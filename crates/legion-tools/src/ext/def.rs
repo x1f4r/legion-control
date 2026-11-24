@@ -11,9 +11,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use toml_edit::{Array, DocumentMut, Item, Table};
 
-/// Built-in family namespaces reserved for Legion; extensions may never register under them.
-pub const RESERVED_FAMILIES: [&str; 12] = [
-    "meta", "audit", "fs", "sys", "exec", "job", "proj", "svc", "power", "fleet", "ext", "token",
+/// Static family namespaces reserved for Legion (core families plus names kept for Legion's own
+/// future use). At load and define time, every family present in the node's built-in registry is
+/// also reserved dynamically so newly added built-in families can never be shadowed.
+pub const RESERVED_FAMILIES: [&str; 15] = [
+    "agent", "audit", "config", "exec", "ext", "fleet", "fs", "job", "legion", "meta", "power",
+    "proj", "svc", "sys", "token",
 ];
 
 /// Default command timeout in seconds when `timeout_s` is omitted.
@@ -21,6 +24,35 @@ pub const DEFAULT_TIMEOUT_S: f64 = 60.0;
 
 /// Maximum command timeout in seconds.
 pub const MAX_TIMEOUT_S: f64 = 3600.0;
+
+/// Maximum byte length of a single `LEGION_ARG_<NAME>` environment variable value (32 KiB).
+/// Keeps each variable inside Windows's per-variable environment limit and well below Linux's
+/// `MAX_ARG_STRLEN`.
+pub const MAX_ENV_ARG_BYTES: usize = 32 * 1024;
+
+/// Maximum combined byte length of all `LEGION_ARG_*` environment variable values (96 KiB).
+pub const MAX_ENV_TOTAL_BYTES: usize = 96 * 1024;
+
+/// What happens when a string argument exceeds the environment variable size cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LargeArgPolicy {
+    /// Fail the call with `invalid_args` before starting the command (default).
+    Refuse,
+    /// Omit `LEGION_ARG_<NAME>`, set `LEGION_ARG_<NAME>_OMITTED=1`, and pass the full value only
+    /// in the JSON object on stdin.
+    Stdin,
+}
+
+impl LargeArgPolicy {
+    /// The TOML/JSON spelling of the policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LargeArgPolicy::Refuse => "refuse",
+            LargeArgPolicy::Stdin => "stdin",
+        }
+    }
+}
 
 /// Parameter types an extension tool may declare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -177,6 +209,10 @@ pub struct ParamDef {
     /// Allowed string values (only valid for `string` parameters).
     #[serde(rename = "enum", default, skip_serializing_if = "Option::is_none")]
     pub enum_values: Option<Vec<String>>,
+    /// How to handle string values larger than [`MAX_ENV_ARG_BYTES`] (only valid for `string`
+    /// parameters). Defaults to refusing the call with `invalid_args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub large: Option<LargeArgPolicy>,
 }
 
 /// One extension tool definition, as stored in `tools.d/<name>.toml`.
@@ -247,6 +283,16 @@ pub fn parse_toml(
     bytes: &[u8],
     is_builtin: &dyn Fn(&str) -> bool,
 ) -> Result<ExtensionDef, ParseFailure> {
+    parse_toml_with_reserved(bytes, is_builtin, &|_| false)
+}
+
+/// Parses and validates an extension TOML file, also refusing any family for which
+/// `is_reserved_family` returns `true` (typically families present in the built-in registry).
+pub fn parse_toml_with_reserved(
+    bytes: &[u8],
+    is_builtin: &dyn Fn(&str) -> bool,
+    is_reserved_family: &dyn Fn(&str) -> bool,
+) -> Result<ExtensionDef, ParseFailure> {
     let def: ExtensionDef =
         legion_core::config::parse_toml_bytes(bytes).map_err(|(message, line)| {
             let reason = match line {
@@ -256,7 +302,7 @@ pub fn parse_toml(
             ParseFailure { reason, line }
         })?;
     let text = std::str::from_utf8(bytes).unwrap_or_default();
-    if let Err(error) = def.validate(is_builtin) {
+    if let Err(error) = def.validate_with_reserved(is_builtin, is_reserved_family) {
         let line = find_field_line(text, &error.field);
         let reason = match line {
             Some(line) => format!("line {line}: {}", error.message),
@@ -268,8 +314,19 @@ pub fn parse_toml(
 }
 
 impl ExtensionDef {
-    /// Validates every field of the definition.
+    /// Validates every field of the definition against built-in tool names and
+    /// [`RESERVED_FAMILIES`].
     pub fn validate(&self, is_builtin: &dyn Fn(&str) -> bool) -> Result<(), ValidationError> {
+        self.validate_with_reserved(is_builtin, &|_| false)
+    }
+
+    /// Validates every field of the definition, also refusing families reported by
+    /// `is_reserved_family` (such as every family registered in the node's built-in registry).
+    pub fn validate_with_reserved(
+        &self,
+        is_builtin: &dyn Fn(&str) -> bool,
+        is_reserved_family: &dyn Fn(&str) -> bool,
+    ) -> Result<(), ValidationError> {
         if !is_tool_name(&self.name) {
             return Err(ValidationError::new(
                 "name",
@@ -280,7 +337,7 @@ impl ExtensionDef {
             ));
         }
         let family = self.name.split('.').next().unwrap_or_default();
-        if RESERVED_FAMILIES.contains(&family) {
+        if RESERVED_FAMILIES.contains(&family) || is_reserved_family(family) {
             return Err(ValidationError::new(
                 "name",
                 format!(
@@ -413,6 +470,15 @@ impl ExtensionDef {
                     }
                 }
             }
+            if param.large.is_some() && param.kind != ParamType::String {
+                return Err(ValidationError::new(
+                    format!("params.{param_name}.large"),
+                    format!(
+                        "`large` is only allowed for string parameters, not {}",
+                        param.kind.as_str()
+                    ),
+                ));
+            }
             if let Some(default) = &param.default {
                 validate_default(param_name, param, default)?;
             }
@@ -521,7 +587,69 @@ impl ExtensionDef {
         Ok(resolved)
     }
 
-    /// Maps validated arguments to `LEGION_ARG_<NAME>` environment variables.
+    /// Maps validated arguments to `LEGION_ARG_<NAME>` environment variables, enforcing
+    /// [`MAX_ENV_ARG_BYTES`] per argument and [`MAX_ENV_TOTAL_BYTES`] across all arguments.
+    ///
+    /// By default, an oversized argument is refused with `invalid_args` before the command starts.
+    /// When a string parameter sets `large = "stdin"`, an oversized value omits
+    /// `LEGION_ARG_<NAME>` and sets `LEGION_ARG_<NAME>_OMITTED=1` instead, while the full JSON
+    /// object still arrives on stdin.
+    pub fn prepare_arg_env(
+        &self,
+        resolved: &Map<String, Value>,
+    ) -> Result<Vec<(String, String)>, ErrorBody> {
+        let tool = &self.name;
+        let mut vars = Vec::with_capacity(resolved.len());
+        let mut total_bytes: usize = 0;
+        for (name, value) in resolved {
+            let upper = name.to_ascii_uppercase();
+            let env_name = format!("LEGION_ARG_{upper}");
+            let env_value = match value {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => if *b { "true" } else { "false" }.to_owned(),
+                other => other.to_string(),
+            };
+            let policy = self
+                .params
+                .get(name)
+                .and_then(|param| param.large)
+                .unwrap_or(LargeArgPolicy::Refuse);
+            let is_string = value.is_string();
+            let over_single = env_value.len() > MAX_ENV_ARG_BYTES;
+            let over_total = !over_single && total_bytes + env_value.len() > MAX_ENV_TOTAL_BYTES;
+            if over_single || over_total {
+                if is_string && policy == LargeArgPolicy::Stdin {
+                    vars.push((format!("LEGION_ARG_{upper}_OMITTED"), "1".to_owned()));
+                    continue;
+                }
+                let message = if over_single {
+                    format!(
+                        "{tool}: `{name}` is {} bytes, which exceeds the {MAX_ENV_ARG_BYTES}-byte limit for environment variables; full arguments are also passed as JSON on stdin.",
+                        env_value.len()
+                    )
+                } else {
+                    format!(
+                        "{tool}: `{name}` pushes total argument environment size past the {MAX_ENV_TOTAL_BYTES}-byte limit; full arguments are also passed as JSON on stdin."
+                    )
+                };
+                return Err(ErrorBody::new(ErrorCode::InvalidArgs, message)
+                    .with_hint(format!(
+                        "Set `large = \"stdin\"` on `[params.{name}]` to omit {env_name}, set LEGION_ARG_{upper}_OMITTED=1, and read `{name}` from stdin JSON."
+                    ))
+                    .with_details(json!({
+                        "field": name,
+                        "bytes": env_value.len(),
+                        "limit_bytes": if over_single { MAX_ENV_ARG_BYTES } else { MAX_ENV_TOTAL_BYTES },
+                    })));
+            }
+            total_bytes += env_value.len();
+            vars.push((env_name, env_value));
+        }
+        Ok(vars)
+    }
+
+    /// Maps validated arguments to `LEGION_ARG_<NAME>` environment variables without size limits.
     ///
     /// Strings pass verbatim; numbers and booleans use their JSON spelling.
     pub fn arg_env_vars(resolved: &Map<String, Value>) -> Vec<(String, String)> {
@@ -588,6 +716,9 @@ impl ExtensionDef {
                         array.push(item.as_str());
                     }
                     table.insert("enum", Item::Value(toml_edit::Value::Array(array)));
+                }
+                if let Some(large) = param.large {
+                    table.insert("large", toml_edit::value(large.as_str()));
                 }
                 params_table.insert(name, Item::Table(table));
             }
@@ -1039,5 +1170,92 @@ enum = ["fast", "safe"]
 
         let err = def.validate_args(json!({"name": "bad\0val"})).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
+    }
+
+    #[test]
+    fn enforces_env_arg_size_cap_and_large_stdin_policy() {
+        let bad_non_string = r#"
+name = "demo.bad"
+description = "Bad."
+effect = "read"
+run = ["echo"]
+
+[params.n]
+type = "integer"
+large = "stdin"
+"#;
+        let err = parse_toml(bad_non_string.as_bytes(), &none_builtin).unwrap_err();
+        assert!(err.reason.contains("large"), "{err:?}");
+
+        let def = parse_toml(
+            r#"
+name = "demo.big"
+description = "Big."
+effect = "read"
+run = ["echo"]
+
+[params.a]
+type = "string"
+
+[params.b]
+type = "string"
+large = "stdin"
+
+[params.c]
+type = "string"
+
+[params.d]
+type = "string"
+
+[params.e]
+type = "string"
+"#
+            .as_bytes(),
+            &none_builtin,
+        )
+        .unwrap();
+        let reparsed = parse_toml(def.to_toml().as_bytes(), &none_builtin).unwrap();
+        assert_eq!(reparsed, def);
+
+        // Oversized default parameter is refused with invalid_args naming the parameter and stdin.
+        let big = "x".repeat(MAX_ENV_ARG_BYTES + 1);
+        let resolved = def.validate_args(json!({"a": big})).unwrap();
+        let err = def.prepare_arg_env(&resolved).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("`a`"), "{}", err.message);
+        assert!(err.message.contains("stdin"), "{}", err.message);
+
+        // Oversized parameter with large = "stdin" omits LEGION_ARG_B and sets LEGION_ARG_B_OMITTED=1.
+        let resolved = def.validate_args(json!({"b": big})).unwrap();
+        let env: BTreeMap<String, String> = def
+            .prepare_arg_env(&resolved)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!env.contains_key("LEGION_ARG_B"));
+        assert_eq!(
+            env.get("LEGION_ARG_B_OMITTED").map(String::as_str),
+            Some("1")
+        );
+
+        // Small value on a large = "stdin" parameter still passes via env normally.
+        let resolved = def.validate_args(json!({"b": "small"})).unwrap();
+        let env: BTreeMap<String, String> = def
+            .prepare_arg_env(&resolved)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(env.get("LEGION_ARG_B").map(String::as_str), Some("small"));
+        assert!(!env.contains_key("LEGION_ARG_B_OMITTED"));
+
+        // Combined total across multiple under-cap params exceeds MAX_ENV_TOTAL_BYTES -> refused.
+        let chunk = "y".repeat(MAX_ENV_ARG_BYTES);
+        let resolved = def
+            .validate_args(json!({"a": chunk, "c": chunk, "d": chunk, "e": "z"}))
+            .unwrap();
+        let err = def.prepare_arg_env(&resolved).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("`e`"), "{}", err.message);
+        assert!(err.message.contains("stdin"), "{}", err.message);
     }
 }

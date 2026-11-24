@@ -61,12 +61,29 @@ fn main() -> ExitCode {
             Box::pin(builtin_name_and_reserved_families_are_refused())
         }),
         (
+            "every_builtin_registry_family_is_dynamically_reserved",
+            || Box::pin(every_builtin_registry_family_is_dynamically_reserved()),
+        ),
+        (
             "broken_file_is_skipped_and_reported_while_others_work",
             || Box::pin(broken_file_is_skipped_and_reported_while_others_work()),
         ),
         (
             "hot_added_and_edited_files_are_picked_up_without_restart",
             || Box::pin(hot_added_and_edited_files_are_picked_up_without_restart()),
+        ),
+        (
+            "oversized_string_args_are_refused_by_default_and_passed_on_stdin_when_opted_in",
+            || {
+                Box::pin(
+                    oversized_string_args_are_refused_by_default_and_passed_on_stdin_when_opted_in(
+                    ),
+                )
+            },
+        ),
+        (
+            "define_and_list_document_effect_honesty_and_execution_mode",
+            || Box::pin(define_and_list_document_effect_honesty_and_execution_mode()),
         ),
     ];
     support::main(tests)
@@ -95,6 +112,24 @@ fn run_helper(args: &[String]) -> ExitCode {
                 "env": legion_env,
                 "stdin": stdin_json,
                 "cwd": cwd,
+            });
+            let _ = writeln!(stdout, "{out}");
+        }
+        // Emits LEGION_* env vars and summary lengths/edges of stdin JSON (stays under stdout cap).
+        "inspect_large" => {
+            let mut stdin_bytes = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut stdin_bytes);
+            let stdin_json: Value = serde_json::from_slice(&stdin_bytes).unwrap_or(Value::Null);
+            let legion_env: BTreeMap<String, String> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("LEGION_"))
+                .collect();
+            let payload = stdin_json["payload"].as_str().unwrap_or_default();
+            let out = json!({
+                "env": legion_env,
+                "payload_len": payload.len(),
+                "payload_starts_with": &payload[..payload.len().min(6)],
+                "payload_ends_with": &payload[payload.len().saturating_sub(6)..],
+                "tag": stdin_json["tag"],
             });
             let _ = writeln!(stdout, "{out}");
         }
@@ -206,7 +241,9 @@ async fn define_show_list_replace_and_remove_lifecycle() {
 
     // Initially empty.
     let listed = fixture.call("ext.list", json!({})).await.unwrap();
-    assert_eq!(listed, json!({"tools": [], "broken": []}));
+    assert_eq!(listed["tools"], json!([]));
+    assert_eq!(listed["broken"], json!([]));
+    assert!(listed["note"].as_str().unwrap().contains("read"));
 
     // Define an extension.
     let created = fixture
@@ -255,6 +292,7 @@ async fn define_show_list_replace_and_remove_lifecycle() {
     assert_eq!(listed["tools"].as_array().unwrap().len(), 1);
     assert_eq!(listed["tools"][0]["name"], json!("gpu.free"));
     assert_eq!(listed["tools"][0]["effect"], json!("read"));
+    assert_eq!(listed["tools"][0]["mode"], json!("run"));
     assert_eq!(listed["tools"][0]["params"], json!(["index"]));
     assert_eq!(listed["broken"], json!([]));
 
@@ -820,6 +858,80 @@ async fn builtin_name_and_reserved_families_are_refused() {
     assert_eq!(listed["broken"].as_array().unwrap().len(), 2);
 }
 
+async fn every_builtin_registry_family_is_dynamically_reserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = legion_tools::registry();
+    // Register a synthetic built-in family not in the static RESERVED_FAMILIES list to prove the
+    // reserved set is derived dynamically from the built-in registry.
+    registry.add_fn(
+        "synth.ping",
+        legion_core::proto::Effect::Read,
+        "Synthetic built-in.",
+        |_ctx: &legion_core::Ctx, _args: legion_core::NoArgs| async { Ok(json!({"ok": true})) },
+    );
+    let mut families: Vec<String> = registry
+        .names()
+        .filter_map(|name| name.split('.').next().map(str::to_owned))
+        .collect();
+    families.push("config".to_owned());
+    families.sort();
+    families.dedup();
+
+    let node = legion_core::Node::new(legion_core::Paths::under(dir.path()), registry);
+
+    // Every family present in the built-in registry (including agent, config, and synth) is
+    // refused by ext.define.
+    for family in &families {
+        let candidate = format!("{family}.custom_ext");
+        let err = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "ext.define",
+                json!({
+                    "name": candidate,
+                    "description": "Should be refused.",
+                    "effect": "read",
+                    "run": helper_argv("print", &["{}"])
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{candidate}: {err:?}");
+        assert!(
+            err.message.contains("reserved"),
+            "{candidate}: {}",
+            err.message
+        );
+    }
+
+    // Hand-written file under tools.d using the dynamically registered family `synth` is also
+    // refused at load time and reported broken.
+    let tools_d = node.paths().tools_dir();
+    std::fs::create_dir_all(&tools_d).unwrap();
+    std::fs::write(
+        tools_d.join("synth.custom.toml"),
+        "name = \"synth.custom\"\ndescription = \"Dynamic shadow.\"\neffect = \"read\"\nrun = [\"echo\"]\n",
+    )
+    .unwrap();
+    assert!(node.spec("synth.custom").is_err());
+    let listed = node
+        .call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "ext.list",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed["tools"], json!([]));
+    assert_eq!(listed["broken"].as_array().unwrap().len(), 1);
+    assert!(
+        listed["broken"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reserved")
+    );
+}
+
 async fn broken_file_is_skipped_and_reported_while_others_work() {
     let fixture = Fixture::new();
     fixture
@@ -897,19 +1009,156 @@ async fn hot_added_and_edited_files_are_picked_up_without_restart() {
         json!({"v": 1})
     );
 
-    // Edit in place (same length!) -> picked up on next call.
+    // Two writes within the same second of different sizes -> picked up on next call.
     let toml_v2 = format!(
-        "name = \"live.echo\"\ndescription = \"V2.\"\neffect = \"read\"\nrun = {}\n",
-        serde_json::to_string(&helper_argv("print", &["{\"v\":2}"])).unwrap()
+        "name = \"live.echo\"\ndescription = \"V2 updated.\"\neffect = \"read\"\nrun = {}\n",
+        serde_json::to_string(&helper_argv("print", &["{\"v\":22}"])).unwrap()
     );
     std::fs::write(&file, toml_v2).unwrap();
-    assert_eq!(fixture.node.spec("live.echo").unwrap().description, "V2.");
+    assert_eq!(
+        fixture.node.spec("live.echo").unwrap().description,
+        "V2 updated."
+    );
     assert_eq!(
         fixture.call("live.echo", json!({})).await.unwrap(),
-        json!({"v": 2})
+        json!({"v": 22})
+    );
+
+    let toml_v3 = format!(
+        "name = \"live.echo\"\ndescription = \"V3.\"\neffect = \"read\"\nrun = {}\n",
+        serde_json::to_string(&helper_argv("print", &["{\"v\":3}"])).unwrap()
+    );
+    std::fs::write(&file, toml_v3).unwrap();
+    assert_eq!(fixture.node.spec("live.echo").unwrap().description, "V3.");
+    assert_eq!(
+        fixture.call("live.echo", json!({})).await.unwrap(),
+        json!({"v": 3})
     );
 
     // Delete -> immediately gone.
     std::fs::remove_file(&file).unwrap();
     assert!(fixture.node.spec("live.echo").is_err());
+}
+
+async fn oversized_string_args_are_refused_by_default_and_passed_on_stdin_when_opted_in() {
+    let fixture = Fixture::new();
+    let marker = fixture.dir.path().join("oversized-should-not-run");
+    let huge = format!("HEAD--{}--TAIL", "a".repeat(200 * 1024));
+
+    // Default policy refuses oversized string argument before starting the command.
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "size.refuse",
+                "description": "Refuses large string args by default.",
+                "effect": "write",
+                "run": helper_argv("touch", &[&marker.to_string_lossy()]),
+                "params": {
+                    "payload": {"type": "string", "required": true}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let err = fixture
+        .call("size.refuse", json!({"payload": huge}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
+    assert!(err.message.contains("`payload`"), "{}", err.message);
+    assert!(err.message.contains("stdin"), "{}", err.message);
+    assert!(
+        !marker.exists(),
+        "command should not have started for oversized env arg"
+    );
+
+    // With large = "stdin", oversized string omits LEGION_ARG_PAYLOAD, sets
+    // LEGION_ARG_PAYLOAD_OMITTED=1, and still arrives intact on stdin JSON.
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "size.stdin",
+                "description": "Accepts large string args via stdin.",
+                "effect": "read",
+                "run": helper_argv("inspect_large", &[]),
+                "params": {
+                    "payload": {"type": "string", "required": true, "large": "stdin"},
+                    "tag": {"type": "string", "default": "ok"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let out = fixture
+        .call("size.stdin", json!({"payload": huge}))
+        .await
+        .unwrap();
+    let env = out["env"].as_object().unwrap();
+    assert!(!env.contains_key("LEGION_ARG_PAYLOAD"), "{env:?}");
+    assert_eq!(env.get("LEGION_ARG_PAYLOAD_OMITTED"), Some(&json!("1")));
+    assert_eq!(env.get("LEGION_ARG_TAG"), Some(&json!("ok")));
+    assert_eq!(out["payload_len"], json!(huge.len()));
+    assert_eq!(out["payload_starts_with"], json!("HEAD--"));
+    assert_eq!(out["payload_ends_with"], json!("--TAIL"));
+    assert_eq!(out["tag"], json!("ok"));
+}
+
+async fn define_and_list_document_effect_honesty_and_execution_mode() {
+    let fixture = Fixture::new();
+
+    let define_desc = fixture.node.spec("ext.define").unwrap().description;
+    assert!(
+        define_desc.contains("declared `read`")
+            && define_desc.contains("every role that may read")
+            && define_desc.contains("honestly"),
+        "{define_desc}"
+    );
+
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "mode.direct",
+                "description": "Runs directly.",
+                "effect": "read",
+                "run": helper_argv("print", &["{\"ok\":true}"])
+            }),
+        )
+        .await
+        .unwrap();
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "mode.shell",
+                "description": "Runs through the shell.",
+                "effect": "exec",
+                "cmd": helper_shell_cmd("inspect")
+            }),
+        )
+        .await
+        .unwrap();
+
+    let listed = fixture.call("ext.list", json!({})).await.unwrap();
+    let note = listed["note"].as_str().unwrap();
+    assert!(
+        note.contains("declared `read`")
+            && note.contains("every role that may read")
+            && note.contains("honestly"),
+        "{note}"
+    );
+
+    let tools = listed["tools"].as_array().unwrap();
+    let direct = tools
+        .iter()
+        .find(|t| t["name"] == json!("mode.direct"))
+        .unwrap();
+    let shell = tools
+        .iter()
+        .find(|t| t["name"] == json!("mode.shell"))
+        .unwrap();
+    assert_eq!(direct["mode"], json!("run"));
+    assert_eq!(shell["mode"], json!("cmd"));
 }

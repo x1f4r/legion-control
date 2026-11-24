@@ -30,12 +30,18 @@ const QUEUE: usize = 256;
 /// window.
 const LONGEST_MESSAGE: usize = 1000;
 
-/// What the door offers: tools, and log messages for a client that asks for them.
-pub(crate) fn capabilities() -> ServerCapabilities {
-    ServerCapabilities::builder()
+/// What the door offers: tools (with `listChanged` in full mode, where extensions can be added,
+/// updated or removed live), and log messages for a client that asks for them. Compact mode always
+/// serves the same three meta-tools, so its list never changes.
+pub(crate) fn capabilities(list_changed: bool) -> ServerCapabilities {
+    let builder = ServerCapabilities::builder()
         .enable_logging()
-        .enable_tools()
-        .build()
+        .enable_tools();
+    if list_changed {
+        builder.enable_tool_list_changed().build()
+    } else {
+        builder.build()
+    }
 }
 
 /// The log level a client asked for, kept as its rank so the deprecated type stays in this module.
