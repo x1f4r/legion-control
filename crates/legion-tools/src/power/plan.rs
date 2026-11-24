@@ -122,7 +122,9 @@ pub enum Timing {
 /// A read-only question to the system: would it let this account carry out the action?
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Check {
-    /// logind's `Can<Verb>` over `busctl`: `yes` allows.
+    /// logind's `Can<Verb>` over `busctl`: whether this account may, and whether an inhibitor
+    /// holds the action back. Asked whatever `[power] sudo` says, because a block inhibitor
+    /// refuses root too.
     Logind(Vec<String>),
     /// `sudo -n -l <command>`: exit 0 allows.
     Sudo(Vec<String>),
@@ -146,8 +148,8 @@ pub struct ActionPlan {
     pub argv: Vec<String>,
     /// Who waits out the delay.
     pub timing: Timing,
-    /// The question to ask first, when the answer would otherwise never come back.
-    pub check: Option<Check>,
+    /// The questions to ask first, in order, because the answer would otherwise never come back.
+    pub checks: Vec<Check>,
 }
 
 /// `["sudo", "-n", …argv]`: a password prompt fails at once instead of hanging the call.
@@ -166,12 +168,14 @@ pub fn maybe_sudo(platform: Platform, sudo: bool, argv: Vec<String>) -> Vec<Stri
     }
 }
 
-/// Builds the plan for `action`. `find` looks a program up on `PATH` (Windows sleep needs one).
+/// Builds the plan for `action`. `ignore_inhibitors` adds systemctl's own `-i`
+/// (`--check-inhibitors=no`). `find` looks a program up on `PATH` (Windows sleep needs one).
 pub fn action_plan(
     platform: Platform,
     action: Action,
     delay_s: u32,
     sudo: bool,
+    ignore_inhibitors: bool,
     sleep_override: Option<&[String]>,
     find: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<ActionPlan, ErrorBody> {
@@ -182,29 +186,32 @@ pub fn action_plan(
         return Ok(ActionPlan {
             argv: argv.to_vec(),
             timing: Timing::Delayed,
-            check: None,
+            checks: Vec::new(),
         });
     }
     let delay = delay_s.to_string();
     match platform {
         Platform::Linux => {
-            let plain = strings(&["systemctl", action.systemctl_verb()]);
-            let check = if sudo {
-                Check::Sudo(sudo_check(&plain))
-            } else {
-                Check::Logind(strings(&[
-                    "busctl",
-                    "call",
-                    "org.freedesktop.login1",
-                    "/org/freedesktop/login1",
-                    "org.freedesktop.login1.Manager",
-                    action.logind_method(),
-                ]))
-            };
+            let mut plain = strings(&["systemctl"]);
+            if ignore_inhibitors {
+                plain.push("-i".to_owned());
+            }
+            plain.push(action.systemctl_verb().to_owned());
+            let mut checks = vec![Check::Logind(strings(&[
+                "busctl",
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                action.logind_method(),
+            ]))];
+            if sudo {
+                checks.push(Check::Sudo(sudo_check(&plain)));
+            }
             Ok(ActionPlan {
                 argv: maybe_sudo(platform, sudo, plain),
                 timing: Timing::Delayed,
-                check: Some(check),
+                checks,
             })
         }
         Platform::Macos => {
@@ -214,7 +221,7 @@ pub fn action_plan(
                     return Ok(ActionPlan {
                         argv: strings(&["pmset", "sleepnow"]),
                         timing: Timing::Delayed,
-                        check: None,
+                        checks: Vec::new(),
                     });
                 }
                 Action::Restart => strings(&["shutdown", "-r", "now"]),
@@ -228,7 +235,7 @@ pub fn action_plan(
             Ok(ActionPlan {
                 argv: maybe_sudo(platform, sudo, plain),
                 timing: Timing::Delayed,
-                check: Some(check),
+                checks: vec![check],
             })
         }
         Platform::Windows => {
@@ -252,7 +259,7 @@ pub fn action_plan(
             Ok(ActionPlan {
                 argv,
                 timing: Timing::SelfTimed,
-                check: None,
+                checks: Vec::new(),
             })
         }
     }
@@ -283,6 +290,14 @@ pub enum Answer {
     Refused(String),
     /// The action is not available on this machine at all; the text says why.
     Unavailable(String),
+    /// logind holds the action back for an inhibitor (`inhibited`, `inhibitor-blocked`), or
+    /// for one and authentication besides (`challenge-inhibitor-blocked`).
+    Inhibited {
+        /// What logind answered.
+        said: String,
+        /// Whether this account would also have to authenticate.
+        challenge: bool,
+    },
     /// The question itself could not be asked or answered.
     Unknown(String),
 }
@@ -322,6 +337,12 @@ pub fn read_check(check: &Check, outcome: &Result<Ran, ErrorBody>) -> Answer {
                 "no" | "challenge" => Answer::Refused(format!(
                     "logind answered {said:?}: this account may not do it without authenticating"
                 )),
+                "inhibited" | "inhibitor-blocked" | "challenge-inhibitor-blocked" => {
+                    Answer::Inhibited {
+                        said: said.to_owned(),
+                        challenge: said.starts_with("challenge"),
+                    }
+                }
                 other => Answer::Unknown(format!("logind answered {other:?}")),
             }
         }
@@ -343,6 +364,68 @@ pub fn read_check(check: &Check, outcome: &Result<Ran, ErrorBody>) -> Answer {
             _ => Answer::Unknown(nonempty(ran.first_line(), "id -u failed").to_owned()),
         },
     }
+}
+
+/// One logind inhibitor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Inhibitor {
+    /// What it holds back, such as `shutdown:sleep`.
+    pub what: String,
+    /// Who holds it.
+    pub who: String,
+    /// Why, in its own words.
+    pub why: String,
+    /// `block`, or `delay` (which only postpones).
+    pub mode: String,
+    /// The user it runs as.
+    pub uid: u64,
+    /// Its process.
+    pub pid: u64,
+}
+
+/// The read-only command that lists logind's inhibitors, as JSON.
+pub fn inhibitors_command() -> Vec<String> {
+    strings(&[
+        "busctl",
+        "--json=short",
+        "call",
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+        "ListInhibitors",
+    ])
+}
+
+/// The block inhibitors that hold `action` back, from `busctl --json=short` output of
+/// `ListInhibitors` (`{"type":"a(ssssuu)","data":[[[what, who, why, mode, uid, pid], …]]}`).
+pub fn parse_inhibitors(text: &str, action: Action) -> Vec<Inhibitor> {
+    let category = match action {
+        Action::Sleep => "sleep",
+        Action::Restart | Action::Shutdown => "shutdown",
+    };
+    let parsed: Value = serde_json::from_str(text.trim()).unwrap_or(Value::Null);
+    let rows = parsed["data"]
+        .get(0)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rows.iter()
+        .filter_map(|row| {
+            let field = |index: usize| row.get(index).and_then(Value::as_str).map(str::to_owned);
+            let number = |index: usize| row.get(index).and_then(Value::as_u64).unwrap_or(0);
+            Some(Inhibitor {
+                what: field(0)?,
+                who: field(1)?,
+                why: field(2)?,
+                mode: field(3)?,
+                uid: number(4),
+                pid: number(5),
+            })
+        })
+        .filter(|inhibitor| {
+            inhibitor.mode == "block" && inhibitor.what.split(':').any(|what| what == category)
+        })
+        .collect()
 }
 
 fn nonempty(text: &str, otherwise: &str) -> String {
@@ -468,60 +551,77 @@ mod tests {
     }
 
     fn plan(platform: Platform, action: Action, sudo: bool) -> ActionPlan {
-        action_plan(platform, action, 3, sudo, None, &|name| {
+        action_plan(platform, action, 3, sudo, false, None, &|name| {
             Some(PathBuf::from(format!("C:\\Tools\\{name}")))
         })
         .unwrap()
     }
 
+    fn logind(method: &str) -> Check {
+        Check::Logind(strings(&[
+            "busctl",
+            "call",
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            method,
+        ]))
+    }
+
     #[test]
-    fn linux_uses_systemd_and_asks_logind_or_sudo_first() {
+    fn linux_uses_systemd_and_asks_logind_always_and_sudo_when_set() {
         let plain = plan(Platform::Linux, Action::Restart, false);
         assert_eq!(plain.argv, strings(&["systemctl", "reboot"]));
         assert_eq!(plain.timing, Timing::Delayed);
-        assert_eq!(
-            plain.check,
-            Some(Check::Logind(strings(&[
-                "busctl",
-                "call",
-                "org.freedesktop.login1",
-                "/org/freedesktop/login1",
-                "org.freedesktop.login1.Manager",
-                "CanReboot"
-            ])))
-        );
+        assert_eq!(plain.checks, [logind("CanReboot")]);
+        // A block inhibitor refuses root too, so logind is asked whatever sudo says.
         let sudo = plan(Platform::Linux, Action::Shutdown, true);
         assert_eq!(sudo.argv, strings(&["sudo", "-n", "systemctl", "poweroff"]));
         assert_eq!(
-            sudo.check,
-            Some(Check::Sudo(strings(&[
-                "sudo",
-                "-n",
-                "-l",
-                "systemctl",
-                "poweroff"
-            ])))
+            sudo.checks,
+            [
+                logind("CanPowerOff"),
+                Check::Sudo(strings(&["sudo", "-n", "-l", "systemctl", "poweroff"]))
+            ]
         );
         let sleep = plan(Platform::Linux, Action::Sleep, false);
         assert_eq!(sleep.argv, strings(&["systemctl", "suspend"]));
-        assert!(matches!(&sleep.check, Some(Check::Logind(argv)) if argv[5] == "CanSuspend"));
+        assert_eq!(sleep.checks, [logind("CanSuspend")]);
+        let past = action_plan(
+            Platform::Linux,
+            Action::Sleep,
+            3,
+            true,
+            true,
+            None,
+            &everything,
+        )
+        .unwrap();
+        assert_eq!(
+            past.argv,
+            strings(&["sudo", "-n", "systemctl", "-i", "suspend"])
+        );
+        assert_eq!(
+            past.checks[1],
+            Check::Sudo(strings(&["sudo", "-n", "-l", "systemctl", "-i", "suspend"]))
+        );
     }
 
     #[test]
     fn macos_sleeps_without_privilege_and_restarts_as_root() {
         let sleep = plan(Platform::Macos, Action::Sleep, true);
         assert_eq!(sleep.argv, strings(&["pmset", "sleepnow"]));
-        assert_eq!(sleep.check, None);
+        assert!(sleep.checks.is_empty());
         let restart = plan(Platform::Macos, Action::Restart, false);
         assert_eq!(restart.argv, strings(&["shutdown", "-r", "now"]));
-        assert_eq!(restart.check, Some(Check::Root(strings(&["id", "-u"]))));
+        assert_eq!(restart.checks, [Check::Root(strings(&["id", "-u"]))]);
         let off = plan(Platform::Macos, Action::Shutdown, true);
         assert_eq!(off.argv, strings(&["sudo", "-n", "shutdown", "-h", "now"]));
         assert_eq!(
-            off.check,
-            Some(Check::Sudo(strings(&[
+            off.checks,
+            [Check::Sudo(strings(&[
                 "sudo", "-n", "-l", "shutdown", "-h", "now"
-            ])))
+            ]))]
         );
     }
 
@@ -530,11 +630,12 @@ mod tests {
         let restart = plan(Platform::Windows, Action::Restart, true);
         assert_eq!(restart.argv, strings(&["shutdown", "/r", "/t", "3"]));
         assert_eq!(restart.timing, Timing::SelfTimed);
-        assert_eq!(restart.check, None);
+        assert!(restart.checks.is_empty());
         let off = action_plan(
             Platform::Windows,
             Action::Shutdown,
             10,
+            false,
             false,
             None,
             &everything,
@@ -553,15 +654,22 @@ mod tests {
             ])
         );
         // Only the 32-bit one installed.
-        let found = action_plan(Platform::Windows, Action::Sleep, 3, false, None, &|name| {
-            (name == "psshutdown.exe").then(|| PathBuf::from("psshutdown.exe"))
-        })
+        let found = action_plan(
+            Platform::Windows,
+            Action::Sleep,
+            3,
+            false,
+            false,
+            None,
+            &|name| (name == "psshutdown.exe").then(|| PathBuf::from("psshutdown.exe")),
+        )
         .unwrap();
         assert_eq!(found.argv[0], "psshutdown.exe");
         let missing = action_plan(
             Platform::Windows,
             Action::Sleep,
             3,
+            false,
             false,
             None,
             &everything,
@@ -575,12 +683,61 @@ mod tests {
     fn a_sleep_command_from_node_toml_runs_as_written_on_every_platform() {
         let custom = strings(&["systemctl", "hibernate"]);
         for platform in [Platform::Linux, Platform::Macos, Platform::Windows] {
-            let plan =
-                action_plan(platform, Action::Sleep, 3, true, Some(&custom), &everything).unwrap();
+            let plan = action_plan(
+                platform,
+                Action::Sleep,
+                3,
+                true,
+                true,
+                Some(&custom),
+                &everything,
+            )
+            .unwrap();
             assert_eq!(plan.argv, custom);
             assert_eq!(plan.timing, Timing::Delayed);
-            assert_eq!(plan.check, None);
+            assert!(plan.checks.is_empty());
         }
+    }
+
+    #[test]
+    fn logind_inhibitor_answers_are_told_apart() {
+        let check = logind("CanSuspend");
+        let answer = |said: &str| read_check(&check, &Ok(Ran::exited(0, said)));
+        assert_eq!(
+            answer("s \"inhibitor-blocked\"\n"),
+            Answer::Inhibited {
+                said: "inhibitor-blocked".to_owned(),
+                challenge: false
+            }
+        );
+        assert_eq!(
+            answer("s \"inhibited\"\n"),
+            Answer::Inhibited {
+                said: "inhibited".to_owned(),
+                challenge: false
+            }
+        );
+        assert_eq!(
+            answer("s \"challenge-inhibitor-blocked\"\n"),
+            Answer::Inhibited {
+                said: "challenge-inhibitor-blocked".to_owned(),
+                challenge: true
+            }
+        );
+    }
+
+    #[test]
+    fn only_block_inhibitors_of_the_action_are_named() {
+        let listed = r#"{"type":"a(ssssuu)","data":[[["shutdown:sleep","Updater","Installing packages","block",0,812],["sleep","Media Player","Playing","block",1000,2044],["handle-lid-switch","Desktop","Lid handled","block",1000,1500],["sleep","Network","Bring links down","delay",0,600]]]}"#;
+        let sleep = parse_inhibitors(listed, Action::Sleep);
+        let who: Vec<&str> = sleep.iter().map(|i| i.who.as_str()).collect();
+        assert_eq!(who, ["Updater", "Media Player"]);
+        assert_eq!(sleep[0].pid, 812);
+        let restart = parse_inhibitors(listed, Action::Restart);
+        assert_eq!(restart.len(), 1);
+        assert_eq!(restart[0].why, "Installing packages");
+        assert!(parse_inhibitors("not json", Action::Sleep).is_empty());
+        assert!(parse_inhibitors(r#"{"type":"a(ssssuu)","data":[[]]}"#, Action::Sleep).is_empty());
     }
 
     #[test]

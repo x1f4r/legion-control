@@ -69,7 +69,7 @@ pub fn register_with(registry: &mut Registry, fleet: Fleet, actuator: Arc<dyn Ac
     registry.add(PowerTool::new(
         "power.switch",
         Effect::Power,
-        "Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, and `force`; the machine's own busy gate applies, and a `busy` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. `dry_run: true` returns the machine's own power.restart dry run (`would_run`, with the exact commands) and restarts nothing. Call it from a machine other than the one being restarted.",
+        "Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, `force` and `ignore_inhibitors`; the machine's own busy gate applies, and a `busy` or `conflict` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. `dry_run: true` returns the machine's own power.restart dry run (`would_run`, with the exact commands) and restarts nothing. Call it from a machine other than the one being restarted.",
         hands,
         |hands, ctx, args: SwitchArgs| Box::pin(power_switch(hands, ctx, args)),
     ));
@@ -427,9 +427,14 @@ struct SwitchArgs {
     #[serde(default)]
     #[schemars(range(min = 0, max = 900))]
     wait_s: Option<u32>,
-    /// Restart even while the machine is busy or unmonitored.
+    /// Restart even while the machine is busy or unmonitored. It does not override a logind
+    /// inhibitor there; `ignore_inhibitors` does.
     #[serde(default)]
     force: bool,
+    /// Restart even while a logind inhibitor holds it back (Linux, with `[power] sudo = true`
+    /// there).
+    #[serde(default)]
+    ignore_inhibitors: bool,
     /// Ask the machine for its power.restart dry run: the exact commands it would run, run nowhere.
     #[serde(default)]
     dry_run: bool,
@@ -517,7 +522,11 @@ async fn power_switch(
         .with_machine(&machine));
     };
 
-    let mut restart = json!({"force": args.force, "dry_run": args.dry_run});
+    let mut restart = json!({
+        "force": args.force,
+        "ignore_inhibitors": args.ignore_inhibitors,
+        "dry_run": args.dry_run,
+    });
     if let Some(into) = &args.into {
         restart["into"] = json!(into);
     }

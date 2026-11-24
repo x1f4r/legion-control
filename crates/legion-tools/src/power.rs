@@ -52,7 +52,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const HANDOFF_PATIENCE: Duration = Duration::from_secs(15);
 
 /// What every gated tool's description says about the gate.
-const GATE: &str = "Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. `dry_run: true` returns the exact commands without running them.";
+const GATE: &str = "Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. On Linux a logind inhibitor (an application asking not to be interrupted) also fails it with `busy`, naming who holds it; `force` does not override that, `ignore_inhibitors: true` does. One power action runs at a time: while one is pending the call fails with `conflict`. `dry_run: true` returns the exact commands without running them, and when a check would refuse the real call, what it would say (`would_refuse`).";
 
 /// Adds the local `power` tools, acting through [`actuator`].
 pub fn register(registry: &mut Registry) {
@@ -83,6 +83,7 @@ pub fn register_with(registry: &mut Registry, actuator: Arc<dyn Actuator>) {
                     action: Action::Sleep,
                     into: None,
                     force: args.force,
+                    ignore_inhibitors: args.ignore_inhibitors,
                     delay_s: SLEEP_DELAY_S,
                     dry_run: args.dry_run,
                 },
@@ -106,6 +107,7 @@ pub fn register_with(registry: &mut Registry, actuator: Arc<dyn Actuator>) {
                         action: Action::Restart,
                         into: args.into,
                         force: args.force,
+                        ignore_inhibitors: args.ignore_inhibitors,
                         delay_s,
                         dry_run: args.dry_run,
                     },
@@ -131,6 +133,7 @@ pub fn register_with(registry: &mut Registry, actuator: Arc<dyn Actuator>) {
                         action: Action::Shutdown,
                         into: None,
                         force: args.force,
+                        ignore_inhibitors: args.ignore_inhibitors,
                         delay_s,
                         dry_run: args.dry_run,
                     },
@@ -210,9 +213,15 @@ where
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SleepArgs {
-    /// Go ahead even while the machine is busy or unmonitored.
+    /// Go ahead even while the machine is busy or unmonitored. It does not override a logind
+    /// inhibitor; `ignore_inhibitors` does.
     #[serde(default)]
     force: bool,
+    /// Linux: go ahead even while a logind inhibitor (an application asking not to be
+    /// interrupted, such as a running update or an unsaved document) holds the action back,
+    /// through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere.
+    #[serde(default)]
+    ignore_inhibitors: bool,
     /// Return the exact commands this call would run, without running them.
     #[serde(default)]
     dry_run: bool,
@@ -226,9 +235,15 @@ struct RestartArgs {
     /// `windows`; power.status lists them. Absent restarts into the firmware's usual choice.
     #[serde(default)]
     into: Option<String>,
-    /// Go ahead even while the machine is busy or unmonitored.
+    /// Go ahead even while the machine is busy or unmonitored. It does not override a logind
+    /// inhibitor; `ignore_inhibitors` does.
     #[serde(default)]
     force: bool,
+    /// Linux: go ahead even while a logind inhibitor (an application asking not to be
+    /// interrupted, such as a running update or an unsaved document) holds the action back,
+    /// through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere.
+    #[serde(default)]
+    ignore_inhibitors: bool,
     /// Seconds between the reply and the restart, 1 to 60; 3 when absent.
     #[serde(default)]
     #[schemars(range(min = 1, max = 60))]
@@ -242,9 +257,15 @@ struct RestartArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ShutdownArgs {
-    /// Go ahead even while the machine is busy or unmonitored.
+    /// Go ahead even while the machine is busy or unmonitored. It does not override a logind
+    /// inhibitor; `ignore_inhibitors` does.
     #[serde(default)]
     force: bool,
+    /// Linux: go ahead even while a logind inhibitor (an application asking not to be
+    /// interrupted, such as a running update or an unsaved document) holds the action back,
+    /// through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere.
+    #[serde(default)]
+    ignore_inhibitors: bool,
     /// Seconds between the reply and the shutdown, 1 to 60; 3 when absent.
     #[serde(default)]
     #[schemars(range(min = 1, max = 60))]
@@ -331,8 +352,39 @@ struct Request {
     action: Action,
     into: Option<String>,
     force: bool,
+    ignore_inhibitors: bool,
     delay_s: u32,
     dry_run: bool,
+}
+
+/// What a check would have refused a dry run with.
+#[derive(Debug, Serialize)]
+struct WouldRefuse {
+    code: ErrorCode,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+/// A check's outcome: an error for a real call; for a dry run, noted (the first one) and passed.
+fn check(
+    outcome: Result<(), ErrorBody>,
+    dry_run: bool,
+    noted: &mut Option<WouldRefuse>,
+) -> Result<(), ErrorBody> {
+    match outcome {
+        Err(error) if dry_run => {
+            if noted.is_none() {
+                *noted = Some(WouldRefuse {
+                    code: error.code,
+                    message: error.message,
+                    hint: error.hint,
+                });
+            }
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// What `power.sleep`, `power.restart` and `power.shutdown` return.
@@ -360,6 +412,9 @@ struct ActionResult {
     /// Anything that may keep the action from happening as scheduled.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    /// On a dry run, the error the real call would fail with at its first refusing check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_refuse: Option<WouldRefuse>,
 }
 
 async fn act(
@@ -388,12 +443,17 @@ async fn act(
         request.action,
         request.delay_s,
         sudo,
+        request.ignore_inhibitors,
         file.power.sleep.as_deref(),
         &|name| actuator.find_program(name),
     )?;
     let boot_id = ctx.boot_id();
+    let dry_run = request.dry_run;
+    let mut would_refuse = None;
     // One power action at a time, from before the gate until this one is handed over.
-    let _call = if request.dry_run {
+    let _call = if dry_run {
+        let conflict = pending::would_conflict(ctx.paths(), boot_id.as_deref());
+        check(conflict.map_or(Ok(()), Err), dry_run, &mut would_refuse)?;
         None
     } else {
         Some(pending::begin(
@@ -403,10 +463,15 @@ async fn act(
         )?)
     };
     if !request.force {
-        gate(actuator, ctx, &file, what).await?;
+        check(
+            gate(actuator, ctx, &file, what).await,
+            dry_run,
+            &mut would_refuse,
+        )?;
     }
-    if let Some(check) = &plan.check {
-        ask(actuator, ctx, platform, sudo, what, check, &plan.argv).await?;
+    for asked in &plan.checks {
+        let answer = ask(actuator, ctx, platform, sudo, &request, asked, &plan.argv).await;
+        check(answer, dry_run, &mut would_refuse)?;
     }
     let arming = match target {
         Some((name, target)) => {
@@ -434,6 +499,7 @@ async fn act(
         commands,
         dry_run: request.dry_run,
         warnings: Vec::new(),
+        would_refuse,
     };
     if request.dry_run {
         return Ok(result);
@@ -583,16 +649,33 @@ async fn ask(
     ctx: &Ctx,
     platform: Platform,
     sudo: bool,
-    what: &str,
+    request: &Request,
     check: &Check,
     argv: &[String],
 ) -> Result<(), ErrorBody> {
+    let what = request.action.phrase();
     let outcome = actuator
         .run(check.argv(), CHECK_TIMEOUT, ctx.cancel_token())
         .await;
     match plan::read_check(check, &outcome) {
         Answer::Allowed => Ok(()),
+        // Root may where this account may not; sudo is asked next.
+        Answer::Refused(_) if sudo && matches!(check, Check::Logind(_)) => Ok(()),
         Answer::Refused(said) => Err(plan::refused(platform, what, sudo, argv, &said)),
+        Answer::Inhibited { said, .. } if !request.ignore_inhibitors => {
+            Err(inhibited(actuator, ctx, request.action, &said).await)
+        }
+        // Overriding an inhibitor is a privilege of its own, which root has.
+        Answer::Inhibited { .. } if sudo => Ok(()),
+        Answer::Inhibited { said, .. } => Err(plan::refused(
+            platform,
+            &format!("{what} past an inhibitor"),
+            false,
+            argv,
+            &format!(
+                "logind answered {said:?}, and overriding an inhibitor needs privileges this account does not have"
+            ),
+        )),
         Answer::Unavailable(why) => Err(ErrorBody::new(
             ErrorCode::Unsupported,
             format!("This machine cannot {what}: {why}."),
@@ -618,6 +701,51 @@ async fn ask(
             .with_details(json!({"asked": check.argv(), "argv": argv})))
         }
     }
+}
+
+/// The `busy` error for an action logind holds back, naming who holds it and why.
+async fn inhibited(
+    actuator: &Arc<dyn Actuator>,
+    ctx: &Ctx,
+    action: Action,
+    said: &str,
+) -> ErrorBody {
+    let listed = actuator
+        .run(
+            &plan::inhibitors_command(),
+            CHECK_TIMEOUT,
+            ctx.cancel_token(),
+        )
+        .await;
+    let inhibitors = match &listed {
+        Ok(ran) if ran.ok() => plan::parse_inhibitors(&ran.stdout, action),
+        _ => Vec::new(),
+    };
+    let who = if inhibitors.is_empty() {
+        "an inhibitor logind did not list".to_owned()
+    } else {
+        inhibitors
+            .iter()
+            .map(|inhibitor| {
+                format!(
+                    "{} ({}, pid {})",
+                    inhibitor.who, inhibitor.why, inhibitor.pid
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    ErrorBody::new(
+        ErrorCode::Busy,
+        format!(
+            "Refused to {}: logind is holding it back for {who}.",
+            action.phrase()
+        ),
+    )
+    .with_hint(
+        "Wait until they let go, or pass ignore_inhibitors: true to override them (with [power] sudo = true). force does not: an inhibitor is something on the machine asking not to be interrupted.",
+    )
+    .with_details(json!({"logind": said, "inhibitors": inhibitors}))
 }
 
 fn describe_failure(ran: &Ran) -> String {

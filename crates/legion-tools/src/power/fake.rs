@@ -98,8 +98,9 @@ impl Reply {
     }
 }
 
-/// The recording fake. A command no reply matches exits 0 and prints nothing; every program is
-/// found unless [`RecordingActuator::without_program`] says otherwise.
+/// The recording fake. A command no reply matches gets what a permissive machine would answer (see
+/// [`permissive`]); every program is found unless [`RecordingActuator::without_program`] says
+/// otherwise.
 #[derive(Debug, Default)]
 pub struct RecordingActuator {
     /// Replies, most specific wins; a prefix with several replies gives them in turn and then
@@ -218,7 +219,7 @@ impl RecordingActuator {
             .map(|(reply, _)| reply.argv.len())
             .max();
         let Some(longest) = longest else {
-            return Ok(Ran::exited(0, ""));
+            return Ok(permissive(argv));
         };
         let mut matching: Vec<&mut (Reply, usize)> = replies
             .iter_mut()
@@ -287,6 +288,19 @@ impl Actuator for RecordingActuator {
         } else {
             Some(PathBuf::from(name))
         }
+    }
+}
+
+/// What a machine that allows everything and holds nothing back answers: logind says `yes` and
+/// lists no inhibitors; any other command exits 0 and prints nothing.
+pub fn permissive(argv: &[String]) -> Ran {
+    let asks_logind = argv.first().is_some_and(|program| program == "busctl");
+    match argv.last().map(String::as_str) {
+        Some(method) if asks_logind && method.starts_with("Can") => Ran::exited(0, "s \"yes\"\n"),
+        Some("ListInhibitors") if asks_logind => {
+            Ran::exited(0, "{\"type\":\"a(ssssuu)\",\"data\":[[]]}\n")
+        }
+        _ => Ran::exited(0, ""),
     }
 }
 

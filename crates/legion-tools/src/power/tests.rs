@@ -63,7 +63,7 @@ fn here() -> Platform {
 
 /// The command this host would carry `action` out with, with `sudo` and nothing found missing.
 fn expected(action: Action, delay_s: u32, sudo: bool) -> (Vec<String>, Timing) {
-    let plan = action_plan(here(), action, delay_s, sudo, None, &|name| {
+    let plan = action_plan(here(), action, delay_s, sudo, false, None, &|name| {
         Some(std::path::PathBuf::from(name))
     })
     .unwrap();
@@ -533,6 +533,139 @@ async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
     assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
     assert!(fixture.fake.records().is_empty());
     drop(blocker);
+}
+
+const UPDATER_INHIBITS: &str = r#"{"type":"a(ssssuu)","data":[[["shutdown:sleep","Updater","Installing packages","block",0,812]]]}"#;
+
+/// A fake whose logind holds sleep back for an updater.
+fn inhibited() -> RecordingActuator {
+    RecordingActuator::new()
+        .reply(Reply::new(
+            &["busctl", "call"],
+            0,
+            "s \"inhibitor-blocked\"\n",
+        ))
+        .reply(Reply::new(&["busctl", "--json=short"], 0, UPDATER_INHIBITS))
+}
+
+#[tokio::test]
+async fn an_inhibitor_holds_the_action_back_until_ignored_on_purpose() {
+    if here() != Platform::Linux {
+        return;
+    }
+    let fixture = Fixture::with_node_toml(inhibited(), IDLE_WITH_SUDO);
+    for args in [json!({}), json!({"force": true})] {
+        let error = fixture.call("power.sleep", args.clone()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Busy, "{args}");
+        assert!(
+            error
+                .message
+                .contains("Updater (Installing packages, pid 812)"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .hint
+                .as_deref()
+                .unwrap()
+                .contains("ignore_inhibitors: true")
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["logind"],
+            json!("inhibitor-blocked")
+        );
+    }
+    assert!(fixture.fake.schedules().is_empty());
+
+    let past = fixture
+        .call("power.sleep", json!({"ignore_inhibitors": true}))
+        .await
+        .unwrap();
+    assert_eq!(past["scheduled"], json!(true));
+    assert_eq!(
+        fixture.fake.schedules(),
+        [(strings(&["sudo", "-n", "systemctl", "-i", "suspend"]), 3)]
+    );
+
+    // Without sudo this account cannot override it, and is told so before anything is handed over.
+    let unprivileged = Fixture::with_node_toml(inhibited(), "busy = \"none\"\n");
+    let error = unprivileged
+        .call("power.sleep", json!({"ignore_inhibitors": true}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    assert!(
+        error
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("sudo = true under [power]")
+    );
+    assert!(unprivileged.fake.schedules().is_empty());
+}
+
+#[tokio::test]
+async fn logind_is_asked_even_with_sudo_and_root_decides_the_rest() {
+    if here() != Platform::Linux {
+        return;
+    }
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new().reply(Reply::new(&["busctl", "call"], 0, "s \"challenge\"\n")),
+        IDLE_WITH_SUDO,
+    );
+    let done = fixture.call("power.restart", json!({})).await.unwrap();
+    assert_eq!(done["scheduled"], json!(true));
+    let runs = fixture.fake.runs();
+    assert_eq!(runs[0][0], "busctl");
+    assert_eq!(runs[1][..3], strings(&["sudo", "-n", "-l"]));
+}
+
+#[tokio::test]
+async fn a_dry_run_shows_the_commands_and_what_would_refuse_them() {
+    // Unmonitored: the gate would refuse, and the dry run says so beside the commands.
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), "[power]\nsudo = true\n");
+    let dry = fixture
+        .call("power.restart", json!({"dry_run": true}))
+        .await
+        .unwrap();
+    let (argv, _) = expected(Action::Restart, 3, true);
+    assert_eq!(dry["commands"], json!([argv]));
+    assert_eq!(dry["would_refuse"]["code"], json!("busy"), "{dry}");
+    assert!(
+        dry["would_refuse"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("busy = \"none\"")
+    );
+    assert!(fixture.fake.schedules().is_empty());
+
+    // Nothing refusing: no would_refuse at all.
+    fixture.write("node.toml", IDLE_WITH_SUDO);
+    let clear = fixture
+        .call("power.restart", json!({"dry_run": true}))
+        .await
+        .unwrap();
+    assert_eq!(clear.get("would_refuse"), None, "{clear}");
+
+    if here() == Platform::Linux {
+        let held = Fixture::with_node_toml(inhibited(), IDLE_WITH_SUDO);
+        let dry = held
+            .call("power.sleep", json!({"dry_run": true}))
+            .await
+            .unwrap();
+        assert_eq!(dry["would_refuse"]["code"], json!("busy"));
+        assert!(
+            dry["would_refuse"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Updater")
+        );
+        assert_eq!(
+            dry["commands"],
+            json!([["sudo", "-n", "systemctl", "suspend"]])
+        );
+    }
 }
 
 #[tokio::test]
