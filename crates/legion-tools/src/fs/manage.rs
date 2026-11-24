@@ -67,6 +67,8 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
     check_not_protected_tree(ctx.grant(), &from)?;
     check_not_protected_tree(ctx.grant(), &to)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
+    let allows_destroy = ctx.grant().allows_effect(Effect::Destroy);
+    let principal = ctx.principal().to_owned();
     let overwrite = args.overwrite;
 
     run_blocking(ctx, "fs.move", move |cancel, mut progress| {
@@ -103,6 +105,9 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
                         format!("{} already exists.", to.display()),
                     )
                     .with_hint("Pass overwrite: true to replace it."));
+                }
+                if to_meta.is_dir() && !allows_destroy {
+                    return Err(deny_replace_directory(&principal, &to));
                 }
                 if from_meta.is_dir() != to_meta.is_dir() {
                     return Err(ErrorBody::new(
@@ -154,18 +159,15 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
             Ok(()) => {}
             Err(OsError::Io { source, .. }) if source.kind() == io::ErrorKind::CrossesDevices => {
                 let mut totals = CopyTotals::default();
-                copy_path(
-                    &from,
-                    &to,
-                    &from_meta,
+                let opts = CopyOptions {
                     overwrite,
-                    true,
-                    "fs.move",
-                    &own_dirs,
-                    &cancel,
-                    &mut progress,
-                    &mut totals,
-                )?;
+                    recursive: true,
+                    allows_destroy,
+                    principal: &principal,
+                    tool: "fs.move",
+                    own_dirs: &own_dirs,
+                };
+                copy_path(&from, &to, &from_meta, &opts, &cancel, &mut progress, &mut totals)?;
                 let mut removed = RemoveTotals::default();
                 remove_path(
                     &from,
@@ -219,6 +221,8 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
     let to = ctx.grant().check_path(&args.to, Access::Write)?;
     check_not_protected_tree(ctx.grant(), &to)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
+    let allows_destroy = ctx.grant().allows_effect(Effect::Destroy);
+    let principal = ctx.principal().to_owned();
     let overwrite = args.overwrite;
     let recursive = args.recursive;
 
@@ -238,14 +242,19 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
             ));
         }
         let mut totals = CopyTotals::default();
+        let opts = CopyOptions {
+            overwrite,
+            recursive,
+            allows_destroy,
+            principal: &principal,
+            tool: "fs.copy",
+            own_dirs: &own_dirs,
+        };
         copy_path(
             &from,
             &to,
             &from_meta,
-            overwrite,
-            recursive,
-            "fs.copy",
-            &own_dirs,
+            &opts,
             &cancel,
             &mut progress,
             &mut totals,
@@ -258,6 +267,28 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
         })
     })
     .await
+}
+
+struct CopyOptions<'a> {
+    overwrite: bool,
+    recursive: bool,
+    allows_destroy: bool,
+    principal: &'a str,
+    tool: &'a str,
+    own_dirs: &'a OwnDirFilter,
+}
+
+fn deny_replace_directory(principal: &str, path: &Path) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "{principal} may not replace existing directory {}: overwriting a directory requires effect:destroy.",
+            path.display()
+        ),
+    )
+    .with_hint(
+        "Ask the owner to allow effect:destroy for this role, or choose a destination that does not already exist.",
+    )
 }
 
 #[derive(Default)]
@@ -292,23 +323,19 @@ impl Read for CancelProgressReader<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn copy_path(
     from: &Path,
     to: &Path,
     from_meta: &Metadata,
-    overwrite: bool,
-    recursive: bool,
-    tool: &str,
-    own_dirs: &OwnDirFilter,
+    opts: &CopyOptions<'_>,
     cancel: &CancellationToken,
     progress: &mut Progress,
     totals: &mut CopyTotals,
 ) -> Result<(), ToolError> {
     if cancel.is_cancelled() {
-        return Err(cancelled_error(tool));
+        return Err(cancelled_error(opts.tool));
     }
-    if own_dirs.is_blocked(from) {
+    if opts.own_dirs.is_blocked(from) {
         return Err(ErrorBody::new(
             ErrorCode::Denied,
             format!(
@@ -319,7 +346,7 @@ fn copy_path(
     }
 
     if from_meta.file_type().is_symlink() {
-        copy_symlink(from, to, from_meta, overwrite)?;
+        copy_symlink(from, to, from_meta, opts)?;
         totals.files += 1;
         let (files, bytes) = (totals.files, totals.bytes);
         progress.maybe_emit(|| json!({"files": files, "bytes": bytes}));
@@ -327,9 +354,7 @@ fn copy_path(
     }
 
     if from_meta.is_file() {
-        let copied = copy_regular_file(
-            from, to, from_meta, overwrite, tool, cancel, progress, totals,
-        )?;
+        let copied = copy_regular_file(from, to, from_meta, opts, cancel, progress, totals)?;
         totals.files += 1;
         totals.bytes += copied;
         let (files, bytes) = (totals.files, totals.bytes);
@@ -338,7 +363,7 @@ fn copy_path(
     }
 
     if from_meta.is_dir() {
-        if !recursive {
+        if !opts.recursive {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
                 format!(
@@ -363,12 +388,15 @@ fn copy_path(
         // destination tree is never followed outside the allowed root.
         match fs::symlink_metadata(to) {
             Ok(to_meta) => {
-                if !overwrite {
+                if !opts.overwrite {
                     return Err(ErrorBody::new(
                         ErrorCode::Exists,
                         format!("{} already exists.", to.display()),
                     )
                     .with_hint("Pass overwrite: true to copy into an existing directory."));
+                }
+                if to_meta.is_dir() && !opts.allows_destroy {
+                    return Err(deny_replace_directory(opts.principal, to));
                 }
                 if !to_meta.is_dir() {
                     return Err(ErrorBody::new(
@@ -391,7 +419,7 @@ fn copy_path(
         let mut children = sorted_children(from)?;
         for (name, child_from) in children.drain(..) {
             if cancel.is_cancelled() {
-                return Err(cancelled_error(tool));
+                return Err(cancelled_error(opts.tool));
             }
             let child_meta = fs::symlink_metadata(&child_from)
                 .map_err(|error| map_io_error("inspect", &child_from, error))?;
@@ -400,10 +428,7 @@ fn copy_path(
                 &child_from,
                 &child_to,
                 &child_meta,
-                overwrite,
-                true,
-                tool,
-                own_dirs,
+                opts,
                 cancel,
                 progress,
                 totals,
@@ -425,13 +450,13 @@ fn copy_symlink(
     from: &Path,
     to: &Path,
     from_meta: &Metadata,
-    overwrite: bool,
+    opts: &CopyOptions<'_>,
 ) -> Result<(), ToolError> {
     let target = fs::read_link(from).map_err(|error| map_io_error("read symlink", from, error))?;
     ensure_parent_exists(to)?;
     match fs::symlink_metadata(to) {
         Ok(to_meta) => {
-            if !overwrite {
+            if !opts.overwrite {
                 return Err(ErrorBody::new(
                     ErrorCode::Exists,
                     format!("{} already exists.", to.display()),
@@ -439,6 +464,9 @@ fn copy_symlink(
                 .with_hint("Pass overwrite: true to replace it."));
             }
             if to_meta.is_dir() {
+                if !opts.allows_destroy {
+                    return Err(deny_replace_directory(opts.principal, to));
+                }
                 return Err(ErrorBody::new(
                     ErrorCode::Conflict,
                     format!(
@@ -462,13 +490,11 @@ fn copy_symlink(
         .map_err(|error| map_io_error("create symlink", to, error))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn copy_regular_file(
     from: &Path,
     to: &Path,
     from_meta: &Metadata,
-    overwrite: bool,
-    tool: &str,
+    opts: &CopyOptions<'_>,
     cancel: &CancellationToken,
     progress: &mut Progress,
     totals: &CopyTotals,
@@ -477,7 +503,7 @@ fn copy_regular_file(
     let mut existed_regular = false;
     match fs::symlink_metadata(to) {
         Ok(to_meta) => {
-            if !overwrite {
+            if !opts.overwrite {
                 return Err(ErrorBody::new(
                     ErrorCode::Exists,
                     format!("{} already exists.", to.display()),
@@ -485,6 +511,9 @@ fn copy_regular_file(
                 .with_hint("Pass overwrite: true to replace it."));
             }
             if to_meta.is_dir() {
+                if !opts.allows_destroy {
+                    return Err(deny_replace_directory(opts.principal, to));
+                }
                 return Err(ErrorBody::new(
                     ErrorCode::Conflict,
                     format!(
@@ -520,7 +549,7 @@ fn copy_regular_file(
     let mode = platform::unix_mode_bits(from_meta);
     let copied = match write_atomic_from_reader(to, &mut reader, WriteOptions { mode }) {
         Ok(copied) => copied,
-        Err(_) if reader.cancelled => return Err(cancelled_error(tool)),
+        Err(_) if reader.cancelled => return Err(cancelled_error(opts.tool)),
         Err(error) => return Err(map_os_error("copy to", to, error)),
     };
     if existed_regular && let Some(bits) = mode {

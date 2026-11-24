@@ -1202,7 +1202,7 @@ async fn confined_role_cannot_escape_through_symlinks_in_any_fs_tool() {
 role = "jailed"
 
 [roles.jailed]
-allow = ["fs.*"]
+allow = ["effect:read", "effect:write", "effect:destroy"]
 paths = ["~/projects/**"]
 "#,
     );
@@ -1464,4 +1464,125 @@ paths = ["~/**"]
     .await
     .unwrap();
     assert_eq!(grepped["matches"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn overwriting_an_existing_directory_requires_effect_destroy() {
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.writer]
+role = "writer"
+
+[principals.cleaner]
+role = "cleaner"
+
+[roles.writer]
+allow = ["effect:read", "effect:write"]
+
+[roles.cleaner]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+"#,
+    );
+
+    // Writer (without `effect:destroy`) may overwrite a single file via `fs.copy` and `fs.move`.
+    let f1 = f.work.join("f1.txt");
+    let f2 = f.work.join("f2.txt");
+    std::fs::write(&f1, "one").unwrap();
+    std::fs::write(&f2, "two").unwrap();
+    f.call_as(
+        "writer",
+        "fs.copy",
+        json!({"from": f.p(&f1), "to": f.p(&f2), "overwrite": true}),
+    )
+    .await
+    .unwrap();
+    f.call_as(
+        "writer",
+        "fs.move",
+        json!({"from": f.p(&f1), "to": f.p(&f2), "overwrite": true}),
+    )
+    .await
+    .unwrap();
+
+    // Writer is denied when overwriting an existing directory in `fs.copy` or `fs.move`.
+    let src_dir = f.work.join("src_dir");
+    let dst_dir = f.work.join("dst_dir");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("a.txt"), "a").unwrap();
+    std::fs::create_dir_all(&dst_dir).unwrap();
+
+    let copy_err = f
+        .call_as(
+            "writer",
+            "fs.copy",
+            json!({
+                "from": f.p(&src_dir),
+                "to": f.p(&dst_dir),
+                "recursive": true,
+                "overwrite": true,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(copy_err.code, ErrorCode::Denied);
+    assert!(
+        copy_err.message.contains("effect:destroy"),
+        "{}",
+        copy_err.message
+    );
+
+    let move_err = f
+        .call_as(
+            "writer",
+            "fs.move",
+            json!({
+                "from": f.p(&src_dir),
+                "to": f.p(&dst_dir),
+                "overwrite": true,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(move_err.code, ErrorCode::Denied);
+    assert!(
+        move_err.message.contains("effect:destroy"),
+        "{}",
+        move_err.message
+    );
+
+    // Role with `effect:destroy` is allowed to overwrite the existing directory.
+    f.call_as(
+        "cleaner",
+        "fs.copy",
+        json!({
+            "from": f.p(&src_dir),
+            "to": f.p(&dst_dir),
+            "recursive": true,
+            "overwrite": true,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(dst_dir.join("a.txt")).unwrap(), "a");
+
+    let empty_dir = f.work.join("empty_dir");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    f.call_as(
+        "cleaner",
+        "fs.move",
+        json!({
+            "from": f.p(&src_dir),
+            "to": f.p(&empty_dir),
+            "overwrite": true,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!src_dir.exists());
+    assert_eq!(
+        std::fs::read_to_string(empty_dir.join("a.txt")).unwrap(),
+        "a"
+    );
 }
