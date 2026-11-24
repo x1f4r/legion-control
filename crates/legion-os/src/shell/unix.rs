@@ -2,12 +2,14 @@
 
 use std::ffi::OsString;
 
+use crate::Result;
+
 use super::ResolvedCommand;
 
-pub(super) fn resolve_shell(command: &str) -> ResolvedCommand {
-    ResolvedCommand {
-        program: OsString::from("sh"),
-        args: vec![OsString::from("-c"), OsString::from(command)],
-        env_remove: Vec::new(),
-    }
+pub(super) fn resolve_shell(command: &str) -> Result<ResolvedCommand> {
+    Ok(ResolvedCommand::new(
+        OsString::from("sh"),
+        vec![OsString::from("-c"), OsString::from(command)],
+        Vec::new(),
+    ))
 }

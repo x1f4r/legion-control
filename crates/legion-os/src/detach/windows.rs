@@ -86,6 +86,9 @@ pub(super) async fn spawn_detached(
 
     match spawn_result {
         Ok(child) => {
+            // The detached child is already running and may still be reading a spilled `.ps1`
+            // wrapper (which deletes itself as its first action); disarm caller-side removal.
+            resolved.disarm_temp_script();
             let pid = child.id();
             // Read the exact 100-ns FILETIME creation timestamp directly from the process handle we
             // already hold; this stays valid even if the child exits immediately and never guesses.
@@ -253,6 +256,7 @@ async fn spawn_via_wmi(
 
     // Wait for the launcher to start the real target process and write its PID + creation time.
     let reported = wait_for_handoff(&handoff_path, wrapper_pid, WMI_LAUNCH_TIMEOUT).await?;
+    resolved.disarm_temp_script();
 
     // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID (avoiding any
     // local-time DST ambiguity in .NET's Process.StartTime), falling back to the launcher's

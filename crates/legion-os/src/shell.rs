@@ -6,9 +6,24 @@
 //! PowerShell 5.1 module loading.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{OsError, Result};
+
+/// Maximum UTF-16LE Base64 payload length sent via PowerShell `-EncodedCommand` before spilling
+/// the wrapper script to a private temporary `.ps1` file invoked with `-File`.
+///
+/// Leaves generous headroom under Windows `CreateProcessW`'s 32,767-character command-line limit
+/// once the executable path and flags are included.
+#[allow(dead_code)]
+pub(crate) const POWERSHELL_MAX_ENCODED_LEN: usize = 24_000;
+
+static TEMP_SCRIPT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(unix)]
 #[path = "shell/unix.rs"]
@@ -78,8 +93,27 @@ impl CommandSpec {
     }
 }
 
+/// RAII guard that removes a spilled temporary PowerShell wrapper script when the last clone of
+/// [`ResolvedCommand`] drops, unless disarmed after handoff to a detached process.
+#[derive(Debug)]
+struct TempScriptGuard {
+    path: PathBuf,
+    armed: AtomicBool,
+}
+
+impl Drop for TempScriptGuard {
+    fn drop(&mut self) {
+        if self.armed.load(Ordering::Acquire) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Concrete executable, arguments, and environment removals ready to apply to a process builder.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// When a long Windows shell command spills to a temporary `.ps1` file, this handle owns the
+/// cleanup guard and removes the file once dropped (including on error or cancellation).
+#[derive(Clone, Debug)]
 pub struct ResolvedCommand {
     /// Program name or path to spawn.
     pub program: OsString,
@@ -87,9 +121,39 @@ pub struct ResolvedCommand {
     pub args: Vec<OsString>,
     /// Environment variables cleared before caller overrides are applied.
     pub env_remove: Vec<OsString>,
+    temp_script: Option<Arc<TempScriptGuard>>,
 }
 
+impl PartialEq for ResolvedCommand {
+    fn eq(&self, other: &Self) -> bool {
+        self.program == other.program
+            && self.args == other.args
+            && self.env_remove == other.env_remove
+    }
+}
+
+impl Eq for ResolvedCommand {}
+
 impl ResolvedCommand {
+    /// Construct a [`ResolvedCommand`] without a backing temporary script.
+    pub(crate) fn new(program: OsString, args: Vec<OsString>, env_remove: Vec<OsString>) -> Self {
+        Self {
+            program,
+            args,
+            env_remove,
+            temp_script: None,
+        }
+    }
+
+    /// Disarm Rust-side deletion of a spilled temporary script once ownership has been handed off
+    /// to a detached process that deletes the script as its own first action.
+    #[allow(dead_code)]
+    pub(crate) fn disarm_temp_script(&self) {
+        if let Some(ref guard) = self.temp_script {
+            guard.armed.store(false, Ordering::Release);
+        }
+    }
+
     /// Lossy string representation of the executable name for diagnostics and typed errors.
     pub fn program_display(&self) -> String {
         self.program.to_string_lossy().into_owned()
@@ -125,11 +189,11 @@ pub fn resolve(spec: &CommandSpec) -> Result<ResolvedCommand> {
                     detail: "command program name must not be empty".into(),
                 });
             }
-            Ok(ResolvedCommand {
-                program: program.clone(),
-                args: args.clone(),
-                env_remove: Vec::new(),
-            })
+            Ok(ResolvedCommand::new(
+                program.clone(),
+                args.clone(),
+                Vec::new(),
+            ))
         }
         CommandSpec::Shell(command) => resolve_shell(command),
     }
@@ -166,7 +230,7 @@ pub fn apply_c_locale_tokio(command: &mut tokio::process::Command) {
 
 #[cfg(any(unix, windows))]
 fn resolve_shell(command: &str) -> Result<ResolvedCommand> {
-    Ok(platform::resolve_shell(command))
+    platform::resolve_shell(command)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -296,22 +360,151 @@ pub(crate) fn windows_cmdline_escape(arg: &str) -> String {
     out
 }
 
-/// Wrap a PowerShell command string so stdout uses UTF-8 without a BOM and native executable
-/// exit codes survive intact instead of being collapsed to `0`/`1`.
+/// Wrap a PowerShell command string so stdout uses UTF-8 without a BOM, negative native crash
+/// exit codes (such as `0xC0000005`) survive intact, failing cmdlets report `1` without leaking a
+/// stale native exit code from an earlier command, and succeeding final commands exit `0`.
 ///
 /// With plain `-Command`, Windows PowerShell encodes stdout in the active OEM code page and
-/// collapses failing native exit codes to `1`. Running this wrapper through `-EncodedCommand`
-/// fixes both issues for Windows PowerShell 5.1 and PowerShell 7.
+/// collapses failing native exit codes to `1`. Running this wrapper fixes both issues for
+/// Windows PowerShell 5.1 and PowerShell 7.
 #[allow(dead_code)]
 pub(crate) fn build_powershell_shell_wrapper(command: &str) -> String {
-    format!(
-        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n\
-         $OutputEncoding = [Console]::OutputEncoding\n\
-         $global:LASTEXITCODE = 0\n\
-         {command}\n\
-         if (!$?) {{ exit [Math]::Max(1, [int]$LASTEXITCODE) }}\n\
-         exit [int]$LASTEXITCODE"
-    )
+    build_powershell_shell_wrapper_with_cleanup(command, None)
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_powershell_shell_wrapper_with_cleanup(
+    command: &str,
+    self_script_path: Option<&str>,
+) -> String {
+    let mut lines = Vec::with_capacity(12);
+    if let Some(path) = self_script_path {
+        lines.push(format!(
+            "Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue",
+            powershell_single_quote(path)
+        ));
+    }
+    lines.extend([
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)".to_owned(),
+        "$OutputEncoding = [Console]::OutputEncoding".to_owned(),
+        "$global:LASTEXITCODE = $null".to_owned(),
+        "$__legion_err_count = $Error.Count".to_owned(),
+        command.to_owned(),
+        "$__legion_ok = $?".to_owned(),
+        "$__legion_code = $global:LASTEXITCODE".to_owned(),
+        "if ($__legion_ok) { exit 0 }".to_owned(),
+        "if ($Error.Count -gt $__legion_err_count -and $Error[0].FullyQualifiedErrorId -notlike 'NativeCommand*') { exit 1 }".to_owned(),
+        "if ($__legion_code -is [int] -and $__legion_code -ne 0) { exit $__legion_code }".to_owned(),
+        "exit 1".to_owned(),
+    ]);
+    lines.join("\n")
+}
+
+/// Build a PowerShell [`ResolvedCommand`] for `command`, using `-EncodedCommand` when it fits
+/// safely within Windows command-line limits and spilling to a private temporary `.ps1` file
+/// invoked with `-File` otherwise.
+#[allow(dead_code)]
+pub(crate) fn resolve_powershell_command(
+    program: OsString,
+    command: &str,
+    temp_dir: &Path,
+) -> Result<ResolvedCommand> {
+    let env_remove = vec![OsString::from("PSModulePath")];
+    let wrapper = build_powershell_shell_wrapper(command);
+    let encoded = encode_utf16le_base64(&wrapper);
+    if encoded.len() <= POWERSHELL_MAX_ENCODED_LEN {
+        return Ok(ResolvedCommand::new(
+            program,
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-EncodedCommand"),
+                OsString::from(encoded),
+            ],
+            env_remove,
+        ));
+    }
+
+    let script_path = write_private_temp_ps1(temp_dir, command)?;
+    let guard = Arc::new(TempScriptGuard {
+        path: script_path.clone(),
+        armed: AtomicBool::new(true),
+    });
+    Ok(ResolvedCommand {
+        program,
+        args: vec![
+            OsString::from("-NoProfile"),
+            OsString::from("-NonInteractive"),
+            OsString::from("-ExecutionPolicy"),
+            OsString::from("Bypass"),
+            OsString::from("-File"),
+            script_path.into_os_string(),
+        ],
+        env_remove,
+        temp_script: Some(guard),
+    })
+}
+
+#[allow(dead_code)]
+fn write_private_temp_ps1(temp_dir: &Path, command: &str) -> Result<PathBuf> {
+    let pid = std::process::id();
+    for _ in 0..32 {
+        let seq = TEMP_SCRIPT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = temp_dir.join(format!("legion-ps-{pid}-{seq}-{nanos}.ps1"));
+
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
+        let mut file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(OsError::from_io(
+                    format!(
+                        "cannot create temporary PowerShell script {}",
+                        path.display()
+                    ),
+                    err,
+                ));
+            }
+        };
+
+        let path_str = path.to_string_lossy().into_owned();
+        let script = build_powershell_shell_wrapper_with_cleanup(command, Some(&path_str));
+        // Prefix a UTF-8 BOM so Windows PowerShell 5.1 reads the `.ps1` file as UTF-8.
+        let write_result = file
+            .write_all(&[0xEF, 0xBB, 0xBF])
+            .and_then(|()| file.write_all(script.as_bytes()))
+            .and_then(|()| file.flush());
+        drop(file);
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_file(&path);
+            return Err(OsError::from_io(
+                format!(
+                    "cannot write temporary PowerShell script {}",
+                    path.display()
+                ),
+                err,
+            ));
+        }
+        return Ok(path);
+    }
+
+    Err(OsError::Platform {
+        detail: format!(
+            "exhausted attempts to allocate a unique temporary PowerShell script in {}",
+            temp_dir.display()
+        ),
+    })
 }
 
 /// Encode UTF-8 text as UTF-16LE Base64 for PowerShell's `-EncodedCommand` parameter.
@@ -471,14 +664,64 @@ mod tests {
             )
         );
         assert!(wrapper.contains("$OutputEncoding = [Console]::OutputEncoding"));
-        assert!(wrapper.contains("$global:LASTEXITCODE = 0"));
+        assert!(wrapper.contains("$global:LASTEXITCODE = $null"));
+        assert!(wrapper.contains("$__legion_err_count = $Error.Count"));
         assert!(wrapper.contains(cmd));
-        assert!(wrapper.contains("if (!$?) { exit [Math]::Max(1, [int]$LASTEXITCODE) }"));
-        assert!(wrapper.ends_with("exit [int]$LASTEXITCODE"));
+        assert!(wrapper.contains("if ($__legion_ok) { exit 0 }"));
+        assert!(wrapper.contains("FullyQualifiedErrorId -notlike 'NativeCommand*'"));
+        assert!(wrapper.contains(
+            "if ($__legion_code -is [int] -and $__legion_code -ne 0) { exit $__legion_code }"
+        ));
+        assert!(!wrapper.contains("[Math]::Max"));
+        assert!(wrapper.ends_with("exit 1"));
 
         let encoded = encode_utf16le_base64(&wrapper);
         let decoded = decode_utf16le_base64(&encoded);
         assert_eq!(decoded, wrapper);
+    }
+
+    #[test]
+    fn resolve_powershell_command_spills_long_scripts_to_temp_file_and_cleans_up_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let short =
+            resolve_powershell_command(OsString::from("pwsh.exe"), "echo hi", dir.path()).unwrap();
+        assert_eq!(short.args[2], OsString::from("-EncodedCommand"));
+        assert_eq!(short.env_remove, vec![OsString::from("PSModulePath")]);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let long_cmd = format!("Write-Output '{}'", "x".repeat(12_000));
+        let spilled =
+            resolve_powershell_command(OsString::from("pwsh.exe"), &long_cmd, dir.path()).unwrap();
+        assert_eq!(spilled.args[2], OsString::from("-ExecutionPolicy"));
+        assert_eq!(spilled.args[3], OsString::from("Bypass"));
+        assert_eq!(spilled.args[4], OsString::from("-File"));
+
+        let script_path = PathBuf::from(&spilled.args[5]);
+        assert!(script_path.starts_with(dir.path()));
+        assert!(script_path.is_file());
+
+        let raw = fs::read(&script_path).unwrap();
+        assert!(raw.starts_with(&[0xEF, 0xBB, 0xBF]));
+        let text = std::str::from_utf8(&raw[3..]).unwrap();
+        let first_line = text.lines().next().unwrap();
+        assert!(first_line.starts_with("Remove-Item -LiteralPath "));
+        assert!(text.contains(&long_cmd));
+
+        // Cloning keeps the file alive until the last handle drops.
+        let cloned = spilled.clone();
+        drop(spilled);
+        assert!(script_path.is_file());
+        drop(cloned);
+        assert!(!script_path.exists());
+
+        // Disarming leaves cleanup to the script's own first-line Remove-Item (used by detach).
+        let detached =
+            resolve_powershell_command(OsString::from("pwsh.exe"), &long_cmd, dir.path()).unwrap();
+        let detached_path = PathBuf::from(&detached.args[5]);
+        detached.disarm_temp_script();
+        drop(detached);
+        assert!(detached_path.is_file());
     }
 
     fn decode_utf16le_base64(encoded: &str) -> String {
