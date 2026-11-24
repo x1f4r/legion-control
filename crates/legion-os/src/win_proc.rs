@@ -6,20 +6,41 @@
 
 #![allow(unsafe_code)]
 
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
-use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
+use std::ptr::null_mut;
 
+use windows::Wdk::System::SystemInformation::{
+    NtQuerySystemInformation, SystemTimeOfDayInformation,
+};
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME,
-    HANDLE, STILL_ACTIVE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    STILL_ACTIVE,
+};
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE, TerminateProcess,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessTimes,
+    InitializeProcThreadAttributeList, IsProcessCritical, LPPROC_THREAD_ATTRIBUTE_LIST,
+    OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
+    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute,
 };
+use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use crate::procid::ProcessId;
 use crate::{OsError, Result};
@@ -55,6 +76,176 @@ pub(crate) enum TerminateOutcome {
     IdentityMismatch,
     /// Access was denied when opening or terminating the process.
     AccessDenied,
+}
+
+/// An open Win32 process handle paired with its verified identity and parent PID read directly
+/// from the handle.
+///
+/// Holding this value keeps the OS PID pinned so the kernel cannot reuse it while subsequent
+/// tree-walk snapshots and termination waves are in progress.
+pub(crate) struct PinnedProcess {
+    handle: OwnedHandle,
+    pub(crate) id: ProcessId,
+    pub(crate) parent_pid: u32,
+    can_terminate: bool,
+}
+
+impl PinnedProcess {
+    /// Return `true` while this pinned process has not yet exited.
+    pub(crate) fn is_running(&self) -> bool {
+        match query_times_raw(self.handle.0, &format!("pid {}", self.id.pid)) {
+            Ok((_, exit_ft)) => is_still_running(self.handle.0, exit_ft),
+            Err(_) => false,
+        }
+    }
+
+    /// Terminate this pinned process through its already-verified handle.
+    pub(crate) fn terminate(&self) -> TerminateOutcome {
+        if !self.is_running() {
+            return TerminateOutcome::AlreadyGone;
+        }
+        if !self.can_terminate {
+            return TerminateOutcome::AccessDenied;
+        }
+
+        // SAFETY: `self.handle.0` is a valid handle opened with `PROCESS_TERMINATE` whose
+        // identity was verified while this handle pinned the PID against reuse.
+        match unsafe { TerminateProcess(self.handle.0, 1) } {
+            Ok(()) => TerminateOutcome::Terminated,
+            Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                if !self.is_running() {
+                    TerminateOutcome::AlreadyGone
+                } else {
+                    TerminateOutcome::AccessDenied
+                }
+            }
+            Err(_) => TerminateOutcome::AccessDenied,
+        }
+    }
+}
+
+/// Result of attempting to open and pin one candidate PID during a process-tree walk.
+pub(crate) enum OpenPinnedOutcome {
+    /// Handle opened and creation time plus parent PID read from the pinned handle.
+    Pinned(PinnedProcess),
+    /// The PID does not exist or has already exited.
+    Gone,
+    /// Access was denied even for `PROCESS_QUERY_LIMITED_INFORMATION`.
+    AccessDenied,
+    /// Querying times or parent PID failed for this single process.
+    Failed,
+}
+
+/// Read `InheritedFromUniqueProcessId` directly from an open handle with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`.
+fn query_parent_pid_raw(handle: HANDLE) -> Result<u32> {
+    let mut info = PROCESS_BASIC_INFORMATION::default();
+    let mut returned = 0u32;
+    let len = size_of::<PROCESS_BASIC_INFORMATION>() as u32;
+
+    // SAFETY: `handle` is a valid process handle with at least `PROCESS_QUERY_LIMITED_INFORMATION`
+    // (sufficient for `ProcessBasicInformation` on Windows Vista+), `info` has exact size `len`,
+    // and `returned` is a valid mutable `u32`.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            ProcessBasicInformation,
+            (&mut info as *mut PROCESS_BASIC_INFORMATION).cast::<c_void>(),
+            len,
+            &mut returned,
+        )
+    };
+    status.ok().map_err(|err| OsError::Platform {
+        detail: format!("NtQueryInformationProcess(ProcessBasicInformation) failed: {err}"),
+    })?;
+    u32::try_from(info.InheritedFromUniqueProcessId).map_err(|_| OsError::Platform {
+        detail: format!(
+            "InheritedFromUniqueProcessId {} exceeds u32 range",
+            info.InheritedFromUniqueProcessId
+        ),
+    })
+}
+
+/// Open `pid` with `PROCESS_QUERY_LIMITED_INFORMATION` only (strictly read-only) and read both
+/// its creation time and its `parent_pid` directly from the held handle.
+pub(crate) fn open_pinned_query_only(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
+    // SAFETY: `OpenProcess` takes plain integer arguments and any returned handle is immediately
+    // wrapped in `OwnedHandle`.
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => OwnedHandle(h),
+        Err(err) if err.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+            return OpenPinnedOutcome::Gone;
+        }
+        Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            return OpenPinnedOutcome::AccessDenied;
+        }
+        Err(_) => return OpenPinnedOutcome::Failed,
+    };
+
+    let Ok((creation, exit_ft)) = query_times_raw(handle.0, &format!("pid {pid}")) else {
+        return OpenPinnedOutcome::Failed;
+    };
+    if !include_exited && !is_still_running(handle.0, exit_ft) {
+        return OpenPinnedOutcome::Gone;
+    }
+    let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
+        return OpenPinnedOutcome::Failed;
+    };
+
+    OpenPinnedOutcome::Pinned(PinnedProcess {
+        handle,
+        id: ProcessId::new(pid, creation),
+        parent_pid,
+        can_terminate: false,
+    })
+}
+
+/// Open `pid` (requesting `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, falling back to
+/// `PROCESS_QUERY_LIMITED_INFORMATION` if termination is denied) and read both its creation time
+/// and its `parent_pid` directly from the held handle.
+pub(crate) fn open_pinned(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
+    let terminate_rights = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    // SAFETY: `OpenProcess` takes plain integer arguments and any returned handle is immediately
+    // wrapped in `OwnedHandle`.
+    let (handle, can_terminate) = match unsafe { OpenProcess(terminate_rights, false, pid) } {
+        Ok(h) => (OwnedHandle(h), true),
+        Err(err) if err.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+            return OpenPinnedOutcome::Gone;
+        }
+        Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            // Fall back to query-only access so we can still verify identity, walk children, and
+            // record the process as a survivor if it cannot be terminated.
+            // SAFETY: Same plain-integer `OpenProcess` contract with query-only rights.
+            match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+                Ok(h) => (OwnedHandle(h), false),
+                Err(err2) if err2.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+                    return OpenPinnedOutcome::Gone;
+                }
+                Err(err2) if err2.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                    return OpenPinnedOutcome::AccessDenied;
+                }
+                Err(_) => return OpenPinnedOutcome::Failed,
+            }
+        }
+        Err(_) => return OpenPinnedOutcome::Failed,
+    };
+
+    let Ok((creation, exit_ft)) = query_times_raw(handle.0, &format!("pid {pid}")) else {
+        return OpenPinnedOutcome::Failed;
+    };
+    if !include_exited && !is_still_running(handle.0, exit_ft) {
+        return OpenPinnedOutcome::Gone;
+    }
+    let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
+        return OpenPinnedOutcome::Failed;
+    };
+
+    OpenPinnedOutcome::Pinned(PinnedProcess {
+        handle,
+        id: ProcessId::new(pid, creation),
+        parent_pid,
+        can_terminate,
+    })
 }
 
 #[inline]
@@ -97,12 +288,349 @@ fn is_still_running(handle: HANDLE, exit_filetime: u64) -> bool {
     ok && exit_code == STILL_ACTIVE.0 as u32
 }
 
-/// Read the exact 100-ns `FILETIME` creation timestamp from a borrowed process handle (for example
-/// `std::process::Child::as_handle()`).
-pub(crate) fn creation_time_from_handle(handle: BorrowedHandle<'_>) -> Result<u64> {
-    let raw = HANDLE(handle.as_raw_handle());
-    let (creation, _exit) = query_times_raw(raw, "child process handle")?;
-    Ok(creation)
+/// Layout of Windows `SYSTEM_TIMEOFDAY_INFORMATION` (48 bytes on all supported Windows versions).
+#[repr(C)]
+#[derive(Default)]
+struct SystemTimeOfDayInfo {
+    boot_time: i64,
+    current_time: i64,
+    time_zone_bias: i64,
+    time_zone_id: u32,
+    reserved: u32,
+    boot_time_bias: u64,
+    sleep_time_bias: u64,
+}
+
+/// Query the clock-step-invariant Windows boot timestamp (`BootTime - BootTimeBias`).
+///
+/// Whenever `NtSetSystemTime` adjusts the system wall clock (NTP or dual-boot RTC jump), the
+/// kernel shifts both `KeBootTime` and `KeBootTimeBias` by the exact same delta, so subtracting
+/// `boot_time_bias` recovers the original boot timestamp unchanged across wall-clock steps of
+/// any magnitude.
+pub(crate) fn query_unbiased_boot_time() -> Result<u64> {
+    let mut info = SystemTimeOfDayInfo::default();
+    let mut returned = 0u32;
+    let buf_len = size_of::<SystemTimeOfDayInfo>() as u32;
+
+    // SAFETY: `info` is an initialized 48-byte `SystemTimeOfDayInfo` struct matching the Windows
+    // `SYSTEM_TIMEOFDAY_INFORMATION` ABI, `buf_len` is its exact byte size, and `returned` is a
+    // valid mutable `u32`.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SystemTimeOfDayInformation,
+            (&mut info as *mut SystemTimeOfDayInfo).cast::<c_void>(),
+            buf_len,
+            &mut returned,
+        )
+    };
+    if let Err(err) = status.ok() {
+        return Err(OsError::Platform {
+            detail: format!("NtQuerySystemInformation(SystemTimeOfDayInformation) failed: {err}"),
+        });
+    }
+    if (returned as usize) < size_of::<SystemTimeOfDayInfo>() || info.boot_time <= 0 {
+        return Err(OsError::Platform {
+            detail: format!(
+                "NtQuerySystemInformation(SystemTimeOfDayInformation) returned incomplete data (bytes={returned}, boot_time={})",
+                info.boot_time
+            ),
+        });
+    }
+
+    let unbiased = crate::procid::unbiased_windows_boot_ticks(info.boot_time, info.boot_time_bias);
+    if unbiased == 0 {
+        return Err(OsError::Platform {
+            detail: "NtQuerySystemInformation produced zero unbiased boot time".into(),
+        });
+    }
+    Ok(unbiased)
+}
+
+/// Error returned by [`spawn_detached_direct`], distinguishing a Job Object breakaway denial
+/// (which triggers the WMI fallback) from all other errors.
+pub(crate) enum DirectSpawnError {
+    /// `CreateProcessW` failed with `ERROR_ACCESS_DENIED` because the caller's Job Object forbids
+    /// `CREATE_BREAKAWAY_FROM_JOB`.
+    BreakawayRefused,
+    /// Any other failure opening log files or starting the process.
+    Other(OsError),
+}
+
+struct ProcThreadAttrList {
+    _storage: Vec<usize>,
+    ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+impl Drop for ProcThreadAttrList {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` was initialized by `InitializeProcThreadAttributeList` into
+        // `self._storage` and is deleted exactly once before `_storage` is freed.
+        unsafe { DeleteProcThreadAttributeList(self.ptr) };
+    }
+}
+
+fn to_wide_null(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+fn open_inheritable_nul(access: u32) -> Result<OwnedHandle> {
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: BOOL(1),
+    };
+    let nul_wide = to_wide_null(OsStr::new("NUL"));
+    // SAFETY: `nul_wide` is NUL-terminated UTF-16 and `sa` is an initialized stack struct.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(nul_wide.as_ptr()),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&sa),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|err| OsError::Platform {
+        detail: format!("cannot open NUL device: {err}"),
+    })?;
+    Ok(OwnedHandle(handle))
+}
+
+fn open_inheritable_append(path: &Path) -> Result<OwnedHandle> {
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: BOOL(1),
+    };
+    let path_wide = to_wide_null(path.as_os_str());
+    // SAFETY: `path_wide` is NUL-terminated UTF-16 and `sa` is an initialized stack struct.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(path_wide.as_ptr()),
+            (FILE_APPEND_DATA | SYNCHRONIZE).0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            Some(&sa),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|err| OsError::Platform {
+        detail: format!("cannot open log file {}: {err}", path.display()),
+    })?;
+    Ok(OwnedHandle(handle))
+}
+
+fn build_unicode_env_block(
+    env_remove: &[OsString],
+    overrides: &BTreeMap<OsString, OsString>,
+) -> Vec<u16> {
+    let normalize_key = |k: &OsStr| -> Vec<u16> {
+        k.encode_wide()
+            .map(|u| {
+                if (b'a' as u16..=b'z' as u16).contains(&u) {
+                    u - 32
+                } else {
+                    u
+                }
+            })
+            .collect()
+    };
+
+    let removed: Vec<Vec<u16>> = env_remove.iter().map(|k| normalize_key(k)).collect();
+    let mut merged: BTreeMap<Vec<u16>, (Vec<u16>, Vec<u16>)> = BTreeMap::new();
+
+    for (k, v) in std::env::vars_os() {
+        let norm = normalize_key(&k);
+        if removed.contains(&norm) {
+            continue;
+        }
+        merged.insert(norm, (k.encode_wide().collect(), v.encode_wide().collect()));
+    }
+    for (k, v) in overrides {
+        let norm = normalize_key(k);
+        merged.insert(norm, (k.encode_wide().collect(), v.encode_wide().collect()));
+    }
+
+    let mut block = Vec::new();
+    for (k_wide, v_wide) in merged.into_values() {
+        block.extend_from_slice(&k_wide);
+        block.push(b'=' as u16);
+        block.extend_from_slice(&v_wide);
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+/// Spawn a detached Windows process via `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+/// restricted strictly to the three freshly opened standard handles (`stdin` null, `stdout` and
+/// `stderr` log files or null), preventing any other inheritable handle in the parent process
+/// (such as parent stdout/stderr pipes) from leaking into the detached job.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_detached_direct(
+    program_display: &str,
+    command_line: &str,
+    cwd: Option<&Path>,
+    env_remove: &[OsString],
+    env_overrides: &BTreeMap<OsString, OsString>,
+    stdout_path: Option<&Path>,
+    stderr_path: Option<&Path>,
+) -> std::result::Result<ProcessId, DirectSpawnError> {
+    let stdin_handle = open_inheritable_nul(GENERIC_READ.0).map_err(DirectSpawnError::Other)?;
+
+    let shared_logs = match (stdout_path, stderr_path) {
+        (Some(out), Some(err)) => {
+            crate::detach::same_windows_path(&out.to_string_lossy(), &err.to_string_lossy())
+        }
+        _ => false,
+    };
+
+    let stdout_handle = match stdout_path {
+        Some(path) => open_inheritable_append(path).map_err(DirectSpawnError::Other)?,
+        None => open_inheritable_nul(GENERIC_WRITE.0).map_err(DirectSpawnError::Other)?,
+    };
+    let stderr_handle = if shared_logs || (stdout_path.is_none() && stderr_path.is_none()) {
+        None
+    } else {
+        Some(match stderr_path {
+            Some(path) => open_inheritable_append(path).map_err(DirectSpawnError::Other)?,
+            None => open_inheritable_nul(GENERIC_WRITE.0).map_err(DirectSpawnError::Other)?,
+        })
+    };
+
+    let h_in = stdin_handle.0;
+    let h_out = stdout_handle.0;
+    let h_err = stderr_handle.as_ref().map_or(h_out, |h| h.0);
+
+    // Build a deduplicated handle whitelist so ONLY these standard handles are inheritable.
+    let mut handle_list = Vec::with_capacity(3);
+    for h in [h_in, h_out, h_err] {
+        if !handle_list.contains(&h) {
+            handle_list.push(h);
+        }
+    }
+
+    let mut attr_size = 0usize;
+    // SAFETY: Querying the required attribute-list size passes `None` and a valid mutable `usize`.
+    let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut attr_size) };
+    if attr_size == 0 {
+        return Err(DirectSpawnError::Other(OsError::Platform {
+            detail: "InitializeProcThreadAttributeList returned zero buffer size".into(),
+        }));
+    }
+
+    let mut storage = vec![0usize; attr_size.div_ceil(size_of::<usize>())];
+    let attr_ptr = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast::<c_void>());
+    // SAFETY: `storage` is pointer-aligned with at least `attr_size` bytes.
+    unsafe { InitializeProcThreadAttributeList(Some(attr_ptr), 1, None, &mut attr_size) }.map_err(
+        |err| {
+            DirectSpawnError::Other(OsError::Platform {
+                detail: format!("InitializeProcThreadAttributeList failed: {err}"),
+            })
+        },
+    )?;
+    let attr_list = ProcThreadAttrList {
+        _storage: storage,
+        ptr: attr_ptr,
+    };
+
+    // SAFETY: `attr_list.ptr` is initialized for 1 attribute and `handle_list` stays alive
+    // through the `CreateProcessW` call below.
+    unsafe {
+        UpdateProcThreadAttribute(
+            attr_list.ptr,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            Some(handle_list.as_ptr().cast::<c_void>()),
+            handle_list.len() * size_of::<HANDLE>(),
+            None,
+            None,
+        )
+    }
+    .map_err(|err| {
+        DirectSpawnError::Other(OsError::Platform {
+            detail: format!("UpdateProcThreadAttribute(HANDLE_LIST) failed: {err}"),
+        })
+    })?;
+
+    let mut si = STARTUPINFOEXW::default();
+    si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = h_in;
+    si.StartupInfo.hStdOutput = h_out;
+    si.StartupInfo.hStdError = h_err;
+    si.lpAttributeList = attr_list.ptr;
+
+    let mut cmdline_wide: Vec<u16> = command_line
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let env_block = build_unicode_env_block(env_remove, env_overrides);
+    let cwd_wide = cwd.map(|dir| to_wide_null(dir.as_os_str()));
+    let cwd_pcwstr = match cwd_wide {
+        Some(ref buf) => PCWSTR::from_raw(buf.as_ptr()),
+        None => PCWSTR::null(),
+    };
+
+    let flags = CREATE_BREAKAWAY_FROM_JOB
+        | CREATE_NO_WINDOW
+        | CREATE_NEW_PROCESS_GROUP
+        | CREATE_UNICODE_ENVIRONMENT
+        | EXTENDED_STARTUPINFO_PRESENT;
+
+    let mut pi = PROCESS_INFORMATION::default();
+    // SAFETY: All pointers (`cmdline_wide`, `env_block`, `cwd_wide`, `si`, `attr_list`,
+    // `handle_list`) remain live and properly aligned/terminated across `CreateProcessW`, and
+    // `si.StartupInfo.cb == size_of::<STARTUPINFOEXW>()` matches `EXTENDED_STARTUPINFO_PRESENT`.
+    let create_res = unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR::from_raw(cmdline_wide.as_mut_ptr())),
+            None,
+            None,
+            true,
+            flags,
+            Some(env_block.as_ptr().cast::<c_void>()),
+            cwd_pcwstr,
+            &si.StartupInfo,
+            &mut pi,
+        )
+    };
+
+    // Keep `attr_list`, `handle_list`, and stdio handles alive until `CreateProcessW` returns.
+    drop(attr_list);
+    drop(handle_list);
+    drop(stderr_handle);
+    drop(stdout_handle);
+    drop(stdin_handle);
+
+    if let Err(err) = create_res {
+        if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+            return Err(DirectSpawnError::BreakawayRefused);
+        }
+        if err.code() == ERROR_FILE_NOT_FOUND.to_hresult()
+            || err.code() == ERROR_PATH_NOT_FOUND.to_hresult()
+        {
+            return Err(DirectSpawnError::Other(OsError::ProgramNotFound {
+                program: program_display.to_owned(),
+            }));
+        }
+        return Err(DirectSpawnError::Other(OsError::Platform {
+            detail: format!("CreateProcessW failed for `{program_display}`: {err}"),
+        }));
+    }
+
+    let _thread_handle = OwnedHandle(pi.hThread);
+    let proc_handle = OwnedHandle(pi.hProcess);
+    let (creation, _) = query_times_raw(proc_handle.0, "detached child process")
+        .map_err(DirectSpawnError::Other)?;
+    Ok(ProcessId::new(pi.dwProcessId, creation))
 }
 
 /// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) for `pid`.
@@ -182,6 +710,96 @@ pub(crate) fn snapshot_processes() -> Result<Vec<ProcessSnapshotEntry>> {
     }
 
     Ok(out)
+}
+
+/// Check whether a verified Windows process is marked critical by the kernel (`IsProcessCritical`)
+/// or belongs to the core Windows session executable set (`csrss`, `wininit`, `smss`, `lsass`,
+/// `services`, `winlogon`).
+pub(crate) fn check_protected_system_process(identity: &ProcessId) -> Option<&'static str> {
+    // SAFETY: `OpenProcess` takes plain integer arguments and the returned handle is immediately
+    // wrapped in `OwnedHandle`.
+    let handle =
+        match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, identity.pid) } {
+            Ok(h) => OwnedHandle(h),
+            Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                // Protected Process Light (PPL) system processes such as csrss/smss/lsass can refuse
+                // OpenProcess for unprivileged callers; fall back to ToolHelp32's image name.
+                if let Some(exe_name) = snapshot_exe_name(identity.pid)
+                    && crate::procid::is_windows_core_session_image(&exe_name)
+                {
+                    return Some("Windows core session process");
+                }
+                return None;
+            }
+            Err(_) => return None,
+        };
+
+    let Ok((creation, exit_ft)) = query_times_raw(handle.0, &format!("pid {}", identity.pid))
+    else {
+        return None;
+    };
+    if !is_still_running(handle.0, exit_ft) || creation != identity.start_time {
+        return None;
+    }
+
+    let mut critical = BOOL::default();
+    // SAFETY: `handle.0` has `PROCESS_QUERY_LIMITED_INFORMATION` (the minimum right required by
+    // `IsProcessCritical`) and `critical` is a valid mutable `BOOL`.
+    if unsafe { IsProcessCritical(handle.0, &mut critical) }.is_ok() && critical.as_bool() {
+        return Some("Windows critical system process");
+    }
+
+    if let Some(image_path) = query_image_name_raw(handle.0)
+        && crate::procid::is_windows_core_session_image(&image_path)
+    {
+        return Some("Windows core session process");
+    }
+
+    None
+}
+
+fn query_image_name_raw(handle: HANDLE) -> Option<String> {
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `handle` has `PROCESS_QUERY_LIMITED_INFORMATION`, `buf` has capacity `len` UTF-16
+    // code units, and `QueryFullProcessImageNameW` writes at most `len` units and updates `len`.
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR::from_raw(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    let slice = buf.get(..(len as usize))?;
+    Some(String::from_utf16_lossy(slice))
+}
+
+fn snapshot_exe_name(target_pid: u32) -> Option<String> {
+    // SAFETY: `CreateToolhelp32Snapshot` takes plain integer arguments and returns an owned handle.
+    let snapshot = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `snapshot.0` is valid and `entry.dwSize` is initialized to `size_of::<PROCESSENTRY32W>()`.
+    unsafe { Process32FirstW(snapshot.0, &mut entry) }.ok()?;
+    loop {
+        if entry.th32ProcessID == target_pid {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            return Some(String::from_utf16_lossy(&entry.szExeFile[..end]));
+        }
+        // SAFETY: `snapshot.0` is valid and `entry` remains properly sized.
+        if unsafe { Process32NextW(snapshot.0, &mut entry) }.is_err() {
+            break;
+        }
+    }
+    None
 }
 
 /// Open `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verify its
