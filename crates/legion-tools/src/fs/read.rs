@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Encoding, EntryKind, OwnDirFilter, Progress, cancelled_error, format_blake3, format_mtime,
-    is_hidden, map_io_error, path_to_string, platform, run_blocking,
+    Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, format_blake3,
+    format_mtime, is_hidden, map_io_error, path_to_string, platform, run_blocking,
 };
 
 const MAX_LIST_DEPTH: u32 = 8;
@@ -138,12 +138,20 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             )
             .with_hint("Use fs.stat or fs.read for a file, or pass its parent directory."));
         }
+        let root_str = path_to_string(&root);
+        let reply_bytes = serde_json::to_vec(&ListResult {
+            path: root_str.clone(),
+            entries: Vec::new(),
+            truncated: false,
+        })
+        .map_or(64, |v| v.len());
         let mut entries = Vec::new();
         let mut truncated = false;
         let mut state = ListWalk {
             max_depth,
             include_hidden,
             limit,
+            reply_bytes,
             own_dirs: &own_dirs,
             cancel: &cancel,
             progress: &mut progress,
@@ -152,7 +160,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
         };
         list_dir(&root, 1, &mut state)?;
         Ok(ListResult {
-            path: path_to_string(&root),
+            path: root_str,
             entries,
             truncated,
         })
@@ -164,6 +172,7 @@ struct ListWalk<'a> {
     max_depth: u32,
     include_hidden: bool,
     limit: usize,
+    reply_bytes: usize,
     own_dirs: &'a OwnDirFilter,
     cancel: &'a CancellationToken,
     progress: &'a mut Progress,
@@ -229,7 +238,7 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         } else {
             None
         };
-        walk.entries.push(ListEntry {
+        let entry = ListEntry {
             name,
             path: path_to_string(&child_path),
             kind,
@@ -237,7 +246,17 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
             mtime: format_mtime(&meta),
             mode: platform::unix_mode(&meta),
             target,
-        });
+        };
+        let entry_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len())
+            + usize::from(!walk.entries.is_empty());
+        if !walk.entries.is_empty()
+            && walk.reply_bytes.saturating_add(entry_bytes) > MAX_REPLY_BYTES
+        {
+            *walk.truncated = true;
+            return Ok(());
+        }
+        walk.reply_bytes = walk.reply_bytes.saturating_add(entry_bytes);
+        walk.entries.push(entry);
         let count = walk.entries.len();
         walk.progress.maybe_emit(|| json!({"entries": count}));
 
@@ -363,14 +382,20 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<ReadResult, ToolError> {
             .with_hint("Use fs.list to inspect a directory."));
         }
         let size = meta.len();
+        let base64_raw_limit = max_base64_raw_bytes(&path, size, offset);
+        let effective_length = if requested_encoding == Some(Encoding::Base64) {
+            length.min(base64_raw_limit)
+        } else {
+            length
+        };
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))
                 .map_err(|error| map_io_error("seek", &path, error))?;
         }
 
-        // Read up to length + 1 bytes so we know definitively whether more bytes remain past the
-        // requested slice.
-        let want = length.saturating_add(1);
+        // Read up to effective_length + 1 bytes so we know definitively whether more bytes remain
+        // past the requested slice.
+        let want = effective_length.saturating_add(1);
         let mut raw = Vec::with_capacity(want.min(STREAM_CHUNK_BYTES));
         let mut scratch = [0u8; STREAM_CHUNK_BYTES];
         while raw.len() < want {
@@ -388,13 +413,13 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<ReadResult, ToolError> {
             raw.extend_from_slice(&scratch[..read_now]);
         }
 
-        let reached_eof = raw.len() <= length;
+        let reached_eof = raw.len() <= effective_length;
         let mut peek = [0u8; 3];
         let mut peek_len = 0usize;
         if !reached_eof {
-            peek[0] = raw[length];
+            peek[0] = raw[effective_length];
             peek_len = 1;
-            raw.truncate(length);
+            raw.truncate(effective_length);
         }
 
         // If the slice ends mid-character, peek up to 2 further bytes (3 total past the cut) so we
@@ -421,6 +446,7 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<ReadResult, ToolError> {
             requested_encoding,
             reached_eof,
             &peek[..peek_len],
+            base64_raw_limit,
         )?;
         let hash =
             (offset == 0 && decoded.eof).then(|| format_blake3(blake3::hash(&raw[..decoded.used])));
@@ -447,22 +473,45 @@ struct DecodedChunk {
     eof: bool,
 }
 
+/// Maximum raw bytes that fit within [`MAX_REPLY_BYTES`] once base64-encoded inside a
+/// [`ReadResult`] JSON object. Always a multiple of 3 so base64 emits no wasted padding.
+fn max_base64_raw_bytes(path: &Path, size: u64, offset: u64) -> usize {
+    let envelope = serde_json::to_vec(&ReadResult {
+        path: path_to_string(path),
+        size,
+        offset,
+        length: MAX_READ_LENGTH,
+        encoding: Encoding::Base64,
+        content: String::new(),
+        eof: false,
+        hash: Some(format!("blake3:{}", "0".repeat(64))),
+    })
+    .map_or(512, |v| v.len());
+    let encoded_budget = MAX_REPLY_BYTES.saturating_sub(envelope);
+    (encoded_budget / 4) * 3
+}
+
 /// Decodes a read byte slice according to `requested`, trimming an incomplete trailing UTF-8
-/// character at a chunk boundary when `peek` confirms it completes cleanly.
+/// character at a chunk boundary when `peek` confirms it completes cleanly and capping base64
+/// slices to `base64_raw_limit` so the encoded JSON reply stays within [`MAX_REPLY_BYTES`].
 fn decode_chunk(
     path: &Path,
     chunk: &[u8],
     requested: Option<Encoding>,
     reached_eof: bool,
     peek: &[u8],
+    base64_raw_limit: usize,
 ) -> Result<DecodedChunk, ToolError> {
     match requested {
-        Some(Encoding::Base64) => Ok(DecodedChunk {
-            encoding: Encoding::Base64,
-            content: BASE64.encode(chunk),
-            used: chunk.len(),
-            eof: reached_eof,
-        }),
+        Some(Encoding::Base64) => {
+            let take = chunk.len().min(base64_raw_limit);
+            Ok(DecodedChunk {
+                encoding: Encoding::Base64,
+                content: BASE64.encode(&chunk[..take]),
+                used: take,
+                eof: reached_eof && take == chunk.len(),
+            })
+        }
         Some(Encoding::Utf8) => match std::str::from_utf8(chunk) {
             Ok(text) => Ok(DecodedChunk {
                 encoding: Encoding::Utf8,
@@ -539,12 +588,15 @@ fn decode_chunk(
                     eof: false,
                 })
             }
-            Err(_) => Ok(DecodedChunk {
-                encoding: Encoding::Base64,
-                content: BASE64.encode(chunk),
-                used: chunk.len(),
-                eof: reached_eof,
-            }),
+            Err(_) => {
+                let take = chunk.len().min(base64_raw_limit);
+                Ok(DecodedChunk {
+                    encoding: Encoding::Base64,
+                    content: BASE64.encode(&chunk[..take]),
+                    used: take,
+                    eof: reached_eof && take == chunk.len(),
+                })
+            }
         },
     }
 }
@@ -631,14 +683,15 @@ mod tests {
     fn decode_chunk_cuts_at_utf8_character_boundary() {
         // "hi€!" is 6 bytes: b"hi" (2), 0xE2 0x82 0xAC (3), b"!" (1).
         let bytes = "hi€!".as_bytes();
-        let decoded = decode_chunk(Path::new("/x"), &bytes[..4], None, false, &bytes[4..]).unwrap();
+        let decoded =
+            decode_chunk(Path::new("/x"), &bytes[..4], None, false, &bytes[4..], 1024).unwrap();
         assert_eq!(decoded.encoding, Encoding::Utf8);
         assert_eq!(decoded.content, "hi");
         assert_eq!(decoded.used, 2);
         assert!(!decoded.eof);
 
         // Next page starting at offset 2 finishes the file cleanly.
-        let rest = decode_chunk(Path::new("/x"), &bytes[2..], None, true, &[]).unwrap();
+        let rest = decode_chunk(Path::new("/x"), &bytes[2..], None, true, &[], 1024).unwrap();
         assert_eq!(rest.encoding, Encoding::Utf8);
         assert_eq!(rest.content, "€!");
         assert_eq!(rest.used, 4);
@@ -648,15 +701,23 @@ mod tests {
     #[test]
     fn decode_chunk_falls_back_to_base64_for_invalid_bytes_even_at_end() {
         let bytes = [b'a', b'b', 0xE2, 0x82, 0x00];
-        let decoded = decode_chunk(Path::new("/x"), &bytes[..4], None, false, &bytes[4..]).unwrap();
+        let decoded =
+            decode_chunk(Path::new("/x"), &bytes[..4], None, false, &bytes[4..], 1024).unwrap();
         assert_eq!(decoded.encoding, Encoding::Base64);
         assert_eq!(decoded.used, 4);
         assert_eq!(BASE64.decode(&decoded.content).unwrap(), &bytes[..4]);
 
         // Truncated UTF-8 at true EOF is also invalid UTF-8 -> base64 when auto-detecting.
-        let eof_bad = decode_chunk(Path::new("/x"), &bytes[..4], None, true, &[]).unwrap();
+        let eof_bad = decode_chunk(Path::new("/x"), &bytes[..4], None, true, &[], 1024).unwrap();
         assert_eq!(eof_bad.encoding, Encoding::Base64);
         assert!(eof_bad.eof);
+
+        // Tight base64 raw limit truncates the fallback slice and clears `eof`.
+        let capped = decode_chunk(Path::new("/x"), &bytes[..4], None, true, &[], 3).unwrap();
+        assert_eq!(capped.encoding, Encoding::Base64);
+        assert_eq!(capped.used, 3);
+        assert!(!capped.eof);
+        assert_eq!(BASE64.decode(&capped.content).unwrap(), &bytes[..3]);
     }
 
     #[test]
@@ -667,6 +728,7 @@ mod tests {
             Some(Encoding::Utf8),
             true,
             &[],
+            1024,
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Failed);

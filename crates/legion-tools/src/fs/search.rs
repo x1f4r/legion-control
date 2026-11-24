@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    EntryKind, OwnDirFilter, Progress, cancelled_error, format_mtime, map_io_error, path_to_string,
-    run_blocking,
+    EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, format_mtime,
+    map_io_error, path_to_string, run_blocking,
 };
 
 const DEFAULT_FIND_LIMIT: u32 = 200;
@@ -28,6 +28,8 @@ const BINARY_PROBE_BYTES: usize = 8 * 1024;
 const MAX_LINE_SCAN_BYTES: usize = 1024 * 1024;
 const MAX_DISPLAY_CHARS: usize = 500;
 const TRUNCATION_MARKER: &str = "... [truncated]";
+/// Conservative per-line headroom reserved for pending `after` context lines in `fs.grep`.
+const GREP_AFTER_LINE_RESERVE: usize = 600;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
@@ -211,6 +213,11 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         let mut matches = Vec::new();
         let mut truncated = false;
         let mut visited: u64 = 0;
+        let mut reply_bytes = serde_json::to_vec(&FindResult {
+            matches: Vec::new(),
+            truncated: false,
+        })
+        .map_or(64, |v| v.len());
 
         for item in build_walker(
             &root,
@@ -255,12 +262,20 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             let Ok(entry_meta) = fs::symlink_metadata(entry_path) else {
                 continue;
             };
-            matches.push(FindMatch {
+            let found = FindMatch {
                 path: path_to_string(entry_path),
                 kind,
                 size: entry_meta.len(),
                 mtime: format_mtime(&entry_meta),
-            });
+            };
+            let item_bytes = serde_json::to_vec(&found).map_or(0, |v| v.len())
+                + usize::from(!matches.is_empty());
+            if !matches.is_empty() && reply_bytes.saturating_add(item_bytes) > MAX_REPLY_BYTES {
+                truncated = true;
+                break;
+            }
+            reply_bytes = reply_bytes.saturating_add(item_bytes);
+            matches.push(found);
         }
 
         Ok(FindResult { matches, truncated })
@@ -361,10 +376,17 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
 
     run_blocking(ctx, "fs.grep", move |cancel, mut progress| {
         let meta = fs::metadata(&root).map_err(|error| map_io_error("search", &root, error))?;
+        let reply_bytes = serde_json::to_vec(&GrepResult {
+            matches: Vec::new(),
+            files_searched: u64::MAX,
+            truncated: false,
+        })
+        .map_or(96, |v| v.len());
         let mut state = GrepState {
             regex: &regex,
             context,
             limit,
+            reply_bytes,
             cancel: &cancel,
             progress: &mut progress,
             matches: Vec::new(),
@@ -437,6 +459,7 @@ struct GrepState<'a> {
     regex: &'a regex::Regex,
     context: usize,
     limit: usize,
+    reply_bytes: usize,
     cancel: &'a CancellationToken,
     progress: &'a mut Progress,
     matches: Vec<GrepMatch>,
@@ -501,7 +524,17 @@ fn grep_file(path: &Path, fail_on_open: bool, state: &mut GrepState<'_>) -> Resu
                     .get_mut(*match_idx)
                     .and_then(|item| item.after.as_mut())
                 {
-                    after.push(display.clone());
+                    let after_bytes = serde_json::to_vec(&display)
+                        .map_or(display.len() + 2, |v| v.len())
+                        + usize::from(!after.is_empty());
+                    if state.reply_bytes.saturating_add(after_bytes) <= MAX_REPLY_BYTES {
+                        state.reply_bytes = state.reply_bytes.saturating_add(after_bytes);
+                        after.push(display.clone());
+                    } else {
+                        state.truncated = true;
+                        *remaining = 0;
+                        continue;
+                    }
                 }
                 *remaining -= 1;
             }
@@ -509,17 +542,37 @@ fn grep_file(path: &Path, fail_on_open: bool, state: &mut GrepState<'_>) -> Resu
         pending_after.retain(|(_, remaining)| *remaining > 0);
 
         if state.regex.is_match(&text) {
-            if state.matches.len() < state.limit {
-                let idx = state.matches.len();
-                state.matches.push(GrepMatch {
+            if !state.truncated && state.matches.len() < state.limit {
+                let candidate = GrepMatch {
                     path: path_str.clone(),
                     line: line_no,
                     text: display.clone(),
                     before: (state.context > 0).then(|| before.iter().cloned().collect()),
                     after: (state.context > 0).then(Vec::new),
-                });
-                if state.context > 0 {
-                    pending_after.push((idx, state.context));
+                };
+                let item_bytes = serde_json::to_vec(&candidate).map_or(0, |v| v.len())
+                    + usize::from(!state.matches.is_empty());
+                let pending_slots = pending_after
+                    .iter()
+                    .map(|(_, rem)| *rem)
+                    .sum::<usize>()
+                    .saturating_add(state.context);
+                let reserve = pending_slots.saturating_mul(GREP_AFTER_LINE_RESERVE);
+                if !state.matches.is_empty()
+                    && state
+                        .reply_bytes
+                        .saturating_add(item_bytes)
+                        .saturating_add(reserve)
+                        > MAX_REPLY_BYTES
+                {
+                    state.truncated = true;
+                } else {
+                    let idx = state.matches.len();
+                    state.reply_bytes = state.reply_bytes.saturating_add(item_bytes);
+                    state.matches.push(candidate);
+                    if state.context > 0 {
+                        pending_after.push((idx, state.context));
+                    }
                 }
             } else {
                 state.truncated = true;

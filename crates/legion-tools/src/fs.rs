@@ -28,6 +28,9 @@ use serde_json::{Value, json};
 /// How often long-running filesystem operations emit a `progress` event.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Soft-to-hard JSON reply byte budget (1 MiB) shared by listing, reading and search tools.
+pub(crate) const MAX_REPLY_BYTES: usize = 1024 * 1024;
+
 /// Adds the `fs` tools.
 pub fn register(registry: &mut Registry) {
     read::register(registry);

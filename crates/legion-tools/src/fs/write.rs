@@ -20,6 +20,10 @@ use super::{
 };
 
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
+/// Maximum byte length of inline `content` accepted by `fs.write` (8 MiB).
+const MAX_WRITE_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum file size `fs.edit` will read into memory (16 MiB).
+const MAX_EDIT_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
@@ -111,6 +115,18 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         )
         .with_hint(
             "Append uses the OS append flag so concurrent writers never lose data; use mode \"overwrite\" or fs.edit when you need expect_hash.",
+        ));
+    }
+    if args.content.len() > MAX_WRITE_CONTENT_BYTES {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "fs.write accepts at most {MAX_WRITE_CONTENT_BYTES} bytes (8 MiB) in `content`, and {} were sent.",
+                args.content.len()
+            ),
+        )
+        .with_hint(
+            "Stream larger files with fs.transfer instead of sending them inline in fs.write.",
         ));
     }
     let unix_mode = match &args.unix_mode {
@@ -363,8 +379,11 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
             )
             .with_hint("Pass a file path to fs.edit."));
         }
+        if meta.len() > MAX_EDIT_FILE_BYTES as u64 {
+            return Err(file_too_large_for_edit(&path, Some(meta.len())));
+        }
 
-        let bytes = read_file_cancellable(&path, &cancel, "fs.edit")?;
+        let bytes = read_file_cancellable(&path, MAX_EDIT_FILE_BYTES, &cancel, "fs.edit")?;
         if let Some(expected) = expect_hash.as_deref() {
             let current = format_blake3(blake3::hash(&bytes));
             check_expected_hash(&path, expected, &current)?;
@@ -694,8 +713,24 @@ fn hash_file(path: &Path, cancel: &CancellationToken, tool: &str) -> Result<Stri
     Ok(format_blake3(hasher.finalize()))
 }
 
+fn file_too_large_for_edit(path: &Path, size: Option<u64>) -> ErrorBody {
+    let message = match size {
+        Some(len) => format!(
+            "{} is {len} bytes, above fs.edit's {MAX_EDIT_FILE_BYTES}-byte (16 MiB) limit.",
+            path.display()
+        ),
+        None => format!(
+            "{} exceeds fs.edit's {MAX_EDIT_FILE_BYTES}-byte (16 MiB) limit.",
+            path.display()
+        ),
+    };
+    ErrorBody::new(ErrorCode::InvalidArgs, message)
+        .with_hint("Use fs.transfer for larger files instead of editing them inline with fs.edit.")
+}
+
 fn read_file_cancellable(
     path: &Path,
+    max_bytes: usize,
     cancel: &CancellationToken,
     tool: &str,
 ) -> Result<Vec<u8>, ToolError> {
@@ -706,13 +741,21 @@ fn read_file_cancellable(
         if cancel.is_cancelled() {
             return Err(cancelled_error(tool));
         }
+        let remaining = max_bytes.saturating_add(1).saturating_sub(out.len());
+        if remaining == 0 {
+            return Err(file_too_large_for_edit(path, None));
+        }
+        let to_read = remaining.min(buf.len());
         let n = file
-            .read(&mut buf)
+            .read(&mut buf[..to_read])
             .map_err(|error| map_io_error("read", path, error))?;
         if n == 0 {
             break;
         }
         out.extend_from_slice(&buf[..n]);
+        if out.len() > max_bytes {
+            return Err(file_too_large_for_edit(path, None));
+        }
     }
     Ok(out)
 }

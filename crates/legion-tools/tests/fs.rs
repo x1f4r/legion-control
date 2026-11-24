@@ -1971,3 +1971,156 @@ async fn find_and_grep_expose_cross_filesystems_opt_in() {
         .unwrap();
     assert_eq!(grepped["matches"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn size_caps_and_reply_byte_budgets_protect_write_edit_read_list_find_and_grep() {
+    const ONE_MIB: usize = 1024 * 1024;
+    let f = Fixture::new();
+
+    // `fs.write` rejects `content` larger than 8 MiB with `invalid_args` and hints at `fs.transfer`.
+    let oversized_write = f.work.join("too_big_write.txt");
+    let big_content = "a".repeat(8 * 1024 * 1024 + 1);
+    let write_err = f
+        .call(
+            "fs.write",
+            json!({"path": f.p(&oversized_write), "content": big_content}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(write_err.code, ErrorCode::InvalidArgs);
+    assert!(
+        write_err
+            .hint
+            .as_deref()
+            .is_some_and(|h| h.contains("fs.transfer")),
+        "{write_err}"
+    );
+    assert!(!oversized_write.exists());
+
+    // `fs.edit` rejects files larger than 16 MiB with `invalid_args` and hints at `fs.transfer`.
+    let oversized_edit = f.work.join("too_big_edit.txt");
+    {
+        let file = std::fs::File::create(&oversized_edit).unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+    }
+    let edit_err = f
+        .call(
+            "fs.edit",
+            json!({"path": f.p(&oversized_edit), "old": "a", "new": "b"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(edit_err.code, ErrorCode::InvalidArgs);
+    assert!(
+        edit_err
+            .hint
+            .as_deref()
+            .is_some_and(|h| h.contains("fs.transfer")),
+        "{edit_err}"
+    );
+
+    // Base64 `fs.read` (both explicit and auto-detected binary) keeps the serialized JSON reply
+    // within 1 MiB, reports the smaller slice via `length`/`eof: false`, and pages cleanly.
+    let bin = f.work.join("binary_900k.bin");
+    let raw: Vec<u8> = (0..(900 * 1024))
+        .map(|i| if i == 0 { 0xFF } else { (i % 251) as u8 })
+        .collect();
+    std::fs::write(&bin, &raw).unwrap();
+
+    for explicit in [true, false] {
+        let mut args = json!({"path": f.p(&bin)});
+        if explicit {
+            args["encoding"] = json!("base64");
+        }
+        let page1 = f.call("fs.read", args).await.unwrap();
+        let page1_json_len = serde_json::to_vec(&page1).unwrap().len();
+        assert!(
+            page1_json_len <= ONE_MIB,
+            "explicit={explicit} reply was {page1_json_len} bytes"
+        );
+        assert_eq!(page1["encoding"], json!("base64"));
+        assert_eq!(page1["eof"], json!(false));
+        assert!(page1.get("hash").is_none());
+        let len1 = page1["length"].as_u64().unwrap();
+        assert!(len1 > 0 && (len1 as usize) < raw.len());
+
+        let page2 = f
+            .call(
+                "fs.read",
+                json!({"path": f.p(&bin), "offset": len1, "encoding": "base64"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page2["eof"], json!(true));
+        let mut reassembled = BASE64.decode(page1["content"].as_str().unwrap()).unwrap();
+        reassembled.extend_from_slice(&BASE64.decode(page2["content"].as_str().unwrap()).unwrap());
+        assert_eq!(reassembled, raw);
+    }
+
+    // `fs.list` and `fs.find` enforce the 1 MiB reply budget before hitting `limit: 5000`.
+    let many = f.work.join("budget");
+    std::fs::create_dir_all(&many).unwrap();
+    let pad = "a".repeat(150);
+    let total_files = 3800usize;
+    for idx in 0..total_files {
+        std::fs::File::create(many.join(format!("f_{idx:04}_{pad}.txt"))).unwrap();
+    }
+
+    let listed = f
+        .call("fs.list", json!({"path": f.p(&many), "limit": 5000}))
+        .await
+        .unwrap();
+    assert_eq!(listed["truncated"], json!(true));
+    let listed_count = listed["entries"].as_array().unwrap().len();
+    assert!(listed_count > 0 && listed_count < total_files);
+    let listed_bytes = serde_json::to_vec(&listed).unwrap().len();
+    assert!(listed_bytes <= ONE_MIB, "fs.list reply was {listed_bytes}");
+
+    let found = f
+        .call("fs.find", json!({"path": f.p(&many), "limit": 5000}))
+        .await
+        .unwrap();
+    assert_eq!(found["truncated"], json!(true));
+    let found_count = found["matches"].as_array().unwrap().len();
+    assert!(found_count > 0 && found_count < total_files);
+    let found_bytes = serde_json::to_vec(&found).unwrap().len();
+    assert!(found_bytes <= ONE_MIB, "fs.find reply was {found_bytes}");
+
+    // `fs.grep` enforces the 1 MiB reply budget (including context lines) before `limit: 1000`.
+    let big_log = f.work.join("big_grep.log");
+    let mut log_text = String::with_capacity(700 * 500);
+    let line_pad = "x".repeat(470);
+    for idx in 0..700 {
+        log_text.push_str(&format!("MATCH_{idx:04}_{line_pad}\n"));
+    }
+    std::fs::write(&big_log, &log_text).unwrap();
+
+    let grepped = f
+        .call(
+            "fs.grep",
+            json!({
+                "path": f.p(&big_log),
+                "pattern": "MATCH_",
+                "context": 2,
+                "limit": 1000,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grepped["truncated"], json!(true));
+    let grep_matches = grepped["matches"].as_array().unwrap();
+    assert!(!grep_matches.is_empty() && grep_matches.len() < 700);
+    let grep_bytes = serde_json::to_vec(&grepped).unwrap().len();
+    assert!(grep_bytes <= ONE_MIB, "fs.grep reply was {grep_bytes}");
+    assert_eq!(
+        grep_matches
+            .last()
+            .unwrap()
+            .get("after")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
