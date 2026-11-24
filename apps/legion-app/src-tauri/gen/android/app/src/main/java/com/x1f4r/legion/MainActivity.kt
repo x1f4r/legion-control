@@ -1,5 +1,7 @@
 package com.x1f4r.legion
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
@@ -10,6 +12,9 @@ import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -18,6 +23,8 @@ import androidx.webkit.WebViewFeature
 
 class MainActivity : TauriActivity() {
   private var attachedWebView: WebView? = null
+  private lateinit var localNetworkPermissionLauncher: ActivityResultLauncher<String>
+  private val pendingLocalNetworkRequests = mutableListOf<Int>()
 
   private val backCallback = object : OnBackPressedCallback(false) {
     override fun handleOnBackPressed() {
@@ -55,7 +62,47 @@ class MainActivity : TauriActivity() {
     fun get(): String = latestInsets.toCsv()
   }
 
+  private inner class PermissionsBridge {
+    @JavascriptInterface
+    fun hasLocalNetwork(): Boolean {
+      if (Build.VERSION.SDK_INT < 37) return true
+      return ContextCompat.checkSelfPermission(
+        this@MainActivity,
+        Manifest.permission.ACCESS_LOCAL_NETWORK,
+      ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    @JavascriptInterface
+    fun requestLocalNetwork(requestId: Int) {
+      runOnUiThread {
+        if (hasLocalNetwork()) {
+          resolveLocalNetworkRequests(listOf(requestId), true)
+          return@runOnUiThread
+        }
+        val shouldLaunch = pendingLocalNetworkRequests.isEmpty()
+        pendingLocalNetworkRequests.add(requestId)
+        if (shouldLaunch) {
+          localNetworkPermissionLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
+        }
+      }
+    }
+  }
+
+  private fun resolveLocalNetworkRequests(requestIds: List<Int>, granted: Boolean) {
+    val webView = attachedWebView ?: return
+    for (requestId in requestIds) {
+      val js = "window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__ && window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__($requestId, $granted);"
+      webView.post { webView.evaluateJavascript(js, null) }
+    }
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
+    localNetworkPermissionLauncher =
+      registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val ids = pendingLocalNetworkRequests.toList()
+        pendingLocalNetworkRequests.clear()
+        resolveLocalNetworkRequests(ids, granted)
+      }
     // Expose the device model to Rust so `device_name()` needs neither unsafe JNI nor subprocesses.
     runCatching {
       val model = Build.MODEL?.trim().orEmpty()
@@ -94,6 +141,7 @@ class MainActivity : TauriActivity() {
     // insets via a read-only bridge and apply them at document start so cold launches never paint
     // under the status bar or gesture bar before the first insets callback reaches the loaded page.
     webView.addJavascriptInterface(InsetsBridge(), "__LEGION_ANDROID_INSETS__")
+    webView.addJavascriptInterface(PermissionsBridge(), "__LEGION_ANDROID_PERMISSIONS__")
     if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
       WebViewCompat.addDocumentStartJavaScript(webView, DOCUMENT_START_INSETS_JS, setOf("*"))
     }

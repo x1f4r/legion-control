@@ -43,6 +43,44 @@ function normalizeError(err) {
 
 export function createAppLink() {
   let nextCallId = 1;
+  let nextPermRequestId = 1;
+  const pendingPermRequests = new Map();
+
+  if (typeof window !== 'undefined' && !window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__) {
+    window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__ = (requestId, granted) => {
+      const resolve = pendingPermRequests.get(requestId);
+      if (resolve) {
+        pendingPermRequests.delete(requestId);
+        resolve(Boolean(granted));
+      }
+    };
+  }
+
+  function ensureLocalNetworkPermission() {
+    if (typeof window === 'undefined') return Promise.resolve(true);
+    const bridge = window.__LEGION_ANDROID_PERMISSIONS__;
+    if (!bridge || typeof bridge.hasLocalNetwork !== 'function') {
+      return Promise.resolve(true);
+    }
+    try {
+      if (bridge.hasLocalNetwork()) return Promise.resolve(true);
+    } catch {
+      return Promise.resolve(true);
+    }
+    if (typeof bridge.requestLocalNetwork !== 'function') {
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      const id = nextPermRequestId++;
+      pendingPermRequests.set(id, resolve);
+      try {
+        bridge.requestLocalNetwork(id);
+      } catch {
+        pendingPermRequests.delete(id);
+        resolve(true);
+      }
+    });
+  }
 
   async function rawState() {
     try {
@@ -116,6 +154,8 @@ export function createAppLink() {
       return base;
     }
 
+    await ensureLocalNetworkPermission();
+
     try {
       const [whoami, version] = await Promise.all([
         call('meta.whoami', {}),
@@ -157,6 +197,16 @@ export function createAppLink() {
   }
 
   async function pair(inviteText, name) {
+    const granted = await ensureLocalNetworkPermission();
+    if (!granted) {
+      throw {
+        code: 'denied',
+        message: 'Local network permission was denied.',
+        hint: 'Allow local network access for Legion in Android Settings to connect to machines on your LAN or Tailscale.',
+        machine: null,
+        details: null,
+      };
+    }
     try {
       await invoke('pair', { invite: inviteText, name: name || null });
       return await state();
