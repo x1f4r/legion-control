@@ -755,9 +755,16 @@ never synced to peers, flagged as `local_only: true` in `device.list`, refused b
 and removable via `device.remove`). Foreign `authorized_keys` lines, pending invites, and entries
 belonging to other Legion homes or OS accounts are preserved byte for byte.
 
-**Sync trust rule:** `fleet.sync direction=push documents='["devices.toml"]'` (and the automatic
-pushes after enrolment, `device.set`, and `device.remove`) pushes local entries to peers and
-imports **only tombstones** back — never live device entries from a peer. To import live devices
+**Two-writers and sync trust rules:** only two things ever write `devices.toml` — the node's own
+device tools (`device.invite` + enrolment, `device.set`, `device.remove`), or an owner-authorised
+write (`config.write devices.toml` and the `devices.toml` part of `fleet.sync` `push`/`pull`
+require the `owner` role on the node doing the writing, locally and on the receiving peer; for
+non-owner callers `config.write devices.toml` is refused and `fleet.sync` skips `devices.toml` with
+the reason while syncing the other documents). After a local device tool succeeds, the node pushes
+`devices.toml` to reachable peers with its own `owner` authority and records `device_registry_push`
+audit metadata on both nodes naming who triggered it. Pushing (`fleet.sync direction=push`, and
+automatic pushes after enrolment, `device.set`, and `device.remove`) sends local entries to peers
+and imports **only tombstones** back — never live device entries from a peer. To import live devices
 paired on another machine, run `legion fleet.sync direction=pull from=<machine>
 documents='["devices.toml"]'` explicitly as owner (`fleet.sync direction=status` compares
 read-only).
@@ -768,12 +775,15 @@ read-only).
   unmarked-principal, or quarantine `status`. For owner callers, it also shows Legion lines pointing
   at another or deleted Legion home (`foreign: true`, `missing_home: true`, `home`). `meta.doctor`
   warns about orphaned keys, unmarked `device:*` principals, key collisions, quarantined devices,
-  and drifted fleet peers. Tombstones in `devices.toml` are permanent so removed devices cannot
-  return; a fleet can hold several thousand removed devices before the 1 MiB configuration limit
-  matters.
+  and drifted fleet peers (and fails loudly if a previous `policy.toml`/`devices.toml` rollback
+  failed). Tombstones in `devices.toml` are permanent so removed devices cannot return; any change
+  whose resulting `devices.toml` would exceed 1 MiB is refused before saving, non-owner callers are
+  capped at 32 pending invites per principal, and non-owner enrolment or removal is refused once
+  `devices.toml` would exceed 512 KiB until an owner tidies up.
 - **Change role, rename, or confirm**: `legion device.set` changes a paired device's role (owner
   role only, only for a registry-owned `device:*` principal marked with `device = "<pairing id>"`,
-  requiring `allow_owner=true` to raise to `owner`, and refusing expiring credentials), renames it,
+  requiring `allow_owner=true` to raise to `owner`, rolling back `policy.toml` if saving
+  `devices.toml` fails, and refusing expiring credentials), renames it,
   or confirms a quarantined descendant (`confirm=true`, owner role only), updating `policy.toml`,
   `devices.toml`, and `authorized_keys`, then pushing `devices.toml` to reachable fleet peers.
 - **Discover endpoints**: `legion device.endpoint` (`effect: read`) returns this node's SSH
@@ -782,13 +792,14 @@ read-only).
   `device.endpoint` with `on: "all"` through any reachable node to learn every machine's direct SSH
   address and pinned host keys.
 - **Remove a device**: `legion device.remove` accepts `name=<device>` or `id=<pairing-or-invite-id>`,
-  writes a tombstone to `devices.toml` first before cleaning up its unused registry-owned
+  writes a tombstone carrying the removed device's provenance to `devices.toml` first before
+  cleaning up its unused registry-owned
   `device:*` principal and `authorized_keys` line, immediately terminates any active sessions and
   verified same-account parent `sshd` connections (disambiguated by pairing id, including
   multiplexed `ControlMaster` connections, reporting `sessions_ended`, even if a later step fails
   after saving `devices.toml`), reports any still-running background jobs started by that device in
   `jobs_left_running` without killing them, and pushes the tombstone to reachable peers in
-  `fleet.toml` (non-owner removals push independently of unrelated entries). Any live descendant
+  `fleet.toml` with the node's own authority and both-sides audit. Any live descendant
   created by a removed device at or after `removed_at` (and transitively its unconfirmed
   descendants) is automatically quarantined until an owner runs `device.set id=<id> confirm=true`.
   **Honest limit without a central hub:** a removed device that held an `owner` or `exec` role can,
@@ -1054,13 +1065,16 @@ requiring `effect:admin`, built on `config.list`, `config.read`, and `config.wri
   `tools.d/<name>.toml`. Extension files may contain internal dots (matching `ext.define` files
   such as `tools.d/ops.greet.toml`); on write, the receiver enforces the same rules as `ext.define`
   — the filename stem must match the `name` field inside the file, duplicate tool names across
-  files are refused, and reserved families are rejected. `devices.toml` merges without conflicts
-  (tombstones always win, registry-owned `device:*` principals and `authorized_keys` are
-  reconciled, and active sessions for newly removed or quarantined devices are ended) while obeying
-  the one-way trust rule: `direction=push` sends local entries to peers and imports **only
-  tombstones** back (never live peer entries), whereas `direction=pull from=<peer>` imports live
-  devices from that named peer without writing back. `meta.doctor` warns if any reachable peer has
-  a different `devices.toml` or has not acknowledged local devices yet.
+  files are refused, and reserved families are rejected. `devices.toml` obeys the two-writers rule
+  (push and pull require the `owner` role on both nodes; non-owner `fleet.sync` skips `devices.toml`
+  with the reason while syncing the other documents) and merges without conflicts (tombstones always
+  win and take identity fields from local entries on merge, local confirmations are kept when
+  identity and pairing provenance match or cleared with a warning otherwise, registry-owned
+  `device:*` principals and `authorized_keys` are reconciled, and active sessions for newly removed
+  or quarantined devices are ended) while obeying the one-way trust rule: `direction=push` sends
+  local entries to peers and imports **only tombstones** back (never live peer entries), whereas
+  `direction=pull from=<peer>` imports live devices from that named peer without writing back.
+  `meta.doctor` warns if any reachable peer has a different `devices.toml`.
 - **Machine-local (never synced)**: `node.toml` and `tokens.toml`.
 
 Inspect differences with `direction=status` (reporting per-document status `same`, `only_here`,

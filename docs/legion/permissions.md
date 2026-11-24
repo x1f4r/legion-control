@@ -251,11 +251,28 @@ devices.toml` (containing no live entries) is allowed through the forwarding gua
 `device.remove` / `fleet.sync direction=push` under an expiring credential sends only tombstones to
 peers, so a removal made with an expiring credential still reaches the fleet.
 
+**Two-writers rule for `devices.toml`:** only two things ever write `devices.toml`:
+
+1. **The node's own device tools** (`device.invite` + enrolment, `device.set`, `device.remove`), which
+   build entries and tombstones themselves from call context — nothing a caller supplies is copied
+   into an entry except the tool's argument fields (name, role, and key at enrolment). Every
+   enrolled entry is stamped with `paired_at`, `paired_on`, `updated_at`, and `updated_on` from the
+   enrolling node's clock and name, and `paired_by` from the invite's recorded creator (principal
+   and, whenever the creator was a paired device of any role including `owner`, that device's
+   pairing id). After a local device tool succeeds, the node pushes its registry to reachable fleet
+   peers with its own `owner` authority rather than as the calling principal, attaching
+   `device_registry_push` audit metadata recorded on both nodes naming who triggered the push
+   (principal and device/pairing id). Only `devices.toml` travels this way.
+2. **An owner-authorised write**: `config.write devices.toml` and the `devices.toml` part of
+   `fleet.sync` (`push` and `pull`) require the caller to hold the `owner` role on the node doing
+   the writing, locally and on the receiving peer. Every other caller is refused (`fleet.sync` by a
+   non-owner syncs the other documents and reports `devices.toml` as `skipped` with the reason).
+
 **Trust rule for syncing paired devices:** a node trusts a paired device only if (a) it paired the
-device itself, (b) a caller with accepted credentials pushed it via `config.write` under this
-node's `policy.toml`, or (c) an owner on this node explicitly pulled it with
-`fleet.sync direction=pull from=<machine> documents='["devices.toml"]'`. Pushing
-(`fleet.sync direction=push`, and the automatic pushes after enrolment, `device.set`, and
+device itself, (b) an owner-authorised write (including a peer node's automatic device-registry
+push) pushed it via `config.write` under this node's `policy.toml`, or (c) an owner on this node
+explicitly pulled it with `fleet.sync direction=pull from=<machine> documents='["devices.toml"]'`.
+Pushing (`fleet.sync direction=push`, and the automatic pushes after enrolment, `device.set`, and
 `device.remove`) sends local entries to peers and imports **only tombstones** back — never live
 device entries from a peer — so syncing out to a less-trusted or compromised peer cannot silently
 inject keys back onto the pushing machine. `fleet.sync direction=status` compares read-only.
@@ -270,12 +287,12 @@ one that owned it. Merging `devices.toml` via `fleet.sync` or `config.write` ref
 timestamps more than 10 minutes in the future, refuses introducing duplicate live public keys,
 always merges with the local file (tombstones always win and can never be dropped by syncing),
 refuses setting `confirmed_by`/`confirmed_at` or dropping `paired_by` on an existing entry even for
-owner callers (confirmation is only allowed through `device.set confirm=true`), restricts non-owner admins to devices pinned to their own principal (refusing to add an entry with
-a pairing id already used by a local-only line in `authorized_keys`, recording `paired_by` from the
-call's context — including the caller's pairing id when the caller is a paired device — and
-refusing entries that claim otherwise, while treating `paired_at`, `paired_on`, `paired_by`, and
-`public_key` as immutable once written), pushes non-owner revocations independently of unrelated
-entries, and
+owner callers (confirmation is only allowed through `device.set confirm=true`), rewrites any
+incoming tombstone matching a local live entry or local tombstone so its identity and pairing
+provenance come from the local entry rather than incoming fields (so a tombstone can never name a
+different principal than the device it removes), preserves a node's local
+`confirmed_by`/`confirmed_at` across newer edits whose identity and pairing provenance match (and
+clears confirmation with a warning otherwise), and
 reconciles only registry-owned `device:*` principals in `policy.toml` to the exact recorded role —
 leaving shared and unmarked `device:*` principals untouched and failing closed to `nobody` when a
 role is undefined on the receiving node or two live devices collide on one `device:*` principal. A
@@ -286,10 +303,16 @@ exceeded by what `policy.toml` happens to say) receives no `authorized_keys` lin
 `meta.doctor`. If two live entries in `devices.toml` ever share a public key (or collide with a
 foreign line in `authorized_keys`), no `authorized_keys` line is written for any colliding entry
 and both `device.list` and `meta.doctor` warn loudly. Tombstones in `devices.toml` are permanent so
-removed devices cannot be resurrected and quarantine cannot be lifted by pruning.
+removed devices cannot be resurrected and quarantine cannot be lifted by pruning. Any change whose
+resulting `devices.toml` would exceed 1 MiB is refused before saving (so a node never saves a file
+that can no longer be pushed); non-owner callers are also capped at 32 pending pairing invites per
+principal and refused enrolment or device removal once `devices.toml` would exceed half the limit
+(512 KiB) until an owner tidies up. If rolling back `policy.toml` or `devices.toml` after a partial
+`device.enrol` or `device.set` failure itself fails, the rollback error is reported loudly in the
+returned error and recorded for `meta.doctor` as a failing check.
 
-Each device records `paired_by = { principal, device }` captured from the invite creator (or filled
-from the call's context when added via `config.write`). When a device is tombstoned, any live
+Each device records `paired_by = { principal, device }` captured from the invite creator at pairing
+time. When a device is tombstoned, any live
 descendant with `paired_by.device == <tombstoned id>` and
 `paired_at >= tomb.removed_at - 10 minutes` (matching the 10-minute clock-skew bound) — and
 transitively its unconfirmed descendants — is automatically quarantined (omitted from

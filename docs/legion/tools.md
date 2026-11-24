@@ -103,7 +103,7 @@ Read one shared configuration document (devices.toml, fleet.toml, policy.toml, p
 
 Effect: `admin`
 
-Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml merges incoming entries with local paired devices (tombstones always win), reconciles registry-owned device:* principals (marked with `device = "<pairing id>"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine, so any role allowed to call config.write (including effect:admin) is as strong as owner. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.
+Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml directly requires the owner role on this node: it merges incoming entries with local paired devices (tombstones always win and rewrite identity fields from matching local entries), reconciles registry-owned device:* principals (marked with `device = "<pairing id>"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine, so any role allowed to call config.write (including effect:admin) is as strong as owner. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -111,6 +111,7 @@ Validate and atomically update one shared configuration document (devices.toml, 
 | `content` | `string` | yes | - | Full UTF-8 TOML text to validate and write atomically. |
 | `expect_hash` | `string` | no | - | Expected BLAKE3 hash (`blake3:<hex>`) of the existing file; fails with `conflict` if different. |
 | `expect_absent` | `boolean` | no | `false` | Require that the document does not currently exist; fails with `conflict` if already present. |
+| `device_registry_push` | `object` | no | - | Optional audit metadata attached during a node-to-node device-registry push after a local device tool (`device.enrol`, `device.set`, or `device.remove`). Valid only for `devices.toml` and grants no additional permission. |
 
 ## device
 
@@ -346,7 +347,7 @@ Remove a machine entry from fleet.toml atomically while preserving comments and 
 
 Effect: `admin`
 
-Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push (including automatic pushes after pair, device.set, and device.remove) sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by a caller this node authorises, or when that peer pushes to this node with credentials this node accepts. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.
+Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the node doing the writing (for non-owner callers, fleet.sync syncs the other documents and reports devices.toml as skipped with the reason; propagation after local device tools runs node to node with the node's own authority). Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by an owner, or when that peer pushes to this node with owner authority. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -357,6 +358,7 @@ Compare, push, or pull shared configuration documents (devices.toml, fleet.toml,
 | `force` | `boolean` | no | `false` | Overwrite conflicts without failing (the receiver still validates every document strictly). |
 | `dry_run` | `boolean` | no | `false` | Report what would happen without modifying any configuration, backup, or sidecar files. |
 | `timeout_s` | `number` | no | - | Optional per-machine timeout in seconds (up to 300). |
+| `device_registry_push` | `object` | no | - | Optional audit metadata attached by this node during an automatic device-registry push after `device.enrol`, `device.set`, or `device.remove`. Valid only with `direction="push"` and `documents=["devices.toml"]` as owner. |
 
 ## fs
 

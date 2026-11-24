@@ -138,16 +138,28 @@ No role and no device name is built in; what a person prefers lives in their own
 
 **Paired devices are fleet configuration.** They are kept in `devices.toml` beside `policy.toml`:
 the device's name, public key, principal, recorded role (for registry-owned `device:*` principals,
-marked `device = "<pairing id>"` in `policy.toml`), creator (`paired_by`), timestamps, and, once
-removed, a permanent tombstone. Syncing `devices.toml` obeys a one-way trust rule: pushing
+marked `device = "<pairing id>"` in `policy.toml`), creator (`paired_by`, including the creating
+device's pairing id whenever created by a paired device of any role), node-stamped timestamps, and,
+once removed, a permanent tombstone carrying the removed device's provenance. Only two things ever
+write `devices.toml`: the node's own device tools (enrolment, `device.set`, `device.remove`) or an
+owner-authorised write (`config.write devices.toml` and `fleet.sync` `push`/`pull` require the
+`owner` role locally and on the receiving peer; non-owner `fleet.sync` skips `devices.toml` with
+the reason). After a local device tool succeeds, the node pushes `devices.toml` to reachable peers
+with its own `owner` authority and records `device_registry_push` audit metadata on both nodes
+naming who triggered it. Syncing `devices.toml` also obeys a one-way trust rule: pushing
 (`fleet.sync direction=push`, and the automatic pushes after pairing, `device.set`, and
 `device.remove`) sends local entries to peers and imports **only tombstones** back — never a peer's
 live device entries — so syncing out to a less-trusted or compromised peer cannot inject keys onto
 the pushing node. Importing live devices paired on another machine requires an explicit
-`fleet.sync direction=pull from=<peer> documents='["devices.toml"]'` (while `fleet.sync
-direction=status`, `device.list`, and `meta.doctor` show which peers are out of date). Every node
-adopts only pre-existing `--pairing` lines verified against its own `state/devices.json` on first
-run (leaving unmatched Legion-shaped lines local-only, never synced), keeps its own
+`fleet.sync direction=pull from=<peer> documents='["devices.toml"]'` as owner (while `fleet.sync
+direction=status`, `device.list`, and `meta.doctor` show which peers are out of date). At every
+merge, incoming tombstones matching a local entry take their identity fields from that local entry,
+and local confirmations are preserved when a newer edit keeps the same identity and pairing
+provenance (or cleared with a warning otherwise). Any change whose resulting `devices.toml` would
+exceed 1 MiB is refused before saving, non-owner callers are capped at 32 pending invites per
+principal, and non-owner enrolment or removal is refused past 512 KiB until an owner tidies up.
+Every node adopts only pre-existing `--pairing` lines verified against its own `state/devices.json`
+on first run (leaving unmatched Legion-shaped lines local-only, never synced), keeps its own
 `authorized_keys` and registry-owned `device:*` principals in step with `devices.toml` whenever it
 pairs, syncs, lists, updates, or removes (failing closed to `nobody` if a synced role is undefined
 locally), and quarantines any unconfirmed descendant paired at or after its creator device was
