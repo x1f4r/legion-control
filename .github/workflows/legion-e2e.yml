@@ -193,10 +193,14 @@ jobs:
           $auth = Join-Path $programData 'administrators_authorized_keys'
           @($farPub, "command=""$farBin gate --as e2e:gate"",restrict $gatePub") | Set-Content -Path $auth -Encoding ascii
           & icacls $auth /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+          # Each leg sets the shell it tests rather than taking the image's: the cmd leg removes any
+          # DefaultShell, and both check below, through ssh, which shell sshd actually used.
+          if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' | Out-Null }
           if ($env:E2E_SHELL -eq 'powershell') {
-            if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' | Out-Null }
             New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
               -Value (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') | Out-Null
+          } else {
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue
           }
           [Environment]::SetEnvironmentVariable('LEGION_HOME', $farHome, 'User')
           Set-Service -Name sshd -StartupType Manual
@@ -220,6 +224,12 @@ jobs:
           Get-Command ssh, scp | Format-Table -AutoSize Source | Out-String | Write-Output
           & ssh -T -o BatchMode=yes legion-e2e-far 'echo far session: LEGION_HOME=%LEGION_HOME% $env:LEGION_HOME'
           if ($LASTEXITCODE -ne 0) { throw 'ssh to the far node failed' }
+          # cmd's echo prints `$PSVersionTable.PSEdition` as it stands; Windows PowerShell prints its
+          # edition, Desktop. Anything else means the leg is not testing the shell it is named for.
+          $probe = (& ssh -T -o BatchMode=yes legion-e2e-far 'echo $PSVersionTable.PSEdition' | Out-String).Trim()
+          $expected = if ($env:E2E_SHELL -eq 'powershell') { 'Desktop' } else { '$PSVersionTable.PSEdition' }
+          if ($probe -ne $expected) { throw "sshd did not run the session in $($env:E2E_SHELL); the probe printed '$probe', expected '$expected'" }
+          Write-Output "far sessions run in $($env:E2E_SHELL), as the probe shows: '$probe'"
           @(
             "E2E_DIR=$e2e"
             "E2E_FAR_HOME=$farHome"
@@ -249,6 +259,11 @@ jobs:
         shell: bash
         run: |
           set -u
+          # A run that failed before the sshd step exported E2E_DIR has nothing of its own to keep.
+          if [ -z "${E2E_DIR:-}" ]; then
+            echo 'The run stopped before the far node was set up; there is nothing to gather.'
+            exit 0
+          fi
           out="$E2E_DIR/work/artifacts"
           mkdir -p "$out"
           if [ "$RUNNER_OS" = Windows ]; then

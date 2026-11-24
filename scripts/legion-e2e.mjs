@@ -219,6 +219,13 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** A timer to race against, which `clear` stops so it cannot keep the process alive. */
+function timer(ms) {
+  let handle;
+  const promise = new Promise(resolve => { handle = setTimeout(resolve, ms); });
+  return { promise, clear: () => clearTimeout(handle) };
+}
+
 /** Runs a PowerShell script without any quoting through a command line. */
 function powershell(script, env) {
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
@@ -274,17 +281,20 @@ step('a1 install the built binary with the platform install script', () => {
     const local = path.join(opts.work, 'install-local');
     fs.mkdirSync(local, { recursive: true });
     const before = userPath();
-    const script = path.join(repository, 'install', 'legion.ps1');
-    const result = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-From', opts.bin], { env: { ...process.env, LOCALAPPDATA: local } });
-    check(result.status === 0, 'install/legion.ps1 -From failed', result.stderr || result.stdout);
     const installDir = path.join(local, 'legion');
-    const after = userPath();
-    check(after && after.value.split(';').some(entry => entry.toLowerCase() === installDir.toLowerCase()), `install/legion.ps1 did not add ${installDir} to the user's PATH`, after);
     // The far node is this same account, and sshd builds its sessions' environment from the
-    // account's registry: left in place, this entry would make the far side find the near
-    // node's binary. Restoring it keeps the two installs apart; the check above already saw the
-    // installer do its part.
-    restoreUserPath(before);
+    // account's registry: left in place, the installer's PATH entry would make the far side find
+    // the near node's binary. It is put back whatever happens here; the check below sees the
+    // installer do its part first.
+    try {
+      const script = path.join(repository, 'install', 'legion.ps1');
+      const result = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-From', opts.bin], { env: { ...process.env, LOCALAPPDATA: local } });
+      check(result.status === 0, 'install/legion.ps1 -From failed', result.stderr || result.stdout);
+      const after = userPath();
+      check(after && after.value.split(';').some(entry => entry.toLowerCase() === installDir.toLowerCase()), `install/legion.ps1 did not add ${installDir} to the user's PATH`, after);
+    } finally {
+      restoreUserPath(before);
+    }
     near = path.join(installDir, 'legion.exe');
   } else {
     const home = path.join(opts.work, 'install-home');
@@ -506,9 +516,13 @@ step('d8 legion cp --checksum sends a file whose size and time did not change', 
 // --- e. jobs -------------------------------------------------------------------------------------
 
 let printJob;
-step('e1 job.start --on far a command that prints, sleeps and prints again', () => {
-  const script = "console.log('first'); setTimeout(() => console.log('second'), 5000)";
-  printJob = ok('job.start', { argv: [NODE, '-e', script], name: 'e2e-print' }, { on: 'far' });
+// The job prints its second line only once this file exists, so how long a slow runner takes
+// between steps cannot decide what the job has printed when it is looked at. It gives up after
+// two minutes, so a run that never creates the file leaves nothing behind.
+const jobGate = path.join(data, 'job-gate');
+step('e1 job.start --on far a command that prints, waits for a file and prints again', () => {
+  const script = "const fs = require('node:fs'); console.log('first'); const started = Date.now(); const tick = setInterval(() => { if (fs.existsSync(process.argv[1])) { clearInterval(tick); console.log('second'); } else if (Date.now() - started > 120000) { process.exit(3); } }, 100)";
+  printJob = ok('job.start', { argv: [NODE, '-e', script, jobGate], name: 'e2e-print' }, { on: 'far' });
   check(printJob.id && ['starting', 'running'].includes(printJob.state), 'job.start did not start the job', printJob);
   return printJob.id;
 });
@@ -517,7 +531,7 @@ step('e2 from new sessions, job.status and job.logs see it running with its firs
   const status = ok('job.status', { id: printJob.id }, { on: 'far' });
   check(['starting', 'running'].includes(status.state), `the job is ${status.state} right after it started`, status);
   let logs;
-  for (let i = 0; i < 20; i += 1) {
+  for (let i = 0; i < 60; i += 1) {
     logs = ok('job.logs', { id: printJob.id }, { on: 'far' });
     if (logs.content.includes('first')) break;
     await sleep(250);
@@ -525,7 +539,8 @@ step('e2 from new sessions, job.status and job.logs see it running with its firs
   check(logs.content.includes('first') && !logs.content.includes('second'), 'job.logs did not show only the first line while the job ran', logs);
 }, ['e1']);
 
-step('e3 job.wait --on far sees it finish with both lines', () => {
+step('e3 job.wait --on far sees it finish with both lines once the file is there', () => {
+  fs.writeFileSync(jobGate, 'go\n');
   const waited = ok('job.wait', { id: printJob.id, timeout_s: 60 }, { on: 'far', timeout: 120_000 });
   check(waited.state === 'succeeded' && waited.exit_code === 0 && waited.timed_out === false, 'the job did not succeed', waited);
   const logs = ok('job.logs', { id: printJob.id }, { on: 'far' });
@@ -548,6 +563,14 @@ step('e4 job.cancel --on far leaves no process of the job behind', async () => {
   check(after.procs.length === 0, 'processes of the cancelled job are still running', after.procs);
   const status = ok('job.status', { id: job.id }, { on: 'far' });
   check(status.state === 'cancelled', `job.status says ${status.state} after job.cancel`, status);
+});
+
+step('e5 job.start --on far with a shell command string keeps an environment value byte for byte', () => {
+  const job = ok('job.start', { cmd: printEnvCommand('E2E_JOB_TEXT'), env: { E2E_JOB_TEXT: TRICKY_TEXT }, name: 'e2e-shell' }, { on: 'far' });
+  const waited = ok('job.wait', { id: job.id, timeout_s: 120 }, { on: 'far', timeout: 180_000 });
+  check(waited.state === 'succeeded' && waited.exit_code === 0, 'the shell job did not succeed', waited);
+  const logs = ok('job.logs', { id: job.id }, { on: 'far' });
+  check(logs.content === TRICKY_TEXT, 'the shell job printed something else', { sent: TRICKY_TEXT, received: logs.content });
 });
 
 // --- f. permissions across the hop ---------------------------------------------------------------
@@ -703,6 +726,17 @@ step('i2 power.restart --on far dry_run=true returns the platform\'s command and
   return flat.join('; ');
 });
 
+step('i3 power.shutdown --on far dry_run=true returns the platform\'s command and does nothing', () => {
+  const plan = ok('power.shutdown', { dry_run: true, force: true }, { on: 'far' });
+  check(plan.dry_run === true && plan.scheduled === false, 'power.shutdown did not stay a dry run', plan);
+  const flat = plan.commands.map(argv => argv.join(' '));
+  const expected = { linux: /systemctl( -i)? poweroff/, macos: /shutdown -h/, windows: /shutdown \/s/ }[expectedOs];
+  check(flat.some(command => expected.test(command)), `power.shutdown did not plan ${expected}`, plan);
+  const status = ok('power.status', {}, { on: 'far' });
+  check(status.boot_id === plan.boot_id, 'the far node restarted', { plan, status });
+  return flat.join('; ');
+});
+
 // --- j. MCP --------------------------------------------------------------------------------------
 
 /** Talks to `legion mcp --compact` with raw JSON lines and returns each answer by id. */
@@ -735,16 +769,23 @@ async function mcpSession(messages) {
       child.stdin.write(`${JSON.stringify(message)}\n`);
       if (message.id === undefined) continue;
       if (!answers.has(message.id)) {
-        await Promise.race([
-          new Promise(resolve => waiting.set(message.id, resolve)),
-          sleep(120_000).then(() => { throw new Failure(`legion mcp did not answer ${message.method} in time.\nstderr: ${clip(stderr)}`); }),
-          exited.then(code => { throw new Failure(`legion mcp exited ${code} before answering ${message.method}.\nstderr: ${clip(stderr)}`); }),
-        ]);
+        const limit = timer(120_000);
+        try {
+          await Promise.race([
+            new Promise(resolve => waiting.set(message.id, resolve)),
+            limit.promise.then(() => { throw new Failure(`legion mcp did not answer ${message.method} in time.\nstderr: ${clip(stderr)}`); }),
+            exited.then(code => { throw new Failure(`legion mcp exited ${code} before answering ${message.method}.\nstderr: ${clip(stderr)}`); }),
+          ]);
+        } finally {
+          limit.clear();
+        }
       }
     }
   } finally {
     child.stdin.end();
-    await Promise.race([exited, sleep(10_000)]);
+    const grace = timer(10_000);
+    await Promise.race([exited, grace.promise]);
+    grace.clear();
     if (child.exitCode === null) child.kill();
     record({ program: near, args: ['mcp', '--compact'], stdin: messages.map(m => JSON.stringify(m)).join('\n'), stdout: clip(JSON.stringify([...answers.values()])), stderr: clip(stderr) });
   }
@@ -859,4 +900,12 @@ async function main() {
   console.log(`\nlegion e2e passed: ${steps.length - skipped.length} steps${skipped.length ? `, ${skipped.length} skipped as asked` : ''}.`);
 }
 
-await main();
+// Said outright: a timer or a child left behind by a step would otherwise keep the run, and the
+// runner it holds, waiting after the verdict.
+try {
+  await main();
+  process.exit(0);
+} catch (error) {
+  console.error(`legion e2e: the driver itself failed: ${error.stack}`);
+  process.exit(1);
+}

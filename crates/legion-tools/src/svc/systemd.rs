@@ -743,7 +743,11 @@ pub(crate) fn parse_systemd_timestamp(raw: &str) -> Option<String> {
     };
     let iso = match tz {
         "UTC" | "GMT" | "Z" => format!("{date}T{time}Z"),
-        offset if (offset.starts_with('+') || offset.starts_with('-')) && offset.len() == 5 => {
+        offset
+            if (offset.starts_with('+') || offset.starts_with('-'))
+                && offset.len() == 5
+                && offset.is_ascii() =>
+        {
             format!("{date}T{time}{}:{}", &offset[..3], &offset[3..])
         }
         offset if (offset.starts_with('+') || offset.starts_with('-')) && offset.len() == 6 => {
@@ -1133,6 +1137,11 @@ InvocationID=abc123
         // rather than emitting an invalid RFC 3339 string.
         assert_eq!(parse_systemd_timestamp("Mo 2026-11-23 23:59:06 MEZ"), None);
         assert_eq!(parse_systemd_timestamp("n/a"), None);
+        // Five bytes that look like an offset but are not ASCII are refused, not sliced.
+        assert_eq!(
+            parse_systemd_timestamp("2026-11-23 23:59:06 +0\u{e9}1"),
+            None
+        );
     }
 
     #[test]
