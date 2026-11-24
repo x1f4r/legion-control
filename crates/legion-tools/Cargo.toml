@@ -28,5 +28,11 @@ jiff.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
+# These re-execute their own binary as the child processes they need, so they cannot use the
+# standard harness, which writes to stdout before any test code runs.
+[[test]]
+name = "sys"
+harness = false
+
 [lints]
 workspace = true
