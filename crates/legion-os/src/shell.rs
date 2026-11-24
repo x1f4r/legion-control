@@ -685,7 +685,10 @@ mod tests {
 
     /// The wrapper under Windows PowerShell 5.1, which every Windows has, and PowerShell 7 where
     /// it is installed; with stdin and without; with a console that has no window, as `run` and
-    /// `detach` start it, and with no console at all, where the encodings cannot be set.
+    /// `detach` start it, and with no console at all, where the encodings cannot be set. Without a
+    /// console, Windows PowerShell 5.1 runs the command but writes nothing to the stdout it was
+    /// given (seen on the Windows runner), so there only the command having run is checked, by a
+    /// file it writes; that is one more reason Legion always starts it with a console.
     #[cfg(windows)]
     #[test]
     fn powershell_wrapper_runs_under_both_editions_with_and_without_stdin_or_a_console() {
@@ -704,16 +707,23 @@ mod tests {
         {
             programs.push(pwsh.into_os_string());
         }
+        let mut case_number = 0;
         for program in programs {
             for (flags, console) in [(CREATE_NO_WINDOW.0, true), (DETACHED_PROCESS.0, false)] {
                 for with_stdin in [true, false] {
+                    case_number += 1;
+                    let marker = dir.path().join(format!("ran-{case_number}"));
+                    let wrote_marker = format!(
+                        "Set-Content -LiteralPath {} -Value ran",
+                        powershell_single_quote(&marker.to_string_lossy())
+                    );
                     let command = if with_stdin {
-                        "[Console]::Out.Write([Console]::In.ReadToEnd())"
+                        format!("[Console]::Out.Write([Console]::In.ReadToEnd()); {wrote_marker}")
                     } else {
-                        "[Console]::Out.Write('no stdin'); [Console]::In.ReadToEnd() | Out-Null"
+                        format!("[Console]::Out.Write('no stdin'); {wrote_marker}")
                     };
                     let resolved =
-                        resolve_powershell_command(program.clone(), command, dir.path()).unwrap();
+                        resolve_powershell_command(program.clone(), &command, dir.path()).unwrap();
                     let mut child = Command::new(&resolved.program);
                     child
                         .args(&resolved.args)
@@ -740,17 +750,22 @@ mod tests {
                     let out = child.wait_with_output().unwrap();
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    let case = format!("{program:?} console={console} stdin={with_stdin}");
-                    assert!(out.status.success(), "{case}: {stdout} {stderr}");
+                    let case = format!(
+                        "{program:?} console={console} stdin={with_stdin} stdout={stdout:?}"
+                    );
+                    assert!(out.status.success(), "{case}: {stderr}");
+                    assert!(
+                        marker.is_file(),
+                        "{case}: the command did not run: {stderr}"
+                    );
                     let lower = stderr.to_lowercase();
                     assert!(
                         !lower.contains("handle is invalid") && !lower.contains("encoding"),
                         "{case}: {stderr}"
                     );
-                    if !with_stdin {
-                        assert_eq!(stdout, "no stdin", "{case}");
-                    } else if console {
-                        assert_eq!(stdout, text, "{case}");
+                    if console {
+                        let expected = if with_stdin { text } else { "no stdin" };
+                        assert_eq!(stdout, expected, "{case}");
                     }
                 }
             }
