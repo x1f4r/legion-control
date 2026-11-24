@@ -85,9 +85,12 @@ dry_run          false
 ### Deleting extras, checksums, exclusions, and resume
 
 - `--delete` removes files and directories at the destination that no longer exist at the source.
+  Extra files are deleted only **after** the new content has arrived (except entries that must be
+  removed up front to make room for a kind change, such as replacing a file with a directory).
   Anything matched by `--exclude` is ignored at both ends and never deleted.
 - `--checksum` compares files by BLAKE3 hash instead of size and modification time (reads every
-  file at both ends).
+  file at both ends) and verifies each unpacked file against its planned hash before replacing the
+  destination.
 - `--exclude <glob>` is repeatable; a trailing `/` matches directories only (for example
   `--exclude target/ --exclude '*.tmp'`).
 - **Single-file resume**: when a large single-file transfer is interrupted, the destination keeps
@@ -113,10 +116,30 @@ duration_ms      7
 dry_run          false
 ```
 
-Progress is rendered on one line of `stderr` when `stderr` is a terminal. Bytes always move over a
-dedicated `legion stream` pipe (never inside JSON), relayed through the calling node, and every
-operation is checked against the target machine's `policy.toml` (`fs.read`, `fs.write`, or
-`fs.remove`) and written to its audit log with door `stream`.
+Progress is rendered on one line of `stderr` when `stderr` is a terminal. Bytes move over a
+dedicated `legion stream` pipe (never inside JSON), relayed through the calling node. Both ends
+exchange a `{"protocol": 1}` line first (60 s handshake/first-reply timeout, 120 s idle timeout,
+with `{"busy": true}` heartbeats every 10 s during long work); directory `unpack` receives the
+planned `entries` (`path`, `kind`, `size`, `hash`, `target`) and refuses anything else in the tar
+stream. Every operation is checked against the target machine's `policy.toml` (`fs.read`,
+`fs.write`, or `fs.remove`) and written to its audit log with door `stream`.
+
+### Transfers involving a `via` relay
+
+Because `legion stream` opens a direct pipe to each end, a machine configured with `via = "pi"`
+cannot be an endpoint of a transfer started on `tower`:
+
+```sh
+legion fs.transfer from=~/projects/site/README.md to=shed:~/README.md dry_run=true
+```
+
+```text
+legion: unsupported: Machine shed is reached via relay pi, so a direct pipe cannot be opened to it.
+  Run transfers involving shed on pi instead (for example `legion fs.transfer --on pi from=... to=...`), or configure a direct ssh or command transport for shed in fleet.toml.
+```
+
+Run the transfer on the relay node (`legion fs.transfer --on pi ...`), or give `shed` a direct
+`ssh` or `command` entry.
 
 ## Long jobs (`job.*`)
 
@@ -379,7 +402,7 @@ Power tools never claim an action succeeded because the machine goes down undern
 Instead, `power.sleep`, `power.restart`, and `power.shutdown` schedule the action a few seconds out
 so the reply leaves first, and every disruptive action passes through the busy gate.
 
-### Busy and `unmonitored`
+### Busy, inhibitors, and one action at a time
 
 A node reports one of three busy states in `power.status`:
 
@@ -389,6 +412,22 @@ A node reports one of three busy states in `power.status`:
   `exclusive` job is running.
 - `idle` — `busy = "none"` is declared explicitly, or every probe exited `1` and no exclusive job
   is running.
+
+Three additional guards protect the machine:
+
+- **One power action at a time**: a node holds two kernel locks under `state/power/` (`call.lock`
+  during the call and `runner.lock` in the delayed runner until the action has run, plus a settle
+  window after sleep). A second power call while one is pending fails with `conflict` instead of
+  queuing a second sleep or re-arming firmware underneath the first.
+- **Linux logind inhibitors**: if a Linux application holds a logind sleep or shutdown inhibitor,
+  the call fails with `busy` and names who holds it. `force=true` overrides busy probes and
+  `unmonitored`, **not** logind inhibitors; to override inhibitors, pass `ignore_inhibitors=true`
+  (which passes `-i` to `systemctl` and requires `[power] sudo = true`).
+- **`power.status` `pending` and `last`**: while an action is waiting to run, `power.status`
+  includes `pending`. After it runs (or after a reboot), `last` reports how the previous handed-over
+  action ended — either the runner's own record (`ran_at`, `exit_code`, `said`, and `disarmed` if a
+  failed `into` restart cleared the firmware's next boot) or a derived `fate` (`pending`,
+  `happened`, `did_not_happen`, `runner_gone`, or `given_up`).
 
 Configure `node.toml` with probes (or `busy = "none"` if nothing needs protecting) and optional
 boot targets:
@@ -422,6 +461,30 @@ targets
     how   efibootmgr --bootnext, firmware entry labelled "Windows Boot Manager"
 sudo     true
 ```
+
+`dry_run=true` always returns the exact `commands` that would run and includes a `would_refuse`
+object (`code`, `message`, `hint`) whenever a check — busy gate, unmonitored node, pending action,
+privilege check, or Linux logind inhibitor — would refuse the real call:
+
+```sh
+legion power.sleep force=true dry_run=true
+```
+
+```text
+action     sleep
+scheduled  false
+in_s       3
+boot_id    00000000-0000-4000-8000-000000000001
+commands
+  - systemctl, suspend
+dry_run    true
+would_refuse
+  code     busy
+  message  Refused to put this machine to sleep: logind is holding it back for Media Player (Playback in progress, pid 1234).
+  hint     Wait until they let go, or pass ignore_inhibitors: true to override them (with [power] sudo = true). force does not: an inhibitor is something on the machine asking not to be interrupted.
+```
+
+When all checks pass, `would_refuse` is omitted:
 
 ```sh
 legion power.sleep dry_run=true
@@ -521,22 +584,49 @@ reports `awake: true`.
 
 ### Checklist: try once under supervision on real hardware
 
-Before relying on unattended power or dual-boot switching, test each step once while you can walk
-over to the machine:
+Before relying on unattended power or dual-boot switching, test each machine kind once while you can
+walk over to it. Always start with `legion power.status` and `dry_run=true` on every call and check
+that `would_refuse` is absent:
 
-1. Run `legion power.status` on each OS of the machine and verify `system`, `boot_id`, `busy`,
-   `targets`, and `sudo`.
-2. Run `dry_run=true` on `power.sleep`, `power.restart into=<target>`, `power.wake`, and
-   `power.switch`, and read every command it plans to run.
-3. Verify non-interactive privileges: on Unix, run `sudo -n -l` for the exact sleep/reboot/efibootmgr
-   commands; on Windows, verify `psshutdown` is on `PATH` (or configure `[power] sleep`) and that
-   your SSH session can run `bcdedit`.
-4. Run one supervised `power.sleep` and confirm the machine suspends and resumes cleanly (including
-   any `[power] before_sleep` hooks).
-5. Run one supervised `power.wake machine=<name> wait_s=90` from another machine via its wake
-   helper to verify BIOS/NIC Wake-on-LAN and broadcast reachability.
-6. Run one supervised `power.switch machine=<name> into=<other>` to confirm one-time boot lands in
-   the requested system, then reboot plainly and confirm the firmware returns to the default OS.
+- **Linux desktop or workstation**:
+  1. Configure `[[busy.probes]]` (or `busy = "none"`) and, if suspending/rebooting over headless
+     SSH without an active polkit session, set `[power] sudo = true` with narrow `NOPASSWD` sudoers
+     rules for `systemctl suspend`, `systemctl reboot`, `systemctl poweroff`, and (if overriding
+     inhibitors) `systemctl -i ...`.
+  2. Check `legion power.sleep dry_run=true` both when idle and while a desktop app holds a logind
+     inhibitor so you see how `would_refuse` reports it.
+  3. Run one supervised `power.sleep` and confirm it suspends, runs `[power] before_sleep`, resumes,
+     and records `last` in `power.status`.
+- **Linux headless server or Raspberry Pi**:
+  1. Confirm `sudo -n -l -l /usr/bin/systemctl reboot` succeeds without a password if `[power]
+     sudo = true`.
+  2. Run one supervised `power.restart` and confirm `boot_id` changes in `power.status` when it
+     returns.
+- **macOS** *(not run here; from code)*:
+  1. `power.sleep` uses `pmset sleepnow` (no `sudo` required); `power.restart` and `power.shutdown`
+     use `shutdown -r now` / `shutdown -h now` and need `[power] sudo = true` with `NOPASSWD`
+     sudoers rules (or root).
+  2. Verify `power.sleep dry_run=true` and `power.restart dry_run=true` have no `would_refuse`,
+     then run one supervised sleep and one supervised restart.
+- **Windows** *(not run here; from code)*:
+  1. `power.restart` and `power.shutdown` use `shutdown.exe /r /t <delay>` and `/s /t <delay>`, so
+     Windows times the delay itself and `power.status` tracks `last.fate` across reboots.
+  2. For `power.sleep`, place Sysinternals `psshutdown` on `PATH` (or set `[power] sleep` in
+     `node.toml`), verify `power.sleep dry_run=true`, and run one supervised sleep to confirm the
+     machine actually enters sleep and wakes cleanly.
+- **Dual-boot machines**:
+  1. Set `system` in each OS's `node.toml` and matching `[[machines.<name>.systems]]` in
+     `fleet.toml`, plus `[boot.<other>]` (`efi_label` or custom `arm`/`verify`).
+  2. Verify `efibootmgr` (Linux, with `sudo -n`) or `bcdedit` (Windows elevated SSH) via
+     `power.restart into=<other> dry_run=true`.
+  3. Run one supervised `power.switch machine=<name> into=<other>` from another machine, confirm it
+     lands in `<other>` with a new `boot_id`, then reboot plainly and confirm the firmware returns
+     to the default OS.
+- **Wake helpers (`wake_via`)**:
+  1. Set `mac` on the helper's own `fleet.toml` and `wake_via` on the caller's `fleet.toml`.
+  2. Run `power.wake machine=<name> dry_run=true` to check the broadcast interface and address,
+     then run one supervised `power.wake machine=<name> wait_s=90` while the target is asleep to
+     confirm BIOS/NIC Wake-on-LAN and LAN broadcast delivery.
 
 ## The HTTP door (`legion serve`)
 
@@ -558,8 +648,16 @@ legion token add phone phone
 
 Copy the token from that reply immediately: `tokens.toml` stores only its BLAKE3 hash, so the
 token cannot be shown again. Pass `expires_days=90` for an expiring token, `legion token list` to
-inspect tokens, and `legion token remove phone` to revoke one (revoking also terminates any active
-MCP sessions opened with that token). Creating a token for `owner` requires `allow_owner=true`.
+inspect tokens, and `legion token remove phone` to revoke one (revoking also closes any active MCP
+sessions opened with that token).
+
+Token management enforces three guard rails:
+
+- A caller may create, list, or remove tokens only for a principal it could itself act as (its own,
+  or any principal when the caller has the `owner` role).
+- Creating a token for any principal whose role is `owner` requires a caller with the `owner` role
+  and `allow_owner=true`.
+- A token created through an expiring HTTP token cannot outlive the caller's token.
 
 ### Start the server and publish with Tailscale Serve
 
@@ -645,6 +743,11 @@ Point streamable-HTTP MCP clients at `http://127.0.0.1:7117/mcp` (or your Tailsc
 `Authorization: Bearer <token>`. Add `?compact=1` (or header `Legion-Compact: 1`) for the three
 compact meta-tools. `POST` sends JSON-RPC messages and `DELETE` ends a session (`Mcp-Session-Id`).
 
+Each session belongs to the token that opened it (other tokens cannot use its `Mcp-Session-Id`). A
+token may hold up to 16 live sessions at once (opening a 17th closes its least recently used
+session), the server caps total live sessions at 256, idle sessions expire after 5 minutes, and
+removing, replacing, or expiring a token closes all of its sessions immediately.
+
 ## Extension tools (`tools.d/`)
 
 Each `.toml` file in `<config_dir>/tools.d/` defines a tool that appears alongside built-in tools
@@ -687,26 +790,81 @@ How arguments and output work:
   (upper-cased) environment variables and as one JSON object on stdin, alongside `LEGION_TOOL`,
   `LEGION_PRINCIPAL`, and `LEGION_NODE`. Any inherited `LEGION_*` environment variables are
   stripped first.
+- **Large string arguments**: string arguments larger than 32 KiB per variable or 96 KiB total are
+  refused by default (`large = "refuse"`). Set `large = "stdin"` on tools that read the full value
+  from stdin JSON: Legion omits the oversized `LEGION_ARG_<NAME>` environment variable, sets
+  `LEGION_ARG_<NAME>_OMITTED=1`, and passes the full value on stdin.
 - Standard output is returned directly when it parses as a JSON object, wrapped as
   `{"value": ...}` for other JSON values, or returned as `{"output": "...", "truncated": false}`
   for plain text.
 - Use `run = ["prog", "arg1"]` (no shell) whenever possible instead of `cmd`.
 - Always declare `effect` honestly (`read`, `write`, `exec`, `destroy`, `power`, `admin`): a role
-  permitted that effect can invoke the tool. Built-in names and reserved families cannot be
-  shadowed.
+  permitted that effect can invoke the tool. Built-in names and every family registered in the
+  built-in registry (plus reserved families `agent`, `audit`, `config`, `exec`, `ext`, `fleet`,
+  `fs`, `job`, `legion`, `meta`, `power`, `proj`, `svc`, `sys`, `token`) cannot be shadowed.
+- Full-mode MCP sessions receive `notifications/tools/list_changed` when `tools.d/` changes.
 
-Inspect or remove extensions with `ext.list`, `ext.show`, and `ext.remove`. See
-[`examples/legion/tools.d/`](../../examples/legion/tools.d/) for complete TOML examples.
+Inspect or remove extensions with `ext.list`, `ext.show`, and `ext.remove`. `ext.list` prints an
+effect-honesty `note` and each tool's execution `mode` (`run` or `cmd`):
+
+```sh
+legion ext.list
+```
+
+```text
+note    A tool declared `read` is callable by every role that may read, whatever its command does, so declare each tool's effect honestly.
+tools
+  - name         ops.greet
+    description  Greet a caller by name.
+    effect       read
+    mode         cmd
+    file         /home/me/.config/legion/tools.d/ops.greet.toml
+    params       who
+broken  -
+```
+
+See [`examples/legion/tools.d/`](../../examples/legion/tools.d/) for complete TOML examples.
 
 ## Keeping machines in step (`fleet.sync`)
 
 `fleet.sync` compares, pushes, or pulls shared configuration across machines in `fleet.toml` (all
 requiring `effect:admin`, built on `config.list`, `config.read`, and `config.write`):
 
-- **Shared documents**: `fleet.toml`, `policy.toml`, `projects.toml`, and `tools.d/*.toml`.
+- **Shared documents**: `fleet.toml`, `policy.toml`, `projects.toml`, and `tools.d/<name>.toml`.
+  Extension files may contain internal dots (matching `ext.define` files such as
+  `tools.d/ops.greet.toml`); on write, the receiver enforces the same rules as `ext.define` — the
+  filename stem must match the `name` field inside the file, duplicate tool names across files are
+  refused, and reserved families are rejected.
 - **Machine-local (never synced)**: `node.toml` and `tokens.toml`.
 
-Preview or push with `direction=status`, `direction=push`, or `direction=pull from=<machine>`:
+Inspect differences with `direction=status` (reporting per-document status `same`, `only_here`,
+`only_there`, `changed_here`, `changed_there`, or `both`):
+
+```sh
+legion fleet.sync direction=status machines='["pi"]'
+```
+
+```text
+node       tower
+direction  status
+dry_run    false
+results
+  pi
+    fleet.toml
+      status      only_here
+      local_hash  blake3:91098d9781e8e315bedfc42355c770ee4b9e8ffb73c7a43422fe17aed20dc667
+    policy.toml
+      status      only_here
+      local_hash  blake3:02737aa64498159b5cfe945119648617b86c513c651f3e995727fe08c7b562e1
+    projects.toml
+      status  same
+    tools.d/ops.greet.toml
+      status      only_here
+      local_hash  blake3:420c9d834cb6b1c84dc3aeb8572afb2a7bdee9957b56a711d32be58413120695
+```
+
+Push or pull with `direction=push` or `direction=pull from=<machine>` (reporting `same`, `pushed`,
+`pulled`, `conflict`, or `error`):
 
 ```sh
 legion fleet.sync direction=push machines='["pi"]' documents='["projects.toml"]' dry_run=true
@@ -748,9 +906,20 @@ Before replacing any file, the receiver validates the incoming TOML with its own
 saves the previous version under `state/sync/backups/`, writes atomically, and records before/after
 hashes in `audit.jsonl`.
 
-## Updating (`meta.update` and `fleet.install`)
+## Updating and releasing (`meta.update` and `fleet.install`)
 
 *(Live downloads not run here; documented from code.)*
+
+Both `meta.update` and `fleet.install` verify every release download (and every cached release under
+`state/dist/<version>/<target>/`) against the offline Ed25519 signature `SHA256SUMS.sig` using the
+release public key compiled into `legion` from `contract/release-public-key.pem`. There is no
+runtime override or skip flag: unsigned or tampered releases are always refused.
+
+Both tools also enforce a persistent SemVer downgrade floor (per node for `meta.update`, per machine
+for `fleet.install`) alongside the running version, so a validly signed older release is refused
+unless you pass `allow_downgrade=true`. Before replacing any live binary, both check the executable
+format header (ELF/Mach-O/PE and architecture), run `--version` on the staged file, and save a
+one-generation `<exe>.prev` backup beside the destination.
 
 - **Update this machine**:
 
@@ -759,11 +928,13 @@ hashes in `audit.jsonl`.
   legion meta.update
   ```
 
-  `meta.update` resolves the newest published `legion-v*` release (or a specific `version=0.2.0`),
-  downloads the binary and `SHA256SUMS` using the system `curl` (or PowerShell on Windows),
-  verifies SHA-256, caches the verified binary under `state/dist/<version>/<target>/`, and
-  atomically replaces the running executable. On Windows, the running binary is renamed aside to
-  `.old.*` and cleaned up on the next startup.
+  `meta.update` resolves the highest published stable `legion-v*` semantic version (or a specific
+  `version=0.2.0`), selects native arm64 on macOS under Rosetta 2 and x86-64 under emulation on
+  Windows ARM64 (with a `note`), downloads over HTTPS/TLS 1.2 via `curl` (or PowerShell on Windows),
+  verifies `SHA256SUMS.sig` and SHA-256, checks the downgrade floor and binary header, stages and
+  runs `--version` preflight, saves `<exe>.prev`, and atomically replaces the running binary. On
+  Windows, the running executable is renamed aside to `.old.*` (restored if the replacement move
+  fails, otherwise cleaned up on the next startup).
 
 - **Install or upgrade another SSH machine**:
 
@@ -773,8 +944,41 @@ hashes in `audit.jsonl`.
   legion fleet.install machine=pi from=target/release/legion
   ```
 
-  `fleet.install` probes the remote OS and CPU architecture over `ssh`, downloads and verifies the
-  matching release (reusing `state/dist/` when already cached) or uses the local file given in
-  `from`, copies it over `scp` to a random temporary name beside `~/.local/bin/legion` (or
-  `%LOCALAPPDATA%\legion\legion.exe` on Windows), atomically renames it into place, and opens a
-  normal `legion rpc` session to verify the new version.
+  `fleet.install` probes the remote OS, architecture, and destination path over `ssh`, downloads and
+  verifies the signed release (reusing `state/dist/` after re-verifying its signature and digest) or
+  uses an unsigned self-built binary you vouch for with `from=<local file>`, checks the downgrade
+  floor and binary header locally, copies to a random temporary file over `scp`, runs `--version`
+  preflight on the remote host before saving `<dest>.prev` and moving it into place, and opens a
+  fresh `legion rpc` session to confirm the installed version. If the new session fails or reports a
+  different version, `fleet.install` restores `<dest>.prev` automatically.
+
+### Publishing a release (owner procedure)
+
+The GitHub Actions workflow `.github/workflows/legion-release.yml` never holds the signing key and
+never signs releases; the offline Ed25519 signature is created locally before publishing:
+
+1. Bump `[workspace.package].version` in `Cargo.toml` on `main` and wait for CI to pass.
+2. Tag that commit on `main` and push the tag:
+
+   ```sh
+   git tag legion-vX.Y.Z && git push origin legion-vX.Y.Z
+   ```
+
+3. Wait for the `Legion release` workflow to finish building all five targets, attaching GitHub
+   build provenance attestations, and creating the draft release (with `--latest=false` so
+   `/releases/latest` stays untouched for older apps).
+4. On the machine holding `~/.legion-control/release-signing.key`, sign `SHA256SUMS` offline and
+   upload `SHA256SUMS.sig` to the draft release:
+
+   ```sh
+   node scripts/sign-legion-release.mjs legion-vX.Y.Z
+   ```
+
+   The script downloads `SHA256SUMS` and every release asset, re-hashes them locally, checks that
+   the signing key matches `contract/release-public-key.pem`, writes and verifies `SHA256SUMS.sig`,
+   uploads it to the draft release, and prints the publish command.
+5. Review the listed artifacts and digests, then publish the draft release:
+
+   ```sh
+   gh release edit legion-vX.Y.Z --draft=false --latest=false
+   ```
