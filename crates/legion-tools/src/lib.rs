@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod audit;
+pub mod binfmt;
 pub mod exec;
 pub mod ext;
 pub mod floor;

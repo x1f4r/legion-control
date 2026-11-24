@@ -25,6 +25,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::binfmt::verify_binary_matches_target;
 use crate::floor::{SemVer, check_version_transition, commit_floor, node_floor_path};
 use crate::trust::{RELEASE_PUBLIC_KEY, SIGNATURE_FILENAME, verify_signature_with_key};
 
@@ -45,6 +46,9 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Marker inserted into renamed Windows executables so startup cleanup only removes our backups.
 const OLD_BINARY_MARKER: &str = ".old.";
+
+/// Timeout for running a staged `legion --version` preflight check before swapping it into place.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fixed PowerShell snippet for fetching the GitHub releases JSON without interpolating any input.
 const PS_FETCH_API_SCRIPT: &str = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; \
@@ -630,17 +634,110 @@ pub fn cleanup_old_binaries_next_to(exe: &Path) {
     }
 }
 
-/// Replaces `target_exe` with the contents of `new_binary` atomically.
-///
-/// Stages `new_binary` beside `target_exe` on the same filesystem so renames never cross mounts.
-/// When `rename_old_first` is `true` (used on Windows because a running executable cannot be
-/// overwritten in place), `target_exe` is moved to a sibling `.old.<hex>` path first; if placing
-/// the staged binary fails, the previous binary is moved back.
-pub fn replace_executable(
-    target_exe: &Path,
-    new_binary: &Path,
-    rename_old_first: bool,
+/// Sibling one-generation backup path (`<exe>.prev`) kept beside the live binary during updates.
+pub fn prev_binary_path(target_exe: &Path) -> Option<PathBuf> {
+    let parent = target_exe.parent()?;
+    let file_name = target_exe.file_name()?.to_str()?;
+    Some(parent.join(format!("{file_name}.prev")))
+}
+
+/// Parses `legion --version` output (`"legion 0.2.0"`) into the bare version string.
+pub fn parse_legion_version_output(output: &str) -> Option<String> {
+    for line in output.lines().rev() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("legion ") {
+            let ver = rest.split_whitespace().next().unwrap_or("");
+            if !ver.is_empty() && normalize_version(ver).is_ok() {
+                return Some(ver.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Runs a staged `legion` binary with `--version` and verifies that it exits 0 and reports
+/// `expected_version`.
+pub async fn verify_staged_binary_version(
+    staged: &Path,
+    expected_version: &str,
+    cancel: CancellationToken,
 ) -> Result<(), ErrorBody> {
+    let options = RunOptions::new(CommandSpec::argv(staged, ["--version"]))
+        .c_locale()
+        .timeout(PREFLIGHT_TIMEOUT)
+        .cancel(cancel);
+    let output = run(options).await.map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Staged binary {} could not be executed for --version preflight: {err}.",
+                staged.display()
+            ),
+        )
+        .with_hint("The downloaded binary may not match this platform; nothing was replaced.")
+    })?;
+    if output.cancelled {
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            "Preflight check of the staged legion binary was cancelled.",
+        ));
+    }
+    if output.timed_out {
+        return Err(ErrorBody::new(
+            ErrorCode::Timeout,
+            format!(
+                "Staged binary {} timed out while running --version.",
+                staged.display()
+            ),
+        )
+        .with_hint("Nothing was replaced."));
+    }
+    if !output.success() {
+        let detail = output.stderr.text.trim();
+        let reason = if detail.is_empty() {
+            format!("exited with {:?}", output.exit_code)
+        } else {
+            detail.to_owned()
+        };
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Staged binary {} failed --version preflight ({reason}).",
+                staged.display()
+            ),
+        )
+        .with_hint("Nothing was replaced."));
+    }
+    let reported = parse_legion_version_output(&output.stdout.text).ok_or_else(|| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Staged binary {} did not print a valid `legion <version>` line on --version.",
+                staged.display()
+            ),
+        )
+        .with_hint("Nothing was replaced.")
+    })?;
+    let matches = match (SemVer::parse(&reported), SemVer::parse(expected_version)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => reported == expected_version,
+    };
+    if !matches {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Staged binary {} reported version {reported}, expected {expected_version}.",
+                staged.display()
+            ),
+        )
+        .with_hint("Nothing was replaced."));
+    }
+    Ok(())
+}
+
+/// Copies `new_binary` to a sibling temp file beside `target_exe`, fsyncs it, and marks it
+/// executable on Unix. The returned guard unlinks the staged file unless disarmed on commit.
+fn stage_executable_beside(target_exe: &Path, new_binary: &Path) -> Result<TempCleanup, ErrorBody> {
     let parent = target_exe.parent().ok_or_else(|| {
         ErrorBody::new(
             ErrorCode::Failed,
@@ -665,7 +762,7 @@ pub fn replace_executable(
 
     let token = random_hex(8)?;
     let staged_path = parent.join(format!(".{file_name}.tmp.{token}"));
-    let mut staged_guard = TempCleanup::new(staged_path.clone());
+    let staged_guard = TempCleanup::new(staged_path.clone());
 
     let mut src = File::open(new_binary).map_err(|err| {
         ErrorBody::new(
@@ -726,8 +823,65 @@ pub fn replace_executable(
             })?;
     }
     drop(dst);
+    Ok(staged_guard)
+}
+
+/// Saves a one-generation copy of `target_exe` as `<exe>.prev` beside it atomically.
+fn save_prev_backup(target_exe: &Path) -> Result<(), ErrorBody> {
+    if !target_exe.exists() {
+        return Ok(());
+    }
+    let Some(prev_path) = prev_binary_path(target_exe) else {
+        return Ok(());
+    };
+    let mut backup_guard = stage_executable_beside(target_exe, target_exe)?;
+    replace_file(&backup_guard.path, &prev_path).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not save previous binary backup {}: {err}.",
+                prev_path.display()
+            ),
+        )
+        .with_hint("Ensure the directory holding legion is writable.")
+    })?;
+    backup_guard.disarm();
+    Ok(())
+}
+
+/// Commits an already-staged sibling binary over `target_exe`, keeping a one-generation backup
+/// (`<exe>.prev`) beside it.
+fn commit_staged_executable(
+    mut staged_guard: TempCleanup,
+    target_exe: &Path,
+    rename_old_first: bool,
+) -> Result<(), ErrorBody> {
+    let parent = target_exe.parent().ok_or_else(|| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Cannot determine the directory containing {}.",
+                target_exe.display()
+            ),
+        )
+    })?;
+    let file_name = target_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Executable path {} has no valid filename.",
+                    target_exe.display()
+                ),
+            )
+        })?;
+
+    save_prev_backup(target_exe)?;
 
     if rename_old_first && target_exe.exists() {
+        let token = random_hex(8)?;
         let old_path = parent.join(format!("{file_name}{OLD_BINARY_MARKER}{token}"));
         replace_file(target_exe, &old_path).map_err(|err| {
             ErrorBody::new(
@@ -739,13 +893,13 @@ pub fn replace_executable(
             )
             .with_hint("Ensure this account has write permission in the legion install directory.")
         })?;
-        if let Err(err) = replace_file(&staged_path, target_exe) {
+        if let Err(err) = replace_file(&staged_guard.path, target_exe) {
             // Roll back so the machine is never left without its legion executable.
             let _ = replace_file(&old_path, target_exe);
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
-                    "Could not move updated binary into {}: {err}.",
+                    "Could not move updated binary into {}: {err}. The previous binary was restored.",
                     target_exe.display()
                 ),
             ));
@@ -755,9 +909,8 @@ pub fn replace_executable(
         // removed on the next start by `cleanup_old_binary`.
         let _ = fs::remove_file(&old_path);
     } else {
-        // Use WriteOptions-compatible atomic replacement on the same filesystem.
         let _ = WriteOptions::with_mode(0o755);
-        replace_file(&staged_path, target_exe).map_err(|err| {
+        replace_file(&staged_guard.path, target_exe).map_err(|err| {
             ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
@@ -771,6 +924,17 @@ pub fn replace_executable(
     }
 
     Ok(())
+}
+
+/// Replaces `target_exe` with the contents of `new_binary` atomically, keeping one previous
+/// generation beside it as `<exe>.prev`.
+pub fn replace_executable(
+    target_exe: &Path,
+    new_binary: &Path,
+    rename_old_first: bool,
+) -> Result<(), ErrorBody> {
+    let staged_guard = stage_executable_beside(target_exe, new_binary)?;
+    commit_staged_executable(staged_guard, target_exe, rename_old_first)
 }
 
 async fn meta_update(ctx: &Ctx, args: UpdateArgs) -> Result<UpdateResult, ToolError> {
@@ -814,6 +978,7 @@ pub async fn run_meta_update(
         current_exe,
         rename_old_first,
         &RELEASE_PUBLIC_KEY,
+        true,
         args,
         cancel,
     )
@@ -830,6 +995,7 @@ async fn run_meta_update_with_key(
     current_exe: &Path,
     rename_old_first: bool,
     public_key: &[u8; 32],
+    run_staged_preflight: bool,
     args: UpdateArgs,
     cancel: CancellationToken,
 ) -> Result<UpdateResult, ErrorBody> {
@@ -886,12 +1052,32 @@ async fn run_meta_update_with_key(
         &desired_version,
         target,
         public_key,
-        cancel,
+        cancel.clone(),
     )
     .await?;
-    let target_exe = current_exe.to_path_buf();
+
+    // Check executable header (ELF/Mach-O/PE + arch) before staging over the live binary.
+    verify_binary_matches_target(&cached_bin, target)?;
+
+    let target_exe_stage = current_exe.clone();
+    let staged_guard = tokio::task::spawn_blocking(move || {
+        stage_executable_beside(&target_exe_stage, &cached_bin)
+    })
+    .await
+    .map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Staging the legion binary stopped unexpectedly: {err}."),
+        )
+    })??;
+
+    if run_staged_preflight {
+        verify_staged_binary_version(&staged_guard.path, &desired_version, cancel).await?;
+    }
+
+    let target_exe_commit = current_exe.clone();
     tokio::task::spawn_blocking(move || {
-        replace_executable(&target_exe, &cached_bin, rename_old_first)
+        commit_staged_executable(staged_guard, &target_exe_commit, rename_old_first)
     })
     .await
     .map_err(|err| {
@@ -1268,7 +1454,8 @@ mod tests {
         let signing = SigningKey::from_bytes(&[0x42; 32]);
         let pubkey = signing.verifying_key().to_bytes();
 
-        let new_bytes = b"new-legion-0.2.0-binary-content".to_vec();
+        let mut new_bytes = crate::binfmt::synthetic_header_for_target("x86_64-unknown-linux-musl");
+        new_bytes.extend_from_slice(b"new-legion-0.2.0-binary-content");
         let target = "x86_64-unknown-linux-musl";
         let asset = artifact_filename("0.2.0", target);
         let sums = format!("{}  {asset}\n", sha256_bytes(&new_bytes));
@@ -1289,6 +1476,7 @@ mod tests {
             &current_copy,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: None,
                 dry_run: true,
@@ -1305,7 +1493,10 @@ mod tests {
         assert_eq!(fetcher.download_count(), 0);
         assert_ne!(fs::read(&current_copy).unwrap(), new_bytes);
 
-        // Real update downloads SHA256SUMS + SHA256SUMS.sig + binary, verifies, caches, and replaces.
+        let original_bytes = fs::read(&current_copy).unwrap();
+
+        // Real update downloads SHA256SUMS + SHA256SUMS.sig + binary, verifies, caches, saves
+        // `.prev`, and replaces atomically.
         let updated = run_meta_update_with_key(
             &paths,
             &fetcher,
@@ -1315,6 +1506,7 @@ mod tests {
             &current_copy,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: None,
                 dry_run: false,
@@ -1330,6 +1522,10 @@ mod tests {
         assert_eq!(updated.installed_version, "0.2.0");
         assert_eq!(fetcher.download_count(), 3);
         assert_eq!(fs::read(&current_copy).unwrap(), new_bytes);
+        assert_eq!(
+            fs::read(prev_binary_path(&current_copy).unwrap()).unwrap(),
+            original_bytes
+        );
 
         // A second explicit call reuses the verified signed dist cache without re-downloading.
         let cached = run_meta_update_with_key(
@@ -1341,6 +1537,7 @@ mod tests {
             &current_copy,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
@@ -1409,6 +1606,7 @@ mod tests {
             &exe,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
@@ -1509,7 +1707,8 @@ mod tests {
         let signing = SigningKey::from_bytes(&[0x77; 32]);
         let pubkey = signing.verifying_key().to_bytes();
         let target = "x86_64-unknown-linux-musl";
-        let old_bytes = b"legion-0.2.0-binary".to_vec();
+        let mut old_bytes = crate::binfmt::synthetic_header_for_target(target);
+        old_bytes.extend_from_slice(b"legion-0.2.0-binary");
         let asset = artifact_filename("0.2.0", target);
         let sums = format!("{}  {asset}\n", sha256_bytes(&old_bytes));
         let sig = crate::trust::encode_signature_bytes(&signing.sign(sums.as_bytes()).to_bytes());
@@ -1529,6 +1728,7 @@ mod tests {
             &exe,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: None,
                 dry_run: false,
@@ -1552,6 +1752,7 @@ mod tests {
             &exe,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
@@ -1582,10 +1783,15 @@ mod tests {
         let pubkey = signing.verifying_key().to_bytes();
         let target = "x86_64-unknown-linux-musl";
 
+        let mut bytes_020 = crate::binfmt::synthetic_header_for_target(target);
+        bytes_020.extend_from_slice(b"legion-0.2.0-bytes");
+        let mut bytes_030 = crate::binfmt::synthetic_header_for_target(target);
+        bytes_030.extend_from_slice(b"legion-0.3.0-bytes");
+
         let mut files = HashMap::new();
         for (ver, bytes) in [
-            ("0.2.0", b"legion-0.2.0-bytes".as_slice()),
-            ("0.3.0", b"legion-0.3.0-bytes".as_slice()),
+            ("0.2.0", bytes_020.as_slice()),
+            ("0.3.0", bytes_030.as_slice()),
         ] {
             let asset = artifact_filename(ver, target);
             let sums = format!("{}  {asset}\n", sha256_bytes(bytes));
@@ -1607,6 +1813,7 @@ mod tests {
             &exe,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
@@ -1616,7 +1823,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(fs::read(&exe).unwrap(), b"legion-0.2.0-bytes");
+        assert_eq!(fs::read(&exe).unwrap(), bytes_020);
+        assert_eq!(
+            fs::read(prev_binary_path(&exe).unwrap()).unwrap(),
+            b"legion-0.1.0"
+        );
 
         run_meta_update_with_key(
             &paths,
@@ -1627,6 +1838,7 @@ mod tests {
             &exe,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: Some("0.3.0".to_owned()),
                 dry_run: false,
@@ -1636,7 +1848,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(fs::read(&exe).unwrap(), b"legion-0.3.0-bytes");
+        assert_eq!(fs::read(&exe).unwrap(), bytes_030);
+        assert_eq!(
+            fs::read(prev_binary_path(&exe).unwrap()).unwrap(),
+            bytes_020
+        );
         assert!(!dir.path().join("legion (deleted)").exists());
 
         // Removing the recorded file causes a subsequent update to fail cleanly rather than
@@ -1651,6 +1867,7 @@ mod tests {
             &exe,
             false,
             &pubkey,
+            false,
             UpdateArgs {
                 version: Some("0.3.0".to_owned()),
                 dry_run: false,
@@ -1662,5 +1879,84 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Failed);
         assert!(!exe.exists());
+    }
+
+    #[tokio::test]
+    async fn meta_update_refuses_wrong_arch_binary_and_bad_staged_version() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("home"));
+        let exe = dir.path().join("legion");
+        fs::write(&exe, b"original-good-binary").unwrap();
+
+        let signing = SigningKey::from_bytes(&[0x55; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let target = "x86_64-unknown-linux-musl";
+        // Ship an aarch64 ELF under the x86_64 asset name: header verification must reject it.
+        let wrong_arch = crate::binfmt::synthetic_header_for_target("aarch64-unknown-linux-musl");
+        let asset = artifact_filename("0.2.0", target);
+        let sums = format!("{}  {asset}\n", sha256_bytes(&wrong_arch));
+        let sig = crate::trust::encode_signature_bytes(&signing.sign(sums.as_bytes()).to_bytes());
+        let mut files = HashMap::new();
+        files.insert(checksums_url("0.2.0"), sums.into_bytes());
+        files.insert(checksums_sig_url("0.2.0"), sig.into_bytes());
+        files.insert(artifact_url("0.2.0", target), wrong_arch);
+        let fetcher = FakeFetcher::new("0.2.0", files);
+
+        let err = run_meta_update_with_key(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.1.0",
+            &exe,
+            false,
+            &pubkey,
+            false,
+            UpdateArgs {
+                version: Some("0.2.0".to_owned()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("aarch64"), "{}", err.message);
+        assert_eq!(fs::read(&exe).unwrap(), b"original-good-binary");
+
+        // Staged `--version` preflight rejects a binary that exits non-zero or prints the wrong version.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let bad_script = dir.path().join("staged-bad");
+            fs::write(&bad_script, "#!/bin/sh\necho 'legion 0.9.9'\n").unwrap();
+            fs::set_permissions(&bad_script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mismatch =
+                verify_staged_binary_version(&bad_script, "0.2.0", CancellationToken::new())
+                    .await
+                    .unwrap_err();
+            assert_eq!(mismatch.code, ErrorCode::Failed);
+            assert!(mismatch.message.contains("0.9.9"), "{}", mismatch.message);
+
+            let crash_script = dir.path().join("staged-crash");
+            fs::write(&crash_script, "#!/bin/sh\nexit 1\n").unwrap();
+            fs::set_permissions(&crash_script, fs::Permissions::from_mode(0o755)).unwrap();
+            let crashed =
+                verify_staged_binary_version(&crash_script, "0.2.0", CancellationToken::new())
+                    .await
+                    .unwrap_err();
+            assert_eq!(crashed.code, ErrorCode::Failed);
+
+            let good_script = dir.path().join("staged-good");
+            fs::write(&good_script, "#!/bin/sh\necho 'legion 0.2.0'\n").unwrap();
+            fs::set_permissions(&good_script, fs::Permissions::from_mode(0o755)).unwrap();
+            verify_staged_binary_version(&good_script, "0.2.0", CancellationToken::new())
+                .await
+                .unwrap();
+        }
     }
 }
