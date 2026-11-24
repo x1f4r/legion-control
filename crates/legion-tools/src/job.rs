@@ -34,10 +34,10 @@ pub use supervise::try_supervise_cli;
 use logs::{DEFAULT_LOG_LIMIT, DEFAULT_TAIL_LINES, MAX_LOG_LIMIT, MAX_TAIL_LINES};
 use store::{
     ExitOutcome, ExitRecord, JobRecord, command_summary, compare_newest_first, default_job_name,
-    derive_status, find_by_key, generate_job_id, job_dir, jobs_dir, jobs_lock_path,
-    load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record, read_job_record,
-    remove_env_file, validate_job_id, write_cancel_request, write_env_file, write_exit_record,
-    write_job_record,
+    derive_status, derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir,
+    jobs_lock_path, load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record,
+    read_job_record, remove_env_file, validate_job_id, write_cancel_request, write_env_file,
+    write_exit_record, write_job_record,
 };
 
 /// Default and maximum `limit` for `job.list`.
@@ -244,6 +244,10 @@ pub struct JobStatus {
     pub detach: Option<DetachHandle>,
     /// Current derived state.
     pub state: JobState,
+    /// Whether the job supervisor is attached while the job is active (`false` when the supervisor
+    /// died while the command tree keeps running; omitted once finished or interrupted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervised: Option<bool>,
     /// Exit code when the command exited normally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -669,51 +673,58 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<JobList, ToolError> {
     let filter_state = args.state;
     let keep = usize::try_from(limit).unwrap_or(usize::MAX);
 
-    blocking("job.list", move || {
+    let (records, boot) = blocking("job.list", move || {
         let mut records = load_all_records(&state_dir)?;
         records.sort_by(|(_, a), (_, b)| compare_newest_first(a, b));
         let boot = procid::boot_id().ok();
-        let now = jiff::Timestamp::now();
-
-        let mut jobs = Vec::new();
-        let mut truncated = false;
-        for (dir, record) in records {
-            let derived = derive_status(&dir, &record, boot.as_deref(), now);
-            if filter_state.is_some_and(|want| derived.state != want) {
-                continue;
-            }
-            if jobs.len() == keep {
-                truncated = true;
-                break;
-            }
-            jobs.push(JobSummary {
-                command: command_summary(&record),
-                id: record.id,
-                name: record.name,
-                state: derived.state,
-                created: record.created,
-                finished: derived.finished,
-                exit_code: derived.exit_code,
-            });
-        }
-        Ok(JobList { jobs, truncated })
+        Ok((records, boot))
     })
-    .await
+    .await?;
+
+    let now = jiff::Timestamp::now();
+    let mut jobs = Vec::new();
+    let mut truncated = false;
+    for (dir, record) in records {
+        let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
+        if filter_state.is_some_and(|want| derived.state != want) {
+            continue;
+        }
+        if jobs.len() == keep {
+            truncated = true;
+            break;
+        }
+        jobs.push(JobSummary {
+            command: command_summary(&record),
+            id: record.id,
+            name: record.name,
+            state: derived.state,
+            created: record.created,
+            finished: derived.finished,
+            exit_code: derived.exit_code,
+        });
+    }
+    Ok(JobList { jobs, truncated })
 }
 
 async fn status(ctx: &Ctx, args: StatusArgs) -> Result<JobStatus, ToolError> {
     validate_job_id(&args.id)?;
     let state_dir = ctx.paths().state_dir().to_path_buf();
-    let id = args.id;
-    blocking("job.status", move || load_status(&state_dir, &id)).await
+    load_status_async(&state_dir, &args.id).await
 }
 
-fn load_status(state_dir: &Path, id: &str) -> Result<JobStatus, ErrorBody> {
+async fn load_status_async(state_dir: &Path, id: &str) -> Result<JobStatus, ErrorBody> {
     let dir = job_dir(state_dir, id);
-    let record = read_job_record(&dir, id)?;
-    let boot = procid::boot_id().ok();
+    let dir_for_read = dir.clone();
+    let id_for_read = id.to_owned();
+    let (record, boot) = blocking("job.status", move || {
+        let record = read_job_record(&dir_for_read, &id_for_read)?;
+        let boot = procid::boot_id().ok();
+        Ok((record, boot))
+    })
+    .await?;
+
     let now = jiff::Timestamp::now();
-    let derived = derive_status(&dir, &record, boot.as_deref(), now);
+    let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
     Ok(JobStatus {
         id: record.id,
         name: record.name,
@@ -728,6 +739,7 @@ fn load_status(state_dir: &Path, id: &str) -> Result<JobStatus, ErrorBody> {
         exclusive: record.exclusive,
         detach: record.detach,
         state: derived.state,
+        supervised: derived.supervised,
         exit_code: derived.exit_code,
         signal: derived.signal,
         finished: derived.finished,
@@ -771,33 +783,35 @@ async fn read_logs(ctx: &Ctx, args: LogsArgs) -> Result<JobLogs, ToolError> {
     let tail_usize = usize::try_from(tail).unwrap_or(usize::MAX);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
-    blocking("job.logs", move || {
-        let dir = job_dir(&state_dir, &id);
-        let record = read_job_record(&dir, &id)?;
+    let dir = job_dir(&state_dir, &id);
+    let dir_for_read = dir.clone();
+    let id_for_read = id.clone();
+    let (record, boot) = blocking("job.logs", move || {
+        let record = read_job_record(&dir_for_read, &id_for_read)?;
         let boot = procid::boot_id().ok();
-        let now = jiff::Timestamp::now();
-        let derived = derive_status(&dir, &record, boot.as_deref(), now);
-        let log_path = dir.join(store::LOG_FILE);
-        let slice = match offset {
-            Some(off) => logs::read_offset(&log_path, off, limit_usize, derived.state.is_active())?,
-            None => logs::read_tail(
-                &log_path,
-                tail_usize,
-                limit_usize,
-                derived.state.is_active(),
-            )?,
-        };
-        Ok(JobLogs {
-            id,
-            state: derived.state,
-            content: slice.content,
-            offset: slice.offset,
-            next_offset: slice.next_offset,
-            eof: slice.eof,
-            truncated: slice.truncated,
-        })
+        Ok((record, boot))
     })
-    .await
+    .await?;
+
+    let derived = derive_status_async(&dir, &record, boot.as_deref(), jiff::Timestamp::now()).await;
+    let actively_writing = derived.supervised == Some(true);
+    let log_path = dir.join(store::LOG_FILE);
+
+    let slice = blocking("job.logs", move || match offset {
+        Some(off) => logs::read_offset(&log_path, off, limit_usize, actively_writing),
+        None => logs::read_tail(&log_path, tail_usize, limit_usize, actively_writing),
+    })
+    .await?;
+
+    Ok(JobLogs {
+        id,
+        state: derived.state,
+        content: slice.content,
+        offset: slice.offset,
+        next_offset: slice.next_offset,
+        eof: slice.eof,
+        truncated: slice.truncated,
+    })
 }
 
 async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
@@ -810,9 +824,7 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
     let mut pause = WAIT_INITIAL_POLL;
 
     loop {
-        let dir_clone = state_dir.clone();
-        let id_clone = id.clone();
-        let current = blocking("job.wait", move || load_status(&dir_clone, &id_clone)).await?;
+        let current = load_status_async(&state_dir, &id).await?;
         if !current.state.is_active() {
             return Ok(JobWait {
                 status: current,
@@ -968,10 +980,7 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
         });
     }
 
-    let state = blocking("job.cancel", move || {
-        load_status(&state_dir, &id).map(|status| status.state)
-    })
-    .await?;
+    let state = load_status_async(&state_dir, &id).await?.state;
     Ok(CancelledJob {
         id: record.id,
         state,

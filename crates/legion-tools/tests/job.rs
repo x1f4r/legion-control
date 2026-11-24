@@ -672,9 +672,15 @@ async fn forced_cancel_works_when_supervisor_was_killed_first() {
     assert_eq!(killed["stopped"], json!(true), "{killed:#}");
     assert!(gone(sup_pid).await, "supervisor {sup_pid} stayed alive");
 
-    // With the supervisor gone and no exit record, state is `interrupted`.
+    // With the supervisor gone while the command tree still runs (on Unix), the job stays
+    // `running` with `supervised: false`.
     let mid = fixture.call("job.status", json!({"id": id})).await.unwrap();
-    assert_eq!(mid["state"], json!("interrupted"), "{mid:#}");
+    if has_systemd_unit || cfg!(unix) {
+        assert_eq!(mid["state"], json!("running"), "{mid:#}");
+        assert_eq!(mid["supervised"], json!(false), "{mid:#}");
+    } else {
+        assert_eq!(mid["state"], json!("interrupted"), "{mid:#}");
+    }
 
     // Forced cancel stops the detached handle and records the job as cancelled & forced.
     let cancelled = fixture
@@ -722,7 +728,10 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
     let started = fixture
         .call(
             "job.start",
-            job_helper_args("family", &[&pids_file.to_string_lossy()]),
+            merge_args(
+                job_helper_args("family", &[&pids_file.to_string_lossy()]),
+                json!({"name": "unsupervised-test", "exclusive": true}),
+            ),
         )
         .await
         .unwrap();
@@ -733,8 +742,12 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
     cleanup.track_pids(&family);
 
     let running = fixture.call("job.status", json!({"id": id})).await.unwrap();
+    assert_eq!(running["state"], json!("running"));
+    assert_eq!(running["supervised"], json!(true));
     let sup_pid = running["detach"]["process"]["pid"].as_u64().unwrap() as u32;
 
+    // Kill ONLY the supervisor: on Unix the command family keeps running under the detached handle,
+    // so derived state must stay `running` with `supervised: false` and keep counting as busy.
     fixture
         .call(
             "sys.kill",
@@ -744,12 +757,40 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
         .unwrap();
     assert!(gone(sup_pid).await);
 
+    if family.iter().any(|&pid| alive(pid)) {
+        let unsupervised = fixture.call("job.status", json!({"id": id})).await.unwrap();
+        assert_eq!(unsupervised["state"], json!("running"), "{unsupervised:#}");
+        assert_eq!(unsupervised["supervised"], json!(false), "{unsupervised:#}");
+        let detail = unsupervised["detail"].as_str().unwrap();
+        assert!(detail.contains("supervisor"), "{detail}");
+        assert!(detail.contains("output"), "{detail}");
+        assert!(detail.contains("job.cancel"), "{detail}");
+
+        let busy = exclusive_running_jobs(fixture.node.paths()).unwrap();
+        assert!(
+            busy.iter().any(|job| job.id == id),
+            "unsupervised exclusive job stopped counting as busy: {busy:?}"
+        );
+
+        // Now kill the remaining command processes so nothing under the handle is active.
+        for &pid in &family {
+            if alive(pid) {
+                let _ = fixture
+                    .call("sys.kill", json!({"pid": pid, "tree": true, "force": true}))
+                    .await;
+                assert!(gone(pid).await, "process {pid} stayed alive");
+            }
+        }
+    }
+
+    // Once nothing is active and no exit record exists, state becomes `interrupted` and busy clears.
     let interrupted = fixture.call("job.status", json!({"id": id})).await.unwrap();
     assert_eq!(
         interrupted["state"],
         json!("interrupted"),
         "{interrupted:#}"
     );
+    assert!(interrupted.get("supervised").is_none());
     let detail = interrupted["detail"].as_str().unwrap();
     assert!(
         detail.contains("supervisor") && detail.contains(&sup_pid.to_string()),
@@ -758,6 +799,11 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
     assert!(
         detail.contains('s'),
         "detail should mention duration: {detail}"
+    );
+    assert!(
+        exclusive_running_jobs(fixture.node.paths())
+            .unwrap()
+            .is_empty()
     );
 
     // Also simulate a machine reboot by replacing `boot_id` in `job.json`.

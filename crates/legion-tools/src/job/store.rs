@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic};
-use legion_os::detach::DetachHandle;
+use legion_os::detach::{DetachHandle, detached_active};
 use legion_os::lock::FileLock;
 use legion_os::procid;
 use schemars::JsonSchema;
@@ -143,10 +143,12 @@ pub(super) struct ExitRecord {
     pub detail: Option<String>,
 }
 
-/// Status derived on read from `job.json`, `exit.json`, `lock`, and `output.log`.
+/// Status derived on read from `job.json`, `exit.json`, `lock`, `detached_active`, and
+/// `output.log`.
 #[derive(Clone, Debug)]
 pub(super) struct DerivedStatus {
     pub state: JobState,
+    pub supervised: Option<bool>,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub finished: Option<String>,
@@ -442,41 +444,140 @@ pub(super) fn probe_lock(dir: &Path) -> (bool, bool) {
     }
 }
 
-/// Derives a job's live state purely from disk state and kernel locks without writing anything.
+/// Intermediate result of synchronous local file/lock inspection before an optional
+/// `detached_active` check.
+enum LocalInspect {
+    Ready(DerivedStatus),
+    NeedsTreeCheck {
+        handle: DetachHandle,
+        lock_exists: bool,
+        age_ms: i64,
+        created_ts: Option<jiff::Timestamp>,
+        output_bytes: u64,
+    },
+}
+
+/// Checks `legion_os::detach::detached_active` from synchronous code without panicking when
+/// invoked inside a Tokio runtime worker thread.
+pub(super) fn detached_active_sync(handle: &DetachHandle) -> bool {
+    let handle = handle.clone();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return false;
+                };
+                rt.block_on(detached_active(&handle)).unwrap_or(false)
+            })
+            .join()
+            .unwrap_or(false)
+    })
+}
+
+/// Derives a job's live state purely from disk state, kernel locks, and `detached_active` without
+/// writing anything (async path for tool handlers).
+pub(super) async fn derive_status_async(
+    dir: &Path,
+    record: &JobRecord,
+    current_boot_id: Option<&str>,
+    now: jiff::Timestamp,
+) -> DerivedStatus {
+    match inspect_local(dir, record, current_boot_id, now) {
+        LocalInspect::Ready(status) => status,
+        LocalInspect::NeedsTreeCheck {
+            handle,
+            lock_exists,
+            age_ms,
+            created_ts,
+            output_bytes,
+        } => {
+            let active = detached_active(&handle).await.unwrap_or(false);
+            finish_same_boot_unlocked(
+                dir,
+                record,
+                &handle,
+                lock_exists,
+                age_ms,
+                created_ts,
+                output_bytes,
+                active,
+                now,
+            )
+        }
+    }
+}
+
+/// Derives a job's live state purely from disk state, kernel locks, and `detached_active` without
+/// writing anything (sync path for `exclusive_running_jobs`, retention, and unit tests).
 pub(super) fn derive_status(
     dir: &Path,
     record: &JobRecord,
     current_boot_id: Option<&str>,
     now: jiff::Timestamp,
 ) -> DerivedStatus {
+    match inspect_local(dir, record, current_boot_id, now) {
+        LocalInspect::Ready(status) => status,
+        LocalInspect::NeedsTreeCheck {
+            handle,
+            lock_exists,
+            age_ms,
+            created_ts,
+            output_bytes,
+        } => {
+            let active = detached_active_sync(&handle);
+            finish_same_boot_unlocked(
+                dir,
+                record,
+                &handle,
+                lock_exists,
+                age_ms,
+                created_ts,
+                output_bytes,
+                active,
+                now,
+            )
+        }
+    }
+}
+
+fn inspect_local(
+    dir: &Path,
+    record: &JobRecord,
+    current_boot_id: Option<&str>,
+    now: jiff::Timestamp,
+) -> LocalInspect {
     let output_bytes = fs::metadata(dir.join(LOG_FILE))
         .map(|meta| meta.len())
         .unwrap_or(0);
     let created_ts = parse_timestamp(&record.created);
 
     if let Some(exit) = read_exit_record(dir) {
-        return derived_from_exit(exit, created_ts, output_bytes);
+        return LocalInspect::Ready(derived_from_exit(exit, created_ts, output_bytes));
     }
 
     let (lock_exists, lock_held) = probe_lock(dir);
     if lock_held {
         let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
-        return DerivedStatus {
+        return LocalInspect::Ready(DerivedStatus {
             state: JobState::Running,
+            supervised: Some(true),
             exit_code: None,
             signal: None,
             finished: None,
             duration_s,
             output_bytes,
             detail: None,
-        };
+        });
     }
 
     // The supervisor writes `exit.json` before releasing `lock`. Re-checking after seeing the lock
     // free closes the window where a job finished cleanly between our first check and the lock
     // probe.
     if let Some(exit) = read_exit_record(dir) {
-        return derived_from_exit(exit, created_ts, output_bytes);
+        return LocalInspect::Ready(derived_from_exit(exit, created_ts, output_bytes));
     }
 
     let same_boot = current_boot_id.is_none_or(|cur| procid::same_boot(&record.boot_id, cur));
@@ -487,28 +588,108 @@ pub(super) fn derive_status(
         })
         .unwrap_or(STARTING_GRACE_MS);
 
-    if same_boot && age_ms < STARTING_GRACE_MS {
-        let supervisor_alive = record
-            .detach
-            .as_ref()
-            .is_none_or(|handle| procid::is_alive(&handle.process));
-        if supervisor_alive {
-            let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
-            return DerivedStatus {
-                state: JobState::Starting,
-                exit_code: None,
-                signal: None,
-                finished: None,
-                duration_s,
-                output_bytes,
-                detail: None,
-            };
-        }
+    if !same_boot {
+        let detail = interrupted_detail(dir, record, false, lock_exists, created_ts, now);
+        return LocalInspect::Ready(DerivedStatus {
+            state: JobState::Interrupted,
+            supervised: None,
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s: None,
+            output_bytes,
+            detail: Some(detail),
+        });
     }
 
-    let detail = interrupted_detail(dir, record, same_boot, lock_exists, created_ts, now);
+    if let Some(handle) = record.detach.clone() {
+        return LocalInspect::NeedsTreeCheck {
+            handle,
+            lock_exists,
+            age_ms,
+            created_ts,
+            output_bytes,
+        };
+    }
+
+    if age_ms < STARTING_GRACE_MS {
+        let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
+        return LocalInspect::Ready(DerivedStatus {
+            state: JobState::Starting,
+            supervised: Some(true),
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s,
+            output_bytes,
+            detail: None,
+        });
+    }
+
+    let detail = interrupted_detail(dir, record, true, lock_exists, created_ts, now);
+    LocalInspect::Ready(DerivedStatus {
+        state: JobState::Interrupted,
+        supervised: None,
+        exit_code: None,
+        signal: None,
+        finished: None,
+        duration_s: None,
+        output_bytes,
+        detail: Some(detail),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_same_boot_unlocked(
+    dir: &Path,
+    record: &JobRecord,
+    handle: &DetachHandle,
+    lock_exists: bool,
+    age_ms: i64,
+    created_ts: Option<jiff::Timestamp>,
+    output_bytes: u64,
+    tree_active: bool,
+    now: jiff::Timestamp,
+) -> DerivedStatus {
+    // Before the supervisor has created `lock`, a live root within the startup grace window is
+    // still starting normally.
+    if !lock_exists && age_ms < STARTING_GRACE_MS && procid::is_alive(&handle.process) {
+        let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
+        return DerivedStatus {
+            state: JobState::Starting,
+            supervised: Some(true),
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s,
+            output_bytes,
+            detail: None,
+        };
+    }
+
+    // With no exit record and the lock free, if anything started under the detach handle is still
+    // active on the same boot, the job is still running without its supervisor.
+    if tree_active {
+        let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
+        return DerivedStatus {
+            state: JobState::Running,
+            supervised: Some(false),
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s,
+            output_bytes,
+            detail: Some(
+                "The job supervisor is gone, so output is no longer captured; the command is still running and `job.cancel` will stop it."
+                    .to_owned(),
+            ),
+        };
+    }
+
+    let detail = interrupted_detail(dir, record, true, lock_exists, created_ts, now);
     DerivedStatus {
         state: JobState::Interrupted,
+        supervised: None,
         exit_code: None,
         signal: None,
         finished: None,
@@ -528,6 +709,7 @@ fn derived_from_exit(
         .map(|(started, finished)| elapsed_seconds(started, finished));
     DerivedStatus {
         state: JobState::from(exit.outcome),
+        supervised: None,
         exit_code: exit.exit_code,
         signal: exit.signal,
         finished: Some(exit.finished),
