@@ -50,7 +50,8 @@ function Get-TargetTriple {
         'X64'   { return 'x86_64-pc-windows-msvc' }
         'AMD64' { return 'x86_64-pc-windows-msvc' }
         'ARM64' {
-            throw 'Native Windows ARM64 binaries are not published yet; pass -From with a local binary or use the x86_64 build under emulation.'
+            Write-Warning 'Windows ARM64 detected: using x86_64-pc-windows-msvc under x64 emulation because native Windows ARM64 release binaries are not published yet.'
+            return 'x86_64-pc-windows-msvc'
         }
         default {
             throw "Unsupported Windows architecture '$arch' (supported: x86_64)."

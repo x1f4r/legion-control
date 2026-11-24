@@ -101,6 +101,20 @@ pub struct UpdateResult {
     pub dry_run: bool,
     /// Whether the executable on disk was replaced.
     pub updated: bool,
+    /// Optional platform note (for example Rosetta 2 native selection or Windows ARM64 emulation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Resolved release architecture, target triple, and optional user-facing platform note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTarget {
+    /// Target architecture of the selected release binary (`x86_64` or `aarch64`).
+    pub arch: &'static str,
+    /// Release target triple published by CI.
+    pub target: &'static str,
+    /// Optional explanation when selecting a native or emulated build (Rosetta 2 / Windows ARM64).
+    pub note: Option<&'static str>,
 }
 
 /// Network boundary for discovering and downloading Legion releases.
@@ -265,14 +279,53 @@ pub fn parse_latest_release_version(releases_json: &str) -> Result<String, Error
     .with_hint("Specify an explicit `version` or install from a local binary with `from`."))
 }
 
-/// Maps a normalized `(os, arch)` pair to the release target triple published by CI.
-pub fn target_triple_for(os: &str, arch: &str) -> Result<&'static str, ErrorBody> {
+/// Maps a normalized `(os, arch)` pair (plus whether macOS is running under Rosetta 2 translation)
+/// to the release target triple published by CI and any user-facing note.
+pub fn resolve_target_for(
+    os: &str,
+    arch: &str,
+    macos_translated: bool,
+) -> Result<ResolvedTarget, ErrorBody> {
     match (os, arch) {
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("linux", "x86_64") => Ok(ResolvedTarget {
+            arch: "x86_64",
+            target: "x86_64-unknown-linux-musl",
+            note: None,
+        }),
+        ("linux", "aarch64") => Ok(ResolvedTarget {
+            arch: "aarch64",
+            target: "aarch64-unknown-linux-musl",
+            note: None,
+        }),
+        ("macos", "aarch64") => Ok(ResolvedTarget {
+            arch: "aarch64",
+            target: "aarch64-apple-darwin",
+            note: None,
+        }),
+        ("macos", "x86_64") if macos_translated => Ok(ResolvedTarget {
+            arch: "aarch64",
+            target: "aarch64-apple-darwin",
+            note: Some(
+                "Rosetta 2 translation detected; selecting native Apple Silicon (aarch64-apple-darwin) build.",
+            ),
+        }),
+        ("macos", "x86_64") => Ok(ResolvedTarget {
+            arch: "x86_64",
+            target: "x86_64-apple-darwin",
+            note: None,
+        }),
+        ("windows", "x86_64") => Ok(ResolvedTarget {
+            arch: "x86_64",
+            target: "x86_64-pc-windows-msvc",
+            note: None,
+        }),
+        ("windows", "aarch64") => Ok(ResolvedTarget {
+            arch: "x86_64",
+            target: "x86_64-pc-windows-msvc",
+            note: Some(
+                "Windows ARM64 detected; selecting x86_64-pc-windows-msvc under x64 emulation because native Windows ARM64 release binaries are not published yet.",
+            ),
+        }),
         ("linux", "arm" | "armv6" | "armv6l" | "armv7" | "armv7l" | "armhf" | "armel") => {
             Err(ErrorBody::new(
                 ErrorCode::Unsupported,
@@ -282,13 +335,6 @@ pub fn target_triple_for(os: &str, arch: &str) -> Result<&'static str, ErrorBody
             )
             .with_hint("Use a 64-bit OS image (aarch64) on ARM boards such as Raspberry Pi."))
         }
-        ("windows", "aarch64") => Err(ErrorBody::new(
-            ErrorCode::Unsupported,
-            "Native Windows ARM64 release binaries are not published yet.",
-        )
-        .with_hint(
-            "Pass a local binary via `from`, or build locally for aarch64-pc-windows-msvc.",
-        )),
         _ => Err(ErrorBody::new(
             ErrorCode::Unsupported,
             format!("No Legion release binary is published for {os}/{arch}."),
@@ -297,6 +343,11 @@ pub fn target_triple_for(os: &str, arch: &str) -> Result<&'static str, ErrorBody
             "Supported release targets are Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64).",
         )),
     }
+}
+
+/// Maps a normalized `(os, arch)` pair to the release target triple published by CI.
+pub fn target_triple_for(os: &str, arch: &str) -> Result<&'static str, ErrorBody> {
+    resolve_target_for(os, arch, false).map(|resolved| resolved.target)
 }
 
 /// Computes the lowercase hex SHA-256 digest of a file on disk.
@@ -987,6 +1038,23 @@ pub async fn run_meta_update(
     .await
 }
 
+async fn detect_macos_rosetta(os: &str, arch: &str, cancel: CancellationToken) -> bool {
+    if !cfg!(target_os = "macos") || os != "macos" || arch != "x86_64" {
+        return false;
+    }
+    let opts = RunOptions::new(CommandSpec::argv(
+        "sysctl",
+        ["-in", "sysctl.proc_translated"],
+    ))
+    .c_locale()
+    .timeout(Duration::from_secs(5))
+    .cancel(cancel);
+    match run(opts).await {
+        Ok(out) => out.success() && out.stdout.text.trim() == "1",
+        Err(_) => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_meta_update_with_key(
     paths: &Paths,
@@ -1002,7 +1070,10 @@ async fn run_meta_update_with_key(
     cancel: CancellationToken,
 ) -> Result<UpdateResult, ErrorBody> {
     let current_exe = legion_core::validate_recorded_exe(current_exe)?;
-    let target = target_triple_for(os, arch)?;
+    let macos_translated = detect_macos_rosetta(os, arch, cancel.clone()).await;
+    let resolved = resolve_target_for(os, arch, macos_translated)?;
+    let target = resolved.target;
+    let note = resolved.note.map(str::to_owned);
     let explicit_version = args.version.is_some();
     let desired_version = match args.version {
         Some(raw) => normalize_version(&raw)?,
@@ -1027,6 +1098,7 @@ async fn run_meta_update_with_key(
             path: current_exe.display().to_string(),
             dry_run: args.dry_run,
             updated: false,
+            note,
         });
     }
 
@@ -1045,6 +1117,7 @@ async fn run_meta_update_with_key(
             path: current_exe.display().to_string(),
             dry_run: true,
             updated: false,
+            note,
         });
     }
 
@@ -1098,6 +1171,7 @@ async fn run_meta_update_with_key(
         path: current_exe.display().to_string(),
         dry_run: false,
         updated: true,
+        note,
     })
 }
 
@@ -2005,5 +2079,23 @@ mod tests {
         assert!(PS_FETCH_API_SCRIPT.contains("Tls12"));
         assert!(PS_DOWNLOAD_FILE_SCRIPT.contains("$ProgressPreference = 'SilentlyContinue'"));
         assert!(PS_DOWNLOAD_FILE_SCRIPT.contains("Tls12"));
+    }
+
+    #[test]
+    fn resolve_target_handles_rosetta_and_windows_arm64_emulation() {
+        let rosetta = resolve_target_for("macos", "x86_64", true).unwrap();
+        assert_eq!(rosetta.arch, "aarch64");
+        assert_eq!(rosetta.target, "aarch64-apple-darwin");
+        assert!(rosetta.note.unwrap().contains("Rosetta 2"));
+
+        let intel = resolve_target_for("macos", "x86_64", false).unwrap();
+        assert_eq!(intel.arch, "x86_64");
+        assert_eq!(intel.target, "x86_64-apple-darwin");
+        assert_eq!(intel.note, None);
+
+        let win_arm = resolve_target_for("windows", "aarch64", false).unwrap();
+        assert_eq!(win_arm.arch, "x86_64");
+        assert_eq!(win_arm.target, "x86_64-pc-windows-msvc");
+        assert!(win_arm.note.unwrap().contains("emulation"));
     }
 }

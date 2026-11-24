@@ -67,7 +67,14 @@ detect_target() {
     Darwin)
       case "$arch_name" in
         arm64|aarch64) printf '%s' 'aarch64-apple-darwin' ;;
-        x86_64) printf '%s' 'x86_64-apple-darwin' ;;
+        x86_64)
+          if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" = '1' ]; then
+            printf 'Note: Rosetta 2 translation detected; installing native Apple Silicon (aarch64-apple-darwin) build.\n' >&2
+            printf '%s' 'aarch64-apple-darwin'
+          else
+            printf '%s' 'x86_64-apple-darwin'
+          fi
+          ;;
         *)
           die "Unsupported macOS architecture: $arch_name (supported: arm64, x86_64)."
           ;;

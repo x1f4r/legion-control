@@ -26,7 +26,7 @@ use legion_tools::floor::{SemVer, check_version_transition, commit_floor, machin
 use legion_tools::trust::RELEASE_PUBLIC_KEY;
 use legion_tools::update::{
     ReleaseFetcher, SystemFetcher, artifact_url, dist_cache_binary, normalize_version, random_hex,
-    resolve_release_binary_with_key, target_triple_for,
+    resolve_release_binary_with_key, resolve_target_for,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,8 @@ const SSH_CMD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Timeout for copying the `legion` binary over `scp`.
 const SCP_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Fixed remote Unix command to detect OS and architecture.
-pub const UNIX_PROBE_COMMAND: &str = "uname -sm";
+/// Fixed remote Unix command to detect OS, architecture, and macOS Rosetta 2 translation.
+pub const UNIX_PROBE_COMMAND: &str = "sh -c 's=$(uname -s); m=$(uname -m); if [ \"$s\" = Darwin ] && [ \"$m\" = x86_64 ] && [ \"$(sysctl -in sysctl.proc_translated 2>/dev/null || true)\" = 1 ]; then printf \"%s %s translated=1\\n\" \"$s\" \"$m\"; else printf \"%s %s\\n\" \"$s\" \"$m\"; fi'";
 
 /// Fixed remote Unix command to ensure `$HOME/.local/bin` exists before `scp`.
 pub const UNIX_PREPARE_DIR_COMMAND: &str = "sh -c 'mkdir -p \"$HOME/.local/bin\"'";
@@ -165,6 +165,9 @@ pub struct InstallResult {
     /// Whether this call was a dry run that left the remote machine untouched.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+    /// Optional platform note (for example Rosetta 2 native selection or Windows ARM64 emulation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Remote operating system, architecture, and release target detected over SSH.
@@ -178,6 +181,8 @@ pub struct DetectedPlatform {
     pub target: &'static str,
     /// Remote shell family used for install commands.
     pub remote_os: RemoteOs,
+    /// Optional explanation when selecting a native or emulated build (Rosetta 2 / Windows ARM64).
+    pub note: Option<&'static str>,
 }
 
 /// Result of parsing `uname -sm` (or `uname -srm` / `uname -a`) output.
@@ -814,8 +819,14 @@ pub fn parse_uname_output(output: &str) -> Result<UnameProbe, ErrorBody> {
     }
 
     // `uname -sm` yields `<sysname> <machine>`; `uname -srm` (including WSL kernels such as
-    // `Linux 5.15.153.1-microsoft-standard-WSL2 x86_64`) also puts `<machine>` last.
-    let arch_raw = tokens[tokens.len() - 1];
+    // `Linux 5.15.153.1-microsoft-standard-WSL2 x86_64`) also puts `<machine>` last; our probe
+    // appends `translated=1` on macOS running under Rosetta 2.
+    let (macos_translated, arch_raw) =
+        if tokens.len() >= 3 && tokens[tokens.len() - 1] == "translated=1" {
+            (true, tokens[tokens.len() - 2])
+        } else {
+            (false, tokens[tokens.len() - 1])
+        };
     let os = match sysname {
         "Linux" => "linux",
         "Darwin" => "macos",
@@ -829,12 +840,13 @@ pub fn parse_uname_output(output: &str) -> Result<UnameProbe, ErrorBody> {
     };
 
     let arch = normalize_unix_arch(arch_raw, os)?;
-    let target = target_triple_for(os, arch)?;
+    let resolved = resolve_target_for(os, arch, macos_translated)?;
     Ok(UnameProbe::Detected(DetectedPlatform {
         os,
-        arch,
-        target,
+        arch: resolved.arch,
+        target: resolved.target,
         remote_os: RemoteOs::Unix,
+        note: resolved.note,
     }))
 }
 
@@ -911,12 +923,13 @@ pub fn parse_powershell_probe(output: &str) -> Result<DetectedPlatform, ErrorBod
         }
     };
 
-    let target = target_triple_for("windows", arch)?;
+    let resolved = resolve_target_for("windows", arch, false)?;
     Ok(DetectedPlatform {
         os: "windows",
-        arch,
-        target,
+        arch: resolved.arch,
+        target: resolved.target,
         remote_os: RemoteOs::Windows,
+        note: resolved.note,
     })
 }
 
@@ -1105,6 +1118,7 @@ async fn run_fleet_install_with_key(
             path: remote_display_path,
             source: Some(source_desc),
             dry_run: true,
+            note: platform.note.map(str::to_owned),
         });
     }
 
@@ -1377,6 +1391,7 @@ async fn run_fleet_install_with_key(
         path: remote_display_path,
         source: None,
         dry_run: false,
+        note: platform.note.map(str::to_owned),
     })
 }
 
@@ -1696,6 +1711,7 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         assert_eq!(
@@ -1705,6 +1721,7 @@ mod tests {
                 arch: "aarch64",
                 target: "aarch64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         // Apple Silicon macOS
@@ -1715,6 +1732,7 @@ mod tests {
                 arch: "aarch64",
                 target: "aarch64-apple-darwin",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         // Intel macOS
@@ -1725,8 +1743,19 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-apple-darwin",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
+        // Apple Silicon macOS under Rosetta 2 selects native aarch64 with an explicit note
+        let rosetta = match parse_uname_output("Darwin x86_64 translated=1\n").unwrap() {
+            UnameProbe::Detected(p) => p,
+            UnameProbe::WindowsShellLayer => panic!("expected Darwin"),
+        };
+        assert_eq!(rosetta.os, "macos");
+        assert_eq!(rosetta.arch, "aarch64");
+        assert_eq!(rosetta.target, "aarch64-apple-darwin");
+        assert!(rosetta.note.unwrap().contains("Rosetta 2"));
+        assert!(UNIX_PROBE_COMMAND.contains("sysctl.proc_translated"));
         // WSL2 outputs Linux x86_64 / Linux <microsoft-standard-WSL2> x86_64
         assert_eq!(
             parse_uname_output("Linux 5.15.153.1-microsoft-standard-WSL2 x86_64\n").unwrap(),
@@ -1735,6 +1764,7 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         assert_eq!(
@@ -1744,6 +1774,7 @@ mod tests {
                 arch: "aarch64",
                 target: "aarch64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         // Git Bash / MSYS2 / Cygwin on Windows triggers PowerShell fallback
@@ -1769,6 +1800,7 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-pc-windows-msvc",
                 remote_os: RemoteOs::Windows,
+                note: None,
             }
         );
         assert_eq!(
@@ -1778,11 +1810,15 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-pc-windows-msvc",
                 remote_os: RemoteOs::Windows,
+                note: None,
             }
         );
-        let arm64 = parse_powershell_probe("LEGION_OS=windows Arm64\r\n").unwrap_err();
-        assert_eq!(arm64.code, ErrorCode::Unsupported);
-        assert!(arm64.message.contains("ARM64"), "{}", arm64.message);
+        // Windows ARM64 honestly selects x86_64 under emulation with an explicit note.
+        let arm64 = parse_powershell_probe("LEGION_OS=windows Arm64\r\n").unwrap();
+        assert_eq!(arm64.os, "windows");
+        assert_eq!(arm64.arch, "x86_64");
+        assert_eq!(arm64.target, "x86_64-pc-windows-msvc");
+        assert!(arm64.note.unwrap().contains("emulation"));
 
         let x86 = parse_powershell_probe("LEGION_OS=windows X86\r\n").unwrap_err();
         assert_eq!(x86.code, ErrorCode::Unsupported);

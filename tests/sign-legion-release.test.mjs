@@ -155,3 +155,12 @@ test('install/legion.sh wraps execution in main() and refuses a directory destin
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('install scripts handle Rosetta 2 on macOS and honest x64 emulation on Windows ARM64', () => {
+  const sh = fs.readFileSync(new URL('../install/legion.sh', import.meta.url), 'utf8');
+  assert.match(sh, /sysctl\.proc_translated/);
+  assert.match(sh, /Rosetta 2 translation detected/);
+
+  const ps1 = fs.readFileSync(new URL('../install/legion.ps1', import.meta.url), 'utf8');
+  assert.match(ps1, /'ARM64'\s*\{[\s\S]*Write-Warning[\s\S]*x86_64-pc-windows-msvc/);
+});
