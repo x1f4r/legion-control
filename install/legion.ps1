@@ -19,6 +19,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 # Windows PowerShell 5.1 defaults to TLS 1.0/1.1, which GitHub rejects.
 if ($PSVersionTable.PSVersion.Major -lt 6) {

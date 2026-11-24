@@ -101,3 +101,18 @@ test('legion release workflow enforces main ancestry, --latest=false, and --prer
   assert.match(workflow, /gh release edit legion-vX\.Y\.Z --draft=false --latest=false/);
   assert.doesNotMatch(workflow, /actions\/cache/);
 });
+
+test('install scripts enforce HTTPS-only TLS 1.2 downloads and silent PowerShell progress', () => {
+  const sh = fs.readFileSync(new URL('../install/legion.sh', import.meta.url), 'utf8');
+  assert.match(sh, /--proto '=https'/);
+  assert.match(sh, /--proto-redir '=https'/);
+  assert.match(sh, /--tlsv1\.2/);
+  assert.match(sh, /--max-time 120/);
+  assert.match(sh, /--https-only/);
+  assert.match(sh, /--secure-protocol=TLSv1_2/);
+  assert.match(sh, /require_hardened_wget/);
+
+  const ps1 = fs.readFileSync(new URL('../install/legion.ps1', import.meta.url), 'utf8');
+  assert.match(ps1, /\$ProgressPreference\s*=\s*'SilentlyContinue'/);
+  assert.match(ps1, /Tls12/);
+});

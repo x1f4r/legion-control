@@ -51,11 +51,13 @@ const OLD_BINARY_MARKER: &str = ".old.";
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fixed PowerShell snippet for fetching the GitHub releases JSON without interpolating any input.
-const PS_FETCH_API_SCRIPT: &str = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; \
+const PS_FETCH_API_SCRIPT: &str = "$ProgressPreference = 'SilentlyContinue'; \
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; \
 (Invoke-WebRequest -Uri $env:LEGION_DOWNLOAD_URL -Headers @{ 'Accept'='application/vnd.github+json'; 'User-Agent'='legion' } -UseBasicParsing).Content";
 
 /// Fixed PowerShell snippet for downloading one URL into `$env:LEGION_DOWNLOAD_DEST`.
-const PS_DOWNLOAD_FILE_SCRIPT: &str = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; \
+const PS_DOWNLOAD_FILE_SCRIPT: &str = "$ProgressPreference = 'SilentlyContinue'; \
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; \
 Invoke-WebRequest -Uri $env:LEGION_DOWNLOAD_URL -OutFile $env:LEGION_DOWNLOAD_DEST -Headers @{ 'User-Agent'='legion' } -UseBasicParsing";
 
 /// Registers `meta.update` on `registry`.
@@ -1099,25 +1101,61 @@ async fn run_meta_update_with_key(
     })
 }
 
+fn curl_api_args(url: &str) -> [&str; 20] {
+    [
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--tlsv1.2",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--retry",
+        "2",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "30",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: legion",
+        url,
+    ]
+}
+
+fn curl_download_args<'a>(url: &'a str, dest_str: &'a str) -> [&'a str; 20] {
+    [
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--tlsv1.2",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--retry",
+        "2",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "120",
+        "-H",
+        "User-Agent: legion",
+        "-o",
+        dest_str,
+        url,
+    ]
+}
+
 async fn fetch_api_text(url: &str, cancel: CancellationToken) -> Result<String, ErrorBody> {
-    let curl_opts = RunOptions::new(CommandSpec::argv(
-        "curl",
-        [
-            "-fsSL",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "15",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: legion",
-            url,
-        ],
-    ))
-    .c_locale()
-    .timeout(API_TIMEOUT)
-    .cancel(cancel.clone());
+    let curl_opts = RunOptions::new(CommandSpec::argv("curl", curl_api_args(url)))
+        .c_locale()
+        .timeout(API_TIMEOUT)
+        .cancel(cancel.clone());
 
     match run(curl_opts).await {
         Ok(output) => check_download_output("curl", url, output).map(|out| out.stdout.text),
@@ -1167,24 +1205,10 @@ async fn download_url_to_file(
             format!("Download path {} is not valid UTF-8.", dest.display()),
         )
     })?;
-    let curl_opts = RunOptions::new(CommandSpec::argv(
-        "curl",
-        [
-            "-fsSL",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "15",
-            "-H",
-            "User-Agent: legion",
-            "-o",
-            dest_str,
-            url,
-        ],
-    ))
-    .c_locale()
-    .timeout(DOWNLOAD_TIMEOUT)
-    .cancel(cancel.clone());
+    let curl_opts = RunOptions::new(CommandSpec::argv("curl", curl_download_args(url, dest_str)))
+        .c_locale()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .cancel(cancel.clone());
 
     match run(curl_opts).await {
         Ok(output) => {
@@ -1958,5 +1982,28 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn download_commands_enforce_https_tls12_and_silent_powershell_progress() {
+        let api = curl_api_args("https://api.github.com/repos/example/repo/releases");
+        assert!(api.windows(2).any(|w| w == ["--proto", "=https"]));
+        assert!(api.windows(2).any(|w| w == ["--proto-redir", "=https"]));
+        assert!(api.contains(&"--tlsv1.2"));
+        assert!(api.windows(2).any(|w| w == ["--max-time", "30"]));
+
+        let dl = curl_download_args(
+            "https://github.com/example/repo/releases/download/a/b",
+            "/tmp/out",
+        );
+        assert!(dl.windows(2).any(|w| w == ["--proto", "=https"]));
+        assert!(dl.windows(2).any(|w| w == ["--proto-redir", "=https"]));
+        assert!(dl.contains(&"--tlsv1.2"));
+        assert!(dl.windows(2).any(|w| w == ["--max-time", "120"]));
+
+        assert!(PS_FETCH_API_SCRIPT.contains("$ProgressPreference = 'SilentlyContinue'"));
+        assert!(PS_FETCH_API_SCRIPT.contains("Tls12"));
+        assert!(PS_DOWNLOAD_FILE_SCRIPT.contains("$ProgressPreference = 'SilentlyContinue'"));
+        assert!(PS_DOWNLOAD_FILE_SCRIPT.contains("Tls12"));
     }
 }

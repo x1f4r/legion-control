@@ -96,15 +96,29 @@ normalize_version() {
   printf '%s' "$raw"
 }
 
+require_hardened_wget() {
+  wget_help="$(wget --help 2>&1 || true)"
+  case "$wget_help" in
+    *--https-only*--secure-protocol*|*--secure-protocol*--https-only*) ;;
+    *)
+      die "This wget does not support --https-only and --secure-protocol (for example BusyBox wget); install curl or GNU wget, or pass --from <file>."
+      ;;
+  esac
+}
+
 fetch_to_file() {
   url="$1"
   out_path="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 2 --connect-timeout 15 \
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --fail --silent --show-error --location \
+      --retry 2 --connect-timeout 15 --max-time 120 \
       -H 'User-Agent: legion-installer' \
       -o "$out_path" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q --timeout=15 -U 'legion-installer' -O "$out_path" "$url"
+    require_hardened_wget
+    wget -q --https-only --secure-protocol=TLSv1_2 --timeout=15 --tries=3 \
+      -U 'legion-installer' -O "$out_path" "$url"
   else
     die "Neither curl nor wget is installed; install one of them or pass --from <file>."
   fi
@@ -113,12 +127,16 @@ fetch_to_file() {
 fetch_text() {
   url="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 2 --connect-timeout 15 \
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+      --fail --silent --show-error --location \
+      --retry 2 --connect-timeout 15 --max-time 30 \
       -H 'Accept: application/vnd.github+json' \
       -H 'User-Agent: legion-installer' \
       "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --timeout=15 --header='Accept: application/vnd.github+json' \
+    require_hardened_wget
+    wget -qO- --https-only --secure-protocol=TLSv1_2 --timeout=15 --tries=3 \
+      --header='Accept: application/vnd.github+json' \
       -U 'legion-installer' "$url"
   else
     die "Neither curl nor wget is installed; install one of them or pass --from <file>."
