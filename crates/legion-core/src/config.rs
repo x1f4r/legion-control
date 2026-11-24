@@ -7,7 +7,7 @@
 //! with [`write_atomically`], so a reader never sees one half written.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,10 @@ use legion_proto::{ErrorBody, ErrorCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
+
+mod power;
+
+pub use power::{BootTarget, BusyConfig, BusyProbe, DEFAULT_PROBE_S, LONGEST_PROBE_S, PowerConfig};
 
 /// A configuration file with a fixed name in the configuration directory.
 ///
@@ -282,8 +286,9 @@ fn line_and_column(bytes: &[u8], offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// `node.toml`: what this node calls itself and node-wide settings. Later milestones add its boot
-/// targets and busy probes.
+/// `node.toml`: what this node calls itself and node-wide settings, including what keeps the
+/// machine busy and how it sleeps and restarts (see [`BusyConfig`], [`PowerConfig`] and
+/// [`BootTarget`]).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeFile {
@@ -293,6 +298,20 @@ pub struct NodeFile {
     /// Settings for the `svc` tool family.
     #[serde(default)]
     pub svc: SvcConfig,
+    /// Which system of this machine this is, such as `linux` or `windows`. `hello` reports it, so
+    /// a machine that was restarted into another system says which one answered.
+    #[serde(default)]
+    pub system: Option<NodeName>,
+    /// What keeps this machine busy; absent leaves it unmonitored, which blocks unattended power
+    /// changes.
+    #[serde(default)]
+    pub busy: Option<BusyConfig>,
+    /// `[power]`: how this machine sleeps and whether system actions use `sudo`.
+    #[serde(default)]
+    pub power: PowerConfig,
+    /// `[boot.<name>]`: the systems this machine can restart into, by name.
+    #[serde(default)]
+    pub boot: BTreeMap<String, BootTarget>,
 }
 
 /// The `[svc]` table of `node.toml`: how the node controls system services.
@@ -311,6 +330,10 @@ impl Document for NodeFile {
     const FILE: &'static str = "node.toml";
     // Its default is the host's name, which grants nothing.
     const EMPTY_IS_DEFAULT: bool = true;
+
+    fn validate(&self) -> Result<(), String> {
+        power::validate(self.busy.as_ref(), &self.power, &self.boot)
+    }
 }
 
 impl NodeFile {
@@ -612,5 +635,124 @@ mod tests {
             parse::<NodeFile>(Path::new("node.toml"), b"[svc]\nroot = true\n").unwrap_err();
         assert!(unknown.message.contains("line 2"), "{}", unknown.message);
         assert!(unknown.message.contains("root"), "{}", unknown.message);
+    }
+
+    fn node(text: &str) -> Result<NodeFile, ErrorBody> {
+        parse::<NodeFile>(Path::new("node.toml"), text.as_bytes())
+    }
+
+    #[test]
+    fn node_toml_reads_the_power_settings_it_documents() {
+        let file = node(
+            r#"
+system = "linux"
+
+[[busy.probes]]
+name = "render"
+run = ["pgrep", "-x", "blender"]
+
+[[busy.probes]]
+name = "backup"
+run = ["backup-running"]
+timeout_s = 20
+
+[power]
+sudo = true
+sleep = ["systemctl", "hibernate"]
+before_sleep = [["stop-keepawake"], ["sync"]]
+
+[boot.windows]
+efi_label = "Windows Boot Manager"
+
+[boot.other]
+arm = ["sudo", "-n", "grub-reboot", "Other"]
+verify = ["check-next-entry", "Other"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(file.system.as_ref().map(NodeName::as_str), Some("linux"));
+        let Some(BusyConfig::Probes(probes)) = &file.busy else {
+            panic!("{:?}", file.busy)
+        };
+        assert_eq!(probes[0].name, "render");
+        assert_eq!(probes[0].timeout_s, DEFAULT_PROBE_S);
+        assert_eq!(probes[1].timeout_s, 20);
+        assert!(file.power.sudo);
+        assert_eq!(
+            file.power.sleep.as_deref(),
+            Some(&["systemctl".to_owned(), "hibernate".to_owned()][..])
+        );
+        assert_eq!(file.power.before_sleep.len(), 2);
+        assert_eq!(
+            file.boot.get("windows"),
+            Some(&BootTarget::EfiLabel("Windows Boot Manager".to_owned()))
+        );
+        assert!(matches!(
+            file.boot.get("other"),
+            Some(BootTarget::Commands { .. })
+        ));
+
+        let never = node("busy = \"none\"\n").unwrap();
+        assert_eq!(never.busy, Some(BusyConfig::Never));
+        let unmonitored = node("").unwrap();
+        assert_eq!(unmonitored.busy, None);
+        assert!(unmonitored.boot.is_empty());
+        assert!(!unmonitored.power.sudo);
+    }
+
+    #[test]
+    fn node_toml_refuses_power_settings_that_would_mislead() {
+        let cases: &[(&str, &str)] = &[
+            ("busy = \"idle\"\n", "busy = \"none\""),
+            ("busy = true\n", "busy"),
+            ("[busy]\nprobes = []\n", "busy.probes is empty"),
+            ("[busy]\nprobe = []\n", "probe"),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = []\n",
+                "busy.probes[0].run",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\ntimeout_s = 0\n",
+                "timeout_s",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\ntimeout_s = 61\n",
+                "timeout_s",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\n[[busy.probes]]\nname = \"a\"\nrun = [\"y\"]\n",
+                "already called",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\ncommand = [\"y\"]\n",
+                "command",
+            ),
+            ("[power]\nsleep = []\n", "power.sleep"),
+            (
+                "[power]\nbefore_sleep = [[\"\"]]\n",
+                "power.before_sleep[0]",
+            ),
+            ("[power]\nsudo = \"yes\"\n", "line 2"),
+            ("[boot.windows]\narm = [\"x\"]\n", "verify"),
+            ("[boot.windows]\nverify = [\"x\"]\n", "arm"),
+            (
+                "[boot.windows]\nefi_label = \"W\"\narm = [\"x\"]\nverify = [\"y\"]\n",
+                "not both",
+            ),
+            ("[boot.windows]\n", "efi_label"),
+            ("[boot.windows]\nefi_label = \" \"\n", "empty"),
+            ("[boot.Windows]\nefi_label = \"W\"\n", "boot.Windows"),
+            ("[boot.windows]\nefi_lable = \"W\"\n", "efi_lable"),
+            ("system = \"Linux\"\n", "line 1"),
+        ];
+        for (text, expected) in cases {
+            let error = node(text).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Failed, "{text}");
+            assert!(
+                error.message.contains(expected),
+                "{text:?}: {}",
+                error.message
+            );
+        }
     }
 }
