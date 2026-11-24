@@ -1640,6 +1640,7 @@ mod tests {
                 serde_json::to_value(HelloResult {
                     node: "pi".to_owned(),
                     version: "0.1.0".to_owned(),
+                    build: None,
                     protocol: PROTOCOL,
                     os: "linux".to_owned(),
                     arch: "x86_64".to_owned(),

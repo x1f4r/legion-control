@@ -7,7 +7,7 @@ use std::io;
 use std::path::Path;
 
 use legion_core::proto::{Effect, PROTOCOL};
-use legion_core::{Ctx, Door, NoArgs, Registry, ToolError, VERSION};
+use legion_core::{BUILD, Ctx, Door, NoArgs, Registry, ToolError, VERSION};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,9 @@ pub struct Version {
     pub name: &'static str,
     /// The version of legion.
     pub version: &'static str,
+    /// The source revision of legion, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<&'static str>,
     /// The protocol it speaks.
     pub protocol: u32,
     /// The node's name.
@@ -62,6 +65,7 @@ async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
     Ok(Version {
         name: "legion",
         version: VERSION,
+        build: BUILD,
         protocol: PROTOCOL,
         node: ctx.node_name().to_owned(),
         os: ctx.os(),

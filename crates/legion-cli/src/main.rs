@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use legion_core::proto::{ErrorBody, ErrorCode, Target, ToolsResult};
 use legion_core::{
-    CANCEL_GRACE, Call, CancellationToken, Door, EventSink, Node, Paths, RouteOutcome, Router,
-    VERSION,
+    BUILD, CANCEL_GRACE, Call, CancellationToken, Door, EventSink, Node, Paths, RouteOutcome,
+    Router, VERSION, format_version_line,
 };
 use legion_doors::mcp::{self, McpDoor};
 use legion_net::stream::Host;
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
     };
     match command {
         Command::Version => {
-            out(&format!("legion {VERSION}\n"));
+            out(&format!("{}\n", format_version_line(VERSION, BUILD)));
             ExitCode::SUCCESS
         }
         Command::Help { tool: None, .. } => {

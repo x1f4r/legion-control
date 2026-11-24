@@ -98,6 +98,9 @@ pub struct UpdateResult {
     pub previous_version: String,
     /// Version installed (or planned when `dry_run` is true).
     pub installed_version: String,
+    /// Source revision reported by the newly installed binary, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// Release target triple selected for this node.
     pub target: String,
     /// Path to the executable that was (or would be) replaced.
@@ -699,18 +702,48 @@ pub fn prev_binary_path(target_exe: &Path) -> Option<PathBuf> {
     Some(parent.join(format!("{file_name}.prev")))
 }
 
-/// Parses `legion --version` output (`"legion 0.2.0"`) into the bare version string.
-pub fn parse_legion_version_output(output: &str) -> Option<String> {
+/// Parsed version and optional build string from `legion --version` output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedVersion {
+    /// Bare semantic version string (for example `"0.1.0"`).
+    pub version: String,
+    /// Optional build revision inside trailing parentheses (for example `"a59ec0d12345"` or
+    /// `"a59ec0d12345, modified"`).
+    pub build: Option<String>,
+}
+
+/// Parses `legion --version` output in either the old (`"legion 0.2.0"`) or new
+/// (`"legion 0.2.0 (a59ec0d12345[, modified])"`) form into a [`ParsedVersion`].
+pub fn parse_legion_version_line(output: &str) -> Option<ParsedVersion> {
     for line in output.lines().rev() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("legion ") {
-            let ver = rest.split_whitespace().next().unwrap_or("");
+            let rest = rest.trim_start();
+            let (ver, tail) = match rest.find(char::is_whitespace) {
+                Some(idx) => (&rest[..idx], rest[idx..].trim()),
+                None => (rest, ""),
+            };
             if !ver.is_empty() && normalize_version(ver).is_ok() {
-                return Some(ver.to_owned());
+                let build = tail
+                    .strip_prefix('(')
+                    .and_then(|inner| inner.strip_suffix(')'))
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_owned);
+                return Some(ParsedVersion {
+                    version: ver.to_owned(),
+                    build,
+                });
             }
         }
     }
     None
+}
+
+/// Parses `legion --version` output (`"legion 0.2.0"` or `"legion 0.2.0 (<rev>[, modified])"`)
+/// into the bare version string.
+pub fn parse_legion_version_output(output: &str) -> Option<String> {
+    parse_legion_version_line(output).map(|parsed| parsed.version)
 }
 
 /// Resolves and validates a local `from` binary path (absolute or starting with `~`), ensuring it
@@ -774,11 +807,12 @@ fn expand_local_path(paths: &Paths, raw: &str) -> Result<PathBuf, ErrorBody> {
     Ok(resolved)
 }
 
-/// Runs `binary --version` with a bounded timeout and parses the reported bare version string.
+/// Runs `binary --version` with a bounded timeout and parses the reported version and optional
+/// build revision.
 pub async fn probe_binary_version(
     binary: &Path,
     cancel: CancellationToken,
-) -> Result<String, ErrorBody> {
+) -> Result<ParsedVersion, ErrorBody> {
     let options = RunOptions::new(CommandSpec::argv(binary, ["--version"]))
         .c_locale()
         .timeout(PREFLIGHT_TIMEOUT)
@@ -825,7 +859,7 @@ pub async fn probe_binary_version(
         )
         .with_hint("Nothing was replaced."));
     }
-    parse_legion_version_output(&output.stdout.text).ok_or_else(|| {
+    parse_legion_version_line(&output.stdout.text).ok_or_else(|| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!(
@@ -845,16 +879,20 @@ pub async fn verify_staged_binary_version(
     cancel: CancellationToken,
 ) -> Result<(), ErrorBody> {
     let reported = probe_binary_version(staged, cancel).await?;
-    let matches = match (SemVer::parse(&reported), SemVer::parse(expected_version)) {
+    let matches = match (
+        SemVer::parse(&reported.version),
+        SemVer::parse(expected_version),
+    ) {
         (Ok(a), Ok(b)) => a == b,
-        _ => reported == expected_version,
+        _ => reported.version == expected_version,
     };
     if !matches {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
-                "Staged binary {} reported version {reported}, expected {expected_version}.",
-                staged.display()
+                "Staged binary {} reported version {}, expected {expected_version}.",
+                staged.display(),
+                reported.version
             ),
         )
         .with_hint("Nothing was replaced."));
@@ -1150,7 +1188,7 @@ trait BinaryProber: Send + Sync {
         &'a self,
         binary: &'a Path,
         cancel: CancellationToken,
-    ) -> BoxFuture<'a, Result<String, ErrorBody>>;
+    ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>>;
 }
 
 struct SystemProber;
@@ -1160,7 +1198,7 @@ impl BinaryProber for SystemProber {
         &'a self,
         binary: &'a Path,
         cancel: CancellationToken,
-    ) -> BoxFuture<'a, Result<String, ErrorBody>> {
+    ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>> {
         Box::pin(async move { probe_binary_version(binary, cancel).await })
     }
 }
@@ -1310,27 +1348,28 @@ async fn run_meta_update_inner(
         verify_binary_matches_target(&local_bin, target)?;
 
         if args.dry_run {
-            let planned_version = if let Some(prober) = prober {
+            let (planned_version, planned_build) = if let Some(prober) = prober {
                 match prober.probe(&local_bin, cancel).await {
-                    Ok(ver) => {
-                        let semver = SemVer::parse(&ver)?;
+                    Ok(parsed) => {
+                        let semver = SemVer::parse(&parsed.version)?;
                         check_version_transition(
                             &semver,
                             current_semver.as_ref(),
                             &floor_path,
                             args.allow_downgrade,
                         )?;
-                        ver
+                        (parsed.version, parsed.build)
                     }
                     Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
-                    Err(_) => "local".to_owned(),
+                    Err(_) => ("local".to_owned(), None),
                 }
             } else {
-                "local".to_owned()
+                ("local".to_owned(), None)
             };
             return Ok(UpdateResult {
                 previous_version: current_version.to_owned(),
                 installed_version: planned_version,
+                build: planned_build,
                 target: target.to_owned(),
                 path: current_exe.display().to_string(),
                 dry_run: true,
@@ -1351,14 +1390,17 @@ async fn run_meta_update_inner(
             )
         })??;
 
-        let reported_version = match prober {
+        let reported = match prober {
             Some(prober) => prober.probe(&staged_guard.path, cancel.clone()).await?,
-            None => "local".to_owned(),
+            None => ParsedVersion {
+                version: "local".to_owned(),
+                build: None,
+            },
         };
-        let desired_semver = if reported_version == "local" && prober.is_none() {
+        let desired_semver = if reported.version == "local" && prober.is_none() {
             None
         } else {
-            let semver = SemVer::parse(&reported_version)?;
+            let semver = SemVer::parse(&reported.version)?;
             check_version_transition(
                 &semver,
                 current_semver.as_ref(),
@@ -1380,17 +1422,22 @@ async fn run_meta_update_inner(
             )
         })??;
 
-        let installed_version = if let Some(prober) = prober {
+        let installed = if let Some(prober) = prober {
             match prober.probe(&current_exe, cancel).await {
-                Ok(ver) if versions_match(&ver, &reported_version) => ver,
-                Ok(ver) => {
+                Ok(parsed) if versions_match(&parsed.version, &reported.version) => ParsedVersion {
+                    version: parsed.version,
+                    build: parsed.build.or(reported.build),
+                },
+                Ok(parsed) => {
                     let rollback_note =
                         attempt_local_rollback(&current_exe, rename_old_first).await;
                     return Err(ErrorBody::new(
                         ErrorCode::Failed,
                         format!(
-                            "Replaced {} with legion {reported_version}, but running it reported version {ver}.{rollback_note}",
-                            current_exe.display()
+                            "Replaced {} with legion {}, but running it reported version {}.{rollback_note}",
+                            current_exe.display(),
+                            reported.version,
+                            parsed.version
                         ),
                     ));
                 }
@@ -1408,7 +1455,7 @@ async fn run_meta_update_inner(
                 }
             }
         } else {
-            reported_version
+            reported
         };
 
         if let Some(semver) = desired_semver {
@@ -1417,7 +1464,8 @@ async fn run_meta_update_inner(
 
         return Ok(UpdateResult {
             previous_version: current_version.to_owned(),
-            installed_version,
+            installed_version: installed.version,
+            build: installed.build,
             target: target.to_owned(),
             path: current_exe.display().to_string(),
             dry_run: false,
@@ -1444,6 +1492,7 @@ async fn run_meta_update_inner(
         return Ok(UpdateResult {
             previous_version: current_version.to_owned(),
             installed_version: desired_version,
+            build: None,
             target: target.to_owned(),
             path: current_exe.display().to_string(),
             dry_run: args.dry_run,
@@ -1463,6 +1512,7 @@ async fn run_meta_update_inner(
         return Ok(UpdateResult {
             previous_version: current_version.to_owned(),
             installed_version: desired_version,
+            build: None,
             target: target.to_owned(),
             path: current_exe.display().to_string(),
             dry_run: true,
@@ -1496,18 +1546,21 @@ async fn run_meta_update_inner(
         )
     })??;
 
+    let mut installed_build = None;
     if let Some(prober) = prober {
         let reported = prober.probe(&staged_guard.path, cancel.clone()).await?;
-        if !versions_match(&reported, &desired_version) {
+        if !versions_match(&reported.version, &desired_version) {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
-                    "Staged binary {} reported version {reported}, expected {desired_version}.",
-                    staged_guard.path.display()
+                    "Staged binary {} reported version {}, expected {desired_version}.",
+                    staged_guard.path.display(),
+                    reported.version
                 ),
             )
             .with_hint("Nothing was replaced."));
         }
+        installed_build = reported.build;
     }
 
     let target_exe_commit = current_exe.clone();
@@ -1524,14 +1577,19 @@ async fn run_meta_update_inner(
 
     if let Some(prober) = prober {
         match prober.probe(&current_exe, cancel).await {
-            Ok(ver) if versions_match(&ver, &desired_version) => {}
-            Ok(ver) => {
+            Ok(parsed) if versions_match(&parsed.version, &desired_version) => {
+                if parsed.build.is_some() {
+                    installed_build = parsed.build;
+                }
+            }
+            Ok(parsed) => {
                 let rollback_note = attempt_local_rollback(&current_exe, rename_old_first).await;
                 return Err(ErrorBody::new(
                     ErrorCode::Failed,
                     format!(
-                        "Replaced {} with legion {desired_version}, but running it reported version {ver}.{rollback_note}",
-                        current_exe.display()
+                        "Replaced {} with legion {desired_version}, but running it reported version {}.{rollback_note}",
+                        current_exe.display(),
+                        parsed.version
                     ),
                 ));
             }
@@ -1554,6 +1612,7 @@ async fn run_meta_update_inner(
     Ok(UpdateResult {
         previous_version: current_version.to_owned(),
         installed_version: desired_version,
+        build: installed_build,
         target: target.to_owned(),
         path: current_exe.display().to_string(),
         dry_run: false,
@@ -2516,11 +2575,11 @@ mod tests {
     }
 
     struct ScriptedProber {
-        outcomes: std::sync::Mutex<std::collections::VecDeque<Result<String, ErrorBody>>>,
+        outcomes: std::sync::Mutex<std::collections::VecDeque<Result<ParsedVersion, ErrorBody>>>,
     }
 
     impl ScriptedProber {
-        fn new(outcomes: Vec<Result<String, ErrorBody>>) -> Self {
+        fn new(outcomes: Vec<Result<ParsedVersion, ErrorBody>>) -> Self {
             Self {
                 outcomes: std::sync::Mutex::new(outcomes.into()),
             }
@@ -2532,7 +2591,7 @@ mod tests {
             &'a self,
             _binary: &'a Path,
             _cancel: CancellationToken,
-        ) -> BoxFuture<'a, Result<String, ErrorBody>> {
+        ) -> BoxFuture<'a, Result<ParsedVersion, ErrorBody>> {
             Box::pin(async move {
                 self.outcomes
                     .lock()
@@ -2543,6 +2602,38 @@ mod tests {
                     })
             })
         }
+    }
+
+    #[test]
+    fn parse_legion_version_accepts_old_and_new_forms() {
+        assert_eq!(
+            parse_legion_version_line("legion 0.1.0\n"),
+            Some(ParsedVersion {
+                version: "0.1.0".to_owned(),
+                build: None,
+            })
+        );
+        assert_eq!(
+            parse_legion_version_line("legion 0.1.0 (a59ec0d12345)\n"),
+            Some(ParsedVersion {
+                version: "0.1.0".to_owned(),
+                build: Some("a59ec0d12345".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_legion_version_line(
+                "MOTD banner\r\nlegion 0.2.0-rc.1 (a59ec0d12345, modified)\r\n"
+            ),
+            Some(ParsedVersion {
+                version: "0.2.0-rc.1".to_owned(),
+                build: Some("a59ec0d12345, modified".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_legion_version_output("legion 0.1.0 (a59ec0d12345, modified)\n").as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(parse_legion_version_line("not legion\n"), None);
     }
 
     #[tokio::test]
@@ -2649,8 +2740,12 @@ mod tests {
         assert!(wrong_arch_err.message.contains("aarch64"));
         assert_eq!(fs::read(&exe).unwrap(), original);
 
-        // 4. Dry run reports planned version without modifying exe, .prev, or downloads.
-        let dry_prober = ScriptedProber::new(vec![Ok("0.3.0".to_owned())]);
+        // 4. Dry run reports planned version and build without modifying exe, .prev, or downloads.
+        let parsed_030 = || ParsedVersion {
+            version: "0.3.0".to_owned(),
+            build: Some("a59ec0d12345".to_owned()),
+        };
+        let dry_prober = ScriptedProber::new(vec![Ok(parsed_030())]);
         let dry = run_meta_update_inner(
             &paths,
             &fetcher,
@@ -2673,12 +2768,16 @@ mod tests {
         .unwrap();
         assert!(dry.dry_run && !dry.updated);
         assert_eq!(dry.installed_version, "0.3.0");
+        assert_eq!(dry.build.as_deref(), Some("a59ec0d12345"));
         assert_eq!(fetcher.download_count(), 0);
         assert_eq!(fs::read(&exe).unwrap(), original);
         assert!(!prev_binary_path(&exe).unwrap().exists());
 
         // 5. Downgrade via `from` is refused unless `allow_downgrade` is set.
-        let down_prober = ScriptedProber::new(vec![Ok("0.1.0".to_owned())]);
+        let down_prober = ScriptedProber::new(vec![Ok(ParsedVersion {
+            version: "0.1.0".to_owned(),
+            build: None,
+        })]);
         let down_err = run_meta_update_inner(
             &paths,
             &fetcher,
@@ -2704,7 +2803,7 @@ mod tests {
 
         // 6. If the newly placed binary fails to run after swap, `.prev` is restored automatically.
         let rollback_prober = ScriptedProber::new(vec![
-            Ok("0.3.0".to_owned()),
+            Ok(parsed_030()),
             Err(ErrorBody::new(
                 ErrorCode::Failed,
                 "exec failed after commit",
@@ -2738,8 +2837,9 @@ mod tests {
         );
         assert_eq!(fs::read(&exe).unwrap(), original);
 
-        // 7. Successful local install saves `.prev`, replaces `exe`, and commits the version floor.
-        let ok_prober = ScriptedProber::new(vec![Ok("0.3.0".to_owned()), Ok("0.3.0".to_owned())]);
+        // 7. Successful local install saves `.prev`, replaces `exe`, reports `build`, and commits
+        // the version floor.
+        let ok_prober = ScriptedProber::new(vec![Ok(parsed_030()), Ok(parsed_030())]);
         let ok = run_meta_update_inner(
             &paths,
             &fetcher,
@@ -2763,6 +2863,7 @@ mod tests {
         assert!(ok.updated && !ok.dry_run);
         assert_eq!(ok.previous_version, "0.2.0");
         assert_eq!(ok.installed_version, "0.3.0");
+        assert_eq!(ok.build.as_deref(), Some("a59ec0d12345"));
         assert_eq!(fetcher.download_count(), 0);
         assert_eq!(fs::read(&exe).unwrap(), local_bytes);
         assert_eq!(fs::read(prev_binary_path(&exe).unwrap()).unwrap(), original);
@@ -2772,8 +2873,11 @@ mod tests {
         );
 
         // 8. Downgrade below the recorded floor with `from` succeeds when `allow_downgrade=true`.
-        let allow_prober =
-            ScriptedProber::new(vec![Ok("0.1.0".to_owned()), Ok("0.1.0".to_owned())]);
+        let parsed_010 = || ParsedVersion {
+            version: "0.1.0".to_owned(),
+            build: None,
+        };
+        let allow_prober = ScriptedProber::new(vec![Ok(parsed_010()), Ok(parsed_010())]);
         let downgraded = run_meta_update_inner(
             &paths,
             &fetcher,
@@ -2796,6 +2900,7 @@ mod tests {
         .unwrap();
         assert!(downgraded.updated);
         assert_eq!(downgraded.installed_version, "0.1.0");
+        assert_eq!(downgraded.build, None);
         assert_eq!(
             crate::floor::read_floor(&node_floor_path(&paths)),
             crate::floor::FloorState::Recorded(SemVer::parse("0.1.0").unwrap())

@@ -207,6 +207,7 @@ fn hello() {
         HelloResult {
             node: "tower".into(),
             version: "0.1.0".into(),
+            build: None,
             protocol: 1,
             os: "linux".into(),
             arch: "x86_64".into(),
@@ -227,6 +228,7 @@ fn hello() {
         HelloResult {
             node: "tower".into(),
             version: "0.1.0".into(),
+            build: Some("a59ec0d12345".into()),
             protocol: 1,
             os: "linux".into(),
             arch: "x86_64".into(),
@@ -237,6 +239,7 @@ fn hello() {
         json!({
             "node": "tower",
             "version": "0.1.0",
+            "build": "a59ec0d12345",
             "protocol": 1,
             "os": "linux",
             "arch": "x86_64",

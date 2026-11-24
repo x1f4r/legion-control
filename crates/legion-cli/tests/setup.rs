@@ -1851,6 +1851,10 @@ fn meta_update_from_local_binary_replaces_temp_copy_and_keeps_prev() {
         updated["installed_version"],
         json!(env!("CARGO_PKG_VERSION"))
     );
+    assert_eq!(
+        updated.get("build").and_then(Value::as_str),
+        legion_core::BUILD
+    );
     assert!(install_dir.join(format!("{exe_name}.prev")).is_file());
     assert!(
         legion_home
