@@ -113,6 +113,11 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         ));
     }
 
+    let quarantined = crate::device::registry::inspect_quarantined_devices(ctx.paths());
+    if let Some(check) = check_quarantined_devices(&quarantined) {
+        checks.push(check);
+    }
+
     let unsynced = crate::device::registry::unsynced_fleet_peers_summary(ctx.paths(), ctx.node_name());
     if let Some(check) = check_unsynced_fleet_devices(&unsynced) {
         checks.push(check);
@@ -216,6 +221,32 @@ pub fn check_device_key_conflicts(
         });
     }
     out
+}
+
+/// Builds a `meta.doctor` warning when one or more live paired devices in `devices.toml` are
+/// quarantined because their creator device was removed at or before they were paired.
+pub fn check_quarantined_devices(quarantined: &[(String, String, String)]) -> Option<Check> {
+    if quarantined.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = quarantined
+        .iter()
+        .map(|(name, id, reason)| format!("{name} ({id}): {reason}"))
+        .collect();
+    Some(Check {
+        name: "quarantined devices".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "{} paired device(s) are quarantined and blocked from connecting: {}.",
+            quarantined.len(),
+            items.join("; ")
+        ),
+        hint: Some(
+            "Inspect with `legion device.list`, then either confirm legitimate devices as owner with `legion device.set id=<pairing_id> confirm=true` or remove them with `legion device.remove id=<pairing_id>`."
+                .to_owned(),
+        ),
+    })
 }
 
 /// Builds a `meta.doctor` warning when `policy.toml` defines any `device:*` principal without a

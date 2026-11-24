@@ -1354,6 +1354,7 @@ impl Fleet {
                 door: call.door,
                 pinned: call.pinned.clone(),
                 device: call.device.clone(),
+                pairing_id: call.pairing_id.clone(),
                 cancel: call.cancel.child_token(),
                 events: call.events.for_machine(machine.as_str()),
                 hops: call.hops,

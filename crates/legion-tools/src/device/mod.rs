@@ -446,6 +446,11 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     };
     let invite_text = payload.encode()?;
 
+    let creator_policy = ctx.config().get::<Policy>()?;
+    let created_by_device = ctx
+        .pairing_id()
+        .map(str::to_owned)
+        .or_else(|| creator_policy.device_owner(ctx.principal()).map(str::to_owned));
     let record = InviteRecord {
         id: id.clone(),
         principal: principal.clone(),
@@ -453,6 +458,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         create_principal: create_device_principal,
         device_name: invite_device_name.clone(),
         created_by: Some(ctx.principal().to_owned()),
+        created_by_device,
         created,
         expires: expires.clone(),
         fingerprint: ephemeral.fingerprint,
@@ -605,6 +611,10 @@ struct SetArgs {
     /// unless given as true.
     #[serde(default)]
     allow_owner: bool,
+    /// Explicitly confirm a quarantined paired device so it becomes active again (owner role
+    /// only). Off unless given as true.
+    #[serde(default)]
+    confirm: bool,
 }
 
 /// What `device.set` returns.
@@ -618,6 +628,8 @@ struct SetResult {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_role: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    confirmed: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     fleet: BTreeMap<String, FleetPushOutcome>,
 }
@@ -658,12 +670,12 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         }
     };
 
-    if args.role.is_none() && args.rename.is_none() {
+    if args.role.is_none() && args.rename.is_none() && !args.confirm {
         return Err(ErrorBody::new(
             ErrorCode::InvalidArgs,
-            "device.set requires at least one of `role` or `rename`.",
+            "device.set requires at least one of `role`, `rename`, or `confirm=true`.",
         )
-        .with_hint("Pass `role=<role>` to change permissions, or `rename=<new-name>` to rename."));
+        .with_hint("Pass `role=<role>` to change permissions, `rename=<new-name>` to rename, or `confirm=true` to confirm a quarantined device."));
     }
 
     let caller = Caller::of(ctx)?;
@@ -676,6 +688,13 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             ),
         )
         .with_hint("Run `device.set` from a local shell or a non-expiring credential."));
+    }
+    if args.confirm && !caller.is_owner() {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            "Only a caller with the owner role may confirm a quarantined paired device.",
+        )
+        .with_hint("Run `device.set confirm=true` as the owner of this machine."));
     }
     if let Some(ref new_role) = args.role {
         validate_role_name(new_role)?;
@@ -718,6 +737,8 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         .unwrap_or_else(|_| "node".to_owned());
     let paths = ctx.paths().clone();
     let new_role = args.role;
+    let confirm = args.confirm;
+    let caller_principal = ctx.principal().to_owned();
 
     let mut result = blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
@@ -914,6 +935,9 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         };
 
         let mut updated_entry = current_entry.clone();
+        if confirm {
+            updated_entry.confirmed_by = Some(caller_principal);
+        }
         let previous_name = if let Some(ref renamed) = new_name
             && renamed != &current_entry.name
         {
@@ -938,6 +962,20 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             .insert(pairing_id.clone(), updated_entry.clone());
 
         save_devices_locked(&paths, &devices_file)?;
+
+        if confirm {
+            let _ = reconcile_device_principals_locked(&paths, &devices_file)?;
+        }
+        let effective_role_after = if confirm && new_role.is_none() {
+            let policy_path = paths.config_file(Policy::FILE);
+            std::fs::read(&policy_path)
+                .ok()
+                .and_then(|b| legion_core::config::parse::<Policy>(&policy_path, &b).ok())
+                .map(|p| p.role_of(&updated_entry.principal).0)
+                .unwrap_or(final_role)
+        } else {
+            final_role
+        };
 
         let exe = legion_core::current_exe()?;
         let shell = ForcedCommandShell::host()?;
@@ -969,8 +1007,9 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             name: updated_entry.name,
             previous_name,
             principal: updated_entry.principal,
-            role: final_role,
+            role: effective_role_after,
             previous_role,
+            confirmed: confirm,
             fleet: BTreeMap::new(),
         })
     })
@@ -1029,6 +1068,8 @@ struct ListedDevice {
     home: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     foreign: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    quarantined: bool,
     #[serde(skip_serializing_if = "is_false")]
     local_only: bool,
     #[serde(skip_serializing_if = "is_false")]
@@ -1165,15 +1206,25 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             .iter()
             .map(|(id, entry)| {
                 let effective_role = policy.role_of(&entry.principal).0;
-                let status = if let Some(others) = report.duplicate_key_ids.get(id) {
-                    Some(format!(
-                        "not active here: public key collides with another live device ({})",
-                        others.join(", ")
-                    ))
+                let (quarantined, status) = if let Some(reason) = report.quarantined_ids.get(id) {
+                    (
+                        true,
+                        Some(format!(
+                            "quarantined: {reason}; confirm with `legion device.set id={id} confirm=true` or remove with `legion device.remove id={id}`"
+                        )),
+                    )
+                } else if let Some(others) = report.duplicate_key_ids.get(id) {
+                    (
+                        false,
+                        Some(format!(
+                            "not active here: public key collides with another live device ({})",
+                            others.join(", ")
+                        )),
+                    )
                 } else if report.foreign_key_ids.contains(id) {
-                    Some(registry::FOREIGN_KEY_COLLISION_STATUS.to_owned())
+                    (false, Some(registry::FOREIGN_KEY_COLLISION_STATUS.to_owned()))
                 } else {
-                    None
+                    (false, None)
                 };
                 let not_synced_to = registry::unsynced_peers_for_device(
                     id,
@@ -1196,6 +1247,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                     not_synced_to,
                     home: None,
                     foreign: false,
+                    quarantined,
                     local_only: false,
                     missing_home: false,
                 }
@@ -1258,6 +1310,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                             not_synced_to: Vec::new(),
                             home: None,
                             foreign: false,
+                            quarantined: false,
                             local_only: true,
                             missing_home: false,
                         });
@@ -1281,6 +1334,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                         not_synced_to: Vec::new(),
                         home: home.as_ref().map(PinnedHome::display_label),
                         foreign: true,
+                        quarantined: false,
                         local_only: false,
                         missing_home,
                     });
@@ -1570,6 +1624,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
             };
 
             if let Some(pairing_id) = matched_id {
+                let quarantined_before = registry::quarantined_devices(&devices_file);
                 let entry = devices_file.devices.remove(&pairing_id).ok_or_else(|| {
                     RemoveBlockingError::BeforeSave(ErrorBody::new(
                         ErrorCode::Internal,
@@ -1589,6 +1644,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                         removed_on: valid_node_name.clone(),
                     },
                 );
+                let quarantined_after = registry::quarantined_devices(&devices_file);
 
                 // 1. Write the tombstone to `devices.toml` FIRST.
                 save_devices_locked(&paths, &devices_file)
@@ -1596,7 +1652,16 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
 
                 let primary_target =
                     sessions::SessionTarget::new(entry.name.clone(), Some(pairing_id.clone()));
-                let tombstoned = vec![primary_target.clone()];
+                let mut tombstoned = vec![primary_target.clone()];
+                for (qid, qdev) in &devices_file.devices {
+                    if quarantined_after.contains_key(qid) && !quarantined_before.contains_key(qid)
+                    {
+                        tombstoned.push(sessions::SessionTarget::new(
+                            qdev.name.clone(),
+                            Some(qid.clone()),
+                        ));
+                    }
+                }
                 let after_save = |error: ErrorBody| RemoveBlockingError::AfterSave {
                     error,
                     tombstoned: tombstoned.clone(),
@@ -3448,6 +3513,7 @@ role = "owner"
                 create_principal: false,
                 device_name: None,
                 created_by: None,
+                created_by_device: None,
                 created: format_rfc3339(now),
                 expires: format_rfc3339(exp),
                 fingerprint: eph.fingerprint.clone(),
@@ -3977,6 +4043,8 @@ allow = ["effect:read", "effect:write"]
                     role: None,
                     paired_at: "2026-11-24T10:00:00Z".to_owned(),
                     paired_on: "tower".to_owned(),
+                    paired_by: None,
+                    confirmed_by: None,
                     updated_at: "2026-11-24T10:00:00Z".to_owned(),
                     updated_on: "tower".to_owned(),
                 },
@@ -4287,5 +4355,226 @@ allow = ["effect:read", "effect:write"]
         )
         .unwrap_err();
         assert_eq!(gate_err.code, ErrorCode::Denied);
+    }
+
+    #[tokio::test]
+    async fn paired_by_and_tombstone_quarantine_block_post_removal_descendants_until_owner_confirms()
+    {
+        let h = Harness::new();
+
+        // 1. Enrol creator device A (`device:dev-a`, owner role) from a local shell.
+        let inv_a = h
+            .call(
+                "device.invite",
+                json!({ "name": "dev-a", "role": "owner", "allow_owner": true }),
+            )
+            .await
+            .unwrap();
+        let id_inv_a = inv_a["id"].as_str().unwrap().to_owned();
+        let key_a = keys::ed25519_public_key_from_seed(&[0x61; 32]);
+        let req_a = format!(
+            "{{\"enrol\":1,\"id\":\"{id_inv_a}\",\"public_key\":\"{key_a}\",\"name\":\"dev-a\"}}\n"
+        );
+        let reply_a = enrol::run_enrol(&h.node, &id_inv_a, req_a.as_bytes()).await;
+        assert!(reply_a.is_ok(), "{reply_a:?}");
+
+        let devices_after_a: DevicesFile = legion_core::config::parse(
+            &h.node.paths().config_file("devices.toml"),
+            &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        let id_a = devices_after_a.devices.keys().next().unwrap().clone();
+        assert_eq!(
+            devices_after_a.devices[&id_a].paired_by,
+            Some(registry::PairedBy {
+                principal: "owner".to_owned(),
+                device: None,
+            })
+        );
+
+        // 2. Device A (pinned to `device:dev-a` with `pairing_id = Some(id_a)`) invites and enrols
+        //    child device B (`device:dev-b`, observer role).
+        let mut call_b = Call::new(
+            Door::Ssh,
+            "device.invite",
+            json!({ "name": "dev-b", "role": "observer" }),
+        );
+        call_b.pinned = Some("device:dev-a".to_owned());
+        call_b.device = Some("dev-a".to_owned());
+        call_b.pairing_id = Some(id_a.clone());
+        let inv_b = h.node.call(call_b).await.unwrap();
+        let id_inv_b = inv_b["id"].as_str().unwrap().to_owned();
+        let key_b = keys::ed25519_public_key_from_seed(&[0x62; 32]);
+        let req_b = format!(
+            "{{\"enrol\":1,\"id\":\"{id_inv_b}\",\"public_key\":\"{key_b}\",\"name\":\"dev-b\"}}\n"
+        );
+        let reply_b = enrol::run_enrol(&h.node, &id_inv_b, req_b.as_bytes()).await;
+        assert!(reply_b.is_ok(), "{reply_b:?}");
+
+        let mut devices_file: DevicesFile = legion_core::config::parse(
+            &h.node.paths().config_file("devices.toml"),
+            &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        let id_b = devices_file
+            .devices
+            .iter()
+            .find(|(_, d)| d.name == "dev-b")
+            .unwrap()
+            .0
+            .clone();
+        assert_eq!(
+            devices_file.devices[&id_b].paired_by,
+            Some(registry::PairedBy {
+                principal: "device:dev-a".to_owned(),
+                device: Some(id_a.clone()),
+            })
+        );
+        let b_paired_at = devices_file.devices[&id_b].paired_at.clone();
+
+        // 3. Add a transitive grandchild device C created by B, and simulate a tombstone for A
+        //    arriving with `removed_at <= B.paired_at` (A was revoked on another node before it
+        //    paired B here).
+        let id_c = "63".repeat(16);
+        devices_file.devices.insert(
+            id_c.clone(),
+            registry::FleetDevice {
+                name: "dev-c".to_owned(),
+                public_key: keys::ed25519_public_key_from_seed(&[0x63; 32]),
+                principal: "device:dev-c".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: b_paired_at.clone(),
+                paired_on: "tower".to_owned(),
+                paired_by: Some(registry::PairedBy {
+                    principal: "device:dev-b".to_owned(),
+                    device: Some(id_b.clone()),
+                }),
+                confirmed_by: None,
+                updated_at: b_paired_at.clone(),
+                updated_on: "tower".to_owned(),
+            },
+        );
+        let dev_a = devices_file.devices.remove(&id_a).unwrap();
+        devices_file.removed.insert(
+            id_a.clone(),
+            registry::DeviceTombstone {
+                name: dev_a.name,
+                principal: dev_a.principal,
+                paired_at: Some(dev_a.paired_at),
+                paired_on: Some(dev_a.paired_on),
+                removed_at: b_paired_at.clone(),
+                removed_on: "other".to_owned(),
+            },
+        );
+        {
+            let _cfg = registry::lock_config(h.node.paths()).unwrap();
+            registry::save_devices_locked(h.node.paths(), &devices_file).unwrap();
+            let _ = registry::reconcile_device_principals_locked(h.node.paths(), &devices_file)
+                .unwrap();
+        }
+
+        // Reconciling via `device.list` removes BOTH B and C from authorized_keys and flags both.
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(!auth_text.contains("legion-device:dev-b"), "{auth_text}");
+        assert!(!auth_text.contains("legion-device:dev-c"), "{auth_text}");
+
+        let pol_quarantined: Policy = legion_core::config::parse(
+            &h.node.paths().config_file("policy.toml"),
+            &std::fs::read(h.node.paths().config_file("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pol_quarantined.role_of("device:dev-b").0, "nobody");
+
+        for name in ["dev-b", "dev-c"] {
+            let entry = listed["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == json!(name))
+                .expect("device must be listed");
+            assert_eq!(entry["quarantined"], json!(true), "{entry}");
+            assert!(
+                entry["status"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("quarantined") && s.contains("confirm=true")),
+                "{entry}"
+            );
+        }
+
+        // `legion gate` denies both B and C with `ErrorCode::Denied`.
+        let node_file = h.node.config().get::<NodeFile>().unwrap();
+        for (name, pid, principal) in [
+            ("dev-b", id_b.as_str(), "device:dev-b"),
+            ("dev-c", id_c.as_str(), "device:dev-c"),
+        ] {
+            let err = registry::verify_gate_device(
+                h.node.paths(),
+                "tower",
+                &node_file,
+                name,
+                pid,
+                principal,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{name}: {err:?}");
+            assert!(err.message.contains("quarantined"), "{name}: {err:?}");
+        }
+
+        // `meta.doctor` flags the quarantined devices loudly.
+        let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        let q_check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == json!("quarantined devices"))
+            .expect("meta.doctor must report quarantined devices");
+        assert_eq!(q_check["warning"], json!(true), "{q_check}");
+        assert!(q_check["detail"].as_str().unwrap().contains("dev-b"));
+        assert!(q_check["detail"].as_str().unwrap().contains("dev-c"));
+
+        // Non-owner cannot confirm a quarantined device.
+        let mut non_owner_confirm = Call::new(
+            Door::Cli,
+            "device.set",
+            json!({"id": id_b, "confirm": true}),
+        );
+        non_owner_confirm.pinned = Some("phone".to_owned());
+        let deny = h.node.call(non_owner_confirm).await.unwrap_err();
+        assert_eq!(deny.code, ErrorCode::Denied, "{deny:?}");
+
+        // Owner explicitly confirms B -> restores B and unconfirmed child C in authorized_keys and
+        // restores B's `observer` role in policy.toml.
+        let confirmed = h
+            .call("device.set", json!({"id": id_b, "confirm": true}))
+            .await
+            .unwrap();
+        assert_eq!(confirmed["confirmed"], json!(true), "{confirmed}");
+        assert_eq!(confirmed["role"], json!("observer"), "{confirmed}");
+
+        let auth_after = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(auth_after.contains("legion-device:dev-b"), "{auth_after}");
+        assert!(auth_after.contains("legion-device:dev-c"), "{auth_after}");
+        registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            "dev-b",
+            &id_b,
+            "device:dev-b",
+            None,
+        )
+        .expect("confirmed device B must pass gate verification");
+        registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            "dev-c",
+            &id_c,
+            "device:dev-c",
+            None,
+        )
+        .expect("descendant C of confirmed B must pass gate verification");
     }
 }

@@ -22,7 +22,7 @@ use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
 
 use super::authkeys::{
     AuthKeysFile, AuthKeysTarget, ForcedCommandShell, LineKind, PinnedHome,
@@ -81,6 +81,17 @@ impl Default for DevicesFile {
     }
 }
 
+/// Who created a paired device (captured from the invite creator at pairing time).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairedBy {
+    /// Principal that created the pairing invite.
+    pub principal: String,
+    /// Pairing identifier of the device that created the invite, when created by a paired device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
 /// One live paired device entry in `devices.toml`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +111,13 @@ pub struct FleetDevice {
     pub paired_at: String,
     /// Node name where this device was paired.
     pub paired_on: String,
+    /// Who created the invite that paired this device (principal and optional creator device id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_by: Option<PairedBy>,
+    /// Owner principal that explicitly confirmed this device after a quarantine, clearing
+    /// quarantine for it and its unconfirmed descendants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_by: Option<String>,
     /// RFC 3339 UTC timestamp of the most recent update (initially `paired_at`).
     pub updated_at: String,
     /// Node name that wrote the most recent update (initially `paired_on`).
@@ -209,6 +227,18 @@ impl Document for DevicesFile {
                 .map_err(|e| format!("devices.{id}.paired_at is not RFC 3339 UTC: {e}"))?;
             NodeName::try_from(entry.paired_on.clone())
                 .map_err(|e| format!("devices.{id}.paired_on: {e}"))?;
+            if let Some(paired_by) = &entry.paired_by {
+                Principal::parse(&paired_by.principal)
+                    .map_err(|e| format!("devices.{id}.paired_by.principal: {}", e.message))?;
+                if let Some(dev_id) = &paired_by.device {
+                    validate_pairing_id(dev_id)
+                        .map_err(|e| format!("devices.{id}.paired_by.device: {}", e.message))?;
+                }
+            }
+            if let Some(confirmed_by) = &entry.confirmed_by {
+                Principal::parse(confirmed_by)
+                    .map_err(|e| format!("devices.{id}.confirmed_by: {}", e.message))?;
+            }
             entry
                 .updated_at
                 .parse::<Timestamp>()
@@ -266,6 +296,17 @@ impl DevicesFile {
                 }
                 t["paired_at"] = value(dev.paired_at.as_str());
                 t["paired_on"] = value(dev.paired_on.as_str());
+                if let Some(paired_by) = &dev.paired_by {
+                    let mut inline = InlineTable::new();
+                    inline.insert("principal", paired_by.principal.as_str().into());
+                    if let Some(dev_id) = &paired_by.device {
+                        inline.insert("device", dev_id.as_str().into());
+                    }
+                    t["paired_by"] = value(inline);
+                }
+                if let Some(confirmed_by) = &dev.confirmed_by {
+                    t["confirmed_by"] = value(confirmed_by.as_str());
+                }
                 t["updated_at"] = value(dev.updated_at.as_str());
                 t["updated_on"] = value(dev.updated_on.as_str());
                 devices_table.insert(id, Item::Table(t));
@@ -425,7 +466,104 @@ fn device_sort_key(d: &FleetDevice) -> impl Ord + '_ {
         d.public_key.as_str(),
         d.paired_at.as_str(),
         d.paired_on.as_str(),
+        d.paired_by
+            .as_ref()
+            .map(|p| p.principal.as_str())
+            .unwrap_or(""),
+        d.paired_by
+            .as_ref()
+            .and_then(|p| p.device.as_deref())
+            .unwrap_or(""),
+        d.confirmed_by.as_deref().unwrap_or(""),
     )
+}
+
+/// Returns the live pairing ids in `devices` that are quarantined because they (or an unconfirmed
+/// ancestor in their `paired_by.device` chain) were paired at or after their creator device was
+/// tombstoned, mapped to a human-readable reason.
+///
+/// A device with `confirmed_by.is_some()` has been explicitly confirmed by the owner and is never
+/// quarantined (nor does it propagate quarantine to its own descendants).
+pub fn quarantined_devices(devices: &DevicesFile) -> BTreeMap<String, String> {
+    let mut quarantined: BTreeMap<String, String> = BTreeMap::new();
+
+    for (id, entry) in &devices.devices {
+        if entry.confirmed_by.is_some() {
+            continue;
+        }
+        let Some(creator_id) = entry.paired_by.as_ref().and_then(|p| p.device.as_deref()) else {
+            continue;
+        };
+        let Some(tomb) = devices.removed.get(creator_id) else {
+            continue;
+        };
+        let paired_at_or_after_removal = match (
+            entry.paired_at.parse::<Timestamp>(),
+            tomb.removed_at.parse::<Timestamp>(),
+        ) {
+            (Ok(paired_ts), Ok(removed_ts)) => paired_ts >= removed_ts,
+            _ => false,
+        };
+        if paired_at_or_after_removal {
+            quarantined.insert(
+                id.clone(),
+                format!(
+                    "created by removed device {} ({creator_id}) at {} (creator was removed at {})",
+                    tomb.name, entry.paired_at, tomb.removed_at
+                ),
+            );
+        }
+    }
+
+    loop {
+        let mut added = Vec::new();
+        for (id, entry) in &devices.devices {
+            if entry.confirmed_by.is_some() || quarantined.contains_key(id) {
+                continue;
+            }
+            let Some(creator_id) = entry.paired_by.as_ref().and_then(|p| p.device.as_deref()) else {
+                continue;
+            };
+            if quarantined.contains_key(creator_id) {
+                let creator_name = devices
+                    .devices
+                    .get(creator_id)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or(creator_id);
+                added.push((
+                    id.clone(),
+                    format!("created by quarantined device {creator_name} ({creator_id})"),
+                ));
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        for (id, reason) in added {
+            quarantined.insert(id, reason);
+        }
+    }
+
+    quarantined
+}
+
+/// Read-only list of `(name, pairing_id, reason)` for quarantined live devices in `devices.toml`,
+/// used by `meta.doctor`.
+pub fn inspect_quarantined_devices(paths: &Paths) -> Vec<(String, String, String)> {
+    let Ok(Some(devices)) = load_devices_raw(paths) else {
+        return Vec::new();
+    };
+    quarantined_devices(&devices)
+        .into_iter()
+        .map(|(id, reason)| {
+            let name = devices
+                .devices
+                .get(&id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| id.clone());
+            (name, id, reason)
+        })
+        .collect()
 }
 
 /// Pure CRDT merge of two [`DevicesFile`] states.
@@ -924,6 +1062,7 @@ pub fn reconcile_device_principals_locked(
         }
     }
 
+    let quarantined = quarantined_devices(devices);
     let mut warnings = Vec::new();
     for (principal, entries) in &live_by_principal {
         let existing_entry = policy
@@ -967,6 +1106,18 @@ pub fn reconcile_device_principals_locked(
             warnings.push(format!(
                 "Principal {principal} in policy.toml is owned by pairing {other}, not {pairing_id}; leaving it untouched."
             ));
+            continue;
+        }
+
+        if let Some(reason) = quarantined.get(pairing_id) {
+            warnings.push(format!(
+                "Principal {principal} belongs to quarantined device {pairing_id} ({reason}); leaving it restricted to `nobody` until confirmed by the owner."
+            ));
+            if let Some(existing) = existing_entry
+                && existing.device.as_deref() == Some(pairing_id)
+            {
+                upsert_device_principal_locked(paths, principal, NOBODY, pairing_id)?;
+            }
             continue;
         }
 
@@ -1123,6 +1274,8 @@ pub fn adopt_legacy_devices_from_auth_keys(
                 role,
                 paired_at: paired_at.clone(),
                 paired_on: valid_node.clone(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: paired_at,
                 updated_on: valid_node.clone(),
             });
@@ -1150,7 +1303,10 @@ pub struct AuthKeysReconcileReport {
     /// Live pairing ids skipped because their public key already sits on a foreign line of
     /// `authorized_keys`.
     pub foreign_key_ids: BTreeSet<String>,
-    /// Warnings generated for colliding or inactive entries.
+    /// Live pairing ids quarantined because an unconfirmed ancestor was removed at or before their
+    /// pairing time, mapped to a human-readable reason.
+    pub quarantined_ids: BTreeMap<String, String>,
+    /// Warnings generated for colliding, quarantined, or inactive entries.
     pub warnings: Vec<String>,
 }
 
@@ -1310,10 +1466,18 @@ pub fn reconcile_authorized_keys_in_memory(
         }
     }
 
-    // Pass 2: build expected canonical line per non-colliding live pairing id.
+    // Pass 2: build expected canonical line per non-colliding, non-quarantined live pairing id.
+    let quarantined_ids = quarantined_devices(devices);
     let mut expected_lines: BTreeMap<&str, (String, Vec<u8>)> = BTreeMap::new();
     let mut foreign_key_ids: BTreeSet<String> = BTreeSet::new();
     for (id, entry) in &devices.devices {
+        if let Some(reason) = quarantined_ids.get(id) {
+            warnings.push(format!(
+                "Device {} ({id}) is quarantined ({reason}) and not active here; confirm with `legion device.set id={id} confirm=true` or remove with `legion device.remove id={id}`.",
+                entry.name
+            ));
+            continue;
+        }
         if duplicate_key_ids.contains_key(id) {
             continue;
         }
@@ -1413,6 +1577,7 @@ pub fn reconcile_authorized_keys_in_memory(
         removed_targets: removed_targets.into_iter().collect(),
         duplicate_key_ids,
         foreign_key_ids,
+        quarantined_ids,
         warnings,
     })
 }
@@ -1578,6 +1743,20 @@ pub fn verify_gate_device(
                 "Device {device_name} is no longer authorized as {principal} (it was removed)."
             ),
         ));
+    }
+
+    let quarantined = quarantined_devices(&devices);
+    if let Some(reason) = quarantined.get(pairing_id) {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Device {device_name} ({pairing_id}) is quarantined ({reason}) and cannot connect until confirmed by the owner."
+            ),
+        )
+        .with_hint(format!(
+            "Confirm this device as owner with `legion device.set id={pairing_id} confirm=true`, or remove it with `legion device.remove id={pairing_id}`."
+        )));
     }
 
     let Some(entry) = devices.devices.get(pairing_id) else {
@@ -1967,12 +2146,17 @@ pub fn apply_devices_merge_blocking(
         }
     }
 
-    // Record every previously live device that this merge tombstones so live sessions are ALWAYS
-    // terminated once `devices.toml` has been saved, even if a later step fails.
+    // Record every previously live device that this merge tombstones or newly quarantines so live
+    // sessions are ALWAYS terminated once `devices.toml` has been saved, even if a later step fails.
+    let quarantined_before = quarantined_devices(&local);
+    let quarantined_after = quarantined_devices(&merged);
     let newly_tombstoned: Vec<SessionTarget> = local
         .devices
         .iter()
-        .filter(|(id, _)| merged.removed.contains_key(*id))
+        .filter(|(id, _)| {
+            merged.removed.contains_key(*id)
+                || (quarantined_after.contains_key(*id) && !quarantined_before.contains_key(*id))
+        })
         .map(|(id, prev)| SessionTarget::new(prev.name.clone(), Some(id.clone())))
         .collect();
 
@@ -2293,15 +2477,30 @@ pub fn prune_acknowledged_tombstones_blocking(
 /// Pushes `devices.toml` to every peer listed in `fleet.toml` in parallel with a short timeout,
 /// returning a per-machine [`FleetPushOutcome`] map.
 ///
-/// Returns an empty map when `fleet.sync` is not registered or `fleet.toml` lists no other
-/// machines. Never fails the already-committed local change when a peer is unreachable.
+/// Returns an empty map ONLY when `fleet.toml` lists no other machines. Whenever `fleet.toml`
+/// names peers and the push cannot run (for example `fleet.sync` is absent, the invite did not
+/// record a creator principal, the caller lacks permission, or `fleet.sync` fails), every peer is
+/// explicitly reported as `"not_reached"` with the reason — never silently omitted as `{}` — and
+/// an invite without a recorded creator never falls back to `owner`.
 pub async fn push_devices_to_fleet(
     node: &Node,
     ctx_opt: Option<&Ctx>,
     acting_principal: Option<&str>,
 ) -> BTreeMap<String, FleetPushOutcome> {
-    let Some(sync_tool) = node.registry().get("fleet.sync") else {
+    let peers = fleet_peer_names(node.paths(), &node.name());
+    if peers.is_empty() {
         return BTreeMap::new();
+    }
+    let all_not_reached = |reason: &str| -> BTreeMap<String, FleetPushOutcome> {
+        peers
+            .iter()
+            .map(|peer| (peer.clone(), FleetPushOutcome::not_reached(reason)))
+            .collect()
+    };
+    let Some(sync_tool) = node.registry().get("fleet.sync") else {
+        return all_not_reached(
+            "fleet.sync is not available on this node; run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` manually",
+        );
     };
     let args = json!({
         "direction": "push",
@@ -2309,16 +2508,36 @@ pub async fn push_devices_to_fleet(
         "timeout_s": DEVICE_PUSH_TIMEOUT_S,
     });
     let reply = match ctx_opt {
-        Some(ctx) => sync_tool.call(ctx, args).await,
+        Some(ctx) => {
+            if !ctx.grant().allows(sync_tool.spec()) {
+                return all_not_reached(
+                    "caller is not permitted to run fleet.sync; run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` manually",
+                );
+            }
+            sync_tool.call(ctx, args).await
+        }
         None => {
+            let Some(creator) = acting_principal else {
+                return all_not_reached(
+                    "cannot push automatically because this invite did not record who created it; run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` manually",
+                );
+            };
             let mut call = Call::new(Door::Ssh, "fleet.sync", args);
-            call.pinned = Some(acting_principal.unwrap_or(OWNER).to_owned());
+            call.pinned = Some(creator.to_owned());
             node.call(call).await
         }
     };
     match reply {
-        Ok(value) => parse_fleet_push_outcomes(&value),
-        Err(_) => BTreeMap::new(),
+        Ok(value) => {
+            let mut outcomes = parse_fleet_push_outcomes(&value);
+            for peer in &peers {
+                outcomes.entry(peer.clone()).or_insert_with(|| {
+                    FleetPushOutcome::not_reached("machine did not finish syncing devices.toml")
+                });
+            }
+            outcomes
+        }
+        Err(error) => all_not_reached(&error.message),
     }
 }
 
@@ -2397,6 +2616,8 @@ mod tests {
             role: role.map(str::to_owned),
             paired_at: "2026-11-24T10:00:00Z".to_owned(),
             paired_on: "tower".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
             updated_at: updated_at.to_owned(),
             updated_on: node.to_owned(),
         }
@@ -3056,5 +3277,106 @@ role = \"observer\"
         let reloaded = load_devices_raw(&paths).unwrap().unwrap();
         assert!(!reloaded.removed.contains_key(&old_id));
         assert!(reloaded.removed.contains_key(&fresh_id));
+    }
+
+    #[tokio::test]
+    async fn failed_push_and_missing_creator_report_every_fleet_machine_not_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("legion"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\ncommand = [\"echo\"]\n\n[machines.nas]\ncommand = [\"echo\"]\n",
+        )
+        .unwrap();
+
+        let node = Node::new(paths.clone(), crate::registry());
+        // No `fleet.sync` registered AND no recorded creator -> must report EVERY fleet peer as
+        // `not_reached` with a reason, never an empty map `{}`.
+        let outcomes = push_devices_to_fleet(&node, None, None).await;
+        assert_eq!(outcomes.len(), 2, "expected both peers reported: {outcomes:?}");
+        for peer in ["pi", "nas"] {
+            let entry = outcomes.get(peer).expect("peer must be present");
+            assert_eq!(entry.status, "not_reached", "{peer}: {entry:?}");
+            assert!(
+                entry.reason.as_deref().is_some_and(|r| !r.is_empty()),
+                "{peer}: {entry:?}"
+            );
+        }
+
+        // Even when `fleet.sync` IS registered, a missing creator principal (`acting_principal = None`)
+        // MUST refuse to push (never assuming `owner`) and report every peer as `not_reached`.
+        struct StubFailingSync {
+            spec: legion_core::proto::ToolSpec,
+            invoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl legion_core::Tool for StubFailingSync {
+            fn spec(&self) -> &legion_core::proto::ToolSpec {
+                &self.spec
+            }
+            fn call<'a>(
+                &'a self,
+                _ctx: &'a Ctx,
+                _args: Value,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Value, ErrorBody>> + Send + 'a>,
+            > {
+                let flag = std::sync::Arc::clone(&self.invoked);
+                Box::pin(async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        "simulated fleet.sync failure",
+                    ))
+                })
+            }
+        }
+        let mut reg_with_sync = crate::registry();
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        reg_with_sync.add(StubFailingSync {
+            spec: legion_core::proto::ToolSpec {
+                name: "fleet.sync".to_owned(),
+                description: "stub sync".to_owned(),
+                effect: legion_core::proto::Effect::Admin,
+                input_schema: json!({"type": "object"}),
+            },
+            invoked: std::sync::Arc::clone(&invoked),
+        });
+        let node_with_sync = Node::new(paths.clone(), reg_with_sync);
+        let no_creator = push_devices_to_fleet(&node_with_sync, None, None).await;
+        assert!(
+            !invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "push_devices_to_fleet must NOT invoke fleet.sync when acting_principal is None"
+        );
+        assert_eq!(no_creator.len(), 2, "{no_creator:?}");
+        for peer in ["pi", "nas"] {
+            let entry = no_creator.get(peer).expect("peer must be present");
+            assert_eq!(entry.status, "not_reached", "{peer}: {entry:?}");
+            assert!(
+                entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("did not record who created it")),
+                "{peer}: {entry:?}"
+            );
+        }
+
+        // When `acting_principal` IS present and `fleet.sync` returns an error, every peer is still
+        // reported as `not_reached` carrying the error message (never silently omitted as `{}`).
+        let failed = push_devices_to_fleet(&node_with_sync, None, Some("owner")).await;
+        assert!(invoked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        for peer in ["pi", "nas"] {
+            let entry = failed.get(peer).expect("peer must be present");
+            assert_eq!(entry.status, "not_reached", "{peer}: {entry:?}");
+            assert!(
+                entry
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("simulated fleet.sync failure")),
+                "{peer}: {entry:?}"
+            );
+        }
     }
 }

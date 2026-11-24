@@ -363,6 +363,7 @@ impl McpDoor {
             },
             pinned,
             device: None,
+            pairing_id: None,
             // Cancelled when the client cancels the request, and when the session ends.
             cancel,
             events,

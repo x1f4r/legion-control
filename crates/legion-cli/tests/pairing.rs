@@ -3120,6 +3120,8 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
                 role: Some("owner".to_owned()),
                 paired_at: now_str.clone(),
                 paired_on: "b".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: now_str,
                 updated_on: "b".to_owned(),
             },
@@ -3245,4 +3247,163 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
     );
     assert_eq!(rogue_now_on_a["result"]["node"], json!("a"), "{rogue_now_on_a}");
     assert_eq!(rogue_now_on_a["result"]["principal"], json!("owner"));
+}
+
+#[test]
+fn non_owner_removal_pushes_tombstone_independently_of_unrelated_entries() {
+    use legion_tools::device::registry::{DeviceTombstone, DevicesFile, FleetDevice};
+
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "\
+default = \"owner\"
+
+[roles.phone_admin]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"phone_admin\"
+";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_a)
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_b)
+        ),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let fleet_a = if cfg!(windows) {
+        let cmdline = format!(
+            "set \"LEGION_HOME={}\" && \"{}\" rpc --as tablet",
+            home_b_legion.display(),
+            bin
+        );
+        format!(
+            "[machines.b]\ncommand = [\"cmd.exe\", \"/C\", {}]\n",
+            toml_literal(Path::new(&cmdline)),
+        )
+    } else {
+        let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
+        format!(
+            "[machines.b]\ncommand = [\"env\", {}, {}, \"rpc\", \"--as\", \"tablet\"]\n",
+            toml_literal(Path::new(&env_arg)),
+            toml_literal(Path::new(bin)),
+        )
+    };
+    node_a.write_config("fleet.toml", &fleet_a);
+
+    let id_owner = "11".repeat(16);
+    let id_tablet = "22".repeat(16);
+    let id_old_owner = "33".repeat(16);
+    let now_str = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
+
+    // Node A has an unrelated live `owner` device (which `tablet` cannot push to B) AND `tablet`'s
+    // own live device.
+    let mut devices_a = DevicesFile::default();
+    devices_a.devices.insert(
+        id_owner.clone(),
+        FleetDevice {
+            name: "owner-laptop".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0x41; 32]),
+            principal: "owner".to_owned(),
+            role: Some("owner".to_owned()),
+            paired_at: now_str.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            updated_at: now_str.clone(),
+            updated_on: "a".to_owned(),
+        },
+    );
+    devices_a.devices.insert(
+        id_tablet.clone(),
+        FleetDevice {
+            name: "tablet-dev".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0x42; 32]),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: now_str.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            updated_at: now_str.clone(),
+            updated_on: "a".to_owned(),
+        },
+    );
+    node_a.write_config("devices.toml", &devices_a.to_toml_string());
+
+    // Node B has `tablet`'s live device AND an unrelated `owner` tombstone (which `tablet` cannot
+    // import onto A).
+    let mut devices_b = DevicesFile::default();
+    devices_b.devices.insert(
+        id_tablet.clone(),
+        FleetDevice {
+            name: "tablet-dev".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0x42; 32]),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: now_str.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            updated_at: now_str.clone(),
+            updated_on: "a".to_owned(),
+        },
+    );
+    devices_b.removed.insert(
+        id_old_owner.clone(),
+        DeviceTombstone {
+            name: "old-owner".to_owned(),
+            principal: "owner".to_owned(),
+            paired_at: None,
+            paired_on: None,
+            removed_at: now_str,
+            removed_on: "b".to_owned(),
+        },
+    );
+    node_b.write_config("devices.toml", &devices_b.to_toml_string());
+    assert_eq!(node_a.run(&["device.list"]).code, 0);
+    assert_eq!(node_b.run(&["device.list"]).code, 0);
+    assert!(std::fs::read_to_string(&auth_b)
+        .unwrap()
+        .contains("legion-device:tablet-dev"));
+
+    // Non-owner `tablet` removes its own device on A: its tombstone MUST push cleanly to B
+    // despite A's unrelated `owner` device and B's unrelated `owner` tombstone!
+    let rm = node_a.run(&["device.remove", "name=tablet-dev", "--as", "tablet"]);
+    assert_eq!(rm.code, 0, "tablet remove failed: {}", rm.stderr);
+    let rm_json = rm.json();
+    assert_eq!(rm_json["removed"], json!(true), "{rm_json}");
+    assert_eq!(rm_json["fleet"]["b"]["status"], json!("synced"), "{rm_json}");
+    assert!(rm_json.get("still_trusted_by").is_none(), "{rm_json}");
+
+    // Verify B tombstoned `tablet-dev`, removed its authorized_keys line, and did NOT import A's
+    // `owner-laptop`.
+    let b_saved: DevicesFile = legion_core::config::parse(
+        &home_b_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_b_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    assert!(!b_saved.devices.contains_key(&id_tablet), "{b_saved:?}");
+    assert!(b_saved.removed.contains_key(&id_tablet), "{b_saved:?}");
+    assert!(!b_saved.devices.contains_key(&id_owner), "{b_saved:?}");
+    assert!(
+        !std::fs::read_to_string(&auth_b)
+            .unwrap()
+            .contains("legion-device:tablet-dev")
+    );
 }

@@ -903,17 +903,48 @@ async fn apply_local_write(
                 }
                 match change {
                     MergeChange::Live { entry, previous } => {
-                        if let Some(prev) = previous
-                            && prev.principal != caller_principal
-                        {
-                            return Err(ErrorBody::new(
-                                ErrorCode::Denied,
-                                format!(
-                                    "As {caller_principal}, you may not modify a paired device owned by {}.",
-                                    prev.principal
-                                ),
-                            )
-                            .with_hint("Modify other principals' devices as the owner of this machine."));
+                        if let Some(prev) = previous {
+                            if prev.principal != caller_principal {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "As {caller_principal}, you may not modify a paired device owned by {}.",
+                                        prev.principal
+                                    ),
+                                )
+                                .with_hint("Modify other principals' devices as the owner of this machine."));
+                            }
+                            if entry.confirmed_by != prev.confirmed_by {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    "Only a caller with the owner role may confirm a quarantined paired device.",
+                                )
+                                .with_hint("Run `device.set confirm=true` as the owner of this machine."));
+                            }
+                            if entry.paired_by != prev.paired_by {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    "Only a caller with the owner role may change a paired device's creator metadata.",
+                                ));
+                            }
+                        } else {
+                            if entry.confirmed_by.is_some() {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    "Only a caller with the owner role may mark a paired device as confirmed.",
+                                ));
+                            }
+                            if let Some(ref paired_by) = entry.paired_by
+                                && paired_by.principal != caller_principal
+                            {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "As {caller_principal}, you may not record paired_by.principal as {}.",
+                                        paired_by.principal
+                                    ),
+                                ));
+                            }
                         }
                         if entry.principal != caller_principal {
                             return Err(ErrorBody::new(
@@ -2032,25 +2063,92 @@ async fn sync_devices_document(
         SyncDirection::Push => {
             // Trust rule: push sends local entries to the peer and imports ONLY tombstones back —
             // never live device entries from the peer.
-            let remote_tombstones_only = DevicesFile {
-                version: DEVICES_VERSION,
-                devices: BTreeMap::new(),
-                removed: remote_devices.removed.clone(),
+            //
+            // Non-owner callers scope their outgoing push and incoming tombstones to their own
+            // principal, and outgoing writes run BEFORE local tombstone import (with a tombstone-
+            // only fallback if a live entry is refused), so a peer's refusal of an unrelated entry
+            // never blocks revocation.
+            let caller_is_owner = ctx.grant().role() == OWNER;
+            let caller_principal = ctx.principal();
+            let caller_role = ctx.grant().role();
+
+            let outgoing = if caller_is_owner {
+                local_devices.clone()
+            } else {
+                let mut scoped = DevicesFile::default();
+                for (id, entry) in &local_devices.devices {
+                    if remote_devices.removed.contains_key(id) {
+                        continue;
+                    }
+                    let prev_remote = remote_devices.devices.get(id);
+                    let prev_ok = prev_remote.is_none_or(|p| {
+                        p.principal == caller_principal
+                            && p.confirmed_by == entry.confirmed_by
+                            && p.paired_by == entry.paired_by
+                    });
+                    let new_ok = prev_remote.is_some()
+                        || (entry.confirmed_by.is_none()
+                            && entry
+                                .paired_by
+                                .as_ref()
+                                .is_none_or(|pb| pb.principal == caller_principal));
+                    let role_ok = entry.role.as_deref().is_none_or(|r| r == caller_role);
+                    if entry.principal == caller_principal && prev_ok && new_ok && role_ok {
+                        scoped.devices.insert(id.clone(), entry.clone());
+                    }
+                }
+                for (id, tomb) in &local_devices.removed {
+                    if remote_devices
+                        .devices
+                        .get(id)
+                        .is_some_and(|prev| prev.principal == caller_principal)
+                    {
+                        scoped.removed.insert(id.clone(), tomb.clone());
+                    }
+                }
+                scoped
             };
+
+            let filter_remote_tombstones =
+                |remote_removed: &BTreeMap<String, legion_tools::device::registry::DeviceTombstone>,
+                 local_now: &DevicesFile|
+                 -> DevicesFile {
+                    let removed = if caller_is_owner {
+                        remote_removed.clone()
+                    } else {
+                        remote_removed
+                            .iter()
+                            .filter(|(id, _)| {
+                                local_now
+                                    .devices
+                                    .get(*id)
+                                    .is_some_and(|prev| prev.principal == caller_principal)
+                            })
+                            .map(|(id, tomb)| (id.clone(), tomb.clone()))
+                            .collect()
+                    };
+                    DevicesFile {
+                        version: DEVICES_VERSION,
+                        devices: BTreeMap::new(),
+                        removed,
+                    }
+                };
+
+            let remote_tombstones_only =
+                filter_remote_tombstones(&remote_devices.removed, &local_devices);
             let local_after_tombstones = merge_devices(&local_devices, &remote_tombstones_only);
             let local_needs_tombstones = local_after_tombstones != local_devices;
 
-            let remote_after_push = merge_devices(&remote_devices, &local_after_tombstones);
-            let local_after_is_empty = local_after_tombstones.devices.is_empty()
-                && local_after_tombstones.removed.is_empty();
-            let remote_needs_push = remote_after_push != remote_devices
-                || (!remote.exists && !local_after_is_empty);
+            let remote_after_push = merge_devices(&remote_devices, &outgoing);
+            let outgoing_is_empty = outgoing.devices.is_empty() && outgoing.removed.is_empty();
+            let remote_needs_push =
+                remote_after_push != remote_devices || (!remote.exists && !outgoing_is_empty);
 
             if !local_needs_tombstones && !remote_needs_push {
                 if !dry_run {
                     let paths = ctx.paths().clone();
                     let peer_name = machine.to_owned();
-                    let confirmed = local_after_tombstones.clone();
+                    let confirmed = outgoing.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         record_peer_device_ack(&paths, &peer_name, &confirmed)
                     })
@@ -2097,76 +2195,38 @@ async fn sync_devices_document(
             }
 
             let mut current_local = local_devices.clone();
-            let mut current_local_toml = local_devices.to_toml_string();
             let mut current_local_hash = local
                 .hash
                 .clone()
-                .unwrap_or_else(|| hash_bytes(current_local_toml.as_bytes()).to_string());
+                .unwrap_or_else(|| hash_bytes(local_devices.to_toml_string().as_bytes()).to_string());
             let mut local_backup = None;
             let mut warnings = Vec::new();
-
-            // 1. Apply ONLY remote tombstones locally (never remote live entries).
-            if local_needs_tombstones {
-                match apply_local_write(
-                    ctx,
-                    SharedDocument::Devices,
-                    remote_tombstones_only.to_toml_string(),
-                    None,
-                    false,
-                )
-                .await
-                {
-                    Ok(written) => {
-                        local_backup = written.backup;
-                        current_local_hash = written.hash_after;
-                        warnings.extend(written.warnings);
-                        if let Some(canonical) = written.canonical_content {
-                            if let Ok(parsed) = parse::<DevicesFile>(&local_path, canonical.as_bytes())
-                            {
-                                current_local = parsed;
-                            }
-                            current_local_toml = canonical;
-                        }
-                    }
-                    Err(error) => {
-                        return DocSyncOutcome {
-                            status: SyncStatus::Error,
-                            local_hash: local.hash,
-                            remote_hash: remote.hash,
-                            last_synced_hash,
-                            backup: None,
-                            detail: None,
-                            warnings: Vec::new(),
-                            error: Some(error),
-                        };
-                    }
-                }
-            }
-
-            // 2. Push our local devices.toml to the peer.
             let mut final_remote_hash = remote.hash.clone();
             let mut remote_has_extra_live = remote_after_push.devices.len() > current_local.devices.len()
                 || remote_after_push
                     .devices
                     .iter()
                     .any(|(id, dev)| current_local.devices.get(id) != Some(dev));
+            let mut tombstones_to_import = remote_tombstones_only;
+            let mut pushed_to_ack = DevicesFile::default();
 
-            let should_write_remote = remote_needs_push
-                || merge_devices(&remote_devices, &current_local) != remote_devices;
-            if should_write_remote && !(current_local.devices.is_empty() && current_local.removed.is_empty()) {
-                match fleet
+            // 1. Push our outgoing entries to the peer FIRST so revocation tombstones leave this
+            //    node even if a local step or an unrelated entry fails.
+            if remote_needs_push && !outgoing_is_empty {
+                let outgoing_toml = outgoing.to_toml_string();
+                let write_res = fleet
                     .call_remote(
                         ctx,
                         machine,
                         "config.write",
                         json!({
                             "document": "devices.toml",
-                            "content": current_local_toml,
+                            "content": outgoing_toml,
                         }),
                         EventSink::discard(),
                     )
-                    .await
-                {
+                    .await;
+                match write_res {
                     Ok(val) => {
                         let written: ConfigWriteResult = match serde_json::from_value(val) {
                             Ok(parsed) => parsed,
@@ -2179,6 +2239,7 @@ async fn sync_devices_document(
                         };
                         final_remote_hash = Some(written.hash.clone());
                         warnings.extend(written.warnings);
+                        pushed_to_ack = outgoing.clone();
                         // If the remote hash differs from ours, read back ONLY tombstones from
                         // the peer (never live device entries!).
                         if written.hash != current_local_hash
@@ -2196,30 +2257,10 @@ async fn sync_devices_document(
                             && let Ok(again_devices) =
                                 parse::<DevicesFile>(Path::new("devices.toml"), again_content.as_bytes())
                         {
-                            let again_tombs = DevicesFile {
-                                version: DEVICES_VERSION,
-                                devices: BTreeMap::new(),
-                                removed: again_devices.removed.clone(),
-                            };
-                            if merge_devices(&current_local, &again_tombs) != current_local
-                                && let Ok(final_local) = apply_local_write(
-                                    ctx,
-                                    SharedDocument::Devices,
-                                    again_tombs.to_toml_string(),
-                                    None,
-                                    false,
-                                )
-                                .await
-                            {
-                                current_local_hash = final_local.hash_after;
-                                warnings.extend(final_local.warnings);
-                                if let Some(canonical) = final_local.canonical_content
-                                    && let Ok(parsed) =
-                                        parse::<DevicesFile>(&local_path, canonical.as_bytes())
-                                {
-                                    current_local = parsed;
-                                }
-                            }
+                            let extra_tombs =
+                                filter_remote_tombstones(&again_devices.removed, &current_local);
+                            tombstones_to_import =
+                                merge_devices(&tombstones_to_import, &extra_tombs);
                             remote_has_extra_live = again_devices
                                 .devices
                                 .iter()
@@ -2227,10 +2268,48 @@ async fn sync_devices_document(
                         }
                     }
                     Err(error) => {
+                        // If outgoing contained both live entries and tombstones, still push the
+                        // tombstones on their own so a refusal on a live entry never blocks
+                        // revocation.
+                        if !outgoing.removed.is_empty() && !outgoing.devices.is_empty() {
+                            let tombs_only = DevicesFile {
+                                version: DEVICES_VERSION,
+                                devices: BTreeMap::new(),
+                                removed: outgoing.removed.clone(),
+                            };
+                            if let Ok(val) = fleet
+                                .call_remote(
+                                    ctx,
+                                    machine,
+                                    "config.write",
+                                    json!({
+                                        "document": "devices.toml",
+                                        "content": tombs_only.to_toml_string(),
+                                    }),
+                                    EventSink::discard(),
+                                )
+                                .await
+                                && let Ok(written) = serde_json::from_value::<ConfigWriteResult>(val)
+                            {
+                                let paths = ctx.paths().clone();
+                                let peer_name = machine.to_owned();
+                                let confirmed = tombs_only.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    record_peer_device_ack(&paths, &peer_name, &confirmed)
+                                })
+                                .await;
+                                warnings.extend(written.warnings);
+                                warnings.push(format!(
+                                    "Tombstones were pushed to {machine}, but live device entries could not be pushed: {}",
+                                    error.message
+                                ));
+                                final_remote_hash = Some(written.hash);
+                            }
+                        }
                         return DocSyncOutcome {
                             status: SyncStatus::Error,
                             local_hash: Some(current_local_hash),
-                            remote_hash: remote.hash,
+                            remote_hash: final_remote_hash,
                             last_synced_hash,
                             backup: local_backup,
                             detail: None,
@@ -2241,14 +2320,58 @@ async fn sync_devices_document(
                 }
             }
 
-            // Record that `machine` has now acknowledged all entries in `current_local`.
+            // 2. Apply ONLY remote tombstones locally (never remote live entries).
+            if merge_devices(&current_local, &tombstones_to_import) != current_local {
+                match apply_local_write(
+                    ctx,
+                    SharedDocument::Devices,
+                    tombstones_to_import.to_toml_string(),
+                    None,
+                    false,
+                )
+                .await
+                {
+                    Ok(written) => {
+                        local_backup = written.backup;
+                        current_local_hash = written.hash_after;
+                        warnings.extend(written.warnings);
+                        if let Some(canonical) = written.canonical_content
+                            && let Ok(parsed) =
+                                parse::<DevicesFile>(&local_path, canonical.as_bytes())
+                        {
+                            current_local = parsed;
+                        }
+                    }
+                    Err(error) => {
+                        return DocSyncOutcome {
+                            status: SyncStatus::Error,
+                            local_hash: Some(current_local_hash),
+                            remote_hash: final_remote_hash,
+                            last_synced_hash,
+                            backup: None,
+                            detail: None,
+                            warnings,
+                            error: Some(error),
+                        };
+                    }
+                }
+            }
+
+            // Record that `machine` has now acknowledged every entry we pushed (and for owners,
+            // every tombstone we confirmed it already holds).
             let paths = ctx.paths().clone();
             let peer_name = machine.to_owned();
-            let confirmed = current_local.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                record_peer_device_ack(&paths, &peer_name, &confirmed)
-            })
-            .await;
+            let confirmed = if caller_is_owner {
+                current_local.clone()
+            } else {
+                merge_devices(&pushed_to_ack, &tombstones_to_import)
+            };
+            if !confirmed.is_empty() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    record_peer_device_ack(&paths, &peer_name, &confirmed)
+                })
+                .await;
+            }
 
             let converged = final_remote_hash.as_deref() == Some(current_local_hash.as_str());
             if converged
@@ -2954,6 +3077,8 @@ mod tests {
             role: Some("observer".to_owned()),
             paired_at: "2026-11-24T10:00:00Z".to_owned(),
             paired_on: "node-a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
             updated_at: "2026-11-24T10:00:00Z".to_owned(),
             updated_on: "node-a".to_owned(),
         };
@@ -2964,6 +3089,8 @@ mod tests {
             role: Some("observer".to_owned()),
             paired_at: "2026-11-24T10:01:00Z".to_owned(),
             paired_on: "node-b".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
             updated_at: "2026-11-24T10:01:00Z".to_owned(),
             updated_on: "node-b".to_owned(),
         };
@@ -3049,6 +3176,8 @@ role = \"phone_admin\"
                 role: Some("observer".to_owned()),
                 paired_at: "2026-11-24T10:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3078,6 +3207,8 @@ role = \"phone_admin\"
                 role: Some("observer".to_owned()),
                 paired_at: "2026-11-24T09:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T11:00:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3091,6 +3222,8 @@ role = \"phone_admin\"
                 role: Some("observer".to_owned()),
                 paired_at: "2026-11-24T10:10:00Z".to_owned(),
                 paired_on: "box-b".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:10:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3142,6 +3275,8 @@ role = \"phone_admin\"
                 role: Some("owner".to_owned()),
                 paired_at: "2026-11-24T10:20:00Z".to_owned(),
                 paired_on: "box-b".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:20:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3234,6 +3369,8 @@ device = \"11111111111111111111111111111111\"
                 role: Some("observer".to_owned()),
                 paired_at: "2026-11-24T10:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3253,6 +3390,8 @@ device = \"11111111111111111111111111111111\"
                 role: Some("owner".to_owned()),
                 paired_at: "2026-11-24T10:05:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:05:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3359,6 +3498,8 @@ role = \"phone_admin\"
                 role: Some("owner".to_owned()),
                 paired_at: "2026-11-24T10:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },
@@ -3377,6 +3518,8 @@ role = \"phone_admin\"
                 role: None,
                 paired_at: "2026-11-24T10:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:05:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3428,6 +3571,8 @@ role = \"phone_admin\"
                 role: None,
                 paired_at: "2026-11-24T10:07:00Z".to_owned(),
                 paired_on: "box-b".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:07:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
             },
@@ -3492,6 +3637,8 @@ role = \"phone_admin\"
                 role: Some("observer".to_owned()),
                 paired_at: "2026-11-24T10:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
             },

@@ -46,6 +46,9 @@ pub struct Call {
     pub pinned: Option<String>,
     /// The paired device name when the call arrived through `legion gate --as ... --device <name>`.
     pub device: Option<String>,
+    /// The paired device's 32-hex pairing identifier when the call arrived through
+    /// `legion gate --as ... --pairing <id>`.
+    pub pairing_id: Option<String>,
     /// Cancelled by the door when the caller cancels.
     pub cancel: CancellationToken,
     /// Where the call's events go.
@@ -69,6 +72,7 @@ impl Call {
             door,
             pinned: None,
             device: None,
+            pairing_id: None,
             cancel: CancellationToken::new(),
             events: EventSink::discard(),
             hops: 0,
@@ -392,6 +396,7 @@ impl Node {
             name: name.to_owned(),
             door: call.door,
             device: call.device,
+            pairing_id: call.pairing_id,
             grant,
             cancel: call.cancel.clone(),
             events: call.events,

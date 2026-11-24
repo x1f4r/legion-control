@@ -64,6 +64,9 @@ pub struct InviteRecord {
     /// Principal that created this invite, used when pushing the enrolled device to the fleet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Pairing identifier of the device that created this invite, when created by a paired device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_device: Option<String>,
     /// RFC 3339 UTC creation timestamp.
     pub created: String,
     /// RFC 3339 UTC expiry timestamp.
@@ -429,6 +432,7 @@ mod tests {
                         create_principal: false,
                         device_name: None,
                         created_by: None,
+                        created_by_device: None,
                         created: "2026-11-24T11:44:00Z".to_owned(),
                         expires: format_rfc3339(past),
                         fingerprint: key1.fingerprint,
@@ -443,6 +447,7 @@ mod tests {
                         create_principal: false,
                         device_name: None,
                         created_by: None,
+                        created_by_device: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: key3.fingerprint,
@@ -457,6 +462,7 @@ mod tests {
                         create_principal: false,
                         device_name: None,
                         created_by: None,
+                        created_by_device: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: "SHA256:abc".to_owned(),

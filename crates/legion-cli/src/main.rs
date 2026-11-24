@@ -208,7 +208,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Rpc { pinned } => {
             let shutdown = install_shutdown_token();
-            serve_rpc(node, router, pinned, Door::Rpc, None, shutdown).await
+            serve_rpc(node, router, pinned, Door::Rpc, None, None, shutdown).await
         }
         Command::Mcp { pinned, compact } => {
             let shutdown = install_shutdown_token();
@@ -258,6 +258,7 @@ async fn serve_rpc(
     pinned: Option<String>,
     door: Door,
     device: Option<String>,
+    pairing_id: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     match rpc::serve_until(
@@ -268,6 +269,7 @@ async fn serve_rpc(
         pinned,
         door,
         device,
+        pairing_id,
         shutdown,
     )
     .await
@@ -429,7 +431,18 @@ async fn gate(
     }
     let _session = session;
     match subcommand {
-        Subcommand::Rpc => serve_rpc(node, router, Some(pinned), Door::Ssh, device, shutdown).await,
+        Subcommand::Rpc => {
+            serve_rpc(
+                node,
+                router,
+                Some(pinned),
+                Door::Ssh,
+                device,
+                pairing,
+                shutdown,
+            )
+            .await
+        }
         Subcommand::Stream => {
             let code = serve_stream(&node, Some(pinned), Door::Ssh, device, shutdown).await;
             router.shutdown().await;

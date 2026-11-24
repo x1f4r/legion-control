@@ -25,7 +25,7 @@ use super::authkeys::{
 };
 use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
 use super::registry::{
-    DevicesFile, FleetDevice, FleetPushOutcome, adopt_legacy_devices_from_auth_keys,
+    DevicesFile, FleetDevice, FleetPushOutcome, PairedBy, adopt_legacy_devices_from_auth_keys,
     format_precise_rfc3339, load_devices_raw, lock_config, push_devices_to_fleet,
     reconcile_authorized_keys_in_memory, remove_device_principal_locked, save_devices_locked,
     upsert_device_principal_locked,
@@ -642,6 +642,10 @@ fn process_enrol_blocking(
         } else {
             None
         };
+        let paired_by = invite.created_by.as_ref().map(|creator| PairedBy {
+            principal: creator.clone(),
+            device: invite.created_by_device.clone(),
+        });
         devices.devices.insert(
             pairing_id.clone(),
             FleetDevice {
@@ -651,6 +655,8 @@ fn process_enrol_blocking(
                 role: recorded_role,
                 paired_at: precise_now.clone(),
                 paired_on: valid_node_name.clone(),
+                paired_by,
+                confirmed_by: None,
                 updated_at: precise_now,
                 updated_on: valid_node_name.clone(),
             },
