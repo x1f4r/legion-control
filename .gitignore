@@ -11,10 +11,8 @@ node_modules/
 # Staged release artifacts belong on GitHub releases, not in git history.
 dist/
 
-# Native desktop build outputs and local signing material.
+# Local build outputs and signing material.
 **/bin/
-**/obj/
-desktop/artifacts/
 *.key
 
 # What cargo builds for the Rust workspace at the root of the repository.
