@@ -28,9 +28,9 @@ use serde::{Deserialize, Serialize};
 use crate::caller::Caller;
 
 use self::authkeys::{
-    ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_invite_line,
+    AuthKeysTarget, ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_invite_line,
     line_matches_account, line_matches_home, resolve_safe_write_path, resolve_target,
-    verify_exe_not_group_or_world_writable, verify_owner_matches_euid, write_auth_keys,
+    verify_exe_not_group_or_world_writable, verify_owner_matches_euid,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
@@ -295,27 +295,16 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        let (original_bytes, existed_before, mut state) =
-            edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
-                let original_bytes = auth_keys.to_bytes();
-                let existed_before = write_path.exists();
-                let mut state = load_state(&paths)?;
-                sweep(&mut auth_keys, &mut state, now);
-                auth_keys.append_line(&invite_line);
-                Ok((Some(auth_keys), (original_bytes, existed_before, state)))
-            })?;
-
-        state.invites.insert(id_for_write, record);
-        if let Err(state_err) = save_state(&paths, &state) {
-            // Roll back authorized_keys so a failed state write never leaves an orphaned invite key.
-            if existed_before {
-                let _ = write_auth_keys(&target, &write_path, &original_bytes);
-            } else {
-                let _ = std::fs::remove_file(&write_path);
-            }
-            return Err(state_err);
-        }
-        Ok(())
+        commit_invite_and_state(
+            &paths,
+            &target,
+            &write_path,
+            &id_for_write,
+            &invite_line,
+            record,
+            now,
+            save_state,
+        )
     })
     .await?;
 
@@ -782,6 +771,46 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     }
 
     Ok(removed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_invite_and_state(
+    paths: &legion_core::Paths,
+    target: &AuthKeysTarget,
+    write_path: &std::path::Path,
+    invite_id: &str,
+    invite_line: &str,
+    record: InviteRecord,
+    now: Timestamp,
+    save_fn: impl FnOnce(&legion_core::Paths, &store::DevicesState) -> Result<(), ErrorBody>,
+) -> Result<(), ErrorBody> {
+    let mut state = edit_auth_keys_with_retry(target, write_path, |mut auth_keys| {
+        let mut state = load_state(paths)?;
+        sweep(&mut auth_keys, &mut state, now);
+        auth_keys.append_line(invite_line);
+        Ok((Some(auth_keys), state))
+    })?;
+
+    state.invites.insert(invite_id.to_owned(), record);
+    if let Err(state_err) = save_fn(paths, &state) {
+        // Roll back through the guarded concurrent-edit path by removing only this invite's line,
+        // so any out-of-band edit that landed after the append is preserved intact.
+        let _ = rollback_invite_line(target, write_path, invite_id);
+        return Err(state_err);
+    }
+    Ok(())
+}
+
+fn rollback_invite_line(
+    target: &AuthKeysTarget,
+    write_path: &std::path::Path,
+    invite_id: &str,
+) -> Result<(), ErrorBody> {
+    edit_auth_keys_with_retry(target, write_path, |mut auth_keys| {
+        let removed = auth_keys
+            .retain(|line| !matches!(&line.kind, LineKind::Invite { id, .. } if id == invite_id));
+        Ok((removed.then_some(auth_keys), ()))
+    })
 }
 
 fn caller_account_for_target(
@@ -1644,5 +1673,88 @@ role = "owner"
             assert_eq!(err.code, ErrorCode::NotFound, "{name}");
         }
         assert_eq!(std::fs::read_to_string(&h.auth_keys).unwrap(), initial);
+    }
+
+    #[test]
+    fn invite_rollback_removes_only_invite_line_and_preserves_concurrent_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let exp: Timestamp = "2026-11-24T12:15:00Z".parse().unwrap();
+        let eph = generate_ephemeral_ed25519().unwrap();
+        let concurrent_key = generate_ephemeral_ed25519().unwrap();
+        let concurrent_line = format!("{} added-concurrently@host\n", concurrent_key.public_key);
+
+        for (label, initial) in [
+            ("existing_file", Some("# preexisting\n")),
+            ("newly_created_file", None),
+        ] {
+            let auth_path = dir.path().join(format!("authorized_keys_{label}"));
+            if let Some(seed_content) = initial {
+                std::fs::write(&auth_path, seed_content).unwrap();
+            }
+            let target = AuthKeysTarget {
+                path: auth_path.clone(),
+                is_default_home_ssh: false,
+                windows_admin_acl: false,
+            };
+            let id = format!("rollback{label}");
+            let invite_line = format_invite_line(
+                std::path::Path::new("/home/me/.local/bin/legion"),
+                &id,
+                exp,
+                &eph.public_key,
+                paths.explicit_home(),
+                None,
+                ForcedCommandShell::Posix,
+            )
+            .unwrap();
+            let record = InviteRecord {
+                id: id.clone(),
+                principal: "phone".to_owned(),
+                created: format_rfc3339(now),
+                expires: format_rfc3339(exp),
+                fingerprint: eph.fingerprint.clone(),
+            };
+
+            let err = commit_invite_and_state(
+                &paths,
+                &target,
+                &auth_path,
+                &id,
+                &invite_line,
+                record,
+                now,
+                |_, _| {
+                    // Simulate an out-of-band edit landing between the invite append and rollback.
+                    let mut current = std::fs::read_to_string(&auth_path).unwrap();
+                    current.push_str(&concurrent_line);
+                    std::fs::write(&auth_path, current).unwrap();
+                    Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        "simulated devices.json save failure",
+                    ))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed, "{label}");
+
+            let final_text = std::fs::read_to_string(&auth_path).unwrap();
+            assert!(
+                !final_text.contains(&format!("legion-invite:{id}")),
+                "{label}: invite line was not rolled back: {final_text}"
+            );
+            assert!(
+                final_text.contains(&concurrent_line),
+                "{label}: concurrent edit was lost during rollback: {final_text}"
+            );
+            if let Some(seed_content) = initial {
+                assert!(final_text.contains(seed_content), "{label}: {final_text}");
+            }
+        }
     }
 }
