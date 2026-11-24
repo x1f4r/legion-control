@@ -32,5 +32,11 @@ tokio = { workspace = true, features = ["time"] }
 name = "fleet"
 harness = false
 
+# Runs its own binary as the connector to second and third nodes, to cut, slow down or prefix a
+# banner to their stream pipes.
+[[test]]
+name = "transfer"
+harness = false
+
 [lints]
 workspace = true

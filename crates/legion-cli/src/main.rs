@@ -5,6 +5,7 @@
 //! command line itself is wrong.
 
 mod args;
+mod cp;
 mod render;
 mod rpc;
 
@@ -15,12 +16,13 @@ use std::sync::Arc;
 use legion_core::proto::{ErrorBody, Target, ToolsResult};
 use legion_core::{Call, Door, EventSink, Node, Paths, RouteOutcome, Router, VERSION};
 use legion_doors::mcp::{self, McpDoor};
-use legion_net::Fleet;
+use legion_net::stream::Host;
+use legion_net::{Fleet, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::args::{ArgsSource, CallCommand, Command, USAGE, UsageError};
+use crate::args::{ArgsSource, CallCommand, Command, USAGE, UsageError, command_help};
 
 const FAILED: u8 = 1;
 const USAGE_ERROR: u8 = 2;
@@ -40,6 +42,12 @@ fn main() -> ExitCode {
         }
         Command::Help { tool: None, .. } => {
             out(&format!("{USAGE}\n"));
+            ExitCode::SUCCESS
+        }
+        Command::Help {
+            tool: Some(name), ..
+        } if command_help(&name).is_some() => {
+            out(&format!("{}\n", command_help(&name).unwrap_or_default()));
             ExitCode::SUCCESS
         }
         command => match tokio::runtime::Builder::new_multi_thread()
@@ -66,8 +74,13 @@ fn main() -> ExitCode {
 async fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::Call(call) => call.json,
+        Command::Cp(cp) => cp.json,
         Command::Tools { json } | Command::Help { json, .. } => *json,
-        Command::Rpc { .. } | Command::Mcp { .. } | Command::Version => false,
+        Command::Rpc { .. }
+        | Command::Mcp { .. }
+        | Command::Stream { .. }
+        | Command::Gate { .. }
+        | Command::Version => false,
     };
     let (node, router) = match Paths::from_env() {
         Ok(paths) => {
@@ -79,8 +92,20 @@ async fn run(command: Command) -> ExitCode {
                 Arc::new(fleet) as Arc<dyn Router>,
             )
         }
-        // The stdout of `legion rpc` and `legion mcp` carries protocol messages and nothing else.
-        Err(error) if matches!(command, Command::Rpc { .. } | Command::Mcp { .. }) => {
+        // The stdout of `legion rpc`, `legion mcp` and `legion stream` carries protocol messages
+        // and nothing else; a stream says what went wrong as its one reply.
+        Err(error)
+            if matches!(
+                command,
+                Command::Rpc { .. }
+                    | Command::Mcp { .. }
+                    | Command::Stream { .. }
+                    | Command::Gate { .. }
+            ) =>
+        {
+            if matches!(command, Command::Stream { .. }) {
+                out(&format!("{}\n", serde_json::json!({ "error": error })));
+            }
             err(&render::error(&error));
             return ExitCode::from(FAILED);
         }
@@ -115,27 +140,80 @@ async fn run(command: Command) -> ExitCode {
             }
             Err(error) => failed(&error, json),
         },
-        Command::Rpc { pinned } => {
-            match rpc::serve(
-                tokio::io::stdin(),
-                tokio::io::stdout(),
-                node,
-                router,
-                pinned,
-            )
-            .await
-            {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    err(&format!("legion rpc: the session ended: {error}\n"));
-                    ExitCode::from(FAILED)
-                }
-            }
+        Command::Cp(command) => {
+            let code = cp::run(&node, router.as_ref(), command).await;
+            router.shutdown().await;
+            code
         }
+        Command::Rpc { pinned } => serve_rpc(node, router, pinned).await,
         Command::Mcp { pinned, compact } => serve_mcp(node, router, pinned, compact).await,
+        Command::Stream { pinned } => serve_stream(&node, pinned).await,
+        Command::Gate { pinned } => gate(node, router, pinned).await,
         Command::Help { tool: None, .. } | Command::Version => {
             out(&format!("{USAGE}\n"));
             ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `legion rpc`: JSON-RPC on stdin and stdout until stdin ends.
+async fn serve_rpc(node: Node, router: Arc<dyn Router>, pinned: Option<String>) -> ExitCode {
+    match rpc::serve(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        node,
+        router,
+        pinned,
+    )
+    .await
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            err(&format!("legion rpc: the session ended: {error}\n"));
+            ExitCode::from(FAILED)
+        }
+    }
+}
+
+/// `legion stream`: one bulk-data operation on stdin and stdout. Its reason for failing, when it
+/// fails, goes to stderr whether or not it could still be said on stdout.
+async fn serve_stream(node: &Node, pinned: Option<String>) -> ExitCode {
+    let host = Host::new(node.paths().clone(), node.name());
+    let served = tokio::task::spawn_blocking(move || {
+        legion_net::stream::serve(
+            &host,
+            pinned.as_deref(),
+            io::stdin().lock(),
+            io::stdout().lock(),
+        )
+    })
+    .await;
+    match served {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(error)) => {
+            err(&format!("legion stream: {}\n", error.message));
+            ExitCode::from(FAILED)
+        }
+        Err(error) => {
+            err(&format!("legion stream: the operation stopped: {error}\n"));
+            ExitCode::from(FAILED)
+        }
+    }
+}
+
+/// `legion gate`: serves what a key forced to it asked for, when that is exactly `legion rpc` or
+/// `legion stream` as the ssh connector sends them, pinned to the key's principal. The request is
+/// only compared, never run.
+async fn gate(node: Node, router: Arc<dyn Router>, pinned: String) -> ExitCode {
+    let requested = std::env::var("SSH_ORIGINAL_COMMAND")
+        .ok()
+        .and_then(|command| legion_net::gate::requested(&command));
+    match requested {
+        Some(Subcommand::Rpc) => serve_rpc(node, router, Some(pinned)).await,
+        Some(Subcommand::Stream) => serve_stream(&node, Some(pinned)).await,
+        None => {
+            err(&format!("{}\n", legion_net::gate::REFUSAL));
+            ExitCode::from(FAILED)
         }
     }
 }
@@ -191,40 +269,54 @@ async fn call_tool(node: &Node, router: &dyn Router, command: CallCommand) -> Ex
     if io::stderr().is_terminal() {
         call.events = EventSink::with_events(move |event| err(&render::event(&event, multi)));
     }
+    let outcome = run_call(node, router, call, command.on).await;
+    print_outcome(outcome, command.json)
+}
+
+/// Runs a call until it ends. Ctrl-C cancels the call rather than killing the process, so the
+/// call still ends in the audit log, as cancelled.
+async fn run_call(
+    node: &Node,
+    router: &dyn Router,
+    call: Call,
+    on: Option<Target>,
+) -> RouteOutcome {
     let cancel = call.cancel.clone();
-    let running = router.call(node, call, command.on);
+    let running = router.call(node, call, on);
     tokio::pin!(running);
-    // Ctrl-C cancels the call rather than killing the process, so the call still ends in the
-    // audit log, as cancelled.
-    let outcome = tokio::select! {
+    tokio::select! {
         outcome = &mut running => outcome,
         Ok(()) = tokio::signal::ctrl_c() => {
             cancel.cancel();
             running.await
         }
-    };
+    }
+}
+
+/// Prints what a call came to and returns the exit code it means.
+fn print_outcome(outcome: RouteOutcome, json: bool) -> ExitCode {
     let exit_code = if outcome.all_failed() {
         ExitCode::from(FAILED)
     } else {
         ExitCode::SUCCESS
     };
     match outcome {
-        RouteOutcome::One(Ok(value)) if wants_json(command.json) => {
-            print_json(&value, command.json);
+        RouteOutcome::One(Ok(value)) if wants_json(json) => {
+            print_json(&value, json);
             exit_code
         }
         RouteOutcome::One(Ok(value)) => {
             out(&render::value(&value));
             exit_code
         }
-        RouteOutcome::One(Err(error)) => failed(&error, command.json),
-        RouteOutcome::Many(results) if wants_json(command.json) => {
+        RouteOutcome::One(Err(error)) => failed(&error, json),
+        RouteOutcome::Many(results) if wants_json(json) => {
             match RouteOutcome::Many(results).into_wire() {
                 Ok(wire) => {
-                    print_json(&wire, command.json);
+                    print_json(&wire, json);
                     exit_code
                 }
-                Err(error) => failed(&error, command.json),
+                Err(error) => failed(&error, json),
             }
         }
         RouteOutcome::Many(results) => {
