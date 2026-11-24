@@ -44,7 +44,10 @@ targets:
     info:
       path: legion-app_iOS/Info.plist
       properties:
+        CFBundleDisplayName: Legion
         LSRequiresIPhoneOS: true
+        NSCameraUsageDescription: Legion uses the camera to scan the pairing code shown by your computer.
+        NSLocalNetworkUsageDescription: Legion uses the local network to reach your own machines.
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
