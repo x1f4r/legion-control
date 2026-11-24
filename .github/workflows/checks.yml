@@ -3,6 +3,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      windows_rust_only:
+        description: Run only the Windows Rust job
+        type: boolean
+        default: false
+      repeat_count:
+        description: Number of times to run the Windows process and job tests (1-50)
+        type: number
+        default: 1
 permissions:
   contents: read
 # A newer push to a pull request makes the run still going on it moot, so that run is cancelled.
@@ -16,6 +26,7 @@ concurrency:
 jobs:
   scripts:
     name: Scripts and UI (${{ matrix.os }})
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,9 +47,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.windows_rust_only && '["windows-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,6 +75,31 @@ jobs:
       # tests run the built binary under a LEGION_HOME of their own, so Windows is the one place its
       # paths, its locks and its line endings are exercised.
       - run: bash scripts/check.sh rust
+      # Optional repeat loop for Windows process, job, and pairing tests when dispatched manually.
+      - name: Repeat Windows process and job tests
+        if: ${{ runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.repeat_count > 1 }}
+        shell: bash
+        env:
+          REPEAT_COUNT: ${{ inputs.repeat_count }}
+        run: |
+          set -euo pipefail
+          case "$REPEAT_COUNT" in
+            ''|*[!0-9]*)
+              echo "repeat_count must be an integer between 1 and 50 (got '$REPEAT_COUNT')" >&2
+              exit 2
+              ;;
+          esac
+          if [ "$REPEAT_COUNT" -lt 1 ] || [ "$REPEAT_COUNT" -gt 50 ]; then
+            echo "repeat_count must be between 1 and 50 (got '$REPEAT_COUNT')" >&2
+            exit 2
+          fi
+          for i in $(seq 2 "$REPEAT_COUNT"); do
+            echo "=== Windows repeat $i/$REPEAT_COUNT ==="
+            cargo test --locked -p legion-os --lib
+            cargo test --locked -p legion-os --test integration
+            cargo test --locked -p legion-tools --test job --test exec --test sys
+            cargo test --locked -p legion-cli --test pairing
+          done
       # Verify that the generated tool reference matches the built binary's registry.
       - name: Check generated Legion tool reference
         if: runner.os == 'Linux'
@@ -156,6 +192,7 @@ jobs:
 
   private-data:
     name: Private data
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -174,6 +211,7 @@ jobs:
 
   shellcheck:
     name: ShellCheck
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -187,6 +225,7 @@ jobs:
 
   powershell:
     name: PSScriptAnalyzer
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -205,6 +244,7 @@ jobs:
 
   ui-browser:
     name: UI browser
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
