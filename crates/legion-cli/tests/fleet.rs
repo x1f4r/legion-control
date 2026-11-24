@@ -1382,6 +1382,30 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
     assert_eq!(mcp_all_fail["isError"], json!(true), "{mcp_all_fail}");
     assert_eq!(mcp.finish(), 0);
 
+    // Duplicate target names collapse before choosing single vs fan-out shape across all doors.
+    let dup_remote = laptop.run(&["meta.version", "--on", "pi,pi"]);
+    assert_eq!(dup_remote.code, 0, "{}", dup_remote.stdout);
+    let dup_json = dup_remote.json();
+    assert!(dup_json.get("results").is_none(), "{dup_json}");
+    assert_eq!(dup_json["node"], json!("pi"));
+
+    let dup_local = laptop.run(&["meta.version", "--on", "laptop,laptop"]);
+    assert_eq!(dup_local.code, 0, "{}", dup_local.stdout);
+    let dup_local_json = dup_local.json();
+    assert!(dup_local_json.get("results").is_none(), "{dup_local_json}");
+    assert_eq!(dup_local_json["node"], json!("laptop"));
+
+    let mut rpc = laptop.session(&[]);
+    rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": ["pi", "pi"]}),
+    ));
+    let (dup_rpc, _) = rpc.reply_to(&json!(1));
+    assert!(dup_rpc["result"].get("results").is_none(), "{dup_rpc}");
+    assert_eq!(dup_rpc["result"]["node"], json!("pi"));
+    assert_eq!(rpc.finish(), 0);
+
     // Unknown single machine returns not_found carrying this node's name and listing known names.
     let unknown = laptop.run(&["meta.version", "--on", "ghost"]);
     assert_eq!(unknown.code, 1);

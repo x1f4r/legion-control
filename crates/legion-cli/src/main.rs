@@ -277,8 +277,13 @@ async fn call_tool(
         }
     };
 
-    let multi = matches!(&command.on, Some(Target::All))
-        || matches!(&command.on, Some(Target::Many(names)) if names.len() > 1);
+    let multi = match &command.on {
+        Some(Target::All) => true,
+        Some(Target::Many(names)) => {
+            names.iter().collect::<std::collections::HashSet<_>>().len() > 1
+        }
+        None | Some(Target::One(_)) => false,
+    };
     let tool_name = command.tool.clone();
     let mut call = Call::new(Door::Cli, command.tool, args);
     call.as_principal = command.as_principal;

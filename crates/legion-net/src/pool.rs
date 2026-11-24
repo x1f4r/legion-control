@@ -1240,10 +1240,6 @@ impl Router for Fleet {
                 Some(Target::One(machine)) => {
                     RouteOutcome::One(self.call_machine(node, &machine, call).await)
                 }
-                Some(Target::Many(mut names)) if names.len() == 1 => {
-                    let machine = names.pop().unwrap_or_default();
-                    RouteOutcome::One(self.call_machine(node, &machine, call).await)
-                }
                 Some(Target::All) => {
                     let here = node.name();
                     let fleet_file = match node.config().get::<FleetFile>() {
@@ -1261,11 +1257,16 @@ impl Router for Fleet {
                 }
                 Some(Target::Many(names)) => {
                     let mut seen = HashSet::new();
-                    let unique: Vec<String> = names
+                    let mut unique: Vec<String> = names
                         .into_iter()
                         .filter(|name| seen.insert(name.clone()))
                         .collect();
-                    self.fan_out(node, call, unique).await
+                    if unique.len() == 1 {
+                        let machine = unique.pop().unwrap_or_default();
+                        RouteOutcome::One(self.call_machine(node, &machine, call).await)
+                    } else {
+                        self.fan_out(node, call, unique).await
+                    }
                 }
             }
         })
