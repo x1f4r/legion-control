@@ -101,7 +101,7 @@ fn job_helper(mode: &str, args: Vec<String>) -> ExitCode {
     let mut stdout = std::io::stdout();
     match mode {
         // Prints a first chunk (including multi-byte UTF-8), waits until the gate file appears,
-        // then prints a second chunk and a stderr line and exits 0.
+        // then prints additional stdout and stderr lines and exits 0.
         "trickle" => {
             let gate = Path::new(&args[0]);
             let _ = writeln!(stdout, "chunk-1: αβγ");
@@ -111,8 +111,10 @@ fn job_helper(mode: &str, args: Vec<String>) -> ExitCode {
                 std::thread::sleep(Duration::from_millis(20));
             }
             let _ = writeln!(stdout, "chunk-2: €😀");
+            let _ = writeln!(stdout, "chunk-3: stdout-end");
             let _ = stdout.flush();
-            let _ = writeln!(std::io::stderr(), "stderr-line");
+            let _ = writeln!(std::io::stderr(), "stderr-1");
+            let _ = writeln!(std::io::stderr(), "stderr-2");
             let _ = std::io::stderr().flush();
             ExitCode::SUCCESS
         }
@@ -382,20 +384,73 @@ async fn output_is_captured_and_readable_incrementally() {
         .await
         .unwrap();
     assert_eq!(rest["state"], json!("succeeded"));
+    assert_eq!(rest["offset"], json!(offset));
     assert_eq!(rest["eof"], json!(true));
     assert_eq!(rest["truncated"], json!(false));
     let tail_text = rest["content"].as_str().unwrap();
-    assert!(tail_text.contains("chunk-2: €😀"), "{tail_text:?}");
-    assert!(tail_text.contains("stderr-line"), "{tail_text:?}");
+    assert!(!tail_text.contains('\u{fffd}'), "{tail_text:?}");
+    let rest_lines: Vec<&str> = tail_text.lines().collect();
+    assert_eq!(
+        rest_lines.len(),
+        4,
+        "expected four intact lines without splitting: {rest_lines:?}"
+    );
+    let pos = |needle: &str| {
+        rest_lines
+            .iter()
+            .position(|&line| line == needle)
+            .unwrap_or_else(|| panic!("missing line {needle:?} in {rest_lines:?}"))
+    };
+    // Each stream keeps its own lines intact and in order; cross-stream order is unspecified.
+    assert!(
+        pos("chunk-2: €😀") < pos("chunk-3: stdout-end"),
+        "stdout lines out of order: {rest_lines:?}"
+    );
+    assert!(
+        pos("stderr-1") < pos("stderr-2"),
+        "stderr lines out of order: {rest_lines:?}"
+    );
 
-    // Default tail mode returns the final lines with offset/next_offset.
+    // Re-reading the whole finished log incrementally with small `limit` matches byte-for-byte
+    // and reaches the same `next_offset`.
+    let mut reread_offset = 0u64;
+    let mut reread = String::new();
+    loop {
+        let page = fixture
+            .call(
+                "job.logs",
+                json!({"id": id, "offset": reread_offset, "limit": 7}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["offset"], json!(reread_offset));
+        let piece = page["content"].as_str().unwrap();
+        assert!(!piece.contains('\u{fffd}'), "split UTF-8: {page:#}");
+        reread.push_str(piece);
+        reread_offset = page["next_offset"].as_u64().unwrap();
+        if page["eof"] == json!(true) {
+            break;
+        }
+    }
+    let full_expected = format!("{collected}{tail_text}");
+    assert_eq!(reread, full_expected);
+    assert_eq!(reread_offset, rest["next_offset"].as_u64().unwrap());
+
+    // Default tail mode returns the final line actually written, regardless of which stream
+    // landed last.
+    let expected_last = *rest_lines.last().unwrap();
+    assert!(
+        matches!(expected_last, "chunk-3: stdout-end" | "stderr-2"),
+        "unexpected final line: {rest_lines:?}"
+    );
     let tail_one = fixture
         .call("job.logs", json!({"id": id, "tail": 1}))
         .await
         .unwrap();
     assert_eq!(tail_one["eof"], json!(true));
     assert_eq!(tail_one["truncated"], json!(true));
-    assert_eq!(tail_one["content"].as_str().unwrap().trim(), "stderr-line");
+    assert_eq!(tail_one["next_offset"], rest["next_offset"]);
+    assert_eq!(tail_one["content"].as_str().unwrap().trim(), expected_last);
 
     // Combining `offset` and `tail` is invalid.
     let err = fixture

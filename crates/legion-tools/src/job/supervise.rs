@@ -16,7 +16,7 @@ use legion_core::{CancellationToken, Paths};
 use legion_os::OsError;
 use legion_os::atomic::replace_file;
 use legion_os::lock::{FileLock, LockMode};
-use legion_os::run::{ChunkCallback, OutputChunk, RunOptions, run};
+use legion_os::run::{ChunkCallback, OutputChunk, OutputStream, RunOptions, run};
 use legion_os::shell::CommandSpec;
 
 use super::platform;
@@ -38,6 +38,9 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the supervisor retries taking the exclusive job lock so a reader's brief shared probe
 /// landing between lock creation and locking never aborts startup.
 const SUPERVISOR_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+/// Maximum partial line bytes buffered per stream before flushing without a newline, keeping
+/// supervisor memory strictly bounded while preventing stdout and stderr from splitting lines.
+const MAX_LINE_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Runs the hidden `job-supervise` subcommand when `args` starts with `"job-supervise"`.
 ///
@@ -141,7 +144,7 @@ fn parse_args(rest: &[OsString]) -> Result<(String, Option<PathBuf>), String> {
     Ok((id, state_dir))
 }
 
-struct LogSink {
+struct LogWriter {
     dir: PathBuf,
     file: Option<File>,
     current_bytes: u64,
@@ -150,7 +153,7 @@ struct LogSink {
     write_error: Option<String>,
 }
 
-impl LogSink {
+impl LogWriter {
     fn open(dir: PathBuf, cap: u64) -> io::Result<Self> {
         let file = platform::open_private_append(&dir.join(LOG_FILE))?;
         let current_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -165,7 +168,7 @@ impl LogSink {
         })
     }
 
-    fn write_chunk(&mut self, mut bytes: &[u8]) {
+    fn write_bytes(&mut self, mut bytes: &[u8]) {
         if self.write_error.is_some() || bytes.is_empty() {
             return;
         }
@@ -229,6 +232,75 @@ impl LogSink {
             let _ = file.sync_data();
         }
         self.write_error.take()
+    }
+}
+
+/// Merges stdout and stderr into `output.log` under one lock, buffering incomplete trailing lines
+/// per stream (up to `max_line_buffer`) so the two streams never split each other's lines.
+struct LogSink {
+    writer: LogWriter,
+    stdout_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
+    max_line_buffer: usize,
+}
+
+impl LogSink {
+    fn open(dir: PathBuf, cap: u64) -> io::Result<Self> {
+        Self::open_with_line_cap(dir, cap, MAX_LINE_BUFFER_BYTES)
+    }
+
+    fn open_with_line_cap(dir: PathBuf, cap: u64, max_line_buffer: usize) -> io::Result<Self> {
+        Ok(Self {
+            writer: LogWriter::open(dir, cap)?,
+            stdout_buf: Vec::new(),
+            stderr_buf: Vec::new(),
+            max_line_buffer,
+        })
+    }
+
+    fn write_stream(&mut self, stream: OutputStream, bytes: &[u8]) {
+        if self.writer.write_error.is_some() || bytes.is_empty() {
+            return;
+        }
+        let buf = match stream {
+            OutputStream::Stdout => &mut self.stdout_buf,
+            OutputStream::Stderr => &mut self.stderr_buf,
+        };
+        if let Some(last_nl) = bytes.iter().rposition(|&b| b == b'\n') {
+            if !buf.is_empty() {
+                self.writer.write_bytes(buf);
+                buf.clear();
+            }
+            self.writer.write_bytes(&bytes[..=last_nl]);
+            let tail = &bytes[last_nl + 1..];
+            if !tail.is_empty() {
+                if tail.len() > self.max_line_buffer {
+                    self.writer.write_bytes(tail);
+                } else {
+                    buf.extend_from_slice(tail);
+                }
+            }
+        } else if buf.len().saturating_add(bytes.len()) > self.max_line_buffer {
+            if !buf.is_empty() {
+                self.writer.write_bytes(buf);
+                buf.clear();
+            }
+            self.writer.write_bytes(bytes);
+        } else {
+            buf.extend_from_slice(bytes);
+        }
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if !self.stdout_buf.is_empty() {
+            self.writer.write_bytes(&self.stdout_buf);
+            self.stdout_buf.clear();
+        }
+        if !self.stderr_buf.is_empty() {
+            self.writer.write_bytes(&self.stderr_buf);
+            self.stderr_buf.clear();
+        }
+        self.writer.finish()
     }
 }
 
@@ -345,7 +417,7 @@ async fn supervise_with_cap(state_dir: &Path, id: &str, max_log_bytes: u64) -> R
         let sink = Arc::clone(&sink);
         Arc::new(move |chunk: OutputChunk| {
             if let Ok(mut guard) = sink.lock() {
-                guard.write_chunk(&chunk.bytes);
+                guard.write_stream(chunk.stream, &chunk.bytes);
             }
         })
     };
@@ -594,5 +666,42 @@ mod tests {
         assert_eq!(slice.next_offset, expected.len() as u64);
         assert!(slice.eof);
         assert_eq!(slice.content, &expected[meta.dropped_bytes as usize..]);
+    }
+
+    #[test]
+    fn log_sink_keeps_interleaved_stream_lines_intact_and_flushes_trailing_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = LogSink::open(tmp.path().to_path_buf(), 0).unwrap();
+
+        // Interleave partial UTF-8 and partial lines across stdout and stderr.
+        sink.write_stream(OutputStream::Stdout, b"out-1: \xe2\x82");
+        sink.write_stream(OutputStream::Stderr, b"err-1: first ");
+        sink.write_stream(OutputStream::Stdout, b"\xac\nout-2: half ");
+        sink.write_stream(OutputStream::Stderr, b"line\nerr-2: complete\nerr-tail");
+        sink.write_stream(OutputStream::Stdout, b"finished\nout-tail");
+        assert_eq!(sink.finish(), None);
+
+        let content = fs::read_to_string(tmp.path().join(LOG_FILE)).unwrap();
+        assert_eq!(
+            content,
+            "out-1: €\nerr-1: first line\nerr-2: complete\nout-2: half finished\nout-tailerr-tail"
+        );
+    }
+
+    #[test]
+    fn log_sink_flushes_overlong_partial_line_to_bound_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = LogSink::open_with_line_cap(tmp.path().to_path_buf(), 0, 16).unwrap();
+
+        sink.write_stream(OutputStream::Stdout, b"0123456789");
+        assert_eq!(sink.stdout_buf.len(), 10);
+        // Pushing 10 more bytes exceeds the 16-byte cap and flushes immediately.
+        sink.write_stream(OutputStream::Stdout, b"abcdefghij");
+        assert!(sink.stdout_buf.is_empty());
+        sink.write_stream(OutputStream::Stdout, b"\n");
+        assert_eq!(sink.finish(), None);
+
+        let content = fs::read_to_string(tmp.path().join(LOG_FILE)).unwrap();
+        assert_eq!(content, "0123456789abcdefghij\n");
     }
 }
