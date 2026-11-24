@@ -558,7 +558,14 @@ fn copy_regular_file(
         cancelled: false,
     };
     let mode = platform::unix_mode_bits(from_meta);
-    let copied = match write_atomic_from_reader(to, &mut reader, WriteOptions { mode }) {
+    let copied = match write_atomic_from_reader(
+        to,
+        &mut reader,
+        WriteOptions {
+            mode,
+            no_replace: false,
+        },
+    ) {
         Ok(copied) => copied,
         Err(_) if reader.cancelled => return Err(cancelled_error(opts.tool)),
         Err(error) => return Err(map_os_error("copy to", to, error)),

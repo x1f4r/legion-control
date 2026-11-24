@@ -31,14 +31,27 @@ serde_json.workspace = true
 sysinfo.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
+toml_edit.workspace = true
+
+# sys.kill asks a Unix kernel whether a pid exists with signal 0, through nix's safe wrapper.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal"] }
 
 # These re-execute their own binary as the child processes they need, so they cannot use the
 # standard harness, which writes to stdout before any test code runs.
 [[test]]
 name = "exec"
+harness = false
+
+[[test]]
+name = "job"
+harness = false
+
+[[test]]
+name = "proj"
 harness = false
 
 [[test]]

@@ -261,7 +261,10 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
 
         let hash = hash_bytes_cancellable(&payload, &cancel, "fs.write")?;
         let size = payload.len() as u64;
-        let options = WriteOptions { mode: unix_mode };
+        let options = WriteOptions {
+            mode: unix_mode,
+            no_replace: false,
+        };
         write_atomic_cancellable(&path, &payload, options, &cancel, "fs.write")?;
         // `legion-os` preserves the existing file's mode on overwrite; honor an explicit
         // `unix_mode` when the caller asked for one.

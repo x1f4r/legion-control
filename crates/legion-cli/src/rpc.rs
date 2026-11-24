@@ -112,7 +112,6 @@ where
             Some(Ok(Line::Read)) => session.handle(&line).await,
         }
     };
-
     let mut cancelled = matches!(ended, Ended::OutputGone);
     if cancelled {
         session.cancel_all();
@@ -130,6 +129,7 @@ where
             },
         }
     }
+    session.router.shutdown().await;
     drop(session);
     let written = writer
         .await
@@ -387,11 +387,12 @@ impl Session {
         let events = {
             let out = self.out.clone();
             let id = id.clone();
-            EventSink::new(move |kind, data| {
+            EventSink::with_events(move |event| {
                 let params = EventParams {
                     id: id.clone(),
-                    kind,
-                    data,
+                    kind: event.kind,
+                    data: event.data,
+                    machine: event.machine,
                 };
                 if let Ok(params) = serde_json::to_value(params)
                     && let Ok(line) =
@@ -411,6 +412,7 @@ impl Session {
             pinned: self.pinned.clone(),
             cancel,
             events,
+            hops: params.hops,
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);
@@ -418,7 +420,7 @@ impl Session {
         let running = Arc::clone(&self.running);
         let reply_id = id.clone();
         let task = self.calls.spawn(async move {
-            let result = router.call(&node, call, params.on).await;
+            let result = router.call(&node, call, params.on).await.into_wire();
             running
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -233,7 +233,27 @@ last is tried first; only the running system answers, and its `hello` says which
 
 The node keeps one session per machine open while it lives and multiplexes calls over it by id,
 so only the first call to a machine pays for the handshake. A session that dies is reopened once
-before the call fails with `unreachable`.
+before the call fails with `unreachable`, and a call is retried only if it was never sent.
+
+A call sent to a machine carries no target of its own: the machine that receives it runs it,
+whatever it calls itself, so two fleet files that disagree about names can never send a call to
+the wrong place. Reaching a machine through another is said out loud, never guessed:
+
+    [machines.shed]
+    ssh = "shed"
+    via = "pi"                      # ask pi to forward; pi must know shed too
+
+A node that is asked to forward to a name it does not know answers `not_found`. It never runs the
+call itself.
+
+A node that forwards a call lends its own ssh identity to the caller, so it treats the call as
+its own business: it authorises it against its own policy first, and writes it to its own audit
+log with the machine it went to. The target then decides again by its own policy. A call has to
+be allowed by every node it passes through.
+
+`all` means this node and every machine in the fleet file. `fleet.discover` only offers machines
+on the tailnet that belong to the same user as this node; a device someone shared in is not yours
+to send commands to.
 
 Waking is honest. `power.wake` asks a helper on the target's network to send the packet; the
 helper takes the hardware address from its own fleet file, never from the request. The reply says
@@ -308,7 +328,7 @@ replaced by their size.
   schema. Output is a readable rendering on a terminal and the raw JSON object otherwise.
 - **MCP.** `legion mcp` serves the registry over stdio. Tool names swap the dot for an underscore
   (`fs_read`), every tool gains the optional `on` argument, and effects become the standard
-  annotations (`readOnlyHint` for `read`, `destructiveHint` for `destroy` and `power`). A failed
+  annotations (`readOnlyHint` for `read`, `destructiveHint` for every other effect). A failed
   call is a result with `isError` and the same error object as text, so the agent can read the
   code and the hint. `--compact` serves three tools instead (`legion_tools`, `legion_describe`,
   `legion_call`) for agents that should not carry forty schemas in their context. Two revisions

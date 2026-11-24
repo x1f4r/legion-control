@@ -195,20 +195,26 @@ impl Drop for Mcp {
     }
 }
 
-/// A successful tool result's object, checking that its text and structured content agree.
+/// The one JSON object a tool result carries: as one line of text, and only there.
+fn payload(result: &Value) -> Value {
+    assert_eq!(result.get("structuredContent"), None, "{result}");
+    let content = result["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1, "{result}");
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(!text.contains('\n'), "{text}");
+    serde_json::from_str(text).unwrap()
+}
+
+/// A successful tool result's object.
 fn ok(result: &Value) -> Value {
     assert_eq!(result["isError"], json!(false), "{result}");
-    let text = result["content"][0]["text"].as_str().unwrap();
-    let parsed: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(parsed, result["structuredContent"], "{result}");
-    parsed
+    payload(result)
 }
 
 /// A failed tool result's error object, which must be a result and not a protocol error.
 fn failed(result: &Value) -> Value {
     assert_eq!(result["isError"], json!(true), "{result}");
-    let text = result["content"][0]["text"].as_str().unwrap();
-    let error: Value = serde_json::from_str(text).unwrap();
+    let error = payload(result);
     assert!(error["message"].is_string(), "{error}");
     error
 }
@@ -240,21 +246,39 @@ fn the_handshake_revision_lists_and_calls_the_tools() {
     assert_eq!(whoami["title"], json!("meta.whoami"));
     assert_eq!(whoami["annotations"]["readOnlyHint"], json!(true));
     assert!(whoami["inputSchema"]["properties"]["on"].is_object());
-    let write = tools
-        .iter()
-        .find(|tool| tool["name"] == json!("test_write_path"))
-        .unwrap();
-    assert_eq!(write["annotations"]["readOnlyHint"], json!(false));
-    assert_eq!(write["annotations"]["destructiveHint"], json!(false));
-    assert!(tools.iter().all(|tool| {
+    // Anything that is not read-only asks for confirmation in a client that asks.
+    for name in [
+        "test_write_path",
+        "exec_run",
+        "fs_write",
+        "fs_edit",
+        "fs_move",
+        "fs_remove",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == json!(name))
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], json!(false), "{name}");
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            json!(true),
+            "{name}"
+        );
+    }
+    for tool in tools {
         let name = tool["name"].as_str().unwrap();
-        !name.contains('.') && tool["inputSchema"]["type"] == json!("object")
-    }));
+        assert!(!name.contains('.'), "{name}");
+        assert_eq!(tool["inputSchema"]["type"], json!("object"), "{name}");
+        assert_eq!(
+            legion_core::schema::problems(&tool["inputSchema"]),
+            Vec::<String>::new(),
+            "{name}"
+        );
+    }
 
     let version = mcp.call("meta_version", json!({}));
     assert_eq!(version.get("resultType"), None);
-    let text = version["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("\n  \"name\": \"legion\""), "{text}");
     assert_eq!(ok(&version)["name"], json!("legion"));
     assert_eq!(
         ok(&mcp.call("meta_whoami", json!({})))["door"],
@@ -353,12 +377,37 @@ fn failures_are_tool_results_carrying_the_error_object() {
         assert_eq!(extra["code"], json!("invalid_args"));
 
         let elsewhere = failed(&mcp.call("meta_version", json!({"on": "pi"})));
-        assert_eq!(elsewhere["code"], json!("unreachable"));
+        assert_eq!(elsewhere["code"], json!("not_found"));
         assert!(elsewhere["hint"].is_string());
-        let several = failed(&mcp.call("meta_version", json!({"on": ["tower", "pi"]})));
-        assert_eq!(several["code"], json!("unreachable"));
-        let bad_on = failed(&mcp.call("meta_version", json!({"on": 5})));
-        assert_eq!(bad_on["code"], json!("invalid_args"));
+        // The schema asks for one string, with commas between names; a list is taken too.
+        for several in [json!("tower,pi"), json!(["tower", "pi"])] {
+            let partial = ok(&mcp.call("meta_version", json!({"on": several})));
+            assert_eq!(
+                partial["results"]["tower"]["ok"]["node"],
+                json!("tower"),
+                "{several}"
+            );
+            assert_eq!(
+                partial["results"]["pi"]["error"]["code"],
+                json!("not_found"),
+                "{several}"
+            );
+        }
+        // A fan-out where every machine fails sets isError with the wire results object.
+        for all_bad in [json!("pi,laptop"), json!(["pi", "laptop"])] {
+            let call = mcp.call("meta_version", json!({"on": all_bad}));
+            assert_eq!(call["isError"], json!(true), "{call}");
+            let body = payload(&call);
+            assert_eq!(body["results"]["pi"]["error"]["code"], json!("not_found"));
+            assert_eq!(
+                body["results"]["laptop"]["error"]["code"],
+                json!("not_found")
+            );
+        }
+        for bad in [json!(5), json!(""), json!("tower,,pi")] {
+            let bad_on = failed(&mcp.call("meta_version", json!({"on": bad})));
+            assert_eq!(bad_on["code"], json!("invalid_args"), "{bad}");
+        }
 
         // `on` naming this node runs here, and `on` never reaches the tool.
         assert_eq!(
@@ -479,7 +528,7 @@ fn compact_mode_serves_three_tools_that_reach_every_other() {
             "legion_call",
             json!({"tool": "meta.version", "on": "elsewhere"}),
         ));
-        assert_eq!(elsewhere["code"], json!("unreachable"));
+        assert_eq!(elsewhere["code"], json!("not_found"));
         let missing = failed(&mcp.call("legion_call", json!({"args": {}})));
         assert_eq!(missing["code"], json!("invalid_args"));
         let direct = failed(&mcp.call("meta_version", json!({})));
@@ -668,4 +717,176 @@ fn input_that_ends_at_once_ends_the_session_quietly() {
     let run = home.run(&["mcp", "--json"]);
     assert_eq!(run.code, 2);
     assert_eq!(run.stdout, "");
+}
+
+/// The names `legion_tools` lists.
+fn compact_names(mcp: &mut Mcp) -> Vec<String> {
+    ok(&mcp.call("legion_tools", json!({})))["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn compact_mode_tells_a_role_nothing_about_tools_beyond_it() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"tower\"\n");
+    home.write_config(
+        "policy.toml",
+        r#"
+[principals."agent:obs"]
+role = "observer"
+
+[roles.observer]
+allow = ["effect:read"]
+deny = ["meta.doctor"]
+"#,
+    );
+    let (mut mcp, _) = Mcp::initialized(&home, &["--compact", "--as", "agent:obs"]);
+    let names = compact_names(&mut mcp);
+    assert!(names.contains(&"meta.version".to_owned()), "{names:?}");
+    for hidden in ["exec.run", "meta.doctor", "test.write_path"] {
+        assert!(!names.contains(&hidden.to_owned()), "{names:?}");
+    }
+
+    // A tool beyond the role is described exactly as one that does not exist.
+    let missing = failed(&mcp.call("legion_describe", json!({"tool": "nope.nothing"})));
+    assert_eq!(missing["code"], json!("unknown_tool"));
+    for hidden in ["exec.run", "exec_run", "meta.doctor", "test.write_path"] {
+        let error = failed(&mcp.call("legion_describe", json!({"tool": hidden})));
+        let expected = missing["message"]
+            .as_str()
+            .unwrap()
+            .replace("nope.nothing", hidden);
+        assert_eq!(error["message"], json!(expected), "{hidden}");
+        assert_eq!(
+            (&error["code"], &error["hint"], &error["details"]),
+            (&missing["code"], &missing["hint"], &missing["details"]),
+            "{hidden}"
+        );
+    }
+    assert_eq!(
+        ok(&mcp.call("legion_describe", json!({"tool": "meta.version"})))["name"],
+        json!("meta.version")
+    );
+
+    // So is a full-mode name: only a tool the role may use is named in the hint.
+    let unknown = failed(&mcp.call("nope_nothing", json!({})));
+    let beyond = failed(&mcp.call("exec_run", json!({})));
+    assert_eq!(beyond["hint"], unknown["hint"]);
+    assert!(!beyond.to_string().contains("exec.run"), "{beyond}");
+    let allowed = failed(&mcp.call("meta_version", json!({})));
+    assert!(
+        allowed["hint"]
+            .as_str()
+            .unwrap()
+            .contains("\"meta.version\""),
+        "{allowed}"
+    );
+    assert_eq!(mcp.finish().0, 0);
+
+    // A principal the policy does not name may use nothing, and is shown nothing.
+    let (mut stranger, _) = Mcp::initialized(&home, &["--compact", "--as", "stranger"]);
+    assert_eq!(compact_names(&mut stranger), Vec::<String>::new());
+    let error = failed(&stranger.call("legion_describe", json!({"tool": "meta.version"})));
+    assert_eq!(error["code"], json!("unknown_tool"));
+    assert_eq!(error["hint"], missing["hint"]);
+    assert_eq!(stranger.finish().0, 0);
+}
+
+#[test]
+fn a_policy_that_does_not_parse_shows_nothing_and_every_call_says_why() {
+    let home = Home::new();
+    home.write_config("policy.toml", "[roles.x]\nallow = [\"effect:raed\"]\n");
+
+    let (mut full, _) = Mcp::initialized(&home, &[]);
+    assert_eq!(full.tool_names(), Vec::<String>::new());
+    let error = failed(&full.call("meta_version", json!({})));
+    assert!(
+        error["message"].as_str().unwrap().contains("policy.toml"),
+        "{error}"
+    );
+    assert_eq!(full.finish().0, 0);
+
+    let (mut compact, _) = Mcp::initialized(&home, &["--compact"]);
+    for (tool, args) in [
+        ("legion_tools", json!({})),
+        ("legion_describe", json!({"tool": "meta.version"})),
+        ("legion_call", json!({"tool": "meta.version"})),
+    ] {
+        let failure = failed(&compact.call(tool, args));
+        assert_eq!(failure["code"], error["code"], "{tool}: {failure}");
+        assert_eq!(failure["message"], error["message"], "{tool}");
+    }
+    assert_eq!(compact.finish().0, 0);
+}
+
+#[test]
+fn a_result_is_sent_once_as_compact_json() {
+    let home = Home::new();
+    let (mut mcp, _) = Mcp::initialized(&home, &[]);
+    let text = "x".repeat(200_000);
+    let echo = mcp.call("test_echo", json!({"text": text}));
+    assert_eq!(ok(&echo), json!({"text": text}));
+    // The reply is the payload once, plus the envelope around it.
+    let line = echo.to_string();
+    assert!(line.len() < text.len() + 200, "{} bytes", line.len());
+    assert_eq!(
+        echo["content"][0]["text"],
+        json!(json!({"text": text}).to_string())
+    );
+
+    let error = mcp.call("test_sleep", json!({"seconds": "long"}));
+    assert_eq!(failed(&error)["code"], json!("invalid_args"));
+    assert_eq!(mcp.finish().0, 0);
+}
+
+#[test]
+fn hints_point_at_what_an_mcp_client_has() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"tower\"\n");
+
+    let (mut full, _) = Mcp::initialized(&home, &[]);
+    let invalid = failed(&full.call("test_sleep", json!({"seconds": "long"})));
+    let hint = invalid["hint"].as_str().unwrap();
+    assert!(!hint.contains("legion help"), "{hint}");
+    assert!(
+        hint.contains("test_sleep") && hint.contains("tools/list"),
+        "{hint}"
+    );
+    let unknown = failed(&full.call("fs_nothing", json!({})));
+    assert!(
+        !unknown["hint"].as_str().unwrap().contains("legion tools"),
+        "{unknown}"
+    );
+    assert_eq!(full.finish().0, 0);
+
+    let (mut compact, _) = Mcp::initialized(&home, &["--compact"]);
+    let invalid = failed(&compact.call(
+        "legion_call",
+        json!({"tool": "test.sleep", "args": {"seconds": "long"}}),
+    ));
+    let hint = invalid["hint"].as_str().unwrap();
+    assert!(!hint.contains("legion help"), "{hint}");
+    assert!(
+        hint.contains("legion_describe") && hint.contains("\"test.sleep\""),
+        "{hint}"
+    );
+    assert_eq!(compact.finish().0, 0);
+
+    // A principal that may use nothing is told so, not shown an empty list of families.
+    let (mut stranger, _) = Mcp::initialized(&home, &["--compact", "--as", "stranger"]);
+    let none = failed(&stranger.call("legion_tools", json!({"family": "fs"})));
+    assert_eq!(none["code"], json!("denied"));
+    assert_eq!(
+        none["message"],
+        json!("stranger may use no tools on tower.")
+    );
+    assert!(
+        none["hint"].as_str().unwrap().contains("policy.toml"),
+        "{none}"
+    );
+    assert_eq!(stranger.finish().0, 0);
 }

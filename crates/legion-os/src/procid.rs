@@ -125,9 +125,11 @@ pub fn is_alive(identity: &ProcessId) -> bool {
 ///
 /// - **Linux:** `/proc/sys/kernel/random/boot_id` (kernel UUID, unaffected by clock steps).
 /// - **macOS:** `sysctl -n kern.bootsessionuuid` (kernel UUID, unaffected by clock steps).
-/// - **Windows:** `boot-ticks-<ticks>` from `Win32_OperatingSystem.LastBootUpTime` UTC ticks
-///   (single source and format; compare with [`same_boot`] so minor NTP clock steps do not look
-///   like a reboot).
+/// - **Windows:** `boot-win-<unbiased_ticks>` computed from
+///   `NtQuerySystemInformation(SystemTimeOfDayInformation)` as `BootTime - BootTimeBias`, which
+///   stays invariant across NTP and dual-boot wall-clock steps of any size. Note that Windows Fast
+///   Startup (hybrid shutdown) hibernates the kernel session rather than performing a cold boot,
+///   so the kernel boot timestamp—and therefore this ID—persists across a Fast Startup cycle.
 pub fn boot_id() -> Result<String> {
     if let Some(cached) = CACHED_BOOT_ID.get() {
         return Ok(cached.clone());
@@ -139,10 +141,10 @@ pub fn boot_id() -> Result<String> {
 
 /// Compare two boot identifiers returned by [`boot_id`].
 ///
-/// UUID-based boot IDs (Linux `boot_id` and macOS `kern.bootsessionuuid`) require exact equality.
-/// Time-derived boot IDs (`boot-ticks-<ticks>` on Windows and `boot-sec-<secs>` on fallback Unix
-/// platforms) allow up to 5 seconds of clock-step tolerance so routine NTP adjustments do not
-/// falsely indicate a reboot.
+/// Clock-step-invariant boot IDs (Linux `boot_id`, macOS `kern.bootsessionuuid`, and Windows
+/// `boot-win-<unbiased_ticks>`) require exact equality. Legacy or fallback time-derived boot IDs
+/// (`boot-ticks-<ticks>` and `boot-sec-<secs>`) allow up to 5 seconds of clock-step tolerance so
+/// routine NTP adjustments do not falsely indicate a reboot.
 pub fn same_boot(a: &str, b: &str) -> bool {
     let a = a.trim();
     let b = b.trim();
@@ -175,15 +177,65 @@ fn parse_prefixed_u64(value: &str, prefix: &str) -> Option<u64> {
     rest.parse::<u64>().ok()
 }
 
+/// Return `Some(reason)` if `identity` refers to a protected process that callers should refuse to
+/// terminate, or `None` otherwise.
+///
+/// Always protects:
+/// - PID 0 and the current process
+/// - Any ancestor of the current process (walking the parent chain up to the root)
+/// - **Unix:** PID 1 (`init` / `systemd` / `launchd`)
+/// - **Windows:** PID 4 (`System`), any process marked critical by the kernel
+///   (`IsProcessCritical`), and core session processes (`csrss`, `wininit`, `smss`, `lsass`,
+///   `services`, `winlogon`)
+pub fn is_protected(identity: &ProcessId) -> Option<&'static str> {
+    if identity.pid == 0 {
+        return Some("kernel / idle process (pid 0)");
+    }
+    if identity.pid == std::process::id() {
+        return Some("current process");
+    }
+    is_protected_impl(identity)
+}
+
+/// Stop a single verified process without signaling its process group or walking descendants.
+///
+/// Returns `Ok(true)` once the exact process identified by `identity` is no longer alive
+/// (including when it has already exited or its PID has been reused by another process), and
+/// `Ok(false)` if it remained alive past the post-kill settle timeout.
+///
+/// - **Unix:** sends `SIGTERM`, polls up to `grace`, and escalates to `SIGKILL`; when `force` is
+///   `true`, sends `SIGKILL` immediately without waiting for `grace`.
+/// - **Windows:** opens `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`,
+///   verifies its exact 100-ns `FILETIME` creation time while the held handle pins the PID against
+///   reuse, and calls `TerminateProcess` directly through that handle (both `force = false` and
+///   `force = true` terminate immediately via the pinned handle).
+pub async fn kill_process(identity: &ProcessId, force: bool, grace: Duration) -> Result<bool> {
+    if identity.pid == 0 {
+        return Err(OsError::InvalidArgument {
+            detail: "cannot terminate pid 0".into(),
+        });
+    }
+    if identity.pid == std::process::id() {
+        return Err(OsError::InvalidArgument {
+            detail: "refusing to terminate the current process".into(),
+        });
+    }
+    kill_process_impl(identity, force, grace).await
+}
+
 /// Stop a process and all of its descendants when the root is not a direct child of this process.
 ///
-/// On Unix, signals both the target's process group (when the target leads its own group distinct
-/// from ours) and every discovered descendant with `SIGTERM`, waits up to `grace`, and escalates
-/// any survivors to `SIGKILL`. On Windows, opens each target and descendant handle with
-/// `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verifies its exact 100-ns `FILETIME`
-/// creation time while the held handle pins the PID, and calls `TerminateProcess` through that
-/// handle. Returns only once every tracked process has exited or the post-kill settle period
-/// elapses, reporting any survivors.
+/// Works even if the root process has already exited while descendants survive:
+/// - **Unix:** signals the target's isolated process group, any process still in the target's
+///   process group or session started at or after `identity.start_time`, and every discovered
+///   descendant with `SIGTERM`, waits up to `grace`, and escalates any survivors to `SIGKILL`.
+/// - **Windows:** walks the process tree starting from `identity.pid` (orphans retain their
+///   original `parent_pid`), verifies each candidate's `parent_pid` and 100-ns `FILETIME` creation
+///   time directly through an open handle (keeping handles pinned across bounded re-snapshot
+///   waves), and calls `TerminateProcess` through those handles.
+///
+/// Returns only once every tracked process has exited or the post-kill settle period elapses,
+/// reporting any survivors.
 pub async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     if identity.pid == 0 {
         return Err(OsError::InvalidArgument {
@@ -222,6 +274,52 @@ fn read_boot_id_impl() -> Result<String> {
     })
 }
 
+/// Return `true` while `identity` itself or any surviving process belonging to its tree/session
+/// (using the same verified ownership rule as [`kill_tree`]) is still running.
+///
+/// Runs all OS queries off the async executor via `spawn_blocking` and performs no writes or
+/// signaling.
+pub(crate) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
+    if identity.pid == 0 {
+        return Ok(false);
+    }
+    tree_is_active_impl(identity).await
+}
+
+#[cfg(any(unix, windows))]
+async fn tree_is_active_impl(identity: &ProcessId) -> Result<bool> {
+    platform::tree_is_active(identity).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn tree_is_active_impl(_identity: &ProcessId) -> Result<bool> {
+    Err(OsError::Unsupported {
+        detail: "process tree liveness check is not supported on this platform".into(),
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn is_protected_impl(identity: &ProcessId) -> Option<&'static str> {
+    platform::is_protected(identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_protected_impl(_identity: &ProcessId) -> Option<&'static str> {
+    None
+}
+
+#[cfg(any(unix, windows))]
+async fn kill_process_impl(identity: &ProcessId, force: bool, grace: Duration) -> Result<bool> {
+    platform::kill_process(identity, force, grace).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn kill_process_impl(_identity: &ProcessId, _force: bool, _grace: Duration) -> Result<bool> {
+    Err(OsError::Unsupported {
+        detail: "single-process termination is not supported on this platform".into(),
+    })
+}
+
 #[cfg(any(unix, windows))]
 async fn kill_tree_impl(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     platform::kill_tree(identity, grace).await
@@ -234,19 +332,55 @@ async fn kill_tree_impl(_identity: &ProcessId, _grace: Duration) -> Result<KillT
     })
 }
 
-/// Parse `(state, start_ticks)` from a Linux `/proc/<pid>/stat` line.
+/// Recover the clock-step-invariant Windows boot timestamp from `SYSTEM_TIMEOFDAY_INFORMATION`'s
+/// `BootTime` and `BootTimeBias` fields.
+///
+/// `NtSetSystemTime` applies the same signed delta to both `KeBootTime` and `KeBootTimeBias`
+/// (with two's-complement wrap on `u64` for backward steps), so wrapping subtraction cancels any
+/// wall-clock adjustment of arbitrary size.
+#[allow(dead_code)]
+pub(crate) const fn unbiased_windows_boot_ticks(boot_time: i64, boot_time_bias: u64) -> u64 {
+    (boot_time as u64).wrapping_sub(boot_time_bias)
+}
+
+/// Return `true` when `image_path` names one of the Windows core session executables that must
+/// never be terminated (`csrss`, `wininit`, `smss`, `lsass`, `services`, `winlogon`).
+#[allow(dead_code)]
+pub(crate) fn is_windows_core_session_image(image_path: &str) -> bool {
+    let file_name = image_path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(image_path)
+        .trim();
+    let lower = file_name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    matches!(
+        stem,
+        "csrss" | "wininit" | "smss" | "lsass" | "services" | "winlogon"
+    )
+}
+
+/// Parse `(state, ppid, start_ticks)` from a Linux `/proc/<pid>/stat` line.
 ///
 /// The command name in field 2 is wrapped in parentheses and may itself contain spaces and
-/// parentheses, so parsing anchors at the last `)` before reading field 3 (`state`) and
-/// field 22 (`starttime`).
+/// parentheses, so parsing anchors at the last `)` before reading field 3 (`state`), field 4
+/// (`ppid`), and field 22 (`starttime`).
 #[allow(dead_code)]
-pub(crate) fn parse_linux_proc_stat(contents: &str) -> Option<(char, u64)> {
+pub(crate) fn parse_linux_proc_stat_full(contents: &str) -> Option<(char, u32, u64)> {
     let close = contents.rfind(')')?;
     let rest = contents.get(close + 1..)?.trim_start();
     let mut fields = rest.split_ascii_whitespace();
     let state = fields.next()?.chars().next()?;
-    // Field 3 (index 0) was consumed above; field 22 is index 19, which is 18 skips further.
-    let start_ticks = fields.nth(18)?.parse::<u64>().ok()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    // Fields 3 and 4 (indices 0 and 1) were consumed above; field 22 is index 19, which is 17 skips further.
+    let start_ticks = fields.nth(17)?.parse::<u64>().ok()?;
+    Some((state, ppid, start_ticks))
+}
+
+/// Parse `(state, start_ticks)` from a Linux `/proc/<pid>/stat` line.
+#[allow(dead_code)]
+pub(crate) fn parse_linux_proc_stat(contents: &str) -> Option<(char, u64)> {
+    let (state, _ppid, start_ticks) = parse_linux_proc_stat_full(contents)?;
     Some((state, start_ticks))
 }
 
@@ -368,13 +502,60 @@ mod tests {
 
     #[test]
     fn parse_linux_proc_stat_handles_parens_and_spaces_in_comm() {
-        let line = "12345 (my (weird) proc) S 1 12345 12345 0 -1 4194304 100 0 0 0 10 5 0 0 20 0 1 0 987654321 1024 50";
+        let line = "12345 (my (weird) proc) S 777 12345 12345 0 -1 4194304 100 0 0 0 10 5 0 0 20 0 1 0 987654321 1024 50";
         assert_eq!(parse_linux_proc_stat(line), Some(('S', 987_654_321)));
+        assert_eq!(
+            parse_linux_proc_stat_full(line),
+            Some(('S', 777, 987_654_321))
+        );
 
         let zombie = "99 (defunct) Z 1 99 99 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 42 0 0";
         assert_eq!(parse_linux_proc_stat(zombie), Some(('Z', 42)));
 
         assert_eq!(parse_linux_proc_stat("malformed"), None);
+    }
+
+    #[test]
+    fn is_protected_identifies_self_ancestors_and_core_system_processes() {
+        let me = current().unwrap();
+        assert!(is_protected(&me).is_some());
+        assert!(is_protected(&ProcessId::new(0, 1)).is_some());
+
+        #[cfg(unix)]
+        {
+            assert!(is_protected(&ProcessId::new(1, 1)).is_some());
+            // Walk up to our immediate parent and confirm it is protected when alive.
+            let ppid = nix::unistd::getppid().as_raw() as u32;
+            if let Ok(Some(parent_id)) = of_pid(ppid) {
+                assert!(
+                    is_protected(&parent_id).is_some(),
+                    "parent process {parent_id} should be protected"
+                );
+            }
+        }
+
+        // Non-existent high PID is not protected.
+        assert!(is_protected(&ProcessId::new(i32::MAX as u32, 1)).is_none());
+
+        // Windows core session image matcher (platform-independent helper).
+        for path in [
+            r"C:\Windows\System32\csrss.exe",
+            r"C:\Windows\System32\WININIT.EXE",
+            "smss.exe",
+            r"\SystemRoot\System32\lsass.exe",
+            "services.exe",
+            "winlogon",
+        ] {
+            assert!(is_windows_core_session_image(path), "expected {path}");
+        }
+        for path in [
+            r"C:\Users\me\worker.exe",
+            "lsass_helper.exe",
+            "my-services.exe",
+            "",
+        ] {
+            assert!(!is_windows_core_session_image(path), "unexpected {path}");
+        }
     }
 
     #[test]
@@ -385,7 +566,13 @@ mod tests {
         assert!(same_boot(uuid_a, uuid_a));
         assert!(!same_boot(uuid_a, uuid_b));
 
-        // Windows LastBootUpTime ticks allow up to 5 seconds of clock-step drift.
+        // Windows unbiased boot IDs are clock-step-invariant and require exact equality.
+        let win_a = "boot-win-133700000000000000";
+        let win_b = "boot-win-133700000000000001";
+        assert!(same_boot(win_a, win_a));
+        assert!(!same_boot(win_a, win_b));
+
+        // Legacy Windows LastBootUpTime ticks allow up to 5 seconds of clock-step drift.
         let base_ticks: u64 = 638_600_000_000_000_000;
         let a = format!("boot-ticks-{base_ticks}");
         let drift_3s = format!("boot-ticks-{}", base_ticks + 3 * TICKS_PER_SEC);
@@ -408,6 +595,27 @@ mod tests {
         assert!(!same_boot("boot-ticks-abc", "boot-ticks-abc-2"));
     }
 
+    #[test]
+    fn unbiased_windows_boot_ticks_cancels_positive_and_negative_clock_steps() {
+        let initial_boot: i64 = 133_700_000_000_000_000;
+        let base = unbiased_windows_boot_ticks(initial_boot, 0);
+        assert_eq!(base, initial_boot as u64);
+
+        // +2 hour dual-boot RTC jump (both BootTime and BootTimeBias increase by +7200s).
+        let plus_2h: i64 = 7_200 * TICKS_PER_SEC as i64;
+        assert_eq!(
+            unbiased_windows_boot_ticks(initial_boot + plus_2h, plus_2h as u64),
+            base
+        );
+
+        // -2 hour backward clock step (BootTime decreases, BootTimeBias wraps in two's complement).
+        let minus_2h: i64 = -7_200 * TICKS_PER_SEC as i64;
+        assert_eq!(
+            unbiased_windows_boot_ticks(initial_boot + minus_2h, minus_2h as u64),
+            base
+        );
+    }
+
     #[tokio::test]
     async fn kill_tree_refuses_current_process_and_zero_pid() {
         let me = current().unwrap();
@@ -419,6 +627,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OsError::InvalidArgument { .. }));
+    }
+
+    #[tokio::test]
+    async fn kill_process_refuses_current_process_and_zero_pid_and_handles_absent() {
+        let me = current().unwrap();
+        let err = kill_process(&me, false, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OsError::InvalidArgument { .. }));
+
+        let zero = ProcessId::new(0, 1);
+        let err = kill_process(&zero, true, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OsError::InvalidArgument { .. }));
+
+        let absent = ProcessId::new(i32::MAX as u32, 1);
+        let gone = kill_process(&absent, false, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(gone);
+        assert!(is_alive(&me));
     }
 
     #[tokio::test]

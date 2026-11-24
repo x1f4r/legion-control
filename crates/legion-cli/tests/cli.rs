@@ -180,23 +180,41 @@ fn a_tool_error_exits_1_with_the_error_object_on_stdout() {
 }
 
 #[test]
-fn on_runs_here_for_this_node_and_is_unreachable_for_any_other() {
+fn on_runs_here_for_this_node_and_reports_unknown_machines_as_not_found() {
     let home = Home::new();
     home.write_config("node.toml", "name = \"tower\"\n");
     let here = home.run(&["meta.version", "--on", "tower"]);
     assert_eq!(here.code, 0, "{}", here.stdout);
     assert_eq!(here.json()["node"], json!("tower"));
-    for target in ["pi", "tower,pi", "all"] {
-        let there = home.run(&["meta.version", "--on", target]);
-        assert_eq!(there.code, 1, "{target}");
-        let error = there.json();
-        assert_eq!(error["code"], json!("unreachable"), "{target}");
-        assert!(
-            error["hint"].as_str().unwrap().contains("later milestone"),
-            "{error}"
-        );
-        assert_eq!(error["machine"], json!("tower"));
-    }
+
+    let unknown = home.run(&["meta.version", "--on", "pi"]);
+    assert_eq!(unknown.code, 1);
+    let error = unknown.json();
+    assert_eq!(error["code"], json!("not_found"));
+    assert_eq!(error["machine"], json!("pi"));
+    assert!(error["hint"].as_str().unwrap().contains("tower"), "{error}");
+
+    // Partial fan-out success exits 0 and returns per-machine outcomes.
+    let partial = home.run(&["meta.version", "--on", "tower,pi"]);
+    assert_eq!(partial.code, 0, "{}", partial.stdout);
+    let body = partial.json();
+    assert_eq!(body["results"]["tower"]["ok"]["node"], json!("tower"));
+    assert_eq!(body["results"]["pi"]["error"]["code"], json!("not_found"));
+
+    // Fan-out where every machine fails exits non-zero.
+    let all_bad = home.run(&["meta.version", "--on", "pi,laptop"]);
+    assert_eq!(all_bad.code, 1, "{}", all_bad.stdout);
+    let body = all_bad.json();
+    assert_eq!(body["results"]["pi"]["error"]["code"], json!("not_found"));
+    assert_eq!(
+        body["results"]["laptop"]["error"]["code"],
+        json!("not_found")
+    );
+
+    // Empty fleet.toml returns an empty fan-out object.
+    let empty_all = home.run(&["meta.version", "--on", "all"]);
+    assert_eq!(empty_all.code, 0, "{}", empty_all.stdout);
+    assert_eq!(empty_all.json(), json!({"results": {}}));
 }
 
 #[test]

@@ -1,9 +1,11 @@
 //! What a person sees on a terminal. Anything that reads the output reads JSON instead, so nothing
 //! here is a format to keep stable.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use legion_core::proto::{ErrorBody, ToolSpec};
+use legion_core::Event;
+use legion_core::proto::{ErrorBody, EventKind, ToolSpec};
 use serde_json::Value;
 
 /// A tool's result as aligned `key  value` lines, nested values indented beneath their key.
@@ -206,6 +208,54 @@ pub fn error(error: &ErrorBody) -> String {
     out
 }
 
+/// A fan-out result as one readable block per machine on a terminal.
+pub fn fan_out(results: &BTreeMap<String, Result<Value, ErrorBody>>) -> String {
+    if results.is_empty() {
+        return "No machines in fleet.toml.\n".to_owned();
+    }
+    let mut out = String::new();
+    for (index, (machine, outcome)) in results.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let _ = writeln!(out, "{machine}");
+        match outcome {
+            Ok(val) => match val {
+                Value::Object(_) | Value::Array(_) => block(&mut out, val, 2),
+                scalar => {
+                    let _ = writeln!(out, "  {}", scalar_text(scalar));
+                }
+            },
+            Err(err) => {
+                let _ = writeln!(out, "  error ({}): {}", err.code, err.message);
+                if let Some(hint) = &err.hint {
+                    let _ = writeln!(out, "    {hint}");
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Formats one streamed event for a terminal stderr, prefixing each line with the machine name
+/// when more than one machine is involved.
+pub fn event(event: &Event, prefix_machine: bool) -> String {
+    let text = match (event.kind, &event.data) {
+        (EventKind::Stdout | EventKind::Stderr, Value::String(text)) => text.clone(),
+        (_, Value::String(text)) => format!("{text}\n"),
+        (kind, data) => format!("{}: {data}\n", kind.as_str()),
+    };
+    if prefix_machine && let Some(machine) = event.machine.as_deref() {
+        let mut out = String::new();
+        for chunk in text.split_inclusive('\n') {
+            let _ = write!(out, "[{machine}] {chunk}");
+        }
+        out
+    } else {
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use legion_core::proto::{Effect, ErrorCode};
@@ -296,5 +346,47 @@ empty    -
     fn errors_say_what_and_what_to_do() {
         let body = ErrorBody::new(ErrorCode::Denied, "No.").with_hint("Ask.");
         assert_eq!(error(&body), "legion: denied: No.\n  Ask.\n");
+    }
+
+    #[test]
+    fn fan_out_renders_one_block_per_machine() {
+        let mut results = BTreeMap::new();
+        results.insert("pi".to_owned(), Ok(json!({"node": "pi", "ok": true})));
+        results.insert(
+            "tower".to_owned(),
+            Err(ErrorBody::new(ErrorCode::Unreachable, "Asleep.").with_hint("Wake it.")),
+        );
+        let text = fan_out(&results);
+        assert_eq!(
+            text,
+            "\
+pi
+  node  pi
+  ok    true
+
+tower
+  error (unreachable): Asleep.
+    Wake it.
+"
+        );
+        assert_eq!(fan_out(&BTreeMap::new()), "No machines in fleet.toml.\n");
+    }
+
+    #[test]
+    fn fan_out_events_prefix_lines_with_the_machine_name() {
+        let ev = Event {
+            kind: EventKind::Stdout,
+            data: json!("line one\nline two\n"),
+            machine: Some("pi".to_owned()),
+        };
+        assert_eq!(event(&ev, false), "line one\nline two\n");
+        assert_eq!(event(&ev, true), "[pi] line one\n[pi] line two\n");
+
+        let progress = Event {
+            kind: EventKind::Progress,
+            data: json!({"step": 1}),
+            machine: Some("tower".to_owned()),
+        };
+        assert_eq!(event(&progress, true), "[tower] progress: {\"step\":1}\n");
     }
 }
