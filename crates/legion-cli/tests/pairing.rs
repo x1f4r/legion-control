@@ -3772,22 +3772,40 @@ role = \"ops\"
     assert_eq!(owner_child.updated_on, "stamp-box");
     assert_eq!(owner_child.paired_at, owner_child.updated_at);
 
-    // 3. Reviewer's backdating case: admin-capable non-owner paired device creates a child via
-    //    invite + enrol (any attempt to backdate via config.write is refused). When the parent is
-    //    removed shortly afterwards, the child is quarantined regardless.
-    let inv_child = gate_call(
-        "tablet",
-        "tablet-parent",
-        &id_non_owner_dev,
-        "device.invite",
-        json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
-    );
-    let child_inv_id = inv_child["result"]["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{inv_child}"))
-        .to_owned();
-    let child_key = ed25519_public_key_from_seed(&[0xb2; 32]);
-    run_enrol_gate(&child_inv_id, "tablet-child", &child_key);
+    // 3. Non-owner admin (`tablet`, role `ops` with `effect:admin`) is now refused from
+    //    creating invites for itself under the owner-strength guard AND refused from backdating
+    //    via `config.write devices.toml`. Removing `owner-phone` shortly afterwards quarantines
+    //    its paired child `owner-child` and strips its key from authorized_keys.
+    for allow_owner in [false, true] {
+        let inv_denied = gate_call(
+            "tablet",
+            "tablet-parent",
+            &id_non_owner_dev,
+            "device.invite",
+            json!({
+                "principal": "tablet",
+                "allow_owner": allow_owner,
+                "host": "127.0.0.1",
+                "port": 22,
+                "user": "tester"
+            }),
+        );
+        assert_eq!(
+            inv_denied["error"]["data"]["code"],
+            json!("denied"),
+            "{inv_denied}"
+        );
+        let msg = inv_denied["error"]["data"]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            msg.contains("ops")
+                && msg.contains(
+                    "this role can change who may do what, which makes it as strong as owner"
+                ),
+            "{inv_denied}"
+        );
+    }
 
     let backdate_res = gate_call(
         "tablet",
@@ -3802,10 +3820,10 @@ role = \"ops\"
         "{backdate_res}"
     );
 
-    let rm_parent = home.run(&["device.remove", "name=tablet-parent"]);
+    let rm_parent = home.run(&["device.remove", "name=owner-phone"]);
     assert_eq!(
         rm_parent.code, 0,
-        "remove tablet-parent failed: {}",
+        "remove owner-phone failed: {}",
         rm_parent.stderr
     );
 
@@ -3814,13 +3832,13 @@ role = \"ops\"
         .as_array()
         .unwrap()
         .iter()
-        .find(|d| d["name"] == json!("tablet-child"))
-        .expect("tablet-child missing in device.list");
+        .find(|d| d["name"] == json!("owner-child"))
+        .expect("owner-child missing in device.list");
     assert_eq!(child_entry["quarantined"], json!(true), "{child_entry}");
     assert!(
         !std::fs::read_to_string(&auth)
             .unwrap()
-            .contains("legion-device:tablet-child"),
+            .contains("legion-device:owner-child"),
         "quarantined child key must be absent from authorized_keys"
     );
 }
@@ -4197,6 +4215,7 @@ allow = [\"effect:read\"]
         "device.invite",
         "name=x",
         "role=admin",
+        "allow_owner=true",
         "host=127.0.0.1",
         "port=22",
         "user=tester",
@@ -4259,6 +4278,7 @@ allow = [\"effect:read\"]
         "device.invite",
         "name=y",
         "role=admin",
+        "allow_owner=true",
         "host=127.0.0.1",
         "port=22",
         "user=tester",
@@ -5187,4 +5207,87 @@ allow = [\"effect:read\"]
         ak_b_after.contains(&id_phone_b),
         "B's own phone must stay active on B"
     );
+}
+
+#[test]
+fn device_roles_cli_resolves_live_net_tools_and_scopes_to_caller() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"roles-box\"\n");
+    home.write_config(
+        "policy.toml",
+        r#"
+default = "owner"
+secrets = ["~/hidden-vault"]
+
+[roles.observer]
+allow = ["effect:read"]
+deny = ["audit.*"]
+paths = ["~/work/**"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+
+[roles.phone_admin]
+allow = ["effect:read", "effect:admin"]
+
+[principals.phone]
+role = "observer"
+
+[principals.tablet]
+role = "phone_admin"
+"#,
+    );
+
+    // Owner gets all roles resolved against the live binary's full tool registry (including
+    // `config.write` from `legion-net`), with no extra policy fields leaked.
+    let owner_run = home.run(&["device.roles", "--json"]);
+    assert_eq!(owner_run.code, 0, "{}", owner_run.stderr);
+    let owner_json = owner_run.json();
+    assert_eq!(owner_json["node"], json!("roles-box"));
+    assert!(!owner_run.stdout.contains("hidden-vault"));
+    assert!(!owner_run.stdout.contains("tablet"));
+
+    let roles = owner_json["roles"].as_array().unwrap();
+    let names: Vec<&str> = roles.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["observer", "phone_admin", "policy_writer", "owner"]
+    );
+
+    let pw = roles
+        .iter()
+        .find(|r| r["name"] == json!("policy_writer"))
+        .unwrap();
+    assert_eq!(pw["strongest_effect"], json!("admin"));
+    assert_eq!(pw["owner_strength"], json!(true));
+    assert!(
+        pw["description"]
+            .as_str()
+            .unwrap()
+            .contains("everything, including changing who may do what"),
+        "policy_writer description: {pw}"
+    );
+
+    let obs = roles
+        .iter()
+        .find(|r| r["name"] == json!("observer"))
+        .unwrap();
+    assert_eq!(obs["strongest_effect"], json!("read"));
+    assert_eq!(obs["owner_strength"], json!(false));
+    assert!(
+        obs["description"].as_str().unwrap().contains("look only"),
+        "observer description: {obs}"
+    );
+
+    // Non-owner callers (both `observer` and non-owner `effect:admin`) may call `device.roles`
+    // (`effect:read`) and receive an empty list, leaking nothing from policy.toml.
+    for principal in ["phone", "tablet"] {
+        let non_owner = home.run(&["device.roles", "--as", principal, "--json"]);
+        assert_eq!(non_owner.code, 0, "{principal}: {}", non_owner.stderr);
+        let parsed = non_owner.json();
+        assert_eq!(parsed["node"], json!("roles-box"));
+        assert_eq!(parsed["roles"], json!([]), "{principal}: {parsed}");
+        assert!(!non_owner.stdout.contains("policy_writer"));
+        assert!(!non_owner.stdout.contains("hidden-vault"));
+    }
 }

@@ -62,13 +62,13 @@ pub const MAX_VALID_MINUTES: u32 = 1440;
 pub const DEFAULT_SSH_PORT: u16 = 22;
 
 /// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`, `device.set`,
-/// `device.endpoint`) and registers `devices.toml`.
+/// `device.endpoint`, `device.roles`) and registers `devices.toml`.
 pub fn register(registry: &mut Registry) {
     registry.add_document::<registry::DevicesFile>();
     registry.add_fn(
         "device.invite",
         Effect::Admin,
-        "Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves a unique `device:<name>` principal and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true. A paired device may create invites only on the node it is connected to directly (not forwarded via `on=`).",
+        "Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves a unique `device:<name>` principal and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role or any admin (owner-strength) role requires an owner caller and allow_owner=true. A paired device may create invites only on the node it is connected to directly (not forwarded via `on=`).",
         invite,
     );
     registry.add_fn(
@@ -80,7 +80,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.set",
         Effect::Admin,
-        "Change a paired device's role (only for a dedicated `device:*` principal marked with `device = \"<pairing_id>\"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a currently quarantined descendant (`confirm=true`, owner role only; confirmation records `confirmed_at` locally on this node and is refused if the device is not quarantined) in devices.toml, reconciling authorized_keys and pushing role or name changes to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for the owner role) and every `device.set` call is refused through an expiring credential.",
+        "Change a paired device's role (only for a dedicated `device:*` principal marked with `device = \"<pairing_id>\"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a currently quarantined descendant (`confirm=true`, owner role only; confirmation records `confirmed_at` locally on this node and is refused if the device is not quarantined) in devices.toml, reconciling authorized_keys and pushing role or name changes to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for `owner` or any admin owner-strength role) and every `device.set` call is refused through an expiring credential.",
         set_device,
     );
     registry.add_fn(
@@ -95,6 +95,12 @@ pub fn register(registry: &mut Registry) {
         "Return how a paired device reaches this node over SSH: node name, candidate host names or Tailscale addresses, SSH port, OS account name, and pinned sshd public host keys. Uses the same detection as device.invite (honouring any [devices] settings in node.toml, caching auto-discovered host-key scans briefly per node). Call with on=\"all\" through any node to learn every machine's direct SSH endpoint.",
         endpoint,
     );
+    registry.add_fn(
+        "device.roles",
+        Effect::Read,
+        "Return the roles this caller may assign to a newly paired device on this node: each role's name, one-line plain description (generated with the same analysis as `legion pair`), strongest allowed effect, and whether it is owner-strength (`owner` or any role allowing an `admin` tool). Lists only roles the caller is allowed to hand out (empty for callers without the `owner` role) and exposes nothing else from policy.toml.",
+        roles,
+    );
 }
 
 /// Arguments of `device.invite`.
@@ -105,9 +111,9 @@ struct InviteArgs {
     /// or both `role` and `name`.
     #[serde(default)]
     principal: Option<String>,
-    /// Role from policy.toml (or built-in `owner` with allow_owner=true, or `nobody`) for a new
-    /// `device:<name>` principal created atomically in policy.toml. Requires `name` and an owner
-    /// caller.
+    /// Role from policy.toml (or built-in `owner`, or `nobody`) for a new `device:<name>`
+    /// principal created atomically in policy.toml. Requires `name` and an owner caller (plus
+    /// `allow_owner=true` for `owner` or any admin owner-strength role).
     #[serde(default)]
     role: Option<String>,
     /// Device name used to create principal `device:<name>` when pairing with `role`.
@@ -130,8 +136,8 @@ struct InviteArgs {
     /// legion runs as).
     #[serde(default)]
     user: Option<String>,
-    /// Allow inviting a device as a principal with the owner role, which may do everything the
-    /// account can. Off unless given as true.
+    /// Allow inviting a device with the `owner` role or any admin (owner-strength) role, which can
+    /// change who may do what. Off unless given as true.
     #[serde(default)]
     allow_owner: bool,
 }
@@ -164,6 +170,31 @@ async fn endpoint(ctx: &Ctx, _args: NoArgs) -> Result<EndpointResult, ToolError>
     let node_file = ctx.config().get::<NodeFile>()?;
     let detected = detect_endpoint(ctx, &node_file, None, None, None, true).await?;
     Ok(detected.endpoint)
+}
+
+/// What `device.roles` returns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRolesResult {
+    /// Node name as configured in `node.toml` or derived from the hostname.
+    pub node: String,
+    /// Roles this caller is allowed to hand out to a newly paired device, ordered from narrowest
+    /// to broadest. Empty when the caller may not hand out roles for new devices.
+    pub roles: Vec<crate::roles::RoleSummary>,
+}
+
+async fn roles(ctx: &Ctx, _args: NoArgs) -> Result<DeviceRolesResult, ToolError> {
+    let caller = Caller::of(ctx)?;
+    let roles = if caller.is_owner() {
+        let policy = ctx.config().get::<Policy>()?;
+        let specs = ctx.node().specs();
+        crate::roles::role_summaries(&policy, &specs)
+    } else {
+        Vec::new()
+    };
+    Ok(DeviceRolesResult {
+        node: ctx.node_name().to_owned(),
+        roles,
+    })
 }
 
 async fn detect_endpoint(
@@ -346,7 +377,8 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                 args.allow_owner,
                 "a device invite",
                 format!(
-                    "{principal} has the owner role: a paired device acting as it may do everything the account can over SSH, so it is not made unless asked for in so many words."
+                    "{principal} has the owner role ({}): a paired device acting as it may do everything the account can over SSH, so it is not made unless asked for in so many words.",
+                    crate::roles::OWNER_STRENGTH_REASON
                 ),
                 "Give the device a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want.",
             )?;
@@ -364,23 +396,6 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                 ));
             }
             validate_role_name(&raw_role)?;
-            if raw_role == OWNER && !args.allow_owner {
-                return Err(ErrorBody::new(
-                    ErrorCode::Denied,
-                    "The owner role may do everything the account can over SSH, so a device is not paired with it unless asked for in so many words.",
-                )
-                .with_hint(
-                    "Choose a narrower role from policy.toml, or pass allow_owner=true if this is really what you want.",
-                ));
-            }
-            let trimmed_name = raw_name.trim();
-            if trimmed_name.is_empty() || trimmed_name.chars().any(char::is_control) {
-                return Err(ErrorBody::new(
-                    ErrorCode::InvalidArgs,
-                    format!("{raw_name:?} is not a valid device name."),
-                )
-                .with_hint("Give a short name such as `pixel` or `tablet`."));
-            }
             let policy = ctx.config().get::<Policy>()?;
             let known_role =
                 raw_role == OWNER || raw_role == NOBODY || policy.roles.contains_key(&raw_role);
@@ -395,6 +410,29 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                     "Available roles: {}. Define custom roles in policy.toml or run `legion init`.",
                     available.join(", ")
                 )));
+            }
+            if caller.is_owner_strength_role(&raw_role) && !args.allow_owner {
+                let reason = crate::roles::OWNER_STRENGTH_REASON;
+                let message = if raw_role == OWNER {
+                    format!(
+                        "The owner role may do everything the account can over SSH ({reason}), so a device is not paired with it unless asked for in so many words."
+                    )
+                } else {
+                    format!(
+                        "Role {raw_role} cannot be granted without allow_owner=true: {reason}, so a device is not paired with it unless asked for in so many words."
+                    )
+                };
+                return Err(ErrorBody::new(ErrorCode::Denied, message).with_hint(
+                    "Choose a narrower role from policy.toml, or pass allow_owner=true if this is really what you want.",
+                ));
+            }
+            let trimmed_name = raw_name.trim();
+            if trimmed_name.is_empty() || trimmed_name.chars().any(char::is_control) {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("{raw_name:?} is not a valid device name."),
+                )
+                .with_hint("Give a short name such as `pixel` or `tablet`."));
             }
             let slug = sanitise_device_name(trimmed_name);
             let principal = format!("{DEVICE_PRINCIPAL_PREFIX}{slug}");
@@ -707,15 +745,16 @@ struct SetArgs {
     /// both.
     #[serde(default)]
     id: Option<String>,
-    /// New role from `policy.toml` (or built-in `owner` with `allow_owner=true`, or `nobody`).
-    /// Updates the device's principal in `policy.toml` and `devices.toml`.
+    /// New role from `policy.toml` (or built-in `owner`, or `nobody`). Updates the device's
+    /// principal in `policy.toml` and `devices.toml`. Setting `owner` or any admin
+    /// (owner-strength) role requires `allow_owner=true`.
     #[serde(default)]
     role: Option<String>,
     /// New device name (sanitised to lowercase ASCII letters, digits, and `-`).
     #[serde(default)]
     rename: Option<String>,
-    /// Allow setting the device's role to `owner`, which may do everything the account can. Off
-    /// unless given as true.
+    /// Allow setting the device's role to `owner` or any admin (owner-strength) role, which can
+    /// change who may do what. Off unless given as true.
     #[serde(default)]
     allow_owner: bool,
     /// Explicitly confirm a quarantined paired device so it becomes active again (owner role
@@ -812,12 +851,19 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             )
             .with_hint("Run `device.set` as the owner of this machine."));
         }
-        if new_role == OWNER && !args.allow_owner {
-            return Err(ErrorBody::new(
-                ErrorCode::Denied,
-                "The owner role may do everything the account can over SSH, so a device's role is not raised to owner unless asked for in so many words.",
-            )
-            .with_hint("Pass allow_owner=true if this is really what you want."));
+        if caller.is_owner_strength_role(new_role) && !args.allow_owner {
+            let reason = crate::roles::OWNER_STRENGTH_REASON;
+            let message = if new_role == OWNER {
+                format!(
+                    "The owner role may do everything the account can over SSH ({reason}), so a device's role is not raised to owner unless asked for in so many words."
+                )
+            } else {
+                format!(
+                    "Role {new_role} cannot be granted without allow_owner=true: {reason}, so a device's role is not set to {new_role} unless asked for in so many words."
+                )
+            };
+            return Err(ErrorBody::new(ErrorCode::Denied, message)
+                .with_hint("Pass allow_owner=true if this is really what you want."));
         }
     }
 
@@ -3172,16 +3218,65 @@ role = "owner"
             .unwrap();
         let owner_inv_id = owner_inv["id"].as_str().unwrap().to_owned();
 
-        // Non-owner admin (`tablet`) may invite for itself, but NOT for `phone` or `owner`.
-        let self_inv = h
-            .call_as(
+        // Non-owner admin (`tablet`, role `phone_admin` with `effect:admin`) has an owner-strength
+        // role, so it may NOT invite for itself (nor for `phone` or `owner`), even with
+        // `allow_owner=true`: only an `owner` caller with `allow_owner=true` may issue invites for
+        // an owner-strength principal.
+        for allow_owner in [false, true] {
+            let self_err = h
+                .call_as(
+                    "device.invite",
+                    "tablet",
+                    json!({
+                        "principal": "tablet",
+                        "allow_owner": allow_owner,
+                        "host": "tower.example",
+                        "user": "me"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(self_err.code, ErrorCode::Denied, "{self_err:?}");
+            assert!(
+                self_err.message.contains("phone_admin")
+                    && self_err
+                        .message
+                        .contains(crate::roles::OWNER_STRENGTH_REASON),
+                "{self_err:?}"
+            );
+        }
+
+        // Owner without `allow_owner=true` is also refused for `tablet` (owner-strength).
+        let tablet_no_flag = h
+            .call(
                 "device.invite",
-                "tablet",
                 json!({"principal": "tablet", "host": "tower.example", "user": "me"}),
             )
             .await
+            .unwrap_err();
+        assert_eq!(tablet_no_flag.code, ErrorCode::Denied, "{tablet_no_flag:?}");
+        assert!(
+            tablet_no_flag.message.contains("phone_admin")
+                && tablet_no_flag
+                    .message
+                    .contains(crate::roles::OWNER_STRENGTH_REASON),
+            "{tablet_no_flag:?}"
+        );
+
+        // Owner WITH `allow_owner=true` creates `tablet`'s invite.
+        let tablet_inv = h
+            .call(
+                "device.invite",
+                json!({
+                    "principal": "tablet",
+                    "allow_owner": true,
+                    "host": "tower.example",
+                    "user": "me"
+                }),
+            )
+            .await
             .unwrap();
-        let tablet_inv_id = self_inv["id"].as_str().unwrap().to_owned();
+        let tablet_inv_id = tablet_inv["id"].as_str().unwrap().to_owned();
 
         let other_err = h
             .call_as(
@@ -3994,18 +4089,32 @@ role = "owner"
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Denied);
 
-        // Raising role to `owner` via `device.set` requires `allow_owner=true`.
-        let err = h
-            .call("device.set", json!({"name": "my-phone", "role": "owner"}))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Denied);
+        // Raising role to `owner` or any owner-strength (`effect:admin`) role via `device.set`
+        // requires `allow_owner=true`.
+        for role_name in ["owner", "phone_admin"] {
+            let err = h
+                .call("device.set", json!({"name": "my-phone", "role": role_name}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{role_name}: {err:?}");
+            assert!(
+                err.message.contains(role_name)
+                    && err.message.contains(crate::roles::OWNER_STRENGTH_REASON),
+                "{role_name}: {err:?}"
+            );
+        }
 
-        // Owner changes role to `phone_admin` and renames to `pocket-phone`.
+        // Owner changes role to `phone_admin` (with `allow_owner=true`) and renames to
+        // `pocket-phone`.
         let updated = h
             .call(
                 "device.set",
-                json!({"name": "my-phone", "role": "phone_admin", "rename": "Pocket Phone"}),
+                json!({
+                    "name": "my-phone",
+                    "role": "phone_admin",
+                    "allow_owner": true,
+                    "rename": "Pocket Phone"
+                }),
             )
             .await
             .unwrap();
@@ -4185,11 +4294,17 @@ role = "owner"
      {
         let h = Harness::new();
 
-        // 1. Pair a device under shared principal `tablet` via `--as` (`principal`).
+        // 1. Pair a device under shared principal `tablet` via `--as` (`principal`), passing
+        //    `allow_owner=true` because `tablet`'s role (`phone_admin`) grants `effect:admin`.
         let shared_inv = h
             .call(
                 "device.invite",
-                json!({"principal": "tablet", "host": "tower.example", "user": "me"}),
+                json!({
+                    "principal": "tablet",
+                    "allow_owner": true,
+                    "host": "tower.example",
+                    "user": "me"
+                }),
             )
             .await
             .unwrap();
@@ -5491,68 +5606,37 @@ role = \"ops\"
         )
         .unwrap();
 
-        // 1. Non-owner (`tablet`) can hold at most 32 pending invites; 33rd is refused with Denied.
-        let mut created_ids = Vec::new();
-        for i in 0..32 {
+        // 1. Non-owner (`tablet`, whose `ops` role grants `effect:admin`) cannot issue invites at
+        //    all under the owner-strength guard, even with `allow_owner=true`.
+        for allow_owner in [false, true] {
             let mut call = Call::new(
                 Door::Cli,
                 "device.invite",
                 json!({
                     "principal": "tablet",
+                    "allow_owner": allow_owner,
                     "host": "127.0.0.1",
                     "port": 22,
                     "user": "tester"
                 }),
             );
             call.pinned = Some("tablet".to_owned());
-            let res = h
+            let err = h
                 .node
                 .call(call)
                 .await
-                .unwrap_or_else(|e| panic!("invite #{i} should succeed: {e:?}"));
-            created_ids.push(res["id"].as_str().unwrap().to_owned());
-        }
-        let mut call_33 = Call::new(
-            Door::Cli,
-            "device.invite",
-            json!({
-                "principal": "tablet",
-                "host": "127.0.0.1",
-                "port": 22,
-                "user": "tester"
-            }),
-        );
-        call_33.pinned = Some("tablet".to_owned());
-        let err_33 = h
-            .node
-            .call(call_33)
-            .await
-            .expect_err("33rd pending invite for non-owner must be refused");
-        assert_eq!(err_33.code, ErrorCode::Denied, "{err_33:?}");
-
-        // Owner is NOT blocked by tablet's 32 pending invites.
-        let owner_inv = h
-            .call(
-                "device.invite",
-                json!({
-                    "principal": "tablet",
-                    "host": "127.0.0.1",
-                    "port": 22,
-                    "user": "tester"
-                }),
-            )
-            .await
-            .expect("owner invite should succeed even when tablet has 32 pending");
-        let owner_inv_id = owner_inv["id"].as_str().unwrap().to_owned();
-
-        // Clear all pending invites before testing create-then-remove growth.
-        for id in created_ids.into_iter().chain(std::iter::once(owner_inv_id)) {
-            h.call("device.remove", json!({"id": id})).await.unwrap();
+                .expect_err("non-owner owner-strength invite must be refused");
+            assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+            assert!(
+                err.message.contains("ops")
+                    && err.message.contains(crate::roles::OWNER_STRENGTH_REASON),
+                "{err:?}"
+            );
         }
 
-        // 2. Reviewer's create-then-remove loop as non-owner: seed devices.toml just below 512 KiB,
-        //    then loop invite -> enrol -> remove as `tablet`. Once the file crosses 512 KiB, both
-        //    non-owner enrolment AND non-owner removal are refused with Denied + owner-tidy hint.
+        // 2. Non-owner (`tablet`) device removal is still capped at the 512 KiB half-limit once
+        //    `devices.toml` grows past 512 KiB, while owner can still enrol (with
+        //    `allow_owner=true`) and remove cleanly!
         let half_limit: usize = 512 * 1024;
         let now_str = registry::format_precise_rfc3339(Timestamp::now());
         let make_tomb = |idx: u32| DeviceTombstone {
@@ -5562,7 +5646,7 @@ role = \"ops\"
             paired_at: Some(now_str.clone()),
             paired_on: Some("tower".to_owned()),
             paired_by: Some(PairedBy {
-                principal: "tablet".to_owned(),
+                principal: "owner".to_owned(),
                 device: None,
             }),
             removed_by: Some(PairedBy {
@@ -5601,150 +5685,65 @@ role = \"ops\"
         )
         .unwrap();
 
-        let mut hit_enrol_cap = false;
-        let mut hit_remove_cap = false;
-        let mut last_live_name: Option<String> = None;
-        for round in 1u8..=20 {
-            let mut inv_call = Call::new(
-                Door::Cli,
-                "device.invite",
-                json!({
-                    "principal": "tablet",
-                    "host": "127.0.0.1",
-                    "port": 22,
-                    "user": "tester"
-                }),
-            );
-            inv_call.pinned = Some("tablet".to_owned());
-            let inv = h.node.call(inv_call).await.unwrap();
-            let inv_id = inv["id"].as_str().unwrap().to_owned();
-            let dev_name = format!("loop-dev-{round}");
-            let pub_key = ed25519_public_key_from_seed(&[round; 32]);
-            let req = format!(
-                "{}\n",
-                json!({"enrol": 1, "id": inv_id, "public_key": pub_key, "name": dev_name})
-            );
-            let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
-            match reply {
-                crate::device::enrol::EnrolReply::Err { error, .. } => {
-                    assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
-                    assert!(
-                        error
-                            .hint
-                            .as_deref()
-                            .is_some_and(|hint| hint.to_ascii_lowercase().contains("owner")),
-                        "expected hint mentioning owner tidy-up: {error:?}"
-                    );
-                    hit_enrol_cap = true;
-                    break;
-                }
-                crate::device::enrol::EnrolReply::Ok { device, .. } => {
-                    last_live_name = Some(device.clone());
-                    let mut rm_call =
-                        Call::new(Door::Cli, "device.remove", json!({"name": device}));
-                    rm_call.pinned = Some("tablet".to_owned());
-                    if let Err(err) = h.node.call(rm_call).await {
-                        assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
-                        assert!(
-                            err.hint
-                                .as_deref()
-                                .is_some_and(|hint| hint.to_ascii_lowercase().contains("owner")),
-                            "expected hint mentioning owner tidy-up: {err:?}"
-                        );
-                        hit_remove_cap = true;
-                        break;
-                    }
-                    last_live_name = None;
-                }
-            }
-        }
-        assert!(
-            hit_enrol_cap || hit_remove_cap,
-            "create-then-remove loop must stop at the 512 KiB non-owner half-limit"
-        );
-
-        // Ensure BOTH non-owner enrolment AND non-owner removal are refused once past 512 KiB,
-        // while owner can still enrol and remove cleanly!
-        if let Some(ref live) = last_live_name {
-            // File is right at half-limit: verify non-owner enrolment is ALSO refused.
-            let mut inv_call = Call::new(
-                Door::Cli,
-                "device.invite",
-                json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
-            );
-            inv_call.pinned = Some("tablet".to_owned());
-            let inv = h.node.call(inv_call).await.unwrap();
-            let inv_id = inv["id"].as_str().unwrap().to_owned();
-            let req = format!(
-                "{}\n",
-                json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[0xee; 32]), "name": "blocked-enrol"})
-            );
-            let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
-            assert!(
-                !reply.is_ok(),
-                "non-owner enrol past 512 KiB must fail: {reply:?}"
-            );
-
-            // Owner CAN still remove `live` cleanly.
-            let owner_rm = h
-                .call("device.remove", json!({"name": live}))
+        // Owner enrols two devices for `tablet` (with `allow_owner=true`) so the file is strictly
+        // past 512 KiB even after turning one into a tombstone; then non-owner `tablet` removal
+        // must be refused with the honest owner size-limit hint while owner removal succeeds.
+        for (seed, name) in [
+            (0xee_u8, "owner-seeded-tablet-1"),
+            (0xef_u8, "owner-seeded-tablet-2"),
+        ] {
+            let inv = h
+                .call(
+                    "device.invite",
+                    json!({
+                        "principal": "tablet",
+                        "allow_owner": true,
+                        "host": "127.0.0.1",
+                        "port": 22,
+                        "user": "tester"
+                    }),
+                )
                 .await
                 .unwrap();
-            assert_eq!(owner_rm["removed"], json!(true));
-        } else {
-            // Enrol was refused first: enrol two devices as owner so the file is strictly past
-            // 512 KiB even after turning one into a tombstone, then verify non-owner remove is
-            // refused while owner remove succeeds.
-            for (seed, name) in [
-                (0xee_u8, "owner-seeded-tablet-1"),
-                (0xef_u8, "owner-seeded-tablet-2"),
-            ] {
-                let inv = h
-                    .call(
-                        "device.invite",
-                        json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
-                    )
-                    .await
-                    .unwrap();
-                let inv_id = inv["id"].as_str().unwrap().to_owned();
-                let req = format!(
-                    "{}\n",
-                    json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[seed; 32]), "name": name})
-                );
-                let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
-                assert!(
-                    reply.is_ok(),
-                    "owner enrol past 512 KiB must still succeed: {reply:?}"
-                );
-            }
-
-            let mut rm_call = Call::new(
-                Door::Cli,
-                "device.remove",
-                json!({"name": "owner-seeded-tablet-2"}),
+            let inv_id = inv["id"].as_str().unwrap().to_owned();
+            let req = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[seed; 32]), "name": name})
             );
-            rm_call.pinned = Some("tablet".to_owned());
-            let rm_err = h
-                .node
-                .call(rm_call)
-                .await
-                .expect_err("non-owner remove past 512 KiB must be refused");
-            assert_eq!(rm_err.code, ErrorCode::Denied, "{rm_err:?}");
+            let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
             assert!(
-                rm_err.hint.as_deref().is_some_and(|hint| hint
-                    .to_ascii_lowercase()
-                    .contains("owner")
+                reply.is_ok(),
+                "owner enrol past 512 KiB must still succeed: {reply:?}"
+            );
+        }
+
+        let mut rm_call = Call::new(
+            Door::Cli,
+            "device.remove",
+            json!({"name": "owner-seeded-tablet-2"}),
+        );
+        rm_call.pinned = Some("tablet".to_owned());
+        let rm_err = h
+            .node
+            .call(rm_call)
+            .await
+            .expect_err("non-owner remove past 512 KiB must be refused");
+        assert_eq!(rm_err.code, ErrorCode::Denied, "{rm_err:?}");
+        assert!(
+            rm_err
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.to_ascii_lowercase().contains("owner")
                     && hint.contains("device.remove")
                     && !hint.to_ascii_lowercase().contains("tidy")),
-                "expected honest owner size-limit hint: {rm_err:?}"
-            );
+            "expected honest owner size-limit hint: {rm_err:?}"
+        );
 
-            let owner_rm = h
-                .call("device.remove", json!({"name": "owner-seeded-tablet-2"}))
-                .await
-                .unwrap();
-            assert_eq!(owner_rm["removed"], json!(true));
-        }
+        let owner_rm = h
+            .call("device.remove", json!({"name": "owner-seeded-tablet-2"}))
+            .await
+            .unwrap();
+        assert_eq!(owner_rm["removed"], json!(true));
     }
 
     #[tokio::test]
@@ -6568,5 +6567,445 @@ role = \"ops\"
                 panic!("expected audited meta.doctor.acknowledge record: {records:?}")
             });
         assert_eq!(ack_audit["args"]["cleared_count"], json!(1), "{ack_audit}");
+    }
+
+    #[tokio::test]
+    async fn owner_strength_guard_covers_all_admin_roles_on_invite_and_set() {
+        use legion_core::NoArgs;
+
+        let h = Harness::new();
+        // Register a `config.write` Admin stub just like `legion-net` does on live nodes so we
+        // verify roles reaching an admin tool by exact name (including `config.write` and
+        // `device.invite`) are resolved identically to `legion pair`.
+        let mut reg = crate::registry();
+        reg.add_fn(
+            "config.write",
+            Effect::Admin,
+            "Write a config file (test stub).",
+            |_ctx: &Ctx, _args: NoArgs| async { Ok(json!({})) },
+        );
+        let node = Node::new(h.node.paths().clone(), reg);
+
+        std::fs::write(
+            node.paths().config_file("policy.toml"),
+            r#"
+default = "owner"
+
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny = ["effect:power", "effect:admin"]
+
+[roles.phone_admin]
+allow = ["effect:read", "effect:admin"]
+
+[roles.wildcard_admin]
+allow = ["*"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+
+[roles.inviter]
+allow = ["effect:read", "device.invite"]
+
+[principals.phone]
+role = "observer"
+
+[principals.ops_box]
+role = "operator"
+
+[principals.tablet]
+role = "phone_admin"
+
+[principals.star]
+role = "wildcard_admin"
+
+[principals.writer]
+role = "policy_writer"
+
+[principals.inv_user]
+role = "inviter"
+"#,
+        )
+        .unwrap();
+
+        let reason = "this role can change who may do what, which makes it as strong as owner";
+
+        let call_as = |principal: Option<&str>, tool: &str, args: Value| {
+            let mut call = Call::new(Door::Cli, tool, args);
+            if let Some(p) = principal {
+                call.pinned = Some(p.to_owned());
+            }
+            node.call(call)
+        };
+
+        // Pair a regular observer device to test `device.set role=`.
+        let seed_inv = call_as(
+            None,
+            "device.invite",
+            json!({"name": "target-dev", "role": "observer", "host": "tower.example", "user": "me"}),
+        )
+        .await
+        .unwrap();
+        let seed_id = seed_inv["id"].as_str().unwrap();
+        let seed_key = generate_ephemeral_ed25519().unwrap();
+        let seed_req = format!(
+            "{{\"enrol\":1,\"id\":\"{seed_id}\",\"public_key\":\"{}\",\"name\":\"target-dev\"}}\n",
+            seed_key.public_key
+        );
+        assert!(run_enrol(&node, seed_id, seed_req.as_bytes()).await.is_ok());
+
+        // Non-admin roles (`observer`, `operator`) do NOT require allow_owner=true.
+        for (idx, (role, principal)) in [("observer", "phone"), ("operator", "ops_box")]
+            .into_iter()
+            .enumerate()
+        {
+            call_as(
+                None,
+                "device.invite",
+                json!({"principal": principal, "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("non-admin principal {principal} should not need allow_owner: {e:?}")
+            });
+            call_as(
+                None,
+                "device.invite",
+                json!({"name": format!("non-admin-{idx}"), "role": role, "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("non-admin role {role} should not need allow_owner: {e:?}"));
+            call_as(
+                None,
+                "device.set",
+                json!({"name": "target-dev", "role": role}),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("device.set to non-admin role {role} should not need allow_owner: {e:?}")
+            });
+        }
+
+        // Every owner-strength role (effect:admin, *, config.write, device.invite) must enforce
+        // BOTH the explicit allow_owner=true flag AND the owner-only caller rule.
+        for (idx, (role, principal)) in [
+            ("phone_admin", "tablet"),
+            ("wildcard_admin", "star"),
+            ("policy_writer", "writer"),
+            ("inviter", "inv_user"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // 1. Owner without allow_owner=true is refused on device.invite (principal=).
+            let err = call_as(
+                None,
+                "device.invite",
+                json!({"principal": principal, "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{principal}/{role}: {err:?}");
+            assert!(
+                err.message.contains(role) && err.message.contains(reason),
+                "principal={principal} missing role or plain reason: {}",
+                err.message
+            );
+
+            // 2. Owner without allow_owner=true is refused on device.invite (role= + name=).
+            let err = call_as(
+                None,
+                "device.invite",
+                json!({"name": format!("os-dev-{idx}"), "role": role, "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "role={role}: {err:?}");
+            assert!(
+                err.message.contains(role) && err.message.contains(reason),
+                "role={role} invite missing role or plain reason: {}",
+                err.message
+            );
+
+            // 3. Owner without allow_owner=true is refused on device.set role=.
+            let err = call_as(
+                None,
+                "device.set",
+                json!({"name": "target-dev", "role": role}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "device.set {role}: {err:?}");
+            assert!(
+                err.message.contains(role) && err.message.contains(reason),
+                "device.set role={role} missing role or plain reason: {}",
+                err.message
+            );
+
+            // 4. Non-owner caller (even the principal itself, and even with allow_owner=true) is
+            //    refused on device.invite principal= (same caller rule as owner).
+            for flag in [false, true] {
+                let err = call_as(
+                    Some(principal),
+                    "device.invite",
+                    json!({
+                        "principal": principal,
+                        "allow_owner": flag,
+                        "host": "tower.example",
+                        "user": "me"
+                    }),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    err.code,
+                    ErrorCode::Denied,
+                    "self-invite for {principal} (allow_owner={flag}): {err:?}"
+                );
+                // Roles that can reach `device.invite` hit check_issue and must explain why;
+                // roles that cannot call `device.invite` (like `policy_writer`) are already
+                // denied by policy.
+                if role != "policy_writer" {
+                    assert!(
+                        err.message.contains(role) && err.message.contains(reason),
+                        "non-owner caller {principal} (allow_owner={flag}) missing role or plain reason: {}",
+                        err.message
+                    );
+                }
+            }
+
+            // 5. Non-owner admin caller (`tablet`) trying to invite for `writer` is also refused
+            //    with the owner-strength caller message.
+            let err = call_as(
+                Some("tablet"),
+                "device.invite",
+                json!({
+                    "principal": principal,
+                    "allow_owner": true,
+                    "host": "tower.example",
+                    "user": "me"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::Denied,
+                "tablet -> {principal}: {err:?}"
+            );
+            assert!(
+                err.message.contains(role) && err.message.contains(reason),
+                "tablet -> {principal} missing role or plain reason: {}",
+                err.message
+            );
+
+            // 6. Owner WITH allow_owner=true succeeds for principal=, role=+name=, and device.set.
+            call_as(
+                None,
+                "device.invite",
+                json!({"principal": principal, "allow_owner": true, "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("owner + allow_owner principal={principal} failed: {e:?}"));
+            call_as(
+                None,
+                "device.invite",
+                json!({"name": format!("os-ok-{idx}"), "role": role, "allow_owner": true, "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("owner + allow_owner role={role} failed: {e:?}"));
+            call_as(
+                None,
+                "device.set",
+                json!({"name": "target-dev", "role": role, "allow_owner": true}),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("owner + allow_owner device.set role={role} failed: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn device_roles_returns_caller_allowed_roles_with_pair_descriptions_and_hides_policy_from_non_owners()
+     {
+        use legion_core::NoArgs;
+
+        let h = Harness::new();
+        let mut reg = crate::registry();
+        reg.add_fn(
+            "config.write",
+            Effect::Admin,
+            "Write a config file (test stub).",
+            |_ctx: &Ctx, _args: NoArgs| async { Ok(json!({})) },
+        );
+        let node = Node::new(h.node.paths().clone(), reg);
+
+        std::fs::write(
+            node.paths().config_file("policy.toml"),
+            r#"
+default = "owner"
+secrets = ["~/top-secret-vault"]
+
+[roles.empty_role]
+allow = []
+
+[roles.observer]
+allow = ["effect:read"]
+deny = ["audit.*"]
+paths = ["~/private-project/**"]
+
+[roles.editor]
+allow = ["effect:read", "effect:write"]
+deny = ["audit.*"]
+paths = ["~/private-project/**"]
+
+[roles.cleaner]
+allow = ["effect:read", "fs.remove"]
+
+[roles.unknown_ext]
+allow = ["effect:read", "custom.mystery"]
+
+[roles.power_user]
+allow = ["effect:read", "power.shutdown"]
+
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny = ["effect:power", "effect:admin"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+
+[roles.phone_admin]
+allow = ["effect:read", "effect:admin"]
+
+[principals.phone]
+role = "observer"
+
+[principals.dev]
+role = "editor"
+
+[principals.ops]
+role = "operator"
+
+[principals.tablet]
+role = "phone_admin"
+
+[principals.secret_user]
+role = "observer"
+"#,
+        )
+        .unwrap();
+
+        // 1. `device.roles` is registered with Effect::Read.
+        let specs = node.specs();
+        let role_spec = specs
+            .iter()
+            .find(|s| s.name == "device.roles")
+            .expect("device.roles tool must be registered");
+        assert_eq!(role_spec.effect, Effect::Read);
+
+        // 2. Owner sees every role from policy.toml + built-in `owner`, in `legion pair`'s exact
+        //    order and with `legion pair`'s exact descriptions, plus strongest_effect and
+        //    owner_strength — and nothing else from policy.toml.
+        let owner_res = node
+            .call(Call::new(Door::Cli, "device.roles", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(owner_res["node"], json!("tower"), "{owner_res}");
+        let owner_text = serde_json::to_string(&owner_res).unwrap();
+        for leaked in [
+            "secret_user",
+            "top-secret-vault",
+            "private-project",
+            "audit.*",
+        ] {
+            assert!(
+                !owner_text.contains(leaked),
+                "device.roles must not expose {leaked:?} from policy.toml: {owner_text}"
+            );
+        }
+
+        let policy = node.config().get::<Policy>().unwrap();
+        let expected_choices = crate::roles::role_choices(&policy, &specs);
+        let returned = owner_res["roles"].as_array().unwrap();
+        let returned_pairs: Vec<(String, String)> = returned
+            .iter()
+            .map(|r| {
+                let obj = r.as_object().unwrap();
+                assert_eq!(
+                    obj.len(),
+                    4,
+                    "unexpected extra fields in role object: {obj:?}"
+                );
+                (
+                    obj["name"].as_str().unwrap().to_owned(),
+                    obj["description"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(returned_pairs, expected_choices);
+
+        let by_name = |name: &str| {
+            returned
+                .iter()
+                .find(|r| r["name"] == json!(name))
+                .unwrap_or_else(|| panic!("missing role {name} in {returned:?}"))
+        };
+        for (name, expected_effect, expected_owner_strength) in [
+            ("empty_role", Value::Null, false),
+            ("observer", json!("read"), false),
+            ("editor", json!("write"), false),
+            ("cleaner", json!("destroy"), false),
+            ("unknown_ext", Value::Null, false),
+            ("power_user", json!("power"), false),
+            ("operator", json!("exec"), false),
+            ("phone_admin", json!("admin"), true),
+            ("policy_writer", json!("admin"), true),
+            ("owner", json!("admin"), true),
+        ] {
+            let entry = by_name(name);
+            assert_eq!(
+                entry["strongest_effect"], expected_effect,
+                "role {name} strongest_effect mismatch: {entry}"
+            );
+            assert_eq!(
+                entry["owner_strength"],
+                json!(expected_owner_strength),
+                "role {name} owner_strength mismatch: {entry}"
+            );
+        }
+
+        // 3. Every non-owner caller (observer, editor, operator, and even non-owner admin
+        //    `tablet`) can call `device.roles` (it is Effect::Read) and receives an empty list,
+        //    leaking nothing from policy.toml.
+        for caller in ["phone", "dev", "ops", "tablet"] {
+            let mut call = Call::new(Door::Cli, "device.roles", json!({}));
+            call.pinned = Some(caller.to_owned());
+            let res = node
+                .call(call)
+                .await
+                .unwrap_or_else(|e| panic!("device.roles as {caller} should succeed: {e:?}"));
+            assert_eq!(res["node"], json!("tower"), "{caller}: {res}");
+            assert_eq!(
+                res["roles"],
+                json!([]),
+                "non-owner {caller} may not hand out roles and must get []: {res}"
+            );
+            let text = serde_json::to_string(&res).unwrap();
+            for hidden in [
+                "observer",
+                "policy_writer",
+                "phone_admin",
+                "secret_user",
+                "top-secret-vault",
+            ] {
+                assert!(
+                    !text.contains(hidden),
+                    "non-owner {caller} response leaked {hidden:?}: {text}"
+                );
+            }
+        }
     }
 }

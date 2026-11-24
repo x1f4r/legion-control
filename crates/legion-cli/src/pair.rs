@@ -7,9 +7,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use legion_core::config::parse;
-use legion_core::policy::{OWNER, Policy, Role, Rule};
-use legion_core::proto::{Effect, ErrorBody, ErrorCode, Target, ToolSpec};
+use legion_core::policy::{OWNER, Policy};
+use legion_core::proto::{ErrorBody, ErrorCode, Target, ToolSpec};
 use legion_core::{Call, CancellationToken, Door, Node, RouteOutcome, Router};
+use legion_tools::roles::role_choices;
 use qrcode::render::unicode::Dense1x2;
 use qrcode::{EcLevel, QrCode};
 use serde_json::{Map, Value, json};
@@ -197,198 +198,6 @@ async fn load_target_specs(
     node.specs()
 }
 
-struct RoleEffects {
-    read: bool,
-    write: bool,
-    destroy: bool,
-    exec: bool,
-    power: bool,
-    admin: bool,
-    broad_write: bool,
-    broad_exec: bool,
-    broad_admin: bool,
-    can_write_policy: bool,
-    has_unknown_tool_rule: bool,
-}
-
-fn analyze_role(role: &Role, specs: &[ToolSpec]) -> RoleEffects {
-    let broad_rule_allows = |effect: Effect| -> bool {
-        let covers = |rule: &Rule| match rule {
-            Rule::Effect(of) => *of == effect,
-            Rule::Tools(pattern) => pattern.chars().all(|c| c == '*'),
-        };
-        !role.deny.iter().any(covers) && role.allow.iter().any(covers)
-    };
-
-    let spec_allowed = |spec: &ToolSpec| -> bool {
-        !role.deny.iter().any(|rule| rule.matches(spec))
-            && role.allow.iter().any(|rule| rule.matches(spec))
-    };
-
-    let allows_effect = |effect: Effect| -> bool {
-        let mut saw_spec_of_effect = false;
-        for spec in specs {
-            if spec.effect == effect {
-                saw_spec_of_effect = true;
-                if spec_allowed(spec) {
-                    return true;
-                }
-            }
-        }
-        if saw_spec_of_effect {
-            false
-        } else {
-            broad_rule_allows(effect)
-        }
-    };
-
-    // Any named or globbed allow rule (other than all-`*`) that matches no live `ToolSpec` has an
-    // unknown effect (for example an extension defined only on another machine); treat it
-    // conservatively so it is never described as "look only".
-    let has_unknown_tool_rule = role.allow.iter().any(|rule| match rule {
-        Rule::Effect(_) => false,
-        Rule::Tools(pattern) => {
-            if pattern.chars().all(|c| c == '*') {
-                return false;
-            }
-            let explicitly_denied = role.deny.iter().any(|deny_rule| match deny_rule {
-                Rule::Tools(dp) => dp == pattern || dp.chars().all(|c| c == '*'),
-                Rule::Effect(_) => false,
-            });
-            if explicitly_denied {
-                return false;
-            }
-            !specs.iter().any(|spec| rule.matches(spec))
-        }
-    });
-
-    let can_write_policy = broad_rule_allows(Effect::Admin)
-        || specs
-            .iter()
-            .find(|spec| spec.name == "config.write")
-            .is_some_and(spec_allowed);
-
-    RoleEffects {
-        read: allows_effect(Effect::Read),
-        write: allows_effect(Effect::Write),
-        destroy: allows_effect(Effect::Destroy),
-        exec: allows_effect(Effect::Exec),
-        power: allows_effect(Effect::Power),
-        admin: allows_effect(Effect::Admin),
-        broad_write: broad_rule_allows(Effect::Write),
-        broad_exec: broad_rule_allows(Effect::Exec),
-        broad_admin: broad_rule_allows(Effect::Admin),
-        can_write_policy,
-        has_unknown_tool_rule,
-    }
-}
-
-fn summarize_allow_rules(role: &Role) -> String {
-    let allowed: Vec<String> = role.allow.iter().take(4).map(ToString::to_string).collect();
-    let suffix = if role.allow.len() > 4 { ", ..." } else { "" };
-    format!("{}{suffix}", allowed.join(", "))
-}
-
-/// Returns a concise one-line plain-English description of what `role` may do, derived directly
-/// from its rules in `policy.toml` resolved against the node's live `ToolSpec`s (with no
-/// hardcoded role names).
-pub fn describe_role(name: &str, role: &Role, specs: &[ToolSpec]) -> String {
-    if name == OWNER {
-        return "everything, including changing who may do what".to_owned();
-    }
-    if role.allow.is_empty() {
-        return "nothing (no tools allowed)".to_owned();
-    }
-
-    let eff = analyze_role(role, specs);
-    let summary = summarize_allow_rules(role);
-
-    if eff.admin {
-        if eff.broad_admin {
-            "everything, including changing who may do what (admin — as strong as owner)".to_owned()
-        } else if eff.can_write_policy {
-            format!(
-                "everything, including changing who may do what (allows admin — as strong as owner: {summary})"
-            )
-        } else {
-            format!("custom (allows admin: {summary})")
-        }
-    } else if eff.exec {
-        if eff.broad_exec && eff.write && !eff.has_unknown_tool_rule {
-            "operate (read, change files, and run commands — as strong as this account)".to_owned()
-        } else {
-            format!("custom (allows exec — as strong as this account: {summary})")
-        }
-    } else if eff.power {
-        format!("custom (allows power: {summary})")
-    } else if eff.destroy {
-        format!("custom (allows destroy: {summary})")
-    } else if eff.has_unknown_tool_rule {
-        format!("custom (unknown tool effect: {summary})")
-    } else if eff.write {
-        if eff.broad_write {
-            "change files (read and edit files, no running commands)".to_owned()
-        } else {
-            format!("custom (allows write: {summary})")
-        }
-    } else if eff.read {
-        "look only (read status and files, change nothing)".to_owned()
-    } else {
-        "nothing (no tools allowed)".to_owned()
-    }
-}
-
-fn role_rank(name: &str, role: &Role, specs: &[ToolSpec]) -> u8 {
-    if name == OWNER {
-        return 7;
-    }
-    if role.allow.is_empty() {
-        return 0;
-    }
-    let eff = analyze_role(role, specs);
-    if eff.admin {
-        6
-    } else if eff.exec {
-        5
-    } else if eff.power {
-        4
-    } else if eff.destroy || eff.has_unknown_tool_rule {
-        3
-    } else if eff.write {
-        2
-    } else if eff.read {
-        1
-    } else {
-        0
-    }
-}
-
-/// Lists the policy's defined roles plus built-in `owner` ordered from narrowest to broadest, each
-/// paired with a plain one-line description resolved against `specs`.
-pub fn role_choices(policy: &Policy, specs: &[ToolSpec]) -> Vec<(String, String)> {
-    let mut items: Vec<(u8, String, String)> = policy
-        .roles
-        .iter()
-        .map(|(name, role)| {
-            (
-                role_rank(name, role, specs),
-                name.clone(),
-                describe_role(name, role, specs),
-            )
-        })
-        .collect();
-    items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let mut out: Vec<(String, String)> = items
-        .into_iter()
-        .map(|(_, name, desc)| (name, desc))
-        .collect();
-    out.push((
-        OWNER.to_owned(),
-        describe_role(OWNER, &Role::default(), specs),
-    ));
-    out
-}
-
 /// Interactively asks for any missing device name and role without preset defaults.
 pub fn prompt_pair_choices(
     policy: &Policy,
@@ -476,20 +285,36 @@ pub fn prompt_pair_choices(
         }
     };
 
-    let confirmed_owner = if role == OWNER && !allow_owner {
-        writeln!(
-            writer,
-            "Warning: `owner` lets {device_name} do everything this account can, including pairing further devices."
-        )
-        .map_err(prompt_io)?;
-        write!(writer, "Grant full owner access to {device_name}? [y/N] ").map_err(prompt_io)?;
+    let owner_strength = legion_tools::roles::is_owner_strength_role(policy, &role, specs);
+    let confirmed_owner = if owner_strength && !allow_owner {
+        let reason = legion_tools::roles::OWNER_STRENGTH_REASON;
+        if role == OWNER {
+            writeln!(
+                writer,
+                "Warning: `owner` ({reason}) lets {device_name} do everything this account can, including pairing further devices."
+            )
+            .map_err(prompt_io)?;
+            write!(writer, "Grant full owner access to {device_name}? [y/N] ")
+                .map_err(prompt_io)?;
+        } else {
+            writeln!(
+                writer,
+                "Warning: role `{role}` — {reason}, letting {device_name} do everything this account can, including pairing further devices."
+            )
+            .map_err(prompt_io)?;
+            write!(
+                writer,
+                "Grant owner-strength role `{role}` to {device_name}? [y/N] "
+            )
+            .map_err(prompt_io)?;
+        }
         writer.flush().map_err(prompt_io)?;
         let mut confirm = String::new();
         let read = reader.read_line(&mut confirm).map_err(prompt_io)?;
         if read == 0 {
             return Err(ErrorBody::new(
                 ErrorCode::Cancelled,
-                "Pairing with the owner role was cancelled.",
+                format!("Pairing with owner-strength role `{role}` was cancelled."),
             ));
         }
         let reply = confirm.trim().to_ascii_lowercase();
@@ -498,7 +323,7 @@ pub fn prompt_pair_choices(
         } else {
             return Err(ErrorBody::new(
                 ErrorCode::Cancelled,
-                "Pairing with the owner role was cancelled.",
+                format!("Pairing with owner-strength role `{role}` was cancelled."),
             )
             .with_hint(
                 "Choose a narrower role from policy.toml, or answer `yes` / pass `--allow-owner`.",
@@ -624,6 +449,8 @@ mod tests {
 
     use std::io::Cursor;
 
+    use legion_core::policy::Role;
+    use legion_tools::roles::describe_role;
     use serde_json::json;
 
     use super::*;
@@ -884,5 +711,78 @@ allow = ["effect:read", "config.write"]
             "config.write tool description must state plainly it is as strong as owner: {}",
             cw_spec.description
         );
+    }
+
+    #[test]
+    fn prompt_requires_typed_confirmation_for_every_owner_strength_role() {
+        let policy = parse::<Policy>(
+            Path::new("policy.toml"),
+            br#"
+default = "owner"
+
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny = ["effect:power", "effect:admin"]
+
+[roles.fleet_admin]
+allow = ["effect:read", "effect:admin"]
+
+[roles.wildcard_admin]
+allow = ["*"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+
+[roles.inviter]
+allow = ["effect:read", "device.invite"]
+"#,
+        )
+        .unwrap();
+
+        let mut reg = legion_tools::registry();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = legion_core::Paths::under(dir.path());
+        let fleet = legion_net::Fleet::new(&paths);
+        legion_net::register(&mut reg, fleet);
+        let specs = reg.specs();
+
+        // Operator (no admin) needs no typed confirmation.
+        let mut out = Vec::new();
+        let mut input = Cursor::new(b"laptop\noperator\n".to_vec());
+        let (name, role, allow_owner) =
+            prompt_pair_choices(&policy, &specs, None, None, false, &mut input, &mut out).unwrap();
+        assert_eq!(name, "laptop");
+        assert_eq!(role, "operator");
+        assert!(!allow_owner);
+
+        // Every owner-strength custom role requires typed confirmation.
+        for role_name in ["fleet_admin", "wildcard_admin", "policy_writer", "inviter"] {
+            let mut out = Vec::new();
+            let mut decline = Cursor::new(format!("laptop\n{role_name}\nn\n").into_bytes());
+            let err =
+                prompt_pair_choices(&policy, &specs, None, None, false, &mut decline, &mut out)
+                    .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Cancelled, "{role_name}: {err:?}");
+            let prompt_text = String::from_utf8(out).unwrap();
+            assert!(
+                prompt_text.contains(role_name)
+                    && prompt_text.contains(
+                        "this role can change who may do what, which makes it as strong as owner"
+                    ),
+                "prompt for {role_name} should name the role and explain why it is as strong as owner: {prompt_text}"
+            );
+
+            let mut out = Vec::new();
+            let mut accept = Cursor::new(format!("laptop\n{role_name}\nyes\n").into_bytes());
+            let (name, chosen, allow_owner) =
+                prompt_pair_choices(&policy, &specs, None, None, false, &mut accept, &mut out)
+                    .unwrap();
+            assert_eq!(name, "laptop");
+            assert_eq!(chosen, role_name);
+            assert!(
+                allow_owner,
+                "accepting {role_name} must set allow_owner=true"
+            );
+        }
     }
 }
