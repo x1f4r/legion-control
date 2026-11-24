@@ -1,15 +1,55 @@
 //! Tauri command surface backed by [`Backend`].
 
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tauri::State;
 use tauri::ipc::Channel;
 
 use crate::backend::{
-    AppError, AppState, Backend, CallEvent, CallId, CallRequest, CancelResult, PairResult,
-    UnpairResult,
+    AppError, AppState, Backend, CallEvent, CallId, CallRequest, CancelResult, ErrorCode,
+    PairResult, UnpairResult,
 };
+
+/// Log line emitted when the web interface finishes its first paint.
+pub const INTERFACE_READY_MARKER: &str = "legion-app: interface ready";
+
+/// Optional environment variable naming a file to write [`INTERFACE_READY_MARKER`] to on ready.
+pub const READY_FILE_ENV: &str = "LEGION_APP_READY_FILE";
+
+static READY_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Result returned by `scan_invite`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScanInviteResult {
+    /// A QR code was scanned directly by the native command (Android).
+    Scanned {
+        /// Trimmed QR code payload.
+        content: String,
+    },
+    /// The caller should invoke the registered `barcode-scanner` plugin directly (iOS).
+    ///
+    /// `tauri-plugin-barcode-scanner` 2.5.3 keeps its iOS `PluginHandle` private and registering
+    /// a second iOS plugin handle requires `unsafe` FFI (`tauri::ios_plugin_binding!`), which this
+    /// crate forbids. The plugin is registered and permitted in `capabilities/mobile.json` so the
+    /// web view can call `plugin:barcode-scanner|scan` directly.
+    UsePlugin {
+        /// Registered Tauri plugin name (`"barcode-scanner"`).
+        plugin: String,
+        /// Barcode formats to pass to `plugin:barcode-scanner|scan`.
+        formats: Vec<String>,
+        /// Preferred camera direction (`"back"`).
+        camera_direction: String,
+        /// Whether the scanner should use a transparent webview overlay (`false`).
+        windowed: bool,
+    },
+}
 
 /// Shared backend state registered with Tauri.
 pub struct SharedBackend(pub Arc<dyn Backend>);
@@ -88,6 +128,47 @@ pub fn device_name() -> String {
     default_device_name()
 }
 
+/// Signals that the web interface has mounted and painted its initial view.
+///
+/// Logs [`INTERFACE_READY_MARKER`] once to stdout (and logcat on Android). When
+/// `LEGION_APP_READY_FILE` is set, also writes the marker line to that path so automated smoke
+/// checks can assert startup without guessing a sleep duration.
+#[tauri::command]
+pub fn ready() -> Result<(), AppError> {
+    if !READY_LOGGED.swap(true, Ordering::SeqCst) {
+        println!("{INTERFACE_READY_MARKER}");
+        let _ = std::io::stdout().flush();
+        #[cfg(target_os = "android")]
+        log::info!(target: "legion-app", "{INTERFACE_READY_MARKER}");
+    }
+
+    if let Some(path) = std::env::var_os(READY_FILE_ENV).filter(|val| !val.is_empty()) {
+        write_ready_marker(Path::new(&path))?;
+    }
+
+    Ok(())
+}
+
+fn write_ready_marker(path: &Path) -> Result<(), AppError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not create directory for ready marker: {err}"),
+            )
+        })?;
+    }
+
+    fs::write(path, format!("{INTERFACE_READY_MARKER}\n")).map_err(|err| {
+        AppError::new(
+            ErrorCode::Internal,
+            format!("Could not write ready marker file: {err}"),
+        )
+    })
+}
+
 /// Resolves the default name for this device without panicking.
 pub fn default_device_name() -> String {
     #[cfg(target_os = "android")]
@@ -134,11 +215,8 @@ pub fn default_device_name() -> String {
 /// Camera permission is checked and requested only when this command is called.
 #[cfg(target_os = "android")]
 #[tauri::command]
-pub async fn scan_invite(scanner: State<'_, ScannerHandle>) -> Result<String, AppError> {
-    use serde::Deserialize;
+pub async fn scan_invite(scanner: State<'_, ScannerHandle>) -> Result<ScanInviteResult, AppError> {
     use serde_json::json;
-
-    use crate::backend::ErrorCode;
 
     #[derive(Deserialize)]
     struct PermissionResponse {
@@ -214,23 +292,60 @@ pub async fn scan_invite(scanner: State<'_, ScannerHandle>) -> Result<String, Ap
         );
     }
 
-    Ok(content)
+    Ok(ScanInviteResult::Scanned { content })
 }
 
-/// Scans a pairing invite QR code on iOS.
+/// Returns the barcode-scanner plugin instructions for scanning a pairing invite QR code on iOS.
 ///
-/// `tauri-plugin-barcode-scanner` 2.5.3 does not expose a public Rust `PluginHandle` accessor and
-/// this crate forbids `unsafe_code` (required by `tauri::ios_plugin_binding!`). The plugin is
-/// registered and permitted in `capabilities/mobile.json` so stage two can wire the iOS bridge
-/// once the Xcode target is initialized.
+/// The `barcode-scanner` plugin is registered on iOS and permitted in `capabilities/mobile.json`
+/// (`plugin:barcode-scanner|check_permissions`, `request_permissions`, `scan`, and `cancel`), so
+/// the web interface invokes the plugin directly without requiring `unsafe` FFI in this crate.
 #[cfg(target_os = "ios")]
 #[tauri::command]
-pub async fn scan_invite() -> Result<String, AppError> {
-    use crate::backend::ErrorCode;
+pub async fn scan_invite() -> Result<ScanInviteResult, AppError> {
+    Ok(ScanInviteResult::UsePlugin {
+        plugin: "barcode-scanner".to_owned(),
+        formats: vec!["QR_CODE".to_owned()],
+        camera_direction: "back".to_owned(),
+        windowed: false,
+    })
+}
 
-    Err(AppError::new(
-        ErrorCode::Unsupported,
-        "Native scan_invite command is not yet wired for iOS in this build.",
-    )
-    .with_hint("Use the barcode-scanner plugin bridge or paste the invite text."))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_marker_writes_expected_line() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let marker_path = dir.path().join("nested").join("ready.txt");
+        write_ready_marker(&marker_path)?;
+        let text = fs::read_to_string(&marker_path)?;
+        assert_eq!(text, format!("{INTERFACE_READY_MARKER}\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_invite_result_serializes_cleanly() -> Result<(), Box<dyn std::error::Error>> {
+        let scanned = ScanInviteResult::Scanned {
+            content: "legion-invite:v1:example".to_owned(),
+        };
+        let scanned_json = serde_json::to_value(&scanned)?;
+        assert_eq!(scanned_json["kind"], "scanned");
+        assert_eq!(scanned_json["content"], "legion-invite:v1:example");
+
+        let use_plugin = ScanInviteResult::UsePlugin {
+            plugin: "barcode-scanner".to_owned(),
+            formats: vec!["QR_CODE".to_owned()],
+            camera_direction: "back".to_owned(),
+            windowed: false,
+        };
+        let plugin_json = serde_json::to_value(&use_plugin)?;
+        assert_eq!(plugin_json["kind"], "use_plugin");
+        assert_eq!(plugin_json["plugin"], "barcode-scanner");
+        assert_eq!(plugin_json["formats"], serde_json::json!(["QR_CODE"]));
+        assert_eq!(plugin_json["camera_direction"], "back");
+        assert_eq!(plugin_json["windowed"], false);
+        Ok(())
+    }
 }

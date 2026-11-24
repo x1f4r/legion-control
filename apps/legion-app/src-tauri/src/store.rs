@@ -18,6 +18,44 @@ pub const STORE_VERSION: u32 = 1;
 /// Filename inside the platform's private app data directory.
 pub const STORE_FILENAME: &str = "legion-app.json";
 
+/// Extended attribute Apple's Foundation uses to mark a file or directory excluded from iCloud,
+/// iTunes and Time Machine backups (`NSURLIsExcludedFromBackupKey`).
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+const APPLE_BACKUP_EXCLUDE_XATTR: &str = "com.apple.metadata:com_apple_backup_excludeItem";
+
+/// Binary property list encoding the string `"com.apple.backupd"`, matching the payload written
+/// by `NSURL.setResourceValue(true, forKey: .isExcludedFromBackupKey)`.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+const APPLE_BACKUP_EXCLUDE_VALUE: &[u8] = &[
+    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0x5f, 0x10, 0x11, 0x63, 0x6f, 0x6d, 0x2e, 0x61,
+    0x70, 0x70, 0x6c, 0x65, 0x2e, 0x62, 0x61, 0x63, 0x6b, 0x75, 0x70, 0x64, 0x08, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c,
+];
+
+/// Marks `path` excluded from iCloud, iTunes and Time Machine backups on Apple platforms.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn exclude_from_backup(path: &Path) -> Result<(), AppError> {
+    rustix::fs::setxattr(
+        path,
+        APPLE_BACKUP_EXCLUDE_XATTR,
+        APPLE_BACKUP_EXCLUDE_VALUE,
+        rustix::fs::XattrFlags::empty(),
+    )
+    .map_err(|err| {
+        AppError::new(
+            ErrorCode::Internal,
+            format!("Could not exclude app data from Apple backups: {err}"),
+        )
+    })
+}
+
+/// No-op on non-Apple platforms (Android uses `data_extraction_rules.xml`).
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+fn exclude_from_backup(_path: &Path) -> Result<(), AppError> {
+    Ok(())
+}
+
 /// Persisted state owned by the native shell.
 ///
 /// Stage two extends this structure with the device's Ed25519 key material and per-node connection
@@ -63,6 +101,32 @@ impl AppStore {
         &self.path
     }
 
+    /// Ensures the backing app data directory exists, is owner-only on Unix, and is excluded from
+    /// Apple iCloud/iTunes/Time Machine backups.
+    pub fn prepare_dir(&self) -> Result<(), AppError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            AppError::new(
+                ErrorCode::Internal,
+                "App state path has no parent directory.",
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not create app data directory: {err}"),
+            )
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+
+        exclude_from_backup(parent)?;
+        Ok(())
+    }
+
     /// Loads the stored state, returning [`AppStoreData::default`] when the file does not exist.
     pub fn load(&self) -> Result<AppStoreData, AppError> {
         let bytes = match fs::read(&self.path) {
@@ -92,24 +156,13 @@ impl AppStore {
 
     /// Atomically writes `data` to the backing JSON file with owner-only permissions on Unix.
     pub fn save(&self, data: &AppStoreData) -> Result<(), AppError> {
+        self.prepare_dir()?;
         let parent = self.path.parent().ok_or_else(|| {
             AppError::new(
                 ErrorCode::Internal,
                 "App state path has no parent directory.",
             )
         })?;
-        fs::create_dir_all(parent).map_err(|err| {
-            AppError::new(
-                ErrorCode::Internal,
-                format!("Could not create app data directory: {err}"),
-            )
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-        }
 
         let mut payload = serde_json::to_vec_pretty(data).map_err(|err| {
             AppError::new(
@@ -139,6 +192,8 @@ impl AppStore {
                 })?;
         }
 
+        exclude_from_backup(temp.path())?;
+
         temp.write_all(&payload).map_err(|err| {
             AppError::new(
                 ErrorCode::Internal,
@@ -158,6 +213,8 @@ impl AppStore {
                 format!("Could not replace app state file: {}", err.error),
             )
         })?;
+
+        exclude_from_backup(&self.path)?;
 
         Ok(())
     }
@@ -206,6 +263,19 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(store.path())?.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+
+        #[cfg(any(target_os = "ios", target_os = "macos"))]
+        {
+            let mut dir_buf = [0u8; 128];
+            let dir_len =
+                rustix::fs::getxattr(dir.path(), APPLE_BACKUP_EXCLUDE_XATTR, &mut dir_buf)?;
+            assert_eq!(&dir_buf[..dir_len], APPLE_BACKUP_EXCLUDE_VALUE);
+
+            let mut file_buf = [0u8; 128];
+            let file_len =
+                rustix::fs::getxattr(store.path(), APPLE_BACKUP_EXCLUDE_XATTR, &mut file_buf)?;
+            assert_eq!(&file_buf[..file_len], APPLE_BACKUP_EXCLUDE_VALUE);
         }
 
         Ok(())

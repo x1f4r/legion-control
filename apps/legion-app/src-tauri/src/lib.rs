@@ -31,11 +31,31 @@ fn android_barcode_scanner_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    #[cfg(target_os = "android")]
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("legion-app"),
+    );
+
+    let builder = tauri::Builder::default();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    let builder = builder
         .manage(SharedBackend(Arc::new(Unpaired)))
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            app.manage(AppStore::in_dir(data_dir));
+            let store = AppStore::in_dir(data_dir);
+            store.prepare_dir()?;
+            app.manage(store);
             Ok(())
         });
 
@@ -50,6 +70,7 @@ pub fn run() {
             commands::pair,
             commands::unpair,
             commands::device_name,
+            commands::ready,
             commands::scan_invite,
         ]);
 
@@ -64,6 +85,7 @@ pub fn run() {
             commands::pair,
             commands::unpair,
             commands::device_name,
+            commands::ready,
             commands::scan_invite,
         ]);
 
@@ -76,6 +98,7 @@ pub fn run() {
         commands::pair,
         commands::unpair,
         commands::device_name,
+        commands::ready,
     ]);
 
     #[allow(clippy::expect_used)]

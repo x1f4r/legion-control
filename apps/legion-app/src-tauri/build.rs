@@ -317,6 +317,13 @@ const PLACEHOLDER_JS: &str = r##"(function () {
       return;
     }
 
+    let readySent = false;
+    function signalReady() {
+      if (readySent || !invoke) return;
+      readySent = true;
+      invoke("ready").catch(function () {});
+    }
+
     try {
       const [name, st] = await Promise.all([
         invoke("device_name"),
@@ -327,6 +334,10 @@ const PLACEHOLDER_JS: &str = r##"(function () {
       needsEl.textContent = st.needs === null ? "none" : String(st.needs);
       statusChip.textContent = st.ready ? "ready" : (st.needs || "unpaired");
       stateJsonEl.textContent = JSON.stringify(st, null, 2);
+      window.requestAnimationFrame(function () {
+        window.requestAnimationFrame(signalReady);
+      });
+      window.setTimeout(signalReady, 250);
     } catch (err) {
       statusChip.textContent = "error";
       stateJsonEl.textContent = JSON.stringify(err, null, 2);

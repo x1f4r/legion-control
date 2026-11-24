@@ -18,12 +18,15 @@
       }
     ],
     "security": {
-      "csp": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'none'; script-src 'self' tauri:; style-src 'self' tauri:; img-src 'self' tauri: data:; connect-src ipc: http://ipc.localhost https://ipc.localhost"
     }
   },
   "bundle": {
     "active": true,
     "targets": ["deb", "appimage", "dmg", "nsis"],
+    "iOS": {
+      "minimumSystemVersion": "15.0"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
