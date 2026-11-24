@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use legion_proto::ErrorCode;
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::ctx::Door;
 use crate::glob;
@@ -171,7 +172,15 @@ impl AuditLog {
     ///
     /// The log is read backwards in blocks and only as far as needed, so a long log costs no more
     /// than its tail. Lines that are not JSON, such as one cut short by a crash, are skipped.
-    pub fn tail(&self, limit: usize, filter: &Filter) -> io::Result<Tail> {
+    ///
+    /// A filter that matches little can still read the whole log, so `cancel` is checked before
+    /// every block, and a cancelled read fails with [`io::ErrorKind::Interrupted`].
+    pub fn tail(
+        &self,
+        limit: usize,
+        filter: &Filter,
+        cancel: &CancellationToken,
+    ) -> io::Result<Tail> {
         const BLOCK: u64 = 64 * 1024;
         let lock = self.lock_file()?;
         lock.lock_shared()?;
@@ -196,6 +205,10 @@ impl AuditLog {
         let mut partial: Vec<u8> = Vec::new();
         let mut end = file.metadata()?.len();
         'blocks: while end > 0 {
+            if cancel.is_cancelled() {
+                let _ = lock.unlock();
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
             let start = end.saturating_sub(BLOCK);
             let mut block = vec![0; usize::try_from(end - start).unwrap_or(0)];
             file.seek(SeekFrom::Start(start))?;
@@ -405,7 +418,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = AuditLog::new(&Paths::under(dir.path()));
         assert_eq!(
-            log.tail(5, &Filter::default()).unwrap().entries,
+            log.tail(5, &Filter::default(), &CancellationToken::new())
+                .unwrap()
+                .entries,
             Vec::<Value>::new()
         );
         for n in 0..10 {
@@ -420,7 +435,9 @@ mod tests {
         log.append(&entry("fs.read", "agent:claude", Outcome::Ok))
             .unwrap();
 
-        let last = log.tail(3, &Filter::default()).unwrap();
+        let last = log
+            .tail(3, &Filter::default(), &CancellationToken::new())
+            .unwrap();
         let tools: Vec<&str> = last
             .entries
             .iter()
@@ -433,13 +450,19 @@ mod tests {
             outcome: Some("denied".to_owned()),
             ..Filter::default()
         };
-        assert_eq!(log.tail(100, &denied).unwrap().entries.len(), 5);
+        assert_eq!(
+            log.tail(100, &denied, &CancellationToken::new())
+                .unwrap()
+                .entries
+                .len(),
+            5
+        );
         let by_glob = Filter {
             tool: Some("fs.*".to_owned()),
             principal: Some("agent:claude".to_owned()),
             ..Filter::default()
         };
-        let found = log.tail(100, &by_glob).unwrap();
+        let found = log.tail(100, &by_glob, &CancellationToken::new()).unwrap();
         assert_eq!(found.entries.len(), 1);
         assert!(!found.truncated);
     }
@@ -459,14 +482,34 @@ mod tests {
             .open(paths.audit_log())
             .and_then(|mut file| file.write_all(b"{\"tool\": \"torn"))
             .unwrap();
-        let tail = log.tail(50, &Filter::default()).unwrap();
+        let tail = log
+            .tail(50, &Filter::default(), &CancellationToken::new())
+            .unwrap();
         assert_eq!(tail.entries.len(), 50);
         assert!(tail.truncated);
         assert!(tail.entries.iter().all(|e| e["tool"] == json!("meta.big")));
         assert_eq!(
-            log.tail(1000, &Filter::default()).unwrap().entries.len(),
+            log.tail(1000, &Filter::default(), &CancellationToken::new())
+                .unwrap()
+                .entries
+                .len(),
             60
         );
+    }
+
+    #[test]
+    fn a_cancelled_tail_stops_before_reading_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::new(&Paths::under(dir.path()));
+        log.append(&entry("meta.version", "owner", Outcome::Ok))
+            .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = log.tail(10, &Filter::default(), &cancel).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        // The lock was given back: a writer can still append.
+        log.append(&entry("meta.version", "owner", Outcome::Ok))
+            .unwrap();
     }
 
     #[test]

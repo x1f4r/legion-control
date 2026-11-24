@@ -17,7 +17,7 @@ mod tool;
 
 pub use config::{ConfigStore, Document};
 pub use ctx::{Ctx, Door, EventSink};
-pub use node::{Call, Node, VERSION};
+pub use node::{CANCEL_GRACE, Call, Node, VERSION};
 pub use paths::Paths;
 pub use policy::{Access, Grant, Policy};
 pub use registry::{DocumentInfo, Registry};
