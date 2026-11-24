@@ -129,6 +129,16 @@ impl Fleet {
     ) -> Result<Arc<Session>, ErrorBody> {
         let fleet_file = config.get::<FleetFile>()?;
         let entry = lookup_machine(&fleet_file, machine, here)?;
+        if let Some(relay) = &entry.via {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                format!("Machine {machine} is reached via relay {relay}, not through a direct session."),
+            )
+            .with_hint(format!(
+                "Use Fleet::call_remote for relayed calls to {machine}, or open a direct session to {relay}."
+            ))
+            .with_machine(here));
+        }
         self.get_or_open(machine, entry, None, cancel)
             .await
             .map(|live| live.session)
@@ -150,17 +160,24 @@ impl Fleet {
             .config()
             .get::<FleetFile>()
             .map_err(|err| ensure_machine(err, here))?;
-        let entry = lookup_machine(&fleet_file, machine, here)?;
+        let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, machine, here)?;
+        if relayed && direct_machine == here {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Machine {machine} relays through {here}, which is this node."),
+            )
+            .with_machine(here));
+        }
         let params = CallParams {
             tool: tool.to_owned(),
             args,
             as_principal: Some(ctx.principal().to_owned()),
-            on: Some(Target::One(machine.to_owned())),
+            on: relayed.then(|| Target::One(machine.to_owned())),
             hops: 1,
         };
         self.execute_on_machine(
-            machine,
-            entry,
+            direct_machine,
+            direct_entry,
             params,
             ctx.cancel_token().clone(),
             events.for_machine(machine),
@@ -211,6 +228,16 @@ impl Fleet {
         }
         let fleet_file = config.get::<FleetFile>()?;
         let entry = lookup_machine(&fleet_file, machine, here)?;
+        if let Some(relay) = &entry.via {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                format!("Machine {machine} is reached via relay {relay}, so a direct pipe cannot be opened to it."),
+            )
+            .with_hint(format!(
+                "Configure a direct ssh or command transport for {machine}, or open a pipe to {relay}."
+            ))
+            .with_machine(here));
+        }
         let systems = entry.resolved_systems();
 
         // Reuse the verified active system and OS from an already-open session when available.
@@ -273,7 +300,10 @@ impl Fleet {
     }
 
     /// Runs `call` on a single named machine (locally if `machine` is this node, otherwise over
-    /// the pooled session).
+    /// the pooled session, or through an explicit `via` relay).
+    ///
+    /// A node never runs a call locally when `machine` is not this node and is missing from
+    /// `fleet.toml`: unknown names fail with `not_found` carrying this node's name.
     pub async fn call_machine(
         &self,
         node: &Node,
@@ -288,18 +318,13 @@ impl Fleet {
             .config()
             .get::<FleetFile>()
             .map_err(|err| ensure_machine(err, &here))?;
-        match fleet_file.machine(machine) {
-            Some(entry) => self.forward_one(node, machine, entry, call).await,
-            None if call.hops > 0 => {
-                // This call was forwarded directly here under a fleet alias that differs from this
-                // node's own name, and this node has no forwarding entry for that name.
-                node.call(call).await
-            }
-            None => Err(unknown_machine_error(machine, &fleet_file.names(), &here)),
-        }
+        let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, machine, &here)?;
+        self.forward_one(node, machine, direct_machine, direct_entry, relayed, call)
+            .await
     }
 
-    /// Probes one machine with `hello`, returning structured reachability and latency data.
+    /// Probes one machine with `hello` (or `meta.version` through its relay when configured with
+    /// `via`), returning structured reachability and latency data.
     pub async fn ping(
         &self,
         config: &ConfigStore,
@@ -328,12 +353,71 @@ impl Fleet {
                 return ping_failed(machine, ensure_machine(err, here));
             }
         };
-        let entry = match lookup_machine(&fleet_file, machine, here) {
-            Ok(entry) => entry,
-            Err(err) => return ping_failed(machine, err),
-        };
+        let (direct_machine, direct_entry, relayed) =
+            match resolve_route(&fleet_file, machine, here) {
+                Ok(route) => route,
+                Err(err) => return ping_failed(machine, err),
+            };
 
         let started = Instant::now();
+        if relayed {
+            if direct_machine == here {
+                return ping_failed(
+                    machine,
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("Machine {machine} relays through {here}, which is this node."),
+                    )
+                    .with_machine(here),
+                );
+            }
+            let params = CallParams {
+                tool: "meta.version".to_owned(),
+                args: serde_json::json!({}),
+                as_principal: None,
+                on: Some(Target::One(machine.to_owned())),
+                hops: 1,
+            };
+            let fut = self.execute_on_machine(
+                direct_machine,
+                direct_entry,
+                params,
+                cancel,
+                EventSink::discard(),
+            );
+            return match tokio::time::timeout(timeout, fut).await {
+                Ok(Ok(value)) => PingOutcome {
+                    machine: machine.to_owned(),
+                    reachable: true,
+                    node: value.get("node").and_then(Value::as_str).map(str::to_owned),
+                    system: None,
+                    version: value
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    os: value.get("os").and_then(Value::as_str).map(str::to_owned),
+                    arch: value.get("arch").and_then(Value::as_str).map(str::to_owned),
+                    latency_ms: Some(
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ),
+                    error: None,
+                },
+                Ok(Err(err)) => ping_failed(machine, ensure_machine(err, machine)),
+                Err(_) => ping_failed(
+                    machine,
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!(
+                            "Timed out waiting for {machine} after {}s.",
+                            timeout.as_secs_f64()
+                        ),
+                    )
+                    .with_machine(machine),
+                ),
+            };
+        }
+
+        let entry = direct_entry;
         let systems = entry.resolved_systems();
         let slot = self.slot(machine);
         let existing = {
@@ -443,9 +527,20 @@ impl Fleet {
         &self,
         node: &Node,
         machine: &str,
-        entry: &MachineEntry,
+        direct_machine: &str,
+        direct_entry: &MachineEntry,
+        relayed: bool,
         call: Call,
     ) -> Result<Value, ErrorBody> {
+        let here = node.name();
+        if relayed && direct_machine == here {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Machine {machine} relays through {here}, which is this node."),
+            )
+            .with_machine(&here));
+        }
+
         let next_hops = call.hops.saturating_add(1);
         if next_hops > MAX_HOPS {
             return Err(ErrorBody::new(
@@ -463,7 +558,6 @@ impl Fleet {
 
         // Resolve the effective principal locally so a pinned door cannot be bypassed on forward
         // and invalid policy.toml fails closed before anything leaves this node.
-        let here = node.name();
         let policy = node
             .config()
             .get::<Policy>()
@@ -476,13 +570,15 @@ impl Fleet {
             tool: call.tool,
             args: call.args,
             as_principal: Some(principal),
-            on: Some(Target::One(machine.to_owned())),
+            // Direct forwards send no `on` so the receiver runs the call locally regardless of
+            // what it calls itself. Explicit `via` relays send `on` naming the final target.
+            on: relayed.then(|| Target::One(machine.to_owned())),
             hops: next_hops,
         };
 
         self.execute_on_machine(
-            machine,
-            entry,
+            direct_machine,
+            direct_entry,
             params,
             call.cancel,
             call.events.for_machine(machine),
@@ -963,9 +1059,26 @@ fn default_first_os(program: Option<&str>) -> RemoteOs {
     }
 }
 
+fn resolve_route<'a>(
+    fleet_file: &'a FleetFile,
+    machine: &'a str,
+    here: &str,
+) -> Result<(&'a str, &'a MachineEntry, bool), ErrorBody> {
+    if fleet_file.machine(machine).is_none() {
+        return Err(unknown_machine_error(machine, &fleet_file.names(), here));
+    }
+    fleet_file.resolve_route(machine).map_err(|reason| {
+        ErrorBody::new(ErrorCode::Failed, format!("{reason}."))
+            .with_hint(
+                "Fix the `via` entries in fleet.toml so they name a valid relay without cycles.",
+            )
+            .with_machine(here)
+    })
+}
+
 fn lookup_machine<'a>(
     fleet_file: &'a FleetFile,
-    machine: &str,
+    machine: &'a str,
     here: &str,
 ) -> Result<&'a MachineEntry, ErrorBody> {
     fleet_file
@@ -986,10 +1099,10 @@ fn unknown_machine_error(machine: &str, known: &[&str], here: &str) -> ErrorBody
     };
     ErrorBody::new(
         ErrorCode::NotFound,
-        format!("There is no machine called {machine} in fleet.toml."),
+        format!("There is no machine called {machine} in fleet.toml on {here}."),
     )
     .with_hint(hint)
-    .with_machine(machine)
+    .with_machine(here)
 }
 
 fn ensure_machine(err: ErrorBody, machine: &str) -> ErrorBody {

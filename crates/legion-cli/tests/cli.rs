@@ -191,7 +191,7 @@ fn on_runs_here_for_this_node_and_reports_unknown_machines_as_not_found() {
     assert_eq!(unknown.code, 1);
     let error = unknown.json();
     assert_eq!(error["code"], json!("not_found"));
-    assert_eq!(error["machine"], json!("pi"));
+    assert_eq!(error["machine"], json!("tower"));
     assert!(error["hint"].as_str().unwrap().contains("tower"), "{error}");
 
     // Partial fan-out success exits 0 and returns per-machine outcomes.

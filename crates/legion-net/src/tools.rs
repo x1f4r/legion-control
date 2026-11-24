@@ -152,6 +152,8 @@ struct ListedMachine {
     this_node: bool,
     systems: Vec<ListedSystem>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     mac: Option<String>,
     wake_via: Vec<String>,
 }
@@ -197,6 +199,7 @@ async fn fleet_list(_fleet: &Fleet, ctx: &Ctx, _args: NoArgs) -> Result<ListResu
                 name: name.clone(),
                 this_node: name == here,
                 systems,
+                via: entry.via.clone(),
                 mac: entry.mac.clone(),
                 wake_via: entry.wake_via.clone(),
             }
@@ -336,15 +339,18 @@ struct AddSystemArgs {
 struct AddArgs {
     /// Machine name (lower-case letters, digits, `-` and `_`, starting with a letter or digit).
     name: String,
-    /// SSH target accepted by the system ssh client. Give one of `ssh`, `command` or `systems`.
+    /// SSH target accepted by the system ssh client. Give one of `ssh`, `command`, `systems` or `via`.
     #[serde(default)]
     ssh: Option<String>,
-    /// Exact argv to start `legion rpc`. Give one of `ssh`, `command` or `systems`.
+    /// Exact argv to start `legion rpc`. Give one of `ssh`, `command`, `systems` or `via`.
     #[serde(default)]
     command: Option<Vec<String>>,
-    /// Multiple bootable systems for a dual-boot machine. Give one of `ssh`, `command` or `systems`.
+    /// Multiple bootable systems for a dual-boot machine. Give one of `ssh`, `command`, `systems` or `via`.
     #[serde(default)]
     systems: Option<Vec<AddSystemArgs>>,
+    /// Relay machine in `fleet.toml` through which calls to this machine are forwarded. Give one of `ssh`, `command`, `systems` or `via`.
+    #[serde(default)]
+    via: Option<String>,
     /// Remote `legion` binary name or path when it is not found the default way.
     #[serde(default)]
     program: Option<String>,
@@ -385,6 +391,7 @@ async fn fleet_add(fleet: &Fleet, ctx: &Ctx, args: AddArgs) -> Result<AddResult,
                 })
                 .collect()
         }),
+        via: args.via,
         mac: args.mac,
         wake_via: args.wake_via.unwrap_or_default(),
     };

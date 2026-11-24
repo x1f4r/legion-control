@@ -968,12 +968,12 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
     assert_eq!(mcp_all_fail["isError"], json!(true), "{mcp_all_fail}");
     assert_eq!(mcp.finish(), 0);
 
-    // Unknown single machine returns not_found with hint listing known names.
+    // Unknown single machine returns not_found carrying this node's name and listing known names.
     let unknown = laptop.run(&["meta.version", "--on", "ghost"]);
     assert_eq!(unknown.code, 1);
     let err = unknown.json();
     assert_eq!(err["code"], json!("not_found"));
-    assert_eq!(err["machine"], json!("ghost"));
+    assert_eq!(err["machine"], json!("laptop"));
     let hint = err["hint"].as_str().unwrap();
     assert!(hint.contains("pi") && hint.contains("tower"), "{hint}");
 }
@@ -1036,12 +1036,18 @@ fn hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop() {
     node_b.write_config("node.toml", "name = \"b\"\n");
     node_c.write_config("node.toml", "name = \"c\"\n");
 
-    // Deliberate loop: A forwards `loopbox` -> B, B forwards `loopbox` -> A.
-    // Valid 2-hop: A forwards `c` -> B, B forwards `c` -> C.
+    // 1. Direct alias never re-routes on the receiver: A maps `tower` directly to B, and B maps
+    //    `tower` directly to C, and A also maps `b_alias` directly to B while B maps `b_alias` to
+    //    itself. Both run directly on B because direct forwards carry no `on`.
+    // 2. Explicit `via = "b"` relays through B with `on` naming the final target:
+    //    - `c` succeeds because B has `[machines.c]` -> C.
+    //    - `ghost` fails with `not_found` carrying relay B's machine name (never runs on B).
+    // 3. Cross-node `via` cycle (`loopbox`: A via B, B via A) stops at the 3-hop limit.
     node_a.write_config(
         "fleet.toml",
         &format!(
-            "[machines.loopbox]\ncommand = {}\n\n[machines.c]\ncommand = {}\n",
+            "[machines.b]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n\n[machines.b_alias]\ncommand = {}\n\n[machines.c]\nvia = \"b\"\n\n[machines.ghost]\nvia = \"b\"\n\n[machines.loopbox]\nvia = \"b\"\n",
+            toml_argv(&run_argv(&node_b, None)),
             toml_argv(&run_argv(&node_b, None)),
             toml_argv(&run_argv(&node_b, None)),
         ),
@@ -1049,18 +1055,37 @@ fn hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop() {
     node_b.write_config(
         "fleet.toml",
         &format!(
-            "[machines.loopbox]\ncommand = {}\n\n[machines.c]\ncommand = {}\n",
+            "[machines.a]\ncommand = {}\n\n[machines.c]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n\n[machines.b_alias]\ncommand = {}\n\n[machines.loopbox]\nvia = \"a\"\n",
             toml_argv(&run_argv(&node_a, None)),
             toml_argv(&run_argv(&node_c, None)),
+            toml_argv(&run_argv(&node_c, None)),
+            toml_argv(&run_argv(&node_b, None)),
         ),
     );
 
-    // Valid 2-hop reaches C through B.
+    // Direct forward under an alias runs on B, NOT C, even though B maps `tower` to C.
+    let direct_tower = node_a.run(&["meta.version", "--on", "tower"]);
+    assert_eq!(direct_tower.code, 0, "{}", direct_tower.stdout);
+    assert_eq!(direct_tower.json()["node"], json!("b"));
+
+    // Direct forward where receiver's own name differs from the fleet alias does not self-loop.
+    let direct_alias = node_a.run(&["meta.version", "--on", "b_alias"]);
+    assert_eq!(direct_alias.code, 0, "{}", direct_alias.stdout);
+    assert_eq!(direct_alias.json()["node"], json!("b"));
+
+    // Explicit `via = "b"` reaches C through B.
     let reached = node_a.run(&["meta.version", "--on", "c"]);
     assert_eq!(reached.code, 0, "{}", reached.stdout);
     assert_eq!(reached.json()["node"], json!("c"));
 
-    // Deliberate loop stops with `failed` after exceeding 3 hops.
+    // Explicit `via = "b"` for a target B does not know fails with `not_found` from relay B.
+    let missing_on_relay = node_a.run(&["meta.version", "--on", "ghost"]);
+    assert_eq!(missing_on_relay.code, 1, "{}", missing_on_relay.stdout);
+    let err = missing_on_relay.json();
+    assert_eq!(err["code"], json!("not_found"), "{err}");
+    assert_eq!(err["machine"], json!("b"), "{err}");
+
+    // Deliberate cross-node `via` loop stops with `failed` after exceeding 3 hops.
     let looped = node_a.run(&["meta.version", "--on", "loopbox"]);
     assert_eq!(looped.code, 1, "{}", looped.stdout);
     let err = looped.json();

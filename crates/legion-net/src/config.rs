@@ -74,6 +74,38 @@ impl FleetFile {
             })
         })
     }
+
+    /// Resolves the first direct machine entry for `name` by following any local `via` links.
+    ///
+    /// Returns `(direct_name, direct_entry, relayed)`, where `relayed` is `true` if at least one
+    /// `via` link was followed so the forwarded call must carry `on = name` to the relay.
+    pub fn resolve_route<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Result<(&'a str, &'a MachineEntry, bool), String> {
+        let mut current = name;
+        let mut relayed = false;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(format!(
+                    "machines.{name}.via: relay cycle involving {current:?}"
+                ));
+            }
+            let entry = self.machines.get(current).ok_or_else(|| {
+                format!(
+                    "machines.{name}.via: unknown relay machine {current:?}; define [machines.{current}] in fleet.toml"
+                )
+            })?;
+            match entry.via.as_deref() {
+                Some(next) => {
+                    relayed = true;
+                    current = next;
+                }
+                None => return Ok((current, entry, relayed)),
+            }
+        }
+    }
 }
 
 impl Document for FleetFile {
@@ -85,6 +117,11 @@ impl Document for FleetFile {
     fn validate(&self) -> Result<(), String> {
         for (name, entry) in &self.machines {
             validate_machine_entry(name, entry)?;
+        }
+        for (name, entry) in &self.machines {
+            if entry.via.is_some() {
+                self.resolve_route(name)?;
+            }
         }
         Ok(())
     }
@@ -109,6 +146,9 @@ pub struct MachineEntry {
     /// Multiple bootable systems for a dual-boot or multi-system machine.
     #[serde(default)]
     pub systems: Option<Vec<SystemEntry>>,
+    /// Relay machine in this same `fleet.toml` through which calls to this machine are forwarded.
+    #[serde(default)]
+    pub via: Option<String>,
     /// Hardware MAC address for Wake-on-LAN.
     #[serde(default)]
     pub mac: Option<String>,
@@ -328,7 +368,39 @@ pub fn validate_machine_entry(name: &str, entry: &MachineEntry) -> Result<(), St
         }
     }
 
-    if let Some(systems) = &entry.systems {
+    if let Some(via) = &entry.via {
+        validate_machine_name(via).map_err(|reason| format!("machines.{name}.via: {reason}"))?;
+        if via == name {
+            return Err(format!(
+                "machines.{name}.via: a machine cannot relay through itself"
+            ));
+        }
+        if entry.ssh.is_some() {
+            return Err(format!(
+                "machines.{name}.ssh cannot be combined with via; a relayed machine has no direct transport"
+            ));
+        }
+        if entry.command.is_some() {
+            return Err(format!(
+                "machines.{name}.command cannot be combined with via; a relayed machine has no direct transport"
+            ));
+        }
+        if entry.systems.is_some() {
+            return Err(format!(
+                "machines.{name}.systems cannot be combined with via; a relayed machine has no direct transport"
+            ));
+        }
+        if entry.program.is_some() {
+            return Err(format!(
+                "machines.{name}.program cannot be combined with via; set program on the relay machine instead"
+            ));
+        }
+        if entry.os.is_some() {
+            return Err(format!(
+                "machines.{name}.os cannot be combined with via; set os on the relay machine instead"
+            ));
+        }
+    } else if let Some(systems) = &entry.systems {
         if entry.ssh.is_some() {
             return Err(format!(
                 "machines.{name}.ssh cannot be combined with systems; set ssh on each system entry"
@@ -375,7 +447,9 @@ pub fn validate_machine_entry(name: &str, entry: &MachineEntry) -> Result<(), St
     } else {
         let prefix = format!("machines.{name}");
         if entry.ssh.is_none() && entry.command.is_none() {
-            return Err(format!("{prefix}: set one of ssh, command, or systems"));
+            return Err(format!(
+                "{prefix}: set one of ssh, command, systems, or via"
+            ));
         }
         validate_transport(
             &prefix,
@@ -590,6 +664,9 @@ fn build_machine_table(entry: &MachineEntry) -> Table {
     if let Some(os) = entry.os {
         table.insert("os", toml_edit::value(os.as_str()));
     }
+    if let Some(via) = &entry.via {
+        table.insert("via", toml_edit::value(via.as_str()));
+    }
     if let Some(mac) = &entry.mac {
         table.insert("mac", toml_edit::value(mac.as_str()));
     }
@@ -767,6 +844,42 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
             msg.contains("machines.tower") && msg.contains("systems"),
             "{msg}"
         );
+
+        // `via` validation: unknown relay, self-relay, cycles, and mixing with direct transports.
+        let msg = err("[machines.c]\nvia = \"b\"\n");
+        assert!(msg.contains("machines.c.via") && msg.contains("b"), "{msg}");
+
+        let msg = err("[machines.b]\nvia = \"b\"\n");
+        assert!(
+            msg.contains("machines.b.via") && msg.contains("itself"),
+            "{msg}"
+        );
+
+        let msg = err("[machines.a]\nvia = \"b\"\n[machines.b]\nvia = \"a\"\n");
+        assert!(msg.contains("via") && msg.contains("cycle"), "{msg}");
+
+        let msg = err(
+            "[machines.a]\nvia = \"b\"\n[machines.b]\nvia = \"c\"\n[machines.c]\nvia = \"b\"\n",
+        );
+        assert!(msg.contains("via") && msg.contains("cycle"), "{msg}");
+
+        let msg = err("[machines.b]\nssh = \"b\"\n[machines.c]\nvia = \"b\"\nssh = \"c\"\n");
+        assert!(
+            msg.contains("machines.c.ssh") && msg.contains("via"),
+            "{msg}"
+        );
+
+        let valid_via = parse::<FleetFile>(
+            Path::new("fleet.toml"),
+            b"[machines.b]\nssh = \"b.example\"\n[machines.c]\nvia = \"b\"\n[machines.d]\nvia = \"c\"\n",
+        )
+        .unwrap();
+        let (direct, _, relayed) = valid_via.resolve_route("d").unwrap();
+        assert_eq!(direct, "b");
+        assert!(relayed);
+        let (direct, _, relayed) = valid_via.resolve_route("b").unwrap();
+        assert_eq!(direct, "b");
+        assert!(!relayed);
     }
 
     #[test]
