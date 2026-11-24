@@ -9,7 +9,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Grant, Registry, ToolError};
-use legion_os::atomic::{WriteOptions, write_atomic};
+use legion_os::atomic::{WriteOptions, write_atomic_from_reader};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -259,11 +259,10 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
             return Err(cancelled_error("fs.write"));
         }
 
-        let hash = format_blake3(blake3::hash(&payload));
+        let hash = hash_bytes_cancellable(&payload, &cancel, "fs.write")?;
         let size = payload.len() as u64;
         let options = WriteOptions { mode: unix_mode };
-        write_atomic(&path, &payload, options)
-            .map_err(|error| map_os_error("write", &path, error))?;
+        write_atomic_cancellable(&path, &payload, options, &cancel, "fs.write")?;
         // `legion-os` preserves the existing file's mode on overwrite; honor an explicit
         // `unix_mode` when the caller asked for one.
         if existed && let Some(bits) = unix_mode {
@@ -368,9 +367,14 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
         }
 
         let updated_bytes = updated.as_bytes();
-        let hash = format_blake3(blake3::hash(updated_bytes));
-        write_atomic(&path, updated_bytes, WriteOptions::default())
-            .map_err(|error| map_os_error("edit", &path, error))?;
+        let hash = hash_bytes_cancellable(updated_bytes, &cancel, "fs.edit")?;
+        write_atomic_cancellable(
+            &path,
+            updated_bytes,
+            WriteOptions::default(),
+            &cancel,
+            "fs.edit",
+        )?;
 
         Ok(EditResult {
             path: path_to_string(&path),
@@ -577,6 +581,68 @@ fn resolve_write_target(
     }
 }
 
+/// Streams `bytes` into `write_atomic_from_reader` in bounded chunks, aborting promptly when
+/// `cancel` fires so `legion-os` cleans up its temporary file and leaves `path` untouched.
+fn write_atomic_cancellable(
+    path: &Path,
+    bytes: &[u8],
+    options: WriteOptions,
+    cancel: &CancellationToken,
+    tool: &str,
+) -> Result<(), ToolError> {
+    let mut reader = CancelSliceReader {
+        data: bytes,
+        offset: 0,
+        cancel,
+        cancelled: false,
+    };
+    match write_atomic_from_reader(path, &mut reader, options) {
+        Ok(_) => Ok(()),
+        Err(_) if reader.cancelled => Err(cancelled_error(tool)),
+        Err(error) => Err(map_os_error("write", path, error)),
+    }
+}
+
+struct CancelSliceReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+    cancel: &'a CancellationToken,
+    cancelled: bool,
+}
+
+impl Read for CancelSliceReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            self.cancelled = true;
+            // Must not be `ErrorKind::Interrupted`, which `std::io::copy` silently retries.
+            return Err(io::Error::other("cancelled"));
+        }
+        let remaining = &self.data[self.offset..];
+        if remaining.is_empty() {
+            return Ok(0);
+        }
+        let n = remaining.len().min(buf.len()).min(HASH_CHUNK_BYTES);
+        buf[..n].copy_from_slice(&remaining[..n]);
+        self.offset += n;
+        Ok(n)
+    }
+}
+
+fn hash_bytes_cancellable(
+    bytes: &[u8],
+    cancel: &CancellationToken,
+    tool: &str,
+) -> Result<String, ToolError> {
+    let mut hasher = blake3::Hasher::new();
+    for chunk in bytes.chunks(HASH_CHUNK_BYTES) {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error(tool));
+        }
+        hasher.update(chunk);
+    }
+    Ok(format_blake3(hasher.finalize()))
+}
+
 fn check_expected_hash(path: &Path, expected: &str, actual: &str) -> Result<(), ToolError> {
     if actual == expected {
         return Ok(());
@@ -682,5 +748,48 @@ mod tests {
         let mixed = "one\r\ntwo\n";
         let (kept, _) = apply_edit(p, mixed, "two", "a\nb", false).unwrap();
         assert_eq!(kept, "one\r\na\nb\n");
+    }
+
+    #[test]
+    fn cancelled_atomic_write_leaves_target_untouched_and_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("data.bin");
+        fs::write(&target, b"original").unwrap();
+
+        let cancel = CancellationToken::new();
+        let payload = vec![b'x'; HASH_CHUNK_BYTES * 4];
+        let mut reader = CancelAfterFirstChunk {
+            inner: CancelSliceReader {
+                data: &payload,
+                offset: 0,
+                cancel: &cancel,
+                cancelled: false,
+            },
+            reads: 0,
+        };
+        let err =
+            write_atomic_from_reader(&target, &mut reader, WriteOptions::default()).unwrap_err();
+        assert!(reader.inner.cancelled, "{err}");
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec!["data.bin"]);
+    }
+
+    struct CancelAfterFirstChunk<'a> {
+        inner: CancelSliceReader<'a>,
+        reads: usize,
+    }
+
+    impl Read for CancelAfterFirstChunk<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 2 {
+                self.inner.cancel.cancel();
+            }
+            self.inner.read(buf)
+        }
     }
 }

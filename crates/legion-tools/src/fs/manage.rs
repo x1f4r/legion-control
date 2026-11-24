@@ -258,7 +258,17 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
             &cancel,
             &mut progress,
             &mut totals,
-        )?;
+        )
+        .map_err(|err| {
+            if err.code == ErrorCode::Cancelled {
+                err.with_details(json!({
+                    "files": totals.files,
+                    "bytes": totals.bytes,
+                }))
+            } else {
+                err
+            }
+        })?;
         Ok(CopyResult {
             from: path_to_string(&from),
             to: path_to_string(&to),
@@ -311,7 +321,8 @@ impl Read for CancelProgressReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.cancel.is_cancelled() {
             self.cancelled = true;
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            // Must not be `ErrorKind::Interrupted`, which `std::io::copy` silently retries.
+            return Err(io::Error::other("cancelled"));
         }
         let n = self.inner.read(buf)?;
         self.bytes_so_far += n as u64;
@@ -606,7 +617,19 @@ async fn remove_entry(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolE
             &cancel,
             &mut progress,
             &mut totals,
-        )?;
+        )
+        .map_err(|err| {
+            if err.code == ErrorCode::Cancelled {
+                err.with_details(json!({
+                    "removed": totals.removed,
+                    "bytes": totals.bytes,
+                    "dry_run": dry_run,
+                    "sample": totals.sample,
+                }))
+            } else {
+                err
+            }
+        })?;
 
         Ok(RemoveResult {
             path: path_to_string(&path),
@@ -689,9 +712,9 @@ fn remove_path(
         return Ok(());
     }
 
-    // Record the directory first in `sample` for readability (pre-order), then remove children
-    // before removing the directory itself (post-order).
-    totals.record(path, 0);
+    if dry_run {
+        totals.record(path, 0);
+    }
     let children = sorted_children(path)?;
     for (_, child_path) in children {
         if cancel.is_cancelled() {
@@ -716,7 +739,11 @@ fn remove_path(
         progress.maybe_emit(|| json!({"removed": removed, "bytes": bytes, "dry_run": dry_run}));
     }
     if !dry_run {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error(tool));
+        }
         fs::remove_dir(path).map_err(|error| map_io_error("remove directory", path, error))?;
+        totals.record(path, 0);
     }
     Ok(())
 }
@@ -752,4 +779,41 @@ fn sorted_children(dir: &Path) -> Result<Vec<(std::ffi::OsString, PathBuf)>, Too
     }
     children.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(children)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_remove_only_counts_entries_actually_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("a.txt"), "1234").unwrap();
+        fs::write(tree.join("b.txt"), "5678").unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut progress = Progress::for_test(tx);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let meta = fs::symlink_metadata(&tree).unwrap();
+        let mut totals = RemoveTotals::default();
+        let err = remove_path(
+            &tree,
+            &meta,
+            true,
+            false,
+            "fs.remove",
+            &cancel,
+            &mut progress,
+            &mut totals,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert_eq!(totals.removed, 0);
+        assert_eq!(totals.bytes, 0);
+        assert!(tree.join("a.txt").exists());
+    }
 }

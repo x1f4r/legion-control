@@ -1741,3 +1741,86 @@ async fn append_preserves_open_file_identity_and_never_loses_concurrent_appends(
     let expected: Vec<String> = (0..20).map(|idx| format!("line-{idx:02}")).collect();
     assert_eq!(lines, expected);
 }
+
+#[tokio::test]
+async fn cancelled_recursive_copy_and_remove_wait_for_worker_and_report_honest_counts() {
+    let f = Fixture::new();
+    let src = f.work.join("many");
+    std::fs::create_dir_all(&src).unwrap();
+    let blob = vec![b'a'; 16 * 1024];
+    for idx in 0..200 {
+        std::fs::write(src.join(format!("file_{idx:03}.bin")), &blob).unwrap();
+    }
+
+    // Cancel a recursive `fs.copy` once the destination directory has started receiving files.
+    let dst = f.work.join("many_copy");
+    let call = Call::new(
+        Door::Rpc,
+        "fs.copy",
+        json!({"from": f.p(&src), "to": f.p(&dst), "recursive": true}),
+    );
+    let cancel = call.cancel.clone();
+    let node = f.node.clone();
+    let task = tokio::spawn(async move { node.call(call).await });
+
+    // Wait until at least one file has been committed in `dst`, then cancel.
+    for _ in 0..1000 {
+        if let Ok(entries) = std::fs::read_dir(&dst)
+            && entries
+                .flatten()
+                .any(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        {
+            cancel.cancel();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    cancel.cancel();
+
+    let result = task.await.unwrap();
+    if let Err(err) = result {
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        let details = err.details.expect("cancelled copy must report counts");
+        let reported_files = details["files"].as_u64().unwrap();
+        let reported_bytes = details["bytes"].as_u64().unwrap();
+        let count_now = std::fs::read_dir(&dst)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        assert_eq!(reported_files, count_now);
+        assert_eq!(reported_bytes, count_now * (blob.len() as u64));
+
+        // The worker must have stopped before `Node::call` returned: no further files appear and
+        // no sibling temp files remain.
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let all_entries: Vec<String> = std::fs::read_dir(&dst)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(all_entries.len() as u64, count_now);
+        assert!(
+            all_entries
+                .iter()
+                .all(|name| !name.contains(".legion-tmp-"))
+        );
+    }
+
+    // Pre-cancelled recursive `fs.remove` reports zero removed in details when cancelled early, and
+    // leaves the tree untouched.
+    let keep = f.work.join("keep_tree");
+    std::fs::create_dir_all(&keep).unwrap();
+    std::fs::write(keep.join("one.txt"), "1234").unwrap();
+    let call = Call::new(
+        Door::Rpc,
+        "fs.remove",
+        json!({"path": f.p(&keep), "recursive": true}),
+    );
+    call.cancel.cancel();
+    let err = f.node.call(call).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Cancelled);
+    assert!(keep.join("one.txt").exists());
+}

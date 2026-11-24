@@ -89,6 +89,11 @@ impl Progress {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: tokio::sync::mpsc::UnboundedSender<Value>) -> Progress {
+        Progress::new(tx)
+    }
+
     /// Emits a progress payload when enough time has passed since the previous one.
     pub(crate) fn maybe_emit(&mut self, build: impl FnOnce() -> Value) {
         if self.last.elapsed() >= self.interval {
@@ -100,6 +105,10 @@ impl Progress {
 
 /// Runs a blocking filesystem operation off the async runtime while forwarding its `progress`
 /// events live to `ctx` and passing `ctx`'s cancellation token.
+///
+/// Under the node's cancellation contract (`CANCEL_GRACE`), this deliberately waits for the
+/// blocking worker to observe `cancel`, clean up and return before the tool call finishes, so no
+/// worker thread keeps modifying files after `cancelled` is reported.
 pub(crate) async fn run_blocking<T, F>(
     ctx: &Ctx,
     tool: &'static str,
