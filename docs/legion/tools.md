@@ -23,7 +23,7 @@ Families (14, 71 tools total): [`agent`](#agent), [`audit`](#audit), [`config`](
 
 Effect: `admin`
 
-Register this `legion` binary as an MCP server named `legion` with an AI coding agent using the agent's own CLI command, never by editing its configuration files directly. `compact` defaults to true because every registered tool schema costs the agent context on every conversation; pass `compact=false` to expose every tool individually. A named, limited principal from policy.toml (such as `agent:claude` with the `operator` or `observer` role) is safer than `owner` because it narrows what the agent may do and identifies its calls in the audit log; registering as `owner` requires `allow_owner=true`.
+Register this `legion` binary as an MCP server named `legion` with an AI coding agent using the agent's own CLI command, never by editing its configuration files directly. `compact` defaults to true because every registered tool schema costs the agent context on every conversation; pass `compact=false` to expose every tool individually. A named, limited principal from policy.toml (such as `agent:claude` with the `editor` or `observer` role) is safer than `owner` because it narrows what the agent may do and identifies its calls in the audit log; registering as `owner` requires `allow_owner=true`.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -103,13 +103,14 @@ Read one shared configuration document (fleet.toml, policy.toml, projects.toml, 
 
 Effect: `admin`
 
-Validate and atomically replace one shared configuration document (fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash with conflict, and refuses machine-local files such as node.toml and tokens.toml.
+Validate and atomically replace one shared configuration document (fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `document` | `string` | yes | - | Shared document name: `fleet.toml`, `policy.toml`, `projects.toml`, or `tools.d/<name>.toml`. |
 | `content` | `string` | yes | - | Full UTF-8 TOML text to validate and write atomically. |
 | `expect_hash` | `string` | no | - | Expected BLAKE3 hash (`blake3:<hex>`) of the existing file; fails with `conflict` if different. |
+| `expect_absent` | `boolean` | no | `false` | Require that the document does not currently exist; fails with `conflict` if already present. |
 
 ## exec
 
@@ -274,7 +275,7 @@ Remove a machine entry from fleet.toml atomically while preserving comments and 
 
 Effect: `admin`
 
-Compare, push, or pull shared configuration documents (fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.
+Compare, push, or pull shared configuration documents (fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -576,7 +577,7 @@ Wait until a background job is no longer starting or running and return the same
 
 | Tool | Effect | Description |
 | --- | --- | --- |
-| `meta.doctor` | `read` | Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, roles do not silently combine paths with exec, and each machine in fleet.toml answers (unless quick=true). |
+| `meta.doctor` | `read` | Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml answers (unless quick=true). |
 | `meta.init` | `admin` | Create starter node.toml and policy.toml files where they do not already exist, leaving every existing file untouched so it is safe to run again. |
 | `meta.update` | `admin` | Replace this node's legion binary with a verified GitHub release artifact (downloading and checking SHA256SUMS, then replacing atomically). |
 | `meta.version` | `read` | Say which build of legion this node runs, the protocol it speaks, and its operating system and architecture. |
@@ -586,7 +587,7 @@ Wait until a background job is no longer starting or running and return the same
 
 Effect: `read`
 
-Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, roles do not silently combine paths with exec, and each machine in fleet.toml answers (unless quick=true). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.
+Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml answers (unless quick=true). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -601,7 +602,7 @@ Create starter node.toml and policy.toml files where they do not already exist, 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `name` | `string` | no | - | Node name to write into node.toml when creating it; defaults to the name derived from this machine's host name. |
-| `roles` | `boolean` | no | `true` | Create policy.toml with ready-made observer, operator and maintainer roles when missing. |
+| `roles` | `boolean` | no | `true` | Create policy.toml with ready-made observer, editor and operator roles when missing. |
 | `dry_run` | `boolean` | no | `false` | Report what would be created or kept without writing any files. |
 
 ### `meta.update`
