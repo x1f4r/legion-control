@@ -410,8 +410,33 @@ pub struct Grant {
 pub enum Access {
     /// The tool will read it, list it or look at it.
     Read,
-    /// The tool will create, change, move or remove it.
+    /// The tool will create, change, move or remove it. One that removes, moves or replaces
+    /// everything under it asks [`Grant::check_tree`] as well.
     Write,
+}
+
+/// A place a tool that acts on a whole tree treats with care, as [`Grant::protected`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// The root of a file system, such as `/` or `C:\`.
+    Root,
+    /// The home directory `~` stands for.
+    Home,
+    /// The node's configuration directory.
+    Config,
+    /// The node's state directory: the audit log and, later, jobs.
+    State,
+}
+
+impl Place {
+    fn describe(self) -> &'static str {
+        match self {
+            Place::Root => "the root of a file system",
+            Place::Home => "the home directory",
+            Place::Config => "Legion's own configuration",
+            Place::State => "Legion's own state",
+        }
+    }
 }
 
 impl Access {
@@ -461,8 +486,9 @@ impl Grant {
         !self.rules.deny.iter().any(covers) && self.rules.allow.iter().any(covers)
     }
 
-    /// The directories file tools are confined to, as written in the policy, or `None` when they
-    /// are not confined.
+    /// The directories file tools are confined to, as written in the policy (`~` not expanded), or
+    /// `None` when they are not confined. A tool that needs a working directory nobody named takes
+    /// the first of them, through [`Grant::check_path`], and the home directory when there are none.
     pub fn roots(&self) -> Option<Vec<String>> {
         self.rules
             .paths
@@ -583,15 +609,100 @@ impl Grant {
         Ok(resolved.path())
     }
 
+    /// Whether a path is one of the places a tool must not remove, move or replace as a whole, or a
+    /// directory that holds one: the root of a file system, the home directory, the node's
+    /// configuration or its state directory, named in that order of precedence.
+    ///
+    /// `path` is one [`Grant::check_path`] returned. A last part that is a symbolic link is never
+    /// one of them, since acting on it acts on the link. Names are compared as the file system
+    /// compares them and, where both exist, so are the files themselves, so neither a symbolic link
+    /// nor another spelling hides a place. [`Grant::check_tree`] says what to refuse.
+    pub fn protected(&self, path: &Path) -> Result<Option<Place>, ErrorBody> {
+        let unclear = |error: Unresolved| match error {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(code, reason) => ErrorBody::new(
+                code,
+                format!("{} cannot be checked: {reason}.", path.display()),
+            ),
+        };
+        let resolved = resolve_keeping_last(path).map_err(unclear)?;
+        if resolved.link.is_some() {
+            return Ok(None);
+        }
+        if names_of(&resolved, Platform::HOST).1.is_empty() {
+            return Ok(Some(Place::Root));
+        }
+        // Only a path that exists has an identity to find among a place's ancestors.
+        let identity = if resolved.missing.is_empty() {
+            Handle::from_path(&resolved.existing).ok()
+        } else {
+            None
+        };
+        let holds = |place: &Resolved| {
+            within(place, &resolved, Platform::HOST)
+                || identity.as_ref().is_some_and(|identity| {
+                    place
+                        .existing
+                        .ancestors()
+                        .any(|ancestor| Handle::from_path(ancestor).is_ok_and(|h| h == *identity))
+                })
+        };
+        if let Some(home) = self.paths.home() {
+            let home = resolve(home).map_err(unclear)?;
+            if holds(&home) {
+                return Ok(Some(Place::Home));
+            }
+        }
+        for dir in self.own_dirs().map_err(|(_, error)| unclear(error))? {
+            if holds(&dir.resolved) {
+                return Ok(Some(dir.place));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Checks a path a tool is about to remove, move or replace with everything under it, after
+    /// [`Grant::check_path`] has: the root of a file system and the home directory are refused to
+    /// every role, and a directory holding the node's configuration or state to a role that does
+    /// not allow `effect:admin`.
+    pub fn check_tree(&self, path: &Path) -> Result<(), ErrorBody> {
+        let place = match self.protected(path)? {
+            None => return Ok(()),
+            Some(Place::Config | Place::State) if self.allows_effect(Effect::Admin) => {
+                return Ok(());
+            }
+            Some(place) => place,
+        };
+        let hint = match place {
+            Place::Root | Place::Home => {
+                "Name what is under it instead; no tool takes all of it at once."
+            }
+            Place::Config | Place::State => {
+                "Only a role that allows effect:admin may change Legion's own files; ask the owner of this machine."
+            }
+        };
+        Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "{} may not remove, move or replace all of {}: it is or holds {}.",
+                self.principal,
+                path.display(),
+                place.describe()
+            ),
+        )
+        .with_hint(hint)
+        .with_details(json!({"path": path, "place": format!("{place:?}").to_lowercase()})))
+    }
+
     /// The node's configuration and state directories, resolved as far as they exist, with the
     /// identity of each that does.
     fn own_dirs(&self) -> Result<Vec<OwnDir>, (PathBuf, Unresolved)> {
         [
-            ("Legion's own configuration", self.paths.config_dir()),
-            ("Legion's own state", self.paths.state_dir()),
+            (Place::Config, self.paths.config_dir()),
+            (Place::State, self.paths.state_dir()),
         ]
         .into_iter()
-        .map(|(what, dir)| {
+        .map(|(place, dir)| {
             let resolved = resolve(dir).map_err(|error| (dir.to_path_buf(), error))?;
             let identity = if resolved.missing.is_empty() {
                 Handle::from_path(&resolved.existing).ok()
@@ -599,7 +710,7 @@ impl Grant {
                 None
             };
             Ok(OwnDir {
-                what,
+                place,
                 dir: dir.to_path_buf(),
                 resolved,
                 identity,
@@ -665,7 +776,7 @@ impl Grant {
                     return Err(refuse(format!(
                         "it is in {}, {}, which only a role that allows effect:admin may read or change",
                         dir.dir.display(),
-                        dir.what
+                        dir.place.describe()
                     ))
                     .with_hint("Legion's own files are read through its tools, such as audit.tail and meta.whoami; ask the owner of this machine for more.")
                     .with_details(json!({"path": resolved.path(), "directory": dir.dir})));
@@ -678,7 +789,7 @@ impl Grant {
 
 /// One of the node's own directories.
 struct OwnDir {
-    what: &'static str,
+    place: Place,
     /// As the node's paths name it.
     dir: PathBuf,
     resolved: Resolved,
@@ -1639,6 +1750,36 @@ paths = ["~/**"]
         assert!(!allows("most", Effect::Admin));
         assert!(!allows("files", Effect::Write));
         assert!(!allows("stranger", Effect::Read));
+    }
+
+    #[test]
+    fn the_places_a_whole_tree_must_not_be_taken_from_are_named() {
+        let own = Own::new();
+        let grant = own.grant("agent:claude");
+        let home = &own.home;
+        let legion = home.join(".legion");
+        let root = home.ancestors().last().unwrap();
+        let place = |path: &Path| grant.protected(path).unwrap();
+        assert_eq!(place(root), Some(Place::Root));
+        assert_eq!(place(home), Some(Place::Home));
+        assert_eq!(place(home.parent().unwrap()), Some(Place::Home));
+        assert_eq!(place(&legion), Some(Place::Config));
+        assert_eq!(place(&legion.join("config")), Some(Place::Config));
+        assert_eq!(place(&legion.join("state")), Some(Place::State));
+        assert_eq!(place(&legion.join("config").join("policy.toml")), None);
+        assert_eq!(place(&home.join("projects")), None);
+        assert_eq!(place(&home.join("projects").join("new")), None);
+
+        let refused = |who: &str, path: &Path| own.grant(who).check_tree(path).is_err();
+        assert!(refused("agent:claude", &legion));
+        assert!(refused("agent:claude", home));
+        assert!(!refused("agent:claude", &home.join("projects")));
+        assert!(!refused("keeper", &legion));
+        assert!(refused("keeper", home));
+        assert!(refused("owner", root));
+        let error = own.grant("agent:claude").check_tree(&legion).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert!(error.message.contains("configuration"), "{}", error.message);
     }
 
     fn resolved(existing: &str, missing: &[&str]) -> Resolved {
