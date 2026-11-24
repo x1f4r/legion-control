@@ -161,7 +161,7 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
     useradd -m -s /bin/bash builder
     mkdir -p /work/repo /work/out
     tar -C /src -cf - \
-      Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging \
+      Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging apps/ui \
       | tar -C /work/repo -xf -
     chown -R builder:builder /work
 

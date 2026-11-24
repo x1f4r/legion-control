@@ -36,6 +36,10 @@ const SINGLE_SYSTEM_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shorter per-system connect timeout when probing a multi-system machine.
 const MULTI_SYSTEM_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// Brief head start given to the last-responding system of a multi-system machine before probing
+/// its sibling systems in parallel, avoiding redundant SSH spawns in the common case.
+const REMEMBERED_SYSTEM_HEAD_START: Duration = Duration::from_millis(250);
+
 /// Outcome of probing one machine with [`Fleet::ping`].
 #[derive(Clone, Debug)]
 pub struct PingOutcome {
@@ -1011,26 +1015,12 @@ impl Fleet {
         timeout_override: Option<Duration>,
         cancel: CancellationToken,
     ) -> Result<(Session, ResolvedSystem, Option<RemoteOs>), ErrorBody> {
-        let multi = systems.len() > 1;
         let ordered = self.order_systems(machine, systems);
-        let per_system_timeout = match timeout_override {
-            Some(total) if multi => {
-                let count = u32::try_from(ordered.len()).unwrap_or(1).max(1);
-                (total / count)
-                    .min(MULTI_SYSTEM_TIMEOUT)
-                    .max(Duration::from_millis(200).min(total))
-            }
-            Some(total) => total,
-            None if multi => MULTI_SYSTEM_TIMEOUT,
-            None => SINGLE_SYSTEM_TIMEOUT,
-        };
-
-        let mut failures: Vec<(String, ErrorBody)> = Vec::new();
-        for sys in ordered {
-            match self
-                .open_one_system(machine, &sys, per_system_timeout, cancel.clone())
-                .await
-            {
+        if ordered.len() == 1
+            && let Some(sys) = ordered.into_iter().next()
+        {
+            let timeout = timeout_override.unwrap_or(SINGLE_SYSTEM_TIMEOUT);
+            return match self.open_one_system(machine, &sys, timeout, cancel).await {
                 Ok((session, worked_os)) => {
                     if sys.explicit {
                         self.inner.state.record_system(machine, &sys.name);
@@ -1038,29 +1028,130 @@ impl Fleet {
                     if let Some(os) = worked_os {
                         self.inner.state.record_os(machine, &sys.name, os);
                     }
-                    return Ok((session, sys, worked_os));
+                    Ok((session, sys, worked_os))
                 }
-                Err(OpenError::Unsupported(err)) | Err(OpenError::Cancelled(err)) => {
-                    return Err(ensure_machine(err, machine));
+                Err(OpenError::Unsupported(err))
+                | Err(OpenError::Cancelled(err))
+                | Err(OpenError::Unreachable { error: err, .. }) => {
+                    Err(ensure_machine(err, machine))
                 }
-                Err(OpenError::Unreachable { error, .. }) => {
-                    failures.push((sys.name.clone(), error));
+            };
+        }
+
+        // Probe a multi-system machine concurrently so an offline or secondary dual-boot target
+        // does not pay one timeout per configured system. When a system answered previously, give
+        // it a brief head start so healthy reconnections never spawn redundant sibling probes.
+        let has_remembered = self.inner.state.last_system(machine).is_some();
+        let ordered = self.order_systems(machine, systems);
+        let per_system_timeout = match timeout_override {
+            Some(total) => total.min(MULTI_SYSTEM_TIMEOUT),
+            None => MULTI_SYSTEM_TIMEOUT,
+        };
+        let deadline = Instant::now() + per_system_timeout;
+
+        let probe_cancel = cancel.child_token();
+        let mut set: JoinSet<SystemProbeOutcome> = JoinSet::new();
+        let mut failures: BTreeMap<usize, (String, ErrorBody)> = BTreeMap::new();
+        let mut iter = ordered.into_iter().enumerate();
+
+        if has_remembered && let Some((index, preferred)) = iter.next() {
+            let fleet = self.clone();
+            let machine_name = machine.to_owned();
+            let task_cancel = probe_cancel.child_token();
+            set.spawn(async move {
+                let res = fleet
+                    .open_one_system(&machine_name, &preferred, per_system_timeout, task_cancel)
+                    .await;
+                (index, preferred, res)
+            });
+
+            let head_start = REMEMBERED_SYSTEM_HEAD_START.min(per_system_timeout / 4);
+            if let Ok(Some(joined)) = tokio::time::timeout(head_start, set.join_next()).await
+                && let Ok((idx, sys, res)) = joined
+            {
+                match res {
+                    Ok((session, worked_os)) => {
+                        if sys.explicit {
+                            self.inner.state.record_system(machine, &sys.name);
+                        }
+                        if let Some(os) = worked_os {
+                            self.inner.state.record_os(machine, &sys.name, os);
+                        }
+                        return Ok((session, sys, worked_os));
+                    }
+                    Err(OpenError::Unsupported(err)) | Err(OpenError::Cancelled(err)) => {
+                        return Err(ensure_machine(err, machine));
+                    }
+                    Err(OpenError::Unreachable { error, .. }) => {
+                        failures.insert(idx, (sys.name, error));
+                    }
                 }
             }
         }
 
-        if failures.len() == 1
-            && let Some((_, err)) = failures.pop()
+        let sibling_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(200).min(per_system_timeout));
+        for (index, sys) in iter {
+            let fleet = self.clone();
+            let machine_name = machine.to_owned();
+            let task_cancel = probe_cancel.child_token();
+            set.spawn(async move {
+                let res = fleet
+                    .open_one_system(&machine_name, &sys, sibling_timeout, task_cancel)
+                    .await;
+                (index, sys, res)
+            });
+        }
+
+        while let Some(joined) = set.join_next().await {
+            let Ok((index, sys, res)) = joined else {
+                continue;
+            };
+            match res {
+                Ok((session, worked_os)) => {
+                    probe_cancel.cancel();
+                    if sys.explicit {
+                        self.inner.state.record_system(machine, &sys.name);
+                    }
+                    if let Some(os) = worked_os {
+                        self.inner.state.record_os(machine, &sys.name, os);
+                    }
+                    drain_probe_tasks(set);
+                    return Ok((session, sys, worked_os));
+                }
+                Err(OpenError::Unsupported(err)) | Err(OpenError::Cancelled(err)) => {
+                    probe_cancel.cancel();
+                    drain_probe_tasks(set);
+                    return Err(ensure_machine(err, machine));
+                }
+                Err(OpenError::Unreachable { error, .. }) => {
+                    failures.insert(index, (sys.name, error));
+                }
+            }
+        }
+
+        if cancel.is_cancelled() {
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Connecting to {machine} was cancelled."),
+            )
+            .with_machine(machine));
+        }
+
+        let mut ordered_failures: Vec<(String, ErrorBody)> = failures.into_values().collect();
+        if ordered_failures.len() == 1
+            && let Some((_, err)) = ordered_failures.pop()
         {
             return Err(ensure_machine(err, machine));
         }
 
-        let summary = failures
+        let summary = ordered_failures
             .iter()
             .map(|(name, err)| format!("{name}: {}", err.message))
             .collect::<Vec<_>>()
             .join("; ");
-        let hints = failures
+        let hints = ordered_failures
             .iter()
             .filter_map(|(name, err)| err.hint.as_deref().map(|h| format!("{name}: {h}")))
             .collect::<Vec<_>>()
@@ -1656,6 +1747,27 @@ fn ping_failed(machine: &str, error: ErrorBody) -> PingOutcome {
     }
 }
 
+type SystemProbeOutcome = (
+    usize,
+    ResolvedSystem,
+    Result<(Session, Option<RemoteOs>), OpenError>,
+);
+
+/// Drains cancelled sibling system probes in the background and closes any session that happened to
+/// open right as another system won the race.
+fn drain_probe_tasks(mut set: JoinSet<SystemProbeOutcome>) {
+    if set.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        while let Some(joined) = set.join_next().await {
+            if let Ok((_, _, Ok((extra, _)))) = joined {
+                extra.close().await;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use legion_core::{BoxFuture, Door, NoArgs, Registry, Tool, ToolError};
@@ -1992,6 +2104,103 @@ mod tests {
                     && e["outcome"] == "unsupported"
             }),
             "{audit:?}"
+        );
+
+        fleet.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ping_probes_dual_boot_systems_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        // A dead machine with two hanging systems, plus a dual-boot machine whose first system
+        // hangs while its second answers hello immediately.
+        let hello_reply = serde_json::to_string(&Response::ok(
+            Some(Id::Number(1)),
+            serde_json::to_value(HelloResult {
+                node: "dual".to_owned(),
+                version: "0.1.0".to_owned(),
+                build: None,
+                protocol: PROTOCOL,
+                os: "windows".to_owned(),
+                arch: "x86_64".to_owned(),
+                systems: Vec::new(),
+                system: Some("windows".to_owned()),
+                boot_id: None,
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+        let respond_script = format!(
+            "read -r _line; printf '%s\\n' '{}'; exec sleep 30",
+            hello_reply.replace('\'', "'\\''")
+        );
+        let fleet_toml = format!(
+            "[machines.dead]\n\
+             [[machines.dead.systems]]\n\
+             name = \"linux\"\n\
+             command = [\"/bin/sh\", \"-c\", \"exec sleep 30\"]\n\
+             [[machines.dead.systems]]\n\
+             name = \"windows\"\n\
+             command = [\"/bin/sh\", \"-c\", \"exec sleep 30\"]\n\
+             \n\
+             [machines.dual]\n\
+             [[machines.dual.systems]]\n\
+             name = \"linux\"\n\
+             command = [\"/bin/sh\", \"-c\", \"exec sleep 30\"]\n\
+             [[machines.dual.systems]]\n\
+             name = \"windows\"\n\
+             command = [\"/bin/sh\", \"-c\", {}]\n",
+            serde_json::to_string(&respond_script).unwrap()
+        );
+        std::fs::write(paths.config_file("fleet.toml"), fleet_toml).unwrap();
+
+        let store = ConfigStore::new(paths.config_dir());
+        let fleet = Fleet::new(&paths);
+
+        // 1. Live second system answers right away without waiting for the hanging first system.
+        let t_live = Instant::now();
+        let live = fleet
+            .ping(
+                &store,
+                "tower",
+                "dual",
+                Duration::from_secs(4),
+                CancellationToken::new(),
+            )
+            .await;
+        let live_elapsed = t_live.elapsed();
+        assert!(live.reachable, "{live:?}");
+        assert_eq!(live.system.as_deref(), Some("windows"));
+        assert!(
+            live_elapsed < Duration::from_secs(2),
+            "second system waited on first system: {live_elapsed:?}"
+        );
+
+        // 2. Dead two-system machine probes both systems in parallel (one timeout, not two).
+        let t_dead = Instant::now();
+        let dead = fleet
+            .ping(
+                &store,
+                "tower",
+                "dead",
+                Duration::from_millis(900),
+                CancellationToken::new(),
+            )
+            .await;
+        let dead_elapsed = t_dead.elapsed();
+        assert!(!dead.reachable, "{dead:?}");
+        let msg = &dead.error.as_ref().unwrap().message;
+        assert!(
+            msg.contains("linux") && msg.contains("windows"),
+            "combined error should mention both systems: {msg}"
+        );
+        assert!(
+            dead_elapsed < Duration::from_millis(2400),
+            "dead dual-boot systems were probed serially: {dead_elapsed:?}"
         );
 
         fleet.close().await;

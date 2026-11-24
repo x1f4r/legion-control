@@ -65,6 +65,10 @@ function splitCrumbs(fullPath) {
 // ── Overview tab ─────────────────────────────────────────────────────────────────────────────
 
 function OverviewTab({ machine, allowedSet, onWake }) {
+  if (machine.status === 'asking' || machine.asking) {
+    return html`<div class="empty">Checking ${machine.name}…</div>`;
+  }
+
   if (!machine.reachable) {
     const err = machine.error || {
       message: machine.reason || `${machine.name} did not answer.`,
@@ -1184,6 +1188,10 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
     });
   }
 
+  if (machine.status === 'asking' || machine.asking) {
+    return html`<div class="empty">Checking ${machine.name}…</div>`;
+  }
+
   if (!machine.reachable) {
     const canWake = allowedSet?.has('power.wake');
     const err = machine.error || {
@@ -1377,7 +1385,14 @@ export function MachineDetail({
   runHistory,
   onRecordRun,
 }) {
-  const dotClass = !machine.reachable ? 'dot off' : machine.busy ? 'dot busy' : 'dot';
+  const dotClass =
+    machine.status === 'asking' || machine.asking
+      ? 'dot asking'
+      : !machine.reachable
+        ? 'dot off'
+        : machine.busy
+          ? 'dot busy'
+          : 'dot';
 
   function selectTab(nextTab) {
     window.location.hash = routeHref({ section: 'machines', machine: machine.name, tab: nextTab });

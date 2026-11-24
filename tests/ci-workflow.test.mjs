@@ -48,7 +48,7 @@ test('every action is pinned to the full commit of the release named beside it',
 });
 
 test('every job has a time limit, and every checkout leaves no credentials behind', () => {
-  assert.ok(all.size >= 10, [...all.keys()].join(', '));
+  assert.ok(all.size >= 6, [...all.keys()].join(', '));
   for (const [id, lines] of all) {
     assert.ok(lines.some(line => /^ {4}timeout-minutes: \d+$/.test(line)), `${id} has no timeout-minutes`);
     lines.forEach((line, at) => {
@@ -64,24 +64,23 @@ test('a newer push cancels the older run of a pull request, and a push to main i
   assert.match(concurrency, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}/);
 });
 
-test('the agent legs install the shells the transport tests run lines through, on Linux', () => {
-  const agent = job('agent');
-  const install = agent.indexOf('sudo apt-get install -y -q --no-install-recommends dash zsh fish');
-  assert.ok(install >= 0, 'the agent job installs no shells');
-  assert.match(agent.slice(agent.lastIndexOf('- name:', install), install), /if: runner\.os == 'Linux'/);
-  assert.ok(agent.indexOf('bash scripts/check.sh agent') > install);
-  assert.match(agent, /os: \[ubuntu-latest, windows-latest, macos-latest\]/);
+test('the scripts and Rust legs run across Linux, macOS and Windows, and UI browser tests run on Linux', () => {
+  const scripts = job('scripts');
+  assert.match(scripts, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  assert.match(scripts, /bash scripts\/check\.sh scripts/);
+
+  const rust = job('rust');
+  assert.match(rust, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  assert.match(rust, /bash scripts\/check\.sh rust/);
+  assert.match(rust, /node scripts\/legion-tools-doc\.mjs --bin target\/debug\/legion --check/);
+  assert.match(rust, /cargo build --lib -p legion-link --features ssh --locked --target aarch64-linux-android/);
+  assert.match(rust, /cargo build --lib -p legion-link --features ssh --locked --target aarch64-apple-ios/);
+
+  const ui = job('ui-browser');
+  assert.match(ui, /node --test apps\/ui\/test\/browser\.test\.mjs/);
 });
 
-test('the release dry run builds what release.sh builds, and reads no secret', () => {
-  const android = job('release-android');
-  assert.match(android, /\.\/gradlew :app:assembleRelease :app:lintRelease/);
-  assert.match(android, /test -s app\/build\/outputs\/apk\/release\/app-release-unsigned\.apk/);
-  assert.match(android, /bash android\/build-apk\.sh/);
-  const desktop = job('release-desktop');
-  assert.match(desktop, /bash desktop\/build\.sh all/);
-  assert.match(desktop, /node scripts\/verify-desktop-artifacts\.mjs "\$version" dist/);
-  assert.match(job('release-mac'), /bash mac\/build\.sh --no-install/);
+test('only private-data reads a repository secret in checks.yml', () => {
   // The release keys never reach CI; the one secret the workflow reads is the private terms list,
   // and only the job that looks for them.
   for (const [id, lines] of all) {
@@ -89,23 +88,6 @@ test('the release dry run builds what release.sh builds, and reads no secret', (
   }
   assert.deepEqual([...checks.matchAll(/secrets\.([A-Z_]+)/g)].map(match => match[1]), ['LEGION_PRIVATE_TERMS']);
   assert.match(job('private-data'), /run: node scripts\/check-private-data\.mjs\n\s+env:\n\s+LEGION_PRIVATE_TERMS: \$\{\{ secrets\.LEGION_PRIVATE_TERMS \}\}/);
-});
-
-test('the Gradle wrapper is validated before Gradle runs, the SDK is named, and Gradle and NuGet are cached', () => {
-  // The jar is checked by CI and the distribution it downloads by the wrapper itself.
-  assert.match(read('android/gradle/wrapper/gradle-wrapper.properties'), /^distributionSha256Sum=[0-9a-f]{64}$/m);
-  for (const id of ['android', 'release-android']) {
-    const lines = job(id);
-    const validated = lines.indexOf('gradle/actions/wrapper-validation@');
-    assert.ok(validated >= 0, `${id} does not validate the Gradle wrapper`);
-    assert.ok(validated < lines.indexOf('actions/setup-java@'), `${id} sets Java up before it validates the wrapper`);
-    assert.match(lines, /cache: gradle\n\s+cache-dependency-path: \|\n(?:\s+android\/.+\n){4}/);
-    // Both jobs install the same SDK packages, named rather than left to the action's default.
-    assert.match(lines, /uses: android-actions\/setup-android@[0-9a-f]{40} # v[\d.]+\n\s+with:\n\s+packages: platform-tools\n/, `${id} leaves the SDK packages to the action`);
-  }
-  for (const id of ['desktop', 'release-desktop']) {
-    assert.match(job(id), /uses: actions\/cache@[0-9a-f]{40} # v[\d.]+\n\s+with:\n\s+path: ~\/\.nuget\/packages\n\s+key: nuget-\$\{\{ runner\.os \}\}-\$\{\{ hashFiles\('desktop\/\*\*\/\*\.csproj'\) \}\}/);
-  }
 });
 
 test('every shell script goes through ShellCheck, and every PowerShell script through a pinned PSScriptAnalyzer', () => {
@@ -119,15 +101,12 @@ test('every shell script goes through ShellCheck, and every PowerShell script th
   assert.ok(fs.existsSync(path.join(repository, 'scripts', 'check-powershell.ps1')));
 });
 
-test('Dependabot proposes updates for the actions, the Android build and every desktop project', () => {
+test('Dependabot proposes weekly updates for the actions, Cargo and the UI browser test driver', () => {
   const dependabot = read('.github/dependabot.yml');
   const ecosystems = dependabot.split(/\n(?= {2}- package-ecosystem:)/).slice(1);
   const of = (name) => ecosystems.find(block => block.startsWith(`  - package-ecosystem: ${name}\n`)) ?? '';
   assert.match(of('github-actions'), /directory: \/\n/);
-  assert.match(of('gradle'), /directory: \/android\n/);
-  const projects = fs.readdirSync(path.join(repository, 'desktop'), { withFileTypes: true })
-    .filter(entry => entry.isDirectory() && fs.readdirSync(path.join(repository, 'desktop', entry.name)).some(name => name.endsWith('.csproj')));
-  assert.ok(projects.length >= 2);
-  for (const project of projects) assert.match(of('nuget'), new RegExp(`- /desktop/${project.name}\\n`), `${project.name} gets no updates`);
+  assert.match(of('cargo'), /directory: \/\n/);
+  assert.match(of('npm'), /directory: \/apps\/ui\/test\n/);
   for (const block of ecosystems) assert.match(block, /schedule:\n\s+interval: weekly/);
 });
