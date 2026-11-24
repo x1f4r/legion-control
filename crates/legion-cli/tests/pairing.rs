@@ -60,20 +60,20 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     }
 
     let home = Home::new();
-    let legion_home = home.state().parent().unwrap().to_path_buf();
     let auth_keys = home.home().join("test_authorized_keys");
     let foreign_comment = "# foreign key kept verbatim\n";
     let foreign_pub = ed25519_public_key_from_seed(&[7_u8; 32]);
     let foreign_key = format!("{foreign_pub} foreign@host\n");
     std::fs::write(&auth_keys, format!("{foreign_comment}{foreign_key}")).unwrap();
 
-    let legion_home_str = legion_home.to_string_lossy().into_owned();
+    // Intentionally omit `SetEnv LEGION_HOME=...` from sshd_config: because `legion` is running
+    // under a non-default LEGION_HOME, the forced commands must pin `--home <abs path>` so
+    // `legion gate --enrol` and `legion gate --as` always reach the right config and state
+    // regardless of the SSH session's environment.
     let home_dir_str = home.home().to_string_lossy().into_owned();
-    let Some(sshd) = TestSshd::start(
-        auth_keys.clone(),
-        &[("LEGION_HOME", &legion_home_str), ("HOME", &home_dir_str)],
-    )
-    .expect("throwaway sshd failed to start") else {
+    let Some(sshd) = TestSshd::start(auth_keys.clone(), &[("HOME", &home_dir_str)])
+        .expect("throwaway sshd failed to start")
+    else {
         eprintln!("skipping: throwaway sshd unavailable");
         return;
     };

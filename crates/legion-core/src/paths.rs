@@ -14,6 +14,7 @@ pub struct Paths {
     config: PathBuf,
     state: PathBuf,
     home: Option<PathBuf>,
+    explicit_home: Option<PathBuf>,
 }
 
 impl Paths {
@@ -28,11 +29,26 @@ impl Paths {
     /// It does not change what `~` means.
     pub fn from_env() -> Result<Paths, ErrorBody> {
         let var = |name: &str| std::env::var_os(name);
-        let home = var(home_variable(cfg!(windows)))
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(std::env::home_dir);
+        let home = env_home(&var);
         resolve(&var, home, cfg!(windows))
+    }
+
+    /// Builds [`Paths`] pinned to an explicit absolute `LEGION_HOME` root (such as from
+    /// `legion gate --home <path>`), reading only the OS user home directory from the environment
+    /// so `~` still expands normally.
+    pub fn from_explicit_home(root: impl Into<PathBuf>) -> Result<Paths, ErrorBody> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("--home {} must be an absolute path.", root.display()),
+            )
+            .with_hint("Pass an absolute directory path to --home."));
+        }
+        let var = |name: &str| std::env::var_os(name);
+        let mut paths = Paths::under(root);
+        paths.home = env_home(&var);
+        Ok(paths)
     }
 
     /// The directories `LEGION_HOME=<root>` would give, without reading the environment. A test
@@ -43,7 +59,14 @@ impl Paths {
             config: root.join("config"),
             state: root.join("state"),
             home: None,
+            explicit_home: Some(root),
         }
+    }
+
+    /// The explicit `LEGION_HOME` root when Legion is running from a non-default home, or `None`
+    /// when using the account's standard config/state directories.
+    pub fn explicit_home(&self) -> Option<&Path> {
+        self.explicit_home.as_deref()
     }
 
     /// The same directories, with `~` standing for `home`.
@@ -87,6 +110,13 @@ impl Paths {
     pub fn audit_lock(&self) -> PathBuf {
         self.state.join("audit.lock")
     }
+}
+
+fn env_home(var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    var(home_variable(cfg!(windows)))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(std::env::home_dir)
 }
 
 fn home_variable(windows: bool) -> &'static str {
@@ -143,6 +173,7 @@ fn resolve(
             config,
             state,
             home,
+            explicit_home: None,
         }),
         _ => {
             let missing = if windows {
@@ -187,6 +218,7 @@ mod tests {
                 config: root.join("config"),
                 state: root.join("state"),
                 home: Some(PathBuf::from("/home/me")),
+                explicit_home: Some(root),
             })
         );
     }

@@ -78,6 +78,18 @@ impl FileLock {
         })
     }
 
+    /// Acquire a lock, blocking up to `timeout` before failing with [`OsError::TimedOut`],
+    /// creating or tightening the lock file to owner-only permissions (`0o600`) on Unix.
+    pub fn acquire_private_timeout(
+        path: impl AsRef<Path>,
+        mode: LockMode,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let file = open_lock_file_inner(path, mode, true)?;
+        Self::lock_open_file_timeout(file, path, mode, timeout)
+    }
+
     /// Acquire a lock, blocking up to `timeout` before failing with [`OsError::TimedOut`].
     ///
     /// Uses non-blocking attempts with short backoff so timing out never leaves an orphan
@@ -89,6 +101,15 @@ impl FileLock {
     ) -> Result<Self> {
         let path = path.as_ref();
         let file = open_lock_file(path, mode)?;
+        Self::lock_open_file_timeout(file, path, mode, timeout)
+    }
+
+    fn lock_open_file_timeout(
+        file: File,
+        path: &Path,
+        mode: LockMode,
+        timeout: Duration,
+    ) -> Result<Self> {
         let deadline = Instant::now() + timeout;
         let mut pause = INITIAL_POLL_INTERVAL;
 
@@ -253,12 +274,21 @@ impl Drop for FileLock {
 }
 
 fn open_lock_file(path: &Path, mode: LockMode) -> Result<File> {
+    open_lock_file_inner(path, mode, false)
+}
+
+fn open_lock_file_inner(path: &Path, mode: LockMode, private: bool) -> Result<File> {
     // Open read+write without truncating so both Unix flock and Windows LockFileEx work for
     // exclusive and shared modes while leaving the lock file intact.
     let mut open = OpenOptions::new();
     open.read(true).write(true).create(true);
-    match open.open(path) {
-        Ok(file) => Ok(file),
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let file = match open.open(path) {
+        Ok(file) => file,
         Err(err) if mode == LockMode::Shared && err.kind() == io::ErrorKind::PermissionDenied => {
             OpenOptions::new()
                 .read(true)
@@ -268,13 +298,27 @@ fn open_lock_file(path: &Path, mode: LockMode) -> Result<File> {
                         format!("cannot open lock file {}", path.display()),
                         read_err,
                     )
-                })
+                })?
         }
-        Err(err) => Err(OsError::from_io(
-            format!("cannot open lock file {}", path.display()),
-            err,
-        )),
+        Err(err) => {
+            return Err(OsError::from_io(
+                format!("cannot open lock file {}", path.display()),
+                err,
+            ));
+        }
+    };
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = file.metadata()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
     }
+    #[cfg(not(unix))]
+    let _ = private;
+    Ok(file)
 }
 
 #[cfg(test)]

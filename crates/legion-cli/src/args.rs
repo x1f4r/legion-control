@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::path::PathBuf;
 
 use legion_core::policy::Principal;
 use legion_core::proto::Target;
@@ -59,18 +60,22 @@ pub enum Command {
     Version,
 }
 
-/// `legion gate --as P` or `legion gate --enrol ID`.
+/// `legion gate --as P [--home PATH]` or `legion gate --enrol ID [--home PATH]`.
 #[derive(Debug, PartialEq)]
 pub enum GateCommand {
     /// Confine an ssh key to `legion rpc` and `legion stream` as `pinned`.
     As {
         /// The principal everything the key does acts as.
         pinned: String,
+        /// Optional pinned absolute `LEGION_HOME` path overriding the ssh session environment.
+        home: Option<PathBuf>,
     },
     /// Single-use forced command that enrols one device for invite `id`.
     Enrol {
         /// The invite identifier issued by `device.invite`.
         id: String,
+        /// Optional pinned absolute `LEGION_HOME` path overriding the ssh session environment.
+        home: Option<PathBuf>,
     },
 }
 
@@ -466,10 +471,11 @@ pub fn command_help(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `legion gate --as PRINCIPAL | --enrol ID`.
+/// `legion gate --as PRINCIPAL [--home PATH] | --enrol ID [--home PATH]`.
 fn gate(rest: &[String]) -> Result<Command, UsageError> {
     let mut pinned = None;
     let mut enrol_id = None;
+    let mut home: Option<PathBuf> = None;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
         if !word.starts_with('-') {
@@ -504,12 +510,24 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
                     return Err(UsageError("--enrol is given twice.".to_owned()));
                 }
             }
+            "--home" => {
+                let value = take_value(name)?;
+                let path = PathBuf::from(&value);
+                if value.is_empty() || !path.is_absolute() {
+                    return Err(UsageError(format!(
+                        "--home must be an absolute path, not {value:?}."
+                    )));
+                }
+                if home.replace(path).is_some() {
+                    return Err(UsageError("--home is given twice.".to_owned()));
+                }
+            }
             _ => return Err(UsageError(format!("{name} is not an option of gate."))),
         }
     }
     match (pinned, enrol_id) {
-        (Some(pinned), None) => Ok(Command::Gate(GateCommand::As { pinned })),
-        (None, Some(id)) => Ok(Command::Gate(GateCommand::Enrol { id })),
+        (Some(pinned), None) => Ok(Command::Gate(GateCommand::As { pinned, home })),
+        (None, Some(id)) => Ok(Command::Gate(GateCommand::Enrol { id, home })),
         (Some(_), Some(_)) => Err(UsageError(
             "gate takes --as or --enrol, not both.".to_owned(),
         )),
@@ -1451,17 +1469,42 @@ mod tests {
         assert_eq!(
             run(&["gate", "--as", "agent:example"]),
             Ok(Command::Gate(GateCommand::As {
-                pinned: "agent:example".into()
+                pinned: "agent:example".into(),
+                home: None,
+            }))
+        );
+        let abs_home = std::env::temp_dir().join("legion-gate-home");
+        let abs_home_str = abs_home.to_string_lossy().into_owned();
+        assert_eq!(
+            run(&["gate", "--as", "agent:example", "--home", &abs_home_str]),
+            Ok(Command::Gate(GateCommand::As {
+                pinned: "agent:example".into(),
+                home: Some(abs_home.clone()),
             }))
         );
         assert_eq!(
             run(&["gate", "--enrol", "0123456789abcdef0123456789abcdef"]),
             Ok(Command::Gate(GateCommand::Enrol {
-                id: "0123456789abcdef0123456789abcdef".into()
+                id: "0123456789abcdef0123456789abcdef".into(),
+                home: None,
+            }))
+        );
+        assert_eq!(
+            run(&[
+                "gate",
+                "--enrol",
+                "0123456789abcdef0123456789abcdef",
+                "--home",
+                &abs_home_str,
+            ]),
+            Ok(Command::Gate(GateCommand::Enrol {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                home: Some(abs_home),
             }))
         );
         for bad_gate in [
             &["gate", "--as", "phone", "--enrol", "0123456789abcdef"][..],
+            &["gate", "--as", "phone", "--home", "relative/path"],
             &["gate", "--enrol", "bad/id"],
             &["gate", "--enrol"],
             &["gate", "--unknown"],

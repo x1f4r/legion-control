@@ -444,49 +444,56 @@ pub fn format_forced_command(
     }
 
     for arg in args {
-        if arg.is_empty()
-            || !arg
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.' | b'@'))
-        {
+        if arg.is_empty() || arg.chars().any(char::is_control) {
             return Err(ErrorBody::new(
                 ErrorCode::Internal,
                 format!("Forced command argument {arg:?} is not safe for authorized_keys."),
             ));
         }
+        if windows && arg.contains('"') {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Forced command argument {arg:?} contains a double quote and cannot be placed in authorized_keys."
+                ),
+            ));
+        }
     }
 
-    let quoted_exe = if windows {
-        let plain_safe = exe_str.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'\\' | b'/' | b':' | b'.' | b'-' | b'_' | b'+')
-        });
-        if plain_safe {
-            exe_str.to_owned()
+    let quote_token = |token: &str| -> String {
+        if windows {
+            let plain_safe = token.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'\\' | b'/' | b':' | b'.' | b'-' | b'_' | b'+' | b'@')
+            });
+            if plain_safe {
+                token.to_owned()
+            } else {
+                format!("\"{token}\"")
+            }
         } else {
-            format!("\"{exe_str}\"")
-        }
-    } else {
-        let plain_safe = exe_str.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':' | b'@')
-        });
-        if plain_safe {
-            exe_str.to_owned()
-        } else {
-            let escaped_single = exe_str.replace('\'', "'\\''");
-            format!("'{escaped_single}'")
+            let plain_safe = token.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':' | b'@')
+            });
+            if plain_safe {
+                token.to_owned()
+            } else {
+                let escaped_single = token.replace('\'', "'\\''");
+                format!("'{escaped_single}'")
+            }
         }
     };
 
-    let mut command = quoted_exe;
+    let mut command = quote_token(exe_str);
     for arg in args {
         command.push(' ');
-        command.push_str(arg);
+        command.push_str(&quote_token(arg));
     }
 
     // OpenSSH `opt_dequote` inside `command="..."` recognizes only `\"` -> `"` and leaves every
     // other backslash untouched, so replacing `"` with `\"` round-trips faithfully as long as the
-    // command does not end with `\` (it always ends with a validated ASCII argument).
+    // command does not end with `\` (it always ends with a validated argument or closing quote).
     Ok(command.replace('"', "\\\""))
 }
 
@@ -520,14 +527,31 @@ pub fn format_sshd_expiry(time: Timestamp) -> String {
 }
 
 /// Formats a temporary invite line for `authorized_keys`.
+///
+/// When `explicit_home` is `Some`, appends `--home <path>` to the forced command so `legion gate
+/// --enrol` always reads the same Legion home that issued the invite regardless of `sshd`'s
+/// session environment.
 pub fn format_invite_line(
     exe: &Path,
     id: &str,
     expires: Timestamp,
     pubkey: &str,
+    explicit_home: Option<&Path>,
     windows: bool,
 ) -> Result<String, ErrorBody> {
-    let cmd = format_forced_command(exe, &["gate", "--enrol", id], windows)?;
+    let mut owned_args = vec!["gate".to_owned(), "--enrol".to_owned(), id.to_owned()];
+    if let Some(home) = explicit_home {
+        let home_str = home.to_str().ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Legion home path {} is not valid Unicode.", home.display()),
+            )
+        })?;
+        owned_args.push("--home".to_owned());
+        owned_args.push(home_str.to_owned());
+    }
+    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+    let cmd = format_forced_command(exe, &arg_refs, windows)?;
     let expiry = format_sshd_expiry(expires);
     Ok(format!(
         "restrict,expiry-time=\"{expiry}\",command=\"{cmd}\" {pubkey} {INVITE_COMMENT_PREFIX}{id}"
@@ -535,14 +559,30 @@ pub fn format_invite_line(
 }
 
 /// Formats a permanent paired device line for `authorized_keys`.
+///
+/// When `explicit_home` is `Some`, appends `--home <path>` to the forced command so `legion gate
+/// --as` always reads the same Legion home regardless of `sshd`'s session environment.
 pub fn format_device_line(
     exe: &Path,
     principal: &str,
     pubkey: &str,
     device_name: &str,
+    explicit_home: Option<&Path>,
     windows: bool,
 ) -> Result<String, ErrorBody> {
-    let cmd = format_forced_command(exe, &["gate", "--as", principal], windows)?;
+    let mut owned_args = vec!["gate".to_owned(), "--as".to_owned(), principal.to_owned()];
+    if let Some(home) = explicit_home {
+        let home_str = home.to_str().ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Legion home path {} is not valid Unicode.", home.display()),
+            )
+        })?;
+        owned_args.push("--home".to_owned());
+        owned_args.push(home_str.to_owned());
+    }
+    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+    let cmd = format_forced_command(exe, &arg_refs, windows)?;
     Ok(format!(
         "restrict,command=\"{cmd}\" {pubkey} {DEVICE_COMMENT_PREFIX}{device_name}"
     ))
@@ -561,6 +601,8 @@ pub enum LineKind {
         key_b64: String,
         /// Raw `expiry-time` option value on the line, when present.
         expiry_time: Option<String>,
+        /// Pinned `--home` path extracted from the forced command, when present.
+        home: Option<String>,
     },
     /// Paired device line whose comment starts with `legion-device:`.
     Device {
@@ -570,6 +612,8 @@ pub enum LineKind {
         key_b64: String,
         /// Principal extracted from `command="... gate --as <principal>"`, when parseable.
         principal: Option<String>,
+        /// Pinned `--home` path extracted from the forced command, when present.
+        home: Option<String>,
     },
 }
 
@@ -730,7 +774,7 @@ pub fn write_auth_keys(
     })
 }
 
-fn ensure_parent_dir(dir: &Path, is_default_ssh_dir: bool) -> Result<(), ErrorBody> {
+pub(crate) fn ensure_parent_dir(dir: &Path, is_default_ssh_dir: bool) -> Result<(), ErrorBody> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -804,28 +848,35 @@ fn classify_line(raw: &[u8]) -> LineKind {
         return LineKind::Foreign;
     };
     let comment = after_key.trim_end_matches([' ', '\t']);
+    let parsed_cmd = options
+        .and_then(|opts| extract_option_value(opts, "command"))
+        .map(|cmd| parse_gate_command_flags(&cmd));
     if let Some(id) = comment.strip_prefix(INVITE_COMMENT_PREFIX)
         && !id.is_empty()
         && !id.chars().any(char::is_whitespace)
     {
         let expiry_time = options.and_then(|opts| extract_option_value(opts, "expiry-time"));
+        let home = parsed_cmd.and_then(|flags| flags.home);
         return LineKind::Invite {
             id: id.to_owned(),
             key_b64: key_b64.to_owned(),
             expiry_time,
+            home,
         };
     }
     if let Some(name) = comment.strip_prefix(DEVICE_COMMENT_PREFIX)
         && !name.is_empty()
         && !name.chars().any(char::is_whitespace)
     {
-        let principal = options
-            .and_then(|opts| extract_option_value(opts, "command"))
-            .and_then(|cmd| extract_gate_as_principal(&cmd));
+        let (principal, home) = match parsed_cmd {
+            Some(flags) => (flags.principal, flags.home),
+            None => (None, None),
+        };
         return LineKind::Device {
             name: name.to_owned(),
             key_b64: key_b64.to_owned(),
             principal,
+            home,
         };
     }
     LineKind::Foreign
@@ -934,15 +985,149 @@ fn extract_option_value(options: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Extracts `<principal>` from a forced command ending in `gate --as <principal>`.
-fn extract_gate_as_principal(command: &str) -> Option<String> {
-    let mut words = command.split_whitespace().rev();
-    let principal = words.next()?;
-    if words.next()? != "--as" || words.next()? != "gate" {
-        return None;
+#[derive(Default)]
+struct GateCommandFlags {
+    principal: Option<String>,
+    home: Option<String>,
+}
+
+/// Parses `legion gate` flag values (`--as`, `--home`, ...) out of an unescaped forced command
+/// string, handling POSIX single quotes, PowerShell `& '...'` (with `''`), and Windows `"..."`.
+fn parse_gate_command_flags(command: &str) -> GateCommandFlags {
+    let tokens = split_forced_command_tokens(command);
+    let Some(gate_pos) = tokens.iter().position(|t| t == "gate") else {
+        return GateCommandFlags::default();
+    };
+    let mut flags = GateCommandFlags::default();
+    let mut i = gate_pos + 1;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        if let Some(value) = token.strip_prefix("--as=") {
+            if Principal::parse(value).is_ok() {
+                flags.principal = Some(value.to_owned());
+            }
+            i += 1;
+        } else if token == "--as" {
+            if let Some(value) = tokens.get(i + 1)
+                && Principal::parse(value).is_ok()
+            {
+                flags.principal = Some(value.clone());
+            }
+            i += 2;
+        } else if let Some(value) = token.strip_prefix("--home=") {
+            if !value.is_empty() {
+                flags.home = Some(value.to_owned());
+            }
+            i += 1;
+        } else if token == "--home" {
+            if let Some(value) = tokens.get(i + 1)
+                && !value.is_empty()
+            {
+                flags.home = Some(value.clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
     }
-    Principal::parse(principal).ok()?;
-    Some(principal.to_owned())
+    flags
+}
+
+/// Splits an unescaped forced command into argv-like tokens, supporting POSIX `'...'` (with
+/// `'\''`), PowerShell `'...'` (with `''`), and `"..."` double-quoted segments.
+fn split_forced_command_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        match ch {
+            ' ' | '\t' => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+                i += 1;
+            }
+            '\'' => {
+                in_token = true;
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\'' {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            // PowerShell doubled single quote inside '...'.
+                            current.push('\'');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        current.push(chars[i]);
+                        i += 1;
+                    }
+                }
+            }
+            '"' => {
+                in_token = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == '"' {
+                    i += 1;
+                }
+            }
+            '\\' if chars.get(i + 1) == Some(&'\'') => {
+                in_token = true;
+                current.push('\'');
+                i += 2;
+            }
+            _ => {
+                in_token = true;
+                current.push(ch);
+                i += 1;
+            }
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Returns `true` when a line's pinned `--home` matches `paths`'s Legion home.
+///
+/// Lines pinned to a different `--home` belong to another Legion home sharing this
+/// `authorized_keys` file and are never listed or removed by this home.
+pub fn line_matches_home(line_home: Option<&str>, paths: &Paths) -> bool {
+    match (line_home, paths.explicit_home()) {
+        (Some(lh), Some(eh)) => paths_equal(Path::new(lh), eh),
+        (None, None) => true,
+        // A line pinned to an explicit home does not belong to the default home, and a default-home
+        // line does not belong to an explicit home unless explicitly matched by state metadata.
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => {
+            if cfg!(windows) {
+                a.to_string_lossy()
+                    .eq_ignore_ascii_case(&b.to_string_lossy())
+            } else {
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1186,6 +1371,7 @@ Match Group users
             "deadbeef01",
             ts,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
+            Some(Path::new("/Users/me/My Legion Home")),
             false,
         )
         .unwrap();
@@ -1204,10 +1390,12 @@ Match Group users
                 id,
                 key_b64,
                 expiry_time,
+                home,
             } => {
                 assert_eq!(id, "deadbeef01");
                 assert!(key_b64.starts_with("AAAAC3Nza"));
                 assert_eq!(expiry_time.as_deref(), Some("202611250215"));
+                assert_eq!(home.as_deref(), Some("/Users/me/My Legion Home"));
             }
             other => panic!("unexpected {other:?}"),
         }

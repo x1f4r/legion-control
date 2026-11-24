@@ -27,15 +27,15 @@ use serde::{Deserialize, Serialize};
 use crate::caller::Caller;
 
 use self::authkeys::{
-    LineKind, format_invite_line, read_auth_keys, resolve_safe_write_path, resolve_target,
-    verify_owner_matches_euid, write_auth_keys,
+    LineKind, format_invite_line, line_matches_home, read_auth_keys, resolve_safe_write_path,
+    resolve_target, verify_owner_matches_euid, write_auth_keys,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
     InvitePayload, fingerprint_key_b64, generate_ephemeral_ed25519, generate_invite_id,
     read_host_keys, validate_invite_id,
 };
-use self::store::{InviteRecord, format_rfc3339, load_state, lock_devices, save_state, sweep};
+use self::store::{InviteRecord, format_rfc3339, load_state, lock_auth_keys, save_state, sweep};
 
 /// Default invite validity in minutes.
 pub const DEFAULT_VALID_MINUTES: u32 = 15;
@@ -205,8 +205,14 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
 
     let id = generate_invite_id()?;
     let ephemeral = generate_ephemeral_ed25519()?;
-    let invite_line =
-        format_invite_line(&exe, &id, expires_ts, &ephemeral.public_key, cfg!(windows))?;
+    let invite_line = format_invite_line(
+        &exe,
+        &id,
+        expires_ts,
+        &ephemeral.public_key,
+        ctx.paths().explicit_home(),
+        cfg!(windows),
+    )?;
 
     let payload = InvitePayload {
         v: keys::INVITE_VERSION,
@@ -241,7 +247,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
             target.is_default_home_ssh,
             legion_os::user::effective_uid(),
         )?;
-        let _guard = lock_devices(&paths)?;
+        let _guard = lock_auth_keys(&target, &write_path)?;
 
         let mut auth_keys = read_auth_keys(&write_path)?;
         let original_bytes = auth_keys.to_bytes();
@@ -322,7 +328,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
             target.is_default_home_ssh,
             legion_os::user::effective_uid(),
         )?;
-        let _guard = lock_devices(&paths)?;
+        let _guard = lock_auth_keys(&target, &write_path)?;
 
         let mut auth_keys = read_auth_keys(&write_path)?;
         let mut state = load_state(&paths)?;
@@ -343,7 +349,13 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     name,
                     key_b64,
                     principal,
+                    home,
                 } => {
+                    if !line_matches_home(home.as_deref(), &paths)
+                        && !(home.is_none() && state.devices.contains_key(name))
+                    {
+                        continue;
+                    }
                     let meta = state.devices.get(name);
                     let resolved_principal = meta
                         .map(|m| m.principal.clone())
@@ -483,7 +495,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
             target.is_default_home_ssh,
             legion_os::user::effective_uid(),
         )?;
-        let _guard = lock_devices(&paths)?;
+        let _guard = lock_auth_keys(&target, &write_path)?;
 
         let mut auth_keys = read_auth_keys(&write_path)?;
         let mut state = load_state(&paths)?;
@@ -500,9 +512,15 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     if let LineKind::Device {
                         name: line_name,
                         principal,
+                        home,
                         ..
                     } = &line.kind
                     {
+                        if !line_matches_home(home.as_deref(), &paths)
+                            && !(home.is_none() && state.devices.contains_key(line_name))
+                        {
+                            continue;
+                        }
                         let resolved = state
                             .devices
                             .get(line_name)
@@ -514,7 +532,9 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                         };
                         if can_manage {
                             let p = resolved.unwrap_or_else(|| "unknown".to_owned());
-                            visible_names.entry(line_name.clone()).or_insert_with(|| p.clone());
+                            visible_names
+                                .entry(line_name.clone())
+                                .or_insert_with(|| p.clone());
                             if line_name == &name {
                                 matched_principal.get_or_insert(p);
                                 matched_lines += 1;
@@ -544,7 +564,13 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 };
 
                 auth_keys.retain(|line| {
-                    !matches!(&line.kind, LineKind::Device { name: line_name, .. } if line_name == &name)
+                    !matches!(
+                        &line.kind,
+                        LineKind::Device { name: line_name, home, .. }
+                            if line_name == &name
+                                && (line_matches_home(home.as_deref(), &paths)
+                                    || (home.is_none() && state.devices.contains_key(line_name)))
+                    )
                 });
                 write_auth_keys(&target, &write_path, &auth_keys.to_bytes())?;
                 state.devices.remove(&name);
@@ -1161,5 +1187,153 @@ role = "owner"
         let err = resolve_default_ssh_user(Some(dir.path()), Some(wrong_uid)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Denied);
         assert!(err.message.contains("owned by"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn two_legion_homes_sharing_one_authorized_keys_do_not_clobber_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let shared_auth = dir.path().join("shared_authorized_keys");
+        let host_key_path = dir.path().join("ssh_host_ed25519_key.pub");
+        let host_key = generate_ephemeral_ed25519().unwrap().public_key;
+        std::fs::write(&host_key_path, format!("{host_key} root@tower\n")).unwrap();
+
+        let make_node = |label: &str| {
+            let paths = Paths::under(dir.path().join(label)).with_home(&home);
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            let auth_escaped = shared_auth.display().to_string().replace('\\', "\\\\");
+            let hk_escaped = host_key_path.display().to_string().replace('\\', "\\\\");
+            std::fs::write(
+                paths.config_file("node.toml"),
+                format!(
+                    "name = \"{label}\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\nhost_keys = [\"{hk_escaped}\"]\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                paths.config_file("policy.toml"),
+                "default = \"owner\"\n[roles.observer]\nallow = [\"effect:read\"]\n[principals.phone]\nrole = \"observer\"\n",
+            )
+            .unwrap();
+            Node::new(paths, crate::registry())
+        };
+
+        let node_a = make_node("home-a");
+        let node_b = make_node("home-b");
+
+        // Both homes create invites into the same authorized_keys file.
+        let inv_a_exp = node_a
+            .call(Call::new(
+                Door::Cli,
+                "device.invite",
+                json!({"principal": "phone", "host": "tower.example", "user": "me"}),
+            ))
+            .await
+            .unwrap();
+        let inv_a = node_a
+            .call(Call::new(
+                Door::Cli,
+                "device.invite",
+                json!({"principal": "phone", "host": "tower.example", "user": "me"}),
+            ))
+            .await
+            .unwrap();
+        let inv_b = node_b
+            .call(Call::new(
+                Door::Cli,
+                "device.invite",
+                json!({"principal": "phone", "host": "tower.example", "user": "me"}),
+            ))
+            .await
+            .unwrap();
+        let id_a_exp = inv_a_exp["id"].as_str().unwrap().to_owned();
+        let id_a = inv_a["id"].as_str().unwrap().to_owned();
+        let id_b = inv_b["id"].as_str().unwrap().to_owned();
+
+        // Lock file sits beside shared_authorized_keys (owner-only on Unix), not in state/.
+        let lock_file = store::auth_keys_lock_path(&shared_auth);
+        assert!(lock_file.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&lock_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        // Expire only home-a's first invite; sweeping on home-a must leave home-b's invite intact.
+        let mut state_a = load_state(node_a.paths()).unwrap();
+        state_a.invites.get_mut(&id_a_exp).unwrap().expires = "2020-01-01T00:00:00Z".to_owned();
+        save_state(node_a.paths(), &state_a).unwrap();
+
+        let list_a = node_a
+            .call(Call::new(Door::Cli, "device.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(list_a["invites"].as_array().unwrap().len(), 1);
+        assert_eq!(list_a["invites"][0]["id"], json!(id_a));
+
+        // home-b still sees its own invite, and the file still contains both active invites.
+        let list_b = node_b
+            .call(Call::new(Door::Cli, "device.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(list_b["invites"].as_array().unwrap().len(), 1);
+        assert_eq!(list_b["invites"][0]["id"], json!(id_b));
+        let auth_text = std::fs::read_to_string(&shared_auth).unwrap();
+        assert!(!auth_text.contains(&id_a_exp));
+        assert!(auth_text.contains(&id_a));
+        assert!(auth_text.contains(&id_b));
+        assert!(auth_text.contains("--home"));
+
+        // Enrol one device on each home with distinct keys; each home sees and manages only its own.
+        let key_a = generate_ephemeral_ed25519().unwrap();
+        let key_b = generate_ephemeral_ed25519().unwrap();
+        let req_a = format!(
+            "{{\"enrol\":1,\"id\":\"{id_a}\",\"public_key\":\"{}\",\"name\":\"Phone\"}}\n",
+            key_a.public_key
+        );
+        let req_b = format!(
+            "{{\"enrol\":1,\"id\":\"{id_b}\",\"public_key\":\"{}\",\"name\":\"Tablet\"}}\n",
+            key_b.public_key
+        );
+        assert!(run_enrol(&node_a, &id_a, req_a.as_bytes()).await.is_ok());
+        assert!(run_enrol(&node_b, &id_b, req_b.as_bytes()).await.is_ok());
+
+        let list_a = node_a
+            .call(Call::new(Door::Cli, "device.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(list_a["devices"].as_array().unwrap().len(), 1);
+        assert_eq!(list_a["devices"][0]["name"], json!("phone"));
+
+        // home-a cannot remove home-b's device.
+        let cross_rm = node_a
+            .call(Call::new(
+                Door::Cli,
+                "device.remove",
+                json!({"name": "tablet"}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(cross_rm.code, ErrorCode::NotFound);
+
+        // Removing home-a's device leaves home-b's device line untouched.
+        node_a
+            .call(Call::new(
+                Door::Cli,
+                "device.remove",
+                json!({"name": "phone"}),
+            ))
+            .await
+            .unwrap();
+        let list_b = node_b
+            .call(Call::new(Door::Cli, "device.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(list_b["devices"].as_array().unwrap().len(), 1);
+        assert_eq!(list_b["devices"][0]["name"], json!("tablet"));
     }
 }

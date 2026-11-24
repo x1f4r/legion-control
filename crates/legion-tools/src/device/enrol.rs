@@ -24,7 +24,7 @@ use super::authkeys::{
 };
 use super::keys::{validate_ed25519_public_key, validate_invite_id};
 use super::store::{
-    DeviceRecord, format_rfc3339, load_state, lock_devices, parse_rfc3339, save_state, sweep,
+    DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
     unique_device_name,
 };
 
@@ -272,7 +272,7 @@ fn process_enrol_blocking(
         return (None, base_args, Err(error));
     }
 
-    let _guard = match lock_devices(paths) {
+    let _guard = match lock_auth_keys(&target, &write_path) {
         Ok(guard) => guard,
         Err(error) => return (None, base_args, Err(error)),
     };
@@ -418,6 +418,7 @@ fn process_enrol_blocking(
         &principal,
         &validated_key.canonical,
         &device_name,
+        paths.explicit_home(),
         cfg!(windows),
     ) {
         Ok(line) => line,

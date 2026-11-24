@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -18,9 +18,9 @@ use legion_os::atomic::{WriteOptions, write_atomic};
 use legion_os::lock::{FileLock, LockMode};
 use serde::{Deserialize, Serialize};
 
-use super::authkeys::{AuthKeysFile, LineKind};
+use super::authkeys::{AuthKeysFile, AuthKeysTarget, LineKind, ensure_parent_dir};
 
-/// Longest time a device operation waits for another holding `state/devices.lock`.
+/// Longest time a device operation waits for another holding the `authorized_keys` lock.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum length of the sanitised base slug of a device name before any numeric suffix.
@@ -72,29 +72,93 @@ pub struct DeviceRecord {
     pub fingerprint: String,
 }
 
-/// Acquires the exclusive kernel lock guarding both `authorized_keys` and `state/devices.json`.
-pub fn lock_devices(paths: &Paths) -> Result<FileLock, ErrorBody> {
-    let lock = lock_path(paths);
-    if let Some(dir) = lock.parent() {
+/// Returns the owner-only lock file path placed beside `write_path` so distinct Legion homes
+/// sharing one `authorized_keys` file serialize edits through the same lock.
+pub fn auth_keys_lock_path(write_path: &Path) -> PathBuf {
+    let base = write_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("authorized_keys");
+    let file = format!(".{base}.legion.lock");
+    match write_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(file),
+        _ => PathBuf::from(file),
+    }
+}
+
+/// Acquires the exclusive owner-only kernel lock beside `write_path` guarding `authorized_keys`
+/// edits across all Legion homes sharing that file.
+pub fn lock_auth_keys(target: &AuthKeysTarget, write_path: &Path) -> Result<FileLock, ErrorBody> {
+    let lock = auth_keys_lock_path(write_path);
+    if let Some(dir) = lock.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        ensure_parent_dir(
+            dir,
+            target.is_default_home_ssh && target.path.parent() == Some(dir),
+        )?;
+    }
+    let guard = FileLock::acquire_private_timeout(&lock, LockMode::Exclusive, LOCK_TIMEOUT)
+        .map_err(|error| match error {
+            OsError::TimedOut { .. } => ErrorBody::new(
+                ErrorCode::Busy,
+                "Another call has been changing paired devices for too long.",
+            )
+            .with_hint("Try again in a moment."),
+            other => ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be locked: {other}.", lock.display()),
+            ),
+        })?;
+    if target.windows_admin_acl {
+        legion_os::user::apply_windows_admin_ssh_acl(&lock).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Cannot secure lock file {} with Administrators/SYSTEM ACL: {error}.",
+                    lock.display()
+                ),
+            )
+            .with_hint(
+                "Run from an elevated Administrator terminal so Legion can update administrators_authorized_keys.",
+            )
+        })?;
+    }
+    Ok(guard)
+}
+
+/// Creates a private directory (`0o700` on Unix) for state files.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), ErrorBody> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if !dir.exists() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(dir).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be created: {error}.", dir.display()),
+                )
+            })?;
+        }
+        if let Ok(meta) = std::fs::metadata(dir)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
         std::fs::create_dir_all(dir).map_err(|error| {
             ErrorBody::new(
                 ErrorCode::Failed,
                 format!("{} cannot be created: {error}.", dir.display()),
             )
-        })?;
+        })
     }
-    FileLock::acquire_timeout(&lock, LockMode::Exclusive, LOCK_TIMEOUT).map_err(|error| match error
-    {
-        OsError::TimedOut { .. } => ErrorBody::new(
-            ErrorCode::Busy,
-            "Another call has been changing paired devices for too long.",
-        )
-        .with_hint("Try again in a moment."),
-        other => ErrorBody::new(
-            ErrorCode::Failed,
-            format!("{} cannot be locked: {other}.", lock.display()),
-        ),
-    })
 }
 
 /// Loads `state/devices.json`, returning an empty state when the file does not exist.
@@ -124,12 +188,7 @@ pub fn load_state(paths: &Paths) -> Result<DevicesState, ErrorBody> {
 pub fn save_state(paths: &Paths, state: &DevicesState) -> Result<(), ErrorBody> {
     let path = state_path(paths);
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be created: {error}.", dir.display()),
-            )
-        })?;
+        ensure_private_dir(dir)?;
     }
     let mut bytes = serde_json::to_vec_pretty(state).map_err(|error| {
         ErrorBody::new(
@@ -151,8 +210,11 @@ pub fn save_state(paths: &Paths, state: &DevicesState) -> Result<(), ErrorBody> 
     })
 }
 
-/// Sweeps expired or used invites from both `auth_keys` and `state`, and prunes device records
-/// whose `authorized_keys` line was removed externally.
+/// Sweeps expired or used invites recorded by **this** Legion home from `auth_keys` and `state`,
+/// and prunes device records whose `authorized_keys` line was removed externally.
+///
+/// `legion-invite:` lines whose id was not recorded in `state.invites` are left untouched so
+/// another Legion home sharing the same `authorized_keys` file never loses its pending invites.
 ///
 /// Returns `(auth_keys_changed, state_changed)`.
 pub fn sweep(
@@ -177,24 +239,29 @@ pub fn sweep(
         })
         .collect();
 
-    // An invite is alive only when it exists in BOTH authorized_keys and state and has not expired.
-    let mut active_invite_ids = HashSet::new();
+    // Classify only invite ids this home knows about: expired ones are removed from authorized_keys
+    // and state; missing ones (used or deleted externally) are pruned from state; unknown invite
+    // lines in authorized_keys belong to another home and are never deleted.
+    let mut expired_owned_ids = HashSet::new();
+    let mut active_owned_ids = HashSet::new();
     for (id, record) in &state.invites {
         if !auth_invite_ids.contains(id) {
             continue;
         }
         if parse_rfc3339(&record.expires).is_some_and(|exp| now < exp) {
-            active_invite_ids.insert(id.clone());
+            active_owned_ids.insert(id.clone());
+        } else {
+            expired_owned_ids.insert(id.clone());
         }
     }
 
     let auth_changed = auth_keys.retain(|line| match &line.kind {
-        LineKind::Invite { id, .. } => active_invite_ids.contains(id),
+        LineKind::Invite { id, .. } => !expired_owned_ids.contains(id),
         LineKind::Device { .. } | LineKind::Foreign => true,
     });
 
     let invites_before = state.invites.len();
-    state.invites.retain(|id, _| active_invite_ids.contains(id));
+    state.invites.retain(|id, _| active_owned_ids.contains(id));
     let devices_before = state.devices.len();
     state
         .devices
@@ -255,10 +322,6 @@ pub fn unique_device_name(raw: &str, existing: &HashSet<String>) -> String {
     }
 }
 
-fn lock_path(paths: &Paths) -> PathBuf {
-    paths.state_dir().join("devices.lock")
-}
-
 fn state_path(paths: &Paths) -> PathBuf {
     paths.state_dir().join("devices.json")
 }
@@ -291,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_expired_and_orphaned_invites_while_preserving_foreign_and_valid() {
+    fn sweep_removes_only_this_homes_expired_invites_and_preserves_other_homes() {
         let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
         let past: Timestamp = "2026-11-24T11:59:00Z".parse().unwrap();
         let future: Timestamp = "2026-11-24T12:15:00Z".parse().unwrap();
@@ -305,14 +368,16 @@ mod tests {
             "invexpired",
             past,
             &key1.public_key,
+            None,
             false,
         )
         .unwrap();
-        let orphan_line = format_invite_line(
+        let other_home_line = format_invite_line(
             Path::new("/home/me/legion"),
-            "invorphan",
+            "invotherhome",
             future,
             &key2.public_key,
+            Some(Path::new("/home/me/other-legion")),
             false,
         )
         .unwrap();
@@ -321,11 +386,12 @@ mod tests {
             "invvalid",
             future,
             &key3.public_key,
+            None,
             false,
         )
         .unwrap();
 
-        let initial = format!("# keep me\n{expired_line}\n{orphan_line}\n{valid_line}\n");
+        let initial = format!("# keep me\n{expired_line}\n{other_home_line}\n{valid_line}\n");
         let mut auth = AuthKeysFile::parse(initial.as_bytes());
         let mut state = DevicesState {
             version: 1,
@@ -372,8 +438,9 @@ mod tests {
         let out = String::from_utf8(auth.to_bytes()).unwrap();
         assert!(out.starts_with("# keep me\n"));
         assert!(out.contains("legion-invite:invvalid"));
+        // Another Legion home's invite line was NOT recorded here and MUST be preserved.
+        assert!(out.contains("legion-invite:invotherhome"));
         assert!(!out.contains("invexpired"));
-        assert!(!out.contains("invorphan"));
 
         // Second sweep is a no-op.
         assert_eq!(sweep(&mut auth, &mut state, now), (false, false));

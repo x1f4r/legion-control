@@ -93,7 +93,18 @@ async fn run(command: Command) -> ExitCode {
         Command::Tools { json } | Command::Help { json, .. } => *json,
         _ => false,
     };
-    let (node, router) = match Paths::from_env() {
+    let paths_result = match &command {
+        Command::Gate(
+            GateCommand::As {
+                home: Some(root), ..
+            }
+            | GateCommand::Enrol {
+                home: Some(root), ..
+            },
+        ) => Paths::from_explicit_home(root),
+        _ => Paths::from_env(),
+    };
+    let (node, router) = match paths_result {
         Ok(paths) => {
             let fleet = Fleet::new(&paths);
             let mut registry = legion_tools::registry();
@@ -182,11 +193,11 @@ async fn run(command: Command) -> ExitCode {
             router.shutdown().await;
             code
         }
-        Command::Gate(GateCommand::As { pinned }) => {
+        Command::Gate(GateCommand::As { pinned, .. }) => {
             let shutdown = install_shutdown_token();
             gate(node, router, pinned, shutdown).await
         }
-        Command::Gate(GateCommand::Enrol { id }) => {
+        Command::Gate(GateCommand::Enrol { id, .. }) => {
             let shutdown = install_shutdown_token();
             enrol(node, router, id, shutdown).await
         }
