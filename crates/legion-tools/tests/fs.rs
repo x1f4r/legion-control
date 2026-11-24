@@ -435,24 +435,7 @@ async fn write_supports_modes_parents_base64_expect_hash_and_redacts_audit() {
         .unwrap_err();
     assert_eq!(missing_conflict.code, ErrorCode::Conflict);
 
-    // Safe atomic append with matching `expect_hash` succeeds and updates hash.
-    let appended = f
-        .call(
-            "fs.write",
-            json!({
-                "path": f.p(&nested),
-                "content": " world",
-                "mode": "append",
-                "expect_hash": hash1,
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(appended["created"], json!(false));
-    assert_eq!(appended["size"], json!(11));
-    assert_eq!(std::fs::read_to_string(&nested).unwrap(), "hello world");
-
-    // Append with stale hash fails without touching the file.
+    // Combining `mode: "append"` with `expect_hash` is rejected with `invalid_args`.
     assert_eq!(
         f.call(
             "fs.write",
@@ -466,8 +449,24 @@ async fn write_supports_modes_parents_base64_expect_hash_and_redacts_audit() {
         .await
         .unwrap_err()
         .code,
-        ErrorCode::Conflict
+        ErrorCode::InvalidArgs
     );
+
+    // Append uses OS append mode without replacing the file.
+    let appended = f
+        .call(
+            "fs.write",
+            json!({
+                "path": f.p(&nested),
+                "content": " world",
+                "mode": "append",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(appended["created"], json!(false));
+    assert_eq!(appended["size"], json!(11));
+    assert!(appended.get("hash").is_none());
     assert_eq!(std::fs::read_to_string(&nested).unwrap(), "hello world");
 
     // Base64 write round-trips raw bytes.
@@ -1679,4 +1678,66 @@ async fn writing_and_editing_through_a_symlink_updates_target_and_refuses_dangli
         "{}",
         edit_err.message
     );
+}
+
+#[tokio::test]
+async fn append_preserves_open_file_identity_and_never_loses_concurrent_appends() {
+    use std::io::Write as _;
+
+    let f = Fixture::new();
+    let log = f.work.join("service.log");
+    let mut service_handle = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .unwrap();
+    let before_handle = same_file::Handle::from_path(&log).unwrap();
+    writeln!(service_handle, "service-1").unwrap();
+    service_handle.flush().unwrap();
+
+    // `fs.write` append must write to the same underlying file rather than renaming a new inode
+    // over it, so the service's open handle keeps writing to the same file.
+    f.call(
+        "fs.write",
+        json!({"path": f.p(&log), "content": "legion-append\n", "mode": "append"}),
+    )
+    .await
+    .unwrap();
+    writeln!(service_handle, "service-2").unwrap();
+    service_handle.flush().unwrap();
+    drop(service_handle);
+
+    let after_handle = same_file::Handle::from_path(&log).unwrap();
+    assert_eq!(before_handle, after_handle);
+    let content = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(content, "service-1\nlegion-append\nservice-2\n");
+
+    // Twenty concurrent appends must all land in the file without losing any.
+    let shared = f.work.join("concurrent.log");
+    let mut tasks = Vec::new();
+    for idx in 0..20 {
+        let node = f.node.clone();
+        let path = f.p(&shared);
+        tasks.push(tokio::spawn(async move {
+            node.call(Call::new(
+                Door::Cli,
+                "fs.write",
+                json!({
+                    "path": path,
+                    "content": format!("line-{idx:02}\n"),
+                    "mode": "append",
+                }),
+            ))
+            .await
+            .unwrap()
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let text = std::fs::read_to_string(&shared).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.sort_unstable();
+    let expected: Vec<String> = (0..20).map(|idx| format!("line-{idx:02}")).collect();
+    assert_eq!(lines, expected);
 }

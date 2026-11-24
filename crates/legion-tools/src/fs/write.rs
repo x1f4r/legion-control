@@ -1,8 +1,8 @@
 //! File creation and modification tools: `fs.write`, `fs.edit` and `fs.mkdir`.
 
 use std::borrow::Cow;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write as _};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -51,7 +51,7 @@ enum WriteMode {
     Overwrite,
     /// Create a new file and fail with `exists` if anything is already at the path.
     Create,
-    /// Append to an existing file (via atomic replace) or create it if missing.
+    /// Append to an existing file in OS append mode or create it if missing.
     Append,
 }
 
@@ -89,7 +89,8 @@ fn default_utf8() -> Encoding {
 struct WriteResult {
     path: String,
     size: u64,
-    hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hash: Option<String>,
     created: bool,
 }
 
@@ -99,7 +100,18 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
             ErrorCode::InvalidArgs,
             "fs.write cannot combine mode \"create\" with expect_hash.",
         )
-        .with_hint("Use mode \"overwrite\" or \"append\" with expect_hash, or omit expect_hash to create a new file."));
+        .with_hint(
+            "Use mode \"overwrite\" or fs.edit with expect_hash, or omit expect_hash to create a new file.",
+        ));
+    }
+    if args.mode == WriteMode::Append && args.expect_hash.is_some() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "fs.write cannot combine mode \"append\" with expect_hash.",
+        )
+        .with_hint(
+            "Append uses the OS append flag so concurrent writers never lose data; use mode \"overwrite\" or fs.edit when you need expect_hash.",
+        ));
     }
     let unix_mode = match &args.unix_mode {
         Some(text) => Some(parse_unix_mode(text)?),
@@ -128,6 +140,62 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         }
 
         let path = resolve_write_target(&grant, checked, mode == WriteMode::Create)?;
+
+        if mode == WriteMode::Append {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
+            {
+                if parents {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        map_io_error("create parent directories for", &path, error)
+                    })?;
+                } else {
+                    return Err(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        format!("Parent directory {} does not exist.", parent.display()),
+                    )
+                    .with_hint(
+                        "Pass parents: true to create missing parent directories, or call fs.mkdir first.",
+                    ));
+                }
+            }
+            let (mut file, created) = match platform::open_append_create_new(&path, unix_mode) {
+                Ok(file) => (file, true),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                        return Err(ErrorBody::new(
+                            ErrorCode::InvalidArgs,
+                            format!("{} is a directory, not a file.", path.display()),
+                        )
+                        .with_hint("Pass a file path to fs.write."));
+                    }
+                    let file = OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .map_err(|err| map_io_error("open for append", &path, err))?;
+                    (file, false)
+                }
+                Err(error) => return Err(map_io_error("open for append", &path, error)),
+            };
+            file.write_all(&payload)
+                .map_err(|error| map_io_error("append to", &path, error))?;
+            file.flush()
+                .map_err(|error| map_io_error("flush", &path, error))?;
+            file.sync_all()
+                .map_err(|error| map_io_error("sync", &path, error))?;
+            if !created && let Some(bits) = unix_mode {
+                platform::set_unix_mode(&path, bits)
+                    .map_err(|error| map_io_error("set permissions on", &path, error))?;
+            }
+            let size = file.metadata().map_or(payload.len() as u64, |m| m.len());
+            return Ok(WriteResult {
+                path: path_to_string(&path),
+                size,
+                hash: None,
+                created,
+            });
+        }
 
         let existed = match fs::symlink_metadata(&path) {
             Ok(meta) => {
@@ -182,37 +250,19 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
             }
         }
 
-        let final_bytes = match mode {
-            WriteMode::Overwrite | WriteMode::Create => {
-                if let Some(expected) = expect_hash.as_deref() {
-                    let current = hash_file(&path, &cancel, "fs.write")?;
-                    check_expected_hash(&path, expected, &current)?;
-                }
-                payload
-            }
-            WriteMode::Append => {
-                if existed {
-                    let mut combined = read_file_cancellable(&path, &cancel, "fs.write")?;
-                    if let Some(expected) = expect_hash.as_deref() {
-                        let current = format_blake3(blake3::hash(&combined));
-                        check_expected_hash(&path, expected, &current)?;
-                    }
-                    combined.extend_from_slice(&payload);
-                    combined
-                } else {
-                    payload
-                }
-            }
-        };
+        if let Some(expected) = expect_hash.as_deref() {
+            let current = hash_file(&path, &cancel, "fs.write")?;
+            check_expected_hash(&path, expected, &current)?;
+        }
 
         if cancel.is_cancelled() {
             return Err(cancelled_error("fs.write"));
         }
 
-        let hash = format_blake3(blake3::hash(&final_bytes));
-        let size = final_bytes.len() as u64;
+        let hash = format_blake3(blake3::hash(&payload));
+        let size = payload.len() as u64;
         let options = WriteOptions { mode: unix_mode };
-        write_atomic(&path, &final_bytes, options)
+        write_atomic(&path, &payload, options)
             .map_err(|error| map_os_error("write", &path, error))?;
         // `legion-os` preserves the existing file's mode on overwrite; honor an explicit
         // `unix_mode` when the caller asked for one.
@@ -224,7 +274,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         Ok(WriteResult {
             path: path_to_string(&path),
             size,
-            hash,
+            hash: Some(hash),
             created: !existed,
         })
     })

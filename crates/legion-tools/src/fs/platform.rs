@@ -9,9 +9,9 @@ use std::path::Path;
 #[cfg(unix)]
 mod imp {
     use std::ffi::OsStr;
-    use std::fs::{self, Metadata, Permissions};
+    use std::fs::{self, File, Metadata, OpenOptions, Permissions};
     use std::io;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::Path;
 
     pub(super) fn unix_mode(meta: &Metadata) -> Option<String> {
@@ -24,6 +24,15 @@ mod imp {
 
     pub(super) fn set_unix_mode(path: &Path, mode: u32) -> io::Result<()> {
         fs::set_permissions(path, Permissions::from_mode(mode))
+    }
+
+    pub(super) fn open_append_create_new(path: &Path, mode: Option<u32>) -> io::Result<File> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).append(true).create_new(true);
+        if let Some(bits) = mode {
+            opts.mode(bits);
+        }
+        opts.open(path)
     }
 
     pub(super) fn symlink_is_dir(_meta: &Metadata) -> bool {
@@ -50,7 +59,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::ffi::OsStr;
-    use std::fs::{self, Metadata};
+    use std::fs::{self, File, Metadata, OpenOptions};
     use std::io;
     use std::os::windows::fs::MetadataExt;
     use std::path::Path;
@@ -68,6 +77,14 @@ mod imp {
 
     pub(super) fn set_unix_mode(_path: &Path, _mode: u32) -> io::Result<()> {
         Ok(())
+    }
+
+    pub(super) fn open_append_create_new(path: &Path, _mode: Option<u32>) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create_new(true)
+            .open(path)
     }
 
     pub(super) fn symlink_is_dir(meta: &Metadata) -> bool {
@@ -102,7 +119,7 @@ mod imp {
 #[cfg(not(any(unix, windows)))]
 mod imp {
     use std::ffi::OsStr;
-    use std::fs::{self, Metadata};
+    use std::fs::{self, File, Metadata, OpenOptions};
     use std::io;
     use std::path::Path;
 
@@ -116,6 +133,14 @@ mod imp {
 
     pub(super) fn set_unix_mode(_path: &Path, _mode: u32) -> io::Result<()> {
         Ok(())
+    }
+
+    pub(super) fn open_append_create_new(path: &Path, _mode: Option<u32>) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create_new(true)
+            .open(path)
     }
 
     pub(super) fn symlink_is_dir(_meta: &Metadata) -> bool {
@@ -155,6 +180,11 @@ pub(crate) fn unix_mode_bits(meta: &Metadata) -> Option<u32> {
 /// Applies Unix permission bits to `path`, doing nothing on Windows.
 pub(crate) fn set_unix_mode(path: &Path, mode: u32) -> io::Result<()> {
     imp::set_unix_mode(path, mode)
+}
+
+/// Atomically creates a new file opened in append mode, applying `mode` on Unix if given.
+pub(crate) fn open_append_create_new(path: &Path, mode: Option<u32>) -> io::Result<std::fs::File> {
+    imp::open_append_create_new(path, mode)
 }
 
 /// On Windows, whether a symbolic link's metadata marks it as a directory symlink.
