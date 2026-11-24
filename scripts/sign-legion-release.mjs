@@ -16,8 +16,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DEFAULT_PRIVATE_KEY = path.join(os.homedir(), '.legion-control/release-signing.key');
-const DEFAULT_PUBLIC_KEY = path.join(root, 'contract/release-public-key.pem');
+const DEFAULT_PRIVATE_KEY = path.join(os.homedir(), '.legion-control', 'release-signing.key');
+const DEFAULT_PUBLIC_KEY = path.join(root, 'contract', 'release-public-key.pem');
 const TAG_PATTERN = /^legion-v([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/;
 const SIGNATURE_PATTERN = /^[A-Za-z0-9+/]{86}==$/;
 const MAX_SUMS_BYTES = 256 * 1024;
@@ -70,6 +70,7 @@ export function signLegionRelease({
   publicKey = DEFAULT_PUBLIC_KEY,
   repo,
   gh = 'gh',
+  ghArgs = [],
   log = (line) => console.log(line),
 } = {}) {
   const tagMatch = TAG_PATTERN.exec(tag ?? '');
@@ -78,7 +79,11 @@ export function signLegionRelease({
   }
   const version = tagMatch[1];
   const repoArgs = repo ? ['--repo', repo] : [];
-  const runGh = (args) => execFileSync(gh, [...args, ...repoArgs], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const [ghProgram, ...ghLeadingArgs] = Array.isArray(gh) ? gh : [gh, ...ghArgs];
+  if (!ghProgram) {
+    throw new Error('GitHub CLI command cannot be empty.');
+  }
+  const runGh = (args) => execFileSync(ghProgram, [...ghLeadingArgs, ...args, ...repoArgs], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 
   const meta = JSON.parse(runGh(['release', 'view', tag, '--json', 'tagName,isDraft,isPrerelease,assets']));
   if (!meta.isDraft) {
@@ -103,7 +108,7 @@ export function signLegionRelease({
 
     const sigText = signSha256SumsBytes(sumsBytes, privateKey, publicKey);
     const sigPath = path.join(tmpDir, 'SHA256SUMS.sig');
-    fs.writeFileSync(sigPath, sigText, { mode: 0o644 });
+    fs.writeFileSync(sigPath, Buffer.from(sigText, 'ascii'), { mode: 0o644 });
 
     runGh(['release', 'upload', tag, sigPath, '--clobber']);
 
@@ -149,8 +154,15 @@ function parseCliArgs(argv) {
   return { tag, privateKey, publicKey, repo };
 }
 
-const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
-if (process.argv[1] && real(process.argv[1]) === real(fileURLToPath(import.meta.url))) {
+const real = (file) => {
+  try {
+    return fs.realpathSync.native(file);
+  } catch {
+    return path.resolve(file);
+  }
+};
+const sameFile = (a, b) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+if (process.argv[1] && sameFile(real(process.argv[1]), real(fileURLToPath(import.meta.url)))) {
   try {
     const options = parseCliArgs(process.argv.slice(2));
     signLegionRelease(options);
