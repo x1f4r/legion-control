@@ -81,6 +81,10 @@ fn main() -> ExitCode {
                 )
             },
         ),
+        (
+            "define_and_list_document_effect_honesty_and_execution_mode",
+            || Box::pin(define_and_list_document_effect_honesty_and_execution_mode()),
+        ),
     ];
     support::main(tests)
 }
@@ -237,7 +241,9 @@ async fn define_show_list_replace_and_remove_lifecycle() {
 
     // Initially empty.
     let listed = fixture.call("ext.list", json!({})).await.unwrap();
-    assert_eq!(listed, json!({"tools": [], "broken": []}));
+    assert_eq!(listed["tools"], json!([]));
+    assert_eq!(listed["broken"], json!([]));
+    assert!(listed["note"].as_str().unwrap().contains("read"));
 
     // Define an extension.
     let created = fixture
@@ -286,6 +292,7 @@ async fn define_show_list_replace_and_remove_lifecycle() {
     assert_eq!(listed["tools"].as_array().unwrap().len(), 1);
     assert_eq!(listed["tools"][0]["name"], json!("gpu.free"));
     assert_eq!(listed["tools"][0]["effect"], json!("read"));
+    assert_eq!(listed["tools"][0]["mode"], json!("run"));
     assert_eq!(listed["tools"][0]["params"], json!(["index"]));
     assert_eq!(listed["broken"], json!([]));
 
@@ -1096,4 +1103,62 @@ async fn oversized_string_args_are_refused_by_default_and_passed_on_stdin_when_o
     assert_eq!(out["payload_starts_with"], json!("HEAD--"));
     assert_eq!(out["payload_ends_with"], json!("--TAIL"));
     assert_eq!(out["tag"], json!("ok"));
+}
+
+async fn define_and_list_document_effect_honesty_and_execution_mode() {
+    let fixture = Fixture::new();
+
+    let define_desc = fixture.node.spec("ext.define").unwrap().description;
+    assert!(
+        define_desc.contains("declared `read`")
+            && define_desc.contains("every role that may read")
+            && define_desc.contains("honestly"),
+        "{define_desc}"
+    );
+
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "mode.direct",
+                "description": "Runs directly.",
+                "effect": "read",
+                "run": helper_argv("print", &["{\"ok\":true}"])
+            }),
+        )
+        .await
+        .unwrap();
+    fixture
+        .call(
+            "ext.define",
+            json!({
+                "name": "mode.shell",
+                "description": "Runs through the shell.",
+                "effect": "exec",
+                "cmd": helper_shell_cmd("inspect")
+            }),
+        )
+        .await
+        .unwrap();
+
+    let listed = fixture.call("ext.list", json!({})).await.unwrap();
+    let note = listed["note"].as_str().unwrap();
+    assert!(
+        note.contains("declared `read`")
+            && note.contains("every role that may read")
+            && note.contains("honestly"),
+        "{note}"
+    );
+
+    let tools = listed["tools"].as_array().unwrap();
+    let direct = tools
+        .iter()
+        .find(|t| t["name"] == json!("mode.direct"))
+        .unwrap();
+    let shell = tools
+        .iter()
+        .find(|t| t["name"] == json!("mode.shell"))
+        .unwrap();
+    assert_eq!(direct["mode"], json!("run"));
+    assert_eq!(shell["mode"], json!("cmd"));
 }

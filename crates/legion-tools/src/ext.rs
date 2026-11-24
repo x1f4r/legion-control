@@ -31,12 +31,15 @@ use self::store::{ExtensionStore, load_snapshot};
 /// How long `ext.define` or `ext.remove` waits for a concurrent write to finish.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One-sentence policy reminder shown in `ext.define`'s description and `ext.list`'s output.
+const EFFECT_HONESTY_NOTE: &str = "A tool declared `read` is callable by every role that may read, whatever its command does, so declare each tool's effect honestly.";
+
 /// Adds the `ext` management tools and registers the reloadable `tools.d` extension source.
 pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "ext.list",
         Effect::Read,
-        "List extension tools loaded from tools.d/ along with any broken files that failed to parse or validate.",
+        "List extension tools loaded from tools.d/ with each tool's declared effect and execution mode (`run` directly or `cmd` through the shell), along with any broken files that failed to parse or validate.",
         list,
     );
     registry.add_fn(
@@ -48,7 +51,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "ext.define",
         Effect::Admin,
-        "Define or replace an extension tool in tools.d/<name>.toml. This creates a command that other callers allowed the declared effect will be able to run, so set effect honestly to match what the command does. Give `run` (exact argv) or `cmd` (platform shell line), never both; caller arguments are never spliced into the command and arrive only as `LEGION_ARG_<NAME>` environment variables (upper-cased) and as one JSON object on stdin, alongside `LEGION_TOOL`, `LEGION_PRINCIPAL` and `LEGION_NODE`. Refuses to overwrite an existing extension unless `replace` is true, and refuses built-in names or reserved Legion families.",
+        "Define or replace an extension tool in tools.d/<name>.toml. A tool declared `read` is callable by every role that may read, whatever its command does, so declare each tool's effect honestly. Give `run` (exact argv) or `cmd` (platform shell line), never both; caller arguments are never spliced into the command and arrive only as `LEGION_ARG_<NAME>` environment variables (upper-cased) and as one JSON object on stdin, alongside `LEGION_TOOL`, `LEGION_PRINCIPAL` and `LEGION_NODE`. Refuses to overwrite an existing extension unless `replace` is true, and refuses built-in names or reserved Legion families.",
         define,
     );
     registry.add_fn(
@@ -94,6 +97,7 @@ impl From<EffectArg> for Effect {
 /// What `ext.list` returns.
 #[derive(Debug, Serialize)]
 struct Listing {
+    note: &'static str,
     tools: Vec<ListedTool>,
     broken: Vec<ListedBroken>,
 }
@@ -103,6 +107,7 @@ struct ListedTool {
     name: String,
     description: String,
     effect: Effect,
+    mode: &'static str,
     file: String,
     params: Vec<String>,
 }
@@ -124,12 +129,20 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<Listing, ToolError> {
     let tools = snapshot
         .tools
         .into_values()
-        .map(|loaded| ListedTool {
-            name: loaded.def.name,
-            description: loaded.def.description,
-            effect: loaded.def.effect,
-            file: loaded.file.display().to_string(),
-            params: loaded.def.params.keys().cloned().collect(),
+        .map(|loaded| {
+            let mode = if loaded.def.cmd.is_some() {
+                "cmd"
+            } else {
+                "run"
+            };
+            ListedTool {
+                name: loaded.def.name,
+                description: loaded.def.description,
+                effect: loaded.def.effect,
+                mode,
+                file: loaded.file.display().to_string(),
+                params: loaded.def.params.keys().cloned().collect(),
+            }
         })
         .collect();
     let broken = snapshot
@@ -141,7 +154,11 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<Listing, ToolError> {
             line: item.line,
         })
         .collect();
-    Ok(Listing { tools, broken })
+    Ok(Listing {
+        note: EFFECT_HONESTY_NOTE,
+        tools,
+        broken,
+    })
 }
 
 /// Arguments of `ext.show`.
