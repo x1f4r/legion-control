@@ -2060,8 +2060,10 @@ async fn size_caps_and_reply_byte_budgets_protect_write_edit_read_list_find_and_
     // `fs.list` and `fs.find` enforce the 1 MiB reply budget before hitting `limit: 5000`.
     let many = f.work.join("budget");
     std::fs::create_dir_all(&many).unwrap();
-    let pad = "a".repeat(150);
-    let total_files = 3800usize;
+    // Names long enough that the listing passes the budget wherever the temporary directory is:
+    // the reply's size depends on the length of the path in front of them.
+    let pad = "a".repeat(220);
+    let total_files = 4500usize;
     for idx in 0..total_files {
         std::fs::File::create(many.join(format!("f_{idx:04}_{pad}.txt"))).unwrap();
     }

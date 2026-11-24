@@ -138,11 +138,7 @@ mod imp {
     }
 
     pub(super) fn open_append_create_new(path: &Path, _mode: Option<u32>) -> io::Result<File> {
-        OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create_new(true)
-            .open(path)
+        OpenOptions::new().append(true).create_new(true).open(path)
     }
 
     pub(super) fn symlink_is_dir(meta: &Metadata) -> bool {
