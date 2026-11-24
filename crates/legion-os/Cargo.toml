@@ -1,0 +1,28 @@
+[package]
+name = "legion-os"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Platform-specific process, file, and locking primitives for Legion"
+
+[dependencies]
+process-wrap = { version = "10.0.1", default-features = false, features = ["tokio1", "std", "process-group", "process-session", "job-object", "creation-flags", "kill-on-drop"] }
+sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["fs", "io-util", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7.20", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.1", default-features = false, features = ["process", "signal"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", default-features = false, features = ["Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal"] }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = false
