@@ -695,6 +695,65 @@ async fn execute_action(
                             return Err(error);
                         }
                     } else {
+                        // After stopping a service that was active, wait a settle window and read
+                        // again so a job that launchd or systemd respawned is reported as still
+                        // running rather than falsely confirmed stopped.
+                        if matches!(previous_state, ServiceState::Running | ServiceState::Other)
+                            && !wait.settle.is_zero()
+                        {
+                            tokio::select! {
+                                biased;
+                                () = ctx.cancelled() => {
+                                    return Err(ErrorBody::new(
+                                        ErrorCode::Cancelled,
+                                        format!(
+                                            "The call to svc.stop was cancelled while confirming {canonical:?} stayed stopped."
+                                        ),
+                                    ));
+                                }
+                                () = tokio::time::sleep(wait.settle) => {}
+                            }
+                            match backend.status(ctx, &canonical, scope).await {
+                                Ok(settled) if settled.state == ServiceState::Running => {
+                                    return Err(ErrorBody::new(
+                                        ErrorCode::Failed,
+                                        format!(
+                                            "Service {canonical:?} in the {} scope restarted itself after stop and is still `running`.",
+                                            scope.as_str()
+                                        ),
+                                    )
+                                    .with_hint(
+                                        "The service manager automatically respawned this service (such as launchd KeepAlive or systemd Restart=always); unload or disable automatic restart before stopping it.",
+                                    )
+                                    .with_details(json!({
+                                        "name": canonical,
+                                        "scope": scope,
+                                        "state": settled.state,
+                                        "previous_state": previous_state,
+                                        "pid": settled.pid,
+                                    })));
+                                }
+                                Ok(settled) => {
+                                    return Ok(ActionResult {
+                                        name: settled.name,
+                                        scope,
+                                        state: settled.state,
+                                        previous_state,
+                                        note: None,
+                                    });
+                                }
+                                Err(err) if err.code == ErrorCode::NotFound => {
+                                    return Ok(ActionResult {
+                                        name: canonical,
+                                        scope,
+                                        state: ServiceState::Stopped,
+                                        previous_state,
+                                        note: None,
+                                    });
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
                         return Ok(ActionResult {
                             name: now.name,
                             scope,
@@ -1689,6 +1748,27 @@ mod tests {
                     .is_some_and(|n| n.contains("ran and exited")),
                 "{ran_once:?}"
             );
+
+            // Stopping a service that briefly reports stopped but is respawned during settle
+            // fails and tells the caller it is still running.
+            let respawn = FakeBackend::new(BackendKind::Launchd, true);
+            respawn.push_status(Scope::User, "com.example.keepalive", ServiceState::Running);
+            respawn.push_status(Scope::User, "com.example.keepalive", ServiceState::Stopped);
+            respawn.push_status(Scope::User, "com.example.keepalive", ServiceState::Running);
+            let err = execute_action(
+                &respawn,
+                ctx,
+                "com.example.keepalive",
+                Some(Scope::User),
+                Action::Stop,
+                false,
+                fast,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed);
+            assert!(err.message.contains("still `running`"), "{}", err.message);
+            assert!(err.hint.as_deref().unwrap_or("").contains("KeepAlive"));
 
             Ok(json!({}))
         }

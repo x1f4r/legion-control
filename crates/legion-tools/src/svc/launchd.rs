@@ -6,11 +6,11 @@
 //! returns `unsupported` with a `log show` hint otherwise.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use legion_core::proto::{ErrorBody, ErrorCode};
-use legion_core::{BoxFuture, Ctx};
+use legion_core::{BoxFuture, CancellationToken, Ctx};
 use serde_json::{Value, json};
 
 use super::backend::{
@@ -80,7 +80,14 @@ impl Backend for Launchd {
             let cmd = print_service_cmd(&domain, name);
             let out = run_cmd(ctx, &cmd, QUERY_TIMEOUT, QUERY_CAPTURE_LIMIT).await?;
             if !out.success() {
-                return Err(classify_print_error(&out.stderr.text, name, scope));
+                let err = classify_print_error(&out.stderr.text, name, scope);
+                if err.code == ErrorCode::NotFound {
+                    let dirs = plist_search_dirs(scope, ctx.paths().home());
+                    if let Some(plist) = find_plist_in_dirs(name, &dirs) {
+                        return Ok(unloaded_status(name, scope, &domain, &plist));
+                    }
+                }
+                return Err(err);
             }
             parse_print(&out.stdout.text, name, scope, &domain)
         })
@@ -96,36 +103,88 @@ impl Backend for Launchd {
     ) -> BoxFuture<'a, Result<(), ErrorBody>> {
         Box::pin(async move {
             let domain = resolve_domain(ctx, scope).await?;
-            let cmd = match action {
-                Action::Start => kickstart_cmd(&domain, name, false, scope, use_sudo),
-                Action::Restart => kickstart_cmd(&domain, name, true, scope, use_sudo),
+            let current = self.status(ctx, name, scope).await.ok();
+            let loaded = current
+                .as_ref()
+                .and_then(|st| st.detail.get("loaded").and_then(Value::as_bool))
+                .unwrap_or(true);
+            let plist_path = current
+                .as_ref()
+                .and_then(|st| st.detail.get("path").and_then(Value::as_str))
+                .map(str::to_owned);
+            let keep_alive = current
+                .as_ref()
+                .and_then(|st| st.detail.get("keep_alive").and_then(Value::as_bool))
+                .unwrap_or(false);
+
+            match action {
+                Action::Start | Action::Restart => {
+                    if !loaded {
+                        let Some(plist) = plist_path.as_deref() else {
+                            return Err(ErrorBody::new(
+                                ErrorCode::NotFound,
+                                format!(
+                                    "launchd service {name:?} is not loaded and no plist was found in the {} scope.",
+                                    scope.as_str()
+                                ),
+                            )
+                            .with_hint(
+                                "Place the service's plist in LaunchAgents (user) or LaunchDaemons (system) before starting it.",
+                            ));
+                        };
+                        let boot = bootstrap_cmd(&domain, plist, scope, use_sudo);
+                        let out = run_cmd(ctx, &boot, ACTION_TIMEOUT, QUERY_CAPTURE_LIMIT).await?;
+                        if !out.success() {
+                            return Err(classify_error(
+                                &out.stderr.text,
+                                scope,
+                                Some((action, name)),
+                                use_sudo,
+                                &format!("bootstrap service {name:?}"),
+                            ));
+                        }
+                    }
+                    // `kickstart` without `-k` starts a newly bootstrapped job that lacks
+                    // `RunAtLoad` without killing one that already started on bootstrap;
+                    // `restart` always passes `-k` for a fresh instance.
+                    let kill_existing = action == Action::Restart;
+                    let cmd = kickstart_cmd(&domain, name, kill_existing, scope, use_sudo);
+                    let out = run_cmd(ctx, &cmd, ACTION_TIMEOUT, QUERY_CAPTURE_LIMIT).await?;
+                    if !out.success() {
+                        return Err(classify_error(
+                            &out.stderr.text,
+                            scope,
+                            Some((action, name)),
+                            use_sudo,
+                            &format!("{} service {name:?}", action.as_str()),
+                        ));
+                    }
+                    Ok(())
+                }
                 Action::Stop => {
-                    // Check whether the service has KeepAlive enabled; if so, `kill SIGTERM`
-                    // would cause launchd to respawn it immediately, so `bootout` is needed.
-                    let keep_alive = self
-                        .status(ctx, name, scope)
-                        .await
-                        .ok()
-                        .and_then(|st| st.detail.get("keep_alive").and_then(Value::as_bool))
-                        .unwrap_or(false);
-                    if keep_alive {
+                    if !loaded {
+                        return Ok(());
+                    }
+                    // KeepAlive jobs (unconditional or conditional via semaphores) respawn
+                    // immediately on `kill SIGTERM`, so stop must unload them with `bootout`.
+                    let cmd = if keep_alive {
                         bootout_cmd(&domain, name, scope, use_sudo)
                     } else {
                         kill_cmd(&domain, name, scope, use_sudo)
+                    };
+                    let out = run_cmd(ctx, &cmd, ACTION_TIMEOUT, QUERY_CAPTURE_LIMIT).await?;
+                    if !out.success() {
+                        return Err(classify_error(
+                            &out.stderr.text,
+                            scope,
+                            Some((action, name)),
+                            use_sudo,
+                            &format!("{} service {name:?}", action.as_str()),
+                        ));
                     }
+                    Ok(())
                 }
-            };
-            let out = run_cmd(ctx, &cmd, ACTION_TIMEOUT, QUERY_CAPTURE_LIMIT).await?;
-            if !out.success() {
-                return Err(classify_error(
-                    &out.stderr.text,
-                    scope,
-                    Some((action, name)),
-                    use_sudo,
-                    &format!("{} service {name:?}", action.as_str()),
-                ));
             }
-            Ok(())
         })
     }
 
@@ -163,14 +222,16 @@ impl Backend for Launchd {
                 return Err(unsupported_logs_error(name));
             }
 
-            let collected = tokio::task::spawn_blocking(move || read_log_tails(&paths, lines))
-                .await
-                .map_err(|error| {
-                    ErrorBody::new(
-                        ErrorCode::Internal,
-                        format!("Reading launchd log files stopped unexpectedly: {error}."),
-                    )
-                })??;
+            let cancel = ctx.cancel_token().clone();
+            let collected =
+                tokio::task::spawn_blocking(move || read_log_tails(&paths, lines, &cancel))
+                    .await
+                    .map_err(|error| {
+                        ErrorBody::new(
+                            ErrorCode::Internal,
+                            format!("Reading launchd log files stopped unexpectedly: {error}."),
+                        )
+                    })??;
             Ok(collected)
         })
     }
@@ -273,7 +334,6 @@ pub(crate) fn bootout_cmd(domain: &str, label: &str, scope: Scope, use_sudo: boo
 }
 
 /// Builds `[sudo -n] launchctl bootstrap <domain> <plist_path>`.
-#[allow(dead_code)]
 pub(crate) fn bootstrap_cmd(
     domain: &str,
     plist_path: &str,
@@ -285,6 +345,77 @@ pub(crate) fn bootstrap_cmd(
         cmd.with_sudo_n()
     } else {
         cmd
+    }
+}
+
+/// Standard launchd plist search directories for `scope`, in priority order.
+pub(crate) fn plist_search_dirs(scope: Scope, home: Option<&Path>) -> Vec<PathBuf> {
+    match scope {
+        Scope::User => {
+            let mut dirs = Vec::new();
+            if let Some(home) = home {
+                dirs.push(home.join("Library").join("LaunchAgents"));
+            }
+            dirs.push(PathBuf::from("/Library/LaunchAgents"));
+            dirs.push(PathBuf::from("/System/Library/LaunchAgents"));
+            dirs
+        }
+        Scope::System => vec![
+            PathBuf::from("/Library/LaunchDaemons"),
+            PathBuf::from("/System/Library/LaunchDaemons"),
+        ],
+    }
+}
+
+/// Finds the plist file for `label` in `dirs`, checking `<label>.plist` first and falling back
+/// to scanning XML `.plist` files for a matching `<key>Label</key>`.
+pub(crate) fn find_plist_in_dirs(label: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let direct_name = format!("{label}.plist");
+    for dir in dirs {
+        let candidate = dir.join(&direct_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten().take(512) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("plist") || !path.is_file() {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && extract_plist_string(&text, "Label").as_deref() == Some(label)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn unloaded_status(label: &str, scope: Scope, domain: &str, plist: &Path) -> BackendStatus {
+    let mut detail = BTreeMap::new();
+    detail.insert("domain".to_owned(), Value::String(domain.to_owned()));
+    detail.insert("loaded".to_owned(), Value::Bool(false));
+    detail.insert(
+        "path".to_owned(),
+        Value::String(plist.to_string_lossy().into_owned()),
+    );
+    BackendStatus {
+        name: label.to_owned(),
+        scope,
+        state: ServiceState::Stopped,
+        enabled: None,
+        pid: None,
+        since: None,
+        instance_id: None,
+        oneshot_completed: false,
+        description: None,
+        exit_code: None,
+        detail,
     }
 }
 
@@ -374,11 +505,14 @@ pub(crate) fn parse_print(
     let mut stdout_path: Option<String> = None;
     let mut stderr_path: Option<String> = None;
     let mut svc_type: Option<String> = None;
+    let mut properties: Option<String> = None;
     let mut keep_alive = false;
+    let mut in_semaphores = false;
 
     // Only parse top-level key = value lines inside the service block (depth == 1) so nested
     // blocks like `environment = { ... }` cannot shadow top-level fields. Also verify the header
-    // line names the exact requested label.
+    // line names the exact requested label, and detect conditional KeepAlive inside
+    // `semaphores = { ... }`.
     let mut depth: usize = 0;
     for raw in text.lines() {
         let line = raw.trim();
@@ -399,14 +533,27 @@ pub(crate) fn parse_print(
                     .with_hint("Give the exact launchd service label as shown by `svc.list`."));
                 }
             }
-            if depth == 1 && line.starts_with("keepalive") {
-                keep_alive = true;
+            if depth == 1 {
+                if line.starts_with("keepalive") {
+                    keep_alive = true;
+                } else if line.starts_with("semaphores") {
+                    in_semaphores = true;
+                }
             }
             depth += 1;
             continue;
         }
         if line == "}" {
             depth = depth.saturating_sub(1);
+            if depth <= 1 {
+                in_semaphores = false;
+            }
+            continue;
+        }
+        if in_semaphores && depth == 2 {
+            // Any entry inside `semaphores = { ... }` (such as `successful exit => 0` or
+            // `crashed => 1`) represents a conditional KeepAlive policy.
+            keep_alive = true;
             continue;
         }
         if depth != 1 {
@@ -431,6 +578,15 @@ pub(crate) fn parse_print(
             "stdout path" => stdout_path = Some(val.to_owned()),
             "stderr path" => stderr_path = Some(val.to_owned()),
             "type" => svc_type = Some(val.to_owned()),
+            "properties" => {
+                properties = Some(val.to_owned());
+                if val
+                    .split('|')
+                    .any(|flag| flag.trim().eq_ignore_ascii_case("keepalive"))
+                {
+                    keep_alive = true;
+                }
+            }
             "keep alive" | "keepalive" => {
                 keep_alive = val == "true" || val == "1";
             }
@@ -450,6 +606,7 @@ pub(crate) fn parse_print(
 
     let mut detail = BTreeMap::new();
     detail.insert("domain".to_owned(), Value::String(domain.to_owned()));
+    detail.insert("loaded".to_owned(), Value::Bool(true));
     if let Some(s) = raw_state {
         detail.insert("launchd_state".to_owned(), Value::String(s));
     }
@@ -458,6 +615,9 @@ pub(crate) fn parse_print(
     }
     if let Some(t) = svc_type {
         detail.insert("type".to_owned(), Value::String(t));
+    }
+    if let Some(p) = properties {
+        detail.insert("properties".to_owned(), Value::String(p));
     }
     if let Some(r) = runs {
         detail.insert("runs".to_owned(), json!(r));
@@ -492,32 +652,46 @@ pub(crate) fn parse_print(
     })
 }
 
+/// Extracts a `<string>` value for `key` from an XML `.plist` document.
+fn extract_plist_string(plist_xml: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let idx = plist_xml.find(&needle)?;
+    let after = &plist_xml[idx + needle.len()..];
+    let start = after.find("<string>")?;
+    let value_start = &after[start + "<string>".len()..];
+    let end = value_start.find("</string>")?;
+    let val = value_start[..end].trim();
+    (!val.is_empty()).then(|| val.to_owned())
+}
+
 /// Extracts `StandardOutPath` and `StandardErrorPath` from an XML launchd `.plist` document.
 pub(crate) fn extract_plist_log_paths(plist_xml: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for key in ["StandardOutPath", "StandardErrorPath"] {
-        let needle = format!("<key>{key}</key>");
-        if let Some(idx) = plist_xml.find(&needle) {
-            let after = &plist_xml[idx + needle.len()..];
-            if let Some(start) = after.find("<string>") {
-                let value_start = &after[start + "<string>".len()..];
-                if let Some(end) = value_start.find("</string>") {
-                    let path = value_start[..end].trim();
-                    if !path.is_empty() && !paths.iter().any(|p| p == path) {
-                        paths.push(path.to_owned());
-                    }
-                }
-            }
+        if let Some(path) = extract_plist_string(plist_xml, key)
+            && !paths.iter().any(|p| p == &path)
+        {
+            paths.push(path);
         }
     }
     paths
 }
 
-fn read_log_tails(paths: &[String], limit: usize) -> Result<BackendLogs, ErrorBody> {
+fn read_log_tails(
+    paths: &[String],
+    limit: usize,
+    cancel: &CancellationToken,
+) -> Result<BackendLogs, ErrorBody> {
     let mut lines = Vec::new();
     let mut truncated = false;
     let mut read_any = false;
     for path_str in paths {
+        if cancel.is_cancelled() {
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                "The call to svc.logs was cancelled while reading launchd log files.",
+            ));
+        }
         let path = Path::new(path_str);
         let Ok(meta) = std::fs::metadata(path) else {
             continue;
@@ -859,7 +1033,8 @@ gui/501/com.example.task = {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("worker.log");
         std::fs::write(&log_path, "first\nsecond\nthird\nfourth\n").unwrap();
-        let out = read_log_tails(&[log_path.to_string_lossy().into_owned()], 2).unwrap();
+        let cancel = CancellationToken::new();
+        let out = read_log_tails(&[log_path.to_string_lossy().into_owned()], 2, &cancel).unwrap();
         assert!(out.truncated);
         assert_eq!(out.lines, ["third", "fourth"]);
 
@@ -870,8 +1045,86 @@ gui/501/com.example.task = {
                 .to_string_lossy()
                 .into_owned()],
             10,
+            &cancel,
         )
         .unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn parse_print_detects_keepalive_from_properties_and_semaphores() {
+        let via_properties = "\
+gui/501/com.example.daemon = {
+    type = LaunchAgent
+    state = running
+    pid = 100
+    properties = keepalive | runatload | inferred program
+}
+";
+        let st = parse_print(via_properties, "com.example.daemon", Scope::User, "gui/501").unwrap();
+        assert_eq!(st.detail.get("keep_alive"), Some(&json!(true)));
+        assert_eq!(st.detail.get("loaded"), Some(&json!(true)));
+
+        let via_semaphores = "\
+gui/501/com.example.cond = {
+    type = LaunchAgent
+    state = running
+    pid = 101
+    properties = runatload
+    semaphores = {
+        successful exit => 0
+    }
+}
+";
+        let st = parse_print(via_semaphores, "com.example.cond", Scope::User, "gui/501").unwrap();
+        assert_eq!(st.detail.get("keep_alive"), Some(&json!(true)));
+
+        let empty_semaphores = "\
+gui/501/com.example.plain = {
+    type = LaunchAgent
+    state = running
+    pid = 102
+    properties = runatload
+    semaphores = {
+    }
+}
+";
+        let st = parse_print(
+            empty_semaphores,
+            "com.example.plain",
+            Scope::User,
+            "gui/501",
+        )
+        .unwrap();
+        assert_eq!(st.detail.get("keep_alive"), None);
+    }
+
+    #[test]
+    fn find_plist_in_dirs_matches_filename_and_xml_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("Library").join("LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+
+        let direct = agents.join("com.example.direct.plist");
+        std::fs::write(&direct, "<plist><dict/></plist>").unwrap();
+
+        let renamed = agents.join("custom-name.plist");
+        std::fs::write(
+            &renamed,
+            "<plist><dict><key>Label</key><string>com.example.renamed</string></dict></plist>",
+        )
+        .unwrap();
+
+        let dirs = plist_search_dirs(Scope::User, Some(dir.path()));
+        assert_eq!(dirs[0], agents);
+        assert_eq!(
+            find_plist_in_dirs("com.example.direct", &dirs).as_deref(),
+            Some(direct.as_path())
+        );
+        assert_eq!(
+            find_plist_in_dirs("com.example.renamed", &dirs).as_deref(),
+            Some(renamed.as_path())
+        );
+        assert_eq!(find_plist_in_dirs("com.example.absent", &dirs), None);
     }
 }
