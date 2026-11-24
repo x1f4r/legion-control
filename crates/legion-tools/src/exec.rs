@@ -6,6 +6,9 @@
 //! [`KILL_GRACE`], within the [`CANCEL_GRACE`] the node waits for, and only then does the tool
 //! return. The run is spawned onto the runtime so that a future dropped anyway (the grace ran out,
 //! the session ended) cannot take the run with it half way and leave descendants behind.
+//!
+//! Its result follows the rule `sys` states for both families: a field without a value is left
+//! out, never `null`.
 
 mod text;
 
@@ -267,6 +270,12 @@ fn command_of(
         (Some(_), Some(_)) => Err(invalid("give `cmd` or `argv`, not both.")),
         (None, None) => Err(invalid("give the command to run, as `cmd` or `argv`.")),
         (Some(cmd), None) if cmd.trim().is_empty() => Err(invalid("`cmd` is empty.")),
+        (Some(cmd), None) if cmd.contains('\0') => Err(invalid(
+            "`cmd` holds a NUL character, which no command line can carry.",
+        )),
+        (None, Some(argv)) if argv.iter().any(|arg| arg.contains('\0')) => Err(invalid(
+            "an argument in `argv` holds a NUL character, which no command line can carry.",
+        )),
         (Some(cmd), None) => {
             let program = cmd.split_whitespace().next().unwrap_or_default().to_owned();
             Ok((CommandSpec::shell(cmd), program))
@@ -369,6 +378,10 @@ fn run_error(error: OsError, program: &str, cwd: Option<&std::path::Path>) -> Er
             )
             .with_hint("Give a directory as `cwd`.")
         }
+        OsError::Unsupported { detail } => ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("This system cannot run {program}: {detail}."),
+        ),
         OsError::PermissionDenied { detail, .. } => ErrorBody::new(
             ErrorCode::Failed,
             format!("The system refused to run {program}: {detail}."),
@@ -408,6 +421,22 @@ mod tests {
             code(command_of(None, Some(vec![String::new()]))).err(),
             Some(ErrorCode::InvalidArgs)
         );
+        assert_eq!(
+            code(command_of(None, Some(vec!["git".into(), "a\0b".into()]))).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            code(command_of(Some("echo a\0b".into()), None)).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        let unsupported = run_error(
+            OsError::Unsupported {
+                detail: "no shell".into(),
+            },
+            "x",
+            None,
+        );
+        assert_eq!(unsupported.code, ErrorCode::Unsupported);
         let (spec, program) = command_of(None, Some(vec!["git".into(), "a b".into()])).unwrap();
         assert_eq!(spec, CommandSpec::argv("git", ["a b"]));
         assert_eq!(program, "git");

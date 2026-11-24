@@ -86,6 +86,13 @@ async fn argv_runs_exactly_and_reports_the_exit_code() {
     assert_eq!(ran["timed_out"], json!(false));
     assert!(ran["duration_ms"].is_u64());
     assert!(ran.get("signal").is_none());
+    // Optional fields are left out, never null.
+    assert!(
+        ran.as_object()
+            .unwrap()
+            .values()
+            .all(|value| !value.is_null())
+    );
 
     let failed = fixture
         .call(
@@ -353,6 +360,7 @@ async fn what_cannot_run_fails_with_a_closed_code() {
         json!({"cmd": "echo hi", "timeout_s": 0}),
         json!({"cmd": "echo hi", "timeout_s": 3601}),
         json!({"cmd": "echo hi", "cwd": "relative/dir"}),
+        json!({"argv": ["x", "a\0b"]}),
     ] {
         let error = fixture.call("exec.run", wrong.clone()).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgs, "{wrong}");

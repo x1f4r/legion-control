@@ -79,6 +79,8 @@ async fn info_describes_the_machine() {
     }
     assert!(info["gpus"].is_array());
 
+    assert_no_nulls(&info);
+
     let error = fixture
         .call("sys.info", json!({"verbose": true}))
         .await
@@ -109,6 +111,8 @@ async fn procs_finds_this_process_and_respects_its_limits() {
     assert!(me["cmd"].as_str().unwrap().chars().count() <= 301, "{me}");
     let start: jiff::Timestamp = me["start_time"].as_str().unwrap().parse().unwrap();
     assert!(start <= jiff::Timestamp::now());
+
+    assert_no_nulls(&found);
 
     let busiest = fixture
         .call("sys.procs", json!({"limit": 1}))
@@ -367,4 +371,19 @@ async fn procs_hides_secrets_in_command_lines() {
     assert_eq!(probed["total"], json!(0), "{probed:#}");
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// Optional fields are left out, never `null`.
+fn assert_no_nulls(value: &Value) {
+    match value {
+        Value::Null => panic!("a result holds null"),
+        Value::Array(items) => items.iter().for_each(assert_no_nulls),
+        Value::Object(map) => {
+            for (key, value) in map {
+                assert!(!value.is_null(), "`{key}` is null");
+                assert_no_nulls(value);
+            }
+        }
+        _ => {}
+    }
 }

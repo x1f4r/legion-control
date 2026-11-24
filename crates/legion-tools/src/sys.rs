@@ -4,6 +4,10 @@
 //! kernel, so every read runs on the blocking pool and the async runtime keeps serving other
 //! calls. CPU usage is a rate, which takes two samples a short interval apart; the interval is
 //! awaited on the runtime between two blocking reads rather than slept through on a thread.
+//!
+//! One rule for every result of the `sys` and `exec` families: a field that may have no value is
+//! left out when it has none, never sent as `null`, so a caller tests for presence and never for
+//! both.
 
 mod disks;
 mod gpu;
@@ -13,6 +17,7 @@ use std::time::Duration;
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Ctx, NoArgs, Registry, ToolError, audit};
+use legion_os::OsError;
 use legion_os::procid::{self, ProcessId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -60,12 +65,14 @@ pub struct Info {
     /// The node's name.
     pub node: String,
     /// The host name the operating system reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     /// The operating system.
     pub os: Os,
     /// Seconds since the machine booted.
     pub uptime_s: u64,
     /// An identifier that changes on every boot, so a reboot can be told apart from a dropped link.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
     /// The processor.
     pub cpu: Cpu,
@@ -83,10 +90,13 @@ pub struct Os {
     /// `linux`, `macos` or `windows`.
     pub family: &'static str,
     /// The system's own name for itself, such as a Linux distribution's.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Its version.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// The kernel's version.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
     /// The CPU architecture, such as `x86_64` or `aarch64`.
     pub arch: &'static str,
@@ -242,6 +252,7 @@ pub struct Proc {
     /// Its process id.
     pub pid: u32,
     /// Its parent's, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ppid: Option<u32>,
     /// The program's name.
     pub name: String,
@@ -256,8 +267,10 @@ pub struct Proc {
     pub cpu_pct: f64,
     /// Resident memory, in bytes.
     pub memory: u64,
-    /// When it started, to the second. `sys.kill` takes it back to be sure of the process.
-    pub start_time: String,
+    /// When it started, to the second, when the system says. `sys.kill` takes it back to be sure
+    /// of the process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
 }
 
 /// The default and the largest `limit` of `sys.procs`.
@@ -437,19 +450,31 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     if protection.is_some() {
         return Err(protected(pid, protection));
     }
-    if let Some(expected) = expected
-        && expected != started
-    {
-        return Err(ErrorBody::new(
-            ErrorCode::Conflict,
-            format!(
-                "Process {pid} started at {}, not at {}: the process that had this id has exited and the id was reused, so nothing was stopped.",
-                rfc3339(started),
-                rfc3339(expected)
-            ),
-        )
-        .with_hint("Look the process up again with sys.procs before stopping it.")
-        .with_details(json!({"pid": pid, "start_time": rfc3339(started)})));
+    if let Some(expected) = expected {
+        let Some(started) = started else {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("The system does not say when process {pid} started, so it cannot be checked against the start_time given, and nothing was stopped."),
+            )
+            .with_hint("Call sys.kill without start_time if you are sure of the process.")
+            .with_details(json!({"pid": pid})));
+        };
+        if expected != started {
+            let mut details = json!({"pid": pid});
+            if let Some(time) = rfc3339(started) {
+                details["start_time"] = json!(time);
+            }
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "Process {pid} started at {}, not at {}: the process that had this id has exited and the id was reused, so nothing was stopped.",
+                    rfc3339(started).unwrap_or_default(),
+                    rfc3339(expected).unwrap_or_default(),
+                ),
+            )
+            .with_hint("Look the process up again with sys.procs before stopping it.")
+            .with_details(details));
+        }
     }
 
     let grace = if args.force {
@@ -460,9 +485,13 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     // The identity read above goes all the way down: legion-os checks it again at the moment it
     // signals, so a process that exits meanwhile and whose id is reused is never hit.
     let survivors = if args.tree {
-        let report = procid::kill_tree(&identity, grace)
-            .await
-            .map_err(|error| failed(&format!("stop process {pid} and its descendants"), &error))?;
+        let report = procid::kill_tree(&identity, grace).await.map_err(|error| {
+            os_error(
+                pid,
+                &format!("stop process {pid} and its descendants"),
+                error,
+            )
+        })?;
         report
             .survivors
             .iter()
@@ -471,7 +500,7 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     } else {
         let gone = procid::kill_process(&identity, args.force, grace)
             .await
-            .map_err(|error| failed(&format!("stop process {pid}"), &error))?;
+            .map_err(|error| os_error(pid, &format!("stop process {pid}"), error))?;
         if gone { Vec::new() } else { vec![pid] }
     };
     Ok(Killed {
@@ -493,15 +522,16 @@ fn protected(pid: u32, reason: Option<&str>) -> ErrorBody {
     .with_details(json!({"pid": pid, "reason": reason}))
 }
 
-/// The identity of a live process and when it started, in seconds since the epoch, or `None`
-/// when there is no such process.
+/// The identity of a live process and when it started, in seconds since the epoch where the
+/// system says, or `None` when there is no such process.
 ///
 /// The seconds are what `sys.procs` reports and a caller passes back; the identity is what
 /// legion-os stops by. Both are read for the same process: the identity is read before and after
 /// the start time, and a process that changed in between counts as gone.
-fn identify(pid: u32) -> Result<Option<(ProcessId, u64)>, ErrorBody> {
-    let read =
-        || procid::of_pid(pid).map_err(|error| failed(&format!("read process {pid}"), &error));
+fn identify(pid: u32) -> Result<Option<(ProcessId, Option<u64>)>, ErrorBody> {
+    let read = || {
+        procid::of_pid(pid).map_err(|error| os_error(pid, &format!("read process {pid}"), error))
+    };
     let Some(identity) = read()? else {
         return Ok(None);
     };
@@ -512,19 +542,45 @@ fn identify(pid: u32) -> Result<Option<(ProcessId, u64)>, ErrorBody> {
         true,
         ProcessRefreshKind::nothing(),
     );
-    let started = system.process(target).map(sysinfo::Process::start_time);
-    match (started, read()?) {
-        (Some(started), Some(again)) if again.matches(&identity) => Ok(Some((identity, started))),
+    let Some(process) = system.process(target) else {
+        return Ok(None);
+    };
+    let started = Some(process.start_time()).filter(|&seconds| seconds > 0);
+    match read()? {
+        Some(again) if again.matches(&identity) => Ok(Some((identity, started))),
         _ => Ok(None),
     }
 }
 
-/// Seconds since the epoch as RFC 3339 UTC.
-fn rfc3339(seconds: u64) -> String {
-    i64::try_from(seconds)
+/// What a failure to read or stop a process means for the caller. The system refusing for lack
+/// of permission is `denied`, whichever way the process was being stopped, and names the process.
+fn os_error(pid: u32, what: &str, error: OsError) -> ErrorBody {
+    match error {
+        OsError::PermissionDenied { .. } => ErrorBody::new(
+            ErrorCode::Denied,
+            format!("The system does not let legion {what}: it belongs to another account, or the system protects it."),
+        )
+        .with_hint("Stop it as the account it runs as, or as an administrator.")
+        .with_details(json!({"pid": pid})),
+        OsError::Unsupported { detail } => ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("This system cannot {what}: {detail}."),
+        )
+        .with_details(json!({"pid": pid})),
+        other => failed(what, &other),
+    }
+}
+
+/// Seconds since the epoch as RFC 3339 UTC. Zero is what the system says when it cannot tell, and
+/// is no time at all.
+fn rfc3339(seconds: u64) -> Option<String> {
+    if seconds == 0 {
+        return None;
+    }
+    let seconds = i64::try_from(seconds).ok()?;
+    jiff::Timestamp::from_second(seconds)
         .ok()
-        .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
-        .map_or_else(|| seconds.to_string(), |time| time.to_string())
+        .map(|time| time.to_string())
 }
 
 /// An RFC 3339 time as whole seconds since the epoch, the resolution `sys.procs` reports.
@@ -608,8 +664,34 @@ mod tests {
     }
 
     #[test]
+    fn refusals_by_the_system_are_denied_and_missing_abilities_unsupported() {
+        let denied = os_error(
+            42,
+            "stop process 42",
+            OsError::PermissionDenied {
+                detail: "kill".into(),
+                source: None,
+            },
+        );
+        assert_eq!(denied.code, ErrorCode::Denied);
+        assert_eq!(denied.details, Some(json!({"pid": 42})));
+        let unsupported = os_error(
+            42,
+            "stop process 42",
+            OsError::Unsupported {
+                detail: "no signals".into(),
+            },
+        );
+        assert_eq!(unsupported.code, ErrorCode::Unsupported);
+    }
+
+    #[test]
     fn start_times_round_trip_through_rfc_3339() {
-        assert_eq!(rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(
+            rfc3339(1_700_000_000).as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(rfc3339(0), None);
         assert_eq!(parse_rfc3339("2023-11-14T22:13:20Z"), Some(1_700_000_000));
         assert_eq!(
             parse_rfc3339("2023-11-14T23:13:20+01:00"),
