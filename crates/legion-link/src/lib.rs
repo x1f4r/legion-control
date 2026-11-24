@@ -108,6 +108,10 @@ pub const REASON_UNREACHABLE: &str = "unreachable";
 /// Structured `details.reason` when the remote side emits too much non-protocol output before
 /// answering `hello` (`code: "unreachable"`).
 pub const REASON_NON_PROTOCOL_OUTPUT: &str = "non_protocol_output";
+/// Structured `details` boolean key set to `false` when a [`Link`] request provably never left
+/// this device (failure to open a session or [`CallError::NotWritten`]). Absent when bytes were
+/// already written to the wire or when an error came back from the node.
+pub const DETAIL_SENT: &str = "sent";
 
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 #[cfg(feature = "ssh")]

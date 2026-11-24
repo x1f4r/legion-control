@@ -1,6 +1,6 @@
 // Pure JSON Schema form helpers and tool catalog grouping.
 
-import { firstSentence } from './format.js';
+import { firstSentence, formatBusyReasonLines } from './format.js';
 
 function baseType(prop) {
   if (!prop || typeof prop !== 'object') return 'json';
@@ -300,12 +300,12 @@ export function describeRoleAccess(whoami, tools) {
 export function describePowerConfirm(toolName, target, args = {}, runningJobs = [], busyReasons = []) {
   const machine = args?.machine || target || 'this machine';
   const jobs = Array.isArray(runningJobs) ? runningJobs : [];
-  const reasons = Array.isArray(busyReasons) ? busyReasons : [];
+  const reasonLines = formatBusyReasonLines(busyReasons);
 
   function interruptionSummary() {
     if (jobs.length === 1) return 'One job is running on it and will be interrupted.';
     if (jobs.length > 1) return `${jobs.length} jobs are running on it and will be interrupted.`;
-    if (reasons.length > 0) return `It is busy right now: ${reasons.join(', ')}.`;
+    if (reasonLines.length > 0) return `It is busy right now: ${reasonLines.join('; ')}.`;
     return 'Nothing is running on it.';
   }
 

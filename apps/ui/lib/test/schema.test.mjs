@@ -169,6 +169,20 @@ test('describePowerConfirm generates plain wording from tool, target, jobs, and 
   assert.equal(sleep.confirmLabel, 'Sleep');
   assert.match(sleep.summary, /render/);
 
+  const objBusy = describePowerConfirm(
+    'power.restart',
+    'studio',
+    {},
+    [],
+    [
+      { source: 'probe', name: 'agents', detail: 'busy: 123 worker' },
+      { source: 'probe', name: 'render', detail: 'frame 4/10' },
+    ],
+  );
+  assert.equal(objBusy.confirmLabel, 'Restart studio');
+  assert.equal(objBusy.summary, 'It is busy right now: agents: busy: 123 worker; render: frame 4/10.');
+  assert.ok(!objBusy.summary.includes('[object Object]'));
+
   const wake = describePowerConfirm('power.wake', 'tower', { machine: 'laptop' }, [], []);
   assert.equal(wake.title, 'Wake laptop?');
   assert.equal(wake.confirmLabel, 'Wake');

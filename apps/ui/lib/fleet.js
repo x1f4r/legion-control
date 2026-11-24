@@ -17,6 +17,16 @@ function makeTimeoutError(timeoutMs, machine) {
   };
 }
 
+function isPairingError(err) {
+  const reason = err?.details?.reason;
+  return (
+    err?.code === 'denied' &&
+    (reason === 'device_removed_or_unknown' ||
+      reason === 'auth_failed' ||
+      reason === 'host_key_mismatch')
+  );
+}
+
 /**
  * Calls a tool with an independent client-side timeout while respecting a parent AbortSignal.
  */
@@ -133,6 +143,7 @@ export function hydrateFleetCache(cached, expectedNode = null) {
       reason: null,
       error: null,
       busy: false,
+      busyState: null,
       busyReasons: [],
       runningJobs: 0,
       jobs: [],
@@ -167,6 +178,7 @@ function makeAskingEntry(name, isLocal, listed, prev) {
     reason: null,
     error: null,
     busy: keepLive ? Boolean(prev.busy) : false,
+    busyState: keepLive ? prev.busyState || null : null,
     busyReasons: keepLive ? prev.busyReasons || [] : [],
     runningJobs: keepLive ? prev.runningJobs || 0 : 0,
     jobs: keepLive ? prev.jobs || [] : [],
@@ -258,8 +270,15 @@ export async function refreshFleetProgressive({
     return next;
   }
 
+  let fatalError = null;
+  const capturePairingError = (fallback) => (err) => {
+    if (isPairingError(err) && !fatalError) fatalError = err;
+    return fallback;
+  };
+
   async function fetchMachineDetails(name, isLocal) {
     const on = isLocal ? undefined : name;
+    const onErr = isLocal ? capturePairingError(undefined) : () => {};
     const tasks = [
       callWithTimeout(link, 'sys.info', {}, { on, signal }, detailTimeoutMs)
         .then((sys) => {
@@ -278,7 +297,7 @@ export async function refreshFleetProgressive({
             sys,
           }));
         })
-        .catch(() => {}),
+        .catch(onErr),
       callWithTimeout(link, 'job.list', { state: 'running', limit: 50 }, { on, signal }, detailTimeoutMs)
         .then((res) => {
           if (signal?.aborted || !res) return;
@@ -287,22 +306,25 @@ export async function refreshFleetProgressive({
             ...prev,
             jobs,
             runningJobs: jobs.length,
-            busy: jobs.length > 0 || (prev.busyReasons?.length || 0) > 0,
+            busy: jobs.length > 0 || prev.busyState === 'busy' || (prev.busyReasons?.length || 0) > 0,
           }));
         })
-        .catch(() => {}),
+        .catch(onErr),
       callWithTimeout(link, 'power.status', {}, { on, signal }, detailTimeoutMs)
         .then((power) => {
           if (signal?.aborted || !power) return;
-          const busyReasons = power?.busy?.state === 'busy' ? power.busy.reasons || [] : [];
+          const busyState = typeof power?.busy?.state === 'string' ? power.busy.state : null;
+          const busyReasons =
+            busyState === 'busy' && Array.isArray(power.busy.reasons) ? power.busy.reasons : [];
           updateMachine(name, (prev) => ({
             ...prev,
             system: power.system || prev.system,
+            busyState,
             busyReasons,
-            busy: (prev.runningJobs || 0) > 0 || busyReasons.length > 0,
+            busy: (prev.runningJobs || 0) > 0 || busyState === 'busy',
           }));
         })
-        .catch(() => {}),
+        .catch(onErr),
     ];
 
     if (isLocal) {
@@ -322,7 +344,7 @@ export async function refreshFleetProgressive({
               version: ver.version || prev.version,
             }));
           })
-          .catch(() => {}),
+          .catch(onErr),
       );
     }
 
@@ -332,11 +354,12 @@ export async function refreshFleetProgressive({
   // Kick off local node details and fleet.list concurrently without waiting for any remote machine.
   const localPromise = fetchMachineDetails(here, true);
   const listPromise = callWithTimeout(link, 'fleet.list', {}, { signal }, detailTimeoutMs).catch(
-    () => ({ node: here, machines: [] }),
+    capturePairingError({ node: here, machines: [] }),
   );
 
   const fleetList = await listPromise;
   if (signal?.aborted) return null;
+  if (fatalError) throw fatalError;
 
   here = fleetList?.node || here;
   const listedMap = new Map();
@@ -408,6 +431,7 @@ export async function refreshFleetProgressive({
         jobs: [],
         runningJobs: 0,
         busy: false,
+        busyState: null,
         busyReasons: [],
       }));
       return;
@@ -434,6 +458,7 @@ export async function refreshFleetProgressive({
 
   await Promise.all([localPromise, remotesPromise]);
   if (signal?.aborted) return null;
+  if (fatalError) throw fatalError;
 
   activeCachedAt = null;
   const finalSnap = snapshot(true);

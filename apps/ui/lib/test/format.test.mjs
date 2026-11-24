@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  busyReasonLabel,
   clampPct,
   diskUsagePct,
   firstSentence,
+  formatBusyReasonLine,
+  formatBusyReasonLines,
+  formatBusyReasonsShort,
   formatBytePair,
   formatBytes,
   formatDuration,
   formatDurationMs,
   formatElapsed,
+  formatOfflineSubtext,
   formatRelativeTime,
   machineMetrics,
   meterLevel,
@@ -121,4 +126,58 @@ test('machineMetrics computes CPU, memory, disk, and GPU figures', () => {
   assert.equal(metrics.diskPct, 9);
   assert.equal(metrics.gpus.length, 1);
   assert.equal(metrics.gpus[0].pct, 69);
+});
+
+test('busy reason helpers format object, job, string, and empty reasons without [object Object]', () => {
+  const probe = { source: 'probe', name: 'agents', detail: 'busy: 1239887 worker' };
+  const probeTwo = { source: 'probe', name: 'render', detail: 'blender frame 42/120' };
+  const jobNamed = { source: 'job', name: 'cargo build --release', detail: 'exclusive job j-1' };
+  const jobCommand = { source: 'job', command: 'python3 train.py --epochs 50', id: 'j-2' };
+  const jobIdOnly = { source: 'job', id: 'j-3' };
+  const sourceOnly = { source: 'probe', detail: 'probe exited 0' };
+
+  assert.equal(busyReasonLabel(probe), 'agents');
+  assert.equal(busyReasonLabel(jobNamed), 'cargo build --release');
+  assert.equal(busyReasonLabel(jobCommand), 'python3 train.py --epochs 50');
+  assert.equal(busyReasonLabel(jobIdOnly), 'j-3');
+  assert.equal(busyReasonLabel(sourceOnly), 'probe');
+  assert.equal(busyReasonLabel('  render  '), 'render');
+  assert.equal(busyReasonLabel({}), '');
+  assert.equal(busyReasonLabel(null), '');
+
+  // List-row short phrase never includes raw detail or [object Object].
+  assert.equal(formatBusyReasonsShort([probe]), 'busy: agents');
+  assert.equal(formatBusyReasonsShort([probe, probeTwo]), 'busy: agents +1');
+  assert.equal(formatBusyReasonsShort([probe, probeTwo, jobNamed]), 'busy: agents +2');
+  assert.equal(formatBusyReasonsShort(['render']), 'busy: render');
+  assert.equal(formatBusyReasonsShort([]), '');
+  assert.equal(formatBusyReasonsShort([{}, null]), '');
+  assert.ok(!formatBusyReasonsShort([probe]).includes('1239887'));
+  assert.ok(!formatBusyReasonsShort([probe]).includes('[object Object]'));
+
+  // Detail lines include name: detail for Overview and Power tabs.
+  assert.equal(formatBusyReasonLine(probe), 'agents: busy: 1239887 worker');
+  assert.equal(formatBusyReasonLine(jobNamed), 'cargo build --release: exclusive job j-1');
+  assert.equal(formatBusyReasonLine({ source: 'probe', name: 'agents' }), 'agents');
+  assert.equal(formatBusyReasonLine('render'), 'render');
+  assert.equal(formatBusyReasonLine({}), '');
+  assert.deepEqual(formatBusyReasonLines([probe, probeTwo, null]), [
+    'agents: busy: 1239887 worker',
+    'render: blender frame 42/120',
+  ]);
+  assert.deepEqual(formatBusyReasonLines([]), []);
+});
+
+test('formatOfflineSubtext stays concise with or without lastSeenAt', () => {
+  const now = Date.parse('2026-11-24T12:00:00Z');
+  assert.equal(formatOfflineSubtext(null, now), 'Did not answer');
+  assert.equal(formatOfflineSubtext(undefined, now), 'Did not answer');
+  assert.equal(
+    formatOfflineSubtext('2026-11-24T11:55:00Z', now),
+    'Did not answer · last seen 5 min ago',
+  );
+  assert.equal(
+    formatOfflineSubtext(Date.parse('2026-11-10T12:00:00Z'), now),
+    'Did not answer · last seen 14 days ago',
+  );
 });
