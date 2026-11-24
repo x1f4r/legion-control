@@ -191,3 +191,74 @@ export function machineMetrics(sysInfo) {
       : [],
   };
 }
+
+/**
+ * Extracts a short human label for one `power.status` busy reason (never raw `detail`).
+ */
+export function busyReasonLabel(reason) {
+  if (typeof reason === 'string') {
+    return reason.trim();
+  }
+  if (!reason || typeof reason !== 'object') {
+    return '';
+  }
+  const source = typeof reason.source === 'string' ? reason.source.trim() : '';
+  const name = typeof reason.name === 'string' ? reason.name.trim() : '';
+  if (source === 'job') {
+    if (name) return name;
+    const command = typeof reason.command === 'string' ? reason.command.trim() : '';
+    if (command) {
+      return command.length > 32 ? `${command.slice(0, 31).trimEnd()}…` : command;
+    }
+    const id = typeof reason.id === 'string' ? reason.id.trim() : '';
+    if (id) return id;
+    return 'job';
+  }
+  return name || source || '';
+}
+
+/**
+ * Formats a compact list-row phrase for busy reasons (`busy: agents` or `busy: agents +1`).
+ */
+export function formatBusyReasonsShort(reasons) {
+  if (!Array.isArray(reasons) || reasons.length === 0) return '';
+  const labels = reasons.map(busyReasonLabel).filter(Boolean);
+  if (labels.length === 0) return '';
+  if (labels.length === 1) return `busy: ${labels[0]}`;
+  return `busy: ${labels[0]} +${labels.length - 1}`;
+}
+
+/**
+ * Formats one busy reason as a full detail line (`name: detail`) for Overview and Power views.
+ */
+export function formatBusyReasonLine(reason) {
+  if (typeof reason === 'string') {
+    return reason.trim();
+  }
+  if (!reason || typeof reason !== 'object') {
+    return '';
+  }
+  const label = busyReasonLabel(reason);
+  const detail = typeof reason.detail === 'string' ? reason.detail.trim() : '';
+  if (label && detail) return `${label}: ${detail}`;
+  return label || detail || '';
+}
+
+/**
+ * Formats all busy reasons as non-empty full detail lines.
+ */
+export function formatBusyReasonLines(reasons) {
+  if (!Array.isArray(reasons) || reasons.length === 0) return [];
+  return reasons.map(formatBusyReasonLine).filter(Boolean);
+}
+
+/**
+ * Formats the short, plain subtitle for an offline machine row in the Machines list.
+ */
+export function formatOfflineSubtext(lastSeenAt, nowMs = Date.now()) {
+  if (lastSeenAt) {
+    const seen = formatRelativeTime(lastSeenAt, nowMs);
+    if (seen) return `Did not answer · last seen ${seen}`;
+  }
+  return 'Did not answer';
+}

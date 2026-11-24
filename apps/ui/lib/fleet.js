@@ -143,6 +143,7 @@ export function hydrateFleetCache(cached, expectedNode = null) {
       reason: null,
       error: null,
       busy: false,
+      busyState: null,
       busyReasons: [],
       runningJobs: 0,
       jobs: [],
@@ -177,6 +178,7 @@ function makeAskingEntry(name, isLocal, listed, prev) {
     reason: null,
     error: null,
     busy: keepLive ? Boolean(prev.busy) : false,
+    busyState: keepLive ? prev.busyState || null : null,
     busyReasons: keepLive ? prev.busyReasons || [] : [],
     runningJobs: keepLive ? prev.runningJobs || 0 : 0,
     jobs: keepLive ? prev.jobs || [] : [],
@@ -304,19 +306,22 @@ export async function refreshFleetProgressive({
             ...prev,
             jobs,
             runningJobs: jobs.length,
-            busy: jobs.length > 0 || (prev.busyReasons?.length || 0) > 0,
+            busy: jobs.length > 0 || prev.busyState === 'busy' || (prev.busyReasons?.length || 0) > 0,
           }));
         })
         .catch(onErr),
       callWithTimeout(link, 'power.status', {}, { on, signal }, detailTimeoutMs)
         .then((power) => {
           if (signal?.aborted || !power) return;
-          const busyReasons = power?.busy?.state === 'busy' ? power.busy.reasons || [] : [];
+          const busyState = typeof power?.busy?.state === 'string' ? power.busy.state : null;
+          const busyReasons =
+            busyState === 'busy' && Array.isArray(power.busy.reasons) ? power.busy.reasons : [];
           updateMachine(name, (prev) => ({
             ...prev,
             system: power.system || prev.system,
+            busyState,
             busyReasons,
-            busy: (prev.runningJobs || 0) > 0 || busyReasons.length > 0,
+            busy: (prev.runningJobs || 0) > 0 || busyState === 'busy',
           }));
         })
         .catch(onErr),
@@ -426,6 +431,7 @@ export async function refreshFleetProgressive({
         jobs: [],
         runningJobs: 0,
         busy: false,
+        busyState: null,
         busyReasons: [],
       }));
       return;

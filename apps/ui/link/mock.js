@@ -1,3 +1,5 @@
+import { formatBusyReasonLines } from '../lib/format.js';
+
 // Deterministic mock link (?mock) shaped like real Legion tool results.
 
 const isoAgo = (sec) => new Date(Date.now() - sec * 1000).toISOString();
@@ -477,7 +479,16 @@ export function createMockLink(mode = '') {
       power: {
         system: 'linux',
         boot_id: '7b51c60a-0d29-42b0-9c52-88b6d5a10001',
-        busy: { state: 'busy', reasons: ['exclusive job: cargo build --release'] },
+        busy: {
+          state: 'busy',
+          reasons: [
+            {
+              source: 'job',
+              name: 'cargo build --release',
+              detail: 'exclusive job j-build-1',
+            },
+          ],
+        },
         targets: [{ name: 'windows', how: 'efibootmgr --bootnext' }],
         sudo: true,
         pending: null,
@@ -543,7 +554,13 @@ export function createMockLink(mode = '') {
       power: {
         system: 'macos',
         boot_id: 'c200c60a-0d29-42b0-9c52-88b6d5a10003',
-        busy: { state: 'idle', reasons: [] },
+        busy: {
+          state: 'busy',
+          reasons: [
+            { source: 'probe', name: 'agents', detail: 'busy: 1239887 worker' },
+            { source: 'probe', name: 'render', detail: 'blender frame 42/120' },
+          ],
+        },
         targets: [],
         sudo: false,
         pending: null,
@@ -553,7 +570,8 @@ export function createMockLink(mode = '') {
       reachable: false,
       error: {
         code: 'unreachable',
-        message: 'Did not answer · last seen 14 days ago. SSH timed out after 8 s.',
+        message:
+          "None of laptop's systems answered (linux: Could not connect to laptop.example:22: timed out after 4 s; windows: Could not connect to laptop-win.example:22: timed out after 4 s).",
         hint: 'Check that laptop is powered on and reachable on your tailnet, or wake it via pi.',
         machine: 'laptop',
       },
@@ -826,7 +844,7 @@ export function createMockLink(mode = '') {
           !args?.force && m.power.busy.state === 'busy'
             ? {
                 code: 'busy',
-                message: `Refused to ${action} ${name}: ${m.power.busy.reasons.join(', ')}.`,
+                message: `Refused to ${action} ${name}: ${formatBusyReasonLines(m.power.busy.reasons).join('; ')}.`,
                 hint: 'Pass force: true to go ahead anyway.',
               }
             : undefined;
