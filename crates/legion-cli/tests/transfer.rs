@@ -124,6 +124,7 @@ fn helper(args: &[String]) -> ExitCode {
             let mut stdout = std::io::stdout().lock();
             writeln!(stdout, "Welcome to pi!").unwrap();
             writeln!(stdout, "{{\"motd\": \"not a reply\"").unwrap();
+            writeln!(stdout, "{{\"banner\": true}}").unwrap();
             stdout.flush().unwrap();
             drop(stdout);
             exit_of(command.status().unwrap())

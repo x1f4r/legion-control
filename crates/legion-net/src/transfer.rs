@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
-use legion_xfer::{Hash, Manifest, PlanConflict, PlanOptions, SkippedEntry};
+use legion_xfer::{Entry, Hash, Manifest, PlanConflict, PlanOptions, SkippedEntry};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -800,6 +800,16 @@ struct Conn {
     /// Whether a reply has been read, which tells a server that never started from one that
     /// failed on the way.
     answered: bool,
+    noise_lines: usize,
+    noise_bytes: usize,
+}
+
+/// One line of a `manifest` reply.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Listed {
+    Done(ManifestDone),
+    Entry(Entry),
 }
 
 enum Process {
@@ -847,6 +857,8 @@ impl Conn {
             writer: Some(writer),
             process,
             answered: false,
+            noise_lines: 0,
+            noise_bytes: 0,
         };
         let mut line = header.to_string().into_bytes();
         line.push(b'\n');
@@ -871,90 +883,70 @@ impl Conn {
         writer.flush().await
     }
 
-    /// The next reply, skipping what is not JSON before the first one: a login banner or a
-    /// shell's own noise cannot break a transfer.
+    /// The next reply, which has the shape `T` or is the other end's error. Before the first
+    /// one, lines that are neither (a login banner, a shell's own noise, even one that happens
+    /// to be JSON) are skipped within bounds; after it, anything else is the other end gone wrong.
     async fn first<T: DeserializeOwned>(&mut self) -> Result<T, ErrorBody> {
-        let value = self.reply().await?;
-        serde_json::from_value(value.clone()).map_err(|error| {
-            ErrorBody::new(
+        loop {
+            let line = self.line().await?;
+            if let Ok(value @ Value::Object(_)) = serde_json::from_slice::<Value>(&line) {
+                if let Some(error) = value.get("error")
+                    && let Ok(error) = serde_json::from_value::<ErrorBody>(error.clone())
+                {
+                    self.answered = true;
+                    return Err(with_machine(error, &self.machine));
+                }
+                if let Ok(reply) = serde_json::from_value::<T>(value) {
+                    self.answered = true;
+                    return Ok(reply);
+                }
+            }
+            if self.answered {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "{} answered a stream with a line that is not what was asked for.",
+                        self.machine
+                    ),
+                )
+                .with_hint("Update legion there, so both ends speak the same stream protocol.")
+                .with_machine(self.machine.clone()));
+            }
+            self.noise_lines += 1;
+            self.noise_bytes += line.len();
+            if self.noise_lines > MOST_NOISE_LINES || self.noise_bytes > MOST_NOISE_BYTES {
+                return Err(ErrorBody::new(
+                    ErrorCode::Unreachable,
+                    format!(
+                        "{} printed {} lines that are not legion's before answering a stream.",
+                        self.machine, self.noise_lines
+                    ),
+                )
+                .with_hint("Something on the way (a login script, a banner) writes to stdout; make it quiet for sessions without a terminal.")
+                .with_machine(self.machine.clone()));
+            }
+        }
+    }
+
+    /// One line of output, without reading more than a reply can be.
+    async fn line(&mut self) -> Result<Vec<u8>, ErrorBody> {
+        let mut line = Vec::new();
+        let read = (&mut self.reader)
+            .take(LONGEST_REPLY as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await;
+        match read {
+            Ok(0) => Err(self.ended("before it answered").await),
+            Ok(_) if line.len() > LONGEST_REPLY => Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
-                    "{} answered a stream with {value}, which is not what was asked for: {error}.",
+                    "{} answered a stream with a line longer than {LONGEST_REPLY} bytes.",
                     self.machine
                 ),
             )
-            .with_hint("Update legion there, so both ends speak the same stream protocol.")
-            .with_machine(self.machine.clone())
-        })
-    }
-
-    async fn reply(&mut self) -> Result<Value, ErrorBody> {
-        let mut noise_lines = 0;
-        let mut noise_bytes = 0;
-        loop {
-            let mut line = Vec::new();
-            let read = (&mut self.reader)
-                .take(LONGEST_REPLY as u64 + 1)
-                .read_until(b'\n', &mut line)
-                .await;
-            match read {
-                Ok(0) => return Err(self.ended("before it answered").await),
-                Ok(_) if line.len() > LONGEST_REPLY => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!(
-                            "{} answered a stream with a line longer than {LONGEST_REPLY} bytes.",
-                            self.machine
-                        ),
-                    )
-                    .with_machine(self.machine.clone()));
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    return Err(self.ended(&format!("while it answered ({error})")).await);
-                }
-            }
-            match serde_json::from_slice::<Value>(&line) {
-                Ok(Value::Object(mut map)) => {
-                    self.answered = true;
-                    if let Some(error) = map.remove("error") {
-                        let error =
-                            serde_json::from_value::<ErrorBody>(error).unwrap_or_else(|_| {
-                                ErrorBody::new(
-                                    ErrorCode::Failed,
-                                    format!(
-                                        "{} refused the stream without saying why.",
-                                        self.machine
-                                    ),
-                                )
-                            });
-                        return Err(with_machine(error, &self.machine));
-                    }
-                    return Ok(Value::Object(map));
-                }
-                _ if !self.answered => {
-                    noise_lines += 1;
-                    noise_bytes += line.len();
-                    if noise_lines > MOST_NOISE_LINES || noise_bytes > MOST_NOISE_BYTES {
-                        return Err(ErrorBody::new(
-                            ErrorCode::Unreachable,
-                            format!("{} printed {noise_lines} lines that are not legion's before answering a stream.", self.machine),
-                        )
-                        .with_hint("Something on the way (a login script, a banner) writes to stdout; make it quiet for non-interactive sessions.")
-                        .with_machine(self.machine.clone()));
-                    }
-                }
-                _ => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!(
-                            "{} answered a stream with a line that is not JSON.",
-                            self.machine
-                        ),
-                    )
-                    .with_machine(self.machine.clone()));
-                }
-            }
+            .with_machine(self.machine.clone())),
+            Ok(_) => Ok(line),
+            Err(error) => Err(self.ended(&format!("while it answered ({error})")).await),
         }
     }
 
@@ -962,41 +954,26 @@ impl Conn {
     async fn manifest(&mut self) -> Result<Manifest, ErrorBody> {
         let mut manifest = Manifest::default();
         loop {
-            let value = self.reply().await?;
-            if value.get("done").is_some() {
-                let done: ManifestDone =
-                    serde_json::from_value(value).map_err(|error| self.garbled(&error))?;
-                if done.entries != manifest.entries.len() as u64 {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Failed,
-                        format!(
-                            "{} listed {} entries and said it listed {}.",
-                            self.machine,
-                            manifest.entries.len(),
-                            done.entries
-                        ),
-                    )
-                    .with_machine(self.machine.clone()));
+            match self.first::<Listed>().await? {
+                Listed::Entry(entry) => manifest.entries.push(entry),
+                Listed::Done(done) => {
+                    if done.entries != manifest.entries.len() as u64 {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!(
+                                "{} listed {} entries and said it listed {}.",
+                                self.machine,
+                                manifest.entries.len(),
+                                done.entries
+                            ),
+                        )
+                        .with_machine(self.machine.clone()));
+                    }
+                    manifest.skipped = done.skipped;
+                    return Ok(manifest);
                 }
-                manifest.skipped = done.skipped;
-                return Ok(manifest);
             }
-            manifest
-                .entries
-                .push(serde_json::from_value(value).map_err(|error| self.garbled(&error))?);
         }
-    }
-
-    fn garbled(&self, error: &serde_json::Error) -> ErrorBody {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "{} sent a listing line that cannot be read: {error}.",
-                self.machine
-            ),
-        )
-        .with_hint("Update legion there, so both ends speak the same stream protocol.")
-        .with_machine(self.machine.clone())
     }
 
     /// Why the stream ended early: the server's own error when it ran here, its exit status and
@@ -1132,7 +1109,7 @@ impl Broken {
             }
             Broken::Destination(what) => {
                 // A destination that refused mid-way says why on its output before it exits.
-                let error = match tokio::time::timeout(EXIT_WAIT, dest.reply()).await {
+                let error = match tokio::time::timeout(EXIT_WAIT, dest.first::<Value>()).await {
                     Ok(Err(error)) => error,
                     _ => dest.ended(&what).await,
                 };
