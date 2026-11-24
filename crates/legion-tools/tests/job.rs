@@ -1484,6 +1484,7 @@ async fn a_role_without_exec_is_denied_and_cwd_is_confined() {
         "policy.toml",
         concat!(
             "[principals.observer]\nrole = \"observer\"\n",
+            "[principals.operator]\nrole = \"builder\"\n",
             "[principals.\"agent:claude\"]\nrole = \"builder\"\n",
             "[roles.observer]\nallow = [\"effect:read\"]\n",
             "[roles.builder]\nallow = [\"effect:read\", \"effect:exec\"]\npaths = [\"~/projects/**\"]\n",
@@ -1544,6 +1545,59 @@ async fn a_role_without_exec_is_denied_and_cwd_is_confined() {
         .await
         .unwrap_err();
     assert_eq!(denied_cwd.code, ErrorCode::Denied);
+
+    // Cross-principal visibility model: any `read` principal sees every job's command and output,
+    // and any `exec` principal can cancel any job; `job.list`, `job.logs`, and `job.cancel` state
+    // this in their tool descriptions.
+    let observer_list = fixture
+        .call_as("observer", "job.list", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        observer_list["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == json!(ok_id) && !j["command"].as_str().unwrap().is_empty())
+    );
+    let observer_logs = fixture
+        .call_as("observer", "job.logs", json!({"id": ok_id}))
+        .await
+        .unwrap();
+    assert!(!observer_logs["content"].as_str().unwrap().is_empty());
+
+    let sleeper = fixture
+        .call_as(
+            "agent:claude",
+            "job.start",
+            merge_args(
+                support_helper_args("sleep", &["30"]),
+                json!({"cwd": "~/projects/app"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let sleep_id = sleeper["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&sleep_id);
+    let cancelled = fixture
+        .call_as("operator", "job.cancel", json!({"id": sleep_id}))
+        .await
+        .unwrap();
+    assert_eq!(cancelled["state"], json!("cancelled"));
+
+    let specs = legion_tools::registry().specs();
+    for (name, needle) in [
+        ("job.list", "Any principal with the read effect"),
+        ("job.logs", "Any principal with the read effect"),
+        ("job.cancel", "Any principal with the exec effect"),
+    ] {
+        let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+        assert!(
+            spec.description.contains(needle),
+            "{name} description missing visibility rule: {}",
+            spec.description
+        );
+    }
 }
 
 async fn reading_state_never_writes() {

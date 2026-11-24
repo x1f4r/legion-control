@@ -75,7 +75,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.list",
         Effect::Read,
-        "List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Reading never modifies job files.",
+        "List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Any principal with the read effect sees every job's command and output on this node. Reading never modifies job files.",
         list,
     );
     registry.add_fn(
@@ -87,7 +87,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.logs",
         Effect::Read,
-        "Read captured stdout and stderr from a background job without loading the whole log into memory. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation.",
+        "Read captured stdout and stderr from a background job without loading the whole log into memory. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation. Any principal with the read effect sees every job's command and output on this node.",
         read_logs,
     );
     registry.add_fn(
@@ -99,7 +99,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.cancel",
         Effect::Exec,
-        "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Cancelling a job that already finished is not an error and returns its final state.",
+        "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any job on this node. Cancelling a job that already finished is not an error and returns its final state.",
         cancel,
     );
 }
