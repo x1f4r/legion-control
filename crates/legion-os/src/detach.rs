@@ -162,6 +162,21 @@ pub struct DetachHandle {
     pub warnings: Vec<String>,
 }
 
+/// Internal test seam controlling Linux systemd user-scope selection so integration tests can
+/// exercise both the systemd-scope path and the `setsid` fallback paths on any host.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScopeProbeOverride {
+    /// Probe the systemd user manager and lingering state normally.
+    #[default]
+    Auto,
+    /// Behave as if no systemd user manager is reachable (forces direct `setsid`).
+    ForceNoSystemd,
+    /// Probe the systemd user manager normally, but treat lingering as disabled (forces `setsid`
+    /// fallback with the lingering warning when a user manager is reachable).
+    ForceLingerDisabled,
+}
+
 /// Start a detached process that outlives the caller, its terminal, and its SSH session.
 ///
 /// Standard input is always connected to null; standard output and standard error are appended
@@ -169,6 +184,16 @@ pub struct DetachHandle {
 /// [`DetachHandle`] carrying the target's [`ProcessId`], its Linux systemd scope unit name when
 /// a scope was used, and any non-fatal launch warnings.
 pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
+    spawn_detached_for_test(options, ScopeProbeOverride::Auto).await
+}
+
+/// Test-only entry point for [`spawn_detached`] that allows forcing the Linux scope-selection
+/// branch without mutating process-wide environment variables.
+#[doc(hidden)]
+pub async fn spawn_detached_for_test(
+    options: DetachOptions,
+    scope_override: ScopeProbeOverride,
+) -> Result<DetachHandle> {
     let resolved = shell::resolve(&options.command)?;
     validate_scope_name(options.name.as_deref())?;
 
@@ -191,7 +216,7 @@ pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
         }
     }
 
-    spawn_detached_impl(&resolved, &options).await
+    spawn_detached_impl(&resolved, &options, scope_override).await
 }
 
 /// Return `true` while any process started under `handle` is still running—not just the root.
@@ -397,10 +422,20 @@ fn open_append_file(path: &Path) -> Result<std::fs::File> {
         .map_err(|err| OsError::from_io(format!("cannot open log file {}", path.display()), err))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 async fn spawn_detached_impl(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
+    scope_override: ScopeProbeOverride,
+) -> Result<DetachHandle> {
+    platform::spawn_detached(resolved, options, scope_override).await
+}
+
+#[cfg(windows)]
+async fn spawn_detached_impl(
+    resolved: &ResolvedCommand,
+    options: &DetachOptions,
+    _scope_override: ScopeProbeOverride,
 ) -> Result<DetachHandle> {
     platform::spawn_detached(resolved, options).await
 }
@@ -409,6 +444,7 @@ async fn spawn_detached_impl(
 async fn spawn_detached_impl(
     _resolved: &ResolvedCommand,
     _options: &DetachOptions,
+    _scope_override: ScopeProbeOverride,
 ) -> Result<DetachHandle> {
     Err(OsError::Unsupported {
         detail: "detached process launching is not supported on this platform".into(),
@@ -756,14 +792,14 @@ fn split_windows_path_entries(path_var: &str) -> impl Iterator<Item = &str> {
 fn probe_executable_with_exts(base: &Path, exts: &[String]) -> Option<PathBuf> {
     let has_ext = base.extension().is_some();
     if (has_ext || exts.is_empty()) && base.is_file() {
-        return Some(base.to_path_buf());
+        return Some(resolve_on_disk_filename(base));
     }
     if !has_ext {
         let raw = base.to_string_lossy();
         for ext in exts {
             let candidate = PathBuf::from(format!("{raw}{ext}"));
             if candidate.is_file() {
-                return Some(candidate);
+                return Some(resolve_on_disk_filename(&candidate));
             }
             // Support case-sensitive filesystems (for example cross-platform unit tests on Linux)
             // by also checking the lowercase extension when `PATHEXT` contains uppercase entries.
@@ -771,12 +807,43 @@ fn probe_executable_with_exts(base: &Path, exts: &[String]) -> Option<PathBuf> {
             if lower_ext != *ext {
                 let lower_candidate = PathBuf::from(format!("{raw}{lower_ext}"));
                 if lower_candidate.is_file() {
-                    return Some(lower_candidate);
+                    return Some(resolve_on_disk_filename(&lower_candidate));
                 }
             }
         }
     }
     None
+}
+
+/// Replace the final path component with its actual on-disk spelling when the parent directory is
+/// readable, avoiding uppercase `PATHEXT` suffixes (such as `mytool.EXE`) on case-insensitive
+/// filesystems without introducing Windows `\\?\` verbatim prefixes from `canonicalize`.
+#[allow(dead_code)]
+fn resolve_on_disk_filename(path: &Path) -> PathBuf {
+    let (Some(parent), Some(target_name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let target_str = target_name.to_string_lossy();
+    let mut ci_match = None;
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let entry_name = entry.file_name();
+            if entry_name == target_name {
+                return parent.join(entry_name);
+            }
+            if ci_match.is_none()
+                && entry_name
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&target_str)
+            {
+                ci_match = Some(entry_name);
+            }
+        }
+    }
+    match ci_match {
+        Some(name) => parent.join(name),
+        None => path.to_path_buf(),
+    }
 }
 
 /// Refuse `.cmd`/`.bat` targets on the Windows WMI path unless every argument is free of `cmd.exe`
@@ -998,12 +1065,33 @@ mod tests {
             ("PATHEXT".to_owned(), ".EXE;.CMD;.BAT".to_owned()),
         ];
 
-        assert_eq!(
-            resolve_wmi_program("mytool", dir.path(), &merged_env),
-            exe_path.to_string_lossy()
+        let resolved_exe = resolve_wmi_program("mytool", dir.path(), &merged_env);
+        assert!(
+            same_windows_path(&resolved_exe, &exe_path.to_string_lossy()),
+            "expected {}, got {resolved_exe}",
+            exe_path.display()
         );
+        assert_eq!(
+            Path::new(&resolved_exe).file_name(),
+            Some(std::ffi::OsStr::new("mytool.exe"))
+        );
+
         let resolved_shim = resolve_wmi_program("shim", dir.path(), &merged_env);
-        assert_eq!(resolved_shim, cmd_path.to_string_lossy());
+        assert!(
+            same_windows_path(&resolved_shim, &cmd_path.to_string_lossy()),
+            "expected {}, got {resolved_shim}",
+            cmd_path.display()
+        );
+        assert_eq!(
+            Path::new(&resolved_shim).file_name(),
+            Some(std::ffi::OsStr::new("shim.cmd"))
+        );
+
+        // Even when probed with uppercase `PATHEXT` casing, on-disk filename spelling is returned.
+        assert_eq!(
+            resolve_on_disk_filename(&bin_dir.join("MYTOOL.EXE")),
+            exe_path
+        );
 
         // Safe args to a `.cmd` file are allowed; cmd.exe metacharacters are refused.
         assert!(
