@@ -327,8 +327,9 @@ What the effects do and do not promise:
   configuration or state directory for a role without the `admin` effect, whatever its `paths`
   say, so a role cannot edit the policy that confines it or the log that records it.
 
-A door that pinned a principal ignores a different `as` in the request. Only a role with
-`delegate = true` (the owner's) may act as someone else. A forwarded call names its principal to
+A door that pinned a principal ignores a different `as` in the request. Only the built-in owner role may act
+as someone else: a role that could act as anyone would be the owner under another name, so a policy
+file that sets `delegate = true` on any other role is refused when it is loaded. A forwarded call names its principal to
 the target, and the target applies its own policy to it.
 
 Every call is appended to `state/audit.jsonl`: time, principal, door, tool, target, outcome and

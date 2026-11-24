@@ -138,7 +138,7 @@ Run a command that finishes and return its exit code and output. Give `argv` to 
 | Tool | Effect | Description |
 | --- | --- | --- |
 | `ext.define` | `admin` | Define or replace an extension tool in tools.d/<name>.toml. |
-| `ext.list` | `read` | List extension tools loaded from tools.d/ along with any broken files that failed to parse or validate. |
+| `ext.list` | `read` | List extension tools loaded from tools.d/ with each tool's declared effect and execution mode (`run` directly or `cmd` through the shell), along with any broken files that failed to parse or validate. |
 | `ext.remove` | `admin` | Remove an extension tool's definition file from tools.d/. |
 | `ext.show` | `read` | Show the full stored definition of one extension tool from tools.d/. |
 
@@ -146,7 +146,7 @@ Run a command that finishes and return its exit code and output. Give `argv` to 
 
 Effect: `admin`
 
-Define or replace an extension tool in tools.d/<name>.toml. This creates a command that other callers allowed the declared effect will be able to run, so set effect honestly to match what the command does. Give `run` (exact argv) or `cmd` (platform shell line), never both; caller arguments are never spliced into the command and arrive only as `LEGION_ARG_<NAME>` environment variables (upper-cased) and as one JSON object on stdin, alongside `LEGION_TOOL`, `LEGION_PRINCIPAL` and `LEGION_NODE`. Refuses to overwrite an existing extension unless `replace` is true, and refuses built-in names or reserved Legion families.
+Define or replace an extension tool in tools.d/<name>.toml. A tool declared `read` is callable by every role that may read, whatever its command does, so declare each tool's effect honestly. Give `run` (exact argv) or `cmd` (platform shell line), never both; caller arguments are never spliced into the command and arrive only as `LEGION_ARG_<NAME>` environment variables (upper-cased) and as one JSON object on stdin, alongside `LEGION_TOOL`, `LEGION_PRINCIPAL` and `LEGION_NODE`. Refuses to overwrite an existing extension unless `replace` is true, and refuses built-in names or reserved Legion families.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -164,7 +164,7 @@ Define or replace an extension tool in tools.d/<name>.toml. This creates a comma
 
 Effect: `read`
 
-List extension tools loaded from tools.d/ along with any broken files that failed to parse or validate.
+List extension tools loaded from tools.d/ with each tool's declared effect and execution mode (`run` directly or `cmd` through the shell), along with any broken files that failed to parse or validate.
 
 Takes no arguments.
 
@@ -954,7 +954,7 @@ List the processes running on this machine, busiest first, with their id, parent
 
 | Tool | Effect | Description |
 | --- | --- | --- |
-| `token.add` | `admin` | Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any but owner when its role delegates. |
+| `token.add` | `admin` | Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any when the caller has the owner role. |
 | `token.list` | `admin` | List the tokens `legion serve` accepts for principals the caller could act as: each one's name, principal, when it was made and when it expires. |
 | `token.remove` | `admin` | Remove a token of a principal the caller could act as, so `legion serve` refuses it from its next request on and ends its MCP sessions. |
 
@@ -962,7 +962,7 @@ List the processes running on this machine, busiest first, with their id, parent
 
 Effect: `admin`
 
-Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any but owner when its role delegates. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for owner is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so only owner may make one, and only with allow_owner true.
+Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any when the caller has the owner role. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for a principal with the owner role is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so only a caller with the owner role may make one, and only with allow_owner true. A token made by a call that came with an expiring token expires no later.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
