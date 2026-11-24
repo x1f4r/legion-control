@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use legion_core::proto::{ErrorBody, Target};
+use legion_core::proto::{ErrorBody, EventKind, Target};
 use legion_core::{BoxFuture, Call, Door, Node, Paths, Router};
 use legion_doors::mcp::{McpDoor, Options};
 use serde_json::{Value, json};
@@ -114,6 +114,87 @@ async fn on_is_taken_out_of_the_arguments_and_handed_to_the_router() {
                 door: Door::Mcp,
                 pinned: Some("agent:test".to_owned()),
             },
+        ]
+    );
+}
+
+/// Says something through the call's events before answering.
+struct Chatty;
+
+impl Router for Chatty {
+    fn call<'a>(
+        &'a self,
+        _node: &'a Node,
+        call: Call,
+        _on: Option<Target>,
+    ) -> BoxFuture<'a, Result<Value, ErrorBody>> {
+        call.events.emit(EventKind::Stdout, json!("compiling\n"));
+        call.events.emit(EventKind::Log, json!("done"));
+        Box::pin(async { Ok(json!({"said": 2})) })
+    }
+}
+
+#[tokio::test]
+async fn events_reach_a_client_that_asked_for_progress_and_no_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::new(Paths::under(dir.path()), legion_tools::registry());
+    let door = McpDoor::new(node, Arc::new(Chatty), Options::default()).unwrap();
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (server_in, server_out) = tokio::io::split(server);
+    let serving = tokio::spawn(door.serve(server_in, server_out));
+    let (client_in, mut client_out) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_in).lines();
+
+    let requests = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "meta_version"}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "_meta": {"progressToken": "t"}, "name": "meta_version"}}),
+    ];
+    let mut seen = Vec::new();
+    for request in requests {
+        let id = request["id"].clone();
+        client_out
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            let line = lines.next_line().await.unwrap().unwrap();
+            let message: Value = serde_json::from_str(&line).unwrap();
+            let done = message["id"] == id;
+            seen.push(message);
+            if done {
+                break;
+            }
+        }
+    }
+    client_out.shutdown().await.unwrap();
+    serving.await.unwrap().unwrap();
+
+    let methods: Vec<&Value> = seen.iter().map(|message| &message["method"]).collect();
+    // The call without a progress token got nothing but its result.
+    assert_eq!(
+        methods,
+        [
+            &Value::Null,
+            &Value::Null,
+            &json!("notifications/progress"),
+            &json!("notifications/progress"),
+            &Value::Null
+        ]
+    );
+    let progress: Vec<&Value> = seen[2..4]
+        .iter()
+        .map(|message| &message["params"])
+        .collect();
+    assert_eq!(
+        progress,
+        [
+            &json!({"progressToken": "t", "progress": 1.0, "message": "stdout: compiling"}),
+            &json!({"progressToken": "t", "progress": 2.0, "message": "done"}),
         ]
     );
 }

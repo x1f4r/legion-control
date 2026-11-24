@@ -11,16 +11,17 @@
 //! reads the code and the hint instead of a protocol error it cannot see.
 
 mod catalog;
+mod events;
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use legion_core::policy::Policy;
 use legion_core::proto::{ErrorBody, ErrorCode, Target};
 use legion_core::{Call, Door, EventSink, Grant, Node, Router, VERSION};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, ServerInitializeError};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -29,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::task::TaskTracker;
 
 use self::catalog::{Catalog, ON};
+use self::events::{Forwarder, Level};
 
 /// How a session is served.
 #[derive(Clone, Debug, Default)]
@@ -44,6 +46,8 @@ pub struct McpDoor {
     router: Arc<dyn Router>,
     options: Options,
     catalog: Catalog,
+    /// The level `logging/setLevel` asked for, if a client of the older revision asked.
+    log_level: Mutex<Option<Level>>,
     /// Every call still running, so the session can wait for calls it cancels as it ends to reach
     /// the audit log.
     calls: TaskTracker,
@@ -65,6 +69,7 @@ impl McpDoor {
             router,
             options,
             catalog,
+            log_level: Mutex::new(None),
             calls: TaskTracker::new(),
         })
     }
@@ -119,7 +124,7 @@ impl McpDoor {
         "Legion gives you the tools of the machine it runs on, and through `on` those of the other machines it can reach. Call meta_whoami first: it says who you act as here, your role, the directories file tools are confined to, and the tools you may use. Every tool takes an optional `on`: a machine's name, a list of names, or \"all\"; leave it out to act on this machine. A failed call returns a JSON error object with a `code` to branch on and, usually, a `hint` saying what to do.".to_owned()
     }
 
-    /// Runs one call through the router.
+    /// Runs one call through the router, forwarding its events while it runs.
     async fn run(
         &self,
         tool: &str,
@@ -127,6 +132,18 @@ impl McpDoor {
         on: Option<Target>,
         context: &RequestContext<RoleServer>,
     ) -> Result<Value, ErrorBody> {
+        let session_level = *self
+            .log_level
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let forwarder = Forwarder::new(context, tool, session_level);
+        let (events, queue) = match &forwarder {
+            Some(_) => {
+                let (sink, queue) = Forwarder::sink();
+                (sink, Some(queue))
+            }
+            None => (EventSink::discard(), None),
+        };
         let call = Call {
             tool: tool.to_owned(),
             args,
@@ -135,14 +152,18 @@ impl McpDoor {
             pinned: self.options.pinned.clone(),
             // Cancelled when the client cancels the request, and when the session ends.
             cancel: context.ct.clone(),
-            events: EventSink::discard(),
+            events,
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);
         let running = self
             .calls
             .spawn(async move { router.call(&node, call, on).await });
-        running.await.unwrap_or_else(|error| {
+        let joined = match (forwarder, queue) {
+            (Some(forwarder), Some(queue)) => forwarder.forward_during(queue, running).await,
+            _ => running.await,
+        };
+        joined.unwrap_or_else(|error| {
             Err(ErrorBody::new(
                 ErrorCode::Internal,
                 format!("The call to {tool} stopped before it replied: {error}."),
@@ -205,7 +226,7 @@ fn tool_result(outcome: Result<Value, ErrorBody>) -> CallToolResult {
 
 impl ServerHandler for McpDoor {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(events::capabilities())
             .with_server_info(Implementation::new("legion", VERSION).with_title("Legion"))
             .with_instructions(self.instructions())
     }
@@ -226,5 +247,21 @@ impl ServerHandler for McpDoor {
         let args = request.arguments.unwrap_or_default();
         let outcome = self.call_tool_by_name(&request.name, args, &context).await;
         Ok(tool_result(outcome).into())
+    }
+
+    #[allow(
+        deprecated,
+        reason = "logging/setLevel is deprecated in the newest MCP revision, and still sent by the older one"
+    )]
+    async fn set_level(
+        &self,
+        request: rmcp::model::SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        *self
+            .log_level
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Level::of(request.level));
+        Ok(())
     }
 }
