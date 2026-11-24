@@ -93,19 +93,18 @@ pub(super) fn boot_id() -> Result<String> {
 
 #[cfg(target_os = "macos")]
 pub(super) fn boot_id() -> Result<String> {
-    if let Ok(output) = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "kern.boottime"])
-        .output()
-        && output.status.success()
-        && let Some(parsed) = super::parse_macos_boottime(&String::from_utf8_lossy(&output.stdout))
-    {
-        return Ok(parsed);
+    // kern.bootsessionuuid is a kernel-generated UUID immutable across NTP/wall-clock steps.
+    let mut cmd = std::process::Command::new("/usr/sbin/sysctl");
+    cmd.args(["-n", "kern.bootsessionuuid"]);
+    let raw =
+        super::run_command_stdout_with_timeout(cmd, Duration::from_secs(5), "/usr/sbin/sysctl")?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(OsError::Platform {
+            detail: "sysctl kern.bootsessionuuid returned empty output".into(),
+        });
     }
-
-    let secs = System::boot_time().map_err(|err| OsError::Platform {
-        detail: format!("failed to read macOS boot time: {err}"),
-    })?;
-    Ok(format!("boot-{secs}"))
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -113,7 +112,7 @@ pub(super) fn boot_id() -> Result<String> {
     let secs = System::boot_time().map_err(|err| OsError::Platform {
         detail: format!("failed to read system boot time: {err}"),
     })?;
-    Ok(format!("boot-{secs}"))
+    Ok(format!("boot-sec-{secs}"))
 }
 
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {

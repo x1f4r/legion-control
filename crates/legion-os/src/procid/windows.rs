@@ -13,6 +13,7 @@ use crate::{OsError, Result};
 use super::{KillTreeReport, ProcessId, is_alive};
 
 const TASKKILL_TIMEOUT: Duration = Duration::from_secs(15);
+const BOOT_ID_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -40,33 +41,31 @@ pub(super) fn of_pid(pid: u32, _include_zombie: bool) -> Result<Option<ProcessId
 }
 
 pub(super) fn boot_id() -> Result<String> {
-    // Query Win32_OperatingSystem.LastBootUpTime via Windows PowerShell with PSModulePath
-    // cleared so a PowerShell 7 parent environment cannot break CimCmdlets. Unlike subtracting
-    // GetTickCount64() from wall-clock time, LastBootUpTime stays invariant across invocations.
-    if let Ok(output) = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks",
-        ])
-        .env_remove("PSModulePath")
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .output()
-        && output.status.success()
+    // Always use one single source and format (`boot-ticks-<ticks>` from Win32_OperatingSystem
+    // LastBootUpTime) with a hard timeout so a stalled WMI service cannot hang a caller and two
+    // incompatible boot-id formats are never mixed. Callers compare with `procid::same_boot`.
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks",
+    ])
+    .env_remove("PSModulePath")
+    .creation_flags(CREATE_NO_WINDOW.0);
+
+    let stdout = super::run_command_stdout_with_timeout(cmd, BOOT_ID_TIMEOUT, "powershell.exe")?;
+    let ticks = stdout.trim();
+    if !ticks.is_empty()
+        && ticks.bytes().all(|b| b.is_ascii_digit())
+        && ticks.parse::<u64>().is_ok()
     {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let ticks = stdout.trim();
-        if !ticks.is_empty() && ticks.bytes().all(|b| b.is_ascii_digit()) {
-            return Ok(format!("boot-{ticks}"));
-        }
+        return Ok(format!("boot-ticks-{ticks}"));
     }
 
-    let secs = System::boot_time().map_err(|err| OsError::Platform {
-        detail: format!("failed to read Windows boot time: {err}"),
-    })?;
-    Ok(format!("boot-{secs}"))
+    Err(OsError::Platform {
+        detail: format!("unexpected Windows LastBootUpTime output: {ticks:?}"),
+    })
 }
 
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
