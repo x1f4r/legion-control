@@ -5,6 +5,7 @@
 //! log records a call's arguments and outcome, never its result.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -37,7 +38,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "token.add",
         Effect::Admin,
-        "Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any but owner when its role delegates. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for owner is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so only owner may make one, and only with allow_owner true.",
+        "Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any when the caller has the owner role. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for a principal with the owner role is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so only a caller with the owner role may make one, and only with allow_owner true. A token made by a call that came with an expiring token expires no later.",
         add,
     );
     registry.add_fn(
@@ -87,17 +88,18 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
         .map_err(|message| ErrorBody::new(ErrorCode::InvalidArgs, format!("name: {message}.")))?;
     let principal = Principal::parse(&args.principal)?;
     let principal = principal.as_str().to_owned();
-    may_manage(ctx, &principal)?;
-    if principal == OWNER {
+    let caller = Caller::of(ctx)?;
+    caller.check(&principal)?;
+    if caller.has_owner_role(&principal) {
         if !args.allow_owner {
             return Err(ErrorBody::new(
                 ErrorCode::Denied,
-                "A token for owner may do everything the account can, from anywhere the server is published, so it is not made unless asked for in so many words.",
+                format!("{principal} has the owner role: a token for it may do everything the account can, from anywhere the server is published, so it is not made unless asked for in so many words."),
             )
             .with_hint("Give the token a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want."));
         }
     } else {
-        let policy = ctx.config().get::<Policy>()?;
+        let policy = &caller.policy;
         if !policy
             .principals
             .keys()
@@ -124,7 +126,6 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
         .with_hint("Leave it out for a token that does not expire."));
     }
 
-    let token = new_token()?;
     let now = Timestamp::from_second(Timestamp::now().as_second()).map_err(internal)?;
     let expires = match args.expires_days {
         Some(days) => Some(
@@ -133,6 +134,21 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
         ),
         None => None,
     };
+    // A token made through a token lasts no longer than it; no expiry is the longest of all.
+    if let Some(limit) = ctx.credential_expires()
+        && expires.is_none_or(|expires| expires > limit)
+    {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "The token this call came with expires at {}, and a token it makes may not outlive it.",
+                rfc3339(limit)
+            ),
+        )
+        .with_hint("Give expires_days short enough to end by then, or have the owner of this machine make the token."));
+    }
+
+    let token = new_token()?;
     let entry = Entry {
         principal: principal.clone(),
         hash: tokens::hash(&token),
@@ -185,12 +201,13 @@ struct Listed {
 }
 
 async fn list(ctx: &Ctx, _args: NoArgs) -> Result<Listing, ToolError> {
+    let caller = Caller::of(ctx)?;
     let file = ctx.config().get::<Tokens>()?;
     let now = Timestamp::now();
     let tokens = file
         .tokens
         .iter()
-        .filter(|(_, entry)| may_manage(ctx, entry.principal.as_str()).is_ok())
+        .filter(|(_, entry)| caller.may_manage(entry.principal.as_str()))
         .map(|(name, entry)| Listed {
             name: name.clone(),
             principal: entry.principal.as_str().to_owned(),
@@ -227,7 +244,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     let lock = lock_path(ctx);
     // Which tokens the caller may see, decided before the file is locked: a token of a principal
     // it may not act as is treated exactly like one that does not exist.
-    let caller = Caller::of(ctx);
+    let caller = Caller::of(ctx)?;
     blocking(move || {
         update(&file, &lock, |current, doc| {
             let visible = |entry: &tokens::TokenEntry| caller.may_manage(entry.principal.as_str());
@@ -263,51 +280,57 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
 /// Who is calling a token tool, as far as deciding whose tokens it may manage goes.
 struct Caller {
     principal: String,
-    delegates: bool,
+    /// Whether the caller's role is the owner role, the one role that may act as anyone.
+    owner: bool,
+    policy: Arc<Policy>,
 }
 
 impl Caller {
-    fn of(ctx: &Ctx) -> Caller {
-        Caller {
+    fn of(ctx: &Ctx) -> Result<Caller, ErrorBody> {
+        Ok(Caller {
             principal: ctx.principal().to_owned(),
-            delegates: ctx.grant().delegates(),
-        }
+            owner: ctx.grant().role() == OWNER,
+            policy: ctx.config().get::<Policy>()?,
+        })
+    }
+
+    /// Whether `principal` has the owner role, by name (owner) or by the role the file gives it.
+    fn has_owner_role(&self, principal: &str) -> bool {
+        self.policy.role_of(principal).0 == OWNER
     }
 
     /// Whether the caller may make, see or remove a token for `principal`: one it could act as
     /// itself, so a token never gives anyone more than they already have. That is its own
-    /// principal, or any when its role delegates, except owner: a token for owner is the keys to
-    /// the machine, which only owner may hand out.
+    /// principal, or any when the caller has the owner role, which alone may act as others; and a
+    /// token for a principal with the owner role, the keys to the machine, only a caller with the
+    /// owner role may handle.
     fn may_manage(&self, principal: &str) -> bool {
-        principal == self.principal || (self.delegates && principal != OWNER)
+        if self.has_owner_role(principal) {
+            self.owner
+        } else {
+            self.owner || principal == self.principal
+        }
     }
-}
 
-/// [`Caller::may_manage`] as the error that says which rule refused it.
-fn may_manage(ctx: &Ctx, principal: &str) -> Result<(), ErrorBody> {
-    let caller = Caller::of(ctx);
-    if caller.may_manage(principal) {
-        return Ok(());
+    /// [`Caller::may_manage`] as the error that says which rule refused it.
+    fn check(&self, principal: &str) -> Result<(), ErrorBody> {
+        if self.may_manage(principal) {
+            return Ok(());
+        }
+        let message = if self.has_owner_role(principal) {
+            format!(
+                "{} may not make a token for {principal}: it has the owner role, and only a caller with the owner role may hand out a token that may do everything the account can.",
+                self.principal
+            )
+        } else {
+            format!(
+                "{} may not make a token for {principal}: a token may stand only for the caller itself, unless the caller has the owner role.",
+                self.principal
+            )
+        };
+        Err(ErrorBody::new(ErrorCode::Denied, message)
+            .with_hint("Ask the owner of this machine to make the token."))
     }
-    let (message, hint) = if principal == OWNER {
-        (
-            format!(
-                "{} may not make a token for owner: only owner may, since such a token may do everything the account can.",
-                caller.principal
-            ),
-            "Ask the owner of this machine to make it.",
-        )
-    } else {
-        (
-            format!(
-                "{} may not make a token for {principal}: a token may stand only for the caller itself unless the caller's role, {}, delegates.",
-                caller.principal,
-                ctx.grant().role()
-            ),
-            "Ask the owner of this machine to make the token, or give the caller's role delegate = true in policy.toml.",
-        )
-    };
-    Err(ErrorBody::new(ErrorCode::Denied, message).with_hint(hint))
 }
 
 /// A token as the file will keep it.

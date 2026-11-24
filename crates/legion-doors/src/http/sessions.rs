@@ -217,6 +217,7 @@ mod tests {
             principal: principal.to_owned(),
             token: token.to_owned(),
             hash: legion_core::tokens::hash(token),
+            expires: None,
         }
     }
 

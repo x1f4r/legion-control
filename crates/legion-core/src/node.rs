@@ -49,6 +49,10 @@ pub struct Call {
     pub events: EventSink,
     /// How many nodes have already forwarded this call; 0 when it started on this node.
     pub hops: u32,
+    /// When the credential the call arrived with stops working, when it is one that does: an
+    /// HTTP token with an expiry. Whatever the call makes on the caller's behalf, such as another
+    /// token, may last no longer.
+    pub credential_expires: Option<jiff::Timestamp>,
 }
 
 impl Call {
@@ -64,6 +68,7 @@ impl Call {
             cancel: CancellationToken::new(),
             events: EventSink::discard(),
             hops: 0,
+            credential_expires: None,
         }
     }
 }
@@ -365,6 +370,7 @@ impl Node {
             cancel: call.cancel.clone(),
             events: call.events,
             hops: call.hops,
+            credential_expires: call.credential_expires,
         };
         let work = tool.call(&ctx, call.args);
         tokio::pin!(work);

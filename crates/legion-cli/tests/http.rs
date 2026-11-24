@@ -27,14 +27,10 @@ const POLICY: &str = "\
 role = \"observer\"
 
 [principals.admin]
-role = \"admin\"
+role = \"owner\"
 
 [roles.observer]
 allow = [\"effect:read\"]
-
-[roles.admin]
-allow = [\"*\"]
-delegate = true
 ";
 
 type Test = (&'static str, fn());
@@ -94,6 +90,10 @@ fn main() -> ExitCode {
         (
             "a_token_gives_no_one_more_than_they_have",
             a_token_gives_no_one_more_than_they_have,
+        ),
+        (
+            "only_the_owner_role_acts_as_others",
+            only_the_owner_role_acts_as_others,
         ),
         (
             "an_mcp_session_belongs_to_its_token",
@@ -187,7 +187,7 @@ impl Fixture {
         home.write_config("node.toml", "name = \"laptop\"\n");
         home.write_config("policy.toml", POLICY);
         let phone = make_token(&home, &["phone", "phone"]);
-        let admin = make_token(&home, &["admin", "admin"]);
+        let admin = make_token(&home, &["admin", "admin", "allow_owner=true"]);
         Fixture { home, phone, admin }
     }
 }
@@ -1331,23 +1331,11 @@ fn a_token_gives_no_one_more_than_they_have() {
             "--as",
             "keeper",
         ],
-        "only owner may",
+        "only a caller with the owner role",
     );
     refused(
         &["token", "add", "x", "phone", "--as", "keeper"],
-        "unless the caller's role, keeper, delegates",
-    );
-    refused(
-        &[
-            "token",
-            "add",
-            "x",
-            "owner",
-            "allow_owner=true",
-            "--as",
-            "admin",
-        ],
-        "only owner may",
+        "unless the caller has the owner role",
     );
     let keeper = make_token(&home, &["keeper", "keeper", "--as", "keeper"]);
     make_token(&home, &["phone", "phone", "--as", "admin"]);
@@ -1366,10 +1354,10 @@ fn a_token_gives_no_one_more_than_they_have() {
     assert_eq!(names(&["token", "list", "--as", "keeper"]), ["keeper"]);
     assert_eq!(
         names(&["token", "list", "--as", "admin"]),
-        ["keeper", "phone"]
+        ["keeper", "phone", "root"]
     );
     assert_eq!(names(&["token", "list"]), ["keeper", "phone", "root"]);
-    for (name, caller) in [("phone", "keeper"), ("root", "admin")] {
+    for (name, caller) in [("phone", "keeper"), ("root", "keeper")] {
         let removed = home.run(&["token", "remove", name, "--as", caller, "--json"]);
         assert_eq!(
             removed.json()["code"],
@@ -1712,4 +1700,67 @@ fn mcp_takes_post_and_delete() {
         assert_eq!(reply.status, 405, "{method}");
         assert_eq!(reply.header("allow"), Some("POST, DELETE"), "{method}");
     }
+}
+
+fn only_the_owner_role_acts_as_others() {
+    let home = Home::new();
+    let roles = "\n[principals.boss]\nrole = \"owner\"\n\n[principals.deputy]\nrole = \"deputy\"\n\n[roles.deputy]\nallow = [\"*\"]\n";
+    home.write_config("policy.toml", &format!("{POLICY}{roles}"));
+    let deputy = make_token(&home, &["deputy", "deputy"]);
+    let run = |line: &[&str]| {
+        let mut line = line.to_vec();
+        line.push("--json");
+        home.run(&line)
+    };
+
+    // A principal the file gives the owner role is as much the owner as owner is.
+    let boss = run(&["token", "add", "b", "boss"]);
+    assert_eq!(boss.json()["code"], json!("denied"), "{}", boss.stdout);
+    assert!(boss.stdout.contains("owner role"), "{}", boss.stdout);
+    let agent = run(&["agent.add", "agent=claude", "as=boss", "dry_run=true"]);
+    assert_eq!(agent.json()["code"], json!("denied"), "{}", agent.stdout);
+    let agent = run(&["agent.add", "agent=claude", "as=phone", "dry_run=true"]);
+    assert_eq!(agent.code, 0, "{}", agent.stdout);
+    let refused = run(&[
+        "token",
+        "add",
+        "b",
+        "boss",
+        "allow_owner=true",
+        "--as",
+        "deputy",
+    ]);
+    assert_eq!(refused.json()["code"], json!("denied"));
+
+    // A token made through an expiring token expires no later.
+    let lasting = make_token(
+        &home,
+        &["lasting", "boss", "allow_owner=true", "expires_days=30"],
+    );
+    let server = Server::start(&home);
+    for (days, status) in [(None, 403), (Some(60), 403), (Some(10), 200)] {
+        let mut args = json!({"name": format!("p{}", days.unwrap_or(0)), "principal": "phone"});
+        if let Some(days) = days {
+            args["expires_days"] = json!(days);
+        }
+        let made = server.call(&lasting, json!({"tool": "token.add", "args": args}));
+        assert_eq!(made.status, status, "{days:?}: {}", made.text());
+    }
+
+    // Acting as another principal is the owner role's alone: a file that gives it to a role of
+    // its own is refused, so the deputy cannot become owner by asking.
+    home.write_config("policy.toml", &format!("{POLICY}{roles}delegate = true\n"));
+    let refused = run(&["meta.whoami"]);
+    assert_eq!(refused.code, 1);
+    assert!(
+        refused.stdout.contains("the owner's alone"),
+        "{}",
+        refused.stdout
+    );
+    let minted = server.call(
+        &deputy,
+        json!({"tool": "token.add", "as": "owner", "args": {"name": "x", "principal": "owner", "allow_owner": true}}),
+    );
+    assert_ne!(minted.status, 200, "{}", minted.text());
+    assert!(!minted.text().contains("lgn_"));
 }

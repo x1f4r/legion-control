@@ -143,10 +143,7 @@ impl McpDoor {
         if self.http.is_none() {
             return Ok(self.options.pinned.clone());
         }
-        context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<Authenticated>())
+        self.authenticated(context)
             .map(|authenticated| Some(authenticated.principal.clone()))
             .ok_or_else(|| {
                 self.door_error(
@@ -154,6 +151,17 @@ impl McpDoor {
                     "The request carries no principal.".to_owned(),
                 )
             })
+    }
+
+    /// Who an HTTP request's token says it is; nothing over stdio.
+    fn authenticated<'a>(
+        &self,
+        context: &'a RequestContext<RoleServer>,
+    ) -> Option<&'a Authenticated> {
+        context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Authenticated>())
     }
 
     /// Serves one session until `input` ends, then waits for the calls the end cancelled to finish
@@ -325,6 +333,7 @@ impl McpDoor {
             cancel,
             events,
             hops: 0,
+            credential_expires: self.authenticated(context).and_then(|who| who.expires),
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);

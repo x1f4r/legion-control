@@ -74,8 +74,9 @@ struct CallBody {
 /// The call runs on a task of its own, so it still ends in the audit log when the client goes
 /// away; going away cancels it.
 pub(crate) async fn call(State(shared): State<Arc<Shared>>, request: Request) -> Response<Body> {
-    let Some(Authenticated { principal, .. }) =
-        request.extensions().get::<Authenticated>().cloned()
+    let Some(Authenticated {
+        principal, expires, ..
+    }) = request.extensions().get::<Authenticated>().cloned()
     else {
         return reply::error(&no_principal());
     };
@@ -133,6 +134,7 @@ pub(crate) async fn call(State(shared): State<Arc<Shared>>, request: Request) ->
         cancel: cancel.clone(),
         events,
         hops: 0,
+        credential_expires: expires,
     };
     let node = shared.node.clone();
     let router = Arc::clone(&shared.router);
