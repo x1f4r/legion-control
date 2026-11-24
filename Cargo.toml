@@ -1,0 +1,47 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+publish = false
+
+# Every version is named once, here; a crate takes what it needs with `workspace = true`.
+[workspace.dependencies]
+legion-proto = { path = "crates/legion-proto" }
+legion-core = { path = "crates/legion-core" }
+legion-tools = { path = "crates/legion-tools" }
+dunce = "1.0.5"
+gethostname = "1.1.0"
+jiff = { version = "1.0.2", default-features = false, features = ["std"] }
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_ignored = "0.1.14"
+# preserve_order keeps a result's fields in the order its type declares them, which is the order a
+# person reads them in.
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+serde_path_to_error = "0.1.20"
+tempfile = "3.27.0"
+tokio = "1.54.1"
+tokio-util = "0.7.20"
+toml = "1.2.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# A panic in a long-lived node takes every session with it, so the ways to write one by accident
+# are flagged; the few deliberate ones say why where they stand.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+dbg_macro = "warn"
+# Every fallible function returns the one ErrorBody every door hands to callers, about 150 bytes.
+# Failing is the rare path and the type crosses crate and process boundaries as a plain value, so
+# boxing it everywhere would cost readability for no measurable gain.
+result_large_err = "allow"

@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
 component="${1:-all}"
-case "$component" in all|agent|mac|android|desktop) ;; *) echo "Usage: $0 [all|agent|mac|android|desktop]" >&2; exit 2 ;; esac
+case "$component" in all|agent|mac|android|desktop|rust) ;; *) echo "Usage: $0 [all|agent|mac|android|desktop|rust]" >&2; exit 2 ;; esac
 
 if [[ "$component" == all || "$component" == agent ]]; then
   npm --prefix agent run check
@@ -53,4 +53,11 @@ if [[ "$component" == all || "$component" == desktop ]]; then
   DOTNET="${LEGION_DOTNET:-dotnet}"
   "$DOTNET" test desktop/LegionControl.Desktop.Tests --configuration Release
   "$DOTNET" build desktop/LegionControl.Desktop --configuration Release
+fi
+if [[ "$component" == all || "$component" == rust ]]; then
+  # The Rust workspace that is replacing the agent and the contract (docs/legion/design.md). --locked
+  # holds the build to the committed Cargo.lock, so a check never resolves a dependency anew.
+  cargo fmt --all --check
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+  cargo test --workspace --locked
 fi
