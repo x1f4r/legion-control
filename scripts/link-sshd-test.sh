@@ -178,6 +178,40 @@ const config = {
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
 ' "$WORK/config.json" "$WORK/device_key" "$PORT" "$USER_NAME" "$HOST_PUB_ED25519"
 
+NODE_BIN="$(command -v node)"
+cat > "$WORK/enrol-responder.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$NODE_BIN" -e '
+const fs = require("node:fs");
+const [authKeysPath, legionBin] = process.argv.slice(1);
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  const nl = buf.indexOf("\n");
+  if (nl === -1) return;
+  const line = buf.slice(0, nl).trim();
+  const req = JSON.parse(line);
+  if (req.enrol !== 1 || typeof req.public_key !== "string" || !req.public_key.startsWith("ssh-ed25519 ") || /[\r\n]/.test(req.public_key)) {
+    process.stdout.write(JSON.stringify({ ok: false, error: { code: "invalid_args", message: "Bad enrolment request." } }) + "\n");
+    process.exit(0);
+  }
+  const entry = \`command="\${legionBin} gate --as phone",restrict \${req.public_key}\n\`;
+  fs.appendFileSync(authKeysPath, entry, { mode: 0o600 });
+  process.stdout.write(JSON.stringify({
+    ok: true,
+    node: "tower",
+    principal: "phone",
+    role: "observer",
+    device: String(req.name || "device"),
+  }) + "\n");
+  process.exit(0);
+});
+' "$WORK/authorized_keys" "$LEGION_BIN"
+EOF
+chmod 700 "$WORK/enrol-responder.sh"
+
 echo "1) Running legion-link sshd integration test..."
 LEGION_LINK_SSHD="127.0.0.1:$PORT" \
 LEGION_LINK_USER="$USER_NAME" \
@@ -185,6 +219,8 @@ LEGION_LINK_HOST_KEY="$HOST_PUB_ED25519" \
 LEGION_LINK_HOST_KEY_ECDSA="$HOST_PUB_ECDSA" \
 LEGION_LINK_MISMATCH_HOST="$MISMATCH_HOST" \
 LEGION_LINK_KEY_FILE="$WORK/device_key" \
+LEGION_LINK_AUTH_KEYS="$WORK/authorized_keys" \
+LEGION_LINK_ENROL_SCRIPT="$WORK/enrol-responder.sh" \
 LEGION_LINK_NODE="tower" \
   cargo test -p legion-link --features ssh --test sshd -- --ignored --nocapture
 

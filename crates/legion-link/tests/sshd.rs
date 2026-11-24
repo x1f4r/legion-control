@@ -17,8 +17,9 @@ use std::time::Duration;
 
 use legion_link::proto::{ErrorCode, PROTOCOL};
 use legion_link::{
-    CancellationToken, DeviceKey, Link, LinkConfig, NodeLink, REASON_AUTH_FAILED,
-    REASON_HOST_KEY_MISMATCH, SshTarget, SshTimeouts, Subcommand, ssh,
+    CancellationToken, DeviceKey, Invite, Link, LinkConfig, NodeLink, REASON_AUTH_FAILED,
+    REASON_DEVICE_REMOVED_OR_UNKNOWN, REASON_HOST_KEY_MISMATCH, SshTarget, SshTimeouts, Subcommand,
+    ssh,
 };
 use serde_json::json;
 
@@ -29,6 +30,8 @@ struct TestEnv {
     ed25519_host_key: String,
     ecdsa_host_key: Option<String>,
     mismatch_host: Option<String>,
+    auth_keys_path: Option<String>,
+    enrol_script: Option<String>,
     key: DeviceKey,
     node: String,
 }
@@ -45,6 +48,12 @@ fn env_target() -> Option<TestEnv> {
     let mismatch_host = env::var("LEGION_LINK_MISMATCH_HOST")
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let auth_keys_path = env::var("LEGION_LINK_AUTH_KEYS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let enrol_script = env::var("LEGION_LINK_ENROL_SCRIPT")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let key_file = env::var("LEGION_LINK_KEY_FILE").ok()?;
     let key_pem = fs::read_to_string(&key_file).unwrap();
     let key = DeviceKey::from_openssh(&key_pem).unwrap();
@@ -56,6 +65,8 @@ fn env_target() -> Option<TestEnv> {
         ed25519_host_key,
         ecdsa_host_key,
         mismatch_host,
+        auth_keys_path,
+        enrol_script,
         key,
         node,
     })
@@ -323,4 +334,118 @@ async fn real_sshd_session_and_security_checks() {
     );
 
     link.close().await;
+
+    // 7. In-place `Link::pair` starting from an empty `LinkConfig`, live tool call without
+    //    rebuilding `Link`, key removal detection (`device_removed_or_unknown`) on reconnect, and
+    //    `Link::forget`.
+    if let (Some(auth_keys_path), Some(enrol_script)) = (&env.auth_keys_path, &env.enrol_script) {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        let original_auth_keys = fs::read_to_string(auth_keys_path).unwrap();
+        let invite_seed = [42u8; 32];
+        let invite_pub = DeviceKey::from_seed(invite_seed)
+            .public_key_line("invite")
+            .unwrap();
+        let with_invite =
+            format!("{original_auth_keys}command=\"{enrol_script}\",restrict {invite_pub}\n");
+        fs::write(auth_keys_path, &with_invite).unwrap();
+
+        let invite_text = Invite {
+            v: 1,
+            id: "inv-sshd-1".to_owned(),
+            node: env.node.clone(),
+            hosts: vec![env.host.clone()],
+            port: env.port,
+            user: env.user.clone(),
+            host_keys: vec![env.ed25519_host_key.clone()],
+            key: STANDARD.encode(invite_seed),
+            principal: "phone".to_owned(),
+            expires: "2099-01-01T00:00:00Z".to_owned(),
+        }
+        .encode()
+        .unwrap();
+
+        let pair_link = Link::new(LinkConfig::default());
+        assert!(pair_link.config().device_key.is_none());
+
+        let enrolled = pair_link.pair(&invite_text, "tablet").await.unwrap();
+        assert_eq!(enrolled.node, env.node);
+        assert_eq!(enrolled.principal, "phone");
+        assert_eq!(enrolled.role, "observer");
+        assert_eq!(enrolled.device, "tablet");
+        assert!(pair_link.config().device_key.is_some());
+        assert!(pair_link.config().node(&env.node).is_some());
+
+        // The live Link immediately uses its newly generated device key without rebuilding.
+        let paired_info = pair_link
+            .call(&env.node, "sys.info", json!({}), None, |_| {})
+            .await
+            .unwrap();
+        assert!(
+            paired_info
+                .get("os")
+                .and_then(|o| o.get("family"))
+                .is_some(),
+            "{paired_info}"
+        );
+
+        // Locate the live `legion gate --as phone` process, remove the newly paired device key by
+        // restoring `authorized_keys`, and kill the gate process so the next call must reconnect.
+        let paired_procs = pair_link
+            .call(
+                &env.node,
+                "sys.procs",
+                json!({"filter": "legion", "limit": 50}),
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paired_gate_pids: Vec<u64> = paired_procs["procs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| {
+                p.get("cmd")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("gate") && c.contains("phone"))
+            })
+            .filter_map(|p| p.get("pid").and_then(|id| id.as_u64()))
+            .collect();
+        assert!(
+            !paired_gate_pids.is_empty(),
+            "could not find live `legion gate --as phone` process in {paired_procs}"
+        );
+
+        fs::write(auth_keys_path, &original_auth_keys).unwrap();
+        for pid in &paired_gate_pids {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let removed_err = pair_link
+            .call(&env.node, "sys.info", json!({}), None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(removed_err.code, ErrorCode::Denied, "{removed_err}");
+        assert_eq!(removed_err.machine.as_deref(), Some(env.node.as_str()));
+        assert_eq!(
+            removed_err.details.as_ref().unwrap()["reason"],
+            json!(REASON_DEVICE_REMOVED_OR_UNKNOWN),
+            "{removed_err}"
+        );
+        let hint = removed_err.hint.as_deref().unwrap().to_ascii_lowercase();
+        assert!(hint.contains("pair"), "expected pair hint, got: {hint}");
+
+        // `forget` drops the node from LinkConfig while preserving the device key.
+        assert!(pair_link.forget(&env.node).await);
+        assert!(!pair_link.forget(&env.node).await);
+        assert!(pair_link.config().node(&env.node).is_none());
+        assert!(pair_link.config().device_key.is_some());
+        let after_forget = pair_link.hello(&env.node).await.unwrap_err();
+        assert_eq!(after_forget.code, ErrorCode::NotFound);
+
+        pair_link.close().await;
+    }
 }

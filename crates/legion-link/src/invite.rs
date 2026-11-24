@@ -428,6 +428,8 @@ pub struct Enrolled {
 
 #[cfg(feature = "ssh")]
 pub use self::enrol_client::enrol;
+#[cfg(all(test, feature = "ssh"))]
+pub(crate) use self::enrol_client::enrol_exchange;
 
 #[cfg(feature = "ssh")]
 mod enrol_client {
@@ -538,7 +540,7 @@ mod enrol_client {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn enrol_exchange<R, W>(
+    pub(crate) async fn enrol_exchange<R, W>(
         reader: R,
         mut writer: W,
         mut handle: Option<&mut dyn TransportHandle>,

@@ -28,14 +28,7 @@ use crate::key::DeviceKey;
 use crate::session::{Session, TransportHandle};
 use crate::stderr::StderrTail;
 
-/// Structured `details.reason` for a pinned host key mismatch.
-pub const REASON_HOST_KEY_MISMATCH: &str = "host_key_mismatch";
-/// Structured `details.reason` for rejected SSH key authentication.
-pub const REASON_AUTH_FAILED: &str = "auth_failed";
-/// Structured `details.reason` for a connect or handshake timeout.
-pub const REASON_TIMEOUT: &str = "timeout";
-/// Structured `details.reason` for an unreachable host.
-pub const REASON_UNREACHABLE: &str = "unreachable";
+pub use crate::{REASON_AUTH_FAILED, REASON_HOST_KEY_MISMATCH, REASON_TIMEOUT, REASON_UNREACHABLE};
 
 /// Internal duplex buffer size between the SSH channel pump tasks and the session streams.
 const CHANNEL_BUFFER_BYTES: usize = 64 * 1024;
