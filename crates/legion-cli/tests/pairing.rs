@@ -4457,3 +4457,276 @@ fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
     );
     assert_eq!(reply["result"]["door"], json!("ssh"), "{reply}");
 }
+
+#[test]
+fn f3_cli_invite_enrol_push_audit_omits_triggering_device_while_paired_device_invite_records_creator()
+ {
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let host_key_a = node_a.home().join("host_a.pub");
+    let host_key_b = node_b.home().join("host_b.pub");
+    std::fs::write(
+        &host_key_a,
+        format!("{} host@a\n", ed25519_public_key_from_seed(&[0x71; 32])),
+    )
+    .unwrap();
+    std::fs::write(
+        &host_key_b,
+        format!("{} host@b\n", ed25519_public_key_from_seed(&[0x72; 32])),
+    )
+    .unwrap();
+    let home_a_legion = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_a),
+            toml_literal(&host_key_a),
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_b),
+            toml_literal(&host_key_b),
+        ),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let fleet_a = if cfg!(windows) {
+        let script = node_b.home().join("run-b-f3.cmd");
+        let body = format!(
+            "@echo off\r\n\
+             set \"LEGION_HOME={}\"\r\n\
+             set \"HOME={}\"\r\n\
+             set \"USERPROFILE={}\"\r\n\
+             set \"XDG_CONFIG_HOME=\"\r\n\
+             set \"XDG_STATE_HOME=\"\r\n\
+             \"{}\" rpc\r\n",
+            home_b_legion.display(),
+            node_b.home().display(),
+            node_b.home().display(),
+            bin,
+        );
+        std::fs::write(&script, body).unwrap();
+        format!(
+            "[machines.b]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+            toml_literal(&script),
+        )
+    } else {
+        let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
+        format!(
+            "[machines.b]\ncommand = [\"env\", {}, {}, \"rpc\"]\n",
+            toml_literal(Path::new(&env_arg)),
+            toml_literal(Path::new(bin)),
+        )
+    };
+    node_a.write_config("fleet.toml", &fleet_a);
+
+    let run_enrol_on_a = |invite_id: &str, name: &str, pub_key: &str| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args([
+            "gate",
+            "--home",
+            &home_a_legion.display().to_string(),
+            "--enrol",
+            invite_id,
+        ])
+        .env("HOME", node_a.home())
+        .env("USERPROFILE", node_a.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let line = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": invite_id, "public_key": pub_key, "name": name})
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "enrol failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+    };
+
+    // 1. CLI owner (no paired device) creates an invite and enrols `fresh-phone`.
+    let inv_cli = node_a.run(&[
+        "device.invite",
+        "name=fresh-phone",
+        "role=owner",
+        "allow_owner=true",
+        "host=127.0.0.1",
+        "port=22",
+        "user=tester",
+    ]);
+    assert_eq!(inv_cli.code, 0, "{}", inv_cli.stderr);
+    let inv_cli_id = inv_cli.json()["id"].as_str().unwrap().to_owned();
+    run_enrol_on_a(
+        &inv_cli_id,
+        "fresh-phone",
+        &ed25519_public_key_from_seed(&[0x73; 32]),
+    );
+
+    let parse_audit = |path: &Path| -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+
+    // Both A (`fleet.sync`) and B (`config.write` + `config.write.applied`) MUST leave
+    // `device_registry_push.device` and `device_registry_push.pairing_id` empty/absent!
+    let audit_a1 = parse_audit(&node_a.state().join("audit.jsonl"));
+    let sync_a1 = audit_a1
+        .iter()
+        .find(|r| {
+            r["tool"] == json!("fleet.sync")
+                && r["args"]["device_registry_push"]["trigger"] == json!("device.enrol")
+        })
+        .unwrap_or_else(|| panic!("missing fleet.sync audit on A: {audit_a1:?}"));
+    let push_a1 = &sync_a1["args"]["device_registry_push"];
+    assert_eq!(push_a1["principal"], json!("owner"), "{push_a1}");
+    assert!(
+        push_a1.get("device").is_none_or(Value::is_null),
+        "CLI invite enrolment push audit on A MUST NOT blame the newly enrolled device: {push_a1}"
+    );
+    assert!(
+        push_a1.get("pairing_id").is_none_or(Value::is_null),
+        "CLI invite enrolment push audit on A MUST NOT record a pairing_id: {push_a1}"
+    );
+    assert!(
+        sync_a1.get("device").is_none_or(Value::is_null),
+        "outer fleet.sync audit record on A MUST NOT claim the newly enrolled device triggered it: {sync_a1}"
+    );
+
+    let audit_b1 = parse_audit(&node_b.state().join("audit.jsonl"));
+    for tool in ["config.write", "config.write.applied"] {
+        let rec = audit_b1
+            .iter()
+            .find(|r| {
+                r["tool"] == json!(tool)
+                    && r["args"]["device_registry_push"]["trigger"] == json!("device.enrol")
+            })
+            .unwrap_or_else(|| panic!("missing {tool} audit on B: {audit_b1:?}"));
+        let push = &rec["args"]["device_registry_push"];
+        assert_eq!(push["principal"], json!("owner"), "{push}");
+        assert!(
+            push.get("device").is_none_or(Value::is_null),
+            "CLI invite enrolment push audit ({tool}) on B MUST leave device empty: {push}"
+        );
+        assert!(
+            push.get("pairing_id").is_none_or(Value::is_null),
+            "CLI invite enrolment push audit ({tool}) on B MUST leave pairing_id empty: {push}"
+        );
+    }
+
+    // 2. Now `fresh-phone` (an actual paired device) creates an invite through `legion gate`
+    //    and enrols `second-phone`: the push audit MUST record `fresh-phone` and its pairing id.
+    let a_devices: legion_tools::device::registry::DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let fresh_id = a_devices
+        .devices
+        .iter()
+        .find(|(_, d)| d.name == "fresh-phone")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+
+    let req_hello = rpc_request(
+        json!(1),
+        "hello",
+        json!({"protocol": legion_core::proto::PROTOCOL, "client": "test", "version": "0"}),
+    );
+    let req_inv = rpc_request(
+        json!(2),
+        "call",
+        json!({
+            "tool": "device.invite",
+            "args": {"name": "second-phone", "role": "observer", "host": "127.0.0.1", "port": 22, "user": "tester"}
+        }),
+    );
+    let mut gate_cmd = std::process::Command::new(bin);
+    gate_cmd
+        .args([
+            "gate",
+            "--home",
+            &home_a_legion.display().to_string(),
+            "--as",
+            "device:fresh-phone",
+            "--device",
+            "fresh-phone",
+            "--pairing",
+            &fresh_id,
+        ])
+        .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+        .env("HOME", node_a.home())
+        .env("USERPROFILE", node_a.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut gate_child = gate_cmd.spawn().unwrap();
+    gate_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{req_hello}\n{req_inv}\n").as_bytes())
+        .unwrap();
+    let gate_out = gate_child.wait_with_output().unwrap();
+    assert!(
+        gate_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gate_out.stderr)
+    );
+    let inv2_reply: Value = String::from_utf8_lossy(&gate_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["id"] == json!(2))
+        .unwrap();
+    let inv2_id = inv2_reply["result"]["id"].as_str().unwrap().to_owned();
+    run_enrol_on_a(
+        &inv2_id,
+        "second-phone",
+        &ed25519_public_key_from_seed(&[0x74; 32]),
+    );
+
+    let audit_b2 = parse_audit(&node_b.state().join("audit.jsonl"));
+    let second_applied = audit_b2
+        .iter()
+        .rev()
+        .find(|r| {
+            r["tool"] == json!("config.write.applied")
+                && r["args"]["device_registry_push"]["trigger"] == json!("device.enrol")
+        })
+        .unwrap();
+    let push2 = &second_applied["args"]["device_registry_push"];
+    assert_eq!(push2["principal"], json!("device:fresh-phone"), "{push2}");
+    assert_eq!(push2["device"], json!("fresh-phone"), "{push2}");
+    assert_eq!(push2["pairing_id"], json!(fresh_id), "{push2}");
+}

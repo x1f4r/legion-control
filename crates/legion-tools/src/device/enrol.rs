@@ -816,12 +816,8 @@ fn process_enrol_blocking(
     let push_audit = Some(DeviceRegistryPushAudit {
         trigger: "device.enrol".to_owned(),
         principal: invite.created_by,
-        device: invite
-            .created_by_device_name
-            .or_else(|| Some(device_name.clone())),
-        pairing_id: invite
-            .created_by_device
-            .or_else(|| Some(pairing_id.clone())),
+        device: invite.created_by_device_name,
+        pairing_id: invite.created_by_device,
         source_node: Some(node.name()),
     });
     let fingerprint = validated_key.fingerprint;
