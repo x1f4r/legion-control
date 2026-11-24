@@ -107,6 +107,10 @@ pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<Authenti
             principal: entry.principal.as_str().to_owned(),
             token: name.to_owned(),
             hash: entry.hash.clone(),
+            expires: entry
+                .expires
+                .as_deref()
+                .and_then(|expires| legion_core::tokens::parse_time(expires).ok()),
         })
         .ok_or(Refusal::BadToken)
 }

@@ -36,8 +36,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, HeaderValue, ORIGIN, VARY,
-    WWW_AUTHENTICATE,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, CONTENT_TYPE, HeaderValue,
+    ORIGIN, VARY, WWW_AUTHENTICATE,
 };
 use axum::http::{Method, Response, StatusCode};
 use axum::middleware::{self, Next};
@@ -88,6 +88,10 @@ const REFUSAL_DELAY: Duration = Duration::from_millis(200);
 /// How long shutting down waits for connections to close and calls to be recorded: the time a
 /// cancelled call has to stop, and a little more.
 const DRAIN: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(2));
+
+/// How often an event stream with nothing to say says so, so that a client that went away is
+/// noticed, and its call cancelled, within this long.
+pub(crate) const KEEP_ALIVE: Duration = Duration::from_secs(3);
 
 /// How often sessions are checked for a token that went and for idleness.
 const SWEEP: Duration = Duration::from_secs(10);
@@ -186,7 +190,9 @@ impl HttpDoor {
                 .disable_allowed_hosts()
                 .disable_allowed_origins()
                 .with_cancellation_token(link.shutdown.child_token())
-                .with_max_request_body_bytes(MAX_BODY);
+                .with_max_request_body_bytes(MAX_BODY)
+                // Something is written this often, so a client that vanished is noticed.
+                .with_sse_keep_alive(Some(KEEP_ALIVE));
             let mut sessions = LocalSessionManager::default();
             sessions.session_config.keep_alive = Some(sessions::IDLE);
             let sessions = Arc::new(sessions);
@@ -348,9 +354,9 @@ async fn gate(
         .map(|file| file.serve.clone())
         .unwrap_or_default();
     let mut principal = None;
-    // The origin of a page allowed to call, which its responses name so the browser shows them to
-    // it. Only read once the gate has let the origin through.
-    let origin = request.headers().get(ORIGIN).cloned();
+    // The origin of a page allowed to call, which every response past the origin check names, so
+    // the browser shows the page its errors as well as its results.
+    let mut accepted_origin = None;
     let mut response = if let Some(problem) = gate::malformed(request.headers(), request.uri()) {
         reply::refusal(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgs, problem)
     } else if !gate::host_allowed(request.headers(), shared.port, &config) {
@@ -365,42 +371,39 @@ async fn gate(
             ErrorCode::Denied,
             "Pages from that origin may not use this server.",
         )
-    } else if method == Method::OPTIONS && request.headers().contains_key(ORIGIN) {
-        // A browser's preflight carries no token; a listed origin is told what it may send.
-        preflight()
-    } else if method == Method::GET && path == "/v1/health" {
-        next.run(request).await
     } else {
-        let tokens = shared
-            .node
-            .config()
-            .get::<Tokens>()
-            .unwrap_or_else(|error| {
-                log(&format!(
-                    "every token is refused until tokens.toml is mended: {}",
-                    error.message
-                ));
-                Arc::new(Tokens::default())
-            });
-        match gate::principal(request.headers(), &tokens) {
-            Ok(found) => {
-                principal = Some(found.principal.clone());
-                request.extensions_mut().insert(found);
-                next.run(request).await
-            }
-            Err(refusal) => {
-                tokio::time::sleep(REFUSAL_DELAY).await;
-                unauthorized(&refusal)
+        accepted_origin = request.headers().get(ORIGIN).cloned();
+        if method == Method::OPTIONS && accepted_origin.is_some() {
+            // A browser's preflight carries no token; a listed origin is told what it may send.
+            preflight()
+        } else if method == Method::GET && path == "/v1/health" {
+            next.run(request).await
+        } else {
+            let tokens = shared
+                .node
+                .config()
+                .get::<Tokens>()
+                .unwrap_or_else(|error| {
+                    log(&format!(
+                        "every token is refused until tokens.toml is mended: {}",
+                        error.message
+                    ));
+                    Arc::new(Tokens::default())
+                });
+            match gate::principal(request.headers(), &tokens) {
+                Ok(found) => {
+                    principal = Some(found.principal.clone());
+                    request.extensions_mut().insert(found);
+                    next.run(request).await
+                }
+                Err(refusal) => {
+                    tokio::time::sleep(REFUSAL_DELAY).await;
+                    unauthorized(&refusal)
+                }
             }
         }
     };
-    if let Some(origin) = origin
-        && gate::origin_allowed(&origin_only(&origin), &config)
-        && !matches!(
-            response.status(),
-            StatusCode::BAD_REQUEST | StatusCode::MISDIRECTED_REQUEST
-        )
-    {
+    if let Some(origin) = accepted_origin {
         let headers = response.headers_mut();
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         headers.insert(
@@ -437,13 +440,6 @@ fn preflight() -> Response<Body> {
     );
     headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
     response
-}
-
-/// A header map holding only `origin`, to ask the gate about it.
-fn origin_only(origin: &HeaderValue) -> axum::http::HeaderMap {
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(ORIGIN, origin.clone());
-    headers
 }
 
 /// 401, saying a token is needed or that the one given will not do, and never which of the two
@@ -508,9 +504,13 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
         Ok(bytes) => bytes,
         Err(response) => return *response,
     };
+    let mut reservation = None;
     if session.is_none() && opens_session(&bytes) {
-        match shared.sessions.make_room(&who) {
-            Some(ended) => shared.close(ended).await,
+        match shared.sessions.reserve(&who, compact) {
+            Some((place, ended)) => {
+                reservation = Some(place);
+                shared.close(ended).await;
+            }
             None => {
                 return reply::json(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -525,7 +525,12 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
             }
         }
     }
-    let request_id = session.as_ref().and_then(|_| request_id(&bytes));
+    // Only a request posted inside a session can be cancelled by leaving it; a DELETE ends the
+    // session whatever its body says.
+    let request_id = session
+        .as_ref()
+        .filter(|_| !deleting)
+        .and_then(|_| request_id(&bytes));
     let request = Request::from_parts(parts, Body::from(bytes));
     let service = if compact {
         &shared.mcp_compact
@@ -533,7 +538,15 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
         &shared.mcp_full
     };
     let response = service.handle(request).await;
-    if let (Some(id), Some(request_id)) = (&session, request_id) {
+    // Only a successful event stream answers the request; any other reply (a 406 or a 400 for a
+    // request that reused an id) is not the running call's, and leaving it cancels nothing.
+    let streaming = response.status() == StatusCode::OK
+        && response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|kind| kind.to_str().ok())
+            .is_some_and(|kind| kind.starts_with("text/event-stream"));
+    if let (Some(id), Some(request_id), true) = (&session, request_id, streaming) {
         // A client that goes away while a request in its session is answered has cancelled it.
         let manager = Arc::clone(&shared.managers[usize::from(compact)]);
         let id: SessionId = id.as_str().into();
@@ -558,12 +571,15 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
     }
     match &session {
         None => {
-            if let Some(id) = response
-                .headers()
-                .get(SESSION_HEADER)
-                .and_then(|id| id.to_str().ok())
-            {
-                shared.sessions.bind(id.to_owned(), who, compact);
+            // A failed handshake opened nothing, and dropping the reservation gives its place back.
+            if let (Some(place), Some(id)) = (
+                reservation,
+                response
+                    .headers()
+                    .get(SESSION_HEADER)
+                    .and_then(|id| id.to_str().ok()),
+            ) {
+                place.bind(id.to_owned());
             }
         }
         Some(id) if deleting && response.status().is_success() => shared.sessions.forget(id),

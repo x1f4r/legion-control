@@ -82,7 +82,9 @@ pub struct Role {
     /// When present, the only directories the file tools may touch.
     #[serde(default)]
     pub paths: Option<Vec<PathRoot>>,
-    /// Whether a caller with this role may act as another principal.
+    /// Whether a caller with this role may act as another principal. Only the built-in owner role
+    /// does: a role that could act as anyone would be the owner under another name, so a file
+    /// that sets it on a role of its own is refused.
     #[serde(default)]
     pub delegate: bool,
 }
@@ -248,6 +250,11 @@ impl Document for Policy {
                     .to_owned(),
             );
         }
+        if let Some((name, _)) = self.roles.iter().find(|(_, role)| role.delegate) {
+            return Err(format!(
+                "[roles.{name}] sets delegate = true, but acting as another principal is the owner's alone: a role that could act as anyone would be the owner under another name; give the principal role = \"owner\" if that is what is meant"
+            ));
+        }
         for (principal, entry) in &self.principals {
             let known =
                 entry.role == OWNER || entry.role == NOBODY || self.roles.contains_key(&entry.role);
@@ -328,9 +335,7 @@ impl Policy {
                 ErrorCode::Denied,
                 format!("{caller} may not act as {requested}: its role {role} does not delegate."),
             )
-            .with_hint(
-                "Call without --as, or give the caller's role delegate = true in policy.toml.",
-            ))
+            .with_hint("Call without --as: only the owner role may act as another principal."))
         }
     }
 
@@ -1394,12 +1399,24 @@ paths = ["~/projects/**"]
     }
 
     #[test]
-    fn a_role_that_delegates_is_set_in_the_file() {
+    fn only_the_owner_role_delegates() {
+        let error = parse::<Policy>(
+            Path::new("policy.toml"),
+            b"[principals.laptop]\nrole = \"admin\"\n[roles.admin]\nallow = [\"*\"]\ndelegate = true\n",
+        )
+        .unwrap_err()
+        .message;
+        assert!(error.contains("[roles.admin]"), "{error}");
+        assert!(error.contains("the owner's alone"), "{error}");
         let policy = policy(
-            "[principals.laptop]\nrole = \"admin\"\n[roles.admin]\nallow = [\"*\"]\ndelegate = true\n",
+            "[principals.laptop]\nrole = \"owner\"\n[principals.phone]\nrole = \"admin\"\n[roles.admin]\nallow = [\"*\"]\ndelegate = false\n",
         );
         assert_eq!(
             policy.resolve(Some("phone"), Some("laptop")).unwrap(),
+            "phone"
+        );
+        assert_eq!(
+            policy.resolve(Some("owner"), Some("phone")).unwrap(),
             "phone"
         );
     }

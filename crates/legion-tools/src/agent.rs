@@ -302,18 +302,19 @@ pub struct AddResult {
 async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
     let principal = Principal::parse(&args.as_principal)?;
     let principal = principal.as_str().to_owned();
-    if principal == OWNER {
+    let policy = ctx.config().get::<Policy>()?;
+    // The owner role, not the name: a principal the file gives role = "owner" may do as much.
+    if policy.role_of(&principal).0 == OWNER {
         if !args.allow_owner {
             return Err(ErrorBody::new(
                 ErrorCode::Denied,
-                "Registering an AI agent as `owner` gives it unrestricted access to everything this account can do, so it is refused unless `allow_owner=true`.",
+                format!("{principal} has the owner role: registering an AI agent as it gives the agent unrestricted access to everything this account can do, so it is refused unless `allow_owner=true`."),
             )
             .with_hint(
                 "Add a named principal with a narrower role in policy.toml (such as `[principals.\"agent:claude\"]` with `role = \"operator\"`), or pass `allow_owner=true` if you really want unrestricted access.",
             ));
         }
     } else {
-        let policy = ctx.config().get::<Policy>()?;
         if !policy
             .principals
             .keys()
