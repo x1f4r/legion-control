@@ -68,7 +68,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.remove",
         Effect::Admin,
-        "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions and same-account SSH connections for a removed device. Detached background jobs the device started keep running and are listed in `jobs_left_running` (stop them separately with `job.cancel` if needed). Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home.",
+        "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions and same-account SSH connections for a removed device. Detached background jobs the device started keep running and are listed in `jobs_left_running` (stop them separately with `job.cancel` if needed). Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home; for foreign devices this removes the key without ending sessions tracked under that other home and reports `sessions_not_ended: true`.",
         remove,
     );
 }
@@ -560,7 +560,11 @@ struct Removed {
     removed: bool,
     lines_removed: usize,
     sessions_ended: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    sessions_not_ended: bool,
     jobs_left_running: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
 }
 
 async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
@@ -765,7 +769,11 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         removed: true,
                                         lines_removed: matched_lines,
                                         sessions_ended: 0,
+                                        sessions_not_ended: remove_foreign,
                                         jobs_left_running: Vec::new(),
+                                        hint: remove_foreign.then(|| {
+                                            "Active sessions tracked under another Legion home were not ended; new SSH connections and channels are refused immediately, and if that other home still exists you can run `device.remove` from it or end any open sshd sessions manually.".to_owned()
+                                        }),
                                     },
                                     terminate,
                                 )),
@@ -904,7 +912,9 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         removed: true,
                                         lines_removed: matched_lines,
                                         sessions_ended: 0,
+                                        sessions_not_ended: false,
                                         jobs_left_running: Vec::new(),
+                                        hint: None,
                                     },
                                     None,
                                 )),
@@ -1769,8 +1779,9 @@ role = "owner"
             cross_rm.hint
         );
 
-        // Removing home-a's device leaves home-b's device line untouched.
-        node_a
+        // Removing home-a's device leaves home-b's device line untouched and does not set
+        // `sessions_not_ended` or `hint`.
+        let removed_local = node_a
             .call(Call::new(
                 Door::Cli,
                 "device.remove",
@@ -1778,6 +1789,8 @@ role = "owner"
             ))
             .await
             .unwrap();
+        assert!(removed_local.get("sessions_not_ended").is_none());
+        assert!(removed_local.get("hint").is_none());
         let list_b = node_b
             .call(Call::new(Door::Cli, "device.list", json!({})))
             .await
@@ -1825,6 +1838,13 @@ role = "owner"
             .unwrap();
         assert_eq!(removed_foreign["removed"], json!(true));
         assert_eq!(removed_foreign["lines_removed"], json!(1));
+        assert_eq!(removed_foreign["sessions_not_ended"], json!(true));
+        assert!(
+            removed_foreign["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("another") && h.contains("session")),
+            "expected clear sessions_not_ended hint, got: {removed_foreign}"
+        );
         assert!(
             !std::fs::read_to_string(&shared_auth)
                 .unwrap()
