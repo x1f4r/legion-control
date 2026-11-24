@@ -67,7 +67,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(FleetTool::<DiscoverArgs, DiscoverResult, _>::new(
         "fleet.discover",
         Effect::Read,
-        "Discover peer machines from `tailscale status --json` using their MagicDNS names. Pass `add: true` (requires admin permission) to add unlisted peers to fleet.toml.",
+        "Discover peer machines from `tailscale status --json` using their MagicDNS names. Only peers belonging to this node's own Tailscale user (`Self.UserID`) are listed, and shared-in nodes (`ShareeNode`) are skipped so calls and `--on all` never reach machines owned by someone else. Tagged nodes are marked `addable: false` and skipped by `add: true` (add them explicitly with `fleet.add`). Pass `add: true` (requires admin permission) to add unlisted addable peers to fleet.toml.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_discover(fleet, ctx, args)),
     ));
@@ -459,8 +459,8 @@ async fn fleet_remove(
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DiscoverArgs {
-    /// Add every discovered machine that is not already listed in fleet.toml. Requires admin
-    /// permission.
+    /// Add every addable discovered machine (same Tailscale user, not shared in, not tagged) that
+    /// is not already listed in fleet.toml. Requires admin permission.
     #[serde(default)]
     add: bool,
 }
@@ -478,6 +478,11 @@ pub struct DiscoveredMachine {
     pub online: bool,
     /// Whether this machine name or SSH target is already listed in `fleet.toml`.
     pub already_listed: bool,
+    /// Whether the peer carries Tailscale ACL tags.
+    pub tagged: bool,
+    /// Whether `fleet.discover` with `add = true` will add this peer by default (`false` for
+    /// tagged nodes, which should be added explicitly with `fleet.add`).
+    pub addable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -554,18 +559,7 @@ async fn fleet_discover(
     let candidates = parse_tailscale_status(&output.stdout.text, &existing, ctx.node_name())?;
 
     if args.add {
-        let to_add: Vec<(String, MachineEntry)> = candidates
-            .iter()
-            .filter(|c| !c.already_listed)
-            .map(|c| {
-                let entry = MachineEntry {
-                    ssh: Some(c.ssh.clone()),
-                    os: infer_remote_os(&c.os),
-                    ..Default::default()
-                };
-                (c.name.clone(), entry)
-            })
-            .collect();
+        let to_add = addable_entries(&candidates);
         let config_dir = ctx.config().dir().to_path_buf();
         let added = tokio::task::spawn_blocking(move || {
             let store = ConfigStore::new(config_dir);
@@ -586,7 +580,26 @@ async fn fleet_discover(
     Ok(DiscoverResult { candidates })
 }
 
+fn addable_entries(candidates: &[DiscoveredMachine]) -> Vec<(String, MachineEntry)> {
+    candidates
+        .iter()
+        .filter(|c| c.addable && !c.already_listed)
+        .map(|c| {
+            let entry = MachineEntry {
+                ssh: Some(c.ssh.clone()),
+                os: infer_remote_os(&c.os),
+                ..Default::default()
+            };
+            (c.name.clone(), entry)
+        })
+        .collect()
+}
+
 /// Parses a `tailscale status --json` document into sorted fleet discovery candidates.
+///
+/// Only peers owned by the same Tailscale user as `Self.UserID` are returned, shared-in peers
+/// (`ShareeNode: true`) are skipped, and tagged peers (`Tags` non-empty) are marked
+/// `addable = false` so `fleet.discover add=true` does not add them by default.
 ///
 /// Pure function so it can be unit-tested exhaustively against canned Tailscale snapshots without
 /// running `tailscale` or touching the network.
@@ -597,12 +610,26 @@ pub fn parse_tailscale_status(
 ) -> Result<Vec<DiscoveredMachine>, ErrorBody> {
     #[derive(Deserialize)]
     struct TailscaleStatus {
+        #[serde(rename = "Self", default)]
+        self_node: Option<TailscaleSelf>,
         #[serde(rename = "Peer", default)]
         peers: Option<BTreeMap<String, TailscalePeer>>,
     }
 
     #[derive(Deserialize)]
+    struct TailscaleSelf {
+        #[serde(rename = "UserID", default)]
+        user_id: Option<i64>,
+    }
+
+    #[derive(Deserialize)]
     struct TailscalePeer {
+        #[serde(rename = "UserID", default)]
+        user_id: Option<i64>,
+        #[serde(rename = "ShareeNode", default)]
+        sharee_node: bool,
+        #[serde(rename = "Tags", default)]
+        tags: Option<Vec<String>>,
         #[serde(rename = "HostName", default)]
         host_name: String,
         #[serde(rename = "DNSName", default)]
@@ -621,9 +648,24 @@ pub fn parse_tailscale_status(
         .with_hint("Ensure a supported version of the Tailscale CLI is installed.")
     })?;
 
+    let self_user_id = parsed
+        .self_node
+        .and_then(|s| s.user_id)
+        .filter(|&id| id > 0)
+        .ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Unsupported,
+                "Cannot filter Tailscale peers safely: `tailscale status --json` did not include a valid `Self.UserID`.",
+            )
+            .with_hint("Ensure Tailscale is logged in as a user account, or add machines explicitly with fleet.add.")
+        })?;
+
     let mut seen_names = HashSet::new();
     let mut candidates = Vec::new();
     for peer in parsed.peers.unwrap_or_default().into_values() {
+        if peer.sharee_node || peer.user_id != Some(self_user_id) {
+            continue;
+        }
         let ssh = peer.dns_name.trim().trim_end_matches('.').to_owned();
         if ssh.is_empty() || validate_ssh_target(&ssh).is_err() {
             continue;
@@ -638,12 +680,15 @@ pub fn parse_tailscale_status(
             continue;
         }
         let already_listed = existing.machines.contains_key(&name) || existing.has_ssh_target(&ssh);
+        let tagged = peer.tags.as_deref().is_some_and(|tags| !tags.is_empty());
         candidates.push(DiscoveredMachine {
             name,
             ssh,
             os: peer.os.to_lowercase(),
             online: peer.online,
             already_listed,
+            tagged,
+            addable: !tagged,
         });
     }
     candidates.sort_by(|a, b| a.name.cmp(&b.name));
@@ -669,6 +714,7 @@ mod tests {
     const CANNED_TAILSCALE: &str = r#"{
         "BackendState": "Running",
         "Self": {
+            "UserID": 1001,
             "HostName": "laptop",
             "DNSName": "laptop.tailnet.example.",
             "OS": "macOS",
@@ -676,26 +722,53 @@ mod tests {
         },
         "Peer": {
             "nodekey:aaa": {
+                "UserID": 1001,
                 "HostName": "Tower",
                 "DNSName": "tower.tailnet.example.",
                 "OS": "linux",
                 "Online": true
             },
             "nodekey:bbb": {
+                "UserID": 1001,
                 "HostName": "tower-win",
                 "DNSName": "tower-win.tailnet.example.",
                 "OS": "windows",
                 "Online": false
             },
             "nodekey:ccc": {
+                "UserID": 1001,
                 "HostName": "pi",
                 "DNSName": "pi.tailnet.example.",
                 "OS": "linux",
                 "Online": true
             },
             "nodekey:ddd": {
+                "UserID": 1001,
                 "HostName": "no-dns",
                 "DNSName": "",
+                "OS": "linux",
+                "Online": true
+            },
+            "nodekey:eee": {
+                "UserID": 2002,
+                "HostName": "other-user",
+                "DNSName": "other-user.tailnet.example.",
+                "OS": "linux",
+                "Online": true
+            },
+            "nodekey:fff": {
+                "UserID": 1001,
+                "ShareeNode": true,
+                "HostName": "shared-box",
+                "DNSName": "shared-box.other.example.",
+                "OS": "linux",
+                "Online": true
+            },
+            "nodekey:ggg": {
+                "UserID": 1001,
+                "Tags": ["tag:server"],
+                "HostName": "tagged-box",
+                "DNSName": "tagged-box.tailnet.example.",
                 "OS": "linux",
                 "Online": true
             }
@@ -703,7 +776,7 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_canned_tailscale_status_json_and_marks_already_listed() {
+    fn parses_canned_tailscale_status_json_and_filters_unowned_shared_and_tagged_peers() {
         let existing = parse::<FleetFile>(
             Path::new("fleet.toml"),
             b"[machines.pi]\nssh = \"pi.tailnet.example\"\n",
@@ -720,6 +793,17 @@ mod tests {
                     os: "linux".into(),
                     online: true,
                     already_listed: true,
+                    tagged: false,
+                    addable: true,
+                },
+                DiscoveredMachine {
+                    name: "tagged-box".into(),
+                    ssh: "tagged-box.tailnet.example".into(),
+                    os: "linux".into(),
+                    online: true,
+                    already_listed: false,
+                    tagged: true,
+                    addable: false,
                 },
                 DiscoveredMachine {
                     name: "tower".into(),
@@ -727,6 +811,8 @@ mod tests {
                     os: "linux".into(),
                     online: true,
                     already_listed: false,
+                    tagged: false,
+                    addable: true,
                 },
                 DiscoveredMachine {
                     name: "tower-win".into(),
@@ -734,9 +820,23 @@ mod tests {
                     os: "windows".into(),
                     online: false,
                     already_listed: false,
+                    tagged: false,
+                    addable: true,
                 },
             ]
         );
+
+        // `add = true` only adds untagged, unlisted same-user peers (never tagged-box or pi).
+        let to_add: Vec<String> = addable_entries(&candidates)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(to_add, vec!["tower", "tower-win"]);
+
+        // Missing Self.UserID fails closed so peers are never listed without verifying ownership.
+        let no_self = r#"{"Peer": {"k": {"UserID": 1001, "DNSName": "x.example."}}}"#;
+        let err = parse_tailscale_status(no_self, &existing, "laptop").unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
     }
 
     #[test]
