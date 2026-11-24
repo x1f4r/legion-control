@@ -43,5 +43,10 @@ harness = false
 name = "http"
 harness = false
 
+# Re-executes itself as a cross-platform connector and fake agent CLI for init, agent, sync, and doctor tests.
+[[test]]
+name = "setup"
+harness = false
+
 [lints]
 workspace = true
