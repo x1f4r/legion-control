@@ -113,6 +113,18 @@ pub const REASON_NON_PROTOCOL_OUTPUT: &str = "non_protocol_output";
 /// already written to the wire or when an error came back from the node.
 pub const DETAIL_SENT: &str = "sent";
 
+/// Removes any caller-reserved [`DETAIL_SENT`] key from an error received over the wire so a
+/// remote node can never spoof `details.sent = false` to trigger failover or retries.
+pub(crate) fn strip_remote_sent(mut err: legion_proto::ErrorBody) -> legion_proto::ErrorBody {
+    if let Some(serde_json::Value::Object(ref mut obj)) = err.details {
+        obj.remove(DETAIL_SENT);
+        if obj.is_empty() {
+            err.details = None;
+        }
+    }
+    err
+}
+
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 #[cfg(feature = "ssh")]
 pub use invite::enrol;

@@ -1873,9 +1873,9 @@ impl Link {
             }
             CallError::LostInFlight(body) => {
                 self.invalidate_if_same(node, session);
-                body
+                crate::strip_remote_sent(body)
             }
-            CallError::Remote(body) => body,
+            CallError::Remote(body) => crate::strip_remote_sent(body),
         }
     }
 
@@ -4115,6 +4115,142 @@ mod tests {
             json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
         );
 
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn remote_error_with_sent_false_never_triggers_failover_and_strips_sent() {
+        let seen_calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_calls_c = Arc::clone(&seen_calls);
+
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let seen_calls_c = Arc::clone(&seen_calls_c);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let resp = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        } else if req.method == method::CALL {
+                            let tool = req
+                                .params
+                                .get("tool")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            seen_calls_c
+                                .lock()
+                                .unwrap()
+                                .push((node_name.clone(), tool.clone()));
+                            let resp = if node_name == "pi" {
+                                Response::error(
+                                    req.id,
+                                    legion_proto::RpcError::new(
+                                        legion_proto::TOOL_ERROR,
+                                        ErrorBody::new(
+                                            ErrorCode::Unreachable,
+                                            "spoofed unsent remote error",
+                                        )
+                                        .with_details(json!({
+                                            "sent": false,
+                                            "keep": "yes",
+                                        })),
+                                    ),
+                                )
+                            } else {
+                                Response::ok(req.id, json!({ "handled_by": node_name }))
+                            };
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        }
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let cfg = LinkConfig {
+            device_key: Some("dummy".to_owned()),
+            nodes: vec![
+                NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![test_host_key(10)],
+                    },
+                    Some("device:pixel".to_owned()),
+                ),
+                NodeLink::learned(
+                    "pi",
+                    SshTarget {
+                        hosts: vec!["pi.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![test_host_key(11)],
+                    },
+                    Some("device:pixel".to_owned()),
+                    "tower",
+                ),
+            ],
+        };
+        let link = Link::with_opener(cfg, LinkOptions::default(), opener);
+        let err = link
+            .call_machine("pi", "job.start", json!({"cmd": "echo hi"}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unreachable);
+        assert_eq!(
+            seen_calls.lock().unwrap().as_slice(),
+            &[("pi".to_owned(), "job.start".to_owned())],
+            "a remote node returning details.sent=false must never cause failover"
+        );
+        let details = err.details.as_ref().expect("keep field should survive");
+        assert!(
+            details.get(crate::DETAIL_SENT).is_none(),
+            "remote details.sent must be stripped: {details}"
+        );
+        assert_eq!(details.get("keep"), Some(&json!("yes")));
         link.close().await;
     }
 }

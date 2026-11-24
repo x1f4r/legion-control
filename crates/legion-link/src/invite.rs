@@ -751,7 +751,7 @@ mod enrol_client {
 
         if let Some(err_val) = resp.error {
             if let Ok(body) = serde_json::from_value::<ErrorBody>(err_val.clone()) {
-                return Err(body.with_machine(&invite.node));
+                return Err(crate::strip_remote_sent(body).with_machine(&invite.node));
             }
             let message = err_val
                 .get("message")
