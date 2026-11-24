@@ -318,6 +318,9 @@ pub struct NodeFile {
     /// Settings for `legion serve`.
     #[serde(default)]
     pub serve: ServeConfig,
+    /// `[devices]`: settings for paired remote devices (`device.*` and `legion gate --enrol`).
+    #[serde(default)]
+    pub devices: DevicesConfig,
     /// Which system of this machine this is, such as `linux` or `windows`. `hello` reports it, so
     /// a machine that was restarted into another system says which one answered.
     #[serde(default)]
@@ -351,6 +354,23 @@ pub struct ServeConfig {
     pub hosts: Vec<String>,
 }
 
+/// The `[devices]` table of `node.toml`: where paired devices' SSH keys and host keys are read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevicesConfig {
+    /// Override for the `authorized_keys` file that `device.*` and `legion gate --enrol` read and
+    /// edit. Must be an absolute path or start with `~/`. When absent, defaults to
+    /// `~/.ssh/authorized_keys` (or `%ProgramData%\ssh\administrators_authorized_keys` on Windows
+    /// when the account is in the Administrators group and sshd uses it).
+    #[serde(default)]
+    pub authorized_keys: Option<String>,
+    /// Optional explicit list of sshd public host key files (`.pub`) to read instead of the
+    /// system default (`/etc/ssh/ssh_host_*_key.pub` on Unix, `%ProgramData%\ssh\ssh_host_*_key.pub`
+    /// on Windows). Useful for non-standard sshd setups and tests.
+    #[serde(default)]
+    pub host_keys: Vec<String>,
+}
+
 /// The `[svc]` table of `node.toml`: how the node controls system services.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -369,8 +389,38 @@ impl Document for NodeFile {
     const EMPTY_IS_DEFAULT: bool = true;
 
     fn validate(&self) -> Result<(), String> {
+        validate_devices(&self.devices)?;
         power::validate(self.busy.as_ref(), &self.power, &self.boot)
     }
+}
+
+fn validate_devices(devices: &DevicesConfig) -> Result<(), String> {
+    if let Some(path) = &devices.authorized_keys {
+        validate_device_file_path("devices.authorized_keys", path)?;
+    }
+    for (index, path) in devices.host_keys.iter().enumerate() {
+        validate_device_file_path(&format!("devices.host_keys[{index}]"), path)?;
+    }
+    Ok(())
+}
+
+fn validate_device_file_path(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    let is_tilde_file = value.starts_with("~/") || value.starts_with("~\\");
+    let is_unix_abs = value.starts_with('/');
+    let is_win_abs = value.len() >= 3
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+        && matches!(value.as_bytes()[2], b'\\' | b'/');
+    if !(is_tilde_file || is_unix_abs || is_win_abs || Path::new(value).is_absolute()) {
+        return Err(format!("{field} must be an absolute path or start with ~/"));
+    }
+    Ok(())
 }
 
 impl NodeFile {
@@ -803,6 +853,39 @@ verify = ["check-next-entry", "Other"]
                 "{text:?}: {}",
                 error.message
             );
+        }
+    }
+
+    #[test]
+    fn node_toml_parses_and_validates_devices_settings() {
+        let parsed = node(
+            "[devices]\nauthorized_keys = \"~/.ssh/custom_keys\"\nhost_keys = [\"/etc/ssh/ssh_host_ed25519_key.pub\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.devices.authorized_keys.as_deref(),
+            Some("~/.ssh/custom_keys")
+        );
+        assert_eq!(
+            parsed.devices.host_keys,
+            vec!["/etc/ssh/ssh_host_ed25519_key.pub"]
+        );
+
+        let win =
+            node("[devices]\nauthorized_keys = 'C:\\Users\\me\\.ssh\\authorized_keys'\n").unwrap();
+        assert_eq!(
+            win.devices.authorized_keys.as_deref(),
+            Some(r"C:\Users\me\.ssh\authorized_keys")
+        );
+
+        for bad in [
+            "[devices]\nauthorized_keys = \"\"\n",
+            "[devices]\nauthorized_keys = \"relative/authorized_keys\"\n",
+            "[devices]\nauthorized_keys = \"/tmp/bad\\nline\"\n",
+            "[devices]\nhost_keys = [\"relative.pub\"]\n",
+            "[devices]\nunknown = true\n",
+        ] {
+            assert!(node(bad).is_err(), "{bad}");
         }
     }
 }

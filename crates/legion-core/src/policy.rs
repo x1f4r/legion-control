@@ -1305,6 +1305,44 @@ impl Grant {
                 resolved,
             ));
         }
+        // Protect Windows OpenSSH's administrator authorized_keys and host keys under
+        // `%ProgramData%\ssh` alongside `~/.ssh` so non-admin roles cannot plant SSH keys there.
+        #[cfg(windows)]
+        {
+            let program_data = std::env::var_os("ProgramData")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+            let full = program_data.join("ssh");
+            let resolved = resolve(&full)
+                .or_else(|_| resolve_keeping_last(&full))
+                .unwrap_or_else(|_| raw_fallback_resolved(&full));
+            places.push(build_secret_place(
+                r"%ProgramData%\ssh".to_owned(),
+                full,
+                resolved,
+            ));
+        }
+        // If `node.toml` points `[devices] authorized_keys` outside `~/.ssh`, protect that file as
+        // a secret location too so no non-admin file tool can reach the same edit as `device.*`.
+        if let Ok(bytes) = std::fs::read(self.paths.config_file(crate::config::NodeFile::FILE))
+            && let Ok(node) = crate::config::parse::<crate::config::NodeFile>(
+                &self.paths.config_file(crate::config::NodeFile::FILE),
+                &bytes,
+            )
+            && let Some(configured) = node.devices.authorized_keys
+        {
+            let full = expand_tilde(Path::new(&configured), self.paths.home())
+                .unwrap_or_else(|_| PathBuf::from(&configured));
+            let resolved = resolve(&full)
+                .or_else(|_| resolve_keeping_last(&full))
+                .unwrap_or_else(|_| raw_fallback_resolved(&full));
+            places.push(build_secret_place(
+                "[devices] authorized_keys".to_owned(),
+                full,
+                resolved,
+            ));
+        }
         places
     }
 
@@ -3900,5 +3938,74 @@ role = "vault_reader"
                 .is_ok()
         );
         assert!(owner.check_path("~/.npmrc", Access::Read).is_ok());
+    }
+
+    #[test]
+    fn configured_devices_authorized_keys_is_closed_to_non_admin_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let ssh_dir = dir.path().join("custom-ssh");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let auth_keys = ssh_dir.join("authorized_keys");
+        std::fs::write(&auth_keys, "").unwrap();
+
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("[devices]\nauthorized_keys = \"{escaped}\"\n"),
+        )
+        .unwrap();
+
+        let pol = policy(&format!(
+            r#"
+default = "owner"
+
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+
+[roles.parent_scoped]
+allow = ["effect:read", "effect:write"]
+paths = ["{}/**"]
+
+[principals.wide]
+role = "wide"
+
+[principals.scoped]
+role = "parent_scoped"
+"#,
+            ssh_dir.display().to_string().replace('\\', "\\\\")
+        ));
+        let wide = pol.grant("wide", &paths);
+        let scoped = pol.grant("scoped", &paths);
+        let owner = pol.grant("owner", &paths);
+
+        for grant in [&wide, &scoped] {
+            assert_eq!(
+                grant.check_path(&auth_keys, Access::Read).unwrap_err().code,
+                ErrorCode::Denied
+            );
+            assert_eq!(
+                grant
+                    .check_path(&auth_keys, Access::Write)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Denied
+            );
+            assert_eq!(
+                grant
+                    .check_create(&auth_keys, CreateKind::File, false)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Denied
+            );
+            assert_eq!(
+                grant.protected_filter().blocked(&auth_keys).map(|(p, _)| p),
+                Some(Place::Secret)
+            );
+        }
+        assert!(owner.check_path(&auth_keys, Access::Write).is_ok());
     }
 }

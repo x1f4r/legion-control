@@ -30,6 +30,8 @@ pub enum Door {
     /// `legion stream`, the pipe bulk file data moves over, and the ends of a transfer this node
     /// serves itself.
     Stream,
+    /// `legion gate --enrol`, a single-use SSH forced command enrolling a paired device.
+    Ssh,
 }
 
 impl Door {
@@ -41,6 +43,7 @@ impl Door {
             Door::Http => "http",
             Door::Rpc => "rpc",
             Door::Stream => "stream",
+            Door::Ssh => "ssh",
         }
     }
 }
