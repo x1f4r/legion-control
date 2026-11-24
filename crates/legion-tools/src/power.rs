@@ -442,7 +442,7 @@ async fn act(
     if let (Some(arming), Some((name, _))) = (&arming, target) {
         boot::arm(actuator.as_ref(), cancel, platform, sudo, name, arming).await?;
     }
-    result.warnings = match plan.timing {
+    let handed = match plan.timing {
         Timing::Delayed => {
             let log = ctx.paths().state_dir().join("power").join("scheduled.log");
             actuator
@@ -451,14 +451,24 @@ async fn act(
                     Duration::from_secs(u64::from(request.delay_s)),
                     Some(&log),
                 )
-                .await?
+                .await
         }
-        Timing::SelfTimed => {
-            let ran = actuator.run(&plan.argv, COMMAND_TIMEOUT, cancel).await?;
-            plan::read_self_timed(&plan.argv, what, &ran)?;
-            Vec::new()
-        }
+        Timing::SelfTimed => match actuator.run(&plan.argv, COMMAND_TIMEOUT, cancel).await {
+            Ok(ran) => plan::read_self_timed(&plan.argv, what, &ran).map(|()| Vec::new()),
+            Err(error) => Err(error),
+        },
     };
+    result.warnings = handed.map_err(|error| match &request.into {
+        // Armed but not restarted: whatever restarts the machine next lands there.
+        Some(name) => {
+            let message = format!(
+                "{} The firmware stays set to start {name} on the next boot, whatever causes it.",
+                error.message
+            );
+            ErrorBody { message, ..error }
+        }
+        None => error,
+    })?;
     result.scheduled = true;
     Ok(result)
 }

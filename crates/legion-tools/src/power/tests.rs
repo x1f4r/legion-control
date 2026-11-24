@@ -283,6 +283,30 @@ async fn a_read_back_that_fails_restarts_nothing() {
 }
 
 #[tokio::test]
+async fn a_restart_that_cannot_be_handed_over_says_the_firmware_stays_armed() {
+    // Handing over fails: the delayed runner cannot start, or Windows' shutdown refuses.
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new().refusing_schedules().reply(Reply {
+            stderr: "The parameter is incorrect.(87)\r\n".to_owned(),
+            ..Reply::new(&["shutdown"], 87, "")
+        }),
+        "busy = \"none\"\n[power]\nsudo = true\n[boot.linux]\narm = [\"arm-linux\"]\nverify = [\"verify-linux\"]\n",
+    );
+    let error = fixture
+        .call("power.restart", json!({"into": "linux"}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Failed);
+    assert!(
+        error.message.ends_with(
+            "The firmware stays set to start linux on the next boot, whatever causes it."
+        ),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_target_lists_the_configured_ones() {
     let fixture = Fixture::with_node_toml(
         RecordingActuator::new(),
@@ -297,6 +321,34 @@ async fn an_unknown_target_lists_the_configured_ones() {
         error.hint.as_deref(),
         Some("The boot targets in node.toml are other, windows.")
     );
+    assert!(fixture.fake.records().is_empty());
+}
+
+#[tokio::test]
+async fn a_call_that_could_never_work_says_why_before_the_busy_gate() {
+    // Unmonitored, so the gate would refuse; the target that cannot be armed here is named first.
+    let (node_toml, expected) = match here() {
+        Platform::Macos => (
+            "[boot.windows]\nefi_label = \"Windows Boot Manager\"\n",
+            ("power.restart", json!({"into": "windows"})),
+        ),
+        Platform::Windows => ("", ("power.sleep", json!({}))),
+        Platform::Linux => ("", ("power.restart", json!({"into": "windows"}))),
+    };
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new()
+            .without_program("psshutdown64.exe")
+            .without_program("psshutdown.exe"),
+        node_toml,
+    );
+    let (tool, args) = expected;
+    let error = fixture.call(tool, args).await.unwrap_err();
+    let wanted = if here() == Platform::Linux {
+        ErrorCode::NotFound
+    } else {
+        ErrorCode::Unsupported
+    };
+    assert_eq!(error.code, wanted, "{error:?}");
     assert!(fixture.fake.records().is_empty());
 }
 
@@ -338,34 +390,6 @@ async fn a_refusal_without_sudo_is_denied_and_names_the_setting() {
         // Asked, refused, and nothing was scheduled.
         assert!(fixture.fake.schedules().is_empty());
     }
-}
-
-#[tokio::test]
-async fn a_call_that_could_never_work_says_why_before_the_busy_gate() {
-    // Unmonitored, so the gate would refuse; the target that cannot be armed here is named first.
-    let (node_toml, expected) = match here() {
-        Platform::Macos => (
-            "[boot.windows]\nefi_label = \"Windows Boot Manager\"\n",
-            ("power.restart", json!({"into": "windows"})),
-        ),
-        Platform::Windows => ("", ("power.sleep", json!({}))),
-        Platform::Linux => ("", ("power.restart", json!({"into": "windows"}))),
-    };
-    let fixture = Fixture::with_node_toml(
-        RecordingActuator::new()
-            .without_program("psshutdown64.exe")
-            .without_program("psshutdown.exe"),
-        node_toml,
-    );
-    let (tool, args) = expected;
-    let error = fixture.call(tool, args).await.unwrap_err();
-    let wanted = if here() == Platform::Linux {
-        ErrorCode::NotFound
-    } else {
-        ErrorCode::Unsupported
-    };
-    assert_eq!(error.code, wanted, "{error:?}");
-    assert!(fixture.fake.records().is_empty());
 }
 
 #[tokio::test]

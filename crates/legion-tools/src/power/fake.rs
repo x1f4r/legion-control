@@ -107,6 +107,7 @@ pub struct RecordingActuator {
     missing: Mutex<Vec<String>>,
     file: Option<PathBuf>,
     refuse_datagrams: bool,
+    refuse_schedules: bool,
 }
 
 impl RecordingActuator {
@@ -150,6 +151,13 @@ impl RecordingActuator {
     #[must_use]
     pub fn refusing_datagrams(mut self) -> RecordingActuator {
         self.refuse_datagrams = true;
+        self
+    }
+
+    /// Makes every schedule fail, as when the detached runner cannot be started.
+    #[must_use]
+    pub fn refusing_schedules(mut self) -> RecordingActuator {
+        self.refuse_schedules = true;
         self
     }
 
@@ -236,7 +244,17 @@ impl Actuator for RecordingActuator {
             argv: argv.to_vec(),
             delay_s: delay.as_secs(),
         });
-        Box::pin(async { Ok(Vec::new()) })
+        let refused = self.refuse_schedules;
+        Box::pin(async move {
+            if refused {
+                Err(ErrorBody::new(
+                    legion_core::proto::ErrorCode::Failed,
+                    "The detached runner could not be started.",
+                ))
+            } else {
+                Ok(Vec::new())
+            }
+        })
     }
 
     fn send_datagram(&self, payload: &[u8], to: SocketAddrV4) -> Result<(), String> {
