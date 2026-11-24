@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +17,7 @@ use russh::{
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -238,28 +239,84 @@ pub async fn open_exec_raw(
         .await
         {
             Ok(pipe) => return Ok(pipe),
-            Err(HostAttemptError::Fatal(err)) => return Err(err),
-            Err(HostAttemptError::TryNext(err)) => {
+            Err(HostAttemptError::Cancelled(err)) => return Err(err),
+            Err(HostAttemptError::Failed(err)) => {
                 attempts.push((host.clone(), err));
             }
         }
     }
 
+    Err(combine_failures(attempts))
+}
+
+fn error_reason(err: &ErrorBody) -> Option<&str> {
+    err.details
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Combines per-host or per-address connection failures, giving priority to `host_key_mismatch`
+/// (and then `auth_failed`) so a real cryptographic/auth failure is never hidden behind a later
+/// unreachable host.
+fn combine_failures(mut attempts: Vec<(String, ErrorBody)>) -> ErrorBody {
     if attempts.len() == 1
         && let Some((_, err)) = attempts.pop()
     {
-        return Err(err);
+        return err;
+    }
+
+    let summary = attempts
+        .iter()
+        .map(|(host, err)| format!("{host}: {}", err.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if let Some((_, mismatch)) = attempts
+        .iter()
+        .find(|(_, err)| error_reason(err) == Some(REASON_HOST_KEY_MISMATCH))
+    {
+        let mut details = mismatch
+            .details
+            .clone()
+            .unwrap_or_else(|| json!({ "reason": REASON_HOST_KEY_MISMATCH }));
+        if let Some(obj) = details.as_object_mut() {
+            obj.insert("reason".to_owned(), json!(REASON_HOST_KEY_MISMATCH));
+        }
+        let mut combined = ErrorBody::new(
+            ErrorCode::Denied,
+            format!("Host key mismatch while connecting ({summary})."),
+        )
+        .with_details(details);
+        if let Some(hint) = &mismatch.hint {
+            combined = combined.with_hint(hint.clone());
+        }
+        return combined;
+    }
+
+    if let Some((_, auth)) = attempts
+        .iter()
+        .find(|(_, err)| error_reason(err) == Some(REASON_AUTH_FAILED))
+    {
+        let mut combined = ErrorBody::new(
+            ErrorCode::Denied,
+            format!("SSH authentication failed ({summary})."),
+        )
+        .with_details(
+            auth.details
+                .clone()
+                .unwrap_or_else(|| json!({ "reason": REASON_AUTH_FAILED })),
+        );
+        if let Some(hint) = &auth.hint {
+            combined = combined.with_hint(hint.clone());
+        }
+        return combined;
     }
 
     let all_timeouts = !attempts.is_empty()
         && attempts
             .iter()
             .all(|(_, err)| err.code == ErrorCode::Timeout);
-    let summary = attempts
-        .iter()
-        .map(|(host, err)| format!("{host}: {}", err.message))
-        .collect::<Vec<_>>()
-        .join("; ");
     let code = if all_timeouts {
         ErrorCode::Timeout
     } else {
@@ -270,20 +327,29 @@ pub async fn open_exec_raw(
     } else {
         REASON_UNREACHABLE
     };
-    Err(ErrorBody::new(
+    ErrorBody::new(
         code,
         format!("Could not reach any configured host ({summary})."),
     )
     .with_hint("Check that the node is online, sshd is running, and your network can reach one of its addresses.")
-    .with_details(json!({ "reason": reason })))
+    .with_details(json!({ "reason": reason }))
+}
+
+/// Splits a host's connect timeout across multiple resolved addresses so one blackholed address
+/// (such as an unreachable IPv6 record) cannot consume the entire budget.
+fn per_addr_connect_timeout(total: Duration, count: usize) -> Duration {
+    if count <= 1 {
+        return total;
+    }
+    let divisor = u32::try_from(count).unwrap_or(u32::MAX).max(1);
+    (total / divisor).max(Duration::from_millis(500).min(total))
 }
 
 enum HostAttemptError {
-    /// Do not fall through to other hosts (host key mismatch, auth rejection, cancellation, or
-    /// remote exec refusal after connecting).
-    Fatal(ErrorBody),
-    /// Network/TCP failure or timeout; try the next host in `target.hosts`.
-    TryNext(ErrorBody),
+    /// Caller cancelled connecting; abort remaining hosts immediately.
+    Cancelled(ErrorBody),
+    /// This host failed; record the error and continue trying remaining hosts.
+    Failed(ErrorBody),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,28 +363,159 @@ async fn connect_one_host(
     timeouts: SshTimeouts,
     cancel: CancellationToken,
 ) -> Result<SshPipe, HostAttemptError> {
-    let connect_fut = async {
-        let tcp = TcpStream::connect((host, port)).await.map_err(|err| {
-            HostAttemptError::TryNext(
-                ErrorBody::new(
-                    ErrorCode::Unreachable,
-                    format!("Could not connect to {host}:{port}: {err}."),
-                )
-                .with_hint("Check that the node is awake and sshd is listening on that port.")
-                .with_details(json!({
-                    "reason": REASON_UNREACHABLE,
-                    "host": host,
-                    "port": port,
-                })),
-            )
-        })?;
-        let _ = tcp.set_nodelay(true);
+    let resolved: Vec<SocketAddr> = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return Err(HostAttemptError::Cancelled(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Connecting to {host}:{port} was cancelled."),
+            )));
+        }
+        res = tokio::time::timeout(timeouts.connect, lookup_host((host, port))) => match res {
+            Ok(Ok(iter)) => iter.collect(),
+            Ok(Err(err)) => {
+                return Err(HostAttemptError::Failed(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("Could not resolve {host}:{port}: {err}."),
+                    )
+                    .with_hint("Check the host name and network connectivity.")
+                    .with_details(json!({
+                        "reason": REASON_UNREACHABLE,
+                        "host": host,
+                        "port": port,
+                    })),
+                ));
+            }
+            Err(_) => {
+                return Err(HostAttemptError::Failed(
+                    ErrorBody::new(
+                        ErrorCode::Timeout,
+                        format!(
+                            "Timed out resolving {host}:{port} after {}s.",
+                            timeouts.connect.as_secs_f64()
+                        ),
+                    )
+                    .with_hint("Check DNS and network connectivity.")
+                    .with_details(json!({
+                        "reason": REASON_TIMEOUT,
+                        "host": host,
+                        "port": port,
+                    })),
+                ));
+            }
+        }
+    };
 
+    if resolved.is_empty() {
+        return Err(HostAttemptError::Failed(
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Host {host}:{port} resolved to no addresses."),
+            )
+            .with_hint("Check the host name and DNS configuration.")
+            .with_details(json!({
+                "reason": REASON_UNREACHABLE,
+                "host": host,
+                "port": port,
+            })),
+        ));
+    }
+
+    let tcp_timeout = per_addr_connect_timeout(timeouts.connect, resolved.len());
+    let mut addr_failures: Vec<(String, ErrorBody)> = Vec::new();
+    for addr in resolved {
+        match connect_one_addr(
+            host,
+            port,
+            addr,
+            user,
+            expected_keys,
+            key,
+            command,
+            tcp_timeout,
+            timeouts,
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(pipe) => return Ok(pipe),
+            Err(HostAttemptError::Cancelled(err)) => return Err(HostAttemptError::Cancelled(err)),
+            Err(HostAttemptError::Failed(err)) => {
+                addr_failures.push((addr.to_string(), err));
+            }
+        }
+    }
+
+    Err(HostAttemptError::Failed(combine_failures(addr_failures)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_one_addr(
+    host: &str,
+    port: u16,
+    addr: SocketAddr,
+    user: &str,
+    expected_keys: &[PublicKey],
+    key: &DeviceKey,
+    command: &str,
+    tcp_timeout: Duration,
+    timeouts: SshTimeouts,
+    cancel: CancellationToken,
+) -> Result<SshPipe, HostAttemptError> {
+    let tcp = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return Err(HostAttemptError::Cancelled(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Connecting to {host}:{port} was cancelled."),
+            )));
+        }
+        res = tokio::time::timeout(tcp_timeout, TcpStream::connect(addr)) => match res {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                return Err(HostAttemptError::Failed(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("Could not connect to {host}:{port} ({addr}): {err}."),
+                    )
+                    .with_hint("Check that the node is awake and sshd is listening on that port.")
+                    .with_details(json!({
+                        "reason": REASON_UNREACHABLE,
+                        "host": host,
+                        "port": port,
+                    })),
+                ));
+            }
+            Err(_) => {
+                return Err(HostAttemptError::Failed(
+                    ErrorBody::new(
+                        ErrorCode::Timeout,
+                        format!(
+                            "Timed out connecting to {host}:{port} ({addr}) after {}s.",
+                            tcp_timeout.as_secs_f64()
+                        ),
+                    )
+                    .with_hint("Check that the host is awake, reachable over your network, and accepting SSH connections.")
+                    .with_details(json!({
+                        "reason": REASON_TIMEOUT,
+                        "host": host,
+                        "port": port,
+                    })),
+                ));
+            }
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+
+    let ssh_fut = async {
         let mut session = handshake_with_host_key_retry(
             host,
             port,
+            addr,
             tcp,
             expected_keys,
+            tcp_timeout,
             timeouts,
         )
         .await?;
@@ -330,7 +527,7 @@ async fn connect_one_host(
             )
             .await
             .map_err(|err| {
-                HostAttemptError::Fatal(
+                HostAttemptError::Failed(
                     ErrorBody::new(
                         ErrorCode::Unreachable,
                         format!("SSH authentication to {host}:{port} failed: {err}."),
@@ -348,7 +545,7 @@ async fn connect_one_host(
             let _ = session
                 .disconnect(Disconnect::ByApplication, "", "en")
                 .await;
-            return Err(HostAttemptError::Fatal(
+            return Err(HostAttemptError::Failed(
                 ErrorBody::new(
                     ErrorCode::Denied,
                     format!("SSH key authentication for {user} on {host}:{port} was rejected."),
@@ -364,7 +561,7 @@ async fn connect_one_host(
         }
 
         let channel = session.channel_open_session().await.map_err(|err| {
-            HostAttemptError::Fatal(
+            HostAttemptError::Failed(
                 ErrorBody::new(
                     ErrorCode::Unreachable,
                     format!("Could not open an SSH session channel on {host}:{port}: {err}."),
@@ -379,7 +576,7 @@ async fn connect_one_host(
         })?;
 
         channel.exec(true, command).await.map_err(|err| {
-            HostAttemptError::Fatal(
+            HostAttemptError::Failed(
                 ErrorBody::new(
                     ErrorCode::Unreachable,
                     format!("Could not start the remote command on {host}:{port}: {err}."),
@@ -398,19 +595,19 @@ async fn connect_one_host(
 
     tokio::select! {
         biased;
-        () = cancel.cancelled() => Err(HostAttemptError::Fatal(
+        () = cancel.cancelled() => Err(HostAttemptError::Cancelled(
             ErrorBody::new(
                 ErrorCode::Cancelled,
                 format!("Connecting to {host}:{port} was cancelled."),
             ),
         )),
-        res = tokio::time::timeout(timeouts.connect, connect_fut) => match res {
+        res = tokio::time::timeout(timeouts.connect, ssh_fut) => match res {
             Ok(outcome) => outcome,
-            Err(_) => Err(HostAttemptError::TryNext(
+            Err(_) => Err(HostAttemptError::Failed(
                 ErrorBody::new(
                     ErrorCode::Timeout,
                     format!(
-                        "Timed out connecting to {host}:{port} after {}s.",
+                        "Timed out during SSH handshake with {host}:{port} after {}s.",
                         timeouts.connect.as_secs_f64()
                     ),
                 )
@@ -428,8 +625,10 @@ async fn connect_one_host(
 async fn handshake_with_host_key_retry(
     host: &str,
     port: u16,
+    addr: SocketAddr,
     tcp: TcpStream,
     expected_keys: &[PublicKey],
+    tcp_timeout: Duration,
     timeouts: SshTimeouts,
 ) -> Result<client::Handle<HostKeyHandler>, HostAttemptError> {
     let first = handshake_once(host, port, tcp, expected_keys, None, timeouts).await;
@@ -441,25 +640,25 @@ async fn handshake_with_host_key_retry(
         }) if !host_key_algorithms(expected_keys, Some(fam)).is_empty() => {
             // The server offered a key of family `fam` that did not match our pin (for instance a
             // rotated ed25519 key while our ecdsa pin still matches). Retry once without `fam`.
-            let tcp2 = match TcpStream::connect((host, port)).await {
-                Ok(stream) => {
+            let tcp2 = match tokio::time::timeout(tcp_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
                     let _ = stream.set_nodelay(true);
                     stream
                 }
-                Err(_) => return Err(HostAttemptError::Fatal(first_err)),
+                _ => return Err(HostAttemptError::Failed(first_err)),
             };
             match handshake_once(host, port, tcp2, expected_keys, Some(fam), timeouts).await {
                 Ok(session) => Ok(session),
                 Err(HandshakeAttemptError::HostKeyMismatch { error, .. }) => {
-                    Err(HostAttemptError::Fatal(error))
+                    Err(HostAttemptError::Failed(error))
                 }
                 // If the server has no key of the fallback family (NoCommonAlgo) or fails on retry,
                 // keep the original mismatch error carrying the fingerprint it actually offered.
-                Err(HandshakeAttemptError::Other(_)) => Err(HostAttemptError::Fatal(first_err)),
+                Err(HandshakeAttemptError::Other(_)) => Err(HostAttemptError::Failed(first_err)),
             }
         }
         Err(HandshakeAttemptError::HostKeyMismatch { error, .. }) => {
-            Err(HostAttemptError::Fatal(error))
+            Err(HostAttemptError::Failed(error))
         }
         Err(HandshakeAttemptError::Other(err)) => Err(err),
     }
@@ -487,7 +686,7 @@ async fn handshake_once(
         offered_mismatch: Arc::clone(&offered_mismatch),
     };
     let config = build_ssh_config(expected_keys, exclude, timeouts)
-        .map_err(|err| HandshakeAttemptError::Other(HostAttemptError::Fatal(err)))?;
+        .map_err(|err| HandshakeAttemptError::Other(HostAttemptError::Failed(err)))?;
     client::connect_stream(Arc::new(config), tcp, handler)
         .await
         .map_err(|err| map_handshake_error(host, port, err, &offered_mismatch, expected_keys))
@@ -516,7 +715,7 @@ fn map_handshake_error(
         theirs,
     } = err
     {
-        return HandshakeAttemptError::Other(HostAttemptError::Fatal(
+        return HandshakeAttemptError::Other(HostAttemptError::Failed(
             ErrorBody::new(
                 ErrorCode::Denied,
                 format!(
@@ -541,7 +740,7 @@ fn map_handshake_error(
             })),
         ));
     }
-    HandshakeAttemptError::Other(HostAttemptError::TryNext(
+    HandshakeAttemptError::Other(HostAttemptError::Failed(
         ErrorBody::new(
             ErrorCode::Unreachable,
             format!("SSH handshake with {host}:{port} failed: {err}."),
@@ -980,8 +1179,8 @@ mod tests {
             &mismatch,
             &[ed],
         );
-        let HandshakeAttemptError::Other(HostAttemptError::Fatal(err)) = outcome else {
-            panic!("expected fatal denied error");
+        let HandshakeAttemptError::Other(HostAttemptError::Failed(err)) = outcome else {
+            panic!("expected denied error");
         };
         assert_eq!(err.code, ErrorCode::Denied);
         assert!(err.message.contains("ecdsa-sha2-nistp256"), "{}", err.message);
@@ -994,6 +1193,37 @@ mod tests {
         assert_eq!(
             err.details.unwrap()["reason"],
             json!(REASON_HOST_KEY_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn combine_failures_prioritizes_host_key_mismatch_and_splits_addr_timeout() {
+        let ed = DeviceKey::from_seed([7u8; 32]).private_key().public_key().clone();
+        let mismatch = host_key_mismatch_error("192.0.2.1", 22, "SHA256:badkey", &[ed]);
+        let unreachable = ErrorBody::new(ErrorCode::Unreachable, "connection refused")
+            .with_details(json!({"reason": REASON_UNREACHABLE}));
+
+        let combined = combine_failures(vec![
+            ("192.0.2.1".to_owned(), mismatch),
+            ("198.51.100.1".to_owned(), unreachable),
+        ]);
+        assert_eq!(combined.code, ErrorCode::Denied);
+        assert!(combined.message.contains("SHA256:badkey"), "{}", combined.message);
+        let details = combined.details.unwrap();
+        assert_eq!(details["reason"], json!(REASON_HOST_KEY_MISMATCH));
+        assert_eq!(details["offered"], json!("SHA256:badkey"));
+
+        assert_eq!(
+            per_addr_connect_timeout(Duration::from_secs(10), 1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            per_addr_connect_timeout(Duration::from_secs(10), 2),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            per_addr_connect_timeout(Duration::from_secs(10), 4),
+            Duration::from_millis(2500)
         );
     }
 }
