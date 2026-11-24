@@ -2301,7 +2301,8 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
     assert_eq!(fwd_live_denied.json()["code"], json!("denied"));
 
     // Side 2: Local `device.remove` on `laptop` with the expiring token pushes tombstone-only to
-    // `pi` cleanly (`synced`, empty `still_trusted_by`) without pushing `stay-local` to `pi`.
+    // `pi` (`partial` because `stay-local` was not pushed under the expiring credential, with empty
+    // `still_trusted_by` since the removal landed) without pushing `stay-local` to `pi`.
     let rem_local = server.call(
         &expiring_admin,
         json!({
@@ -2319,12 +2320,18 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
     assert_eq!(rem_json["removed"], json!(true), "{rem_json}");
     assert_eq!(
         rem_json["fleet"]["pi"]["status"],
-        json!("synced"),
-        "expiring-credential removal must reach peer pi: {rem_json}"
+        json!("partial"),
+        "expiring-credential removal with unsynced live device must report partial on pi: {rem_json}"
+    );
+    assert!(
+        rem_json["fleet"]["pi"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("Removals delivered") && r.contains("expires")),
+        "partial reason must explain removals delivered and credential expiry: {rem_json}"
     );
     assert!(
         rem_json.get("still_trusted_by").is_none(),
-        "still_trusted_by must be empty after synced tombstone push: {rem_json}"
+        "still_trusted_by must be empty after tombstone delivery: {rem_json}"
     );
 
     let pi_devices_path = pi_home.join("config").join("devices.toml");
