@@ -43,7 +43,13 @@ fn main() -> ExitCode {
             .enable_all()
             .build()
         {
-            Ok(runtime) => runtime.block_on(run(command)),
+            Ok(runtime) => {
+                let code = runtime.block_on(run(command));
+                // A read of stdin cannot be cancelled, and would keep the runtime from shutting
+                // down until the input ends; nothing else is left running by now.
+                runtime.shutdown_background();
+                code
+            }
             Err(error) => {
                 err(&format!(
                     "legion: the async runtime could not start: {error}\n"
@@ -62,6 +68,11 @@ async fn run(command: Command) -> ExitCode {
     };
     let node = match Paths::from_env() {
         Ok(paths) => Node::new(paths, legion_tools::registry()),
+        // The stdout of `legion rpc` carries protocol messages and nothing else.
+        Err(error) if matches!(command, Command::Rpc { .. }) => {
+            err(&render::error(&error));
+            return ExitCode::from(FAILED);
+        }
         Err(error) => return failed(&error, json),
     };
     match command {
