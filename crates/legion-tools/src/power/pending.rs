@@ -97,6 +97,13 @@ pub struct Pending {
     /// When the runner started the command, RFC 3339: from then on it can no longer be called off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fired: Option<String>,
+    /// Whether the call went ahead past the busy gate, so the runner does not ask again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+    /// The node's configuration directory, where the runner reads what keeps the machine busy
+    /// when the action is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<PathBuf>,
 }
 
 /// How a handed-over action ended, as its runner wrote it to `last.json`.
@@ -171,6 +178,9 @@ pub enum Fate {
     GivenUp,
     /// `power.cancel` called it off before it ran.
     Cancelled,
+    /// When it was due the machine was busy, so its runner did not run it (only for an action
+    /// handed over without `force`); `said` says what kept the machine busy.
+    Busy,
 }
 
 /// The record a call writes for an action it hands over, as planned for this platform: a runner
@@ -202,6 +212,8 @@ pub fn record(
         disarm,
         abandoned: false,
         fired: None,
+        force: false,
+        config_dir: None,
     }
 }
 
@@ -228,6 +240,15 @@ pub fn fate(record: &Pending, now: Timestamp, boot_id: Option<&str>, runner_hold
         Some(due) if now < due => Fate::Pending,
         _ => Fate::DidNotHappen,
     }
+}
+
+/// When a handed-over action is to happen: its hand-over time plus its delay, RFC 3339.
+pub fn due_at(record: &Pending) -> Option<String> {
+    let since: Timestamp = record.since.parse().ok()?;
+    let due = since
+        .checked_add(jiff::SignedDuration::from_secs(i64::from(record.delay_s)))
+        .ok()?;
+    Some(due.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// When an action the operating system times stops counting as pending: its delay and the margin
@@ -664,6 +685,8 @@ mod tests {
             disarm: None,
             abandoned: false,
             fired: None,
+            force: false,
+            config_dir: None,
         }
     }
 

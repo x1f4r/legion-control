@@ -77,6 +77,10 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     let ssh_path = find_program_on_env_path("ssh");
     checks.push(check_ssh_on_path(ssh_path.as_deref()));
 
+    if let Some(pending) = crate::power::pending::pending(ctx.paths(), ctx.boot_id().as_deref()) {
+        checks.push(check_pending_power(&pending));
+    }
+
     if let Ok(policy) = ctx.config().get::<Policy>() {
         let specs = ctx.tools();
         checks.push(check_policy_exec_roles(&policy, &specs));
@@ -90,6 +94,29 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         && let Ok(parsed) = serde_json::from_value::<FleetPingResponse>(value)
     {
         checks.extend(fleet_ping_checks(&parsed.results));
+    }
+}
+
+/// A warning while a sleep, restart or shutdown has been handed over and not carried out yet: the
+/// machine is going to go down, and someone looking at its health should know, and how to stop it.
+pub fn check_pending_power(pending: &crate::power::pending::Pending) -> Check {
+    let what = match &pending.into {
+        Some(into) => format!("{} into {into}", pending.action.as_str()),
+        None => pending.action.as_str().to_owned(),
+    };
+    let due = crate::power::pending::due_at(pending)
+        .map_or_else(String::new, |due| format!(", due at {due}"));
+    Check {
+        name: "pending power action".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "A {what} handed over at {} is still to happen{due}.",
+            pending.since
+        ),
+        hint: Some(
+            "power.cancel calls it off until then; power.status shows it under pending.".to_owned(),
+        ),
     }
 }
 
@@ -532,6 +559,49 @@ mod tests {
     use legion_core::proto::ErrorCode;
 
     use super::*;
+
+    #[test]
+    fn a_pending_power_action_is_a_warning_that_names_power_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = legion_core::Paths::under(dir.path());
+        let power = crate::power::pending::dir(&paths);
+        assert!(crate::power::pending::pending(&paths, Some("boot-1")).is_none());
+        let record = crate::power::pending::Pending {
+            id: "a1".to_owned(),
+            action: crate::power::plan::Action::Restart,
+            into: Some("windows".to_owned()),
+            argv: vec![
+                "shutdown".to_owned(),
+                "/r".to_owned(),
+                "/t".to_owned(),
+                "600".to_owned(),
+            ],
+            delay_s: 600,
+            hold_s: 0,
+            since: crate::power::pending::now(),
+            boot_id: Some("boot-1".to_owned()),
+            runner: false,
+            taken: None,
+            disarm: None,
+            abandoned: false,
+            fired: None,
+            force: false,
+            config_dir: None,
+        };
+        crate::power::pending::write_pending(&power, &record).unwrap();
+        let pending = crate::power::pending::pending(&paths, Some("boot-1")).unwrap();
+        let check = check_pending_power(&pending);
+        assert!(check.ok && check.warning);
+        assert!(
+            check
+                .detail
+                .starts_with("A restart into windows handed over at")
+                && check.detail.contains(", due at "),
+            "{}",
+            check.detail
+        );
+        assert!(check.hint.unwrap().contains("power.cancel"));
+    }
 
     #[test]
     fn executable_on_path_checks_unix_and_windows_paths() {

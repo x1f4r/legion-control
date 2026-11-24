@@ -421,6 +421,20 @@ async fn the_action_is_handed_over_to_happen_after_the_reply() {
         .await
         .unwrap();
     assert_eq!(done["in_s"], json!(7));
+    // The runner is told where to ask again whether the machine is busy, and that it should.
+    let record = pending::read_pending(&pending::dir(fixture.node.paths())).unwrap();
+    assert_eq!(
+        record.config_dir.as_deref(),
+        Some(fixture.node.paths().config_dir())
+    );
+    assert!(!record.force);
+    // Windows times it itself and says the busy check will not be repeated.
+    let warned = done["warnings"].as_array().is_some_and(|warnings| {
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("will not be checked again"))
+    });
+    assert_eq!(warned, here() == Platform::Windows, "{done}");
     let (argv, timing) = expected(Action::Shutdown, 7, true);
     match timing {
         Timing::Delayed => assert_eq!(fixture.fake.schedules(), [(argv, 7)]),
@@ -553,6 +567,8 @@ async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
         disarm: None,
         abandoned: false,
         fired: None,
+        force: false,
+        config_dir: None,
     };
     pending::write_pending(&dir, &record).unwrap();
     let error = fixture.call("power.shutdown", json!({})).await.unwrap_err();
@@ -866,6 +882,8 @@ fn self_timed_restart(fixture: &Fixture, disarm: Option<Vec<String>>) -> Pending
         disarm,
         abandoned: false,
         fired: None,
+        force: false,
+        config_dir: None,
     };
     pending::write_pending(&pending::dir(fixture.node.paths()), &record).unwrap();
     record
@@ -1048,6 +1066,8 @@ async fn a_command_the_runner_has_started_is_too_late_to_call_off() {
         disarm: None,
         abandoned: false,
         fired: Some(pending::now()),
+        force: false,
+        config_dir: None,
     };
     pending::write_pending(&dir, &record).unwrap();
     let answer = fixture.call("power.cancel", json!({})).await.unwrap();

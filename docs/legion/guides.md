@@ -415,6 +415,13 @@ A node reports one of three busy states in `power.status`:
 - `idle` — `busy = "none"` is declared explicitly, or every probe exited `1` and no exclusive job
   is running.
 
+Unless the call says `force=true`, the busy state is checked when the call is made and again just
+before the action. On Linux and macOS the delayed runner asks the probes and exclusive jobs once
+more when the delay has passed, and does nothing if the machine has become busy meanwhile (`last`
+then shows `fate: busy` with what kept it busy). On Windows, whose own timer carries out a restart or
+shutdown, the state is checked only when it is handed over, and the reply's `warnings` say so: with
+a long `delay_s` there, use `power.cancel` if work starts before it is due.
+
 Three additional guards protect the machine:
 
 - **One power action at a time**: a node holds two kernel locks under `state/power/` (`call.lock`
@@ -426,11 +433,11 @@ Three additional guards protect the machine:
   `unmonitored`, **not** logind inhibitors; to override inhibitors, pass `ignore_inhibitors=true`
   (which passes `-i` to `systemctl` and requires `[power] sudo = true`).
 - **`power.status` `pending` and `last`**: while an action is waiting to run, `power.status`
-  includes `pending`. After it runs (or after a reboot), `last` reports how the previous handed-over
+  includes `pending`, and `meta.doctor` adds a warning naming it and `power.cancel`. After it runs (or after a reboot), `last` reports how the previous handed-over
   action ended — either the runner's own record (`ran_at`, `exit_code`, `said`, and `disarmed` if a
   failed `into` restart cleared the firmware's next boot) or a derived `fate` (`pending`,
-  `happened`, `did_not_happen`, `runner_gone`, `given_up`, or `cancelled`, which also names
-  `cancelled_by` and `cancelled_at`).
+  `happened`, `did_not_happen`, `runner_gone`, `given_up`, `busy` when the machine was busy when it
+  was due, or `cancelled`, which also names `cancelled_by` and `cancelled_at`).
 
 Configure `node.toml` with probes (or `busy = "none"` if nothing needs protecting) and optional
 boot targets:

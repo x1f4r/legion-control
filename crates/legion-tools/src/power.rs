@@ -57,7 +57,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const HANDOFF_PATIENCE: Duration = Duration::from_secs(15);
 
 /// What every gated tool's description says about the gate.
-const GATE: &str = "Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. On Linux a logind inhibitor (an application asking not to be interrupted) also fails it with `busy`, naming who holds it; `force` does not override that, `ignore_inhibitors: true` does. One power action runs at a time: while one is pending the call fails with `conflict`. `dry_run: true` returns the exact commands without running them, and when a check would refuse the real call, what it would say (`would_refuse`).";
+const GATE: &str = "Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway. Without it the state is checked again just before acting: on Linux and macOS also when the delay has passed, so a machine that became busy meanwhile is not interrupted and `last` says so; on Windows, whose own timer carries out a restart or shutdown, only when it is handed over. On Linux a logind inhibitor (an application asking not to be interrupted) also fails it with `busy`, naming who holds it; `force` does not override that, `ignore_inhibitors: true` does. One power action runs at a time: while one is pending the call fails with `conflict`. `dry_run: true` returns the exact commands without running them, and when a check would refuse the real call, what it would say (`would_refuse`).";
 
 /// Adds the local `power` tools, acting through [`actuator`].
 pub fn register(registry: &mut Registry) {
@@ -69,7 +69,7 @@ pub fn register_with(registry: &mut Registry, actuator: Arc<dyn Actuator>) {
     registry.add(PowerTool::new(
         "power.status",
         Effect::Read,
-        "Report this machine's power state without changing anything: whether it is busy (`idle`; `busy` with the reasons, each from a busy probe or an exclusive job; or `unmonitored` when node.toml says nothing about what keeps it busy), which system of the machine this is, its boot id (which changes on every restart), the boot targets power.restart can name in `into`, and whether system actions run through sudo. Busy probes run concurrently, each within its own timeout.",
+        "Report this machine's power state without changing anything: the sleep, restart or shutdown handed over and not yet carried out (`pending`, which power.cancel calls off) and how the last one ended (`last`); whether it is busy (`idle`; `busy` with the reasons, each from a busy probe or an exclusive job; or `unmonitored` when node.toml says nothing about what keeps it busy), which system of the machine this is, its boot id (which changes on every restart), the boot targets power.restart can name in `into`, and whether system actions run through sudo. Busy probes run concurrently, each within its own timeout.",
         Arc::clone(&actuator),
         |actuator, ctx, _args: NoArgs| Box::pin(status(actuator, ctx)),
     ));
@@ -549,6 +549,13 @@ async fn act(
         boot::arm(actuator.as_ref(), cancel, platform, sudo, name, arming).await?;
     }
     let dir = pending::dir(ctx.paths());
+    if plan.timing == Timing::SelfTimed && !request.force {
+        result.warnings.push(format!(
+            "Windows itself times this {}: whether the machine is busy was checked now, and will not be checked again when it happens in {} s. power.cancel calls it off until then.",
+            request.action.as_str(),
+            request.delay_s
+        ));
+    }
     let mut record = pending::record(
         &plan,
         request.action,
@@ -557,6 +564,8 @@ async fn act(
         boot_id,
         arming.as_ref().and_then(|arming| arming.disarm.clone()),
     );
+    record.force = request.force;
+    record.config_dir = Some(ctx.paths().config_dir().to_path_buf());
     let handed = match plan.timing {
         Timing::Delayed => hand_over(actuator, &dir, &mut record).await,
         Timing::SelfTimed => match actuator.run(&plan.argv, COMMAND_TIMEOUT, cancel).await {
@@ -567,7 +576,7 @@ async fn act(
             Err(error) => Err(error),
         },
     };
-    result.warnings = match handed {
+    let handed_warnings = match handed {
         Ok(warnings) => warnings,
         Err(error) => match (&request.into, &record.disarm) {
             (None, _) => return Err(error),
@@ -581,6 +590,7 @@ async fn act(
             }
         },
     };
+    result.warnings.extend(handed_warnings);
     result.scheduled = true;
     Ok(result)
 }
@@ -738,7 +748,7 @@ async fn cancel_runner(
             return Ok(CancelResult {
                 cancelled: false,
                 action: Some(record.action),
-                was_due: due_at(&record),
+                was_due: pending::due_at(&record),
                 detail: format!(
                     "Too late: {} started `{}` at {fired}, and a command that has started can no longer be called off from here.",
                     describe_action(&record),
@@ -763,7 +773,7 @@ async fn cancel_runner(
         }
     };
     // From here on the runner will not run it, whatever becomes of the runner itself.
-    let was_due = due_at(&record);
+    let was_due = pending::due_at(&record);
     let due = was_due.clone().unwrap_or_else(|| "its time".to_owned());
     let stopped = match pending::read_runner(dir, &record.id) {
         Some(runner) => match actuator.stop_runner(&runner).await {
@@ -814,7 +824,7 @@ async fn cancel_self_timed(
         .run(&abort, COMMAND_TIMEOUT, ctx.cancel_token())
         .await?;
     let said = ran.said();
-    let was_due = due_at(&record);
+    let was_due = pending::due_at(&record);
     if ran.ok() {
         let (disarmed, disarm_note) = disarm_after_cancel(actuator, ctx, &record).await;
         record_cancelled(ctx, dir, &record, said, disarmed);
@@ -1011,15 +1021,6 @@ fn describe_action(record: &Pending) -> String {
             record.since
         ),
     }
-}
-
-/// When a handed-over action was to happen: its hand-over time plus its delay.
-fn due_at(record: &Pending) -> Option<String> {
-    let since: jiff::Timestamp = record.since.parse().ok()?;
-    let due = since
-        .checked_add(jiff::SignedDuration::from_secs(i64::from(record.delay_s)))
-        .ok()?;
-    Some(due.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 fn find_target<'a>(file: &'a NodeFile, name: &str) -> Result<&'a BootTarget, ErrorBody> {
