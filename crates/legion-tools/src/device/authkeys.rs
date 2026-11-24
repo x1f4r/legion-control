@@ -1,0 +1,1113 @@
+//! Safe reading, parsing, quoting, and atomic editing of OpenSSH `authorized_keys` files.
+//!
+//! Guarantees:
+//! - Only lines whose comment begins with `legion-invite:` or `legion-device:` are ever touched.
+//! - Every foreign line, comment, blank line, line ending, and missing trailing newline is
+//!   preserved byte for byte.
+//! - On Unix, `~/.ssh` is kept or set to mode `0o700` and `authorized_keys` to mode `0o600`
+//!   atomically before rename.
+//! - On Windows, when the account is in the `Administrators` group and `sshd_config` uses
+//!   `administrators_authorized_keys`, writes `%ProgramData%\ssh\administrators_authorized_keys`
+//!   and applies the `Administrators:F` + `SYSTEM:F` ACL to the staged temp file before rename.
+//! - Never follows a symlink in `~/.ssh` or `~/.ssh/authorized_keys` outside the account's home
+//!   directory unless configured explicitly via `[devices] authorized_keys` in `node.toml`.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use jiff::Timestamp;
+use legion_core::Paths;
+use legion_core::config::NodeFile;
+use legion_core::policy::{Principal, expand_tilde};
+use legion_core::proto::{ErrorBody, ErrorCode};
+use legion_os::atomic::{WriteOptions, write_atomic_prepared};
+
+/// Comment prefix marking temporary single-use invite lines in `authorized_keys`.
+pub const INVITE_COMMENT_PREFIX: &str = "legion-invite:";
+
+/// Comment prefix marking permanent paired device lines in `authorized_keys`.
+pub const DEVICE_COMMENT_PREFIX: &str = "legion-device:";
+
+/// Resolved `authorized_keys` destination and platform handling flags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthKeysTarget {
+    /// Configured or default path to `authorized_keys`.
+    pub path: PathBuf,
+    /// `true` when using the default `~/.ssh/authorized_keys` under the user's home directory.
+    pub is_default_home_ssh: bool,
+    /// `true` when writing Windows's `%ProgramData%\ssh\administrators_authorized_keys`.
+    pub windows_admin_acl: bool,
+}
+
+/// Resolves which `authorized_keys` file this node manages.
+pub fn resolve_target(paths: &Paths, node_file: &NodeFile) -> Result<AuthKeysTarget, ErrorBody> {
+    if let Some(configured) = &node_file.devices.authorized_keys {
+        let expanded = expand_tilde(Path::new(configured), paths.home())?;
+        let windows_admin_acl = is_windows_admin_auth_keys_path(&expanded);
+        return Ok(AuthKeysTarget {
+            path: expanded,
+            is_default_home_ssh: false,
+            windows_admin_acl,
+        });
+    }
+
+    if cfg!(windows) && legion_os::user::is_windows_administrator() {
+        let program_data_ssh = windows_program_data_ssh_dir();
+        if windows_sshd_uses_admin_file(&program_data_ssh) {
+            return Ok(AuthKeysTarget {
+                path: program_data_ssh.join("administrators_authorized_keys"),
+                is_default_home_ssh: false,
+                windows_admin_acl: true,
+            });
+        }
+    }
+
+    let home = paths.home().ok_or_else(|| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            "Cannot locate ~/.ssh/authorized_keys because the home directory is not known.",
+        )
+        .with_hint(
+            "Set HOME (or USERPROFILE on Windows), or set `[devices] authorized_keys` in node.toml.",
+        )
+    })?;
+    Ok(AuthKeysTarget {
+        path: home.join(".ssh").join("authorized_keys"),
+        is_default_home_ssh: true,
+        windows_admin_acl: false,
+    })
+}
+
+fn windows_program_data_ssh_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("ssh")
+}
+
+fn is_windows_admin_auth_keys_path(path: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let expected = windows_program_data_ssh_dir().join("administrators_authorized_keys");
+    path.to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+}
+
+fn windows_sshd_uses_admin_file(program_data_ssh: &Path) -> bool {
+    match std::fs::read_to_string(program_data_ssh.join("sshd_config")) {
+        Ok(text) => windows_sshd_uses_admin_file_from_text(&text),
+        // Default Windows OpenSSH configuration routes Administrators to
+        // `%ProgramData%\ssh\administrators_authorized_keys`.
+        Err(_) => true,
+    }
+}
+
+/// Determines from Windows `sshd_config` text whether `Match Group administrators` routes
+/// `AuthorizedKeysFile` to `administrators_authorized_keys`.
+pub fn windows_sshd_uses_admin_file_from_text(config: &str) -> bool {
+    let mut in_admin_match = false;
+    for raw_line in config.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let Some(keyword) = words.next() else {
+            continue;
+        };
+        if keyword.eq_ignore_ascii_case("Match") {
+            let rest: Vec<&str> = words.collect();
+            in_admin_match = match_line_targets_administrators(&rest);
+            continue;
+        }
+        if in_admin_match && keyword.eq_ignore_ascii_case("AuthorizedKeysFile") {
+            let targets: Vec<&str> = words.collect();
+            return targets.iter().any(|target| {
+                target
+                    .to_ascii_lowercase()
+                    .contains("administrators_authorized_keys")
+            });
+        }
+    }
+    false
+}
+
+fn match_line_targets_administrators(tokens: &[&str]) -> bool {
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].eq_ignore_ascii_case("Group")
+            && let Some(groups) = tokens.get(i + 1)
+            && groups
+                .split(',')
+                .any(|g| g.trim_matches('"').eq_ignore_ascii_case("administrators"))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Verifies symlink safety for `target` and returns the concrete path to read/write.
+///
+/// For the default `~/.ssh/authorized_keys`, refuses if `~/.ssh` or `~/.ssh/authorized_keys` is a
+/// symbolic link that is dangling or points outside the account's home directory. If a symlink
+/// points cleanly inside the account's home directory, returns the resolved target so atomic
+/// renames update the target file without destroying the symlink.
+pub fn resolve_safe_write_path(
+    target: &AuthKeysTarget,
+    home: Option<&Path>,
+) -> Result<PathBuf, ErrorBody> {
+    if target.is_default_home_ssh {
+        let home = home.ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                "Cannot check ~/.ssh symlink safety because the home directory is not known.",
+            )
+        })?;
+        let canon_home = dunce::canonicalize(home).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Home directory {} cannot be resolved: {error}.",
+                    home.display()
+                ),
+            )
+        })?;
+
+        let ssh_dir = target.path.parent().ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("{} has no parent directory.", target.path.display()),
+            )
+        })?;
+
+        let effective_ssh_dir = match std::fs::symlink_metadata(ssh_dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link_target = std::fs::read_link(ssh_dir)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_owned());
+                let resolved = dunce::canonicalize(ssh_dir).map_err(|error| {
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Refusing to follow symbolic link {} -> {link_target}: {error}.",
+                            ssh_dir.display()
+                        ),
+                    )
+                    .with_hint(
+                        "Replace ~/.ssh with a real directory or set `[devices] authorized_keys` explicitly in node.toml.",
+                    )
+                })?;
+                if !resolved.starts_with(&canon_home) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Refusing to follow symbolic link {} pointing outside home directory (to {}).",
+                            ssh_dir.display(),
+                            resolved.display()
+                        ),
+                    )
+                    .with_hint(
+                        "If this is intentional, set `[devices] authorized_keys` explicitly in node.toml.",
+                    ));
+                }
+                resolved
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} exists and is not a directory.", ssh_dir.display()),
+                ));
+            }
+            Ok(_) => ssh_dir.to_path_buf(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ssh_dir.to_path_buf(),
+            Err(error) => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be inspected: {error}.", ssh_dir.display()),
+                ));
+            }
+        };
+
+        let candidate = effective_ssh_dir.join("authorized_keys");
+        return match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link_target = std::fs::read_link(&candidate)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_owned());
+                let resolved = dunce::canonicalize(&candidate).map_err(|error| {
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Refusing to follow symbolic link {} -> {link_target}: {error}.",
+                            candidate.display()
+                        ),
+                    )
+                    .with_hint(
+                        "Replace ~/.ssh/authorized_keys with a regular file or set `[devices] authorized_keys` explicitly in node.toml.",
+                    )
+                })?;
+                if !resolved.starts_with(&canon_home) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Refusing to follow symbolic link {} pointing outside home directory (to {}).",
+                            candidate.display(),
+                            resolved.display()
+                        ),
+                    )
+                    .with_hint(
+                        "If this is intentional, set `[devices] authorized_keys` explicitly in node.toml.",
+                    ));
+                }
+                if !resolved.is_file() {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("{} does not point to a regular file.", candidate.display()),
+                    ));
+                }
+                Ok(resolved)
+            }
+            Ok(meta) if meta.is_dir() => Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} is a directory, not a file.", candidate.display()),
+            )),
+            Ok(_) => Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(candidate),
+            Err(error) => Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be inspected: {error}.", candidate.display()),
+            )),
+        };
+    }
+
+    // For Windows administrators_authorized_keys, refuse symlinks outright.
+    match std::fs::symlink_metadata(&target.path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if target.windows_admin_acl {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Refusing to follow symbolic link at {}.",
+                        target.path.display()
+                    ),
+                )
+                .with_hint("Use a regular file for administrators_authorized_keys."));
+            }
+            let resolved = dunce::canonicalize(&target.path).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Configured authorized_keys symlink {} cannot be resolved: {error}.",
+                        target.path.display()
+                    ),
+                )
+            })?;
+            Ok(resolved)
+        }
+        Ok(meta) if meta.is_dir() => Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} is a directory, not a file.", target.path.display()),
+        )),
+        Ok(_) => Ok(target.path.clone()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(target.path.clone()),
+        Err(error) => Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be inspected: {error}.", target.path.display()),
+        )),
+    }
+}
+
+/// Formats the value placed inside `command="..."` in `authorized_keys`.
+///
+/// The executable path must be absolute, valid UTF-8, and free of control characters.
+/// When the path contains spaces or shell metacharacters it is safely quoted for the target OS
+/// shell, and any `"` characters are escaped as `\"` for OpenSSH's `authorized_keys` option
+/// parser (which only unescapes `\"` inside double-quoted option values).
+pub fn format_forced_command(
+    exe: &Path,
+    args: &[&str],
+    windows: bool,
+) -> Result<String, ErrorBody> {
+    if !exe.is_absolute() && !(windows && looks_windows_absolute(exe)) {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Legion executable path {} is not absolute and cannot be placed in authorized_keys.",
+                exe.display()
+            ),
+        ));
+    }
+    let exe_str = exe.to_str().ok_or_else(|| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Legion executable path {} is not valid Unicode.",
+                exe.display()
+            ),
+        )
+    })?;
+    if exe_str.is_empty() || exe_str.chars().any(char::is_control) {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            "Legion executable path contains control characters and cannot be placed in authorized_keys.",
+        ));
+    }
+    if windows && exe_str.contains('"') {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            "Windows executable path contains a double quote and cannot be placed in authorized_keys.",
+        ));
+    }
+
+    for arg in args {
+        if arg.is_empty()
+            || !arg
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.' | b'@'))
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Forced command argument {arg:?} is not safe for authorized_keys."),
+            ));
+        }
+    }
+
+    let quoted_exe = if windows {
+        let plain_safe = exe_str.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'\\' | b'/' | b':' | b'.' | b'-' | b'_' | b'+')
+        });
+        if plain_safe {
+            exe_str.to_owned()
+        } else {
+            format!("\"{exe_str}\"")
+        }
+    } else {
+        let plain_safe = exe_str.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':' | b'@')
+        });
+        if plain_safe {
+            exe_str.to_owned()
+        } else {
+            let escaped_single = exe_str.replace('\'', "'\\''");
+            format!("'{escaped_single}'")
+        }
+    };
+
+    let mut command = quoted_exe;
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+
+    // OpenSSH `opt_dequote` inside `command="..."` recognizes only `\"` -> `"` and leaves every
+    // other backslash untouched, so replacing `"` with `\"` round-trips faithfully as long as the
+    // command does not end with `\` (it always ends with a validated ASCII argument).
+    Ok(command.replace('"', "\\\""))
+}
+
+fn looks_windows_absolute(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let bytes = text.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+/// Formats an OpenSSH `expiry-time` UTC timestamp (`YYYYMMDDHHMMSSZ`).
+pub fn format_sshd_expiry(time: Timestamp) -> String {
+    time.strftime("%Y%m%d%H%M%SZ").to_string()
+}
+
+/// Formats a temporary invite line for `authorized_keys`.
+pub fn format_invite_line(
+    exe: &Path,
+    id: &str,
+    expires: Timestamp,
+    pubkey: &str,
+    windows: bool,
+) -> Result<String, ErrorBody> {
+    let cmd = format_forced_command(exe, &["gate", "--enrol", id], windows)?;
+    let expiry = format_sshd_expiry(expires);
+    Ok(format!(
+        "restrict,expiry-time=\"{expiry}\",command=\"{cmd}\" {pubkey} {INVITE_COMMENT_PREFIX}{id}"
+    ))
+}
+
+/// Formats a permanent paired device line for `authorized_keys`.
+pub fn format_device_line(
+    exe: &Path,
+    principal: &str,
+    pubkey: &str,
+    device_name: &str,
+    windows: bool,
+) -> Result<String, ErrorBody> {
+    let cmd = format_forced_command(exe, &["gate", "--as", principal], windows)?;
+    Ok(format!(
+        "restrict,command=\"{cmd}\" {pubkey} {DEVICE_COMMENT_PREFIX}{device_name}"
+    ))
+}
+
+/// Classification of one line in `authorized_keys`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LineKind {
+    /// Any line not managed by Legion (comments, blank lines, user keys); preserved byte for byte.
+    Foreign,
+    /// Temporary invite line whose comment starts with `legion-invite:`.
+    Invite {
+        /// Invite id after `legion-invite:`.
+        id: String,
+        /// Base64 key blob on the line.
+        key_b64: String,
+        /// Parsed UTC `expiry-time` option, when present and parseable.
+        expiry_time: Option<Timestamp>,
+    },
+    /// Paired device line whose comment starts with `legion-device:`.
+    Device {
+        /// Device name after `legion-device:`.
+        name: String,
+        /// Base64 key blob on the line.
+        key_b64: String,
+        /// Principal extracted from `command="... gate --as <principal>"`, when parseable.
+        principal: Option<String>,
+    },
+}
+
+/// One line in `authorized_keys`, retaining its exact original bytes.
+#[derive(Clone, Debug)]
+pub struct AuthKeyLine {
+    /// Exact original bytes including any `\r\n` or `\n` (or missing newline on the final line).
+    pub raw: Vec<u8>,
+    /// Parsed Legion classification.
+    pub kind: LineKind,
+}
+
+/// Parsed representation of an `authorized_keys` file that preserves foreign lines byte for byte.
+#[derive(Clone, Debug, Default)]
+pub struct AuthKeysFile {
+    /// Lines in file order.
+    pub lines: Vec<AuthKeyLine>,
+}
+
+impl AuthKeysFile {
+    /// Parses `bytes` into lines without altering any byte sequence.
+    pub fn parse(bytes: &[u8]) -> AuthKeysFile {
+        if bytes.is_empty() {
+            return AuthKeysFile { lines: Vec::new() };
+        }
+        let lines = bytes
+            .split_inclusive(|&b| b == b'\n')
+            .map(|slice| AuthKeyLine {
+                raw: slice.to_vec(),
+                kind: classify_line(slice),
+            })
+            .collect();
+        AuthKeysFile { lines }
+    }
+
+    /// Keeps only lines for which `keep` returns `true`, returning whether anything was removed.
+    pub fn retain(&mut self, mut keep: impl FnMut(&AuthKeyLine) -> bool) -> bool {
+        let before = self.lines.len();
+        self.lines.retain(|line| match line.kind {
+            // Foreign lines are unconditionally preserved byte for byte.
+            LineKind::Foreign => true,
+            _ => keep(line),
+        });
+        self.lines.len() != before
+    }
+
+    /// Appends a new Legion-managed line, inserting a newline before it only if the previous last
+    /// line lacked one.
+    pub fn append_line(&mut self, line: &str) {
+        let crlf = self
+            .lines
+            .iter()
+            .any(|existing| existing.raw.ends_with(b"\r\n"));
+        let eol: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+        if let Some(last) = self.lines.last_mut()
+            && !last.raw.ends_with(b"\n")
+        {
+            last.raw.extend_from_slice(eol);
+        }
+        let mut raw = line.as_bytes().to_vec();
+        raw.extend_from_slice(eol);
+        let kind = classify_line(&raw);
+        self.lines.push(AuthKeyLine { raw, kind });
+    }
+
+    /// Reassembles the file's exact bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let total: usize = self.lines.iter().map(|l| l.raw.len()).sum();
+        let mut out = Vec::with_capacity(total);
+        for line in &self.lines {
+            out.extend_from_slice(&line.raw);
+        }
+        out
+    }
+}
+
+/// Reads `path`, returning an empty [`AuthKeysFile`] when the file does not exist yet.
+pub fn read_auth_keys(path: &Path) -> Result<AuthKeysFile, ErrorBody> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(AuthKeysFile::parse(&bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AuthKeysFile::default()),
+        Err(error) => {
+            let mut body = ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", path.display()),
+            );
+            if cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied {
+                body = body.with_hint(
+                    "Run from an elevated Administrator terminal so Legion can read administrators_authorized_keys.",
+                );
+            }
+            Err(body)
+        }
+    }
+}
+
+/// Writes `bytes` atomically to `write_path`, ensuring Unix directory/file modes (`0o700` /
+/// `0o600`) and Windows `administrators_authorized_keys` ACLs.
+pub fn write_auth_keys(
+    target: &AuthKeysTarget,
+    write_path: &Path,
+    bytes: &[u8],
+) -> Result<(), ErrorBody> {
+    if let Some(parent) = write_path.parent() {
+        ensure_parent_dir(parent, target.is_default_home_ssh)?;
+    }
+
+    let options = WriteOptions::with_mode(0o600).force_mode(true);
+    let need_win_acl = target.windows_admin_acl;
+    write_atomic_prepared(write_path, bytes, options, move |temp_path| {
+        if need_win_acl {
+            legion_os::user::apply_windows_admin_ssh_acl(temp_path)?;
+        }
+        Ok(())
+    })
+    .map_err(|error| {
+        let mut body = ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be written: {error}.", write_path.display()),
+        );
+        if target.windows_admin_acl {
+            body = body.with_hint(
+                "Run from an elevated Administrator terminal so Legion can update administrators_authorized_keys and set its Administrators/SYSTEM ACL.",
+            );
+        }
+        body
+    })
+}
+
+fn ensure_parent_dir(dir: &Path, is_default_ssh_dir: bool) -> Result<(), ErrorBody> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if !dir.exists() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            if is_default_ssh_dir {
+                builder.mode(0o700);
+            }
+            builder.create(dir).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be created: {error}.", dir.display()),
+                )
+            })?;
+        }
+        if is_default_ssh_dir {
+            let meta = std::fs::metadata(dir).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be inspected: {error}.", dir.display()),
+                )
+            })?;
+            if meta.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |error| {
+                        ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!("Cannot set mode 0700 on {}: {error}.", dir.display()),
+                        )
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = is_default_ssh_dir;
+        std::fs::create_dir_all(dir).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be created: {error}.", dir.display()),
+            )
+        })
+    }
+}
+
+fn classify_line(raw: &[u8]) -> LineKind {
+    let body = raw
+        .strip_suffix(b"\n")
+        .unwrap_or(raw)
+        .strip_suffix(b"\r")
+        .unwrap_or_else(|| raw.strip_suffix(b"\n").unwrap_or(raw));
+    let Ok(text) = std::str::from_utf8(body) else {
+        return LineKind::Foreign;
+    };
+    let trimmed = text.trim_start_matches([' ', '\t']);
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return LineKind::Foreign;
+    }
+
+    let (options, rest) = split_options_and_rest(trimmed);
+    let Some((key_type, after_type)) = split_ws_token(rest) else {
+        return LineKind::Foreign;
+    };
+    if !is_known_ssh_key_type(key_type) {
+        return LineKind::Foreign;
+    }
+    let Some((key_b64, after_key)) = split_ws_token(after_type) else {
+        return LineKind::Foreign;
+    };
+    let comment = after_key.trim_end_matches([' ', '\t']);
+    if let Some(id) = comment.strip_prefix(INVITE_COMMENT_PREFIX)
+        && !id.is_empty()
+        && !id.chars().any(char::is_whitespace)
+    {
+        let expiry_time = options
+            .and_then(|opts| extract_option_value(opts, "expiry-time"))
+            .and_then(|val| parse_sshd_expiry_utc(&val));
+        return LineKind::Invite {
+            id: id.to_owned(),
+            key_b64: key_b64.to_owned(),
+            expiry_time,
+        };
+    }
+    if let Some(name) = comment.strip_prefix(DEVICE_COMMENT_PREFIX)
+        && !name.is_empty()
+        && !name.chars().any(char::is_whitespace)
+    {
+        let principal = options
+            .and_then(|opts| extract_option_value(opts, "command"))
+            .and_then(|cmd| extract_gate_as_principal(&cmd));
+        return LineKind::Device {
+            name: name.to_owned(),
+            key_b64: key_b64.to_owned(),
+            principal,
+        };
+    }
+    LineKind::Foreign
+}
+
+/// Splits an `authorized_keys` line into `(optional_options, rest_starting_with_key_type)`,
+/// respecting OpenSSH double-quoted option strings and `\"` escapes.
+fn split_options_and_rest(line: &str) -> (Option<&str>, &str) {
+    if let Some((first, _)) = split_ws_token(line)
+        && is_known_ssh_key_type(first)
+    {
+        return (None, line);
+    }
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_quotes = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_quotes && bytes.get(i + 1) == Some(&b'"') => {
+                i += 2;
+                continue;
+            }
+            b'"' => in_quotes = !in_quotes,
+            b' ' | b'\t' if !in_quotes => {
+                let options = &line[..i];
+                let rest = line[i..].trim_start_matches([' ', '\t']);
+                return (Some(options), rest);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (None, line)
+}
+
+fn split_ws_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start_matches([' ', '\t']);
+    if s.is_empty() {
+        return None;
+    }
+    match s.find([' ', '\t']) {
+        Some(idx) => Some((&s[..idx], s[idx..].trim_start_matches([' ', '\t']))),
+        None => Some((s, "")),
+    }
+}
+
+fn is_known_ssh_key_type(token: &str) -> bool {
+    matches!(
+        token,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "ssh-dss"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+    ) || token.ends_with("-cert-v01@openssh.com")
+}
+
+/// Extracts and unquotes the value of `key="..."` from an OpenSSH options string.
+fn extract_option_value(options: &str, key: &str) -> Option<String> {
+    let bytes = options.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && bytes[i] != b',' {
+            i += 1;
+        }
+        let name = &options[name_start..i];
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+                let mut val = String::new();
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'"') {
+                        val.push('"');
+                        i += 2;
+                    } else {
+                        let ch = options[i..].chars().next()?;
+                        val.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+                if i < bytes.len() && bytes[i] == b'"' {
+                    i += 1;
+                }
+                if name.eq_ignore_ascii_case(key) {
+                    return Some(val);
+                }
+            } else {
+                let val_start = i;
+                while i < bytes.len() && bytes[i] != b',' {
+                    i += 1;
+                }
+                if name.eq_ignore_ascii_case(key) {
+                    return Some(options[val_start..i].to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extracts `<principal>` from a forced command ending in `gate --as <principal>`.
+fn extract_gate_as_principal(command: &str) -> Option<String> {
+    let mut words = command.split_whitespace().rev();
+    let principal = words.next()?;
+    if words.next()? != "--as" || words.next()? != "gate" {
+        return None;
+    }
+    Principal::parse(principal).ok()?;
+    Some(principal.to_owned())
+}
+
+/// Parses an OpenSSH UTC `expiry-time` (`YYYYMMDD[Z]` or `YYYYMMDDHHMM[SS]Z`).
+fn parse_sshd_expiry_utc(text: &str) -> Option<Timestamp> {
+    let digits = text.strip_suffix('Z')?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i16 = digits.get(0..4)?.parse().ok()?;
+    let month: i8 = digits.get(4..6)?.parse().ok()?;
+    let day: i8 = digits.get(6..8)?.parse().ok()?;
+    let (hour, minute, second): (i8, i8, i8) = match digits.len() {
+        8 => (0, 0, 0),
+        12 => (
+            digits.get(8..10)?.parse().ok()?,
+            digits.get(10..12)?.parse().ok()?,
+            0,
+        ),
+        14 => (
+            digits.get(8..10)?.parse().ok()?,
+            digits.get(10..12)?.parse().ok()?,
+            digits.get(12..14)?.parse().ok()?,
+        ),
+        _ => return None,
+    };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+        .parse::<Timestamp>()
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Exact mirror of OpenSSH `auth-options.c` `opt_dequote` for round-trip verification.
+    fn openssh_opt_dequote(quoted_inner: &str) -> String {
+        let mut out = String::new();
+        let chars: Vec<char> = quoted_inner.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '\\' && chars.get(i + 1) == Some(&'"') {
+                out.push('"');
+                i += 2;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn forced_command_quoting_handles_plain_spaces_and_quotes_on_unix_and_windows() {
+        let plain_unix = format_forced_command(
+            Path::new("/home/me/.local/bin/legion"),
+            &["gate", "--as", "phone"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(plain_unix, "/home/me/.local/bin/legion gate --as phone");
+
+        let space_unix = format_forced_command(
+            Path::new("/Users/me/My Apps/legion"),
+            &["gate", "--as", "phone"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            openssh_opt_dequote(&space_unix),
+            "'/Users/me/My Apps/legion' gate --as phone"
+        );
+
+        let quote_unix = format_forced_command(
+            Path::new(r#"/Users/me/O'Neil "Lab"/legion"#),
+            &["gate", "--enrol", "abc123"],
+            false,
+        )
+        .unwrap();
+        assert!(quote_unix.contains("\\\"Lab\\\""));
+        assert_eq!(
+            openssh_opt_dequote(&quote_unix),
+            r#"''/Users/me/O'\''Neil "Lab"/legion'' gate --enrol abc123"#
+                .strip_prefix('\'')
+                .unwrap()
+                .replacen("'' ", "' ", 1)
+        );
+
+        let plain_win = format_forced_command(
+            Path::new(r"C:\Users\me\AppData\Local\legion\legion.exe"),
+            &["gate", "--as", "phone"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            plain_win,
+            r"C:\Users\me\AppData\Local\legion\legion.exe gate --as phone"
+        );
+
+        let space_win = format_forced_command(
+            Path::new(r"C:\Program Files\Legion Control\legion.exe"),
+            &["gate", "--as", "phone"],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            space_win,
+            r#"\"C:\Program Files\Legion Control\legion.exe\" gate --as phone"#
+        );
+        assert_eq!(
+            openssh_opt_dequote(&space_win),
+            r#""C:\Program Files\Legion Control\legion.exe" gate --as phone"#
+        );
+
+        // Control characters and relative paths are refused.
+        assert!(
+            format_forced_command(Path::new("/home/me/bad\nlegion"), &["gate"], false).is_err()
+        );
+        assert!(format_forced_command(Path::new("relative/legion"), &["gate"], false).is_err());
+    }
+
+    #[test]
+    fn foreign_lines_comments_and_missing_trailing_newline_are_preserved_byte_for_byte() {
+        let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:pixel\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
+        let mut parsed = AuthKeysFile::parse(initial);
+        assert_eq!(parsed.lines.len(), 5);
+        assert_eq!(parsed.lines[0].kind, LineKind::Foreign);
+        assert_eq!(parsed.lines[1].kind, LineKind::Foreign);
+        assert_eq!(parsed.lines[2].kind, LineKind::Foreign);
+        assert!(matches!(
+            &parsed.lines[3].kind,
+            LineKind::Device { name, principal: Some(p), .. } if name == "pixel" && p == "phone"
+        ));
+        assert_eq!(parsed.lines[4].kind, LineKind::Foreign);
+
+        // Removing the device line preserves every other line byte for byte, including the missing
+        // trailing newline on the final foreign line.
+        assert!(parsed.retain(
+            |line| !matches!(&line.kind, LineKind::Device { name, .. } if name == "pixel")
+        ));
+        let expected = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
+        assert_eq!(parsed.to_bytes(), expected);
+
+        // Foreign lines can never be dropped even if the predicate returns false.
+        assert!(!parsed.retain(|_| false));
+        assert_eq!(parsed.to_bytes(), expected);
+    }
+
+    #[test]
+    fn appending_to_file_without_trailing_newline_inserts_separator() {
+        let initial = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 foreign";
+        let mut parsed = AuthKeysFile::parse(initial);
+        parsed.append_line("restrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:tablet");
+        let bytes = parsed.to_bytes();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], std::str::from_utf8(initial).unwrap());
+        assert!(lines[1].ends_with("legion-device:tablet"));
+    }
+
+    #[test]
+    fn parses_windows_sshd_config_admin_match_block() {
+        let default_cfg = "\
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+Match Group administrators
+       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+";
+        assert!(windows_sshd_uses_admin_file_from_text(default_cfg));
+
+        let commented_out = "\
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+# Match Group administrators
+#       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+";
+        assert!(!windows_sshd_uses_admin_file_from_text(commented_out));
+
+        let other_match = "\
+Match Group users
+    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+";
+        assert!(!windows_sshd_uses_admin_file_from_text(other_match));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_outside_home_is_refused_and_symlink_inside_home_is_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let outside_file = outside.join("authorized_keys");
+        std::fs::write(&outside_file, "").unwrap();
+        symlink(&outside_file, home.join(".ssh").join("authorized_keys")).unwrap();
+
+        let target = AuthKeysTarget {
+            path: home.join(".ssh").join("authorized_keys"),
+            is_default_home_ssh: true,
+            windows_admin_acl: false,
+        };
+        let err = resolve_safe_write_path(&target, Some(&home)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(err.message.contains("outside home"), "{}", err.message);
+
+        // Symlink inside home is accepted and resolves to its target file.
+        std::fs::remove_file(home.join(".ssh").join("authorized_keys")).unwrap();
+        let inside_dir = home.join("dotfiles");
+        std::fs::create_dir_all(&inside_dir).unwrap();
+        let inside_file = inside_dir.join("authorized_keys");
+        std::fs::write(&inside_file, "").unwrap();
+        symlink(&inside_file, home.join(".ssh").join("authorized_keys")).unwrap();
+        let resolved = resolve_safe_write_path(&target, Some(&home)).unwrap();
+        assert_eq!(resolved, dunce::canonicalize(&inside_file).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_auth_keys_sets_ssh_dir_700_and_authorized_keys_600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let ssh_dir = home.join(".ssh");
+        let auth_file = ssh_dir.join("authorized_keys");
+        let target = AuthKeysTarget {
+            path: auth_file.clone(),
+            is_default_home_ssh: true,
+            windows_admin_acl: false,
+        };
+
+        // Creates ~/.ssh with 0700 and authorized_keys with 0600.
+        write_auth_keys(&target, &auth_file, b"# test\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&ssh_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&auth_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Tightens permissive permissions back to 0700 / 0600 on subsequent edits.
+        std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_auth_keys(&target, &auth_file, b"# updated\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&ssh_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&auth_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn parses_invite_line_with_quoted_path_and_expiry() {
+        let ts: Timestamp = "2026-11-24T12:15:00Z".parse().unwrap();
+        let line = format_invite_line(
+            Path::new("/Users/me/My Apps/legion"),
+            "deadbeef01",
+            ts,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
+            false,
+        )
+        .unwrap();
+        let parsed = AuthKeysFile::parse(format!("{line}\n").as_bytes());
+        assert_eq!(parsed.lines.len(), 1);
+        match &parsed.lines[0].kind {
+            LineKind::Invite {
+                id,
+                key_b64,
+                expiry_time,
+            } => {
+                assert_eq!(id, "deadbeef01");
+                assert!(key_b64.starts_with("AAAAC3Nza"));
+                assert_eq!(*expiry_time, Some(ts));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}

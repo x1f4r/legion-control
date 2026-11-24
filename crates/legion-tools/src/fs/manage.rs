@@ -799,6 +799,7 @@ fn copy_regular_file(
     let mode = platform::unix_mode_bits(from_meta);
     let write_opts = WriteOptions {
         mode,
+        force_mode: false,
         no_replace: !opts.overwrite,
     };
     let copied = match write_atomic_from_reader(to, &mut reader, write_opts) {

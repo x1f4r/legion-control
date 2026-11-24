@@ -817,6 +817,7 @@ dependencies = [
  "blake3",
  "dunce",
  "ed25519-dalek",
+ "gethostname",
  "getrandom",
  "globset",
  "ignore",
