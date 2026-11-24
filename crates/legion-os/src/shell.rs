@@ -686,10 +686,10 @@ mod tests {
     /// The wrapper under Windows PowerShell 5.1, which every Windows has, and PowerShell 7 where
     /// it is installed; with stdin and without; with a console that has no window, as `run` and
     /// `detach` start it, and with no console at all, where the encodings cannot be set. Without a
-    /// console, Windows PowerShell 5.1 exits 0 having written nothing to the stdout it was given,
-    /// and with stdin attached it does not run the command at all (both seen on the Windows
-    /// runner), one more reason Legion always starts it with a console; so without one only
-    /// PowerShell 7 is held to having run the command, which it shows by a file it writes.
+    /// console, Windows PowerShell 5.1 wrote nothing to the stdout it was given, and with stdin
+    /// attached neither edition ran the command at all, though both exited 0 (seen on the Windows
+    /// runner): one more reason Legion always starts PowerShell with a console. Without one, all
+    /// that is held is that the wrapper's encoding lines do not make it fail or complain.
     #[cfg(windows)]
     #[test]
     fn powershell_wrapper_runs_under_both_editions_with_and_without_stdin_or_a_console() {
@@ -755,21 +755,16 @@ mod tests {
                         "{program:?} console={console} stdin={with_stdin} stdout={stdout:?}"
                     );
                     assert!(out.status.success(), "{case}: {stderr}");
-                    let desktop = Path::new(&program)
-                        .file_stem()
-                        .is_some_and(|stem| stem.eq_ignore_ascii_case("powershell"));
-                    if console || !desktop {
-                        assert!(
-                            marker.is_file(),
-                            "{case}: the command did not run: {stderr}"
-                        );
-                    }
                     let lower = stderr.to_lowercase();
                     assert!(
                         !lower.contains("handle is invalid") && !lower.contains("encoding"),
                         "{case}: {stderr}"
                     );
                     if console {
+                        assert!(
+                            marker.is_file(),
+                            "{case}: the command did not run: {stderr}"
+                        );
                         let expected = if with_stdin { text } else { "no stdin" };
                         assert_eq!(stdout, expected, "{case}");
                     }
