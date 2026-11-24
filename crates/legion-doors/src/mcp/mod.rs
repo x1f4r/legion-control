@@ -35,6 +35,9 @@ use tokio_util::task::TaskTracker;
 use self::catalog::{Catalog, ON, summary};
 use self::events::{Forwarder, Level};
 
+/// The hint for a tool a compact session cannot find.
+const LIST_COMPACT: &str = "legion_tools lists the tools you may use here.";
+
 /// How a session is served.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -106,22 +109,41 @@ impl McpDoor {
         served
     }
 
-    /// What the session's principal may use, or `None` when the policy cannot be read: then every
-    /// tool is listed, and calling one says what is wrong with the file.
-    fn grant(&self) -> Option<Grant> {
-        let policy = self.node.config().get::<Policy>().ok()?;
-        let principal = policy.resolve(None, self.options.pinned.as_deref()).ok()?;
-        Some(policy.grant(&principal, self.node.paths().home()))
+    /// What the session's principal may use, or why that cannot be known: a policy file that
+    /// does not parse grants nothing, the same as it does for every call the node runs.
+    fn grant(&self) -> Result<Grant, ErrorBody> {
+        let here = |error: ErrorBody| match error.machine {
+            Some(_) => error,
+            None => error.with_machine(self.node.name()),
+        };
+        let policy = self.node.config().get::<Policy>().map_err(here)?;
+        let principal = policy
+            .resolve(None, self.options.pinned.as_deref())
+            .map_err(here)?;
+        Ok(policy.grant(&principal, self.node.paths().home()))
     }
 
-    /// The tools listed in full mode: those the principal may use. Listing is a courtesy that
-    /// keeps an agent from trying what will be refused; the node checks every call regardless.
+    /// The tool a client names, when the principal may use it. A tool beyond its role is treated
+    /// exactly like one that does not exist, so a session learns nothing about what it may not
+    /// use.
+    fn visible<'a>(&'a self, grant: &Grant, name: &str) -> Option<&'a catalog::Entry> {
+        self.catalog
+            .get(name)
+            .filter(|entry| grant.allows(&entry.spec))
+    }
+
+    /// The tools listed in full mode: those the principal may use, and none while the policy
+    /// cannot be read. Listing is a courtesy that keeps an agent from trying what will be refused;
+    /// the node checks every call regardless, and a call is how an agent learns what is wrong with
+    /// the policy.
     fn listed(&self) -> Vec<Tool> {
-        let grant = self.grant();
+        let Ok(grant) = self.grant() else {
+            return Vec::new();
+        };
         self.catalog
             .entries()
             .iter()
-            .filter(|entry| grant.as_ref().is_none_or(|grant| grant.allows(&entry.spec)))
+            .filter(|entry| grant.allows(&entry.spec))
             .map(|entry| entry.tool.clone())
             .collect()
     }
@@ -229,11 +251,20 @@ impl McpDoor {
             }
             compact::DESCRIBE => {
                 let args: compact::DescribeArgs = compact::parse(name, args)?;
-                let spec = self
-                    .node
-                    .spec(self.catalog.resolve(&args.tool))
-                    .map_err(|error| error.with_hint("legion_tools lists the tools here."))?;
-                to_object(&spec)
+                let grant = self.grant()?;
+                match self.visible(&grant, &args.tool) {
+                    Some(entry) => to_object(&entry.spec),
+                    None => Err(self
+                        .door_error(
+                            ErrorCode::UnknownTool,
+                            format!(
+                                "There is no tool called {} on {}.",
+                                args.tool,
+                                self.node.name()
+                            ),
+                        )
+                        .with_hint(LIST_COMPACT)),
+                }
             }
             compact::CALL => {
                 let args: compact::CallArgs = compact::parse(name, args)?;
@@ -242,18 +273,18 @@ impl McpDoor {
                 self.run(tool, tool_args, args.on, context)
                     .await
                     .map_err(|error| match error.code {
-                        ErrorCode::UnknownTool => {
-                            error.with_hint("legion_tools lists the tools here.")
-                        }
+                        ErrorCode::UnknownTool => error.with_hint(LIST_COMPACT),
                         _ => error,
                     })
             }
             other => {
-                let tool = self.catalog.resolve(other);
-                let hint = if self.node.spec(tool).is_ok() {
-                    format!("Run it with legion_call, giving tool \"{tool}\".")
-                } else {
-                    "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned()
+                let hint = match self
+                    .grant()
+                    .ok()
+                    .and_then(|grant| self.visible(&grant, other).map(|entry| entry.spec.name.clone()))
+                {
+                    Some(tool) => format!("Run it with legion_call, giving tool \"{tool}\"."),
+                    None => "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned(),
                 };
                 Err(self
                     .door_error(
@@ -277,12 +308,12 @@ impl McpDoor {
             effect: &'a str,
             description: &'a str,
         }
-        let grant = self.grant();
+        let grant = self.grant()?;
         let allowed: Vec<&catalog::Entry> = self
             .catalog
             .entries()
             .iter()
-            .filter(|entry| grant.as_ref().is_none_or(|grant| grant.allows(&entry.spec)))
+            .filter(|entry| grant.allows(&entry.spec))
             .collect();
         let chosen: Vec<Listed<'_>> = allowed
             .iter()

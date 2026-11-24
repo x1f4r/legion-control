@@ -669,3 +669,107 @@ fn input_that_ends_at_once_ends_the_session_quietly() {
     assert_eq!(run.code, 2);
     assert_eq!(run.stdout, "");
 }
+
+/// The names `legion_tools` lists.
+fn compact_names(mcp: &mut Mcp) -> Vec<String> {
+    ok(&mcp.call("legion_tools", json!({})))["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn compact_mode_tells_a_role_nothing_about_tools_beyond_it() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"tower\"\n");
+    home.write_config(
+        "policy.toml",
+        r#"
+[principals."agent:obs"]
+role = "observer"
+
+[roles.observer]
+allow = ["effect:read"]
+deny = ["meta.doctor"]
+"#,
+    );
+    let (mut mcp, _) = Mcp::initialized(&home, &["--compact", "--as", "agent:obs"]);
+    let names = compact_names(&mut mcp);
+    assert!(names.contains(&"meta.version".to_owned()), "{names:?}");
+    for hidden in ["exec.run", "meta.doctor", "test.write_path"] {
+        assert!(!names.contains(&hidden.to_owned()), "{names:?}");
+    }
+
+    // A tool beyond the role is described exactly as one that does not exist.
+    let missing = failed(&mcp.call("legion_describe", json!({"tool": "nope.nothing"})));
+    assert_eq!(missing["code"], json!("unknown_tool"));
+    for hidden in ["exec.run", "exec_run", "meta.doctor", "test.write_path"] {
+        let error = failed(&mcp.call("legion_describe", json!({"tool": hidden})));
+        let expected = missing["message"]
+            .as_str()
+            .unwrap()
+            .replace("nope.nothing", hidden);
+        assert_eq!(error["message"], json!(expected), "{hidden}");
+        assert_eq!(
+            (&error["code"], &error["hint"], &error["details"]),
+            (&missing["code"], &missing["hint"], &missing["details"]),
+            "{hidden}"
+        );
+    }
+    assert_eq!(
+        ok(&mcp.call("legion_describe", json!({"tool": "meta.version"})))["name"],
+        json!("meta.version")
+    );
+
+    // So is a full-mode name: only a tool the role may use is named in the hint.
+    let unknown = failed(&mcp.call("nope_nothing", json!({})));
+    let beyond = failed(&mcp.call("exec_run", json!({})));
+    assert_eq!(beyond["hint"], unknown["hint"]);
+    assert!(!beyond.to_string().contains("exec.run"), "{beyond}");
+    let allowed = failed(&mcp.call("meta_version", json!({})));
+    assert!(
+        allowed["hint"]
+            .as_str()
+            .unwrap()
+            .contains("\"meta.version\""),
+        "{allowed}"
+    );
+    assert_eq!(mcp.finish().0, 0);
+
+    // A principal the policy does not name may use nothing, and is shown nothing.
+    let (mut stranger, _) = Mcp::initialized(&home, &["--compact", "--as", "stranger"]);
+    assert_eq!(compact_names(&mut stranger), Vec::<String>::new());
+    let error = failed(&stranger.call("legion_describe", json!({"tool": "meta.version"})));
+    assert_eq!(error["code"], json!("unknown_tool"));
+    assert_eq!(error["hint"], missing["hint"]);
+    assert_eq!(stranger.finish().0, 0);
+}
+
+#[test]
+fn a_policy_that_does_not_parse_shows_nothing_and_every_call_says_why() {
+    let home = Home::new();
+    home.write_config("policy.toml", "[roles.x]\nallow = [\"effect:raed\"]\n");
+
+    let (mut full, _) = Mcp::initialized(&home, &[]);
+    assert_eq!(full.tool_names(), Vec::<String>::new());
+    let error = failed(&full.call("meta_version", json!({})));
+    assert!(
+        error["message"].as_str().unwrap().contains("policy.toml"),
+        "{error}"
+    );
+    assert_eq!(full.finish().0, 0);
+
+    let (mut compact, _) = Mcp::initialized(&home, &["--compact"]);
+    for (tool, args) in [
+        ("legion_tools", json!({})),
+        ("legion_describe", json!({"tool": "meta.version"})),
+        ("legion_call", json!({"tool": "meta.version"})),
+    ] {
+        let failure = failed(&compact.call(tool, args));
+        assert_eq!(failure["code"], error["code"], "{tool}: {failure}");
+        assert_eq!(failure["message"], error["message"], "{tool}");
+    }
+    assert_eq!(compact.finish().0, 0);
+}

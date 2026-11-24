@@ -69,6 +69,12 @@ impl Catalog {
         &self.entries
     }
 
+    /// The tool a client names, by its registry name or its MCP name.
+    pub(crate) fn get(&self, name: &str) -> Option<&Entry> {
+        let name = self.resolve(name);
+        self.entries.iter().find(|entry| entry.spec.name == name)
+    }
+
     /// The registry name a client means: the name itself, or the MCP name of exactly one tool.
     /// Agents switch between `fs.read` and `fs_read` freely, and both are unambiguous.
     pub(crate) fn resolve<'a>(&'a self, name: &'a str) -> &'a str {
