@@ -196,14 +196,36 @@ pub async fn learn(backend: State<'_, SharedBackend>) -> Result<LearnResult, App
     backend.0.learn().await
 }
 
-/// Explicitly accepts a pending host-key change reported for `node` and persists the new pins.
+/// Explicitly accepts a pending host-key or endpoint change reported for learned node `node`,
+/// requiring `fingerprints` to match the reviewed host keys exactly and persisting before updating
+/// live state.
 #[tauri::command]
 pub async fn accept_identity_change(
     backend: State<'_, SharedBackend>,
     node: String,
+    fingerprints: Vec<String>,
 ) -> Result<AppState, AppError> {
     validate_label_size("Node name", &node)?;
-    backend.0.accept_identity_change(node).await
+    if fingerprints.len() > 32 {
+        return Err(AppError::new(
+            ErrorCode::InvalidArgs,
+            "Too many fingerprints supplied.",
+        ));
+    }
+    for fp in &fingerprints {
+        validate_label_size("Fingerprint", fp)?;
+    }
+    backend.0.accept_identity_change(node, fingerprints).await
+}
+
+/// Dismisses a pending identity-change warning for `node` without altering its pinned target.
+#[tauri::command]
+pub async fn dismiss_identity_change(
+    backend: State<'_, SharedBackend>,
+    node: String,
+) -> Result<AppState, AppError> {
+    validate_label_size("Node name", &node)?;
+    backend.0.dismiss_identity_change(node).await
 }
 
 /// Returns a sensible default name for this device (model on mobile, host name on desktop).

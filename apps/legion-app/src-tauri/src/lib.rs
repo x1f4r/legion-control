@@ -108,6 +108,7 @@ pub fn run() {
             commands::invalidate_sessions,
             commands::learn,
             commands::accept_identity_change,
+            commands::dismiss_identity_change,
             commands::device_name,
             commands::ready,
             commands::scan_invite,
@@ -128,6 +129,7 @@ pub fn run() {
             commands::invalidate_sessions,
             commands::learn,
             commands::accept_identity_change,
+            commands::dismiss_identity_change,
             commands::device_name,
             commands::ready,
             commands::scan_invite,
@@ -146,6 +148,7 @@ pub fn run() {
         commands::invalidate_sessions,
         commands::learn,
         commands::accept_identity_change,
+        commands::dismiss_identity_change,
         commands::device_name,
         commands::ready,
     ]);

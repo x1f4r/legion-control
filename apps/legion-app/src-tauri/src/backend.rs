@@ -183,29 +183,67 @@ fn default_route() -> String {
     "direct".to_owned()
 }
 
-/// Details of a pending host-key change reported for an already known machine.
+/// One conflicting endpoint report received while another pending change was already recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictingIdentityInfo {
+    /// Directly paired node that reported this conflicting endpoint.
+    pub reported_by: String,
+    /// Candidate host names / addresses in the conflicting report.
+    pub hosts: Vec<String>,
+    /// SSH port in the conflicting report.
+    pub port: u16,
+    /// SSH user in the conflicting report.
+    pub user: String,
+    /// SHA-256 fingerprints of the conflicting report's host keys.
+    #[serde(default)]
+    pub fingerprints: Vec<String>,
+}
+
+/// Details of a pending host-key or endpoint change reported for an already known machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityChangedInfo {
-    /// Trusted node that reported the new host keys.
+    /// Directly paired node that reported the pending change.
     pub reported_by: String,
     /// Candidate host names / addresses in the newly reported target.
     pub hosts: Vec<String>,
     /// SSH port in the newly reported target.
     pub port: u16,
+    /// SSH user in the newly reported target.
+    #[serde(default)]
+    pub user: String,
+    /// Currently pinned host names / addresses before this change.
+    #[serde(default)]
+    pub old_hosts: Vec<String>,
+    /// Currently pinned SSH port before this change.
+    #[serde(default)]
+    pub old_port: u16,
+    /// Currently pinned SSH user before this change.
+    #[serde(default)]
+    pub old_user: String,
     /// SHA-256 fingerprints of the currently pinned host keys.
     #[serde(default)]
     pub old_fingerprints: Vec<String>,
     /// SHA-256 fingerprints of the newly reported host keys.
     #[serde(default)]
     pub new_fingerprints: Vec<String>,
+    /// Conflicting reports received while this change was pending; when non-empty, acceptance is
+    /// blocked until dismissed or paired directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ConflictingIdentityInfo>,
+    /// True when the entry is directly paired (informational warning only; cannot be accepted).
+    #[serde(default)]
+    pub is_paired: bool,
 }
 
-/// A fleet machine that did not receive this device yet during pairing.
+/// A fleet machine that did not receive this device fully during pairing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairPendingPeer {
     /// Machine name.
     pub node: String,
-    /// Optional reason the peer was not reached.
+    /// Delivery status reported by the node (`"partial"` or `"not_reached"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Optional reason the peer was not reached or refused live changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -266,10 +304,6 @@ pub struct NodeLink {
     /// Canonical path to the local `legion` binary when `via == "local"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// True when this node is only acting as a temporary in-memory failover link (not persisted
-    /// as the user's chosen default node).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub temporary: bool,
     /// `"paired"` (paired directly or local) or `"learned"` (learned via `device.endpoint`).
     #[serde(default = "default_origin")]
     pub origin: String,
@@ -394,8 +428,16 @@ pub trait Backend: Send + Sync {
     /// Learns direct SSH endpoints for every answering machine in the fleet and persists them.
     fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>>;
 
-    /// Explicitly accepts a pending host-key change for `node` and persists the new pins.
-    fn accept_identity_change(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>>;
+    /// Explicitly accepts a pending host-key or endpoint change for learned node `node`, verifying
+    /// `fingerprints` match the reviewed pending target and persisting before updating live state.
+    fn accept_identity_change(
+        &self,
+        node: String,
+        fingerprints: Vec<String>,
+    ) -> BoxFuture<'_, Result<AppState, AppError>>;
+
+    /// Dismisses a pending identity-change warning for `node` without changing its pinned target.
+    fn dismiss_identity_change(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>>;
 }
 
 /// Fallback backend returning honest unpaired responses.
@@ -475,7 +517,15 @@ impl Backend for Unpaired {
         Box::pin(async { Err(AppError::not_paired()) })
     }
 
-    fn accept_identity_change(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+    fn accept_identity_change(
+        &self,
+        _node: String,
+        _fingerprints: Vec<String>,
+    ) -> BoxFuture<'_, Result<AppState, AppError>> {
+        Box::pin(async { Err(AppError::not_paired()) })
+    }
+
+    fn dismiss_identity_change(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async { Err(AppError::not_paired()) })
     }
 }
@@ -539,7 +589,6 @@ mod tests {
                 role: "operator".to_owned(),
                 via: "ssh".to_owned(),
                 path: None,
-                temporary: false,
                 origin: "paired".to_owned(),
                 learned_from: None,
                 route: "direct".to_owned(),
