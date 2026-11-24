@@ -216,6 +216,7 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     await page.getByText('Machines · 2 of 2 answering').waitFor({ timeout: 15_000 });
     await page.locator('a.row', { hasText: 'tower' }).waitFor();
     await page.locator('a.row', { hasText: 'pi' }).waitFor();
+    await page.locator('a.row .meters').nth(1).waitFor({ timeout: 5_000 });
     await maybeShot(page, 'real-phone-dark-machines');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-machines');
@@ -363,6 +364,7 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
 
     // Wide split view shows machine list beside selected machine overview.
     await wide.locator('.split h2.pane-title', { hasText: 'tower' }).waitFor();
+    await wide.locator('a.row .meters').nth(1).waitFor({ timeout: 5_000 });
     await maybeShot(wide, 'real-wide-dark-machines');
     await setTheme(wide, 'light');
     await maybeShot(wide, 'real-wide-light-machines');
@@ -500,6 +502,135 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
       await ctx.close();
     }
 
+    assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fast start with an offline dual-boot machine paints this node immediately and caches across visits', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const root = makeWorkRoot();
+  const fleet = setupFleet(root);
+
+  // Add a dead dual-boot machine whose two command transports never answer.
+  const hangCmd = [process.execPath, '-e', 'setInterval(() => {}, 60000)'];
+  fs.appendFileSync(
+    path.join(fleet.towerHome, 'config', 'fleet.toml'),
+    [
+      '',
+      '[machines.dead]',
+      '[[machines.dead.systems]]',
+      'name = "linux"',
+      `command = ${JSON.stringify(hangCmd)}`,
+      '[[machines.dead.systems]]',
+      'name = "windows"',
+      `command = ${JSON.stringify(hangCmd)}`,
+      '',
+    ].join('\n'),
+  );
+
+  const server = await startServer(fleet.towerHome, fleet.towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      colorScheme: 'dark',
+    });
+    const page = await ctx.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    await page.goto(server.url, { waitUntil: 'domcontentloaded' });
+    await page.getByLabel('Token', { exact: true }).fill(fleet.token);
+
+    const tClick = performance.now();
+    await page.getByRole('button', { name: 'Connect' }).click();
+
+    // This node paints immediately (well under 2 seconds), never waiting for the dead machine.
+    await page.locator('a.row:not(.asking):not(.off)', { hasText: 'tower' }).waitFor({ timeout: 2000 });
+    const tTower = Math.round(performance.now() - tClick);
+    assert.ok(tTower < 2000, `tower took ${tTower} ms to appear`);
+
+    // The dead machine appears as a quiet "asking…" row while pi answers on its own.
+    await page.locator('a.row.asking', { hasText: 'dead' }).waitFor({ timeout: 2000 });
+    await page.locator('a.row:not(.asking):not(.off)', { hasText: 'pi' }).waitFor({ timeout: 2000 });
+    const tPi = Math.round(performance.now() - tClick);
+    assert.ok(tPi < 2000, `pi took ${tPi} ms to appear`);
+    await maybeShot(page, 'real-phone-dark-machines-asking');
+
+    // Full list settles after a single ping timeout for the dead dual-boot machine.
+    await page.locator('a.row.off', { hasText: 'dead' }).waitFor({ timeout: 10_000 });
+    await page.getByText('Machines · 2 of 3 answering').waitFor({ timeout: 5000 });
+    const tSettled = Math.round(performance.now() - tClick);
+    assert.ok(tSettled < 8000, `fleet took ${tSettled} ms to settle (expected one timeout)`);
+    await maybeShot(page, 'real-phone-dark-machines-offline');
+
+    // Jobs view queries answering machines only and paints without waiting on dead.
+    const tJobs0 = performance.now();
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Jobs' }).click();
+    await page.getByText('No background jobs recorded.').waitFor({ timeout: 2000 });
+    const tJobs = Math.round(performance.now() - tJobs0);
+    assert.ok(tJobs < 2000, `Jobs view took ${tJobs} ms`);
+
+    // Target picker labels the offline machine and "All answering machines" skips it.
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Tools' }).click();
+    await page.getByLabel('Search tools').fill('meta.version');
+    await page.locator('a.row', { hasText: 'meta.version' }).first().click();
+    const deadOpt = await page.locator('#tool-target-on option[value="dead"]').textContent();
+    assert.match(deadOpt || '', /offline/i);
+    await page.locator('#tool-target-on').selectOption('all');
+    await page.getByText(/skipping dead/i).waitFor();
+    const tFan0 = performance.now();
+    await page.getByRole('button', { name: 'Run', exact: true }).click();
+    await page.locator('.label', { hasText: /^pi$/i }).waitFor({ timeout: 2000 });
+    await page.locator('.label', { hasText: /^tower$/i }).waitFor({ timeout: 2000 });
+    const tFan = Math.round(performance.now() - tFan0);
+    assert.ok(tFan < 2000, `All-answering fan-out took ${tFan} ms`);
+
+    // Persistent localStorage cache stores non-secret machine metadata and no token.
+    const cachedRaw = await page.evaluate(() => localStorage.getItem('legion.cache.fleet'));
+    assert.ok(cachedRaw, 'expected legion.cache.fleet in localStorage');
+    assert.ok(!cachedRaw.includes(fleet.token), 'token must never be written to fleet cache');
+    const cached = JSON.parse(cachedRaw);
+    assert.equal(cached.value.node, 'tower');
+    assert.equal(cached.value.machines.length, 3);
+
+    // Return visit paints cached machines immediately with "as of …" while refreshing.
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Machines' }).click();
+    const tReload0 = performance.now();
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.getByText(/as of /i).waitFor({ timeout: 2000 });
+    await page.locator('a.row', { hasText: 'dead' }).waitFor({ timeout: 2000 });
+    const tReload = Math.round(performance.now() - tReload0);
+    assert.ok(tReload < 2000, `Cached return paint took ${tReload} ms`);
+    await maybeShot(page, 'real-phone-dark-machines-cached');
+    await page.locator('a.row.off', { hasText: 'dead' }).waitFor({ timeout: 10_000 });
+
+    // Forgetting this browser clears the persistent fleet cache too.
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /device/i }).click();
+    await page.getByRole('button', { name: 'Forget this browser' }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.waitFor();
+    await dialog.getByRole('button', { name: 'Forget this browser' }).click();
+    await page.getByRole('heading', { name: /Connect this browser to tower/ }).waitFor({ timeout: 5000 });
+    const afterForget = await page.evaluate(() => localStorage.getItem('legion.cache.fleet'));
+    assert.equal(afterForget, null, 'fleet cache should be cleared on forget');
+
+    await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);
   } finally {

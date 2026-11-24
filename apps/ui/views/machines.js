@@ -14,6 +14,16 @@ import { routeHref } from '../lib/route.js';
 import { MachineDetail } from './machine.js';
 
 function machineSubtext(m) {
+  if (m.status === 'asking' || m.asking) {
+    const parts = [];
+    if (m.fromCache && m.os) parts.push(osLabel(m.os));
+    if (m.fromCache && m.lastSeenAt) {
+      const seen = formatRelativeTime(m.lastSeenAt);
+      if (seen) parts.push(`last seen ${seen}`);
+    }
+    parts.push('asking…');
+    return parts.join(' · ');
+  }
   if (!m.reachable) {
     return firstSentence(m.reason || m.error?.message) || 'Did not answer';
   }
@@ -32,8 +42,19 @@ function machineSubtext(m) {
 
 function MachineRow({ machine, selected, canWake, onWake }) {
   const metrics = machineMetrics(machine.sys);
-  const dotClass = !machine.reachable ? 'dot off' : machine.busy ? 'dot busy' : 'dot';
-  const rowClass = ['row', !machine.reachable ? 'off' : '', selected ? 'selected' : '']
+  const isAsking = machine.status === 'asking' || machine.asking;
+  const dotClass = isAsking
+    ? 'dot asking'
+    : !machine.reachable
+      ? 'dot off'
+      : machine.busy
+        ? 'dot busy'
+        : 'dot';
+  const rowClass = [
+    'row',
+    isAsking ? 'asking' : !machine.reachable ? 'off' : '',
+    selected ? 'selected' : '',
+  ]
     .filter(Boolean)
     .join(' ');
   const href = routeHref({ section: 'machines', machine: machine.name, tab: 'overview' });
@@ -62,7 +83,7 @@ function MachineRow({ machine, selected, canWake, onWake }) {
               <${Meter} value=${metrics.diskPct} />
             </span>
           `
-        : !machine.reachable && machine.canWake && canWake
+        : !isAsking && !machine.reachable && machine.canWake && canWake
           ? html`<button type="button" class="chip chip-action" onClick=${handleWake}>wake</button>`
           : null}
     </a>
@@ -89,22 +110,28 @@ export function MachinesView({
   const runningJobs = snapshot?.runningJobs || [];
   const answering = machines.filter((m) => m.reachable).length;
   const canWake = allowedSet ? allowedSet.has('power.wake') : false;
+  const cachedAsOf = snapshot?.cachedAt ? formatRelativeTime(snapshot.cachedAt) : '';
 
   const selectedName = wide
     ? route.machine || machines[0]?.name || null
     : route.machine || null;
   const selectedMachine = machines.find((m) => m.name === selectedName) || null;
 
+  const heading =
+    machines.length > 0
+      ? cachedAsOf
+        ? answering > 0
+          ? `Machines · ${answering} of ${machines.length} answering · as of ${cachedAsOf}`
+          : `Machines · as of ${cachedAsOf}`
+        : `Machines · ${answering} of ${machines.length} answering`
+      : loading
+        ? 'Machines · loading…'
+        : 'Machines';
+
   const listColumn = html`
     <section>
       ${error ? html`<${Notice} error=${error} />` : null}
-      <p class="label">
-        ${machines.length > 0
-          ? `Machines · ${answering} of ${machines.length} answering`
-          : loading
-            ? 'Machines · loading…'
-            : 'Machines'}
-      </p>
+      <p class="label">${heading}</p>
       ${machines.length > 0
         ? html`
             <div class="list">
