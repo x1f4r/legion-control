@@ -653,7 +653,14 @@ step('g4 the gated key refuses to run an arbitrary command', () => {
 // --- h. services ---------------------------------------------------------------------------------
 
 const backends = { linux: 'systemd', macos: 'launchd', windows: 'windows' };
-const knownService = { linux: 'systemd-journald.service', macos: 'com.apple.mDNSResponder', windows: 'sshd' }[expectedOs];
+// Services every machine of the platform runs, by the name its service manager knows them by
+// (on macOS a launchd label, which is not always the plist's file name: mDNSResponder's file
+// carries the label com.apple.mDNSResponder.reloaded).
+const knownServices = {
+  linux: ['systemd-journald.service', 'dbus.service'],
+  macos: ['com.apple.notifyd', 'com.apple.logd', 'com.apple.mDNSResponder.reloaded'],
+  windows: ['sshd', 'EventLog'],
+}[expectedOs];
 
 step('h1 svc.list --on far lists the platform\'s services', () => {
   const list = ok('svc.list', { scope: 'system', limit: 200 }, { on: 'far' });
@@ -662,11 +669,21 @@ step('h1 svc.list --on far lists the platform\'s services', () => {
   return `${list.services.length} services from ${list.backend}`;
 });
 
-step(`h2 svc.status --on far of ${knownService}`, () => {
-  const status = ok('svc.status', { name: knownService, scope: 'system' }, { on: 'far' });
-  check(status.backend === backends[expectedOs] && status.state === 'running', `${knownService} is not reported running`, status);
-  const unscoped = ok('svc.status', { name: knownService }, { on: 'far' });
-  check(unscoped.scope === 'system', 'svc.status without a scope did not find the system service', unscoped);
+step('h2 svc.status --on far of a well-known service svc.list shows running', () => {
+  let name;
+  for (const candidate of knownServices) {
+    const listed = ok('svc.list', { scope: 'system', filter: candidate, state: 'running', limit: 1000 }, { on: 'far' });
+    if (listed.services.some(s => s.name === candidate)) {
+      name = candidate;
+      break;
+    }
+  }
+  check(name, `svc.list --on far shows none of ${knownServices.join(', ')} running`);
+  const status = ok('svc.status', { name, scope: 'system' }, { on: 'far' });
+  check(status.backend === backends[expectedOs] && status.state === 'running', `svc.status does not report ${name} running, though svc.list does`, status);
+  const unscoped = ok('svc.status', { name }, { on: 'far' });
+  check(unscoped.scope === 'system' && unscoped.state === 'running', `svc.status ${name} without a scope did not find the running system service`, unscoped);
+  return name;
 });
 
 // --- i. power, read-only and dry runs ------------------------------------------------------------
