@@ -1141,6 +1141,155 @@ async fn idempotent_key_deduplicates_conflicts_and_concurrent_starts() {
         .call("job.cancel", json!({"id": race_id, "force": true}))
         .await
         .unwrap();
+
+    // Failed starts whose supervisor never took the lock do not match `key` and are replaced on
+    // retry (even if the retried command differs).
+    let jobs_root = fixture.node.paths().state_dir().join("jobs");
+    let boot = procid::boot_id().unwrap();
+    let old_created = "2026-01-01T00:00:00.000Z";
+
+    // (a) `exit.json` recorded with `startup_failed: true`.
+    let startup_fail_dir = jobs_root.join("seed-startup-fail");
+    fs::create_dir_all(&startup_fail_dir).unwrap();
+    fs::write(
+        startup_fail_dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": "seed-startup-fail",
+            "name": "bad-start",
+            "key": "retry-after-startup-fail",
+            "cmd": "echo broken",
+            "env_names": [],
+            "principal": "owner",
+            "created": old_created,
+            "boot_id": boot,
+            "exclusive": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        startup_fail_dir.join("exit.json"),
+        serde_json::to_vec(&json!({
+            "outcome": "failed",
+            "finished": old_created,
+            "forced": false,
+            "startup_failed": true,
+            "detail": "Could not launch the detached job supervisor."
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let replaced = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("args", &["recovered"]),
+                json!({"key": "retry-after-startup-fail"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let replaced_id = replaced["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&replaced_id);
+    assert_eq!(replaced["existing"], json!(false), "{replaced:#}");
+    assert_ne!(replaced_id, "seed-startup-fail");
+    fixture
+        .call("job.wait", json!({"id": replaced_id, "timeout_s": 15}))
+        .await
+        .unwrap();
+    let again = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("args", &["recovered"]),
+                json!({"key": "retry-after-startup-fail"}),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["id"], json!(replaced_id));
+    assert_eq!(again["existing"], json!(true));
+
+    // (b) Expired interrupted job whose supervisor never created `lock`.
+    let never_locked_dir = jobs_root.join("seed-never-locked");
+    fs::create_dir_all(&never_locked_dir).unwrap();
+    fs::write(
+        never_locked_dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": "seed-never-locked",
+            "name": "aborted-start",
+            "key": "retry-after-never-locked",
+            "cmd": "echo never-ran",
+            "env_names": [],
+            "principal": "owner",
+            "created": old_created,
+            "boot_id": boot,
+            "exclusive": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let replaced2 = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("args", &["started-now"]),
+                json!({"key": "retry-after-never-locked"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let replaced2_id = replaced2["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&replaced2_id);
+    assert_eq!(replaced2["existing"], json!(false), "{replaced2:#}");
+    assert_ne!(replaced2_id, "seed-never-locked");
+    fixture
+        .call("job.wait", json!({"id": replaced2_id, "timeout_s": 15}))
+        .await
+        .unwrap();
+
+    // (c) An interrupted job whose supervisor DID take `lock` (ran before crashing/rebooting)
+    // still matches its key.
+    let ran_interrupted_dir = jobs_root.join("seed-ran-interrupted");
+    fs::create_dir_all(&ran_interrupted_dir).unwrap();
+    fs::write(
+        ran_interrupted_dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": "seed-ran-interrupted",
+            "name": "ran-before-reboot",
+            "key": "ran-then-rebooted",
+            "cmd": "echo ran",
+            "env_names": [],
+            "principal": "owner",
+            "created": old_created,
+            "boot_id": "00000000-0000-0000-0000-000000000000",
+            "exclusive": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(ran_interrupted_dir.join("lock"), b"").unwrap();
+    let matched_interrupted = fixture
+        .call(
+            "job.start",
+            json!({"cmd": "echo ran", "key": "ran-then-rebooted"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matched_interrupted["id"], json!("seed-ran-interrupted"));
+    assert_eq!(matched_interrupted["existing"], json!(true));
+    assert_eq!(matched_interrupted["state"], json!("interrupted"));
+
+    // Confirm the `job.start` tool description documents the key-matching rule.
+    let tools = legion_tools::registry().specs();
+    let start_spec = tools.iter().find(|spec| spec.name == "job.start").unwrap();
+    assert!(
+        start_spec.description.contains("never took the lock"),
+        "{}",
+        start_spec.description
+    );
 }
 
 async fn retention_prunes_old_and_excess_finished_jobs_only() {

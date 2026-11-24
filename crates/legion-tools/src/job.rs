@@ -36,10 +36,10 @@ pub use supervise::try_supervise_cli;
 use logs::{DEFAULT_LOG_LIMIT, DEFAULT_TAIL_LINES, MAX_LOG_LIMIT, MAX_TAIL_LINES};
 use store::{
     ExitOutcome, ExitRecord, JobRecord, command_summary, compare_newest_first, default_job_name,
-    derive_status, derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir,
-    jobs_lock_path, load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record,
-    read_job_record, remove_env_file, validate_job_id, write_cancel_request, write_env_file,
-    write_exit_record, write_job_record,
+    derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir, jobs_lock_path,
+    load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record, read_job_record,
+    remove_env_file, validate_job_id, write_cancel_request, write_env_file, write_exit_record,
+    write_job_record,
 };
 
 /// Default and maximum `limit` for `job.list`.
@@ -69,7 +69,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.start",
         Effect::Exec,
-        "Start a command as a detached background job that outlives this call, this legion process, and any ssh session. Give `argv` to run a program with exact arguments or `cmd` for the platform shell (sh on Linux and macOS, PowerShell on Windows). Returns as soon as the job supervisor holds its lock; afterwards poll `job.logs` with `next_offset` to read output as it arrives, call `job.wait` to wait for completion, or inspect `job.status`. Pass `key` to make retries after a dropped connection idempotent, and set `exclusive: true` when the job should mark this machine busy.",
+        "Start a command as a detached background job that outlives this call, this legion process, and any ssh session. Give `argv` to run a program with exact arguments or `cmd` for the platform shell (sh on Linux and macOS, PowerShell on Windows). Returns as soon as the job supervisor holds its lock; afterwards poll `job.logs` with `next_offset` to read output as it arrives, call `job.wait` to wait for completion, or inspect `job.status`. Pass `key` to make retries after a dropped connection idempotent: a key matches an active job or one whose supervisor took the lock and ran (succeeded, failed, cancelled, or interrupted mid-run); a failed start whose supervisor never took the lock does not match and is replaced. Set `exclusive: true` when the job should mark this machine busy.",
         start,
     );
     registry.add_fn(
@@ -134,8 +134,11 @@ struct StartArgs {
     /// Short human-readable name for the job; defaults to the command's program name.
     #[serde(default)]
     name: Option<String>,
-    /// Caller-chosen idempotency key. Re-calling with the same key and identical command, `cwd`,
-    /// and environment variable names returns the existing job instead of starting a second one.
+    /// Caller-chosen idempotency key. Matches an active job or one whose supervisor took the lock
+    /// and ran (succeeded, failed, cancelled, or interrupted mid-run): re-calling with the same
+    /// key and identical command, `cwd`, and environment variable names returns that job instead
+    /// of starting a second one, while differing arguments fail with `conflict`. A failed start
+    /// whose supervisor never took the lock does not match and is replaced.
     #[serde(default)]
     key: Option<String>,
     /// Mark this machine busy while the job runs (blocks unattended `power.*` operations).
@@ -410,16 +413,16 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolError> {
     let state_dir_for_create = state_dir.clone();
     let create_outcome = blocking("job.start", move || {
         let now = jiff::Timestamp::now();
+        let boot = procid::boot_id().ok();
         if let Some(ref key_str) = key
-            && let Some((existing_dir, existing)) = find_by_key(&state_dir_for_create, key_str)?
+            && let Some((_existing_dir, existing, derived)) =
+                find_by_key(&state_dir_for_create, key_str, boot.as_deref(), now)?
         {
             if existing.cmd == args.cmd
                 && existing.argv == args.argv
                 && existing.cwd == cwd_str
                 && existing.env_names == env_names
             {
-                let boot = procid::boot_id().ok();
-                let derived = derive_status(&existing_dir, &existing, boot.as_deref(), now);
                 return Ok(CreateOutcome::Existing(Started {
                     id: existing.id,
                     name: existing.name,
@@ -584,6 +587,7 @@ async fn record_start_failure(dir: &Path, detail: &str) {
         signal: None,
         finished: now_rfc3339(),
         forced: false,
+        startup_failed: true,
         detail: Some(detail.to_owned()),
     };
     let _ = tokio::task::spawn_blocking(move || {
@@ -1131,6 +1135,7 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
                     signal: None,
                     finished: now_rfc3339(),
                     forced: true,
+                    startup_failed: false,
                     detail: Some(
                         "Cancelled forcefully; detached process tree was stopped.".to_owned(),
                     ),

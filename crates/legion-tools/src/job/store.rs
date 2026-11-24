@@ -139,6 +139,9 @@ pub(super) struct ExitRecord {
     pub finished: String,
     #[serde(default)]
     pub forced: bool,
+    /// `true` when `job.start` failed before the detached supervisor ever acquired `lock`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub startup_failed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -149,6 +152,7 @@ pub(super) struct ExitRecord {
 pub(super) struct DerivedStatus {
     pub state: JobState,
     pub supervised: Option<bool>,
+    pub startup_failed: bool,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub finished: Option<String>,
@@ -564,6 +568,7 @@ fn inspect_local(
         return LocalInspect::Ready(DerivedStatus {
             state: JobState::Running,
             supervised: Some(true),
+            startup_failed: false,
             exit_code: None,
             signal: None,
             finished: None,
@@ -593,6 +598,7 @@ fn inspect_local(
         return LocalInspect::Ready(DerivedStatus {
             state: JobState::Interrupted,
             supervised: None,
+            startup_failed: false,
             exit_code: None,
             signal: None,
             finished: None,
@@ -617,6 +623,7 @@ fn inspect_local(
         return LocalInspect::Ready(DerivedStatus {
             state: JobState::Starting,
             supervised: Some(true),
+            startup_failed: false,
             exit_code: None,
             signal: None,
             finished: None,
@@ -630,6 +637,7 @@ fn inspect_local(
     LocalInspect::Ready(DerivedStatus {
         state: JobState::Interrupted,
         supervised: None,
+        startup_failed: false,
         exit_code: None,
         signal: None,
         finished: None,
@@ -658,6 +666,7 @@ fn finish_same_boot_unlocked(
         return DerivedStatus {
             state: JobState::Starting,
             supervised: Some(true),
+            startup_failed: false,
             exit_code: None,
             signal: None,
             finished: None,
@@ -674,6 +683,7 @@ fn finish_same_boot_unlocked(
         return DerivedStatus {
             state: JobState::Running,
             supervised: Some(false),
+            startup_failed: false,
             exit_code: None,
             signal: None,
             finished: None,
@@ -690,6 +700,7 @@ fn finish_same_boot_unlocked(
     DerivedStatus {
         state: JobState::Interrupted,
         supervised: None,
+        startup_failed: false,
         exit_code: None,
         signal: None,
         finished: None,
@@ -710,6 +721,7 @@ fn derived_from_exit(
     DerivedStatus {
         state: JobState::from(exit.outcome),
         supervised: None,
+        startup_failed: exit.startup_failed,
         exit_code: exit.exit_code,
         signal: exit.signal,
         finished: Some(exit.finished),
@@ -837,17 +849,41 @@ pub(super) fn load_all_records(state_dir: &Path) -> Result<Vec<(PathBuf, JobReco
     Ok(records)
 }
 
-/// Finds the newest job with matching `key` under `state_dir`.
+/// Finds the newest matching job with `key` under `state_dir`.
+///
+/// A key matches a job that is active (`starting` or `running`) or that ran (its supervisor took
+/// `lock` and finished as `succeeded`, `failed`, `cancelled`, or was interrupted mid-run). A job
+/// whose start failed before the supervisor ever acquired `lock` does not match and is skipped so
+/// retries can replace it.
 pub(super) fn find_by_key(
     state_dir: &Path,
     key: &str,
-) -> Result<Option<(PathBuf, JobRecord)>, ErrorBody> {
+    current_boot_id: Option<&str>,
+    now: jiff::Timestamp,
+) -> Result<Option<(PathBuf, JobRecord, DerivedStatus)>, ErrorBody> {
     let mut matches: Vec<(PathBuf, JobRecord)> = load_all_records(state_dir)?
         .into_iter()
         .filter(|(_, record)| record.key.as_deref() == Some(key))
         .collect();
     matches.sort_by(|(_, a), (_, b)| compare_newest_first(a, b));
-    Ok(matches.into_iter().next())
+    for (dir, record) in matches {
+        let derived = derive_status(&dir, &record, current_boot_id, now);
+        if key_matches_job(&dir, &derived) {
+            return Ok(Some((dir, record, derived)));
+        }
+    }
+    Ok(None)
+}
+
+fn key_matches_job(dir: &Path, derived: &DerivedStatus) -> bool {
+    if derived.state.is_active() {
+        return true;
+    }
+    if derived.state == JobState::Interrupted {
+        // Matches only if the supervisor ever got far enough to create and take `lock`.
+        return probe_lock(dir).0;
+    }
+    !derived.startup_failed
 }
 
 /// Ordering comparator sorting newer jobs first, breaking ties by id descending.

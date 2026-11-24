@@ -187,6 +187,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
             signal: None,
             finished: now_rfc3339(),
             forced: false,
+            startup_failed: false,
             detail: Some("Cancelled before the command started.".to_owned()),
         };
         let _ = write_exit_record(&dir, &exit);
@@ -316,6 +317,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
                 signal: output.signal,
                 finished: now_rfc3339(),
                 forced: false,
+                startup_failed: false,
                 detail: write_error.map(|err| format!("Writing output.log failed: {err}.")),
             }
         }
@@ -325,6 +327,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
             signal: None,
             finished: now_rfc3339(),
             forced: false,
+            startup_failed: false,
             detail: Some(describe_spawn_error(&os_err, &record)),
         },
     };
@@ -341,6 +344,7 @@ fn record_failure(dir: &Path, detail: String) {
         signal: None,
         finished: now_rfc3339(),
         forced: false,
+        startup_failed: false,
         detail: Some(detail),
     };
     let _ = write_exit_record(dir, &exit);
