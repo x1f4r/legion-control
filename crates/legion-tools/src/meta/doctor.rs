@@ -97,6 +97,11 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         if let Some(check) = check_policy_unmarked_device_principals(&policy) {
             checks.push(check);
         }
+        let principal_conflicts =
+            crate::device::registry::inspect_device_principal_conflicts(ctx.paths(), &policy);
+        if let Some(check) = check_device_principal_conflicts(&principal_conflicts) {
+            checks.push(check);
+        }
     }
 
     let orphans = query_orphaned_device_lines(ctx);
@@ -256,11 +261,39 @@ pub fn check_policy_unmarked_device_principals(policy: &Policy) -> Option<Check>
         ok: true,
         warning: true,
         detail: format!(
-            "policy.toml defines `device:*` principal(s) without a `device = \"<pairing_id>\"` ownership marker: {}. Device reconciliation and `device.set role=` leave them untouched.",
+            "policy.toml defines `device:*` principal(s) without a `device = \"<pairing_id>\"` ownership marker: {}. Device reconciliation and `device.set role=` leave them untouched, and any matching device in devices.toml is not activated.",
             unmarked.join(", ")
         ),
         hint: Some(
             "Rename human-authored principals so they do not start with `device:`, or add `device = \"<pairing_id>\"` if a principal belongs exclusively to one paired device."
+                .to_owned(),
+        ),
+    })
+}
+
+/// Builds a `meta.doctor` warning when one or more live paired devices in `devices.toml` are
+/// blocked from activation because their `device:*` principal is unmarked in `policy.toml`,
+/// marked for a different pairing id, shared/tombstoned, or assigned a different role in
+/// `policy.toml` than recorded in `devices.toml`.
+pub fn check_device_principal_conflicts(conflicts: &[(String, String, String)]) -> Option<Check> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = conflicts
+        .iter()
+        .map(|(name, id, reason)| format!("{name} ({id}): {reason}"))
+        .collect();
+    Some(Check {
+        name: "device principal conflicts".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "{} paired device(s) are not active here because of a `device:*` principal conflict in policy.toml or devices.toml: {}.",
+            conflicts.len(),
+            items.join("; ")
+        ),
+        hint: Some(
+            "Inspect with `legion device.list`, fix or remove the conflicting `device:*` entry in policy.toml, or remove the device with `legion device.remove id=<pairing_id>`."
                 .to_owned(),
         ),
     })

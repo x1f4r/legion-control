@@ -1380,8 +1380,133 @@ pub struct AuthKeysReconcileReport {
     /// Live pairing ids quarantined because an unconfirmed ancestor was removed at or before their
     /// pairing time, mapped to a human-readable reason.
     pub quarantined_ids: BTreeMap<String, String>,
-    /// Warnings generated for colliding, quarantined, or inactive entries.
+    /// Live pairing ids skipped because their `device:*` principal is unmarked in `policy.toml`,
+    /// marked for another pairing id, shared/tombstoned, or assigned a different role in
+    /// `policy.toml` than recorded in `devices.toml`, mapped to a human-readable reason.
+    pub principal_conflict_ids: BTreeMap<String, String>,
+    /// Warnings generated for colliding, principal-conflicting, quarantined, or inactive entries.
     pub warnings: Vec<String>,
+}
+
+/// Returns live pairing ids in `devices` whose `device:*` principal cannot safely be activated
+/// under `policy`, mapped to a human-readable reason:
+/// - the `device:*` principal exists in `policy.toml` without a `device = "<pairing_id>"` marker
+///   (unmarked / human-authored),
+/// - the `device:*` principal is marked in `policy.toml` for a different pairing id,
+/// - two or more live devices claim the same `device:*` principal,
+/// - a tombstoned pairing of a different id previously owned that `device:*` principal, or
+/// - `policy.toml` assigns a role other than the device's recorded `role` (or `nobody`), so a
+///   recorded role can never be exceeded by what `policy.toml` happens to say.
+pub fn device_principal_conflicts(
+    devices: &DevicesFile,
+    policy: &Policy,
+) -> BTreeMap<String, String> {
+    let mut conflicts: BTreeMap<String, String> = BTreeMap::new();
+    let mut live_by_principal: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, entry) in &devices.devices {
+        if entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+            live_by_principal
+                .entry(entry.principal.as_str())
+                .or_default()
+                .push(id.as_str());
+        }
+    }
+
+    for (id, entry) in &devices.devices {
+        if !entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+            continue;
+        }
+        let principal = entry.principal.as_str();
+        if let Some(ids) = live_by_principal.get(principal)
+            && ids.len() > 1
+        {
+            let others: Vec<&str> = ids.iter().copied().filter(|other| *other != id).collect();
+            conflicts.insert(
+                id.clone(),
+                format!(
+                    "principal {principal} is claimed by multiple live devices ({})",
+                    others.join(", ")
+                ),
+            );
+            continue;
+        }
+        if let Some((tomb_id, _)) = devices
+            .removed
+            .iter()
+            .find(|(tid, tomb)| tid.as_str() != id && tomb.principal == principal)
+        {
+            conflicts.insert(
+                id.clone(),
+                format!("principal {principal} previously belonged to removed pairing {tomb_id}"),
+            );
+            continue;
+        }
+        if let Some((_, existing)) = policy
+            .principals
+            .iter()
+            .find(|(p, _)| p.as_str() == principal)
+        {
+            match existing.device.as_deref() {
+                None => {
+                    conflicts.insert(
+                        id.clone(),
+                        format!(
+                            "principal {principal} in policy.toml has no `device = \"{id}\"` ownership marker (role: {})",
+                            existing.role
+                        ),
+                    );
+                    continue;
+                }
+                Some(owner_id) if owner_id != id => {
+                    conflicts.insert(
+                        id.clone(),
+                        format!(
+                            "principal {principal} in policy.toml is owned by pairing {owner_id}, not {id}"
+                        ),
+                    );
+                    continue;
+                }
+                Some(_) => {
+                    if let Some(recorded) = entry.role.as_deref()
+                        && existing.role != recorded
+                        && existing.role != NOBODY
+                    {
+                        conflicts.insert(
+                            id.clone(),
+                            format!(
+                                "policy.toml gives {principal} role {:?}, which does not match recorded role {recorded:?}",
+                                existing.role
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    conflicts
+}
+
+/// Read-only list of `(name, pairing_id, reason)` for live devices in `devices.toml` blocked by a
+/// `device:*` principal ownership or role conflict against `policy`, used by `meta.doctor`.
+pub fn inspect_device_principal_conflicts(
+    paths: &Paths,
+    policy: &Policy,
+) -> Vec<(String, String, String)> {
+    let Ok(Some(devices)) = load_devices_raw(paths) else {
+        return Vec::new();
+    };
+    device_principal_conflicts(&devices, policy)
+        .into_iter()
+        .map(|(id, reason)| {
+            let name = devices
+                .devices
+                .get(&id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| id.clone());
+            (name, id, reason)
+        })
+        .collect()
 }
 
 /// Groups live pairing ids in `devices` by their decoded Ed25519 public-key wire blob, returning
@@ -1482,6 +1607,7 @@ pub fn inspect_device_key_conflicts(paths: &Paths, node_file: &NodeFile) -> Devi
 pub fn reconcile_authorized_keys_in_memory(
     auth_keys: &mut AuthKeysFile,
     devices: &DevicesFile,
+    policy: &Policy,
     paths: &Paths,
     target: &AuthKeysTarget,
     caller_account: Option<&str>,
@@ -1543,14 +1669,23 @@ pub fn reconcile_authorized_keys_in_memory(
         }
     }
 
-    // Pass 2: build expected canonical line per non-colliding, non-quarantined live pairing id.
+    // Pass 2: build expected canonical line per non-colliding, non-quarantined, non-conflicting
+    // live pairing id.
     let quarantined_ids = quarantined_devices(devices);
+    let principal_conflict_ids = device_principal_conflicts(devices, policy);
     let mut expected_lines: BTreeMap<&str, (String, Vec<u8>)> = BTreeMap::new();
     let mut foreign_key_ids: BTreeSet<String> = BTreeSet::new();
     for (id, entry) in &devices.devices {
         if let Some(reason) = quarantined_ids.get(id) {
             warnings.push(format!(
                 "Device {} ({id}) is quarantined ({reason}) and not active here; confirm with `legion device.set id={id} confirm=true` or remove with `legion device.remove id={id}`.",
+                entry.name
+            ));
+            continue;
+        }
+        if let Some(reason) = principal_conflict_ids.get(id) {
+            warnings.push(format!(
+                "Device {} ({id}) is not active here: {reason}.",
                 entry.name
             ));
             continue;
@@ -1655,6 +1790,7 @@ pub fn reconcile_authorized_keys_in_memory(
         duplicate_key_ids,
         foreign_key_ids,
         quarantined_ids,
+        principal_conflict_ids,
         warnings,
     })
 }
@@ -1711,17 +1847,24 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
     )?;
     let _auth_guard = lock_auth_keys(&target, &write_path)?;
 
+    let policy_path = paths.config_file(Policy::FILE);
+    let live_policy = match std::fs::read(&policy_path) {
+        Ok(bytes) => parse::<Policy>(&policy_path, &bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", policy_path.display()),
+            ));
+        }
+    };
+
     let existing_devices = load_devices_raw(paths)?;
     let (devices, devices_adopted) = match existing_devices {
         Some(file) => (file, 0),
         None => {
             let auth_keys = read_auth_keys(&write_path)?;
             let state = load_state(paths).unwrap_or_default();
-            let policy_path = paths.config_file(Policy::FILE);
-            let policy = std::fs::read(&policy_path)
-                .ok()
-                .and_then(|b| parse::<Policy>(&policy_path, &b).ok())
-                .unwrap_or_default();
             let adopted = adopt_legacy_devices_from_auth_keys(
                 paths,
                 node_name,
@@ -1729,7 +1872,7 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
                 &target,
                 caller_account.as_deref(),
                 &state,
-                &policy,
+                &live_policy,
             );
             let count = adopted.devices.len();
             if count > 0 || save_if_adopted {
@@ -1745,6 +1888,7 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
         let report = reconcile_authorized_keys_in_memory(
             &mut auth_keys,
             &devices,
+            &live_policy,
             paths,
             &target,
             caller_account.as_deref(),
@@ -1834,6 +1978,27 @@ pub fn verify_gate_device(
         .with_hint(format!(
             "Confirm this device as owner with `legion device.set id={pairing_id} confirm=true`, or remove it with `legion device.remove id={pairing_id}`."
         )));
+    }
+
+    let policy_path = paths.config_file(Policy::FILE);
+    let live_policy = match std::fs::read(&policy_path) {
+        Ok(bytes) => parse::<Policy>(&policy_path, &bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", policy_path.display()),
+            ));
+        }
+    };
+
+    let principal_conflicts = device_principal_conflicts(&devices, &live_policy);
+    if let Some(reason) = principal_conflicts.get(pairing_id) {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!("Device {device_name} ({pairing_id}) is not active here: {reason}."),
+        ));
     }
 
     let Some(entry) = devices.devices.get(pairing_id) else {
@@ -1931,6 +2096,7 @@ pub fn verify_gate_device(
     let probe_report = reconcile_authorized_keys_in_memory(
         &mut probe,
         &devices,
+        &live_policy,
         paths,
         &target,
         caller_account.as_deref(),
@@ -1946,6 +2112,13 @@ pub fn verify_gate_device(
             format!(
                 "Device {device_name} ({pairing_id}) is not active here due to a public key conflict."
             ),
+        ));
+    }
+    if let Some(reason) = probe_report.principal_conflict_ids.get(pairing_id) {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!("Device {device_name} ({pairing_id}) is not active here: {reason}."),
         ));
     }
     if probe_report.changed {
@@ -2340,6 +2513,16 @@ pub fn apply_devices_merge_blocking(
     };
 
     let mut warnings = reconcile_device_principals_locked(paths, &merged).map_err(after_save)?;
+    let reconciled_policy = match std::fs::read(&policy_path) {
+        Ok(bytes) => parse::<Policy>(&policy_path, &bytes).map_err(after_save)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
+        Err(error) => {
+            return Err(after_save(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", policy_path.display()),
+            )));
+        }
+    };
 
     let target = resolve_target(paths, node_file).map_err(after_save)?;
     let caller_account = caller_account_for_target(&target).map_err(after_save)?;
@@ -2359,6 +2542,7 @@ pub fn apply_devices_merge_blocking(
         let report = reconcile_authorized_keys_in_memory(
             &mut auth_keys,
             &merged,
+            &reconciled_policy,
             paths,
             &target,
             caller_account.as_deref(),

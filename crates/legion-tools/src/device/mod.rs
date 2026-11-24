@@ -1084,13 +1084,19 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         if confirm {
             let _ = reconcile_device_principals_locked(&paths, &devices_file)?;
         }
+        let policy_path = paths.config_file(Policy::FILE);
+        let live_policy = match std::fs::read(&policy_path) {
+            Ok(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
+            Err(error) => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be read: {error}.", policy_path.display()),
+                ));
+            }
+        };
         let effective_role_after = if confirm && new_role.is_none() {
-            let policy_path = paths.config_file(Policy::FILE);
-            std::fs::read(&policy_path)
-                .ok()
-                .and_then(|b| legion_core::config::parse::<Policy>(&policy_path, &b).ok())
-                .map(|p| p.role_of(&updated_entry.principal).0)
-                .unwrap_or(final_role)
+            live_policy.role_of(&updated_entry.principal).0
         } else {
             final_role
         };
@@ -1101,6 +1107,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             let report = reconcile_authorized_keys_in_memory(
                 &mut auth_keys,
                 &devices_file,
+                &live_policy,
                 &paths,
                 &target,
                 caller_account.as_deref(),
@@ -1254,6 +1261,7 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
                 let report = reconcile_authorized_keys_in_memory(
                     &mut auth_keys,
                     &devices_file,
+                    &policy,
                     &paths,
                     &target,
                     caller_account.as_deref(),
@@ -1293,6 +1301,8 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
                             "quarantined: {reason}; confirm with `legion device.set id={id} confirm=true` or remove with `legion device.remove id={id}`"
                         )),
                     )
+                } else if let Some(reason) = report.principal_conflict_ids.get(id) {
+                    (false, Some(format!("not active here: {reason}")))
                 } else if let Some(others) = report.duplicate_key_ids.get(id) {
                     (
                         false,
@@ -1715,6 +1725,18 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 // 2. Reconcile `policy.toml` (clean up registry-owned `device:*` principal).
                 let _ = reconcile_device_principals_locked(&paths, &devices_file)
                     .map_err(after_save)?;
+                let policy_path = paths.config_file(Policy::FILE);
+                let live_policy = match std::fs::read(&policy_path) {
+                    Ok(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)
+                        .map_err(after_save)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
+                    Err(error) => {
+                        return Err(after_save(ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!("{} cannot be read: {error}.", policy_path.display()),
+                        )));
+                    }
+                };
 
                 // 3. Reconcile `authorized_keys` and sweep expired invites.
                 let target = resolve_target(&paths, &node_file).map_err(after_save)?;
@@ -1759,6 +1781,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                         let report = reconcile_authorized_keys_in_memory(
                             &mut auth_keys,
                             &devices_file,
+                            &live_policy,
                             &paths,
                             &target,
                             caller_account.as_deref(),
@@ -4816,5 +4839,172 @@ removed_on = \"tower\"
                 .is_some_and(|hint| hint.to_lowercase().contains("connect")),
             "expected direct-connection hint: {fwd_err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn s1_unmarked_wrong_owner_and_exceeded_device_principal_blocked_in_authkeys_gate_list_and_doctor()
+     {
+        let h = Harness::new();
+        let id_unmarked = "91".repeat(16);
+        let id_other = "92".repeat(16);
+        let id_wrong_owner = "93".repeat(16);
+        let id_exceeded = "94".repeat(16);
+        let id_healthy = "95".repeat(16);
+
+        let policy_path = h.node.paths().config_file("policy.toml");
+        let mut policy_text = std::fs::read_to_string(&policy_path).unwrap();
+        policy_text.push_str(&format!(
+            "\n\
+[principals.\"device:unmarked\"]
+role = \"owner\"
+
+[principals.\"device:wrong-owner\"]
+role = \"owner\"
+device = \"{id_other}\"
+
+[principals.\"device:exceeded\"]
+role = \"owner\"
+device = \"{id_exceeded}\"
+
+[principals.\"device:healthy\"]
+role = \"observer\"
+device = \"{id_healthy}\"
+"
+        ));
+        std::fs::write(&policy_path, policy_text).unwrap();
+
+        let now = "2026-11-24T10:00:00Z";
+        let mut file = DevicesFile::default();
+        for (id, seed, name, principal) in [
+            (&id_unmarked, 0x91u8, "unmarked", "device:unmarked"),
+            (&id_wrong_owner, 0x93u8, "wrong-owner", "device:wrong-owner"),
+            (&id_exceeded, 0x94u8, "exceeded", "device:exceeded"),
+            (&id_healthy, 0x95u8, "healthy", "device:healthy"),
+        ] {
+            file.devices.insert(
+                id.clone(),
+                registry::FleetDevice {
+                    name: name.to_owned(),
+                    public_key: keys::ed25519_public_key_from_seed(&[seed; 32]),
+                    principal: principal.to_owned(),
+                    role: Some("observer".to_owned()),
+                    paired_at: now.to_owned(),
+                    paired_on: "tower".to_owned(),
+                    paired_by: None,
+                    confirmed_by: None,
+                    confirmed_at: None,
+                    updated_at: now.to_owned(),
+                    updated_on: "tower".to_owned(),
+                },
+            );
+        }
+        std::fs::write(
+            h.node.paths().config_file("devices.toml"),
+            file.to_toml_string(),
+        )
+        .unwrap();
+
+        // Pre-seed an authorized_keys line for `unmarked` so we verify reconcile strips it too.
+        let exe = legion_core::current_exe().unwrap();
+        let shell = authkeys::ForcedCommandShell::host().unwrap();
+        let pinned_home = authkeys::PinnedHome::from_paths(h.node.paths());
+        let pre_line = authkeys::format_device_line(
+            &exe,
+            "device:unmarked",
+            &file.devices[&id_unmarked].public_key,
+            "unmarked",
+            &id_unmarked,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        std::fs::write(&h.auth_keys, format!("{pre_line}\n")).unwrap();
+
+        // 1. `device.list` writes NO authorized_keys line for unmarked/wrong-owner/exceeded,
+        //    writes the line for healthy, sets status, and returns warnings.
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(!auth_text.contains("legion-device:unmarked"), "{auth_text}");
+        assert!(
+            !auth_text.contains("legion-device:wrong-owner"),
+            "{auth_text}"
+        );
+        assert!(!auth_text.contains("legion-device:exceeded"), "{auth_text}");
+        assert!(auth_text.contains("legion-device:healthy"), "{auth_text}");
+
+        let warnings = listed["warnings"].as_array().unwrap();
+        for name in ["unmarked", "wrong-owner", "exceeded"] {
+            let entry = listed["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == json!(name))
+                .unwrap();
+            assert!(
+                entry["status"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("not active here")),
+                "{name}: expected not-active status, got {entry}"
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.as_str().is_some_and(|s| s.contains(name))),
+                "{name}: expected warning in {warnings:?}"
+            );
+        }
+        let healthy_entry = listed["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == json!("healthy"))
+            .unwrap();
+        assert!(healthy_entry.get("status").is_none(), "{healthy_entry}");
+
+        // 2. `legion gate` denies unmarked, wrong-owner, and exceeded (even if a line exists on
+        //    disk), and allows healthy.
+        let node_file = h.node.config().get::<NodeFile>().unwrap();
+        for (name, pid, principal) in [
+            ("unmarked", id_unmarked.as_str(), "device:unmarked"),
+            ("wrong-owner", id_wrong_owner.as_str(), "device:wrong-owner"),
+            ("exceeded", id_exceeded.as_str(), "device:exceeded"),
+        ] {
+            let err = registry::verify_gate_device(
+                h.node.paths(),
+                "tower",
+                &node_file,
+                name,
+                pid,
+                principal,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{name}: {err:?}");
+        }
+        registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            "healthy",
+            &id_healthy,
+            "device:healthy",
+            None,
+        )
+        .expect("healthy device must pass gate");
+
+        // 3. `meta.doctor` flags all three blocked devices.
+        let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        let conflict_check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == json!("device principal conflicts"))
+            .expect("meta.doctor must report device principal conflicts");
+        assert_eq!(conflict_check["warning"], json!(true), "{conflict_check}");
+        let detail = conflict_check["detail"].as_str().unwrap();
+        assert!(detail.contains("unmarked"), "{detail}");
+        assert!(detail.contains("wrong-owner"), "{detail}");
+        assert!(detail.contains("exceeded"), "{detail}");
     }
 }

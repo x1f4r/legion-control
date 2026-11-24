@@ -269,13 +269,16 @@ including the caller's pairing id when the caller is a paired device — and ref
 claim otherwise, while treating `paired_at`, `paired_on`, `paired_by`, and `public_key` as
 immutable once written), pushes non-owner revocations independently of unrelated entries, and
 reconciles only registry-owned `device:*` principals in `policy.toml` to the exact recorded role —
-leaving shared and unmarked `device:*` principals untouched (with a warning in the result and
-`meta.doctor`) and failing closed to `nobody` when a role is undefined on the receiving node or two
-live devices collide on one `device:*` principal. If two live entries in `devices.toml` ever share
-a public key (or collide with a foreign line in `authorized_keys`), no `authorized_keys` line is
-written for any colliding entry and both `device.list` and `meta.doctor` warn loudly. Tombstones in
-`devices.toml` are permanent so removed devices cannot be resurrected and quarantine cannot be
-lifted by pruning.
+leaving shared and unmarked `device:*` principals untouched and failing closed to `nobody` when a
+role is undefined on the receiving node or two live devices collide on one `device:*` principal. A
+device whose `device:*` principal is unmarked, marked for a different pairing id, or assigned a
+different role in `policy.toml` than recorded in `devices.toml` (so a recorded role can never be
+exceeded by what `policy.toml` happens to say) receives no `authorized_keys` line and is denied by
+`legion gate` (the same treatment as a key collision), with warnings in results, `device.list`, and
+`meta.doctor`. If two live entries in `devices.toml` ever share a public key (or collide with a
+foreign line in `authorized_keys`), no `authorized_keys` line is written for any colliding entry
+and both `device.list` and `meta.doctor` warn loudly. Tombstones in `devices.toml` are permanent so
+removed devices cannot be resurrected and quarantine cannot be lifted by pruning.
 
 Each device records `paired_by = { principal, device }` captured from the invite creator (or filled
 from the call's context when added via `config.write`). When a device is tombstoned, any live

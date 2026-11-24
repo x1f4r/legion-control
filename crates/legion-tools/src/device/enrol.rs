@@ -672,6 +672,7 @@ fn process_enrol_blocking(
         if let Err(error) = reconcile_authorized_keys_in_memory(
             &mut auth_keys,
             &devices,
+            &policy,
             paths,
             &target,
             pinned_account.as_deref(),
