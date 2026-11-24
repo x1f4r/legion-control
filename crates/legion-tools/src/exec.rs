@@ -106,7 +106,7 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
     let timeout = timeout_of(args.timeout_s)?;
     let limit = max_output_of(args.max_output)?;
     let env = env_of(args.env.unwrap_or_default())?;
-    let cwd = start_dir(ctx, args.cwd.as_deref())?;
+    let cwd = start_dir(ctx, args.cwd).await?;
 
     // Each stream is forwarded as events until `limit` bytes have gone out, so a flood of output
     // costs the caller no more than the captured text does.
@@ -194,13 +194,23 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
 ///
 /// A role's `paths` cannot keep a command inside them, since a command can go anywhere the account
 /// can; starting it in a root keeps a cooperating caller where it was meant to work.
-fn start_dir(ctx: &Ctx, cwd: Option<&str>) -> Result<Option<PathBuf>, ErrorBody> {
-    let grant = ctx.grant();
+///
+/// Checking a path resolves every directory on the way, which waits on the file system, so it runs
+/// on the blocking pool.
+async fn start_dir(ctx: &Ctx, cwd: Option<String>) -> Result<Option<PathBuf>, ErrorBody> {
+    let grant = ctx.grant().clone();
     let first_root = || grant.roots().and_then(|roots| roots.into_iter().next());
-    match cwd.map(str::to_owned).or_else(first_root) {
-        Some(dir) => grant.check_path(dir, Access::Read).map(Some),
-        None => Ok(None),
-    }
+    let Some(dir) = cwd.or_else(first_root) else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || grant.check_path(dir, Access::Read).map(Some))
+        .await
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Checking the working directory stopped unexpectedly: {error}."),
+            )
+        })?
 }
 
 fn ran(output: RunOutput) -> Ran {

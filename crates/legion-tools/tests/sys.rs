@@ -28,6 +28,9 @@ fn main() -> ExitCode {
         ("kill_refuses_a_reused_pid_and_protected_processes", || {
             Box::pin(kill_refuses_a_reused_pid_and_protected_processes())
         }),
+        ("the_runtime_stays_free_while_the_system_is_read", || {
+            Box::pin(the_runtime_stays_free_while_the_system_is_read())
+        }),
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
@@ -279,4 +282,48 @@ fn parent_of(pid: u32) -> Option<u32> {
     let target = sysinfo::Pid::from_u32(pid);
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
     system.process(target)?.parent().map(sysinfo::Pid::as_u32)
+}
+
+/// The sys tools read the system on the blocking pool: on a single-threaded runtime, a task that
+/// wakes every few milliseconds keeps waking while they run.
+async fn the_runtime_stays_free_while_the_system_is_read() {
+    let worst = tokio::task::spawn_blocking(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fixture = Fixture::new();
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let ticker = async {
+                let mut worst = Duration::ZERO;
+                let mut last = Instant::now();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    worst = worst.max(last.elapsed());
+                    last = Instant::now();
+                }
+                worst
+            };
+            let work = async {
+                fixture.call("sys.info", json!({})).await.unwrap();
+                fixture
+                    .call("sys.procs", json!({"limit": 500}))
+                    .await
+                    .unwrap();
+                let mut child = spawn_helper("sleep", &["60"]);
+                let pid = child.id();
+                fixture.call("sys.kill", json!({"pid": pid})).await.unwrap();
+                child.wait().unwrap();
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+            };
+            tokio::join!(ticker, work).0
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        worst < Duration::from_millis(250),
+        "the runtime was held for {worst:?}"
+    );
 }
