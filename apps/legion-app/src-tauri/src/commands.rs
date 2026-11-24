@@ -191,12 +191,6 @@ fn write_ready_marker(path: &Path) -> Result<(), AppError> {
 pub fn default_device_name() -> String {
     #[cfg(target_os = "android")]
     {
-        if let Ok(model) = std::env::var("LEGION_DEVICE_MODEL") {
-            let trimmed = model.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_owned();
-            }
-        }
         if let Ok(output) = std::process::Command::new("/system/bin/getprop")
             .arg("ro.product.model")
             .output()

@@ -71,43 +71,20 @@ export function createAppLink() {
       fire();
     }
   }
-  let nextPermRequestId = 1;
-  const pendingPermRequests = new Map();
-
-  if (typeof window !== 'undefined' && !window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__) {
-    window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__ = (requestId, granted) => {
-      const resolve = pendingPermRequests.get(requestId);
-      if (resolve) {
-        pendingPermRequests.delete(requestId);
-        resolve(Boolean(granted));
-      }
-    };
-  }
-
   function ensureLocalNetworkPermission() {
     if (typeof window === 'undefined') return Promise.resolve(true);
-    const bridge = window.__LEGION_ANDROID_PERMISSIONS__;
-    if (!bridge || typeof bridge.hasLocalNetwork !== 'function') {
+    const android = window.__LEGION_ANDROID__;
+    if (!android || typeof android.requestLocalNetwork !== 'function') {
       return Promise.resolve(true);
     }
     try {
-      if (bridge.hasLocalNetwork()) return Promise.resolve(true);
+      if (typeof android.hasLocalNetwork === 'function' && android.hasLocalNetwork() === true) {
+        return Promise.resolve(true);
+      }
+      return Promise.resolve(android.requestLocalNetwork()).then(Boolean, () => true);
     } catch {
       return Promise.resolve(true);
     }
-    if (typeof bridge.requestLocalNetwork !== 'function') {
-      return Promise.resolve(true);
-    }
-    return new Promise((resolve) => {
-      const id = nextPermRequestId++;
-      pendingPermRequests.set(id, resolve);
-      try {
-        bridge.requestLocalNetwork(id);
-      } catch {
-        pendingPermRequests.delete(id);
-        resolve(true);
-      }
-    });
   }
 
   async function rawState() {
@@ -220,6 +197,14 @@ export function createAppLink() {
   }
 
   async function deviceName() {
+    if (
+      typeof window !== 'undefined' &&
+      window.__LEGION_ANDROID__ &&
+      typeof window.__LEGION_ANDROID__.deviceModel === 'function'
+    ) {
+      const model = String(window.__LEGION_ANDROID__.deviceModel() || '').trim();
+      if (model) return model;
+    }
     try {
       const name = await invoke('device_name');
       return typeof name === 'string' ? name : '';

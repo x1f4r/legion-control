@@ -6,8 +6,6 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
-import android.system.Os
-import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
@@ -18,11 +16,16 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : TauriActivity() {
   private var attachedWebView: WebView? = null
+  @Volatile
+  private var bridgeReplyProxy: JavaScriptReplyProxy? = null
   private lateinit var localNetworkPermissionLauncher: ActivityResultLauncher<String>
   private val pendingLocalNetworkRequests = mutableListOf<Int>()
 
@@ -47,37 +50,42 @@ class MainActivity : TauriActivity() {
     val bottom: Float,
     val left: Float,
   ) {
-    fun toCsv(): String = String.format(
-      java.util.Locale.US,
-      "%.2f,%.2f,%.2f,%.2f",
-      top,
-      right,
-      bottom,
-      left,
-    )
-  }
-
-  private inner class InsetsBridge {
-    @JavascriptInterface
-    fun get(): String = latestInsets.toCsv()
-  }
-
-  private inner class PermissionsBridge {
-    @JavascriptInterface
-    fun hasLocalNetwork(): Boolean {
-      if (Build.VERSION.SDK_INT < 37) return true
-      return ContextCompat.checkSelfPermission(
-        this@MainActivity,
-        Manifest.permission.ACCESS_LOCAL_NETWORK,
-      ) == PackageManager.PERMISSION_GRANTED
+    fun toJsonArray(): JSONArray = JSONArray().apply {
+      put(top.toDouble())
+      put(right.toDouble())
+      put(bottom.toDouble())
+      put(left.toDouble())
     }
+  }
 
-    @JavascriptInterface
-    fun requestLocalNetwork(requestId: Int) {
-      runOnUiThread {
-        if (hasLocalNetwork()) {
+  private fun hasLocalNetworkPermission(): Boolean {
+    if (Build.VERSION.SDK_INT < 37) return true
+    return ContextCompat.checkSelfPermission(
+      this@MainActivity,
+      Manifest.permission.ACCESS_LOCAL_NETWORK,
+    ) == PackageManager.PERMISSION_GRANTED
+  }
+
+  private fun handleBridgeMessage(raw: String, replyProxy: JavaScriptReplyProxy) {
+    val msg = runCatching { JSONObject(raw) }.getOrNull() ?: return
+    when (msg.optString("type")) {
+      "init" -> {
+        bridgeReplyProxy = replyProxy
+        val payload = JSONObject().apply {
+          put("type", "init")
+          put("insets", latestInsets.toJsonArray())
+          put("hasLocalNetwork", hasLocalNetworkPermission())
+          put("model", Build.MODEL?.trim().orEmpty())
+        }
+        runCatching { replyProxy.postMessage(payload.toString()) }
+      }
+      "request_local_network" -> {
+        bridgeReplyProxy = replyProxy
+        val requestId = msg.optInt("id", -1)
+        if (requestId < 0) return
+        if (hasLocalNetworkPermission()) {
           resolveLocalNetworkRequests(listOf(requestId), true)
-          return@runOnUiThread
+          return
         }
         val shouldLaunch = pendingLocalNetworkRequests.isEmpty()
         pendingLocalNetworkRequests.add(requestId)
@@ -89,10 +97,16 @@ class MainActivity : TauriActivity() {
   }
 
   private fun resolveLocalNetworkRequests(requestIds: List<Int>, granted: Boolean) {
-    val webView = attachedWebView ?: return
-    for (requestId in requestIds) {
-      val js = "window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__ && window.__LEGION_ANDROID_PERMISSIONS_RESOLVE__($requestId, $granted);"
-      webView.post { webView.evaluateJavascript(js, null) }
+    val proxy = bridgeReplyProxy ?: return
+    runOnUiThread {
+      for (requestId in requestIds) {
+        val payload = JSONObject().apply {
+          put("type", "local_network")
+          put("id", requestId)
+          put("granted", granted)
+        }
+        runCatching { proxy.postMessage(payload.toString()) }
+      }
     }
   }
 
@@ -103,13 +117,6 @@ class MainActivity : TauriActivity() {
         pendingLocalNetworkRequests.clear()
         resolveLocalNetworkRequests(ids, granted)
       }
-    // Expose the device model to Rust so `device_name()` needs neither unsafe JNI nor subprocesses.
-    runCatching {
-      val model = Build.MODEL?.trim().orEmpty()
-      if (model.isNotEmpty()) {
-        Os.setenv("LEGION_DEVICE_MODEL", model, true)
-      }
-    }
     applySystemBarStyle(resources.configuration)
     super.onCreate(savedInstanceState)
 
@@ -135,15 +142,30 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     attachedWebView = webView
+    bridgeReplyProxy = null
     applySystemBarStyle(resources.configuration)
 
-    // Android 17 WebView reports 0px for CSS env(safe-area-inset-*). Expose the activity's real
-    // insets via a read-only bridge and apply them at document start so cold launches never paint
-    // under the status bar or gesture bar before the first insets callback reaches the loaded page.
-    webView.addJavascriptInterface(InsetsBridge(), "__LEGION_ANDROID_INSETS__")
-    webView.addJavascriptInterface(PermissionsBridge(), "__LEGION_ANDROID_PERMISSIONS__")
+    // Android 17 WebView reports 0px for CSS env(safe-area-inset-*). Expose insets, device model,
+    // and the local-network runtime permission prompt over an origin-restricted WebMessageListener
+    // and document-start script scoped strictly to the bundled app origin.
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+      WebViewCompat.addWebMessageListener(
+        webView,
+        BRIDGE_NAME,
+        ALLOWED_APP_ORIGINS,
+      ) { _, message, sourceOrigin, isMainFrame, replyProxy ->
+        if (!isMainFrame || !ALLOWED_APP_ORIGINS.contains(sourceOrigin.toString())) {
+          return@addWebMessageListener
+        }
+        handleBridgeMessage(message.data.orEmpty(), replyProxy)
+      }
+    }
     if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-      WebViewCompat.addDocumentStartJavaScript(webView, DOCUMENT_START_INSETS_JS, setOf("*"))
+      WebViewCompat.addDocumentStartJavaScript(
+        webView,
+        DOCUMENT_START_BRIDGE_JS,
+        ALLOWED_APP_ORIGINS,
+      )
     }
     syncBackNavigation(webView)
     ViewCompat.requestApplyInsets(window.decorView)
@@ -199,46 +221,101 @@ class MainActivity : TauriActivity() {
   }
 
   private fun pushInsetsToWebView() {
-    val webView = attachedWebView ?: return
-    val insets = latestInsets
-    val js = String.format(
-      java.util.Locale.US,
-      """
-      (function(){
-        var r = document.documentElement;
-        if (!r) return;
-        r.style.setProperty('--safe-area-inset-top', '%.2fpx');
-        r.style.setProperty('--safe-area-inset-right', '%.2fpx');
-        r.style.setProperty('--safe-area-inset-bottom', '%.2fpx');
-        r.style.setProperty('--safe-area-inset-left', '%.2fpx');
-        window.dispatchEvent(new Event('legion-insets'));
-      })();
-      """.trimIndent(),
-      insets.top,
-      insets.right,
-      insets.bottom,
-      insets.left,
-    )
-    webView.post { webView.evaluateJavascript(js, null) }
+    val proxy = bridgeReplyProxy ?: return
+    val payload = JSONObject().apply {
+      put("type", "insets")
+      put("insets", latestInsets.toJsonArray())
+    }.toString()
+    runOnUiThread {
+      runCatching { proxy.postMessage(payload) }
+    }
   }
 
   companion object {
-    private val DOCUMENT_START_INSETS_JS = """
+    private const val BRIDGE_NAME = "__LEGION_ANDROID_BRIDGE__"
+    private val ALLOWED_APP_ORIGINS = setOf(
+      "https://tauri.localhost",
+      "http://tauri.localhost",
+    )
+
+    private val DOCUMENT_START_BRIDGE_JS = """
       (function(){
-        function applyInsets(){
+        var bridge = window.__LEGION_ANDROID_BRIDGE__;
+        if (!bridge || typeof bridge.postMessage !== 'function') return;
+        var cachedInsets = null;
+        var hasLocalNetwork = null;
+        var deviceModel = '';
+        var nextId = 1;
+        var pending = {};
+
+        function applyInsets(values){
+          if (!Array.isArray(values) || values.length !== 4) return;
+          cachedInsets = values;
           var r = document.documentElement;
-          var bridge = window.__LEGION_ANDROID_INSETS__;
-          if (!r || !bridge || typeof bridge.get !== 'function') return;
-          var parts = String(bridge.get()).split(',');
-          if (parts.length !== 4) return;
-          r.style.setProperty('--safe-area-inset-top', parts[0] + 'px');
-          r.style.setProperty('--safe-area-inset-right', parts[1] + 'px');
-          r.style.setProperty('--safe-area-inset-bottom', parts[2] + 'px');
-          r.style.setProperty('--safe-area-inset-left', parts[3] + 'px');
+          if (!r) return;
+          r.style.setProperty('--safe-area-inset-top', Number(values[0]).toFixed(2) + 'px');
+          r.style.setProperty('--safe-area-inset-right', Number(values[1]).toFixed(2) + 'px');
+          r.style.setProperty('--safe-area-inset-bottom', Number(values[2]).toFixed(2) + 'px');
+          r.style.setProperty('--safe-area-inset-left', Number(values[3]).toFixed(2) + 'px');
           window.dispatchEvent(new Event('legion-insets'));
         }
-        applyInsets();
-        document.addEventListener('DOMContentLoaded', applyInsets, { once: true });
+
+        bridge.onmessage = function(event){
+          var msg;
+          try {
+            msg = JSON.parse(String(event && event.data || ''));
+          } catch (_) {
+            return;
+          }
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.type === 'init') {
+            if (typeof msg.hasLocalNetwork === 'boolean') hasLocalNetwork = msg.hasLocalNetwork;
+            if (typeof msg.model === 'string') deviceModel = msg.model;
+            if (msg.insets) applyInsets(msg.insets);
+          } else if (msg.type === 'insets') {
+            if (msg.insets) applyInsets(msg.insets);
+          } else if (msg.type === 'local_network') {
+            var granted = Boolean(msg.granted);
+            if (granted) hasLocalNetwork = true;
+            var resolve = pending[msg.id];
+            if (resolve) {
+              delete pending[msg.id];
+              resolve(granted);
+            }
+          }
+        };
+
+        window.__LEGION_ANDROID__ = {
+          hasLocalNetwork: function(){
+            return hasLocalNetwork;
+          },
+          deviceModel: function(){
+            return deviceModel;
+          },
+          requestLocalNetwork: function(){
+            if (hasLocalNetwork === true) return Promise.resolve(true);
+            return new Promise(function(resolve){
+              var id = nextId++;
+              pending[id] = resolve;
+              try {
+                bridge.postMessage(JSON.stringify({ type: 'request_local_network', id: id }));
+              } catch (_) {
+                delete pending[id];
+                resolve(true);
+              }
+            });
+          }
+        };
+
+        document.addEventListener('DOMContentLoaded', function(){
+          if (cachedInsets) applyInsets(cachedInsets);
+        }, { once: true });
+
+        try {
+          bridge.postMessage(JSON.stringify({ type: 'init' }));
+        } catch (_) {
+          // Ignore if bridge is unavailable.
+        }
       })();
     """.trimIndent()
   }

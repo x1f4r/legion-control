@@ -45,3 +45,44 @@ test('createAppLink uses a distinct random call ID prefix per page load', async 
     }
   }
 });
+
+test('createAppLink uses origin-scoped Android bridge for deviceModel and local network permission', async () => {
+  const prevWindow = globalThis.window;
+  let requested = 0;
+  let invokedDeviceName = 0;
+  globalThis.window = {
+    __LEGION_ANDROID__: {
+      deviceModel: () => 'Pixel 10',
+      hasLocalNetwork: () => false,
+      requestLocalNetwork: () => {
+        requested += 1;
+        return Promise.resolve(false);
+      },
+    },
+    __TAURI__: {
+      core: {
+        invoke(command) {
+          if (command === 'device_name') invokedDeviceName += 1;
+          return Promise.resolve('fallback');
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    assert.equal(await link.deviceName(), 'Pixel 10');
+    assert.equal(invokedDeviceName, 0);
+
+    await assert.rejects(() => link.pair('legion-invite-1:abc', 'Pixel 10'), {
+      code: 'denied',
+    });
+    assert.equal(requested, 1);
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
