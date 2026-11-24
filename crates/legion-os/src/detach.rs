@@ -422,8 +422,17 @@ pub(crate) fn build_wmi_launcher_script(
         _ => false,
     };
 
-    let mut lines = vec![
-        "$ErrorActionPreference = 'Stop'".to_owned(),
+    let mut lines = vec!["$ErrorActionPreference = 'Stop'".to_owned()];
+    if let Some(script_path) = self_script_path {
+        // PowerShell parses the full `.ps1` before running line 1, so deleting the temporary
+        // launcher script immediately avoids leaving it behind even if the target runs for days
+        // or is terminated abruptly.
+        lines.push(format!(
+            "Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue",
+            powershell_single_quote(script_path)
+        ));
+    }
+    lines.extend([
         format!("$handoffPath = {}", powershell_single_quote(handoff_path)),
         "$handoffTmp = $handoffPath + '.tmp'".to_owned(),
         "$psi = New-Object System.Diagnostics.ProcessStartInfo".to_owned(),
@@ -432,7 +441,7 @@ pub(crate) fn build_wmi_launcher_script(
             "$psi.Arguments = {}",
             powershell_single_quote(&escaped_args)
         ),
-    ];
+    ]);
 
     if let Some(dir) = cwd {
         lines.push(format!(
@@ -602,6 +611,184 @@ pub(crate) fn parse_wmi_handoff(contents: &str) -> Result<ProcessId> {
     Ok(ProcessId::new(pid, start_time))
 }
 
+/// One hour expressed in Windows 100-ns `FILETIME` ticks, used to tolerate exact DST-transition
+/// ambiguity between `.NET` `Process.StartTime.ToFileTimeUtc()` and Win32 `GetProcessTimes`.
+#[allow(dead_code)]
+const ONE_HOUR_FILETIME_TICKS: u64 = 3_600 * 10_000_000;
+
+/// Reconcile the target identity reported by the WMI launcher with a direct UTC `GetProcessTimes`
+/// lookup.
+///
+/// Accepts `queried` only when it matches `reported` exactly or differs by exactly one hour
+/// (the local-time DST fold ambiguity in `.NET`'s `Process.StartTime`); any other discrepancy
+/// fails instead of silently accepting a recycled PID. Returns `reported` when `queried` is
+/// `None` (the target already exited before our query ran).
+#[allow(dead_code)]
+pub(crate) fn reconcile_wmi_identity(
+    reported: ProcessId,
+    queried: Option<ProcessId>,
+) -> Result<ProcessId> {
+    let Some(exact) = queried else {
+        return Ok(reported);
+    };
+    if exact.pid == reported.pid
+        && (exact.start_time == reported.start_time
+            || exact.start_time.abs_diff(reported.start_time) == ONE_HOUR_FILETIME_TICKS)
+    {
+        return Ok(exact);
+    }
+    Err(OsError::Platform {
+        detail: format!(
+            "WMI detached target identity mismatch for pid {} (reported start_time={}, queried pid={}, start_time={})",
+            reported.pid, reported.start_time, exact.pid, exact.start_time
+        ),
+    })
+}
+
+/// Resolve a bare or relative executable name against `cwd` and the caller's forwarded `PATH` +
+/// `PATHEXT` entries in `merged_env` before building the WMI launcher script.
+///
+/// Because `wmiprvse.exe` runs under the service environment rather than the caller's, `.NET`
+/// `Process::Start` would otherwise search the service `PATH` instead of the caller's.
+#[allow(dead_code)]
+pub(crate) fn resolve_wmi_program(
+    program: &str,
+    cwd: &Path,
+    merged_env: &[(String, String)],
+) -> String {
+    let is_absolute = program.starts_with(['\\', '/'])
+        || (program.len() >= 3
+            && program.as_bytes()[0].is_ascii_alphabetic()
+            && program.as_bytes()[1] == b':'
+            && matches!(program.as_bytes()[2], b'\\' | b'/'));
+    if is_absolute {
+        return program.to_owned();
+    }
+
+    let pathext_val = merged_env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATHEXT"))
+        .map(|(_, v)| std::ffi::OsStr::new(v.as_str()));
+    let exts = shell::parse_pathext(pathext_val);
+
+    let has_separator = program.contains(['\\', '/']);
+    if has_separator {
+        let base = cwd.join(program);
+        if let Some(found) = probe_executable_with_exts(&base, &exts) {
+            return found.to_string_lossy().into_owned();
+        }
+        return base.to_string_lossy().into_owned();
+    }
+
+    if let Some((_, path_val)) = merged_env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+    {
+        for dir in split_windows_path_entries(path_val) {
+            let candidate = Path::new(dir).join(program);
+            if let Some(found) = probe_executable_with_exts(&candidate, &exts) {
+                return found.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    let cwd_candidate = cwd.join(program);
+    if let Some(found) = probe_executable_with_exts(&cwd_candidate, &exts) {
+        return found.to_string_lossy().into_owned();
+    }
+
+    program.to_owned()
+}
+
+#[allow(dead_code)]
+fn split_windows_path_entries(path_var: &str) -> impl Iterator<Item = &str> {
+    path_var
+        .split(';')
+        .map(|entry| entry.trim().trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+}
+
+#[allow(dead_code)]
+fn probe_executable_with_exts(base: &Path, exts: &[String]) -> Option<PathBuf> {
+    let has_ext = base.extension().is_some();
+    if (has_ext || exts.is_empty()) && base.is_file() {
+        return Some(base.to_path_buf());
+    }
+    if !has_ext {
+        let raw = base.to_string_lossy();
+        for ext in exts {
+            let candidate = PathBuf::from(format!("{raw}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            // Support case-sensitive filesystems (for example cross-platform unit tests on Linux)
+            // by also checking the lowercase extension when `PATHEXT` contains uppercase entries.
+            let lower_ext = ext.to_ascii_lowercase();
+            if lower_ext != *ext {
+                let lower_candidate = PathBuf::from(format!("{raw}{lower_ext}"));
+                if lower_candidate.is_file() {
+                    return Some(lower_candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Refuse `.cmd`/`.bat` targets on the Windows WMI path unless every argument is free of `cmd.exe`
+/// metacharacters.
+///
+/// Launching a batch file through `CreateProcessW` implicitly routes the command line through
+/// `cmd.exe /c`, where characters like `&`, `|`, `<`, `>`, `^`, `%`, `!`, `"`, or newlines can
+/// inject unintended commands despite MSVCRT quoting.
+#[allow(dead_code)]
+pub(crate) fn validate_wmi_batch_target(program: &str, args: &[String]) -> Result<()> {
+    let trimmed = program.trim().trim_end_matches(['.', ' ']);
+    let lower = trimmed.to_ascii_lowercase();
+    let is_batch = lower.ends_with(".cmd") || lower.ends_with(".bat");
+    if !is_batch {
+        return Ok(());
+    }
+
+    for (idx, arg) in args.iter().enumerate() {
+        if !is_safe_cmd_batch_arg(arg) {
+            return Err(OsError::InvalidArgument {
+                detail: format!(
+                    "refusing to launch batch file {program:?} via WMI because argument {idx} contains cmd.exe metacharacters; invoke the underlying executable directly or use CommandSpec::Shell"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn is_safe_cmd_batch_arg(arg: &str) -> bool {
+    if arg.ends_with('\\') {
+        return false;
+    }
+    !arg.chars().any(|ch| {
+        matches!(
+            ch,
+            '\0' | '\r'
+                | '\n'
+                | '&'
+                | '|'
+                | '<'
+                | '>'
+                | '^'
+                | '%'
+                | '!'
+                | '"'
+                | '('
+                | ')'
+                | ';'
+                | ','
+                | '='
+        )
+    })
+}
+
 /// Build the outer PowerShell script that invokes `Win32_Process.Create` via `Invoke-CimMethod`
 /// for a pre-built `command_line` and prints the created wrapper PID to stdout.
 #[allow(dead_code)]
@@ -707,7 +894,103 @@ mod tests {
         assert!(launcher.contains("[System.IO.Stream]::Synchronized($rawShared)"));
         assert!(launcher.contains("$errStream = $outStream"));
         assert!(!launcher.contains("$errStream.Dispose()"));
-        assert!(launcher.contains("Remove-Item -LiteralPath 'C:\\Users\\me\\temp.ps1'"));
+        let mut lines = launcher.lines();
+        assert_eq!(lines.next(), Some("$ErrorActionPreference = 'Stop'"));
+        assert_eq!(
+            lines.next(),
+            Some(
+                "Remove-Item -LiteralPath 'C:\\Users\\me\\temp.ps1' -Force -ErrorAction SilentlyContinue"
+            )
+        );
+    }
+
+    #[test]
+    fn wmi_identity_reconciliation_accepts_exact_and_dst_hour_only() {
+        let reported = ProcessId::new(500, 133_700_000_000_000_000);
+        // Exact match accepted.
+        assert_eq!(
+            reconcile_wmi_identity(reported, Some(reported)).unwrap(),
+            reported
+        );
+        // Exact +1h and -1h DST shift accepted, returning the direct UTC queried identity.
+        let plus_1h = ProcessId::new(500, reported.start_time + ONE_HOUR_FILETIME_TICKS);
+        assert_eq!(
+            reconcile_wmi_identity(reported, Some(plus_1h)).unwrap(),
+            plus_1h
+        );
+        let minus_1h = ProcessId::new(500, reported.start_time - ONE_HOUR_FILETIME_TICKS);
+        assert_eq!(
+            reconcile_wmi_identity(reported, Some(minus_1h)).unwrap(),
+            minus_1h
+        );
+        // Exited before query (`None`) falls back to reported.
+        assert_eq!(reconcile_wmi_identity(reported, None).unwrap(), reported);
+        // Arbitrary recycled PID start time must fail.
+        let recycled = ProcessId::new(500, reported.start_time + 5_000_000);
+        assert!(matches!(
+            reconcile_wmi_identity(reported, Some(recycled)),
+            Err(OsError::Platform { .. })
+        ));
+        let off_by_1h_plus_1 =
+            ProcessId::new(500, reported.start_time + ONE_HOUR_FILETIME_TICKS + 1);
+        assert!(matches!(
+            reconcile_wmi_identity(reported, Some(off_by_1h_plus_1)),
+            Err(OsError::Platform { .. })
+        ));
+    }
+
+    #[test]
+    fn wmi_program_resolution_and_batch_argument_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("tools");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe_path = bin_dir.join("mytool.exe");
+        let cmd_path = bin_dir.join("shim.cmd");
+        std::fs::write(&exe_path, b"").unwrap();
+        std::fs::write(&cmd_path, b"@echo off\r\n").unwrap();
+
+        let merged_env = vec![
+            ("Path".to_owned(), bin_dir.to_string_lossy().into_owned()),
+            ("PATHEXT".to_owned(), ".EXE;.CMD;.BAT".to_owned()),
+        ];
+
+        assert_eq!(
+            resolve_wmi_program("mytool", dir.path(), &merged_env),
+            exe_path.to_string_lossy()
+        );
+        let resolved_shim = resolve_wmi_program("shim", dir.path(), &merged_env);
+        assert_eq!(resolved_shim, cmd_path.to_string_lossy());
+
+        // Safe args to a `.cmd` file are allowed; cmd.exe metacharacters are refused.
+        assert!(
+            validate_wmi_batch_target(&resolved_shim, &["--flag".into(), "plain arg".into()])
+                .is_ok()
+        );
+        for dangerous in [
+            "a&calc",
+            "a|b",
+            "a>out",
+            "%TEMP%",
+            "!VAR!",
+            "quote\"here",
+            "line1\nline2",
+            "caret^escape",
+            "trailing\\",
+        ] {
+            assert!(
+                matches!(
+                    validate_wmi_batch_target(&resolved_shim, &[dangerous.to_owned()]),
+                    Err(OsError::InvalidArgument { .. })
+                ),
+                "expected batch rejection for arg {dangerous:?}"
+            );
+        }
+
+        // Non-batch executables allow arbitrary arguments without restriction.
+        assert!(
+            validate_wmi_batch_target(&exe_path.to_string_lossy(), &["a&b|c%d\"e".to_owned()])
+                .is_ok()
+        );
     }
 
     #[test]

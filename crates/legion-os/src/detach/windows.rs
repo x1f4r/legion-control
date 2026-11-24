@@ -35,6 +35,7 @@ use crate::{OsError, Result};
 use super::{
     DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE, build_wmi_create_script_for_cmdline,
     build_wmi_launcher_script, merge_windows_env, open_append_stdio, parse_wmi_handoff,
+    reconcile_wmi_identity, resolve_wmi_program, validate_wmi_batch_target,
 };
 
 const WMI_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -43,16 +44,19 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 
 static WMI_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Removes temporary handoff files when `spawn_via_wmi` exits.
+/// Removes temporary handoff and fallback launcher files whenever `spawn_via_wmi` exits (on
+/// every error path as well as after handoff completes).
 struct HandoffCleanup {
     path: PathBuf,
     tmp_path: PathBuf,
+    script_path: PathBuf,
 }
 
 impl Drop for HandoffCleanup {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
         let _ = fs::remove_file(&self.tmp_path);
+        let _ = fs::remove_file(&self.script_path);
     }
 }
 
@@ -136,9 +140,10 @@ async fn spawn_via_wmi(
     let _handoff_cleanup = HandoffCleanup {
         tmp_path: PathBuf::from(format!("{handoff_str}.tmp")),
         path: handoff_path.clone(),
+        script_path: script_fallback_path.clone(),
     };
 
-    let program_str = resolved.program_display();
+    let raw_program = resolved.program_display();
     let args_vec: Vec<String> = resolved
         .args
         .iter()
@@ -159,7 +164,17 @@ async fn spawn_via_wmi(
             )
         })
         .collect();
-    let merged_env = merge_windows_env(std::env::vars(), &env_remove, &overrides);
+    // Use `vars_os()` rather than `vars()` so unpaired UTF-16 surrogates in unrelated inherited
+    // environment variables never panic.
+    let inherited_env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    let merged_env = merge_windows_env(inherited_env, &env_remove, &overrides);
+
+    // Resolve bare program names using the caller's forwarded PATH + PATHEXT (before building the
+    // launcher, because WMI's `Process::Start` searches the service PATH rather than `$psi`'s env)
+    // and refuse `.cmd`/`.bat` targets with cmd.exe metacharacters in their arguments.
+    let program_str = resolve_wmi_program(&raw_program, &base_cwd, &merged_env);
+    validate_wmi_batch_target(&program_str, &args_vec)?;
 
     let launcher_script = build_wmi_launcher_script(
         &program_str,
@@ -258,12 +273,12 @@ async fn spawn_via_wmi(
     let reported = wait_for_handoff(&handoff_path, wrapper_pid, WMI_LAUNCH_TIMEOUT).await?;
     resolved.disarm_temp_script();
 
-    // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID (avoiding any
-    // local-time DST ambiguity in .NET's Process.StartTime), falling back to the launcher's
-    // reported FILETIME only if the target already exited before we queried it.
+    // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID, accepting the
+    // queried identity only when it matches `reported` exactly or differs by exactly +/- 1 hour
+    // (DST ambiguity in .NET's Process.StartTime); reject any other mismatch as a recycled PID.
     let process = match win_proc::query_process_identity(reported.pid, true) {
-        Ok(Some(exact)) => exact,
-        _ => reported,
+        Ok(queried) => reconcile_wmi_identity(reported, queried)?,
+        Err(_) => reported,
     };
 
     Ok(DetachHandle {
