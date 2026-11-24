@@ -1,7 +1,7 @@
 //! Tar stream packing and hardened atomic unpacking.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, FileTimes, OpenOptions};
+use std::fs::{self, File, FileTimes};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -853,11 +853,7 @@ fn is_case_insensitive_dir(dir: &Path) -> Result<bool> {
         let seq = platform::next_temp_id();
         let probe_upper = dir.join(format!(".legion-CaseProbe-{pid}-{seq}.tmp"));
         let probe_lower = dir.join(format!(".legion-caseprobe-{pid}-{seq}.tmp"));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe_upper)
-        {
+        match platform::create_new_private(&probe_upper) {
             Ok(file) => {
                 drop(file);
                 let insensitive = fs::symlink_metadata(&probe_lower).is_ok();
@@ -879,7 +875,7 @@ fn unique_temp_path(parent: &Path) -> PathBuf {
 fn create_temp_file(parent: &Path) -> Result<(File, TempFileGuard)> {
     loop {
         let path = unique_temp_path(parent);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match platform::create_new_private(&path) {
             Ok(file) => return Ok((file, TempFileGuard::new(path))),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(classify_io(&path, err)),
@@ -1536,5 +1532,83 @@ mod tests {
         assert!(!dst2.path().join("private/owned").exists());
         assert!(!dst2.path().join("private/sub").exists());
         assert_eq!(fs::read(dst2.path().join("public/ok.txt")).unwrap(), b"yes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpack_temp_files_are_created_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct InspectingReader {
+            data: Vec<u8>,
+            pos: usize,
+            dir: PathBuf,
+            observed_tmp_mode: Option<u32>,
+        }
+
+        impl Read for InspectingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.observed_tmp_mode.is_none() {
+                    for entry in fs::read_dir(&self.dir)?.flatten() {
+                        let name = entry.file_name();
+                        if name.to_string_lossy().starts_with(".legion-unpack-") {
+                            let mode =
+                                fs::symlink_metadata(entry.path())?.permissions().mode() & 0o777;
+                            self.observed_tmp_mode = Some(mode);
+                        }
+                    }
+                }
+                let remaining = self.data.len() - self.pos;
+                if remaining == 0 {
+                    return Ok(0);
+                }
+                let take = remaining.min(buf.len()).min(256);
+                buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+                self.pos += take;
+                Ok(take)
+            }
+        }
+
+        let dst = tempfile::tempdir().unwrap();
+        let (_file, guard) = create_temp_file(dst.path()).unwrap();
+        let direct_mode = fs::symlink_metadata(guard.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(direct_mode, 0o600);
+        drop(guard);
+
+        let payload = vec![b'K'; 4096];
+        let mut tar_bytes = Vec::new();
+        let mut h = Header::new_gnu();
+        h.set_entry_type(EntryType::Regular);
+        h.set_size(payload.len() as u64);
+        h.set_mode(0o600);
+        h.set_mtime(1_700_000_000);
+        h.set_cksum();
+        let mut builder = Builder::new(&mut tar_bytes);
+        builder
+            .append_data(&mut h, "secret.key", Cursor::new(&payload))
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        let mut reader = InspectingReader {
+            data: tar_bytes,
+            pos: 0,
+            dir: dst.path().to_path_buf(),
+            observed_tmp_mode: None,
+        };
+        unpack(dst.path(), &mut reader).unwrap();
+        assert_eq!(reader.observed_tmp_mode, Some(0o600));
+        assert_eq!(
+            fs::metadata(dst.path().join("secret.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }
