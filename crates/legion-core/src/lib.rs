@@ -14,6 +14,7 @@ pub mod paths;
 pub mod policy;
 mod registry;
 mod route;
+pub mod schema;
 mod tool;
 
 pub use config::{ConfigStore, Document};
