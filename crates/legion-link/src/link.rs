@@ -5,6 +5,7 @@
 //! request, cancels in-flight calls by caller-chosen call id, and closes idle sessions.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,7 +31,7 @@ const EVENT_QUEUE: usize = 256;
 
 /// Serializable configuration for [`Link`]: paired or local nodes plus the device's OpenSSH
 /// private key string. The caller persists this JSON document in app storage.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkConfig {
     /// OpenSSH private key string for this device (used for SSH nodes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,6 +39,18 @@ pub struct LinkConfig {
     /// Nodes this controller knows how to reach.
     #[serde(default)]
     pub nodes: Vec<NodeLink>,
+}
+
+impl fmt::Debug for LinkConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinkConfig")
+            .field(
+                "device_key",
+                &self.device_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("nodes", &self.nodes)
+            .finish()
+    }
 }
 
 impl LinkConfig {
@@ -1111,5 +1124,21 @@ mod tests {
         link.hello("tower").await.unwrap();
         assert_eq!(opens.load(Ordering::SeqCst), 2);
         link.close().await;
+    }
+
+    #[test]
+    fn link_config_debug_redacts_device_key() {
+        let secret = "-----BEGIN OPENSSH PRIVATE KEY-----\nSUPER-SECRET-KEY-MATERIAL\n-----END OPENSSH PRIVATE KEY-----\n";
+        let cfg = LinkConfig {
+            device_key: Some(secret.to_owned()),
+            nodes: vec![NodeLink::local("tower", "legion")],
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("SUPER-SECRET-KEY-MATERIAL"), "{rendered}");
+        assert!(!rendered.contains("BEGIN OPENSSH"), "{rendered}");
+
+        let empty = LinkConfig::default();
+        assert!(format!("{empty:?}").contains("device_key: None"));
     }
 }

@@ -5,6 +5,8 @@
 //! node's name, reachable hosts, SSH port, account, pinned host keys, a 32-byte temporary Ed25519
 //! seed, the principal being paired, and an expiry timestamp.
 
+use std::fmt;
+
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use legion_proto::{ErrorBody, ErrorCode};
@@ -29,7 +31,7 @@ pub struct SshTarget {
 }
 
 /// Parsed pairing invite produced by `legion pair` / `device.invite`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
     /// Format version (must be [`INVITE_VERSION`]).
     pub v: u32,
@@ -51,6 +53,23 @@ pub struct Invite {
     pub principal: String,
     /// RFC 3339 UTC expiry timestamp; enforced by the node, not rejected client-side.
     pub expires: String,
+}
+
+impl fmt::Debug for Invite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Invite")
+            .field("v", &self.v)
+            .field("id", &self.id)
+            .field("node", &self.node)
+            .field("hosts", &self.hosts)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("host_keys", &self.host_keys)
+            .field("key", &"<redacted>")
+            .field("principal", &self.principal)
+            .field("expires", &self.expires)
+            .finish()
+    }
 }
 
 impl Invite {
@@ -643,5 +662,14 @@ mod tests {
         let text = expired.encode().unwrap();
         let parsed = Invite::parse(&text).unwrap();
         assert_eq!(parsed.expires, "2020-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn invite_debug_redacts_key() {
+        let invite = sample_invite();
+        let rendered = format!("{invite:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains(&invite.key), "{rendered}");
+        assert!(rendered.contains("tower"), "{rendered}");
     }
 }
