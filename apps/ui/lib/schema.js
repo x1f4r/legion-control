@@ -238,6 +238,85 @@ export function needsConfirmation(effect) {
   return effect === 'destroy' || effect === 'power';
 }
 
+export function isEffectful(effect) {
+  return Boolean(effect && effect !== 'read');
+}
+
+/**
+ * Resolves the `on` argument and display label for a tool run from the Tools screen.
+ *
+ * When `targetMode === 'all'` for an effectful tool (`effect !== 'read'`), expands `'all'` into
+ * the explicit list of answering machine names shown to the user in the confirmation so the target
+ * set cannot change depending on which node answers.
+ */
+export function resolveToolTarget({
+  targetMode,
+  effect,
+  localNode,
+  answeringNames = [],
+  skippedNames = [],
+  multiTargets = [],
+}) {
+  const namedLocal = localNode && localNode !== 'this node' ? localNode : undefined;
+  if (targetMode === 'local') {
+    return {
+      on: namedLocal,
+      machines: namedLocal ? [namedLocal] : [],
+      label: localNode || 'this node',
+      expandedAll: false,
+    };
+  }
+  if (targetMode === 'all') {
+    const names = (Array.isArray(answeringNames) ? answeringNames : []).filter(Boolean);
+    if (isEffectful(effect)) {
+      const explicit = names.length > 0 ? names : namedLocal ? [namedLocal] : [];
+      return {
+        on: explicit.length === 1 ? explicit[0] : explicit,
+        machines: explicit,
+        label: explicit.length > 0 ? explicit.join(', ') : localNode || 'this node',
+        expandedAll: true,
+      };
+    }
+    if (skippedNames.length === 0) {
+      return {
+        on: 'all',
+        machines: names,
+        label: 'all machines',
+        expandedAll: false,
+      };
+    }
+    return {
+      on: names.length <= 1 ? names[0] || namedLocal : names,
+      machines: names,
+      label: 'all answering machines',
+      expandedAll: false,
+    };
+  }
+  if (targetMode === 'multi') {
+    const picked = (Array.isArray(multiTargets) ? multiTargets : []).filter(Boolean);
+    if (picked.length === 0) {
+      return {
+        on: namedLocal,
+        machines: namedLocal ? [namedLocal] : [],
+        label: localNode || 'this node',
+        expandedAll: false,
+      };
+    }
+    return {
+      on: picked.length === 1 ? picked[0] : picked,
+      machines: picked,
+      label: picked.join(', '),
+      expandedAll: false,
+    };
+  }
+  return {
+    on: targetMode,
+    machines: targetMode ? [targetMode] : [],
+    label: targetMode || localNode || 'this node',
+    expandedAll: false,
+  };
+}
+
 export function unavailableReason(tool, whoami) {
   if (!whoami) return `Your current role does not allow ${tool.name}.`;
   const role = whoami.role || 'unknown';

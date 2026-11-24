@@ -1073,6 +1073,22 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText(/SHA256:studioTowerKey1111/).waitFor();
     await p.getByText(/SHA256:studioPiKey2222/).waitFor();
 
+    // 9. Effectful tool run from Tools with target "all" expands to the explicit list of machine
+    //    names shown in the confirmation sheet and sends that exact array (never literal "all").
+    await p.goto(`${server.url}/?mock=fleet,tech#/actions/all/power.restart`, {
+      waitUntil: 'domcontentloaded',
+    });
+    const onSelect = p.locator('#tool-target-on');
+    await onSelect.waitFor();
+    await onSelect.selectOption('all');
+    await p.getByRole('button', { name: 'Restart tower, pi, studio' }).click();
+    await p.locator('.sheet').getByText('Restart tower, pi, studio now?').waitFor();
+    await p.locator('.sheet .btn.danger').click();
+    await p.locator('.sheet').waitFor({ state: 'hidden' });
+    const lastCall = await p.evaluate(() => window.__LEGION_MOCK_LAST_CALL__);
+    assert.equal(lastCall.tool, 'power.restart');
+    assert.deepEqual(lastCall.on, ['tower', 'pi', 'studio']);
+
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);

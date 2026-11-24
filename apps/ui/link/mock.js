@@ -1323,6 +1323,9 @@ export function createMockLink(mode = '') {
 
   async function call(tool, args = {}, options = {}) {
     const { on, onEvent } = options || {};
+    if (typeof window !== 'undefined') {
+      window.__LEGION_MOCK_LAST_CALL__ = { tool, args, on: on ?? null };
+    }
     if (kind === 'app' && !on && !MOCK_ANY_NODE_TOOLS.has(tool)) {
       throw {
         code: 'invalid_args',

@@ -11,8 +11,10 @@ import {
   groupToolsByFamily,
   hasDryRun,
   initialValues,
+  isEffectful,
   needsConfirmation,
   parseRawArgs,
+  resolveToolTarget,
   unavailableReason,
   valuesFromArgs,
 } from '../lib/schema.js';
@@ -211,33 +213,15 @@ export function ToolDetail({
     }
   }
 
-  function resolveOn() {
-    const namedLocal = localNode && localNode !== 'this node' ? localNode : undefined;
-    if (targetMode === 'local') return namedLocal;
-    if (targetMode === 'all') {
-      if (skippedNames.length === 0) return 'all';
-      if (answeringNames.length <= 1) {
-        return answeringNames[0] || namedLocal;
-      }
-      return answeringNames;
-    }
-    if (targetMode === 'multi') {
-      if (multiTargets.length === 0) return namedLocal;
-      if (multiTargets.length === 1) {
-        return multiTargets[0];
-      }
-      return multiTargets;
-    }
-    return targetMode;
-  }
-
-  function targetLabel() {
-    if (targetMode === 'local') return localNode;
-    if (targetMode === 'all') {
-      return skippedNames.length > 0 ? 'all answering machines' : 'all machines';
-    }
-    if (targetMode === 'multi') return multiTargets.length ? multiTargets.join(', ') : localNode;
-    return targetMode;
+  function currentTarget() {
+    return resolveToolTarget({
+      targetMode,
+      effect: tool.effect,
+      localNode,
+      answeringNames,
+      skippedNames,
+      multiTargets,
+    });
   }
 
   function collectArgs() {
@@ -264,7 +248,7 @@ export function ToolDetail({
     return built.args;
   }
 
-  async function executeCall(args) {
+  async function executeCall(args, explicitOn) {
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -274,8 +258,9 @@ export function ToolDetail({
     setEvents([]);
 
     try {
+      const on = explicitOn !== undefined ? explicitOn : currentTarget().on;
       const out = await link.call(tool.name, args, {
-        on: resolveOn(),
+        on,
         signal: ctrl.signal,
         onEvent(evt) {
           if (evt) setEvents((prev) => [...prev, evt]);
@@ -301,28 +286,32 @@ export function ToolDetail({
     const args = collectArgs();
     if (!args) return;
 
+    const target = currentTarget();
+    if (targetMode === 'all' && isEffectful(tool.effect) && target.machines.length === 0) {
+      setError({
+        code: 'unreachable',
+        message: 'No answering machines are available to run this on.',
+        hint: null,
+      });
+      return;
+    }
+
     const toolHasDry = hasDryRun(tool.input_schema);
     if (dryOnly && toolHasDry) {
-      executeCall({ ...args, dry_run: true });
+      executeCall({ ...args, dry_run: true }, target.on);
       return;
     }
 
     const effectiveDry = toolHasDry && Boolean(args.dry_run);
-    if (needsConfirmation(tool.effect) && !effectiveDry) {
-      const where = targetLabel();
-      const targetOn = resolveOn();
-      const targetJobs = (runningJobs || []).filter(
-        (j) =>
-          where === 'all machines' ||
-          j.machine === where ||
-          (Array.isArray(targetOn) && targetOn.includes(j.machine)),
-      );
-      const matchedMachines = (machines || []).filter(
-        (m) =>
-          where === 'all machines' ||
-          m.name === where ||
-          (Array.isArray(targetOn) && targetOn.includes(m.name)),
-      );
+    const shouldConfirm =
+      (needsConfirmation(tool.effect) || (targetMode === 'all' && isEffectful(tool.effect))) &&
+      !effectiveDry;
+    if (shouldConfirm) {
+      const where = target.label;
+      const frozenOn = Array.isArray(target.on) ? [...target.on] : target.on;
+      const frozenMachines = new Set(target.machines);
+      const targetJobs = (runningJobs || []).filter((j) => frozenMachines.has(j.machine));
+      const matchedMachines = (machines || []).filter((m) => frozenMachines.has(m.name));
       const busyReasons = matchedMachines.flatMap((m) => m.busyReasons || []);
       const copy = describePowerConfirm(tool.name, where, args, targetJobs, busyReasons);
       onRequestConfirm({
@@ -336,22 +325,22 @@ export function ToolDetail({
         confirmLabel: copy.confirmLabel,
         canDryRun: toolHasDry,
         async onDryRun() {
-          return executeCall({ ...args, dry_run: true });
+          return executeCall({ ...args, dry_run: true }, frozenOn);
         },
         async onConfirm() {
-          await executeCall(args);
+          await executeCall(args, frozenOn);
         },
       });
       return;
     }
 
-    executeCall(args);
+    executeCall(args, target.on);
   }
 
   const toolHasDry = hasDryRun(tool.input_schema);
   const danger = needsConfirmation(tool.effect);
   const visibleFields = fields.filter((f) => !(danger && f.name === 'dry_run'));
-  const where = targetLabel();
+  const where = currentTarget().label;
   const actionButtonLabel = danger
     ? describePowerConfirm(tool.name, where, values).buttonLabel
     : 'Run';

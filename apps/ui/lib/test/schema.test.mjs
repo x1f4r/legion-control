@@ -8,8 +8,10 @@ import {
   groupToolsByFamily,
   hasDryRun,
   initialValues,
+  isEffectful,
   needsConfirmation,
   parseRawArgs,
+  resolveToolTarget,
   valuesFromArgs,
 } from '../schema.js';
 
@@ -193,4 +195,47 @@ test('describePowerConfirm generates plain wording from tool, target, jobs, and 
 
   const fallback = describePowerConfirm('fs.remove', 'tower', {}, [], []);
   assert.equal(fallback.title, 'Run fs.remove on tower?');
+});
+
+test('resolveToolTarget expands "all" to explicit machine names for every effectful tool', () => {
+  assert.equal(isEffectful('read'), false);
+  for (const eff of ['write', 'exec', 'destroy', 'power', 'admin']) {
+    assert.equal(isEffectful(eff), true, `effect ${eff} must be effectful`);
+    const resolved = resolveToolTarget({
+      targetMode: 'all',
+      effect: eff,
+      localNode: 'tower',
+      answeringNames: ['tower', 'pi', 'studio'],
+      skippedNames: [],
+      multiTargets: [],
+    });
+    assert.deepEqual(resolved.on, ['tower', 'pi', 'studio']);
+    assert.deepEqual(resolved.machines, ['tower', 'pi', 'studio']);
+    assert.equal(resolved.label, 'tower, pi, studio');
+    assert.equal(resolved.expandedAll, true);
+  }
+
+  // Single answering machine collapses to that single explicit name (never "all").
+  const single = resolveToolTarget({
+    targetMode: 'all',
+    effect: 'power',
+    localNode: 'tower',
+    answeringNames: ['tower'],
+    skippedNames: [],
+    multiTargets: [],
+  });
+  assert.equal(single.on, 'tower');
+  assert.equal(single.label, 'tower');
+
+  // Read-only tools may still pass "all" when no machines are skipped.
+  const readAll = resolveToolTarget({
+    targetMode: 'all',
+    effect: 'read',
+    localNode: 'tower',
+    answeringNames: ['tower', 'pi'],
+    skippedNames: [],
+    multiTargets: [],
+  });
+  assert.equal(readAll.on, 'all');
+  assert.equal(readAll.label, 'all machines');
 });
