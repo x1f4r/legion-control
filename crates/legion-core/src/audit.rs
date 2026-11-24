@@ -10,6 +10,7 @@
 //!
 //! - file contents, which a tool takes in a field named `content`, `contents`, `data`, `bytes`,
 //!   `body`, `stdin`, `old` or `new`;
+//! - values inside an object under a key named `env`, keeping the variable names;
 //! - values under a key that names a secret, however it is spelt (`password`, `X-API-Key`,
 //!   `apiKey`, `signing_key`, `auth`, …);
 //! - in a list of arguments, the value after a flag that takes a secret (`--password`, `-p`,
@@ -230,7 +231,14 @@ impl AuditLog {
         // The end of the earliest line found so far, whose start is in a block not read yet; `None`
         // while that line has grown past LONGEST_ENTRY and is being passed over.
         let mut carried: Option<Vec<u8>> = Some(Vec::new());
-        let mut end = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "audit log path is a directory",
+            ));
+        }
+        let mut end = metadata.len();
         'blocks: while end > 0 {
             if cancel.is_cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
@@ -291,6 +299,9 @@ impl AuditLog {
 const CONTENT_KEYS: [&str; 8] = [
     "content", "contents", "data", "bytes", "body", "stdin", "old", "new",
 ];
+/// Keys whose object value holds name-to-secret pairs: the names are kept so the audit log shows
+/// what was set, while every value is replaced by its byte size.
+const SECRET_VALUE_MAP_KEYS: [&str; 1] = ["env"];
 const SECRET_WORDS: [&str; 12] = [
     "password",
     "passwd",
@@ -314,8 +325,8 @@ const SECRET_KEY_ENDINGS: [&str; 3] = ["_key", "_auth", "_pass"];
 /// `sshpass` and others, and `-u`/`--user` takes `user:password` for `curl`.
 const SECRET_FLAGS: [&str; 3] = ["p", "u", "user"];
 /// How a token from a well-known service starts, as a word: GitHub, GitLab, OpenAI, Slack, AWS,
-/// Google, npm, PyPI, Hugging Face, Stripe.
-const TOKEN_PREFIXES: [&str; 23] = [
+/// Google, npm, PyPI, Hugging Face, Stripe, and Legion's own HTTP tokens.
+const TOKEN_PREFIXES: [&str; 24] = [
     "ghp_",
     "gho_",
     "ghu_",
@@ -339,6 +350,7 @@ const TOKEN_PREFIXES: [&str; 23] = [
     "sk_live_",
     "rk_live_",
     "sk_test_",
+    "lgn_",
 ];
 /// What gives a secret away wherever it stands in a string, compared in lower case: a PEM block
 /// such as a private key, and a bearer token.
@@ -406,6 +418,17 @@ fn redact_value(key: Option<&str>, value: &Value) -> Value {
     if key.is_some_and(is_sensitive_key) {
         return size_of(value);
     }
+    if key.is_some_and(is_secret_value_map_key) {
+        return match value {
+            Value::Null => Value::Null,
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(name, val)| (name.clone(), size_of(val)))
+                    .collect::<Map<String, Value>>(),
+            ),
+            other => size_of(other),
+        };
+    }
     match value {
         Value::String(text) if text.len() > LONGEST_KEPT || looks_secret(text) => size_of(value),
         Value::Object(map) => Value::Object(
@@ -437,6 +460,11 @@ fn redact_value(key: Option<&str>, value: &Value) -> Value {
 /// A key or a flag's name the way the rules compare it: lower case, with `-` read as `_`.
 fn normalise(name: &str) -> String {
     name.to_ascii_lowercase().replace('-', "_")
+}
+
+fn is_secret_value_map_key(key: &str) -> bool {
+    let key = normalise(key);
+    SECRET_VALUE_MAP_KEYS.contains(&key.as_str())
 }
 
 fn is_sensitive_key(key: &str) -> bool {
@@ -585,7 +613,7 @@ mod tests {
             redacted["env"]["GITHUB_TOKEN"],
             json!({"redacted_bytes": 1})
         );
-        assert_eq!(redacted["env"]["LANG"], json!("C"));
+        assert_eq!(redacted["env"]["LANG"], json!({"redacted_bytes": 1}));
         assert_eq!(redacted["argv"][0], json!("mysql"));
         assert_eq!(redacted["argv"][1], json!({"redacted_bytes": 18}));
         assert_eq!(redacted["argv"][3], json!("db"));
@@ -630,6 +658,7 @@ mod tests {
             "curl -u me:hunter2 https://example.com",
             "gh auth login --with-token ghp_abc",
             "export GH=ghp_abc",
+            "curl -H x:lgn_Zm9v-YmFy_ https://tower.example",
             "  -----BEGIN OPENSSH PRIVATE KEY-----",
         ] {
             assert!(is_redacted(&recorded(json!(secret))), "{secret:?} was kept");
@@ -692,6 +721,30 @@ mod tests {
         for key in ["key", "path", "author", "monkey", "keyboard"] {
             assert_eq!(redact(&json!({ key: "x" }))[key], json!("x"), "{key}");
         }
+    }
+
+    #[test]
+    fn env_object_keeps_names_and_redacts_every_value() {
+        let args = json!({
+            "cmd": "echo hi",
+            "env": {
+                "MYVAR": "supersecretvalue123",
+                "LANG": "C",
+                "EMPTY": "",
+            },
+        });
+        let redacted = redact(&args);
+        assert_eq!(redacted["cmd"], json!("echo hi"));
+        assert_eq!(
+            redacted["env"],
+            json!({
+                "MYVAR": {"redacted_bytes": 19},
+                "LANG": {"redacted_bytes": 1},
+                "EMPTY": {"redacted_bytes": 0},
+            })
+        );
+        assert_eq!(redact(&json!({"env": null}))["env"], Value::Null);
+        assert!(is_redacted(&redact(&json!({"env": "RAW=secret"}))["env"]));
     }
 
     #[test]

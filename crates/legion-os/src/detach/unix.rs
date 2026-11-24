@@ -11,6 +11,8 @@
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use process_wrap::std::{CommandWrap, ProcessSession};
@@ -21,10 +23,16 @@ use crate::procid::{self, KillTreeReport};
 use crate::shell::{ResolvedCommand, find_executable_in_paths};
 use crate::{OsError, Result};
 
-use super::{DetachHandle, DetachOptions, ScopeProbeOverride, open_append_stdio};
+use super::{
+    DETACH_MARKER_ENV, DetachHandle, DetachOptions, ScopeProbeOverride, generate_detach_marker,
+    merge_recheck_survivors, open_append_stdio,
+};
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_USER_SCOPE_ARGS: &[&str] = &["--user", "--scope", "--quiet", "--collect"];
+
+#[cfg(target_os = "linux")]
+static SYSTEMD_SUPPORTS_EXPAND_ENV_NO: OnceLock<bool> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_CMD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -156,12 +164,14 @@ pub(super) async fn spawn_detached(
         options.stderr_path.as_deref(),
     )?;
 
+    let marker = generate_detach_marker();
     let program_display = resolved.program_display();
     let (mut wrapped, systemd_unit) = if use_systemd_scope {
         #[cfg(target_os = "linux")]
         {
             let (unit_stem, full_unit) = super::resolve_scope_unit_name(options.name.as_deref())?;
             let unit_arg = format!("--unit={unit_stem}");
+            let expand_env_no = systemd_supports_expand_env_no().await;
             let pipe_systemd_stderr = options.stderr_path.is_none();
             let scope_stderr = if pipe_systemd_stderr {
                 Stdio::piped()
@@ -170,6 +180,11 @@ pub(super) async fn spawn_detached(
             };
             let wrap = CommandWrap::with_new("systemd-run", |cmd| {
                 cmd.args(SYSTEMD_USER_SCOPE_ARGS);
+                if expand_env_no {
+                    // Systemd >= 254 expands `$VAR`, `${VAR}`, and `$$` in target argv by default;
+                    // disable expansion so literal arguments and shell scripts arrive untouched.
+                    cmd.arg("--expand-environment=no");
+                }
                 cmd.arg(&unit_arg);
                 cmd.arg("--");
                 if pipe_systemd_stderr {
@@ -186,7 +201,7 @@ pub(super) async fn spawn_detached(
                 }
                 cmd.arg(&resolved.program);
                 cmd.args(&resolved.args);
-                configure_common_cmd(cmd, resolved, options, stdout_stdio, scope_stderr);
+                configure_common_cmd(cmd, resolved, options, &marker, stdout_stdio, scope_stderr);
             });
             (wrap, Some(full_unit))
         }
@@ -194,14 +209,14 @@ pub(super) async fn spawn_detached(
         {
             let wrap = CommandWrap::with_new(&resolved.program, |cmd| {
                 cmd.args(&resolved.args);
-                configure_common_cmd(cmd, resolved, options, stdout_stdio, stderr_stdio);
+                configure_common_cmd(cmd, resolved, options, &marker, stdout_stdio, stderr_stdio);
             });
             (wrap, None)
         }
     } else {
         let wrap = CommandWrap::with_new(&resolved.program, |cmd| {
             cmd.args(&resolved.args);
-            configure_common_cmd(cmd, resolved, options, stdout_stdio, stderr_stdio);
+            configure_common_cmd(cmd, resolved, options, &marker, stdout_stdio, stderr_stdio);
         });
         (wrap, None)
     };
@@ -254,6 +269,8 @@ pub(super) async fn spawn_detached(
     Ok(DetachHandle {
         process,
         systemd_unit,
+        windows_job: None,
+        marker: Some(marker),
         warnings,
     })
 }
@@ -336,14 +353,18 @@ async fn confirm_scope_entry(
 pub(super) async fn detached_active(handle: &DetachHandle) -> Result<bool> {
     #[cfg(target_os = "linux")]
     if let Some(ref unit) = handle.systemd_unit {
-        return systemd_scope_active(unit, &handle.process).await;
+        return systemd_scope_active(unit, &handle.process, handle.marker.as_deref()).await;
     }
 
-    procid::tree_is_active(&handle.process).await
+    procid::tree_is_active_with_marker(&handle.process, handle.marker.as_deref()).await
 }
 
 #[cfg(target_os = "linux")]
-async fn systemd_scope_active(unit: &str, root_process: &ProcessId) -> Result<bool> {
+async fn systemd_scope_active(
+    unit: &str,
+    root_process: &ProcessId,
+    marker: Option<&str>,
+) -> Result<bool> {
     let unit_owned = unit.to_owned();
     let root = *root_process;
 
@@ -422,25 +443,62 @@ async fn systemd_scope_active(unit: &str, root_process: &ProcessId) -> Result<bo
     if !state.live_pids().is_empty() || state.is_active() {
         return Ok(true);
     }
-    procid::tree_is_active(root_process).await
+    procid::tree_is_active_with_marker(root_process, marker).await
 }
 
 pub(super) async fn stop_detached(
     handle: &DetachHandle,
     grace: Duration,
 ) -> Result<KillTreeReport> {
-    #[cfg(target_os = "linux")]
-    if let Some(ref unit) = handle.systemd_unit {
-        return stop_systemd_scope(unit, &handle.process, grace).await;
+    let mut report = {
+        #[cfg(target_os = "linux")]
+        if let Some(ref unit) = handle.systemd_unit {
+            stop_systemd_scope(unit, &handle.process, handle.marker.as_deref(), grace).await?
+        } else {
+            procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await?
+        }
+    };
+
+    // Post-stop re-check using the exact same rule as `detached_active`: if any marked process
+    // (such as a `setsid` grandchild spawned right before teardown) survived without a scope,
+    // run one bounded marker cleanup pass and report whatever still remains so `stop_detached`
+    // never claims `all_gone: true` while `detached_active` would return `true`.
+    if let Some(ref marker) = handle.marker {
+        let mut remaining = procid::find_marked_live_processes(marker).await?;
+        if !remaining.is_empty() {
+            let followup =
+                procid::kill_tree_with_marker(&handle.process, Some(marker), grace).await?;
+            for id in followup.unverified_survivors {
+                if !report
+                    .unverified_survivors
+                    .iter()
+                    .any(|existing| existing.pid == id.pid)
+                {
+                    report.unverified_survivors.push(id);
+                }
+            }
+            remaining = procid::find_marked_live_processes(marker).await?;
+        }
+        if procid::is_alive(&handle.process)
+            && !remaining.iter().any(|id| id.pid == handle.process.pid)
+        {
+            remaining.push(handle.process);
+        }
+        merge_recheck_survivors(&mut report, remaining);
     }
 
-    procid::kill_tree(&handle.process, grace).await
+    Ok(report)
 }
 
 #[cfg(target_os = "linux")]
 async fn stop_systemd_scope(
     unit: &str,
     root_process: &ProcessId,
+    marker: Option<&str>,
     grace: Duration,
 ) -> Result<KillTreeReport> {
     let initial = query_scope_state(unit).await;
@@ -449,11 +507,12 @@ async fn stop_systemd_scope(
     // still alive and handle it via kill_tree if so.
     if !initial.is_active() && initial.live_pids().is_empty() {
         if procid::is_alive(root_process) {
-            return procid::kill_tree(root_process, grace).await;
+            return procid::kill_tree_with_marker(root_process, marker, grace).await;
         }
         return Ok(KillTreeReport {
             all_gone: true,
             survivors: Vec::new(),
+            unverified_survivors: Vec::new(),
         });
     }
 
@@ -474,6 +533,7 @@ async fn stop_systemd_scope(
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
+                unverified_survivors: Vec::new(),
             });
         }
         let now = Instant::now();
@@ -502,6 +562,7 @@ async fn stop_systemd_scope(
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
+                unverified_survivors: Vec::new(),
             });
         }
         let now = Instant::now();
@@ -521,6 +582,7 @@ async fn stop_systemd_scope(
     Ok(KillTreeReport {
         all_gone: survivors.is_empty(),
         survivors,
+        unverified_survivors: Vec::new(),
     })
 }
 
@@ -614,15 +676,22 @@ fn configure_common_cmd(
     cmd: &mut std::process::Command,
     resolved: &ResolvedCommand,
     options: &DetachOptions,
+    marker: &str,
     stdout_stdio: Stdio,
     stderr_stdio: Stdio,
 ) {
     for key in &resolved.env_remove {
         cmd.env_remove(key);
     }
+    for key in &options.env_remove {
+        cmd.env_remove(key);
+    }
     for (key, value) in &options.env {
         cmd.env(key, value);
     }
+    // Stamp the unique per-launch marker AFTER `env_remove` and explicit `env` so callers dropping
+    // inherited `LEGION_*` variables still tag the newly detached tree for orphan verification.
+    cmd.env(DETACH_MARKER_ENV, marker);
     if let Some(ref cwd) = options.cwd {
         cmd.current_dir(cwd);
     }
@@ -804,6 +873,50 @@ mod close_fds {
     }
 }
 
+/// Detect once whether `systemd-run` supports `--expand-environment=no` (added in systemd 254;
+/// older systemd versions do not expand `$` in `--scope` target argv).
+#[cfg(target_os = "linux")]
+async fn systemd_supports_expand_env_no() -> bool {
+    if let Some(&cached) = SYSTEMD_SUPPORTS_EXPAND_ENV_NO.get() {
+        return cached;
+    }
+
+    let mut supported = false;
+    let mut help_cmd = tokio::process::Command::new("systemd-run");
+    help_cmd
+        .arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Ok(Ok(output)) = tokio::time::timeout(SYSTEMD_CMD_TIMEOUT, help_cmd.output()).await
+        && output.status.success()
+        && super::systemd_help_supports_expand_env_no(&String::from_utf8_lossy(&output.stdout))
+    {
+        supported = true;
+    }
+
+    if !supported {
+        let mut ver_cmd = tokio::process::Command::new("systemd-run");
+        ver_cmd
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if let Ok(Ok(output)) = tokio::time::timeout(SYSTEMD_CMD_TIMEOUT, ver_cmd.output()).await
+            && output.status.success()
+            && super::parse_systemd_major_version(&String::from_utf8_lossy(&output.stdout))
+                .is_some_and(|major| major >= 254)
+        {
+            supported = true;
+        }
+    }
+
+    let _ = SYSTEMD_SUPPORTS_EXPAND_ENV_NO.set(supported);
+    supported
+}
+
 #[cfg(target_os = "linux")]
 async fn systemd_user_scope_available(options: &DetachOptions) -> bool {
     let mut probe = tokio::process::Command::new("systemd-run");
@@ -815,9 +928,13 @@ async fn systemd_user_scope_available(options: &DetachOptions) -> bool {
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    // Respect any session-bus environment overrides provided by the caller.
+    // Respect any session-bus environment removals or overrides provided by the caller.
     for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
-        if let Some(val) = options.env.get(OsStr::new(key)) {
+        let os_key = OsStr::new(key);
+        if options.env_remove.iter().any(|k| k.as_os_str() == os_key) {
+            probe.env_remove(key);
+        }
+        if let Some(val) = options.env.get(os_key) {
             probe.env(key, val);
         }
     }
@@ -902,11 +1019,13 @@ fn ensure_target_exists(program: &OsStr, options: &DetachOptions) -> Result<()> 
         return Ok(());
     }
 
+    let path_key = OsStr::new("PATH");
+    let path_removed = options.env_remove.iter().any(|k| k.as_os_str() == path_key);
     let path_var: Option<OsString> = options
         .env
-        .get(OsStr::new("PATH"))
+        .get(path_key)
         .cloned()
-        .or_else(|| std::env::var_os("PATH"));
+        .or_else(|| (!path_removed).then(|| std::env::var_os("PATH")).flatten());
     let name = program.to_string_lossy();
     if find_executable_in_paths(&name, path_var.as_deref(), &[]).is_none() {
         return Err(OsError::ProgramNotFound {

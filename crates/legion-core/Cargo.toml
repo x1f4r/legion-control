@@ -7,10 +7,18 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Lets a test node report the boot id written in the file LEGION_TEST_BOOT_ID_FILE names, so a test
+# can make a node look restarted without restarting anything. legion-tools turns it on with its own
+# `testing` feature; a release build never has it.
+testing = []
+
 [dependencies]
+blake3.workspace = true
 dunce.workspace = true
 gethostname.workspace = true
 jiff.workspace = true
+legion-os.workspace = true
 legion-proto.workspace = true
 same-file.workspace = true
 schemars.workspace = true

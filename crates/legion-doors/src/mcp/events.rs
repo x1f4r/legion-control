@@ -11,8 +11,8 @@
 
 use std::future::Future;
 
-use legion_core::EventSink;
 use legion_core::proto::EventKind;
+use legion_core::{Event, EventSink};
 use rmcp::model::{
     LoggingLevel, LoggingMessageNotificationParam, ProgressNotificationParam, ProgressToken,
     ServerCapabilities,
@@ -100,10 +100,10 @@ impl Forwarder {
     }
 
     /// A sink for the call's events and the queue it fills.
-    pub(crate) fn sink() -> (EventSink, mpsc::Receiver<(EventKind, Value)>) {
+    pub(crate) fn sink() -> (EventSink, mpsc::Receiver<Event>) {
         let (queue, events) = mpsc::channel(QUEUE);
-        let sink = EventSink::new(move |kind, data| {
-            let _ = queue.try_send((kind, data));
+        let sink = EventSink::with_events(move |event| {
+            let _ = queue.try_send(event);
         });
         (sink, events)
     }
@@ -112,40 +112,48 @@ impl Forwarder {
     /// returned. The queued ones go first so no notification follows the result it belongs to.
     pub(crate) async fn forward_during<T>(
         mut self,
-        mut events: mpsc::Receiver<(EventKind, Value)>,
+        mut events: mpsc::Receiver<Event>,
         work: impl Future<Output = T>,
     ) -> T {
         tokio::pin!(work);
         loop {
             tokio::select! {
                 result = &mut work => {
-                    while let Ok((kind, data)) = events.try_recv() {
-                        self.send(kind, data).await;
+                    while let Ok(event) = events.try_recv() {
+                        self.send(event).await;
                     }
                     return result;
                 }
-                Some((kind, data)) = events.recv() => self.send(kind, data).await,
+                Some(event) = events.recv() => self.send(event).await,
             }
         }
     }
 
     /// Sends one event as each notification the client asked for. A client that has gone away
     /// has nobody to tell, so a failed send is dropped.
-    async fn send(&mut self, kind: EventKind, data: Value) {
+    async fn send(&mut self, event: Event) {
         if let Some(token) = &self.progress {
             // Progress has no total: each event is one step further, which is all a client needs
             // to know the call is alive and what it is doing.
             self.sent += 1.0;
-            let param = ProgressNotificationParam::new(token.clone(), self.sent)
-                .with_message(message(kind, &data));
+            let text = match &event.machine {
+                Some(machine) => format!("[{machine}] {}", message(event.kind, &event.data)),
+                None => message(event.kind, &event.data),
+            };
+            let param = ProgressNotificationParam::new(token.clone(), self.sent).with_message(text);
             let _ = self.peer.notify_progress(param).await;
         }
-        let level = level_of(kind);
+        let level = level_of(event.kind);
         if self.level.is_some_and(|wanted| Level::of(level) >= wanted) {
-            let mut param = LoggingMessageNotificationParam::new(
-                level,
-                json!({"kind": kind.as_str(), "data": data}),
-            );
+            let payload = match event.machine {
+                Some(machine) => json!({
+                    "kind": event.kind.as_str(),
+                    "data": event.data,
+                    "machine": machine,
+                }),
+                None => json!({"kind": event.kind.as_str(), "data": event.data}),
+            };
+            let mut param = LoggingMessageNotificationParam::new(level, payload);
             param.logger = Some(self.tool.clone());
             let _ = self.peer.notify_logging_message(param).await;
         }

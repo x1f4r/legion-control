@@ -35,6 +35,12 @@ pub fn register(registry: &mut Registry) {
         "Check a path for writing the way file tools do, and return the path a tool would use.",
         write_path,
     );
+    registry.add_fn(
+        "test.fail",
+        Effect::Read,
+        "Fail with the error code given, so a door's mapping of every code can be checked.",
+        fail,
+    );
 }
 
 async fn echo(_ctx: &Ctx, args: Map<String, Value>) -> Result<Map<String, Value>, ToolError> {
@@ -100,6 +106,28 @@ async fn read_path(ctx: &Ctx, args: PathArgs) -> Result<Checked, ToolError> {
     Ok(Checked {
         path: path.to_string_lossy().into_owned(),
     })
+}
+
+/// Arguments of `test.fail`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FailArgs {
+    /// The code to fail with, such as busy.
+    code: String,
+}
+
+async fn fail(_ctx: &Ctx, args: FailArgs) -> Result<Checked, ToolError> {
+    let code: ErrorCode =
+        serde_json::from_value(Value::String(args.code.clone())).map_err(|_| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("{} is no error code.", args.code),
+            )
+        })?;
+    Err(ErrorBody::new(
+        code,
+        format!("test.fail failed with {code} as asked."),
+    ))
 }
 
 async fn write_path(ctx: &Ctx, args: PathArgs) -> Result<Checked, ToolError> {

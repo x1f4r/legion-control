@@ -377,12 +377,32 @@ fn failures_are_tool_results_carrying_the_error_object() {
         assert_eq!(extra["code"], json!("invalid_args"));
 
         let elsewhere = failed(&mcp.call("meta_version", json!({"on": "pi"})));
-        assert_eq!(elsewhere["code"], json!("unreachable"));
+        assert_eq!(elsewhere["code"], json!("not_found"));
         assert!(elsewhere["hint"].is_string());
         // The schema asks for one string, with commas between names; a list is taken too.
         for several in [json!("tower,pi"), json!(["tower", "pi"])] {
-            let error = failed(&mcp.call("meta_version", json!({"on": several})));
-            assert_eq!(error["code"], json!("unreachable"), "{several}");
+            let partial = ok(&mcp.call("meta_version", json!({"on": several})));
+            assert_eq!(
+                partial["results"]["tower"]["ok"]["node"],
+                json!("tower"),
+                "{several}"
+            );
+            assert_eq!(
+                partial["results"]["pi"]["error"]["code"],
+                json!("not_found"),
+                "{several}"
+            );
+        }
+        // A fan-out where every machine fails sets isError with the wire results object.
+        for all_bad in [json!("pi,laptop"), json!(["pi", "laptop"])] {
+            let call = mcp.call("meta_version", json!({"on": all_bad}));
+            assert_eq!(call["isError"], json!(true), "{call}");
+            let body = payload(&call);
+            assert_eq!(body["results"]["pi"]["error"]["code"], json!("not_found"));
+            assert_eq!(
+                body["results"]["laptop"]["error"]["code"],
+                json!("not_found")
+            );
         }
         for bad in [json!(5), json!(""), json!("tower,,pi")] {
             let bad_on = failed(&mcp.call("meta_version", json!({"on": bad})));
@@ -508,7 +528,7 @@ fn compact_mode_serves_three_tools_that_reach_every_other() {
             "legion_call",
             json!({"tool": "meta.version", "on": "elsewhere"}),
         ));
-        assert_eq!(elsewhere["code"], json!("unreachable"));
+        assert_eq!(elsewhere["code"], json!("not_found"));
         let missing = failed(&mcp.call("legion_call", json!({"args": {}})));
         assert_eq!(missing["code"], json!("invalid_args"));
         let direct = failed(&mcp.call("meta_version", json!({})));

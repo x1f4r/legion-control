@@ -211,6 +211,8 @@ fn hello() {
             os: "linux".into(),
             arch: "x86_64".into(),
             systems: vec![],
+            system: None,
+            boot_id: None,
         },
         json!({
             "node": "tower",
@@ -219,6 +221,28 @@ fn hello() {
             "os": "linux",
             "arch": "x86_64",
             "systems": []
+        }),
+    );
+    pin(
+        HelloResult {
+            node: "tower".into(),
+            version: "0.1.0".into(),
+            protocol: 1,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            systems: vec!["linux".into(), "windows".into()],
+            system: Some("linux".into()),
+            boot_id: Some("0f5b7c1e-2d1a-4c8e-9b3f-5a6d7e8f9012".into()),
+        },
+        json!({
+            "node": "tower",
+            "version": "0.1.0",
+            "protocol": 1,
+            "os": "linux",
+            "arch": "x86_64",
+            "systems": ["linux", "windows"],
+            "system": "linux",
+            "boot_id": "0f5b7c1e-2d1a-4c8e-9b3f-5a6d7e8f9012"
         }),
     );
 }
@@ -237,13 +261,25 @@ fn call_spells_as_and_on_the_way_the_design_does() {
             args: json!({"path": "~/notes.txt"}),
             as_principal: Some("agent:claude".into()),
             on: Some(Target::One("tower".into())),
+            hops: 0,
         },
         json!({"tool": "fs.read", "args": {"path": "~/notes.txt"}, "as": "agent:claude", "on": "tower"}),
+    );
+    pin(
+        CallParams {
+            tool: "meta.version".into(),
+            args: json!({}),
+            as_principal: None,
+            on: Some(Target::One("pi".into())),
+            hops: 2,
+        },
+        json!({"tool": "meta.version", "args": {}, "on": "pi", "hops": 2}),
     );
     let bare: CallParams = serde_json::from_value(json!({"tool": "meta.version"})).unwrap();
     assert_eq!(bare.args, json!({}));
     assert_eq!(bare.as_principal, None);
     assert_eq!(bare.on, None);
+    assert_eq!(bare.hops, 0);
 }
 
 #[test]
@@ -262,8 +298,18 @@ fn cancel_and_event() {
             id: Id::String("c1".into()),
             kind: EventKind::Stdout,
             data: json!("hello\n"),
+            machine: None,
         },
         json!({"id": "c1", "kind": "stdout", "data": "hello\n"}),
+    );
+    pin(
+        EventParams {
+            id: Id::Number(2),
+            kind: EventKind::Progress,
+            data: json!({"step": 1}),
+            machine: Some("tower".into()),
+        },
+        json!({"id": 2, "kind": "progress", "data": {"step": 1}, "machine": "tower"}),
     );
     for (kind, word) in [
         (EventKind::Stdout, "stdout"),

@@ -7,7 +7,7 @@
 //! with [`write_atomically`], so a reader never sees one half written.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,10 @@ use legion_proto::{ErrorBody, ErrorCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
+
+mod power;
+
+pub use power::{BootTarget, BusyConfig, BusyProbe, DEFAULT_PROBE_S, LONGEST_PROBE_S, PowerConfig};
 
 /// A configuration file with a fixed name in the configuration directory.
 ///
@@ -267,6 +271,23 @@ pub fn parse<D: Document>(path: &Path, bytes: &[u8]) -> Result<D, ErrorBody> {
     Ok(document)
 }
 
+/// Parses arbitrary TOML bytes into `T`, returning `(message, Some(1-based line))` on UTF-8 or
+/// TOML syntax/type errors. Useful for per-item configuration files (such as `tools.d/*.toml`)
+/// that are skipped individually rather than failing the whole node.
+pub fn parse_toml_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, (String, Option<usize>)> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        let line = line_and_column(bytes, error.valid_up_to()).0;
+        ("file is not UTF-8 text".to_owned(), Some(line))
+    })?;
+    toml::from_str(text).map_err(|error| {
+        let message = error.message().trim_end_matches('.').to_owned();
+        let line = error
+            .span()
+            .map(|span| line_and_column(bytes, span.start).0);
+        (message, line)
+    })
+}
+
 /// The 1-based line and column of a byte offset.
 fn line_and_column(bytes: &[u8], offset: usize) -> (usize, usize) {
     let before = bytes.get(..offset).unwrap_or(bytes);
@@ -282,19 +303,74 @@ fn line_and_column(bytes: &[u8], offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// `node.toml`: what this node calls itself. Later milestones add its boot targets and busy probes.
+/// `node.toml`: what this node calls itself and node-wide settings, including what keeps the
+/// machine busy and how it sleeps and restarts (see [`BusyConfig`], [`PowerConfig`] and
+/// [`BootTarget`]).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeFile {
     /// The node's name; the host name when absent.
     #[serde(default)]
     pub name: Option<NodeName>,
+    /// Settings for the `svc` tool family.
+    #[serde(default)]
+    pub svc: SvcConfig,
+    /// Settings for `legion serve`.
+    #[serde(default)]
+    pub serve: ServeConfig,
+    /// Which system of this machine this is, such as `linux` or `windows`. `hello` reports it, so
+    /// a machine that was restarted into another system says which one answered.
+    #[serde(default)]
+    pub system: Option<NodeName>,
+    /// What keeps this machine busy; absent leaves it unmonitored, which blocks unattended power
+    /// changes.
+    #[serde(default)]
+    pub busy: Option<BusyConfig>,
+    /// `[power]`: how this machine sleeps and whether system actions use `sudo`.
+    #[serde(default)]
+    pub power: PowerConfig,
+    /// `[boot.<name>]`: the systems this machine can restart into, by name.
+    #[serde(default)]
+    pub boot: BTreeMap<String, BootTarget>,
+}
+
+/// The `[serve]` table of `node.toml`: what `legion serve` accepts besides this machine itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeConfig {
+    /// Browser pages allowed to call this API, by origin (`https://app.example.net`). Their
+    /// requests are answered with the CORS headers that let the page read the answer, and their
+    /// preflights without a token. A request from any other page is refused, so a site open in a
+    /// browser on this machine cannot use the server.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// Host names the server answers to besides loopback, such as the name Tailscale Serve
+    /// publishes it under (`tower.example.ts.net`, or `tower.example.ts.net:8443` for one port).
+    /// Any other `Host` is refused, which is what stops a DNS rebinding page from reaching it.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// The `[svc]` table of `node.toml`: how the node controls system services.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SvcConfig {
+    /// Whether system-scope `svc.start`, `svc.stop` and `svc.restart` on Unix run through
+    /// `sudo -n`. Defaults to `false` so the node never escalates privileges on its own; enabling
+    /// it lets any principal allowed those tools control system services as root via
+    /// non-interactive sudoers rules.
+    #[serde(default)]
+    pub sudo: bool,
 }
 
 impl Document for NodeFile {
     const FILE: &'static str = "node.toml";
     // Its default is the host's name, which grants nothing.
     const EMPTY_IS_DEFAULT: bool = true;
+
+    fn validate(&self) -> Result<(), String> {
+        power::validate(self.busy.as_ref(), &self.power, &self.boot)
+    }
 }
 
 impl NodeFile {
@@ -571,9 +647,149 @@ mod tests {
     fn node_toml_takes_a_name_or_falls_back_to_the_host() {
         let named = parse::<NodeFile>(Path::new("node.toml"), b"name = \"tower\"\n").unwrap();
         assert_eq!(named.name_or_host().as_str(), "tower");
+        assert!(!named.svc.sudo);
         let error = parse::<NodeFile>(Path::new("node.toml"), b"name = \"Tower\"\n").unwrap_err();
         assert!(error.message.contains("line 1"), "{}", error.message);
         let empty = parse::<NodeFile>(Path::new("node.toml"), b"").unwrap();
         assert_eq!(empty.name_or_host(), NodeName::from_host());
+        assert!(!empty.svc.sudo);
+    }
+
+    #[test]
+    fn node_toml_parses_svc_sudo_strictly() {
+        let enabled = parse::<NodeFile>(Path::new("node.toml"), b"[svc]\nsudo = true\n").unwrap();
+        assert!(enabled.svc.sudo);
+        let disabled = parse::<NodeFile>(Path::new("node.toml"), b"[svc]\n").unwrap();
+        assert!(!disabled.svc.sudo);
+        let wrong_type =
+            parse::<NodeFile>(Path::new("node.toml"), b"[svc]\nsudo = \"yes\"\n").unwrap_err();
+        assert!(
+            wrong_type.message.contains("line 2"),
+            "{}",
+            wrong_type.message
+        );
+        let unknown =
+            parse::<NodeFile>(Path::new("node.toml"), b"[svc]\nroot = true\n").unwrap_err();
+        assert!(unknown.message.contains("line 2"), "{}", unknown.message);
+        assert!(unknown.message.contains("root"), "{}", unknown.message);
+    }
+
+    fn node(text: &str) -> Result<NodeFile, ErrorBody> {
+        parse::<NodeFile>(Path::new("node.toml"), text.as_bytes())
+    }
+
+    #[test]
+    fn node_toml_reads_the_power_settings_it_documents() {
+        let file = node(
+            r#"
+system = "linux"
+
+[[busy.probes]]
+name = "render"
+run = ["pgrep", "-x", "blender"]
+
+[[busy.probes]]
+name = "backup"
+run = ["backup-running"]
+timeout_s = 20
+
+[power]
+sudo = true
+sleep = ["systemctl", "hibernate"]
+before_sleep = [["stop-keepawake"], ["sync"]]
+
+[boot.windows]
+efi_label = "Windows Boot Manager"
+
+[boot.other]
+arm = ["sudo", "-n", "grub-reboot", "Other"]
+verify = ["check-next-entry", "Other"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(file.system.as_ref().map(NodeName::as_str), Some("linux"));
+        let Some(BusyConfig::Probes(probes)) = &file.busy else {
+            panic!("{:?}", file.busy)
+        };
+        assert_eq!(probes[0].name, "render");
+        assert_eq!(probes[0].timeout_s, DEFAULT_PROBE_S);
+        assert_eq!(probes[1].timeout_s, 20);
+        assert!(file.power.sudo);
+        assert_eq!(
+            file.power.sleep.as_deref(),
+            Some(&["systemctl".to_owned(), "hibernate".to_owned()][..])
+        );
+        assert_eq!(file.power.before_sleep.len(), 2);
+        assert_eq!(
+            file.boot.get("windows"),
+            Some(&BootTarget::EfiLabel("Windows Boot Manager".to_owned()))
+        );
+        assert!(matches!(
+            file.boot.get("other"),
+            Some(BootTarget::Commands { .. })
+        ));
+
+        let never = node("busy = \"none\"\n").unwrap();
+        assert_eq!(never.busy, Some(BusyConfig::Never));
+        let unmonitored = node("").unwrap();
+        assert_eq!(unmonitored.busy, None);
+        assert!(unmonitored.boot.is_empty());
+        assert!(!unmonitored.power.sudo);
+    }
+
+    #[test]
+    fn node_toml_refuses_power_settings_that_would_mislead() {
+        let cases: &[(&str, &str)] = &[
+            ("busy = \"idle\"\n", "busy = \"none\""),
+            ("busy = true\n", "busy"),
+            ("[busy]\nprobes = []\n", "busy.probes is empty"),
+            ("[busy]\nprobe = []\n", "probe"),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = []\n",
+                "busy.probes[0].run",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\ntimeout_s = 0\n",
+                "timeout_s",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\ntimeout_s = 61\n",
+                "timeout_s",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\n[[busy.probes]]\nname = \"a\"\nrun = [\"y\"]\n",
+                "already called",
+            ),
+            (
+                "[[busy.probes]]\nname = \"a\"\nrun = [\"x\"]\ncommand = [\"y\"]\n",
+                "command",
+            ),
+            ("[power]\nsleep = []\n", "power.sleep"),
+            (
+                "[power]\nbefore_sleep = [[\"\"]]\n",
+                "power.before_sleep[0]",
+            ),
+            ("[power]\nsudo = \"yes\"\n", "line 2"),
+            ("[boot.windows]\narm = [\"x\"]\n", "verify"),
+            ("[boot.windows]\nverify = [\"x\"]\n", "arm"),
+            (
+                "[boot.windows]\nefi_label = \"W\"\narm = [\"x\"]\nverify = [\"y\"]\n",
+                "not both",
+            ),
+            ("[boot.windows]\n", "efi_label"),
+            ("[boot.windows]\nefi_label = \" \"\n", "empty"),
+            ("[boot.Windows]\nefi_label = \"W\"\n", "boot.Windows"),
+            ("[boot.windows]\nefi_lable = \"W\"\n", "efi_lable"),
+            ("system = \"Linux\"\n", "line 1"),
+        ];
+        for (text, expected) in cases {
+            let error = node(text).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Failed, "{text}");
+            assert!(
+                error.message.contains(expected),
+                "{text:?}: {}",
+                error.message
+            );
+        }
     }
 }

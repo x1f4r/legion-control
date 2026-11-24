@@ -10,7 +10,7 @@
 //! Its result follows the rule `sys` states for both families: a field without a value is left
 //! out, never `null`.
 
-mod text;
+pub(crate) mod text;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -42,7 +42,7 @@ pub fn register(registry: &mut Registry) {
 /// Arguments of `exec.run`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct RunArgs {
+pub(crate) struct RunArgs {
     /// A command line handed whole to the platform shell: sh on Linux and macOS, PowerShell on
     /// Windows. Give this or `argv`, not both.
     #[serde(default)]
@@ -104,7 +104,7 @@ const TIMEOUT_S: (f64, f64) = (120.0, 3600.0);
 /// The default and the largest `max_output`.
 const MAX_OUTPUT: (u64, u64) = (64 * 1024, 1024 * 1024);
 
-async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
+pub(crate) async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
     let (command, program) = command_of(args.cmd, args.argv)?;
     let timeout = timeout_of(args.timeout_s)?;
     let limit = max_output_of(args.max_output)?;

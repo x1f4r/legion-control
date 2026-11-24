@@ -38,6 +38,14 @@ pub struct HelloResult {
     pub arch: String,
     /// The systems this machine can boot into, as `node.toml` names them; empty until it does.
     pub systems: Vec<String>,
+    /// Which system of the machine answered, as its `node.toml` names it; absent until it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    /// An identifier of the machine's current boot, which changes on every restart, so a caller
+    /// can tell a machine that came back from one that never went down; absent when the node
+    /// cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 
 /// `tools` params: none yet.
@@ -65,10 +73,17 @@ pub struct CallParams {
     /// The machine or machines to run on; absent is the node that was asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<Target>,
+    /// How many nodes have already forwarded this call; absent is 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hops: u32,
 }
 
 fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// `cancel` params.
@@ -117,6 +132,9 @@ pub struct EventParams {
     pub kind: EventKind,
     /// Its content.
     pub data: Value,
+    /// The machine that produced the event, set on forwarded calls and fan-outs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// Where a call runs: one machine, several, or every machine in the fleet.

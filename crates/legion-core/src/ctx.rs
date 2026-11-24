@@ -12,7 +12,7 @@ use crate::config::ConfigStore;
 use crate::node::Node;
 use crate::paths::Paths;
 use crate::policy::Grant;
-use crate::registry::DocumentInfo;
+use crate::registry::{DocumentInfo, SourceCheck};
 
 /// How a call arrived. Recorded in the audit log, and the reason a principal can be trusted as far
 /// as it is: a local shell is the owner, a pinned ssh key or token is a wall.
@@ -27,6 +27,9 @@ pub enum Door {
     Http,
     /// `legion rpc`, the pipe other nodes and clients use.
     Rpc,
+    /// `legion stream`, the pipe bulk file data moves over, and the ends of a transfer this node
+    /// serves itself.
+    Stream,
 }
 
 impl Door {
@@ -37,6 +40,7 @@ impl Door {
             Door::Mcp => "mcp",
             Door::Http => "http",
             Door::Rpc => "rpc",
+            Door::Stream => "stream",
         }
     }
 }
@@ -47,37 +51,86 @@ impl fmt::Display for Door {
     }
 }
 
+/// One event emitted by a running call: its kind, its content, and the machine that produced it
+/// when the call was forwarded or fanned out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    /// What kind of event it is.
+    pub kind: EventKind,
+    /// Its content.
+    pub data: Value,
+    /// The machine that produced the event, when set by routing.
+    pub machine: Option<String>,
+}
+
 /// Where a running call's `event` notifications go: to the rpc client as notifications carrying
 /// the call's id, to stderr on a command line, nowhere when nobody listens.
 #[derive(Clone, Default)]
-pub struct EventSink(Option<Arc<dyn Fn(EventKind, Value) + Send + Sync>>);
+pub struct EventSink {
+    deliver: Option<Arc<dyn Fn(Event) + Send + Sync>>,
+    machine: Option<Arc<str>>,
+}
 
 impl EventSink {
-    /// A sink that hands each event to `deliver`.
+    /// A sink that hands each event's kind and content to `deliver`.
     pub fn new(deliver: impl Fn(EventKind, Value) + Send + Sync + 'static) -> EventSink {
-        EventSink(Some(Arc::new(deliver)))
+        EventSink {
+            deliver: Some(Arc::new(move |event| deliver(event.kind, event.data))),
+            machine: None,
+        }
+    }
+
+    /// A sink that receives the full [`Event`], including the machine that produced it.
+    pub fn with_events(deliver: impl Fn(Event) + Send + Sync + 'static) -> EventSink {
+        EventSink {
+            deliver: Some(Arc::new(deliver)),
+            machine: None,
+        }
     }
 
     /// A sink that drops every event.
     pub fn discard() -> EventSink {
-        EventSink(None)
+        EventSink::default()
     }
 
-    /// Delivers one event.
+    /// Returns a sink that stamps emitted events with `machine`, overwriting any label the emitter
+    /// supplied so a remote cannot forge another machine's name.
+    #[must_use]
+    pub fn for_machine(&self, machine: impl Into<Arc<str>>) -> EventSink {
+        EventSink {
+            deliver: self.deliver.clone(),
+            machine: Some(machine.into()),
+        }
+    }
+
+    /// Delivers one event from this node.
     pub fn emit(&self, kind: EventKind, data: Value) {
-        if let Some(deliver) = &self.0 {
-            deliver(kind, data);
+        self.emit_event(Event {
+            kind,
+            data,
+            machine: None,
+        });
+    }
+
+    /// Delivers one [`Event`], overwriting its `machine` with the machine bound to this sink when
+    /// one is set.
+    pub fn emit_event(&self, mut event: Event) {
+        if let Some(deliver) = &self.deliver {
+            if let Some(machine) = &self.machine {
+                event.machine = Some(machine.to_string());
+            }
+            deliver(event);
         }
     }
 }
 
 impl fmt::Debug for EventSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0.is_some() {
-            "EventSink"
-        } else {
-            "EventSink(discard)"
-        })
+        match (&self.deliver, &self.machine) {
+            (Some(_), Some(machine)) => write!(f, "EventSink({machine})"),
+            (Some(_), None) => f.write_str("EventSink"),
+            (None, _) => f.write_str("EventSink(discard)"),
+        }
     }
 }
 
@@ -90,9 +143,16 @@ pub struct Ctx {
     pub(crate) grant: Grant,
     pub(crate) cancel: CancellationToken,
     pub(crate) events: EventSink,
+    pub(crate) hops: u32,
 }
 
 impl Ctx {
+    /// The node running this call, for tools that authorise or audit forwarded operations against
+    /// this node's live policy and audit log.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// The name of the node the tool runs on.
     pub fn node_name(&self) -> &str {
         &self.name
@@ -113,6 +173,12 @@ impl Ctx {
         self.node.paths()
     }
 
+    /// An identifier of the machine's current boot, the one `hello` reports; `None` when the
+    /// platform will not say.
+    pub fn boot_id(&self) -> Option<String> {
+        self.node.boot_id()
+    }
+
     /// The principal the call acts as.
     pub fn principal(&self) -> &str {
         self.grant.principal()
@@ -121,6 +187,12 @@ impl Ctx {
     /// The door the call came through.
     pub fn door(&self) -> Door {
         self.door
+    }
+
+    /// How many nodes have already forwarded the call this tool is running for; `0` when the call
+    /// started on this node.
+    pub fn hops(&self) -> u32 {
+        self.hops
     }
 
     /// What the call is allowed. File tools check every path with
@@ -155,9 +227,14 @@ impl Ctx {
         self.events.emit(kind, data);
     }
 
-    /// Every tool the node offers.
+    /// Every tool the node offers, built-ins and reloadable extensions alike.
     pub fn tools(&self) -> Vec<ToolSpec> {
-        self.node.registry().specs()
+        self.node.specs()
+    }
+
+    /// Whether `name` is registered as a built-in tool on this node.
+    pub fn has_builtin(&self, name: &str) -> bool {
+        self.node.registry().get(name).is_some()
     }
 
     /// The node's configuration files.
@@ -168,6 +245,11 @@ impl Ctx {
     /// The configuration documents the node reads.
     pub fn documents(&self) -> &[DocumentInfo] {
         self.node.registry().documents()
+    }
+
+    /// Health checks reported by reloadable tool sources.
+    pub fn source_checks(&self) -> Vec<SourceCheck> {
+        self.node.source_checks()
     }
 }
 

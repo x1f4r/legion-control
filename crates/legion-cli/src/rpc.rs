@@ -9,13 +9,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use legion_core::proto::{
     CallParams, CancelParams, CancelResult, ErrorBody, ErrorCode, EventParams, HelloParams,
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, Id, METHOD_NOT_FOUND, Notification,
     PARSE_ERROR, Request, Response, RpcError, TOOL_ERROR, ToolsParams, ToolsResult, method,
 };
-use legion_core::{Call, CancellationToken, Door, EventSink, Node, Router};
+use legion_core::{CANCEL_GRACE, Call, CancellationToken, Door, EventSink, Node, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -36,14 +37,45 @@ const MOST_CALLS: usize = 256;
 /// a result says everything on its own.
 const QUEUED: usize = 256;
 
+/// Bounded wait for cancelled calls to stop and audit when a session is signalled to shut down.
+const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(4));
+
 /// Serves one session until `input` ends and every call has replied, or until `output` fails and
 /// every call has stopped.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn serve<R, W>(
     input: R,
     output: W,
     node: Node,
     router: Arc<dyn Router>,
     pinned: Option<String>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_until(
+        input,
+        output,
+        node,
+        router,
+        pinned,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Serves one session until `input` ends, `output` closes, or `shutdown` is cancelled.
+///
+/// When `shutdown` fires, every running call is cancelled, drained within [`SHUTDOWN_GRACE`], and
+/// the router is shut down cleanly before returning.
+pub async fn serve_until<R, W>(
+    input: R,
+    output: W,
+    node: Node,
+    router: Arc<dyn Router>,
+    pinned: Option<String>,
+    shutdown: CancellationToken,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -84,17 +116,19 @@ where
             loop {
                 tokio::select! {
                     biased;
-                    () = session.out.closed() => break None,
+                    () = shutdown.cancelled() => break ReadStep::Signalled,
+                    () = session.out.closed() => break ReadStep::OutputGone,
                     Some(joined) = session.calls.join_next_with_id() => session.joined(joined).await,
-                    read = &mut read => break Some(read),
+                    read = &mut read => break ReadStep::Line(read),
                 }
             }
         };
         match next {
-            None => break Ended::OutputGone,
-            Some(Ok(Line::End)) => break Ended::InputEnded(None),
-            Some(Err(error)) => break Ended::InputEnded(Some(error)),
-            Some(Ok(Line::TooLong)) => {
+            ReadStep::Signalled => break Ended::Signalled,
+            ReadStep::OutputGone => break Ended::OutputGone,
+            ReadStep::Line(Ok(Line::End)) => break Ended::Input(None),
+            ReadStep::Line(Err(error)) => break Ended::Input(Some(error)),
+            ReadStep::Line(Ok(Line::TooLong)) => {
                 session
                     .reply(
                         None,
@@ -109,20 +143,37 @@ where
                     )
                     .await;
             }
-            Some(Ok(Line::Read)) => session.handle(&line).await,
+            ReadStep::Line(Ok(Line::Read)) => session.handle(&line).await,
         }
     };
-
-    let mut cancelled = matches!(ended, Ended::OutputGone);
+    let mut cancelled = matches!(ended, Ended::OutputGone | Ended::Signalled);
+    let mut deadline =
+        matches!(ended, Ended::Signalled).then(|| Box::pin(tokio::time::sleep(SHUTDOWN_GRACE)));
     if cancelled {
         session.cancel_all();
     }
     loop {
         tokio::select! {
             biased;
+            () = shutdown.cancelled(), if deadline.is_none() => {
+                if !cancelled {
+                    session.cancel_all();
+                    cancelled = true;
+                }
+                deadline = Some(Box::pin(tokio::time::sleep(SHUTDOWN_GRACE)));
+            }
             () = session.out.closed(), if !cancelled => {
                 session.cancel_all();
                 cancelled = true;
+            }
+            () = async {
+                match deadline.as_mut() {
+                    Some(sleep) => sleep.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            }, if deadline.is_some() => {
+                session.calls.abort_all();
+                break;
             }
             joined = session.calls.join_next_with_id() => match joined {
                 Some(joined) => session.joined(joined).await,
@@ -130,22 +181,31 @@ where
             },
         }
     }
+    session.router.shutdown().await;
     drop(session);
     let written = writer
         .await
         .map_err(|error| io::Error::other(format!("the output task stopped: {error}")))?;
     match ended {
-        Ended::InputEnded(Some(error)) => Err(error),
-        Ended::InputEnded(None) | Ended::OutputGone => written,
+        Ended::Input(Some(error)) => Err(error),
+        Ended::Input(None) | Ended::OutputGone | Ended::Signalled => written,
     }
+}
+
+enum ReadStep {
+    Signalled,
+    OutputGone,
+    Line(io::Result<Line>),
 }
 
 /// Why a session stopped reading.
 enum Ended {
     /// The input ended, or failed with this error.
-    InputEnded(Option<io::Error>),
+    Input(Option<io::Error>),
     /// Writing to the output failed.
     OutputGone,
+    /// A termination signal asked the process to shut down.
+    Signalled,
 }
 
 enum Line {
@@ -387,11 +447,12 @@ impl Session {
         let events = {
             let out = self.out.clone();
             let id = id.clone();
-            EventSink::new(move |kind, data| {
+            EventSink::with_events(move |event| {
                 let params = EventParams {
                     id: id.clone(),
-                    kind,
-                    data,
+                    kind: event.kind,
+                    data: event.data,
+                    machine: event.machine,
                 };
                 if let Ok(params) = serde_json::to_value(params)
                     && let Ok(line) =
@@ -411,6 +472,7 @@ impl Session {
             pinned: self.pinned.clone(),
             cancel,
             events,
+            hops: params.hops,
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);
@@ -418,7 +480,7 @@ impl Session {
         let running = Arc::clone(&self.running);
         let reply_id = id.clone();
         let task = self.calls.spawn(async move {
-            let result = router.call(&node, call, params.on).await;
+            let result = router.call(&node, call, params.on).await.into_wire();
             running
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -721,6 +783,55 @@ mod tests {
             .unwrap();
         assert!(ended.is_err());
         let audit = client.audit();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0]["outcome"], json!("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_token_cancels_running_calls_and_ends_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = Registry::new();
+        registry.add_fn("t.chatter", Effect::Read, "Chatters.", chatter);
+        let node = Node::new(Paths::under(dir.path()), registry);
+        let (mut input, session_input) = tokio::io::duplex(1 << 16);
+        let (session_output, output) = tokio::io::duplex(1 << 16);
+        let shutdown = CancellationToken::new();
+        let session = tokio::spawn(serve_until(
+            session_input,
+            session_output,
+            node,
+            Arc::new(Local),
+            None,
+            shutdown.clone(),
+        ));
+        let mut output = BufReader::new(output);
+        let req =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "call", "params": {"tool": "t.chatter"}});
+        input
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut first = String::new();
+        tokio::time::timeout(Duration::from_secs(10), output.read_line(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        let ev: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(ev["method"], json!("event"));
+
+        // Signal shutdown while stdin and stdout remain open.
+        shutdown.cancel();
+        let ended = tokio::time::timeout(Duration::from_secs(10), session)
+            .await
+            .expect("session did not end after shutdown signal")
+            .unwrap();
+        assert!(ended.is_ok(), "{ended:?}");
+        let log: PathBuf = dir.path().join("state").join("audit.jsonl");
+        let audit: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0]["outcome"], json!("cancelled"));
     }

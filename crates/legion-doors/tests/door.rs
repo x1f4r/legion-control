@@ -3,10 +3,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use legion_core::proto::{ErrorBody, EventKind, Target};
-use legion_core::{BoxFuture, Call, Door, Node, Paths, Router};
+use legion_core::proto::{EventKind, Target};
+use legion_core::{BoxFuture, Call, Door, Node, Paths, RouteOutcome, Router};
 use legion_doors::mcp::{McpDoor, Options};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,7 +23,10 @@ struct Routed {
 }
 
 #[derive(Default)]
-struct Recorder(Mutex<Vec<Routed>>);
+struct Recorder {
+    routed: Mutex<Vec<Routed>>,
+    shut_down: AtomicBool,
+}
 
 impl Router for Recorder {
     fn call<'a>(
@@ -30,15 +34,20 @@ impl Router for Recorder {
         _node: &'a Node,
         call: Call,
         on: Option<Target>,
-    ) -> BoxFuture<'a, Result<Value, ErrorBody>> {
-        self.0.lock().unwrap().push(Routed {
+    ) -> BoxFuture<'a, RouteOutcome> {
+        self.routed.lock().unwrap().push(Routed {
             tool: call.tool,
             args: call.args,
             on,
             door: call.door,
             pinned: call.pinned,
         });
-        Box::pin(async { Ok(json!({"routed": true})) })
+        Box::pin(async { RouteOutcome::One(Ok(json!({"routed": true}))) })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        self.shut_down.store(true, Ordering::SeqCst);
+        Box::pin(async {})
     }
 }
 
@@ -97,7 +106,8 @@ async fn on_is_taken_out_of_the_arguments_and_handed_to_the_router() {
     client_out.shutdown().await.unwrap();
     serving.await.unwrap().unwrap();
 
-    let mut routed = std::mem::take(&mut *recorder.0.lock().unwrap());
+    let mut routed = std::mem::take(&mut *recorder.routed.lock().unwrap());
+    assert!(recorder.shut_down.load(Ordering::SeqCst));
     routed.sort_by(|a, b| a.tool.cmp(&b.tool));
     assert_eq!(
         routed,
@@ -129,10 +139,10 @@ impl Router for Chatty {
         _node: &'a Node,
         call: Call,
         _on: Option<Target>,
-    ) -> BoxFuture<'a, Result<Value, ErrorBody>> {
+    ) -> BoxFuture<'a, RouteOutcome> {
         call.events.emit(EventKind::Stdout, json!("compiling\n"));
         call.events.emit(EventKind::Log, json!("done"));
-        Box::pin(async { Ok(json!({"said": 2})) })
+        Box::pin(async { RouteOutcome::One(Ok(json!({"said": 2}))) })
     }
 }
 
@@ -199,4 +209,107 @@ async fn events_reach_a_client_that_asked_for_progress_and_no_other() {
             &json!({"progressToken": "t", "progress": 2.0, "message": "done"}),
         ]
     );
+}
+
+#[tokio::test]
+async fn extension_tool_is_visible_and_callable_through_mcp_without_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("policy.toml"),
+        "[principals.observer]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+    let node = Node::new(Paths::under(dir.path()), legion_tools::registry());
+    let door = McpDoor::new(
+        node.clone(),
+        Arc::new(legion_core::Local),
+        Options {
+            pinned: Some("observer".to_owned()),
+            compact: false,
+        },
+    )
+    .unwrap();
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (server_in, server_out) = tokio::io::split(server);
+    let serving = tokio::spawn(door.serve(server_in, server_out));
+    let (client_in, mut client_out) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_in).lines();
+
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"}
+    }});
+    client_out
+        .write_all(format!("{init}\n").as_bytes())
+        .await
+        .unwrap();
+    let _ = lines.next_line().await.unwrap().unwrap();
+    client_out
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+
+    // Add two extensions AFTER the MCP door has already started: one read, one exec.
+    let tools_d = node.paths().tools_dir();
+    std::fs::create_dir_all(&tools_d).unwrap();
+    #[cfg(unix)]
+    let cmd = "printf '{\"who\":\"%s\",\"arg\":\"%s\"}' \"$LEGION_PRINCIPAL\" \"$LEGION_ARG_TAG\"";
+    #[cfg(windows)]
+    let cmd = "Write-Output ('{\"who\":\"' + $env:LEGION_PRINCIPAL + '\",\"arg\":\"' + $env:LEGION_ARG_TAG + '\"}')";
+    std::fs::write(
+        tools_d.join("custom.hello.toml"),
+        format!(
+            "name = \"custom.hello\"\ndescription = \"Says hello.\"\neffect = \"read\"\ncmd = {}\n[params.tag]\ntype = \"string\"\nrequired = true\n",
+            serde_json::to_string(cmd).unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        tools_d.join("custom.danger.toml"),
+        "name = \"custom.danger\"\ndescription = \"Runs something.\"\neffect = \"exec\"\ncmd = \"echo no\"\n",
+    )
+    .unwrap();
+
+    // tools/list sees custom_hello (read) and hides custom_danger (exec) for observer.
+    let list_req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+    client_out
+        .write_all(format!("{list_req}\n").as_bytes())
+        .await
+        .unwrap();
+    let list_reply: Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let names: Vec<&str> = list_reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"custom_hello"), "{names:?}");
+    assert!(!names.contains(&"custom_danger"), "{names:?}");
+
+    // Call custom_hello through MCP.
+    let call_req = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "custom_hello",
+        "arguments": {"tag": "mcp-live"}
+    }});
+    client_out
+        .write_all(format!("{call_req}\n").as_bytes())
+        .await
+        .unwrap();
+    let call_reply: Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(
+        call_reply["result"]["isError"],
+        json!(false),
+        "{call_reply}"
+    );
+    let body: Value =
+        serde_json::from_str(call_reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body, json!({"who": "observer", "arg": "mcp-live"}));
+
+    client_out.shutdown().await.unwrap();
+    serving.await.unwrap().unwrap();
 }

@@ -5,23 +5,40 @@
 //! never know which door or machine a call came from beyond what their [`Ctx`](legion_core::Ctx)
 //! says, so they work the same on the command line, over MCP and when forwarded from another node.
 
+pub mod agent;
 pub mod audit;
 pub mod exec;
+pub mod ext;
 pub mod fs;
+pub mod job;
 pub mod meta;
+pub mod power;
+pub mod proj;
+pub mod svc;
 pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod token;
+pub mod update;
+pub mod xfer;
 
 use legion_core::Registry;
 
 /// Adds every built-in family to `registry`.
 pub fn register_all(registry: &mut Registry) {
     meta::register(registry);
+    agent::register(registry);
     audit::register(registry);
     sys::register(registry);
     exec::register(registry);
     fs::register(registry);
+    job::register(registry);
+    proj::register(registry);
+    svc::register(registry);
+    xfer::register(registry);
+    token::register(registry);
+    power::register(registry);
+    ext::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }
