@@ -5,7 +5,3 @@
 *.cjs text eol=lf
 *.sh text eol=lf
 *.ps1 text eol=lf
-gradlew text eol=lf
-# The Gradle wrapper's batch file is the other way round: cmd.exe misreads labels in a batch file
-# with LF endings. It is kept byte for byte, with the CRLF endings Gradle writes it with.
-gradlew.bat -text
