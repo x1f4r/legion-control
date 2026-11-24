@@ -12,6 +12,7 @@ pub mod meta;
 pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod xfer;
 
 use legion_core::Registry;
 
@@ -22,6 +23,7 @@ pub fn register_all(registry: &mut Registry) {
     sys::register(registry);
     exec::register(registry);
     fs::register(registry);
+    xfer::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }
