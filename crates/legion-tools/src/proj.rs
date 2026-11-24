@@ -356,6 +356,9 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
             return Err(invalid("proj.add", &format!("`{field}` is empty"), field));
         }
     }
+    if let Some(repo) = &args.repo {
+        repo_source(repo)?;
+    }
     let exists = match &args.path {
         Some(path) => {
             let resolved = ctx.grant().check_path(path, Access::Read)?;
@@ -504,6 +507,13 @@ async fn clone(ctx: &Ctx, args: CloneArgs) -> Result<Cloned, ToolError> {
             args.project, args.project
         )));
     };
+    let source = match repo_source(&repo)? {
+        RepoSource::Remote(url) => OsString::from(url),
+        RepoSource::Local(path) => ctx
+            .grant()
+            .check_path(&path, Access::Read)?
+            .into_os_string(),
+    };
     let written = args
         .path
         .clone()
@@ -541,7 +551,7 @@ async fn clone(ctx: &Ctx, args: CloneArgs) -> Result<Cloned, ToolError> {
             OsString::from("--progress"),
             // Everything after this is a repository and a directory, even when it starts with `-`.
             OsString::from("--"),
-            OsString::from(&repo),
+            source,
             destination.clone().into_os_string(),
         ],
         cwd: None,
@@ -549,7 +559,8 @@ async fn clone(ctx: &Ctx, args: CloneArgs) -> Result<Cloned, ToolError> {
         timeout: CLONE_TIMEOUT,
         cancel: &cancel,
         on_output: Some(forward),
-        config: Vec::new(),
+        // Belt and braces: repo_source already refuses every `transport::address`.
+        config: vec!["protocol.ext.allow=never".to_owned()],
     }
     .run();
     tokio::pin!(run);
@@ -594,6 +605,81 @@ async fn clone(ctx: &Ctx, args: CloneArgs) -> Result<Cloned, ToolError> {
         path: destination.display().to_string(),
         head,
     })
+}
+
+/// Where a clone comes from, once its form has been checked.
+#[derive(Debug, PartialEq, Eq)]
+enum RepoSource {
+    /// A URL git fetches over the network: `https://`, `ssh://`, `git://` or `user@host:path`.
+    Remote(String),
+    /// A repository on this machine, which the caller must be allowed to read.
+    Local(String),
+}
+
+/// Sorts a `repo` into the forms a clone accepts and refuses every other.
+///
+/// git understands many more: `transport::address` runs a helper program (`ext::` runs any
+/// command), an argument starting with `-` is taken for an option by some transports, and a local
+/// path is a way to copy a repository the caller may not read. So only the network forms people
+/// use, and local paths that go through the grant like every file a tool reads, are let through.
+fn repo_source(repo: &str) -> Result<RepoSource, ErrorBody> {
+    let refuse = |why: &str| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("{repo:?} is not a repository proj.clone fetches from: {why}."),
+        )
+        .with_hint("Record an https://, ssh:// or git:// URL, user@host:path, or an absolute path on this machine, with proj.add.")
+    };
+    let lower = repo.to_ascii_lowercase();
+    if repo.starts_with('-') {
+        return Err(refuse("it would be taken for an option"));
+    }
+    if ["https://", "ssh://", "git://"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+    {
+        return Ok(RepoSource::Remote(repo.to_owned()));
+    }
+    if let Some(rest) = lower
+        .strip_prefix("file://")
+        .map(|_| &repo["file://".len()..])
+    {
+        // file:///home/me/x, or file:///C:/Users/me/x on Windows; no host.
+        let Some(path) = rest.strip_prefix('/') else {
+            return Err(refuse(
+                "a file:// URL names no host and starts its path with /",
+            ));
+        };
+        let drive = path.as_bytes().get(1) == Some(&b':');
+        return Ok(RepoSource::Local(if drive {
+            path.to_owned()
+        } else {
+            format!("/{path}")
+        }));
+    }
+    if repo.contains("://") {
+        return Err(refuse(
+            "only https://, ssh://, git:// and file:// URLs are taken",
+        ));
+    }
+    if repo.contains("::") {
+        return Err(refuse("a transport helper can run any program"));
+    }
+    if let Some((before, _)) = repo.split_once(':')
+        && let Some((user, host)) = before.split_once('@')
+        && !before.contains(['/', '\\'])
+        && !user.is_empty()
+        && !host.is_empty()
+        && !host.starts_with('-')
+    {
+        return Ok(RepoSource::Remote(repo.to_owned()));
+    }
+    if repo.starts_with('~') || Path::new(repo).is_absolute() {
+        return Ok(RepoSource::Local(repo.to_owned()));
+    }
+    Err(refuse(
+        "it is not a URL, user@host:path or an absolute path",
+    ))
 }
 
 /// Splits git's progress output, which redraws one line with carriage returns, into the lines a
@@ -1370,6 +1456,53 @@ mod tests {
         for name in ["proj.list", "proj.status", "proj.discover"] {
             assert_eq!(effect(name), Some(Effect::Read), "{name}");
         }
+    }
+
+    #[test]
+    fn only_the_usual_repository_forms_are_cloned() {
+        let remote = |repo: &str| Some(RepoSource::Remote(repo.to_owned()));
+        let local = |path: &str| Some(RepoSource::Local(path.to_owned()));
+        for (repo, expected) in [
+            (
+                "https://git.example/me/site.git",
+                remote("https://git.example/me/site.git"),
+            ),
+            (
+                "ssh://me@git.example/site.git",
+                remote("ssh://me@git.example/site.git"),
+            ),
+            (
+                "git://git.example/site.git",
+                remote("git://git.example/site.git"),
+            ),
+            (
+                "git@git.example:me/site.git",
+                remote("git@git.example:me/site.git"),
+            ),
+            ("file:///home/me/site.git", local("/home/me/site.git")),
+            (
+                "file:///C:/Users/me/site.git",
+                local("C:/Users/me/site.git"),
+            ),
+            ("~/site.git", local("~/site.git")),
+            ("ext::sh -c touch% /x", None),
+            ("fd::3", None),
+            ("-uevil", None),
+            ("http://git.example/site.git", None),
+            ("ftp://git.example/site.git", None),
+            ("file://host/site.git", None),
+            ("git.example:site.git", None),
+            ("me@-oProxyCommand=x:site", None),
+            ("site.git", None),
+        ] {
+            assert_eq!(repo_source(repo).ok(), expected, "{repo}");
+        }
+        assert_eq!(
+            repo_source("/home/me/site.git").ok(),
+            Path::new("/home/me/site.git")
+                .is_absolute()
+                .then(|| RepoSource::Local("/home/me/site.git".to_owned()))
+        );
     }
 
     #[test]

@@ -81,6 +81,9 @@ fn main() -> ExitCode {
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
+        ("clone_takes_only_repositories_it_may_read", || {
+            Box::pin(clone_takes_only_repositories_it_may_read())
+        }),
         (
             "git_indirection_does_not_lead_a_confined_role_outside",
             || Box::pin(git_indirection_does_not_lead_a_confined_role_outside()),
@@ -314,6 +317,10 @@ async fn list_and_add_record_projects_per_machine() {
             ErrorCode::InvalidArgs,
         ),
         (json!({"name": "x", "repo": " "}), ErrorCode::InvalidArgs),
+        (
+            json!({"name": "x", "repo": "ext::sh -c x"}),
+            ErrorCode::InvalidArgs,
+        ),
         (
             json!({"name": "x", "colour": "red"}),
             ErrorCode::InvalidArgs,
@@ -1134,4 +1141,80 @@ async fn git_indirection_does_not_lead_a_confined_role_outside() {
         json!("Secret subject"),
         "{owner:#}"
     );
+}
+
+async fn clone_takes_only_repositories_it_may_read() {
+    let fixture = tower();
+    fixture.write_config(
+        "policy.toml",
+        concat!(
+            "[principals.\"agent:claude\"]\nrole = \"builder\"\n",
+            "[principals.worker]\nrole = \"worker\"\n",
+            "[roles.builder]\nallow = [\"effect:read\", \"effect:write\", \"effect:exec\"]\npaths = [\"~/projects/**\"]\n",
+            "[roles.worker]\nallow = [\"effect:read\", \"effect:write\", \"effect:exec\"]\n",
+        ),
+    );
+    let remotes = fixture.dir.path().join("remotes");
+    std::fs::create_dir_all(&remotes).unwrap();
+    let outside = bare(&remotes, "lib");
+    let outside_url = format!(
+        "file:///{}",
+        outside
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    let mut text = String::new();
+    for (name, repo) in [
+        ("ext", "ext::sh -c touch% /x".to_owned()),
+        ("option", "--upload-pack=touch /x".to_owned()),
+        ("plain", "http://git.example/me/x.git".to_owned()),
+        ("relative", "remotes/lib.git".to_owned()),
+        ("path", outside.to_string_lossy().into_owned()),
+        ("url", outside_url.clone()),
+    ] {
+        text.push_str(&format!(
+            "[projects.{name}]\nrepo = {}\n",
+            toml_string(&repo)
+        ));
+    }
+    fixture.write_config("projects.toml", &text);
+
+    for name in ["ext", "option", "plain", "relative"] {
+        let error = fixture
+            .call("proj.clone", json!({"project": name}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgs, "{name}: {error:?}");
+        assert!(
+            !fixture.home().join("projects").join(name).exists(),
+            "{name}"
+        );
+    }
+    // A local repository outside the confined role's paths cannot be read through a clone.
+    for name in ["path", "url"] {
+        let error = fixture
+            .call_as("agent:claude", "proj.clone", json!({"project": name}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied, "{name}: {error:?}");
+    }
+    let cloned = fixture
+        .call("proj.clone", json!({"project": "url"}))
+        .await
+        .unwrap();
+    assert_eq!(cloned["name"], json!("url"), "{cloned:#}");
+
+    // Legion's own configuration is not a place to clone into without admin.
+    let config = fixture.dir.path().join("config").join("lib");
+    let error = fixture
+        .call_as(
+            "worker",
+            "proj.clone",
+            json!({"project": "path", "path": config.to_str().unwrap()}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+    assert!(!config.exists());
 }
