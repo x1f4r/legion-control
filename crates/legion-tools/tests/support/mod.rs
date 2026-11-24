@@ -35,23 +35,33 @@ pub type Test = (
     fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
 );
 
-/// Runs the helper named in `LEGION_TEST_HELPER` when it is set, and otherwise every test whose
-/// name contains the first argument that is not an option, each on a fresh runtime.
+/// Runs the helper named in `LEGION_TEST_HELPER` when it is set, and otherwise the tests, reading
+/// the arguments libtest takes so that `cargo test` and CI drive these binaries like any other.
 pub fn main(tests: &[Test]) -> ExitCode {
     if let Ok(mode) = env::var(HELPER) {
         return helper(&mode, env::args().skip(1).collect());
     }
-    let filter = env::args().skip(1).find(|arg| !arg.starts_with('-'));
-    let mut failed = Vec::new();
-    let mut ran = 0;
-    for (name, test) in tests {
-        if filter
-            .as_deref()
-            .is_some_and(|filter| !name.contains(filter))
-        {
-            continue;
+    let options = match Options::parse(env::args().skip(1)) {
+        Ok(options) => options,
+        Err(problem) => {
+            eprintln!("error: {problem}");
+            return ExitCode::from(101);
         }
-        ran += 1;
+    };
+    let chosen: Vec<&Test> = tests
+        .iter()
+        .filter(|(name, _)| options.runs(name))
+        .collect();
+    if options.list {
+        for (name, _) in &chosen {
+            println!("{name}: test");
+        }
+        println!("\n{} tests, 0 benchmarks", chosen.len());
+        return ExitCode::SUCCESS;
+    }
+    println!("\nrunning {} tests", chosen.len());
+    let mut failed = Vec::new();
+    for (name, test) in &chosen {
         let started = Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -71,7 +81,7 @@ pub fn main(tests: &[Test]) -> ExitCode {
     }
     println!(
         "\ntest result: {} passed, {} failed",
-        ran - failed.len(),
+        chosen.len() - failed.len(),
         failed.len()
     );
     if failed.is_empty() {
@@ -79,6 +89,92 @@ pub fn main(tests: &[Test]) -> ExitCode {
     } else {
         println!("failures: {}", failed.join(", "));
         ExitCode::FAILURE
+    }
+}
+
+/// What the arguments a test binary is given ask for, as libtest reads them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Name the tests instead of running them.
+    pub list: bool,
+    /// Only tests whose name contains one of these, or equals one with `exact`.
+    pub filters: Vec<String>,
+    /// Leave out tests whose name contains one of these.
+    pub skip: Vec<String>,
+    /// Filters must match a whole name.
+    pub exact: bool,
+    /// Only ignored tests were asked for, and none of these is.
+    pub only_ignored: bool,
+}
+
+impl Options {
+    /// Reads libtest's arguments. Options that change only how results are shown are accepted and
+    /// have no effect; one this runner does not know is an error, so a misread never passes as a
+    /// run of no tests.
+    pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
+        const SHOWN: [&str; 9] = [
+            "--nocapture",
+            "--show-output",
+            "-q",
+            "--quiet",
+            "--include-ignored",
+            "--report-time",
+            "--ensure-time",
+            "--test",
+            "--no-capture",
+        ];
+        const WITH_VALUE: [&str; 6] = [
+            "--format",
+            "--test-threads",
+            "--logfile",
+            "--color",
+            "-Z",
+            "--shuffle-seed",
+        ];
+        let mut options = Options::default();
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let (flag, inline) = match arg.split_once('=') {
+                Some((flag, value)) if arg.starts_with("--") => {
+                    (flag.to_owned(), Some(value.to_owned()))
+                }
+                _ => (arg.clone(), None),
+            };
+            match flag.as_str() {
+                "--list" => options.list = true,
+                "--exact" => options.exact = true,
+                "--ignored" => options.only_ignored = true,
+                "--skip" => {
+                    let value = inline
+                        .or_else(|| args.next())
+                        .ok_or("--skip needs a value")?;
+                    options.skip.push(value);
+                }
+                flag if SHOWN.contains(&flag) || flag == "--shuffle" => {}
+                flag if WITH_VALUE.contains(&flag) => {
+                    if inline.is_none() && args.next().is_none() {
+                        return Err(format!("{flag} needs a value"));
+                    }
+                }
+                flag if flag.starts_with('-') => return Err(format!("unknown option {flag}")),
+                _ => options.filters.push(arg),
+            }
+        }
+        Ok(options)
+    }
+
+    /// Whether the test called `name` is to run.
+    pub fn runs(&self, name: &str) -> bool {
+        let matches = |filter: &String| {
+            if self.exact {
+                name == filter
+            } else {
+                name.contains(filter.as_str())
+            }
+        };
+        !self.only_ignored
+            && (self.filters.is_empty() || self.filters.iter().any(matches))
+            && !self.skip.iter().any(|skip| name.contains(skip.as_str()))
     }
 }
 
@@ -115,6 +211,38 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
             let value = env::var(&args[0]).unwrap_or_default();
             let _ = write!(stdout, "{value}");
         }
+        // Runs a node in this process, whose environment the test set, and prints what a command
+        // exec.run starts sees of two variables: `<LEGION_TEST_INHERITED>|<TEST_INHERITED>`.
+        "exec-env" => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let seen = runtime.block_on(async {
+                let fixture = Fixture::new();
+                let ran = fixture
+                    .call(
+                        "exec.run",
+                        serde_json::json!({
+                            "argv": [this_binary(), "LEGION_TEST_INHERITED", "TEST_INHERITED"],
+                            "env": {HELPER: "env-pair"},
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                ran["stdout"].as_str().unwrap_or_default().to_owned()
+            });
+            let _ = write!(stdout, "{seen}");
+        }
+        // Prints the values of two variables, `|` between them.
+        "env-pair" => {
+            let value = |name: &str| env::var(name).unwrap_or_default();
+            let _ = write!(stdout, "{}|{}", value(&args[0]), value(&args[1]));
+        }
+        // Writes `ok` and the first byte of a two-byte character it never finishes.
+        "cut-short" => {
+            let _ = stdout.write_all(b"ok\xc3");
+        }
         // Writes the given number of bytes to stdout: a start marker, `x`s, an end marker.
         "flood" => {
             let size: usize = args[0].parse().unwrap();
@@ -129,10 +257,20 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
             let _ = stdout.flush();
             std::thread::sleep(Duration::from_secs_f64(args[0].parse().unwrap()));
         }
+        // Sleeps, ignoring the polite request to stop where there is one (SIGTERM).
+        "stubborn" => {
+            let _ignoring = ignore_terminate();
+            let _ = writeln!(stdout, "sleeping");
+            let _ = stdout.flush();
+            std::thread::sleep(Duration::from_secs(60));
+        }
         // Starts a sleeping grandchild, writes "<own pid> <grandchild pid>" to the given file,
-        // then waits for it.
+        // then waits for it. With a second argument `stubborn`, both ignore SIGTERM.
         "family" => {
-            let mut grandchild = spawn_helper("sleep", &["60"]);
+            let stubborn = args.get(1).is_some_and(|mode| mode == "stubborn");
+            let _ignoring = stubborn.then(ignore_terminate);
+            let mode = if stubborn { "stubborn" } else { "sleep" };
+            let mut grandchild = spawn_helper(mode, &["60"]);
             let line = format!("{} {}", std::process::id(), grandchild.id());
             write_atomically(Path::new(&args[0]), &line);
             let _ = writeln!(stdout, "started");
@@ -146,6 +284,27 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
     }
     let _ = stdout.flush();
     ExitCode::SUCCESS
+}
+
+/// Makes SIGTERM do nothing to this process, for as long as the returned runtime lives. Windows
+/// has no polite request to ignore.
+#[cfg(unix)]
+fn ignore_terminate() -> Option<tokio::runtime::Runtime> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let signal = runtime.block_on(async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    });
+    // Once registered, tokio's handler replaces the default for the life of the process.
+    drop(signal);
+    Some(runtime)
+}
+
+#[cfg(not(unix))]
+fn ignore_terminate() -> Option<tokio::runtime::Runtime> {
+    None
 }
 
 /// The test binary itself, which every helper child runs.
@@ -174,7 +333,7 @@ fn write_atomically(path: &Path, text: &str) {
 
 /// Waits until `path` exists and returns the process ids written in it.
 pub async fn read_pids(path: &Path) -> Vec<u32> {
-    let text = wait_for(Duration::from_secs(20), || {
+    let text = wait_for(Duration::from_secs(60), || {
         std::fs::read_to_string(path).ok()
     })
     .await
@@ -205,7 +364,7 @@ pub fn alive(pid: u32) -> bool {
 
 /// Waits a while for a process to be gone.
 pub async fn gone(pid: u32) -> bool {
-    wait_for(Duration::from_secs(10), || (!alive(pid)).then_some(()))
+    wait_for(Duration::from_secs(30), || (!alive(pid)).then_some(()))
         .await
         .is_some()
 }

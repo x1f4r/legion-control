@@ -374,6 +374,34 @@ pub fn redact_message(message: &str) -> Value {
     redact_value(None, &Value::String(message.to_owned()))
 }
 
+/// What [`redact_command`] puts in place of a secret.
+pub const REDACTED: &str = "[redacted]";
+
+/// A command line's arguments as a person may be shown them, by the rules the log applies to
+/// argument lists: the value after a secret flag (`--password x`, `-p x`), the value of a secret
+/// assignment (`--token=x` keeps `--token=`), and any argument that gives a secret away by itself
+/// (a known token, a URL with credentials, a bearer header) become [`REDACTED`].
+pub fn redact_command(args: &[String]) -> Vec<String> {
+    let mut follows_flag = false;
+    args.iter()
+        .map(|arg| {
+            let shown = if follows_flag {
+                REDACTED.to_owned()
+            } else if let Some((name, _)) = arg.split_once('=')
+                && (takes_secret(name) || is_sensitive_key(name.trim_start_matches('-')))
+            {
+                format!("{name}={REDACTED}")
+            } else if looks_secret(arg) {
+                REDACTED.to_owned()
+            } else {
+                arg.clone()
+            };
+            follows_flag = takes_secret(arg);
+            shown
+        })
+        .collect()
+}
+
 fn redact_value(key: Option<&str>, value: &Value) -> Value {
     if key.is_some_and(is_sensitive_key) {
         return size_of(value);
@@ -861,6 +889,40 @@ mod tests {
             lines
                 .iter()
                 .all(|line| serde_json::from_str::<Value>(line).is_ok())
+        );
+    }
+
+    #[test]
+    fn a_command_line_keeps_its_shape_and_loses_its_secrets() {
+        let args: Vec<String> = [
+            "mysql",
+            "--user",
+            "me",
+            "--password",
+            "hunter2",
+            "--api-key=abc123",
+            "--host=db",
+            "https://me:pw@example.com/x",
+            "ghp_0123456789abcdef",
+            "plain",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+        assert_eq!(
+            redact_command(&args),
+            [
+                "mysql",
+                "--user",
+                REDACTED,
+                "--password",
+                REDACTED,
+                "--api-key=[redacted]",
+                "--host=db",
+                REDACTED,
+                REDACTED,
+                "plain",
+            ]
         );
     }
 }
