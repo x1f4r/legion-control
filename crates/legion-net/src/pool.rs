@@ -1250,7 +1250,13 @@ impl Router for Fleet {
                         Ok(file) => file,
                         Err(err) => return RouteOutcome::One(Err(ensure_machine(err, &here))),
                     };
-                    let names: Vec<String> = fleet_file.machines.keys().cloned().collect();
+                    let mut names = Vec::with_capacity(fleet_file.machines.len() + 1);
+                    names.push(here.clone());
+                    for name in fleet_file.machines.keys() {
+                        if name != &here {
+                            names.push(name.clone());
+                        }
+                    }
                     self.fan_out(node, call, names).await
                 }
                 Some(Target::Many(names)) => {

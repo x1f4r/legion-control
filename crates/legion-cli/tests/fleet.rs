@@ -1311,6 +1311,33 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
             "ssh: connect to host tower.example: Connection refused".to_owned(),
         ],
     );
+    // First, `fleet.toml` does NOT list this node (`laptop`): `all` must still include `laptop`
+    // alongside every machine in `fleet.toml`.
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n",
+            toml_argv(&run_argv(&pi, None)),
+            toml_argv(&fail_argv),
+        ),
+    );
+    let all_unlisted = laptop.run(&["meta.version", "--on", "all"]);
+    assert_eq!(
+        all_unlisted.code, 0,
+        "partial fan-out should exit 0: {}",
+        all_unlisted.stdout
+    );
+    let results_unlisted = &all_unlisted.json()["results"];
+    assert_eq!(results_unlisted.as_object().unwrap().len(), 3);
+    assert_eq!(results_unlisted["laptop"]["ok"]["node"], json!("laptop"));
+    assert_eq!(results_unlisted["pi"]["ok"]["node"], json!("pi"));
+    assert_eq!(
+        results_unlisted["tower"]["error"]["code"],
+        json!("unreachable")
+    );
+
+    // When `laptop` IS also listed in `fleet.toml`, `all` includes it once without duplicates.
+    let before_audit = laptop.audit().len();
     laptop.write_config(
         "fleet.toml",
         &format!(
@@ -1324,10 +1351,16 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
     let all = laptop.run(&["meta.version", "--on", "all"]);
     assert_eq!(all.code, 0, "partial fan-out should exit 0: {}", all.stdout);
     let results = &all.json()["results"];
+    assert_eq!(results.as_object().unwrap().len(), 3);
     assert_eq!(results["laptop"]["ok"]["node"], json!("laptop"));
     assert_eq!(results["pi"]["ok"]["node"], json!("pi"));
     assert_eq!(results["tower"]["error"]["code"], json!("unreachable"));
     assert_eq!(results["tower"]["error"]["machine"], json!("tower"));
+    assert_eq!(
+        laptop.audit().len() - before_audit,
+        3,
+        "listing this node in fleet.toml must not run or audit it twice"
+    );
     assert!(
         results["tower"]["error"]["hint"]
             .as_str()
