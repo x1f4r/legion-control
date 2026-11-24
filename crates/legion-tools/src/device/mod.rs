@@ -1607,7 +1607,12 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     }
 
     let blocking_result = tokio::task::spawn_blocking(move || -> Result<
-        (Removed, Option<sessions::SessionTarget>, Vec<sessions::SessionTarget>),
+        (
+            Removed,
+            Option<sessions::SessionTarget>,
+            Vec<sessions::SessionTarget>,
+            bool,
+        ),
         RemoveBlockingError,
     > {
         let _cfg_guard = lock_config(&paths).map_err(RemoveBlockingError::BeforeSave)?;
@@ -1818,6 +1823,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     },
                     Some(primary_target),
                     extra_stale,
+                    true,
                 ));
             }
         }
@@ -2387,7 +2393,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 if let Some(state) = state_to_save {
                     save_state(&paths, &state).map_err(RemoveBlockingError::BeforeSave)?;
                 }
-                Ok((result, terminate, extra_stale))
+                Ok((result, terminate, extra_stale, false))
             }
             Err(err) => {
                 if let Some(devices) = devices_to_save {
@@ -2408,7 +2414,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         )
     })?;
 
-    let (mut removed, terminate_target, extra_stale) = match blocking_result {
+    let (mut removed, terminate_target, extra_stale, push_to_fleet) = match blocking_result {
         Ok(ok) => ok,
         Err(RemoveBlockingError::BeforeSave(err)) => return Err(err),
         Err(RemoveBlockingError::AfterSave { error, tombstoned }) => {
@@ -2454,24 +2460,26 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         .await
         .unwrap_or_default();
 
-        let fleet_outcomes = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
-        let still_trusted: Vec<String> = fleet_outcomes
-            .iter()
-            .filter(|(_, outcome)| outcome.status != "synced")
-            .map(|(machine, _)| machine.clone())
-            .collect();
-        if !still_trusted.is_empty() {
-            let label = match target.pairing_id.as_deref() {
-                Some(id) => format!("{} ({id})", target.device),
-                None => target.device.clone(),
-            };
-            removed.hint = Some(format!(
-                "These machines could not be reached and still trust {label} until their next sync: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` when they are back online.",
-                still_trusted.join(", ")
-            ));
+        if push_to_fleet {
+            let fleet_outcomes = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
+            let still_trusted: Vec<String> = fleet_outcomes
+                .iter()
+                .filter(|(_, outcome)| outcome.status != "synced")
+                .map(|(machine, _)| machine.clone())
+                .collect();
+            if !still_trusted.is_empty() {
+                let label = match target.pairing_id.as_deref() {
+                    Some(id) => format!("{} ({id})", target.device),
+                    None => target.device.clone(),
+                };
+                removed.hint = Some(format!(
+                    "These machines could not be reached and still trust {label} until their next sync: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` when they are back online.",
+                    still_trusted.join(", ")
+                ));
+            }
+            removed.fleet = fleet_outcomes;
+            removed.still_trusted_by = still_trusted;
         }
-        removed.fleet = fleet_outcomes;
-        removed.still_trusted_by = still_trusted;
     }
 
     Ok(removed)
@@ -5114,5 +5122,101 @@ device = \"{id_healthy}\"
                 "authorized_keys must stay unchanged when swap fails"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn nit_removing_local_only_device_does_not_push_to_fleet_or_report_still_trusted_by() {
+        use crate::device::authkeys::{ForcedCommandShell, PinnedHome, format_device_line};
+        use crate::device::keys::ed25519_public_key_from_seed;
+
+        let h = Harness::new();
+        // Configure another fleet machine (`pi`) so any fleet push attempt produces a `fleet` entry
+        // and `still_trusted_by = ["pi"]`.
+        std::fs::write(
+            h.node.paths().config_file("fleet.toml"),
+            r#"
+[machines.tower]
+default = "linux"
+[machines.tower.systems.linux]
+host = "tower.example"
+
+[machines.pi]
+default = "linux"
+[machines.pi.systems.linux]
+host = "pi.example"
+"#,
+        )
+        .unwrap();
+        // Empty devices.toml ensures lines present only in authorized_keys are local-only.
+        std::fs::write(h.node.paths().config_file("devices.toml"), "version = 1\n").unwrap();
+
+        let exe = legion_core::current_exe().unwrap();
+        let shell = ForcedCommandShell::host().unwrap();
+        let pinned_home = PinnedHome::from_paths(h.node.paths());
+        let id_by_name = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+        let id_by_id = "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3";
+        let line_by_name = format_device_line(
+            &exe,
+            "phone",
+            &ed25519_public_key_from_seed(&[0x71; 32]),
+            "local-name",
+            id_by_name,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        let line_by_id = format_device_line(
+            &exe,
+            "phone",
+            &ed25519_public_key_from_seed(&[0x72; 32]),
+            "local-id",
+            id_by_id,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        std::fs::write(&h.auth_keys, format!("{line_by_name}\n{line_by_id}\n")).unwrap();
+
+        // 1. Remove local-only device by name: must not push to fleet or report still_trusted_by.
+        let removed_name = h
+            .call("device.remove", json!({"name": "local-name"}))
+            .await
+            .unwrap();
+        assert_eq!(removed_name["removed"], json!(true));
+        assert_eq!(removed_name["lines_removed"], json!(1));
+        assert!(
+            removed_name.get("fleet").is_none(),
+            "local-only removal by name must not push to fleet: {removed_name}"
+        );
+        assert!(
+            removed_name.get("still_trusted_by").is_none(),
+            "local-only removal by name must not list fleet machines as still trusting it: {removed_name}"
+        );
+        assert!(
+            removed_name.get("hint").is_none(),
+            "local-only removal by name must not emit a fleet sync hint: {removed_name}"
+        );
+
+        // 2. Remove local-only device by pairing id: same guarantee.
+        let removed_id = h
+            .call("device.remove", json!({"id": id_by_id}))
+            .await
+            .unwrap();
+        assert_eq!(removed_id["removed"], json!(true));
+        assert_eq!(removed_id["lines_removed"], json!(1));
+        assert!(
+            removed_id.get("fleet").is_none(),
+            "local-only removal by id must not push to fleet: {removed_id}"
+        );
+        assert!(
+            removed_id.get("still_trusted_by").is_none(),
+            "local-only removal by id must not list fleet machines as still trusting it: {removed_id}"
+        );
+        assert!(
+            removed_id.get("hint").is_none(),
+            "local-only removal by id must not emit a fleet sync hint: {removed_id}"
+        );
     }
 }
