@@ -542,6 +542,9 @@ impl ForcedCommandShell {
 /// Characters `cmd.exe` interprets even inside or around double quotes (or that break quoting).
 const CMD_UNSAFE_CHARS: &[char] = &['%', '&', '(', ')', '^', '!', '"'];
 
+/// Unicode single-quote variants that PowerShell's lexer treats as single-quoted string delimiters.
+const PS_UNSAFE_SINGLE_QUOTES: &[char] = &['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
+
 /// Formats the value placed inside `command="..."` in `authorized_keys`.
 ///
 /// The executable path must be absolute, valid UTF-8, and free of control characters.
@@ -549,9 +552,10 @@ const CMD_UNSAFE_CHARS: &[char] = &['%', '&', '(', ')', '^', '!', '"'];
 /// - [`ForcedCommandShell::Posix`]: bare ASCII tokens or `'...'` with `'\''`.
 /// - [`ForcedCommandShell::WindowsCmd`]: refuses `%`, `&`, `(`, `)`, `^`, `!`, and `"` in paths
 ///   and arguments, and double-quotes tokens with spaces or non-ASCII characters.
-/// - [`ForcedCommandShell::WindowsPowerShell`]: emits `& '<exe>' ...` with `'` doubled (`''`) and
-///   single-quotes any argument that could trigger PowerShell parsing or splatting (including
-///   leading `@`, spaces, quotes, `$`, or non-ASCII).
+/// - [`ForcedCommandShell::WindowsPowerShell`]: emits `& '<exe>' ...` with `'` doubled (`''`),
+///   refuses Unicode single-quote delimiters (`U+2018`..=`U+201B`), and single-quotes any argument
+///   that could trigger PowerShell parsing or splatting (including leading `@`, spaces, quotes,
+///   `$`, or non-ASCII).
 ///
 /// Finally escapes every `"` as `\"` for OpenSSH's `authorized_keys` option parser (which only
 /// unescapes `\"` inside double-quoted option values).
@@ -657,14 +661,34 @@ pub fn format_forced_command(
             out
         }
         ForcedCommandShell::WindowsPowerShell => {
-            let quote_ps_single = |token: &str| -> String {
+            let check_ps_token = |label: &str, token: &str| -> Result<(), ErrorBody> {
+                if let Some(bad) = token
+                    .chars()
+                    .find(|ch| PS_UNSAFE_SINGLE_QUOTES.contains(ch))
+                {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "Cannot place {label} {token:?} in a Windows PowerShell forced command because it contains Unicode quote U+{:04X}, which PowerShell treats as a string delimiter.",
+                            u32::from(bad)
+                        ),
+                    )
+                    .with_hint(
+                        "Use a path or name without Unicode curly single quotes (U+2018..U+201B), or switch HKLM\\SOFTWARE\\OpenSSH\\DefaultShell to cmd.exe or a POSIX shell.",
+                    ));
+                }
+                Ok(())
+            };
+            let quote_ps_single = |label: &str, token: &str| -> Result<String, ErrorBody> {
+                check_ps_token(label, token)?;
                 let escaped = token.replace('\'', "''");
-                format!("'{escaped}'")
+                Ok(format!("'{escaped}'"))
             };
             // Always invoke the executable via PowerShell's call operator `& '...'` so spaces,
             // quotes, non-ASCII, and drive paths are executed rather than parsed as a string literal.
-            let mut out = format!("& {}", quote_ps_single(exe_str));
+            let mut out = format!("& {}", quote_ps_single("executable path", exe_str)?);
             for arg in args {
+                check_ps_token("forced command argument", arg)?;
                 out.push(' ');
                 // Single-quote anything other than simple bare ASCII words/flags (`gate`, `--as`,
                 // hex ids, etc.) so leading `@` (splatting), `$`, `:`, spaces, backslashes, quotes,
@@ -676,7 +700,7 @@ pub fn format_forced_command(
                 if plain_safe {
                     out.push_str(arg);
                 } else {
-                    out.push_str(&quote_ps_single(arg));
+                    out.push_str(&quote_ps_single("forced command argument", arg)?);
                 }
             }
             out
@@ -2124,6 +2148,28 @@ mod tests {
             openssh_opt_dequote(&ps_cmd),
             r"& 'C:\Users\me\O''Neil\My Légion 日本\legion.exe' gate --as '@phone' --account 'O''Neil' --home 'C:\Users\me\O''Neil\Program Files (x86)\Legion Home'"
         );
+
+        // PowerShell treats Unicode single-quote variants U+2018..=U+201B as string delimiters,
+        // so paths or arguments containing any of them must be refused rather than escaped.
+        for bad_quote in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+            let bad_exe = format!(r"C:\Users\O{bad_quote}Neil\legion.exe");
+            let exe_err = format_forced_command(
+                Path::new(&bad_exe),
+                &["gate", "--as", "phone"],
+                ForcedCommandShell::WindowsPowerShell,
+            )
+            .unwrap_err();
+            assert_eq!(exe_err.code, ErrorCode::Failed, "{bad_quote:?}");
+
+            let bad_arg = format!(r"C:\Users\O{bad_quote}Neil\legion");
+            let arg_err = format_forced_command(
+                Path::new(r"C:\legion\legion.exe"),
+                &["gate", "--as", "phone", "--home", &bad_arg],
+                ForcedCommandShell::WindowsPowerShell,
+            )
+            .unwrap_err();
+            assert_eq!(arg_err.code, ErrorCode::Failed, "{bad_quote:?}");
+        }
 
         // Round-trip parsing of a PowerShell device line recovers principal, account, and home.
         let ps_line = format_device_line(
