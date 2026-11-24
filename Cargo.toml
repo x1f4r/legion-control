@@ -45,6 +45,12 @@ regex = "1.13.2"
 legion-doors = { path = "crates/legion-doors" }
 # The official MCP SDK; it speaks the revisions with and without the initialize handshake.
 rmcp = { version = "3.11.0", default-features = false }
+# The HTTP door: axum routes, hyper serves each connection so its timeouts and shutdown are ours,
+# http-body for the event stream's body. The versions are the ones rmcp's HTTP transport uses.
+axum = { version = "0.8.9", default-features = false }
+http-body = "1.1.0"
+hyper = { version = "1.13.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
