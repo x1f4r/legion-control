@@ -16,10 +16,49 @@ use super::{
     child_not_older_than_parent, is_alive,
 };
 
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WALK_PASSES: usize = 8;
 const MAX_ANCESTOR_HOPS: usize = 256;
+
+/// Verify that `child` is causally newer than `parent`, preferring monotonic Windows kernel
+/// `ProcessStartKey` values (immune to NTP / dual-boot wall-clock steps and recycled PIDs).
+///
+/// Falls back to wall-clock `FILETIME` comparison only when either process lacks a start key,
+/// restricting backward clock-step tolerance to non-protected same-user processes so recycled
+/// parent PIDs never match boot-time or elevated system processes.
+fn is_causally_not_older_than_parent(
+    child: &PinnedProcess,
+    parent_id: &ProcessId,
+    parent_start_key: Option<u64>,
+    max_start_time: Option<u64>,
+    max_start_key: Option<u64>,
+) -> bool {
+    if child.parent_pid != parent_id.pid {
+        return false;
+    }
+    if let (Some(ck), Some(pk)) = (child.start_key, parent_start_key) {
+        if ck <= pk {
+            return false;
+        }
+        if max_start_key.is_some_and(|limit| ck >= limit) {
+            return false;
+        }
+        return true;
+    }
+    if max_start_time.is_some_and(|limit| child.id.start_time >= limit) {
+        return false;
+    }
+    if child.id.start_time >= parent_id.start_time {
+        return true;
+    }
+    child_not_older_than_parent(
+        child.id.start_time,
+        parent_id.start_time,
+        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+    ) && !child.is_protected_system()
+        && child.same_user_as_current()
+}
 
 pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
     if identity.pid == 4 {
@@ -51,6 +90,7 @@ pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
     };
     let parent_pid = self_proc.parent_pid;
     let child_start = self_proc.id.start_time;
+    let child_start_key = self_proc.start_key;
     drop(self_proc);
 
     // On Windows, `sshd.exe` session workers do not rewrite argv[0] with setproctitle, so only
@@ -60,11 +100,15 @@ pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
         return None;
     }
     let info = win_proc::inspect_process_for_sshd(parent_pid)?;
-    if !child_not_older_than_parent(
-        child_start,
-        info.id.start_time,
-        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
-    ) {
+    let valid_order = match (child_start_key, info.start_key) {
+        (Some(ck), Some(pk)) => ck > pk,
+        _ => child_not_older_than_parent(
+            child_start,
+            info.id.start_time,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+        ),
+    };
+    if !valid_order {
         return None;
     }
     windows_info_is_same_account_sshd(&info).then_some(info.id)
@@ -86,11 +130,13 @@ pub(super) fn executable_of(identity: &ProcessId) -> Option<PathBuf> {
 
 fn is_ancestor_of_current(identity: &ProcessId) -> bool {
     let own_pid = std::process::id();
-    let OpenPinnedOutcome::Pinned(self_proc) = win_proc::open_pinned(own_pid, false) else {
+    let OpenPinnedOutcome::Pinned(self_proc) = win_proc::open_pinned_query_only(own_pid, false)
+    else {
         return false;
     };
     let mut parent_pid = self_proc.parent_pid;
     let mut child_start = self_proc.id.start_time;
+    let mut child_start_key = self_proc.start_key;
     drop(self_proc);
 
     let mut seen = HashSet::new();
@@ -100,15 +146,18 @@ fn is_ancestor_of_current(identity: &ProcessId) -> bool {
         if parent_pid == 0 || parent_pid == 4 || !seen.insert(parent_pid) {
             break;
         }
-        match win_proc::open_pinned(parent_pid, false) {
+        match win_proc::open_pinned_query_only(parent_pid, false) {
             OpenPinnedOutcome::Pinned(parent_proc) => {
-                // Stop if `parent_pid` has been recycled by a process newer than its child (allowing
-                // wall-clock backward-step tolerance for dual-boot/NTP clock jumps).
-                if !child_not_older_than_parent(
-                    child_start,
-                    parent_proc.id.start_time,
-                    WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
-                ) {
+                // Stop if `parent_pid` has been recycled by a process newer than its child.
+                let valid_order = match (child_start_key, parent_proc.start_key) {
+                    (Some(ck), Some(pk)) => ck > pk,
+                    _ => child_not_older_than_parent(
+                        child_start,
+                        parent_proc.id.start_time,
+                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    ),
+                };
+                if !valid_order {
                     break;
                 }
                 if parent_proc.id.pid == identity.pid
@@ -117,6 +166,7 @@ fn is_ancestor_of_current(identity: &ProcessId) -> bool {
                     return true;
                 }
                 child_start = parent_proc.id.start_time;
+                child_start_key = parent_proc.start_key;
                 parent_pid = parent_proc.parent_pid;
             }
             OpenPinnedOutcome::AccessDenied => {
@@ -284,18 +334,22 @@ pub(super) async fn kill_tree(
             let mut unverified: HashMap<u32, ProcessId> = HashMap::new();
             let mut root_pinned = false;
             let mut root_live_unopened = false;
+            let mut root_start_key: Option<u64> = None;
             let mut recycled_root_guard: Option<PinnedProcess> = None;
             let mut direct_child_max_start: Option<u64> = None;
+            let mut direct_child_max_start_key: Option<u64> = None;
             let mut root_preceded_by_older = false;
 
             match win_proc::open_pinned(identity.pid, false) {
                 OpenPinnedOutcome::Pinned(root_proc) => {
                     if identity.matches(&root_proc.id) {
+                        root_start_key = root_proc.start_key;
                         let _ = root_proc.terminate();
                         pinned.insert(root_proc.id.pid, root_proc);
                         root_pinned = true;
                     } else if root_proc.id.start_time > identity.start_time {
                         direct_child_max_start = Some(root_proc.id.start_time);
+                        direct_child_max_start_key = root_proc.start_key;
                         recycled_root_guard = Some(root_proc);
                     } else {
                         root_preceded_by_older = true;
@@ -323,14 +377,18 @@ pub(super) async fn kill_tree(
                 for pass in 0..MAX_WALK_PASSES {
                     let mut newly_found = discover_and_terminate_pass(
                         &identity,
+                        root_start_key,
                         direct_child_max_start,
+                        direct_child_max_start_key,
                         own_pid,
                         &mut pinned,
                     )?;
                     if let Some(ref marker_val) = marker_owned {
                         newly_found += discover_marked_orphans_pass(
                             &identity,
+                            root_start_key,
                             direct_child_max_start,
+                            direct_child_max_start_key,
                             false,
                             marker_val,
                             own_pid,
@@ -350,7 +408,9 @@ pub(super) async fn kill_tree(
                         for pass in 0..MAX_WALK_PASSES {
                             let mut newly_found = discover_marked_orphans_pass(
                                 &identity,
+                                root_start_key,
                                 direct_child_max_start,
+                                direct_child_max_start_key,
                                 root_preceded_by_older,
                                 marker_val,
                                 own_pid,
@@ -360,6 +420,7 @@ pub(super) async fn kill_tree(
                             if !pinned.is_empty() {
                                 newly_found += discover_children_of_pinned_pass(
                                     &identity,
+                                    root_start_key,
                                     own_pid,
                                     &mut pinned,
                                 )?;
@@ -373,7 +434,9 @@ pub(super) async fn kill_tree(
                         if !root_preceded_by_older {
                             collect_unverified_orphans_readonly(
                                 &identity,
+                                root_start_key,
                                 direct_child_max_start,
+                                direct_child_max_start_key,
                                 own_pid,
                                 &mut unverified,
                             )?;
@@ -472,7 +535,9 @@ pub(super) async fn kill_tree(
 
 fn collect_unverified_orphans_readonly(
     root: &ProcessId,
+    root_start_key: Option<u64>,
     direct_child_max_start: Option<u64>,
+    direct_child_max_start_key: Option<u64>,
     own_pid: u32,
     unverified: &mut HashMap<u32, ProcessId>,
 ) -> Result<()> {
@@ -488,46 +553,50 @@ fn collect_unverified_orphans_readonly(
             .push(entry.pid);
     }
 
-    let mut queue: VecDeque<ProcessId> = VecDeque::new();
+    let mut queue: VecDeque<(ProcessId, Option<u64>)> = VecDeque::new();
     let mut visited: HashSet<u32> = HashSet::new();
-    queue.push_back(*root);
+    queue.push_back((*root, root_start_key));
     visited.insert(root.pid);
 
-    while let Some(parent) = queue.pop_front() {
+    while let Some((parent, parent_start_key)) = queue.pop_front() {
         let Some(children) = children_by_parent.get(&parent.pid) else {
             continue;
         };
-        let max_start = if parent.pid == root.pid {
-            direct_child_max_start
+        let (max_start, max_start_key) = if parent.pid == root.pid {
+            (direct_child_max_start, direct_child_max_start_key)
         } else {
-            None
+            (None, None)
         };
         for &child_pid in children {
-            if child_pid == own_pid || !visited.insert(child_pid) {
+            if child_pid == own_pid || child_pid == 4 || !visited.insert(child_pid) {
                 continue;
             }
             if let OpenPinnedOutcome::Pinned(child) =
                 win_proc::open_pinned_query_only(child_pid, false)
-                && child.parent_pid == parent.pid
-                && child_not_older_than_parent(
-                    child.id.start_time,
-                    parent.start_time,
-                    WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                && is_causally_not_older_than_parent(
+                    &child,
+                    &parent,
+                    parent_start_key,
+                    max_start,
+                    max_start_key,
                 )
-                && max_start.is_none_or(|limit| child.id.start_time < limit)
             {
                 let child_id = child.id;
+                let child_key = child.start_key;
                 unverified.entry(child_pid).or_insert(child_id);
-                queue.push_back(child_id);
+                queue.push_back((child_id, child_key));
             }
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_marked_orphans_pass(
     root: &ProcessId,
+    root_start_key: Option<u64>,
     direct_child_max_start: Option<u64>,
+    direct_child_max_start_key: Option<u64>,
     root_preceded_by_older: bool,
     marker: &str,
     own_pid: u32,
@@ -537,7 +606,11 @@ fn discover_marked_orphans_pass(
     let entries = win_proc::snapshot_processes()?;
     let mut newly_found = 0usize;
     for entry in entries {
-        if entry.pid == 0 || entry.pid == own_pid || pinned.contains_key(&entry.pid) {
+        if entry.pid == 0
+            || entry.pid == 4
+            || entry.pid == own_pid
+            || pinned.contains_key(&entry.pid)
+        {
             continue;
         }
         match win_proc::check_process_env_marker(
@@ -549,6 +622,9 @@ fn discover_marked_orphans_pass(
                 if let OpenPinnedOutcome::Pinned(proc_handle) =
                     win_proc::open_pinned(entry.pid, false)
                 {
+                    if proc_handle.is_protected_system() {
+                        continue;
+                    }
                     let _ = proc_handle.terminate();
                     pinned.insert(entry.pid, proc_handle);
                     unverified.remove(&entry.pid);
@@ -562,13 +638,13 @@ fn discover_marked_orphans_pass(
                     && entry.pid != root.pid
                     && let OpenPinnedOutcome::Pinned(child) =
                         win_proc::open_pinned_query_only(entry.pid, false)
-                    && child.parent_pid == root.pid
-                    && child_not_older_than_parent(
-                        child.id.start_time,
-                        root.start_time,
-                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    && is_causally_not_older_than_parent(
+                        &child,
+                        root,
+                        root_start_key,
+                        direct_child_max_start,
+                        direct_child_max_start_key,
                     )
-                    && direct_child_max_start.is_none_or(|limit| child.id.start_time < limit)
                 {
                     unverified.entry(entry.pid).or_insert(child.id);
                 }
@@ -580,6 +656,7 @@ fn discover_marked_orphans_pass(
 
 fn discover_children_of_pinned_pass(
     root: &ProcessId,
+    root_start_key: Option<u64>,
     own_pid: u32,
     pinned: &mut HashMap<u32, PinnedProcess>,
 ) -> Result<usize> {
@@ -595,48 +672,57 @@ fn discover_children_of_pinned_pass(
             .push(entry.pid);
     }
 
-    let mut queue: VecDeque<ProcessId> = VecDeque::new();
+    let mut queue: VecDeque<(ProcessId, Option<u64>)> = VecDeque::new();
     let mut queued: HashSet<u32> = HashSet::new();
     for proc_handle in pinned.values() {
         if queued.insert(proc_handle.id.pid) {
-            queue.push_back(proc_handle.id);
+            queue.push_back((proc_handle.id, proc_handle.start_key));
         }
     }
 
     let mut visited_candidates: HashSet<u32> = HashSet::new();
     let mut newly_found = 0usize;
 
-    while let Some(parent) = queue.pop_front() {
+    while let Some((parent, parent_start_key)) = queue.pop_front() {
         let Some(children) = children_by_parent.get(&parent.pid) else {
             continue;
         };
         for &child_pid in children {
-            if child_pid == own_pid || pinned.contains_key(&child_pid) {
+            if child_pid == own_pid || child_pid == 4 || pinned.contains_key(&child_pid) {
                 continue;
             }
             if !visited_candidates.insert(child_pid) {
                 continue;
             }
             if let OpenPinnedOutcome::Pinned(child_proc) = win_proc::open_pinned(child_pid, false) {
-                if child_proc.parent_pid != parent.pid
-                    || !child_not_older_than_parent(
-                        child_proc.id.start_time,
-                        parent.start_time,
-                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
-                    )
-                    || !child_not_older_than_parent(
-                        child_proc.id.start_time,
-                        root.start_time,
-                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                if child_proc.is_protected_system()
+                    || !is_causally_not_older_than_parent(
+                        &child_proc,
+                        &parent,
+                        parent_start_key,
+                        None,
+                        None,
                     )
                 {
                     continue;
                 }
+                let newer_than_root = match (child_proc.start_key, root_start_key) {
+                    (Some(ck), Some(rk)) => ck > rk,
+                    _ => child_not_older_than_parent(
+                        child_proc.id.start_time,
+                        root.start_time,
+                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    ),
+                };
+                if !newer_than_root {
+                    continue;
+                }
                 let child_id = child_proc.id;
+                let child_key = child_proc.start_key;
                 let _ = child_proc.terminate();
                 pinned.insert(child_pid, child_proc);
                 if queued.insert(child_pid) {
-                    queue.push_back(child_id);
+                    queue.push_back((child_id, child_key));
                 }
                 newly_found += 1;
             }
@@ -646,12 +732,14 @@ fn discover_children_of_pinned_pass(
     Ok(newly_found)
 }
 
-/// Take one process-table snapshot, verify every candidate child's `parent_pid` and creation time
-/// directly from a newly pinned handle, terminate newly confirmed descendants, and retain all
-/// pinned handles in `pinned` across passes.
+/// Take one process-table snapshot, verify every candidate child's `parent_pid` and causal start
+/// order directly from a newly pinned handle, terminate newly confirmed descendants, and retain
+/// all pinned handles in `pinned` across passes.
 fn discover_and_terminate_pass(
     root: &ProcessId,
+    root_start_key: Option<u64>,
     direct_child_max_start: Option<u64>,
+    direct_child_max_start_key: Option<u64>,
     own_pid: u32,
     pinned: &mut HashMap<u32, PinnedProcess>,
 ) -> Result<usize> {
@@ -667,30 +755,30 @@ fn discover_and_terminate_pass(
             .push(entry.pid);
     }
 
-    let mut queue: VecDeque<ProcessId> = VecDeque::new();
+    let mut queue: VecDeque<(ProcessId, Option<u64>)> = VecDeque::new();
     let mut queued: HashSet<u32> = HashSet::new();
-    queue.push_back(*root);
+    queue.push_back((*root, root_start_key));
     queued.insert(root.pid);
     for proc_handle in pinned.values() {
         if queued.insert(proc_handle.id.pid) {
-            queue.push_back(proc_handle.id);
+            queue.push_back((proc_handle.id, proc_handle.start_key));
         }
     }
 
     let mut visited_candidates: HashSet<u32> = HashSet::new();
     let mut newly_found = 0usize;
 
-    while let Some(parent) = queue.pop_front() {
+    while let Some((parent, parent_start_key)) = queue.pop_front() {
         let Some(children) = children_by_parent.get(&parent.pid) else {
             continue;
         };
-        let max_start = if parent.pid == root.pid {
-            direct_child_max_start
+        let (max_start, max_start_key) = if parent.pid == root.pid {
+            (direct_child_max_start, direct_child_max_start_key)
         } else {
-            None
+            (None, None)
         };
         for &child_pid in children {
-            if child_pid == own_pid || pinned.contains_key(&child_pid) {
+            if child_pid == own_pid || child_pid == 4 || pinned.contains_key(&child_pid) {
                 continue;
             }
             if !visited_candidates.insert(child_pid) {
@@ -699,20 +787,22 @@ fn discover_and_terminate_pass(
 
             match win_proc::open_pinned(child_pid, false) {
                 OpenPinnedOutcome::Pinned(child_proc) => {
-                    // Validate parent_pid directly on the opened handle (not just the snapshot)
-                    // AND verify parent-before-child ordering with wall-clock backward-step
-                    // tolerance (plus the upper bound when `root.pid` was recycled by a newer process).
-                    if child_proc.parent_pid != parent.pid
-                        || !child_not_older_than_parent(
-                            child_proc.id.start_time,
-                            parent.start_time,
-                            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    // Validate parent_pid and monotonic kernel creation order directly on the
+                    // pinned handle so a recycled parent PID can never match an older unrelated
+                    // process, and never touch protected system processes.
+                    if child_proc.is_protected_system()
+                        || !is_causally_not_older_than_parent(
+                            &child_proc,
+                            &parent,
+                            parent_start_key,
+                            max_start,
+                            max_start_key,
                         )
-                        || max_start.is_some_and(|limit| child_proc.id.start_time >= limit)
                     {
                         continue;
                     }
                     let child_id = child_proc.id;
+                    let child_key = child_proc.start_key;
                     let outcome = child_proc.terminate();
                     let _ = matches!(
                         outcome,
@@ -723,7 +813,7 @@ fn discover_and_terminate_pass(
                     );
                     pinned.insert(child_pid, child_proc);
                     if queued.insert(child_pid) {
-                        queue.push_back(child_id);
+                        queue.push_back((child_id, child_key));
                     }
                     newly_found += 1;
                 }

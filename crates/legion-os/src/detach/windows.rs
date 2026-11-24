@@ -235,6 +235,16 @@ pub(super) async fn stop_detached(
         {
             remaining.push(handle.process);
         }
+        if !report.survivors.is_empty() {
+            let prior = std::mem::take(&mut report.survivors);
+            report.survivors = tokio::task::spawn_blocking(move || {
+                prior.into_iter().filter(procid::is_alive).collect()
+            })
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("stop_detached survivor recheck task failed: {err}"),
+            })?;
+        }
         merge_recheck_survivors(&mut report, remaining);
     }
 

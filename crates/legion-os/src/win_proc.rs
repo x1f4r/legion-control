@@ -16,13 +16,15 @@ use std::sync::Mutex;
 use windows::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemTimeOfDayInformation,
 };
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+use windows::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessTelemetryIdInformation,
+};
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS, DuplicateHandle,
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME,
     GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, RPC_E_DISCONNECTED, RPC_E_TOO_LATE,
-    STILL_ACTIVE,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE,
 };
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
@@ -122,6 +124,9 @@ pub(crate) struct PinnedProcess {
     handle: OwnedHandle,
     pub(crate) id: ProcessId,
     pub(crate) parent_pid: u32,
+    /// Monotonic kernel process creation key (`ProcessStartKey` / `ProcessSequenceNumber` from
+    /// `ProcessTelemetryIdInformation`), immune to wall-clock adjustments.
+    pub(crate) start_key: Option<u64>,
     can_terminate: bool,
 }
 
@@ -132,6 +137,27 @@ impl PinnedProcess {
             Ok((_, exit_ft)) => is_still_running(self.handle.0, exit_ft),
             Err(_) => false,
         }
+    }
+
+    /// Return `true` when this pinned process runs under the same user SID as the current process.
+    pub(crate) fn same_user_as_current(&self) -> bool {
+        same_user_sid_as_current(self.handle.0)
+    }
+
+    /// Return `true` when this pinned process is PID 4 (`System`), marked critical by the kernel,
+    /// or one of the core Windows session executables.
+    pub(crate) fn is_protected_system(&self) -> bool {
+        if self.id.pid == 4 {
+            return true;
+        }
+        let mut critical = BOOL::default();
+        // SAFETY: `self.handle.0` has at least `PROCESS_QUERY_LIMITED_INFORMATION`.
+        if unsafe { IsProcessCritical(self.handle.0, &mut critical) }.is_ok() && critical.as_bool()
+        {
+            return true;
+        }
+        query_image_name_raw(self.handle.0)
+            .is_some_and(|image| crate::procid::is_windows_core_session_image(&image))
     }
 
     /// Terminate this pinned process through its already-verified handle.
@@ -201,6 +227,89 @@ fn query_parent_pid_raw(handle: HANDLE) -> Result<u32> {
     })
 }
 
+/// Fixed-size header of Windows `PROCESS_TELEMETRY_ID_INFORMATION` (class 64), available on
+/// Windows 10+ with `PROCESS_QUERY_LIMITED_INFORMATION`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessTelemetryIdHeader {
+    header_size: u32,
+    process_id: u32,
+    process_start_key: u64,
+    create_time: u64,
+    create_interrupt_time: u64,
+    create_unbiased_interrupt_time: u64,
+    process_sequence_number: u64,
+    session_create_time: u64,
+    session_id: u32,
+    boot_id: u32,
+    image_checksum: u32,
+    image_time_date_stamp: u32,
+    user_sid_offset: u32,
+    image_path_offset: u32,
+    package_name_offset: u32,
+    relative_app_name_offset: u32,
+    command_line_offset: u32,
+}
+
+/// Query the monotonic kernel `ProcessStartKey` (or `ProcessSequenceNumber`) directly from a held
+/// process handle via `NtQueryInformationProcess(ProcessTelemetryIdInformation)`.
+///
+/// Returns `None` if the OS does not support this class or the returned header does not match
+/// `expected_pid`.
+fn query_process_start_key_raw(handle: HANDLE, expected_pid: u32) -> Option<u64> {
+    const MAX_TELEMETRY_BYTES: usize = 128 * 1024;
+    let header_bytes = size_of::<ProcessTelemetryIdHeader>();
+    let mut words = vec![0u64; 256]; // 2048 bytes, 8-byte aligned
+
+    for _ in 0..2 {
+        let byte_len = (words.len() * size_of::<u64>()) as u32;
+        // Initialize `HeaderSize` at offset 0 of the buffer before calling the kernel.
+        // SAFETY: `words` is 8-byte aligned and larger than `ProcessTelemetryIdHeader`.
+        unsafe {
+            (*words.as_mut_ptr().cast::<ProcessTelemetryIdHeader>()).header_size =
+                header_bytes as u32;
+        }
+        let mut returned = 0u32;
+        // SAFETY: `handle` has at least `PROCESS_QUERY_LIMITED_INFORMATION`, `words` has exact
+        // size `byte_len` bytes, and `returned` is a valid mutable `u32`.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessTelemetryIdInformation,
+                words.as_mut_ptr().cast::<c_void>(),
+                byte_len,
+                &mut returned,
+            )
+        };
+        if status.is_ok() {
+            if (returned as usize) < header_bytes {
+                return None;
+            }
+            // SAFETY: `words` is 8-byte aligned and `returned >= size_of::<ProcessTelemetryIdHeader>()`.
+            let header = unsafe { *words.as_ptr().cast::<ProcessTelemetryIdHeader>() };
+            if header.process_id != expected_pid {
+                return None;
+            }
+            if header.process_start_key != 0 {
+                return Some(header.process_start_key);
+            }
+            if header.process_sequence_number != 0 {
+                return Some(header.process_sequence_number);
+            }
+            return None;
+        }
+        if (status == STATUS_BUFFER_TOO_SMALL || status == STATUS_INFO_LENGTH_MISMATCH)
+            && returned > byte_len
+            && (returned as usize) <= MAX_TELEMETRY_BYTES
+        {
+            words.resize((returned as usize).div_ceil(size_of::<u64>()), 0);
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
 /// Open `pid` with `PROCESS_QUERY_LIMITED_INFORMATION` only (strictly read-only) and read both
 /// its creation time and its `parent_pid` directly from the held handle.
 pub(crate) fn open_pinned_query_only(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
@@ -226,11 +335,13 @@ pub(crate) fn open_pinned_query_only(pid: u32, include_exited: bool) -> OpenPinn
     let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
         return OpenPinnedOutcome::Failed;
     };
+    let start_key = query_process_start_key_raw(handle.0, pid);
 
     OpenPinnedOutcome::Pinned(PinnedProcess {
         handle,
         id: ProcessId::new(pid, creation),
         parent_pid,
+        start_key,
         can_terminate: false,
     })
 }
@@ -274,11 +385,13 @@ pub(crate) fn open_pinned(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
     let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
         return OpenPinnedOutcome::Failed;
     };
+    let start_key = query_process_start_key_raw(handle.0, pid);
 
     OpenPinnedOutcome::Pinned(PinnedProcess {
         handle,
         id: ProcessId::new(pid, creation),
         parent_pid,
+        start_key,
         can_terminate,
     })
 }
@@ -1551,6 +1664,7 @@ fn query_image_name_raw(handle: HANDLE) -> Option<String> {
 /// session ancestor or target.
 pub(crate) struct WindowsProcSshdInfo {
     pub(crate) id: ProcessId,
+    pub(crate) start_key: Option<u64>,
     pub(crate) image_path: String,
     pub(crate) same_account: bool,
     pub(crate) cmdline: Option<String>,
@@ -1717,6 +1831,7 @@ pub(crate) fn inspect_process_for_sshd(pid: u32) -> Option<WindowsProcSshdInfo> 
     };
     Some(WindowsProcSshdInfo {
         id: pinned.id,
+        start_key: pinned.start_key,
         image_path,
         same_account,
         cmdline,
@@ -1797,5 +1912,50 @@ pub(crate) fn open_verify_terminate(identity: &ProcessId) -> Result<TerminateOut
         Err(err) => Err(OsError::Platform {
             detail: format!("TerminateProcess failed for pid {}: {err}", identity.pid),
         }),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_telemetry_start_key_is_monotonic_across_parent_and_child() {
+        let OpenPinnedOutcome::Pinned(me) = open_pinned_query_only(std::process::id(), false)
+        else {
+            panic!("failed to open current process");
+        };
+        let my_key = me.start_key.expect(
+            "ProcessTelemetryIdInformation should return a non-zero start key on Windows 10+",
+        );
+        assert!(my_key > 0);
+
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn child cmd.exe");
+
+        let OpenPinnedOutcome::Pinned(child_proc) = open_pinned_query_only(child.id(), false)
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("failed to open child process");
+        };
+        let child_key = child_proc
+            .start_key
+            .expect("child process should also have a non-zero start key");
+        assert!(
+            child_key > my_key,
+            "expected child start_key ({child_key}) > parent start_key ({my_key})"
+        );
+        assert!(child_proc.same_user_as_current());
+        assert!(!child_proc.is_protected_system());
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
