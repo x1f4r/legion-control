@@ -3,12 +3,12 @@
 # End-to-end Android emulator test for Legion over real SSH + legion-link.
 #
 #   ./apps/legion-app/e2e-android.sh
-#   ./apps/legion-app/e2e-android.sh --node-ref origin/link/pairing
+#   ./apps/legion-app/e2e-android.sh --node-ref HEAD
 #   ./apps/legion-app/e2e-android.sh --shots-dir ./shots
 #   ./apps/legion-app/e2e-android.sh --skip-tablet
 #   ./apps/legion-app/e2e-android.sh --keep-running
 #
-# Builds a release `legion` binary from `--node-ref` (default `origin/link/pairing`) in a cache
+# Builds a release `legion` binary from `--node-ref` (default `HEAD`) in a cache
 # checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, brings up a throwaway `LEGION_HOME`
 # node named `tower` and a loopback-only `sshd` on 127.0.0.1, installs a WebView-debuggable x86_64
 # build on `legion-test`, and drives the real UI over `adb forward` + Chrome DevTools Protocol.
@@ -20,7 +20,7 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$HERE/../.." && pwd -P)"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/legion-app"
 
-NODE_REF="${LEGION_E2E_NODE_REF:-origin/link/pairing}"
+NODE_REF="${LEGION_E2E_NODE_REF:-HEAD}"
 SHOTS_DIR="${LEGION_E2E_SHOTS_DIR:-$CACHE_DIR/e2e-shots}"
 PHONE_AVD="${LEGION_E2E_PHONE_AVD:-legion-test}"
 TABLET_AVD="${LEGION_E2E_TABLET_AVD:-legion-tablet}"

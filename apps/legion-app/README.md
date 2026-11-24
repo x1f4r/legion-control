@@ -258,11 +258,11 @@ and loopback `sshd` (`127.0.0.1` on an ephemeral high port):
 
 ```sh
 ./apps/legion-app/e2e-android.sh
-./apps/legion-app/e2e-android.sh --node-ref origin/link/pairing --shots-dir /home/me/shots/e2e
+./apps/legion-app/e2e-android.sh --node-ref HEAD --shots-dir /home/me/shots/e2e
 ./apps/legion-app/e2e-android.sh --skip-tablet
 ```
 
-The script builds a release `legion` binary from `--node-ref` (default `origin/link/pairing`) in a
+The script builds a release `legion` binary from `--node-ref` (default `HEAD`) in a
 cache checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, creates a throwaway
 `LEGION_HOME` node named `tower` with principal `phone` in role `operator`, starts a loopback
 `sshd` using a throwaway host key and `authorized_keys` file, builds a WebView-debuggable `x86_64`
