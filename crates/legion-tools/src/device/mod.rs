@@ -5007,4 +5007,112 @@ device = \"{id_healthy}\"
         assert!(detail.contains("wrong-owner"), "{detail}");
         assert!(detail.contains("exceeded"), "{detail}");
     }
+
+    #[tokio::test]
+    async fn s2_enrol_saves_config_first_leaves_authkeys_untouched_on_save_failure_and_rolls_back_on_swap_failure()
+     {
+        let h = Harness::new();
+
+        // 1. Failing `devices.toml` save (devices.toml exists and reads cleanly, policy.toml
+        //    updates cleanly, but writing `state/sync/backups/devices.toml.bak` fails because a
+        //    directory sits at the backup path) must fail BEFORE touching authorized_keys and must
+        //    roll back the newly created policy.toml principal.
+        let devices_path = h.node.paths().config_file("devices.toml");
+        std::fs::write(&devices_path, "version = 1\n").unwrap();
+        let inv1 = h
+            .call(
+                "device.invite",
+                json!({"name": "fail-save", "role": "observer", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv1_id = inv1["id"].as_str().unwrap().to_owned();
+        let auth_before_1 = std::fs::read(&h.auth_keys).unwrap();
+        let policy_before_1 = std::fs::read(h.node.paths().config_file("policy.toml")).unwrap();
+
+        let devices_bak = h
+            .node
+            .paths()
+            .state_dir()
+            .join("sync")
+            .join("backups")
+            .join("devices.toml.bak");
+        std::fs::create_dir_all(&devices_bak).unwrap();
+
+        let key1 = keys::ed25519_public_key_from_seed(&[0xa5; 32]);
+        let req1 = format!(
+            "{{\"enrol\":1,\"id\":\"{inv1_id}\",\"public_key\":\"{key1}\",\"name\":\"fail-save\"}}\n"
+        );
+        let reply1 = enrol::run_enrol(&h.node, &inv1_id, req1.as_bytes()).await;
+        std::fs::remove_dir(&devices_bak).unwrap();
+
+        assert!(
+            !reply1.is_ok(),
+            "enrol must fail when devices.toml save fails: {reply1:?}"
+        );
+        assert_eq!(
+            std::fs::read(&h.auth_keys).unwrap(),
+            auth_before_1,
+            "authorized_keys must be untouched when devices.toml save fails"
+        );
+        assert_eq!(
+            std::fs::read(h.node.paths().config_file("policy.toml")).unwrap(),
+            policy_before_1,
+            "policy.toml must be rolled back when devices.toml save fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&devices_path).unwrap(),
+            "version = 1\n",
+            "devices.toml must stay unchanged when its save fails"
+        );
+
+        // 2. Failing `authorized_keys` swap (on Unix, unwritable parent dir after lock file exists)
+        //    must roll back BOTH devices.toml AND policy.toml to their exact pre-enrol state.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::remove_file(&devices_path).unwrap();
+            let inv2 = h
+                .call(
+                    "device.invite",
+                    json!({"name": "fail-swap", "role": "observer", "host": "tower.example", "user": "me"}),
+                )
+                .await
+                .unwrap();
+            let inv2_id = inv2["id"].as_str().unwrap().to_owned();
+            let auth_before_2 = std::fs::read(&h.auth_keys).unwrap();
+            let policy_before_2 = std::fs::read(h.node.paths().config_file("policy.toml")).unwrap();
+            assert!(!devices_path.exists());
+
+            let auth_dir = h.auth_keys.parent().unwrap().to_path_buf();
+            std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+            let key2 = keys::ed25519_public_key_from_seed(&[0xa6; 32]);
+            let req2 = format!(
+                "{{\"enrol\":1,\"id\":\"{inv2_id}\",\"public_key\":\"{key2}\",\"name\":\"fail-swap\"}}\n"
+            );
+            let reply2 = enrol::run_enrol(&h.node, &inv2_id, req2.as_bytes()).await;
+            std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            assert!(
+                !reply2.is_ok(),
+                "enrol must fail when authorized_keys swap fails: {reply2:?}"
+            );
+            assert!(
+                !devices_path.exists(),
+                "devices.toml must be rolled back to absent when authorized_keys swap fails"
+            );
+            assert_eq!(
+                std::fs::read(h.node.paths().config_file("policy.toml")).unwrap(),
+                policy_before_2,
+                "policy.toml must be rolled back when authorized_keys swap fails"
+            );
+            assert_eq!(
+                std::fs::read(&h.auth_keys).unwrap(),
+                auth_before_2,
+                "authorized_keys must stay unchanged when swap fails"
+            );
+        }
+    }
 }
