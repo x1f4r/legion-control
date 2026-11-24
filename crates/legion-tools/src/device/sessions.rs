@@ -235,6 +235,11 @@ fn write_session_record(path: &Path, record: &DeviceSessionRecord) -> Result<(),
 /// Removes stale session files (from exited processes, recycled PIDs, earlier boots, or corrupt
 /// files) from `state/device-sessions/`, returning how many stale files were removed.
 pub fn sweep_stale_sessions(paths: &Paths) -> usize {
+    let expected_exe = std::env::current_exe().ok();
+    sweep_stale_sessions_with_exe(paths, expected_exe.as_deref())
+}
+
+fn sweep_stale_sessions_with_exe(paths: &Paths, expected_exe: Option<&Path>) -> usize {
     let dir = sessions_dir(paths);
     let current_boot = procid::boot_id().ok();
     let entries = match std::fs::read_dir(&dir) {
@@ -247,7 +252,7 @@ pub fn sweep_stale_sessions(paths: &Paths) -> usize {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if is_live_session_file(&path, current_boot.as_deref()).is_none()
+        if is_live_session_file(&path, current_boot.as_deref(), expected_exe).is_none()
             && remove_ignoring_not_found(&path)
         {
             removed += 1;
@@ -277,25 +282,49 @@ enum TerminationResult {
 /// forced kill after `grace`.
 ///
 /// Protected processes (PID 0/1, current process, ancestors, and critical OS processes) are never
-/// signaled, and parent `sshd` targets are re-verified as live same-account non-listener `sshd`
-/// session processes immediately before signalling. Returns the number of live sessions/connections
-/// terminated (counting an active gate together with its parent `sshd` as one session, and an idle
-/// `ControlMaster` connection with no active gate as one session).
+/// signaled, gate targets are re-verified as running this exact `legion` executable immediately
+/// before signalling, and parent `sshd` targets are re-verified as live same-account non-listener
+/// `sshd` session processes immediately before signalling. Returns the number of live
+/// sessions/connections terminated (counting an active gate together with its parent `sshd` as one
+/// session, and an idle `ControlMaster` connection with no active gate as one session).
 pub async fn terminate_device_sessions(paths: &Paths, device: &str, grace: Duration) -> usize {
+    let expected_exe = std::env::current_exe().ok();
+    terminate_device_sessions_with_exe(paths, device, grace, expected_exe.as_deref()).await
+}
+
+async fn terminate_device_sessions_with_exe(
+    paths: &Paths,
+    device: &str,
+    grace: Duration,
+    expected_exe: Option<&Path>,
+) -> usize {
     let dir = sessions_dir(paths);
     let device_owned = device.to_owned();
-    let collected =
-        tokio::task::spawn_blocking(move || collect_live_and_sweep(&dir, &device_owned))
-            .await
-            .unwrap_or(CollectedTargets {
-                gates: Vec::new(),
-                sshds: BTreeMap::new(),
-            });
+    let exe_for_collect = expected_exe.map(Path::to_path_buf);
+    let collected = tokio::task::spawn_blocking(move || {
+        collect_live_and_sweep(&dir, &device_owned, exe_for_collect.as_deref())
+    })
+    .await
+    .unwrap_or(CollectedTargets {
+        gates: Vec::new(),
+        sshds: BTreeMap::new(),
+    });
 
     let mut set: JoinSet<TerminationResult> = JoinSet::new();
     for (path, identity, parent_sshd) in collected.gates {
+        let exe_for_gate = expected_exe.map(Path::to_path_buf);
         set.spawn(async move {
-            if procid::is_protected(&identity).is_some() {
+            let Some(ref expected) = exe_for_gate else {
+                return TerminationResult::Gate {
+                    ended: false,
+                    parent_sshd,
+                };
+            };
+            // Re-verify immediately before signalling: never touch a protected process or a
+            // forged/unrelated process that is not running this exact `legion` executable.
+            if procid::is_protected(&identity).is_some()
+                || !procid::verify_same_executable(&identity, expected)
+            {
                 return TerminationResult::Gate {
                     ended: false,
                     parent_sshd,
@@ -368,7 +397,11 @@ pub async fn terminate_device_sessions(paths: &Paths, device: &str, grace: Durat
     ended_gates + ended_idle_connections
 }
 
-fn collect_live_and_sweep(dir: &Path, device: &str) -> CollectedTargets {
+fn collect_live_and_sweep(
+    dir: &Path,
+    device: &str,
+    expected_exe: Option<&Path>,
+) -> CollectedTargets {
     let current_boot = procid::boot_id().ok();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -386,7 +419,7 @@ fn collect_live_and_sweep(dir: &Path, device: &str) -> CollectedTargets {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        match is_live_session_file(&path, current_boot.as_deref()) {
+        match is_live_session_file(&path, current_boot.as_deref(), expected_exe) {
             Some(record) => {
                 if record.device != device {
                     continue;
@@ -421,7 +454,11 @@ fn collect_live_and_sweep(dir: &Path, device: &str) -> CollectedTargets {
     CollectedTargets { gates, sshds }
 }
 
-fn is_live_session_file(path: &Path, current_boot: Option<&str>) -> Option<DeviceSessionRecord> {
+fn is_live_session_file(
+    path: &Path,
+    current_boot: Option<&str>,
+    expected_exe: Option<&Path>,
+) -> Option<DeviceSessionRecord> {
     let bytes = std::fs::read(path).ok()?;
     let record: DeviceSessionRecord = serde_json::from_slice(&bytes).ok()?;
     if let Some(cur) = current_boot
@@ -432,7 +469,8 @@ fn is_live_session_file(path: &Path, current_boot: Option<&str>) -> Option<Devic
     let identity = record.process_id();
     match record.kind {
         SessionRecordKind::Gate => {
-            if !procid::is_alive(&identity) {
+            let expected = expected_exe?;
+            if !procid::verify_same_executable(&identity, expected) {
                 return None;
             }
         }
@@ -479,10 +517,30 @@ mod tests {
 
     use super::*;
 
-    fn spawn_sleeper() -> Child {
+    fn sleeper_executable() -> PathBuf {
         #[cfg(unix)]
         {
-            Command::new("sleep")
+            for candidate in ["/usr/bin/sleep", "/bin/sleep"] {
+                let p = Path::new(candidate);
+                if p.exists() {
+                    return p.to_path_buf();
+                }
+            }
+            PathBuf::from("sleep")
+        }
+        #[cfg(windows)]
+        {
+            std::env::var_os("SystemRoot")
+                .map(|root| PathBuf::from(root).join("System32").join("PING.EXE"))
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\PING.EXE"))
+        }
+    }
+
+    fn spawn_sleeper() -> Child {
+        let exe = sleeper_executable();
+        #[cfg(unix)]
+        {
+            Command::new(exe)
                 .arg("60")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -492,7 +550,7 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            Command::new("ping")
+            Command::new(exe)
                 .args(["-n", "61", "127.0.0.1"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -611,7 +669,14 @@ mod tests {
         let corrupt_file = sess_dir.join("corrupt.json");
         std::fs::write(&corrupt_file, b"{not json").unwrap();
 
-        let ended = terminate_device_sessions(&paths, "pixel", Duration::from_secs(2)).await;
+        let sleeper_exe = sleeper_executable();
+        let ended = terminate_device_sessions_with_exe(
+            &paths,
+            "pixel",
+            Duration::from_secs(2),
+            Some(&sleeper_exe),
+        )
+        .await;
         assert_eq!(ended, 1);
 
         // Reap victim and confirm it exited.
@@ -626,6 +691,35 @@ mod tests {
         // Bystander and its unrelated `tablet` session must remain completely intact.
         assert!(procid::is_alive(&bystander_id));
         assert!(other_device_file.exists());
+
+        // 6. Forged `Gate` record pointing at `bystander` (running `sleep`/`ping`, NOT the
+        //    current `legion` executable) MUST NOT be signalled by `terminate_device_sessions`
+        //    and MUST be swept.
+        let forged_gate_file = write_record(
+            &sess_dir,
+            &format!(
+                "forged-{}-{}.json",
+                bystander_id.pid, bystander_id.start_time
+            ),
+            &DeviceSessionRecord {
+                device: "forged".to_owned(),
+                principal: "phone".to_owned(),
+                pid: bystander_id.pid,
+                start_time: bystander_id.start_time,
+                boot_id: procid::boot_id().unwrap(),
+                started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::Gate,
+                parent_sshd: None,
+            },
+        );
+        let ended_forged =
+            terminate_device_sessions(&paths, "forged", Duration::from_secs(2)).await;
+        assert_eq!(ended_forged, 0);
+        assert!(
+            procid::is_alive(&bystander_id),
+            "forged Gate record targeting a different executable must not signal bystander"
+        );
+        assert!(!forged_gate_file.exists());
 
         let _ = bystander.kill();
         let _ = bystander.wait();

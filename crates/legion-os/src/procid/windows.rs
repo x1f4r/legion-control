@@ -5,6 +5,7 @@
 //! reuse, and calls `TerminateProcess` through that handle—eliminating bare-PID TOCTOU races.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::win_proc::{self, OpenPinnedOutcome, PinnedProcess, TerminateOutcome};
@@ -19,7 +20,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_WALK_PASSES: usize = 8;
 const MAX_ANCESTOR_HOPS: usize = 256;
-const MAX_SSHD_ANCESTOR_HOPS: usize = 4;
 
 pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
     if identity.pid == 4 {
@@ -49,35 +49,25 @@ pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
     else {
         return None;
     };
-    let mut parent_pid = self_proc.parent_pid;
-    let mut child_start = self_proc.id.start_time;
+    let parent_pid = self_proc.parent_pid;
+    let child_start = self_proc.id.start_time;
     drop(self_proc);
 
-    let mut seen = HashSet::new();
-    seen.insert(own_pid);
-
-    for _ in 0..MAX_SSHD_ANCESTOR_HOPS {
-        if parent_pid <= 4 || !seen.insert(parent_pid) {
-            break;
-        }
-        let info = win_proc::inspect_process_for_sshd(parent_pid)?;
-        if !child_not_older_than_parent(
-            child_start,
-            info.id.start_time,
-            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
-        ) {
-            break;
-        }
-        if windows_info_is_same_account_sshd(&info) {
-            return Some(info.id);
-        }
-        if !super::is_shell_wrapper_comm(&info.image_path) {
-            break;
-        }
-        child_start = info.id.start_time;
-        parent_pid = info.parent_pid;
+    // On Windows, `sshd.exe` session workers do not rewrite argv[0] with setproctitle, so only
+    // accept a bare same-account `sshd.exe` / `sshd-session.exe` when it is the direct parent of
+    // this gate process (hop 0) — never walk through shell wrappers to a higher process.
+    if parent_pid <= 4 || parent_pid == own_pid {
+        return None;
     }
-    None
+    let info = win_proc::inspect_process_for_sshd(parent_pid)?;
+    if !child_not_older_than_parent(
+        child_start,
+        info.id.start_time,
+        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+    ) {
+        return None;
+    }
+    windows_info_is_same_account_sshd(&info).then_some(info.id)
 }
 
 pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
@@ -88,6 +78,10 @@ pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
         return false;
     };
     identity.matches(&info.id) && windows_info_is_same_account_sshd(&info)
+}
+
+pub(super) fn executable_of(identity: &ProcessId) -> Option<PathBuf> {
+    win_proc::query_verified_image_path(identity)
 }
 
 fn is_ancestor_of_current(identity: &ProcessId) -> bool {

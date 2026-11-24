@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows::Wdk::System::SystemInformation::{
@@ -1187,7 +1187,6 @@ fn query_image_name_raw(handle: HANDLE) -> Option<String> {
 /// session ancestor or target.
 pub(crate) struct WindowsProcSshdInfo {
     pub(crate) id: ProcessId,
-    pub(crate) parent_pid: u32,
     pub(crate) image_path: String,
     pub(crate) same_account: bool,
     pub(crate) cmdline: Option<String>,
@@ -1327,6 +1326,18 @@ fn read_process_cmdline(pid: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&units[..trimmed_len]))
 }
 
+/// Query the full executable image path of live process `identity` after verifying its exact
+/// `pid` and `start_time` through a held query-only handle.
+pub(crate) fn query_verified_image_path(identity: &ProcessId) -> Option<PathBuf> {
+    let OpenPinnedOutcome::Pinned(pinned) = open_pinned_query_only(identity.pid, false) else {
+        return None;
+    };
+    if !identity.matches(&pinned.id) {
+        return None;
+    }
+    query_image_name_raw(pinned.handle.0).map(PathBuf::from)
+}
+
 /// Inspect live process `pid` through a held query-only handle to verify its identity, parent PID,
 /// image path, user SID equality with the current process, and command line.
 pub(crate) fn inspect_process_for_sshd(pid: u32) -> Option<WindowsProcSshdInfo> {
@@ -1342,7 +1353,6 @@ pub(crate) fn inspect_process_for_sshd(pid: u32) -> Option<WindowsProcSshdInfo> 
     };
     Some(WindowsProcSshdInfo {
         id: pinned.id,
-        parent_pid: pinned.parent_pid,
         image_path,
         same_account,
         cmdline,

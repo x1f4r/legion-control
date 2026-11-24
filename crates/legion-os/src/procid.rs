@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -255,6 +256,74 @@ pub fn sshd_session_ancestor() -> Option<ProcessId> {
     sshd_session_ancestor_impl()
 }
 
+/// Return `true` if and only if `identity` currently refers to a live process whose PID, kernel
+/// start time, and resolved executable image path match `expected_exe`.
+///
+/// Guards against forged session records or PID reuse targeting an unrelated process belonging to
+/// the same account. Always returns `false` for PID 0, exited processes, or unreadable executable
+/// paths.
+pub fn verify_same_executable(identity: &ProcessId, expected_exe: &Path) -> bool {
+    if identity.pid == 0 {
+        return false;
+    }
+    let Some(actual_exe) = executable_of_impl(identity) else {
+        return false;
+    };
+    executables_match(&actual_exe, expected_exe)
+}
+
+fn executables_match(actual: &Path, expected: &Path) -> bool {
+    if paths_equal_platform(actual, expected) {
+        return true;
+    }
+    let canon_expected = std::fs::canonicalize(expected).ok();
+    if let Ok(canon_actual) = std::fs::canonicalize(actual) {
+        if let Some(ref exp) = canon_expected
+            && paths_equal_platform(&canon_actual, exp)
+        {
+            return true;
+        }
+        if paths_equal_platform(&canon_actual, expected) {
+            return true;
+        }
+    }
+    // On Linux, `/proc/<pid>/exe` appends `" (deleted)"` after an in-place binary upgrade while the
+    // old process is still running.
+    #[cfg(target_os = "linux")]
+    if let Some(raw) = actual.to_str()
+        && let Some(stripped) = raw.strip_suffix(" (deleted)")
+    {
+        let stripped_path = Path::new(stripped);
+        if paths_equal_platform(stripped_path, expected) {
+            return true;
+        }
+        if let Some(ref exp) = canon_expected
+            && (paths_equal_platform(stripped_path, exp)
+                || std::fs::canonicalize(stripped_path)
+                    .ok()
+                    .is_some_and(|c| paths_equal_platform(&c, exp)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn paths_equal_platform(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let norm = |p: &Path| {
+            let s = p.to_string_lossy();
+            s.strip_prefix(r"\\?\").unwrap_or(&s).to_ascii_lowercase()
+        };
+        norm(a) == norm(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
 /// Return `true` if and only if `identity` currently refers to a live, non-listener, per-connection
 /// `sshd` / `sshd-session` process running under the same OS account as the current process, with
 /// exact matching PID and kernel start time.
@@ -428,6 +497,16 @@ fn sshd_session_ancestor_impl() -> Option<ProcessId> {
 
 #[cfg(not(any(unix, windows)))]
 fn sshd_session_ancestor_impl() -> Option<ProcessId> {
+    None
+}
+
+#[cfg(any(unix, windows))]
+fn executable_of_impl(identity: &ProcessId) -> Option<PathBuf> {
+    platform::executable_of(identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn executable_of_impl(_identity: &ProcessId) -> Option<PathBuf> {
     None
 }
 
@@ -679,6 +758,12 @@ pub(crate) fn is_shell_wrapper_comm(name: &str) -> bool {
 /// Return `true` when `(comm, argv)` identifies a per-connection `sshd` / `sshd-session` user
 /// session process rather than a listener daemon, privsep monitor, pre-auth child, or unrelated
 /// process.
+///
+/// On Unix, requires a strict allowlisted OpenSSH authenticated-session `setproctitle` form
+/// matching `comm` (`sshd: <user>`, `sshd: <user>@notty`, `sshd: <user>@pts/<N>`, or
+/// `sshd: <user>@ttys<N>`, and the matching `sshd-session: ...` forms for `sshd-session`),
+/// refusing listeners, `[priv]`/`[net]`/`[accepted]`/`[rexec]` monitors, path-prefixed titles,
+/// and non-session invocations.
 #[allow(dead_code)]
 pub(crate) fn is_sshd_session_process(comm: &str, argv: &[&str], is_windows: bool) -> bool {
     let base = comm_basename_stem(comm);
@@ -701,35 +786,62 @@ pub(crate) fn is_sshd_session_process(comm: &str, argv: &[&str], is_windows: boo
     if argv
         .iter()
         .skip(1)
-        .any(|a| matches!(*a, "-D" | "-t" | "-T"))
+        .any(|a| matches!(*a, "-D" | "-d" | "-f" | "-t" | "-T"))
     {
         return false;
     }
-    // Standard OpenSSH setproctitle for an authenticated user session (`sshd: me@notty`,
-    // `sshd-session: me@notty`, `sshd: me@pts/0`, `sshd: me`). Listener titles start with a path
-    // (`sshd: /usr/sbin/sshd ...`) and are rejected here.
-    if let Some(rest) = arg0
-        .strip_prefix("sshd: ")
-        .or_else(|| arg0.strip_prefix("sshd-session: "))
+
+    if !is_windows {
+        if argv.len() != 1 {
+            return false;
+        }
+        let expected_prefix = if base == "sshd" {
+            "sshd: "
+        } else {
+            "sshd-session: "
+        };
+        let Some(rest) = arg0.strip_prefix(expected_prefix) else {
+            return false;
+        };
+        return is_valid_unix_sshd_session_title(rest);
+    }
+
+    // On Windows, `sshd.exe` session workers do not rewrite argv[0] with setproctitle; callers
+    // pair this with direct-parent (`hop == 0`) and same-SID checks to exclude both the `SYSTEM`
+    // listener service and any unrelated same-account `sshd.exe` higher up the tree.
+    true
+}
+
+#[allow(dead_code)]
+fn is_valid_unix_sshd_session_title(rest: &str) -> bool {
+    if rest.is_empty()
+        || rest.starts_with('/')
+        || rest.starts_with('\\')
+        || rest.starts_with('-')
+        || rest.contains('[')
+        || rest.contains(']')
+        || rest.chars().any(|c| c.is_control() || c.is_whitespace())
     {
-        let rest = rest.trim();
-        return !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('\\');
+        return false;
     }
-    // OpenSSH 9.8+ splits per-connection handlers into `sshd-session`, which is never a listener.
-    if base == "sshd-session" {
-        return true;
+    match rest.split_once('@') {
+        None => !rest.contains('/') && !rest.contains('\\'),
+        Some((user, tty)) => {
+            if user.is_empty() || user.contains('/') || user.contains('\\') {
+                return false;
+            }
+            if tty == "notty" {
+                return true;
+            }
+            if let Some(num) = tty.strip_prefix("pts/") {
+                return !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit());
+            }
+            if let Some(num) = tty.strip_prefix("ttys") {
+                return !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit());
+            }
+            false
+        }
     }
-    // Single-connection inetd mode (`sshd -i`, used by macOS launchd per connection).
-    if argv.iter().skip(1).any(|a| *a == "-i") {
-        return true;
-    }
-    // On Windows, `sshd.exe` session workers do not rewrite argv[0] with setproctitle; same-SID
-    // filtering already excludes the `SYSTEM` listener service, and `-D`/`-f` reject manual
-    // same-account listener daemons.
-    if is_windows {
-        return !argv.iter().skip(1).any(|a| *a == "-d" || *a == "-f");
-    }
-    false
 }
 
 /// Parse `(real_uid, effective_uid)` from the `Uid:` line of Linux `/proc/<pid>/status`.
@@ -1349,15 +1461,20 @@ mod tests {
             false
         ));
         assert!(is_sshd_session_process("sshd", &["sshd: me@pts/0"], false));
-        assert!(is_sshd_session_process("sshd", &["sshd: me"], false));
         assert!(is_sshd_session_process(
             "sshd-session",
-            &["/usr/lib/ssh/sshd-session", "-R"],
+            &["sshd-session: me@pts/12"],
             false
         ));
         assert!(is_sshd_session_process(
             "sshd",
-            &["/usr/sbin/sshd", "-i"],
+            &["sshd: me@ttys003"],
+            false
+        ));
+        assert!(is_sshd_session_process("sshd", &["sshd: me"], false));
+        assert!(is_sshd_session_process(
+            "sshd-session",
+            &["sshd-session: me"],
             false
         ));
         assert!(is_sshd_session_process(
@@ -1366,7 +1483,40 @@ mod tests {
             true
         ));
 
-        // Listeners, privsep monitors, pre-auth workers, and non-sshd processes must be rejected.
+        // Listeners, privsep monitors, pre-auth workers, inetd/rexec fallbacks, mismatched comm vs
+        // title prefix, weird session titles, and non-sshd processes must be rejected.
+        assert!(!is_sshd_session_process(
+            "sshd-session",
+            &["/usr/lib/ssh/sshd-session", "-R"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["/usr/sbin/sshd", "-i"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd-session: me@notty"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd-session",
+            &["sshd: me@notty"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: me@pts/abc"],
+            false
+        ));
+        assert!(!is_sshd_session_process("sshd", &["sshd: me@weird"], false));
+        assert!(!is_sshd_session_process("sshd", &["sshd: me extra"], false));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: me@notty", "-D"],
+            false
+        ));
         assert!(!is_sshd_session_process(
             "sshd",
             &["/usr/sbin/sshd", "-D", "-e", "-f", "/tmp/sshd_config"],
@@ -1408,9 +1558,29 @@ mod tests {
             &[r"C:\Windows\System32\OpenSSH\sshd.exe", "-D"],
             true
         ));
+        assert!(!is_sshd_session_process(
+            r"C:\Windows\System32\OpenSSH\sshd.exe",
+            &[r"C:\Windows\System32\OpenSSH\sshd.exe", "-f", "sshd_config"],
+            true
+        ));
         assert!(!is_sshd_session_process("sshd", &[], false));
         assert!(!is_sshd_session_process("bash", &["sshd: me@notty"], false));
         assert!(!is_sshd_session_process("sleep", &["sleep", "60"], false));
+
+        // Executable verification matches the current process against its own executable and
+        // rejects a different executable path, wrong start_time, and pid 0.
+        let me = current().unwrap();
+        let my_exe = std::env::current_exe().unwrap();
+        assert!(verify_same_executable(&me, &my_exe));
+        assert!(!verify_same_executable(
+            &me,
+            Path::new("/nonexistent/other-binary")
+        ));
+        assert!(!verify_same_executable(
+            &ProcessId::new(me.pid, me.start_time.wrapping_add(1)),
+            &my_exe
+        ));
+        assert!(!verify_same_executable(&ProcessId::new(0, 1), &my_exe));
 
         // Shell wrapper detection.
         for shell in [

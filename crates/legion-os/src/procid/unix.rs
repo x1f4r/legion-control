@@ -1,6 +1,7 @@
 //! Unix process identity, boot identity, and process-tree termination.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -213,6 +214,15 @@ pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
     linux_same_account_sshd(identity.pid, Some(identity.start_time)).is_some()
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn executable_of(identity: &ProcessId) -> Option<PathBuf> {
+    let observed = of_pid(identity.pid, false).ok()??;
+    if !identity.matches(&observed) {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{}/exe", identity.pid)).ok()
+}
+
 #[cfg(target_os = "macos")]
 fn macos_same_account_sshd(pid: u32, expected_start: Option<u64>) -> Option<ProcessId> {
     if pid <= 1 || pid == std::process::id() {
@@ -268,6 +278,15 @@ pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
     macos_same_account_sshd(identity.pid, Some(identity.start_time)).is_some()
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn executable_of(identity: &ProcessId) -> Option<PathBuf> {
+    let observed = of_pid(identity.pid, false).ok()??;
+    if !identity.matches(&observed) {
+        return None;
+    }
+    macos_proc::query_executable_path(identity.pid)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
     None
@@ -276,6 +295,11 @@ pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn verify_same_account_sshd(_identity: &ProcessId) -> bool {
     false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn executable_of(_identity: &ProcessId) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -480,6 +504,37 @@ mod macos_proc {
             comm = cstr_to_string(&info.pbi_comm);
         }
         Some((info.pbi_ppid, start_us, info.pbi_ruid, info.pbi_uid, comm))
+    }
+
+    pub(super) fn query_executable_path(pid: u32) -> Option<std::path::PathBuf> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
+        let raw_pid = libc::c_int::try_from(pid).ok()?;
+        let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+        // SAFETY: `buf` holds `PROC_PIDPATHINFO_MAXSIZE` writable bytes and `proc_pidpath` returns
+        // the non-negative byte length written (excluding NUL) or <= 0 on failure.
+        let written = unsafe {
+            libc::proc_pidpath(
+                raw_pid,
+                buf.as_mut_ptr().cast(),
+                PROC_PIDPATHINFO_MAXSIZE as u32,
+            )
+        };
+        if written <= 0 {
+            return None;
+        }
+        let len = usize::try_from(written).ok()?.min(buf.len());
+        let slice = &buf[..len];
+        let trimmed = slice
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(slice, |idx| &slice[..idx]);
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(OsStr::from_bytes(trimmed)))
     }
 
     pub(super) fn query_argv(pid: u32) -> Option<Vec<String>> {
