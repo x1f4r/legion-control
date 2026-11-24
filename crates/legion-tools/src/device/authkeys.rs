@@ -1715,12 +1715,12 @@ mod tests {
             r#""C:\Users\me\My Légion 日本\legion.exe" gate --as agent:example --home "C:\Users\me\Legion Home ü""#
         );
         for bad_cmd_path in [
-            r"C:\Users\%USERNAME%\legion.exe",
-            r"C:\Users\A&B\legion.exe",
+            r"C:\Users\me\%USERNAME%\legion.exe",
+            r"C:\Users\me\A&B\legion.exe",
             r"C:\Program Files (x86)\legion.exe",
-            r"C:\Users\a^b\legion.exe",
-            r"C:\Users\bang!\legion.exe",
-            r#"C:\Users\"quote"\legion.exe"#,
+            r"C:\Users\me\a^b\legion.exe",
+            r"C:\Users\me\bang!\legion.exe",
+            r#"C:\Users\me\"quote"\legion.exe"#,
         ] {
             assert!(
                 format_forced_command(
@@ -1736,7 +1736,7 @@ mod tests {
         // Windows PowerShell: `& '...'` with doubled single quotes, spaces, non-ASCII, and `@`-safe
         // argument quoting (preventing PowerShell splatting of `@`-prefixed arguments).
         let ps_cmd = format_forced_command(
-            Path::new(r"C:\Users\O'Neil\My Légion 日本\legion.exe"),
+            Path::new(r"C:\Users\me\O'Neil\My Légion 日本\legion.exe"),
             &[
                 "gate",
                 "--as",
@@ -1744,23 +1744,23 @@ mod tests {
                 "--account",
                 "O'Neil",
                 "--home",
-                r"C:\Users\O'Neil\Program Files (x86)\Legion Home",
+                r"C:\Users\me\O'Neil\Program Files (x86)\Legion Home",
             ],
             ForcedCommandShell::WindowsPowerShell,
         )
         .unwrap();
         assert_eq!(
             openssh_opt_dequote(&ps_cmd),
-            r"& 'C:\Users\O''Neil\My Légion 日本\legion.exe' gate --as '@phone' --account 'O''Neil' --home 'C:\Users\O''Neil\Program Files (x86)\Legion Home'"
+            r"& 'C:\Users\me\O''Neil\My Légion 日本\legion.exe' gate --as '@phone' --account 'O''Neil' --home 'C:\Users\me\O''Neil\Program Files (x86)\Legion Home'"
         );
 
         // Round-trip parsing of a PowerShell device line recovers principal, account, and home.
         let ps_line = format_device_line(
-            Path::new(r"C:\Users\O'Neil\My Légion\legion.exe"),
+            Path::new(r"C:\Users\me\O'Neil\My Légion\legion.exe"),
             "agent:example",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             "pixel",
-            Some(Path::new(r"C:\Users\O'Neil\Legion Home")),
+            Some(Path::new(r"C:\Users\me\O'Neil\Legion Home")),
             Some("O'Neil"),
             ForcedCommandShell::WindowsPowerShell,
         )
@@ -1776,7 +1776,7 @@ mod tests {
                 ..
             } if name == "pixel"
                 && p == "agent:example"
-                && h == r"C:\Users\O'Neil\Legion Home"
+                && h == r"C:\Users\me\O'Neil\Legion Home"
                 && a == "O'Neil"
         ));
 
