@@ -8,6 +8,7 @@ mod args;
 mod cp;
 mod render;
 mod rpc;
+mod serve;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
@@ -76,11 +77,7 @@ async fn run(command: Command) -> ExitCode {
         Command::Call(call) => call.json,
         Command::Cp(cp) => cp.json,
         Command::Tools { json } | Command::Help { json, .. } => *json,
-        Command::Rpc { .. }
-        | Command::Mcp { .. }
-        | Command::Stream { .. }
-        | Command::Gate { .. }
-        | Command::Version => false,
+        _ => false,
     };
     let (node, router) = match Paths::from_env() {
         Ok(paths) => {
@@ -149,6 +146,7 @@ async fn run(command: Command) -> ExitCode {
         Command::Mcp { pinned, compact } => serve_mcp(node, router, pinned, compact).await,
         Command::Stream { pinned } => serve_stream(&node, pinned).await,
         Command::Gate { pinned } => gate(node, router, pinned).await,
+        Command::Serve { listen, help } => serve::run(node, router, listen, help).await,
         Command::Help { tool: None, .. } | Command::Version => {
             out(&format!("{USAGE}\n"));
             ExitCode::SUCCESS

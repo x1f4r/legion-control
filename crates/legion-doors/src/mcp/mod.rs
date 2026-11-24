@@ -11,14 +11,13 @@
 //! a failed call is a tool result with `isError` set and the error object as its text, so an agent
 //! reads the code and the hint instead of a protocol error it cannot see.
 
-mod catalog;
+pub(crate) mod catalog;
 mod compact;
 mod events;
 
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use legion_core::policy::Policy;
 use legion_core::proto::{ErrorBody, ErrorCode, Target};
 use legion_core::{Call, Door, EventSink, Grant, Node, RouteOutcome, Router, VERSION};
 use rmcp::model::{
@@ -30,7 +29,11 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+use crate::Authenticated;
 
 use self::catalog::{Catalog, ON, summary};
 use self::events::{Forwarder, Level};
@@ -49,12 +52,25 @@ pub struct Options {
     pub compact: bool,
 }
 
+/// What a door serving MCP over HTTP shares with it: how it learns each request's principal, and
+/// the server-wide limits every call is held to.
+#[derive(Clone)]
+pub(crate) struct HttpLink {
+    /// Cancelled when the server shuts down, which cancels every call still running.
+    pub(crate) shutdown: CancellationToken,
+    /// One permit per call allowed to run at once.
+    pub(crate) limit: Arc<Semaphore>,
+}
+
 /// One MCP session over a node.
 pub struct McpDoor {
     node: Node,
     router: Arc<dyn Router>,
     options: Options,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
+    /// Set when the door serves HTTP, where each request carries the principal its token stands
+    /// for, rather than one principal for the whole session.
+    http: Option<HttpLink>,
     /// The level `logging/setLevel` asked for, if a client of the older revision asked.
     log_level: Mutex<Option<Level>>,
     /// Every call still running, so the session can wait for calls it cancels as it ends to reach
@@ -72,15 +88,65 @@ impl McpDoor {
         router: Arc<dyn Router>,
         options: Options,
     ) -> Result<McpDoor, ErrorBody> {
-        let catalog = Catalog::new(node.specs(), !options.compact)?;
+        let catalog = Arc::new(Catalog::new(node.specs(), !options.compact)?);
         Ok(McpDoor {
             node,
             router,
             options,
             catalog,
+            http: None,
             log_level: Mutex::new(None),
             calls: TaskTracker::new(),
         })
+    }
+
+    /// A door for one HTTP session or request, sharing the catalog built once for the server and
+    /// the server's call tracker, so shutting the server down waits for every call to be recorded.
+    pub(crate) fn for_http(
+        node: Node,
+        router: Arc<dyn Router>,
+        compact: bool,
+        catalog: Arc<Catalog>,
+        link: HttpLink,
+        calls: TaskTracker,
+    ) -> McpDoor {
+        McpDoor {
+            node,
+            router,
+            options: Options {
+                pinned: None,
+                compact,
+            },
+            catalog,
+            http: Some(link),
+            log_level: Mutex::new(None),
+            calls,
+        }
+    }
+
+    /// The catalog a door in this mode serves, for a server to build once and share.
+    pub(crate) fn catalog(node: &Node, compact: bool) -> Result<Arc<Catalog>, ErrorBody> {
+        Catalog::new(node.specs(), !compact).map(Arc::new)
+    }
+
+    /// The principal a request acts as: the one the session was pinned to, or over HTTP the one
+    /// the request's token stands for. An HTTP request that somehow arrives without one is refused
+    /// rather than served as the policy's default.
+    fn pinned(&self, context: &RequestContext<RoleServer>) -> Result<Option<String>, ErrorBody> {
+        if self.http.is_none() {
+            return Ok(self.options.pinned.clone());
+        }
+        context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Authenticated>())
+            .map(|authenticated| Some(authenticated.0.clone()))
+            .ok_or_else(|| {
+                self.door_error(
+                    ErrorCode::Denied,
+                    "The request carries no principal.".to_owned(),
+                )
+            })
     }
 
     /// Serves one session until `input` ends, then waits for the calls the end cancelled to finish
@@ -113,16 +179,8 @@ impl McpDoor {
 
     /// What the session's principal may use, or why that cannot be known: a policy file that
     /// does not parse grants nothing, the same as it does for every call the node runs.
-    fn grant(&self) -> Result<Grant, ErrorBody> {
-        let here = |error: ErrorBody| match error.machine {
-            Some(_) => error,
-            None => error.with_machine(self.node.name()),
-        };
-        let policy = self.node.config().get::<Policy>().map_err(here)?;
-        let principal = policy
-            .resolve(None, self.options.pinned.as_deref())
-            .map_err(here)?;
-        Ok(policy.grant(&principal, self.node.paths()))
+    fn grant(&self, context: &RequestContext<RoleServer>) -> Result<Grant, ErrorBody> {
+        crate::grant(&self.node, self.pinned(context)?.as_deref())
     }
 
     /// The tool a client names, when the principal may use it. A tool beyond its role is treated
@@ -138,8 +196,8 @@ impl McpDoor {
     /// cannot be read. Listing is a courtesy that keeps an agent from trying what will be refused;
     /// the node checks every call regardless, and a call is how an agent learns what is wrong with
     /// the policy.
-    fn listed(&self) -> Vec<Tool> {
-        let Ok(grant) = self.grant() else {
+    fn listed(&self, context: &RequestContext<RoleServer>) -> Vec<Tool> {
+        let Ok(grant) = self.grant(context) else {
             return Vec::new();
         };
         self.catalog
@@ -179,6 +237,31 @@ impl McpDoor {
             .log_level
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let pinned = match self.pinned(context) {
+            Ok(pinned) => pinned,
+            Err(error) => return RouteOutcome::One(Err(error)),
+        };
+        // Over HTTP every call also ends when the server shuts down, and waits for a permit.
+        let (cancel, _permit, _linked) = match &self.http {
+            None => (context.ct.clone(), None, None),
+            Some(link) => {
+                let Ok(permit) = Arc::clone(&link.limit).try_acquire_owned() else {
+                    return RouteOutcome::One(Err(crate::too_many_calls(&self.node)));
+                };
+                let cancel = link.shutdown.child_token();
+                let request = context.ct.clone();
+                let linked = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        () = request.cancelled() => linked.cancel(),
+                        () = linked.cancelled() => {}
+                    }
+                });
+                // Ends the watcher once the call is over, however it ended.
+                let guard = cancel.clone().drop_guard();
+                (cancel, Some(permit), Some(guard))
+            }
+        };
         let forwarder = Forwarder::new(context, tool, session_level);
         let (events, queue) = match &forwarder {
             Some(_) => {
@@ -191,10 +274,14 @@ impl McpDoor {
             tool: tool.to_owned(),
             args,
             as_principal: None,
-            door: Door::Mcp,
-            pinned: self.options.pinned.clone(),
+            door: if self.http.is_some() {
+                Door::Http
+            } else {
+                Door::Mcp
+            },
+            pinned,
             // Cancelled when the client cancels the request, and when the session ends.
-            cancel: context.ct.clone(),
+            cancel,
             events,
             hops: 0,
         };
@@ -240,11 +327,11 @@ impl McpDoor {
         match name {
             compact::TOOLS => RouteOutcome::One(
                 compact::parse::<compact::ToolsArgs>(name, args)
-                    .and_then(|args| self.list_compact(args.family.as_deref())),
+                    .and_then(|args| self.list_compact(args.family.as_deref(), context)),
             ),
             compact::DESCRIBE => RouteOutcome::One(
                 compact::parse::<compact::DescribeArgs>(name, args).and_then(|args| {
-                    let grant = self.grant()?;
+                    let grant = self.grant(context)?;
                     match self.visible(&grant, &args.tool) {
                         Some(entry) => to_object(&entry.spec),
                         None => Err(self
@@ -274,7 +361,7 @@ impl McpDoor {
             },
             other => {
                 let hint = match self
-                    .grant()
+                    .grant(context)
                     .ok()
                     .and_then(|grant| self.visible(&grant, other).map(|entry| entry.spec.name.clone()))
                 {
@@ -292,7 +379,11 @@ impl McpDoor {
     }
 
     /// `legion_tools`: the tools the principal may use, optionally of one family.
-    fn list_compact(&self, family: Option<&str>) -> Result<Value, ErrorBody> {
+    fn list_compact(
+        &self,
+        family: Option<&str>,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Value, ErrorBody> {
         #[derive(Serialize)]
         struct Listing<'a> {
             tools: Vec<Listed<'a>>,
@@ -303,7 +394,7 @@ impl McpDoor {
             effect: &'a str,
             description: &'a str,
         }
-        let grant = self.grant()?;
+        let grant = self.grant(context)?;
         let allowed: Vec<&catalog::Entry> = self
             .catalog
             .entries()
@@ -456,12 +547,12 @@ impl ServerHandler for McpDoor {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = if self.options.compact {
             compact::tools()
         } else {
-            self.listed()
+            self.listed(&context)
         };
         Ok(ListToolsResult::with_all_items(tools))
     }

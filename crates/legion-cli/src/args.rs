@@ -49,6 +49,13 @@ pub enum Command {
     },
     /// `legion cp <from> <to> …`: `fs.transfer` from a command line.
     Cp(CpCommand),
+    /// `legion serve`: serve the tools over HTTP on a loopback address.
+    Serve {
+        /// `--listen`.
+        listen: Option<String>,
+        /// `--help`: say how, rather than serve.
+        help: bool,
+    },
     /// `legion --version`.
     Version,
 }
@@ -121,6 +128,8 @@ Usage:
   legion mcp [--as PRINCIPAL] [--compact]
   legion stream [--as PRINCIPAL]
   legion gate --as PRINCIPAL
+  legion serve [--listen ADDRESS]
+  legion token add NAME PRINCIPAL [expires_days=N] [allow_owner=true] | list | remove NAME
   legion --version
 
 A value that parses as JSON is JSON (n=3, ok=true, tags=[\"a\"]); anything else is a string.
@@ -248,6 +257,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
             Ok(Command::Gate { pinned })
         }
         "cp" => cp(rest).map(Command::Cp),
+        "serve" => serve(rest),
+        "token" => token(rest),
         tool if tool.starts_with('-') => Err(UsageError(format!(
             "{tool} is not an option here; options come after the tool's name."
         ))),
@@ -356,6 +367,74 @@ pub fn command_help(name: &str) -> Option<&'static str> {
         "gate" => Some(GATE_HELP),
         _ => None,
     }
+}
+
+/// `legion serve [--listen ADDRESS]`, or `--help`.
+fn serve(rest: &[String]) -> Result<Command, UsageError> {
+    let mut listen = None;
+    let mut help = false;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let value = if word == "--help" || word == "-h" {
+            help = true;
+            continue;
+        } else if let Some(value) = word.strip_prefix("--listen=") {
+            value.to_owned()
+        } else if word == "--listen" {
+            words
+                .next()
+                .cloned()
+                .ok_or_else(|| UsageError("--listen needs a value.".to_owned()))?
+        } else {
+            return Err(UsageError(format!("{word} was not expected here.")));
+        };
+        if listen.replace(value).is_some() {
+            return Err(UsageError("--listen is given twice.".to_owned()));
+        }
+    }
+    Ok(Command::Serve { listen, help })
+}
+
+/// `legion token add|list|remove`, which is `token.add`, `token.list` and `token.remove` with the
+/// names and the principal written as words rather than `key=value`.
+fn token(rest: &[String]) -> Result<Command, UsageError> {
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(UsageError("token takes add, list or remove.".to_owned()));
+    };
+    let (tool, names): (&str, &[&str]) = match verb.as_str() {
+        "add" => ("token.add", &["name", "principal"]),
+        "list" => ("token.list", &[]),
+        "remove" => ("token.remove", &["name"]),
+        other => {
+            return Err(UsageError(format!(
+                "{other} is not something token does; it takes add, list or remove."
+            )));
+        }
+    };
+    let mut flags = Flags::read(rest, &["--json", "--as", "--on"])?;
+    if flags.positional.len() != names.len() {
+        return Err(UsageError(match names {
+            [] => format!("token {verb} takes no names."),
+            [name] => format!("token {verb} takes the token's {name}."),
+            _ => format!("token {verb} takes the token's name and the principal it stands for."),
+        }));
+    }
+    for (name, value) in names.iter().zip(flags.positional.drain(..)) {
+        if flags
+            .pairs
+            .insert((*name).to_owned(), Value::String(value))
+            .is_some()
+        {
+            return Err(UsageError(format!("{name} is given twice.")));
+        }
+    }
+    Ok(Command::Call(CallCommand {
+        tool: tool.to_owned(),
+        args: ArgsSource::Pairs(flags.pairs),
+        as_principal: flags.as_principal,
+        on: flags.on,
+        json: flags.json,
+    }))
 }
 
 fn no_more(rest: &[String]) -> Result<(), UsageError> {
@@ -702,5 +781,66 @@ mod tests {
                 json: false
             })
         );
+    }
+
+    #[test]
+    fn serve_and_token_words() {
+        assert_eq!(
+            run(&["serve"]),
+            Ok(Command::Serve {
+                listen: None,
+                help: false
+            })
+        );
+        assert_eq!(
+            run(&["serve", "--listen", "127.0.0.1:0"]),
+            Ok(Command::Serve {
+                listen: Some("127.0.0.1:0".into()),
+                help: false
+            })
+        );
+        assert_eq!(
+            run(&["serve", "--listen=[::1]:7117", "--help"]),
+            Ok(Command::Serve {
+                listen: Some("[::1]:7117".into()),
+                help: true
+            })
+        );
+        assert!(run(&["serve", "--listen"]).is_err());
+        assert!(run(&["serve", "--listen", "a", "--listen", "b"]).is_err());
+        assert!(run(&["serve", "--port", "1"]).is_err());
+
+        let add = call(&[
+            "token",
+            "add",
+            "phone",
+            "phone",
+            "expires_days=30",
+            "--json",
+        ]);
+        assert_eq!(add.tool, "token.add");
+        assert!(add.json);
+        assert_eq!(
+            add.args,
+            ArgsSource::Pairs(
+                json!({"expires_days": 30, "name": "phone", "principal": "phone"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            )
+        );
+        assert_eq!(call(&["token", "list"]).tool, "token.list");
+        let remove = call(&["token", "remove", "phone", "--on", "pi"]);
+        assert_eq!(remove.tool, "token.remove");
+        assert_eq!(remove.on, Some(Target::One("pi".into())));
+        for wrong in [
+            &["token"][..],
+            &["token", "make"],
+            &["token", "add", "phone"],
+            &["token", "list", "x"],
+            &["token", "remove", "phone", "name=other"],
+        ] {
+            assert!(run(wrong).is_err(), "{wrong:?}");
+        }
     }
 }

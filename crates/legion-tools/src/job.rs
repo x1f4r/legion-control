@@ -1413,6 +1413,8 @@ mod tests {
                 start_time: 1,
             },
             systemd_unit: None,
+            windows_job: None,
+            marker: None,
             warnings: Vec::new(),
         };
 
@@ -1426,6 +1428,7 @@ mod tests {
             Ok(procid::KillTreeReport {
                 all_gone: false,
                 survivors: vec![current],
+                unverified_survivors: Vec::new(),
             }),
             Duration::from_millis(50),
         )
@@ -1448,6 +1451,7 @@ mod tests {
             Ok(procid::KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
+                unverified_survivors: Vec::new(),
             }),
             Duration::from_millis(50),
         )
@@ -1484,6 +1488,7 @@ mod tests {
             Ok(procid::KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
+                unverified_survivors: Vec::new(),
             }),
             Duration::from_millis(50),
         )

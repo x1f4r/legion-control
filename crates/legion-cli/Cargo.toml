@@ -19,7 +19,7 @@ legion-proto.workspace = true
 legion-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 
 [dev-dependencies]
 legion-tools = { workspace = true, features = ["testing"] }
@@ -36,6 +36,11 @@ harness = false
 # banner to their stream pipes.
 [[test]]
 name = "transfer"
+harness = false
+
+# Hosts extra nodes for its fan-out test by re-executing itself, as the fleet tests do.
+[[test]]
+name = "http"
 harness = false
 
 [lints]

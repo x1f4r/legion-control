@@ -15,6 +15,7 @@ pub mod policy;
 mod registry;
 mod route;
 pub mod schema;
+pub mod tokens;
 mod tool;
 
 pub use config::{ConfigStore, Document};
