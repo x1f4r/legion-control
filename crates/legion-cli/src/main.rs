@@ -13,9 +13,13 @@ mod serve;
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
-use legion_core::proto::{ErrorBody, Target, ToolsResult};
-use legion_core::{Call, Door, EventSink, Node, Paths, RouteOutcome, Router, VERSION};
+use legion_core::proto::{ErrorBody, ErrorCode, Target, ToolsResult};
+use legion_core::{
+    CANCEL_GRACE, Call, CancellationToken, Door, EventSink, Node, Paths, RouteOutcome, Router,
+    VERSION,
+};
 use legion_doors::mcp::{self, McpDoor};
 use legion_net::stream::Host;
 use legion_net::{Fleet, Subcommand};
@@ -27,6 +31,8 @@ use crate::args::{ArgsSource, CallCommand, Command, USAGE, UsageError, command_h
 
 const FAILED: u8 = 1;
 const USAGE_ERROR: u8 = 2;
+/// Bounded wait for a cancelled call to stop and audit after a termination signal.
+const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(4));
 
 fn main() -> ExitCode {
     if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
@@ -110,7 +116,8 @@ async fn run(command: Command) -> ExitCode {
     };
     match command {
         Command::Call(call) => {
-            let code = call_tool(&node, router.as_ref(), call).await;
+            let shutdown = install_shutdown_token();
+            let code = call_tool(&node, router.as_ref(), call, shutdown).await;
             router.shutdown().await;
             code
         }
@@ -138,15 +145,33 @@ async fn run(command: Command) -> ExitCode {
             Err(error) => failed(&error, json),
         },
         Command::Cp(command) => {
-            let code = cp::run(&node, router.as_ref(), command).await;
+            let shutdown = install_shutdown_token();
+            let code = cp::run(&node, router.as_ref(), command, shutdown).await;
             router.shutdown().await;
             code
         }
-        Command::Rpc { pinned } => serve_rpc(node, router, pinned).await,
-        Command::Mcp { pinned, compact } => serve_mcp(node, router, pinned, compact).await,
-        Command::Stream { pinned } => serve_stream(&node, pinned).await,
-        Command::Gate { pinned } => gate(node, router, pinned).await,
-        Command::Serve { listen, help } => serve::run(node, router, listen, help).await,
+        Command::Rpc { pinned } => {
+            let shutdown = install_shutdown_token();
+            serve_rpc(node, router, pinned, shutdown).await
+        }
+        Command::Mcp { pinned, compact } => {
+            let shutdown = install_shutdown_token();
+            serve_mcp(node, router, pinned, compact, shutdown).await
+        }
+        Command::Stream { pinned } => {
+            let shutdown = install_shutdown_token();
+            let code = serve_stream(&node, pinned, shutdown).await;
+            router.shutdown().await;
+            code
+        }
+        Command::Gate { pinned } => {
+            let shutdown = install_shutdown_token();
+            gate(node, router, pinned, shutdown).await
+        }
+        Command::Serve { listen, help } => {
+            let shutdown = install_shutdown_token();
+            serve::run(node, router, listen, help, shutdown).await
+        }
         Command::Help { tool: None, .. } | Command::Version => {
             out(&format!("{USAGE}\n"));
             ExitCode::SUCCESS
@@ -154,14 +179,20 @@ async fn run(command: Command) -> ExitCode {
     }
 }
 
-/// `legion rpc`: JSON-RPC on stdin and stdout until stdin ends.
-async fn serve_rpc(node: Node, router: Arc<dyn Router>, pinned: Option<String>) -> ExitCode {
-    match rpc::serve(
+/// `legion rpc`: JSON-RPC on stdin and stdout until stdin ends or a termination signal fires.
+async fn serve_rpc(
+    node: Node,
+    router: Arc<dyn Router>,
+    pinned: Option<String>,
+    shutdown: CancellationToken,
+) -> ExitCode {
+    match rpc::serve_until(
         tokio::io::stdin(),
         tokio::io::stdout(),
         node,
         router,
         pinned,
+        shutdown,
     )
     .await
     {
@@ -175,25 +206,42 @@ async fn serve_rpc(node: Node, router: Arc<dyn Router>, pinned: Option<String>) 
 
 /// `legion stream`: one bulk-data operation on stdin and stdout. Its reason for failing, when it
 /// fails, goes to stderr whether or not it could still be said on stdout.
-async fn serve_stream(node: &Node, pinned: Option<String>) -> ExitCode {
+async fn serve_stream(
+    node: &Node,
+    pinned: Option<String>,
+    shutdown: CancellationToken,
+) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
-    let served = tokio::task::spawn_blocking(move || {
+    let mut served = tokio::task::spawn_blocking(move || {
         legion_net::stream::serve(
             &host,
             pinned.as_deref(),
             io::stdin().lock(),
             io::stdout().lock(),
         )
-    })
-    .await;
-    match served {
-        Ok(Ok(())) => ExitCode::SUCCESS,
-        Ok(Err(error)) => {
+    });
+    let outcome = tokio::select! {
+        result = &mut served => Some(result),
+        () = shutdown.cancelled() => {
+            // Give an operation that is already finishing a short window to audit cleanly
+            // without hanging if stdin stays open.
+            tokio::time::timeout(Duration::from_millis(500), served)
+                .await
+                .ok()
+        }
+    };
+    match outcome {
+        Some(Ok(Ok(()))) => ExitCode::SUCCESS,
+        Some(Ok(Err(error))) => {
             err(&format!("legion stream: {}\n", error.message));
             ExitCode::from(FAILED)
         }
-        Err(error) => {
+        Some(Err(error)) => {
             err(&format!("legion stream: the operation stopped: {error}\n"));
+            ExitCode::from(FAILED)
+        }
+        None => {
+            err("legion stream: stopped by signal\n");
             ExitCode::from(FAILED)
         }
     }
@@ -202,14 +250,24 @@ async fn serve_stream(node: &Node, pinned: Option<String>) -> ExitCode {
 /// `legion gate`: serves what a key forced to it asked for, when that is exactly `legion rpc` or
 /// `legion stream` as the ssh connector sends them, pinned to the key's principal. The request is
 /// only compared, never run.
-async fn gate(node: Node, router: Arc<dyn Router>, pinned: String) -> ExitCode {
+async fn gate(
+    node: Node,
+    router: Arc<dyn Router>,
+    pinned: String,
+    shutdown: CancellationToken,
+) -> ExitCode {
     let requested = std::env::var("SSH_ORIGINAL_COMMAND")
         .ok()
         .and_then(|command| legion_net::gate::requested(&command));
     match requested {
-        Some(Subcommand::Rpc) => serve_rpc(node, router, Some(pinned)).await,
-        Some(Subcommand::Stream) => serve_stream(&node, Some(pinned)).await,
+        Some(Subcommand::Rpc) => serve_rpc(node, router, Some(pinned), shutdown).await,
+        Some(Subcommand::Stream) => {
+            let code = serve_stream(&node, Some(pinned), shutdown).await;
+            router.shutdown().await;
+            code
+        }
         None => {
+            router.shutdown().await;
             err(&format!("{}\n", legion_net::gate::REFUSAL));
             ExitCode::from(FAILED)
         }
@@ -222,6 +280,7 @@ async fn serve_mcp(
     router: Arc<dyn Router>,
     pinned: Option<String>,
     compact: bool,
+    shutdown: CancellationToken,
 ) -> ExitCode {
     let door = match McpDoor::new(node, router, mcp::Options { pinned, compact }) {
         Ok(door) => door,
@@ -230,7 +289,10 @@ async fn serve_mcp(
             return ExitCode::from(FAILED);
         }
     };
-    match door.serve(tokio::io::stdin(), tokio::io::stdout()).await {
+    match door
+        .serve_until(tokio::io::stdin(), tokio::io::stdout(), shutdown)
+        .await
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             err(&format!("legion mcp: the session ended: {error}\n"));
@@ -239,7 +301,87 @@ async fn serve_mcp(
     }
 }
 
-async fn call_tool(node: &Node, router: &dyn Router, command: CallCommand) -> ExitCode {
+/// Installs OS termination-signal handlers synchronously on the runtime and returns a token that
+/// cancels on SIGINT, SIGTERM or SIGHUP on Unix, and Ctrl-C, Ctrl-Break, Ctrl-Close or
+/// Ctrl-Shutdown on Windows.
+fn install_shutdown_token() -> CancellationToken {
+    let token = CancellationToken::new();
+    let fire = token.clone();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{Signal, SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).ok();
+        let mut hup = signal(SignalKind::hangup()).ok();
+        async fn recv(sig: Option<&mut Signal>) {
+            match sig {
+                Some(sig) => {
+                    let _ = sig.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                () = recv(term.as_mut()) => {}
+                () = recv(hup.as_mut()) => {}
+            }
+            fire.cancel();
+        });
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+        let mut brk = ctrl_break().ok();
+        let mut close = ctrl_close().ok();
+        let mut down = ctrl_shutdown().ok();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                () = async {
+                    match brk.as_mut() {
+                        Some(sig) => {
+                            let _ = sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+                () = async {
+                    match close.as_mut() {
+                        Some(sig) => {
+                            let _ = sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+                () = async {
+                    match down.as_mut() {
+                        Some(sig) => {
+                            let _ = sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+            }
+            fire.cancel();
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            fire.cancel();
+        });
+    }
+    token
+}
+
+async fn call_tool(
+    node: &Node,
+    router: &dyn Router,
+    command: CallCommand,
+    shutdown: CancellationToken,
+) -> ExitCode {
     let args = match command.args {
         ArgsSource::Pairs(pairs) => Value::Object(pairs),
         ArgsSource::Json(text) => match args::json_object(&text, "--args") {
@@ -260,33 +402,48 @@ async fn call_tool(node: &Node, router: &dyn Router, command: CallCommand) -> Ex
         }
     };
 
-    let multi = matches!(&command.on, Some(Target::All))
-        || matches!(&command.on, Some(Target::Many(names)) if names.len() > 1);
+    let multi = match &command.on {
+        Some(Target::All) => true,
+        Some(Target::Many(names)) => {
+            names.iter().collect::<std::collections::HashSet<_>>().len() > 1
+        }
+        None | Some(Target::One(_)) => false,
+    };
     let mut call = Call::new(Door::Cli, command.tool, args);
     call.as_principal = command.as_principal;
     if io::stderr().is_terminal() {
         call.events = EventSink::with_events(move |event| err(&render::event(&event, multi)));
     }
-    let outcome = run_call(node, router, call, command.on).await;
+    let outcome = run_call(node, router, call, command.on, shutdown).await;
     print_outcome(outcome, command.json)
 }
 
-/// Runs a call until it ends. Ctrl-C cancels the call rather than killing the process, so the
-/// call still ends in the audit log, as cancelled.
+/// Runs a call until it ends. Termination signals (Ctrl-C, SIGTERM, SIGHUP; Ctrl-Break / console
+/// close on Windows) cancel the call and wait within a bounded grace so remote work stops and the
+/// call reaches the audit log before `router.shutdown()` closes sessions.
 async fn run_call(
     node: &Node,
     router: &dyn Router,
     call: Call,
     on: Option<Target>,
+    shutdown: CancellationToken,
 ) -> RouteOutcome {
+    let tool_name = call.tool.clone();
     let cancel = call.cancel.clone();
     let running = router.call(node, call, on);
     tokio::pin!(running);
     tokio::select! {
         outcome = &mut running => outcome,
-        Ok(()) = tokio::signal::ctrl_c() => {
+        () = shutdown.cancelled() => {
             cancel.cancel();
-            running.await
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut running).await {
+                Ok(outcome) => outcome,
+                Err(_) => RouteOutcome::One(Err(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    format!("The call to {tool_name} was cancelled by signal."),
+                )
+                .with_machine(node.name()))),
+            }
         }
     }
 }

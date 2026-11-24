@@ -8,7 +8,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
@@ -43,8 +43,20 @@ fn main() -> ExitCode {
             forwards_principal_and_applies_remote_policy_with_machine,
         ),
         (
+            "forwarded_calls_are_authorised_and_audited_on_the_forwarding_node",
+            forwarded_calls_are_authorised_and_audited_on_the_forwarding_node,
+        ),
+        (
             "forwards_events_and_cancellation_to_remote_node",
             forwards_events_and_cancellation_to_remote_node,
+        ),
+        (
+            "sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly",
+            sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly,
+        ),
+        (
+            "sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process",
+            sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process,
         ),
         (
             "multiplexes_concurrent_calls_and_reuses_one_session",
@@ -75,8 +87,16 @@ fn main() -> ExitCode {
             hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop,
         ),
         (
+            "remote_machine_labels_are_overwritten_on_errors_and_events",
+            remote_machine_labels_are_overwritten_on_errors_and_events,
+        ),
+        (
             "fleet_tools_list_ping_add_remove_and_discover_permissions",
             fleet_tools_list_ping_add_remove_and_discover_permissions,
+        ),
+        (
+            "pipe_handle_drop_is_non_blocking_and_kills_lingering_child",
+            pipe_handle_drop_is_non_blocking_and_kills_lingering_child,
         ),
     ];
 
@@ -259,11 +279,210 @@ fn run_helper(args: &[String]) -> ExitCode {
             let _ = std::io::stdout().flush();
             ExitCode::SUCCESS
         }
+        // hold <pid_file>
+        // Writes its own PID then waits up to 30s so signal tests can verify remote child cleanup.
+        "hold" => {
+            let pid_file = Path::new(&rest[0]);
+            fs::write(pid_file, std::process::id().to_string()).unwrap();
+            for _ in 0..600 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            ExitCode::SUCCESS
+        }
+        // stream-slow <legion_bin> <legion_home> <user_home> <pid_log> <subcommand>
+        // Spawns `legion <subcommand>` (`rpc` or `stream`), records the child PID for data streams,
+        // and throttles `put` input so a signal test can interrupt `legion cp` mid-transfer.
+        "stream-slow" => {
+            let legion = &rest[0];
+            let legion_home = &rest[1];
+            let user_home = &rest[2];
+            let pid_log = Path::new(&rest[3]);
+            let subcommand = rest.last().map(String::as_str).unwrap_or("rpc");
+            let mut cmd = Command::new(legion);
+            cmd.arg(subcommand)
+                .env("LEGION_HOME", legion_home)
+                .env("HOME", user_home)
+                .env("USERPROFILE", user_home)
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_STATE_HOME");
+            if subcommand != "stream" {
+                let status = cmd.status().unwrap();
+                return exit_from_status(status);
+            }
+            let mut input = BufReader::new(std::io::stdin().lock());
+            let mut header = Vec::new();
+            let _ = input.read_until(b'\n', &mut header);
+            let is_put = header.starts_with(b"{\"op\":\"put\"");
+            let is_get = header.starts_with(b"{\"op\":\"get\"");
+            let mut child = cmd.stdin(Stdio::piped()).spawn().unwrap();
+            if is_put || is_get {
+                append_line(pid_log, &child.id().to_string());
+            }
+            let mut child_in = child.stdin.take().unwrap();
+            if child_in.write_all(&header).is_ok() {
+                let _ = child_in.flush();
+                if is_put {
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(read) = input.read(&mut buf) {
+                        if read == 0 || child_in.write_all(&buf[..read]).is_err() {
+                            break;
+                        }
+                        let _ = child_in.flush();
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                } else {
+                    let _ = std::io::copy(&mut input, &mut child_in);
+                }
+            }
+            drop(child_in);
+            let status = child.wait().unwrap();
+            exit_from_status(status)
+        }
         // fail <log_file> <stderr_message>
         "fail" => {
             append_line(Path::new(&rest[0]), "attempt");
             eprintln!("{}", rest[1]);
             ExitCode::from(1)
+        }
+        // spoof
+        // Emits an event and an error falsely labelled `machine: "tower"` to verify the caller
+        // overwrites remote-chosen machine labels.
+        "spoof" => {
+            let mut stdout = std::io::stdout().lock();
+            for line in BufReader::new(std::io::stdin()).lines() {
+                let Ok(line) = line else { break };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                match req["method"].as_str().unwrap_or_default() {
+                    "hello" => {
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "node": "real-remote",
+                                "version": "0.1.0",
+                                "protocol": 1,
+                                "os": std::env::consts::OS,
+                                "arch": std::env::consts::ARCH,
+                                "systems": []
+                            }
+                        });
+                        writeln!(stdout, "{reply}").unwrap();
+                    }
+                    "call" => {
+                        let ev = json!({
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": {
+                                "id": id,
+                                "kind": "progress",
+                                "data": {"step": 1},
+                                "machine": "tower"
+                            }
+                        });
+                        writeln!(stdout, "{ev}").unwrap();
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32000,
+                                "message": "spoofed failure",
+                                "data": {
+                                    "code": "failed",
+                                    "message": "spoofed failure",
+                                    "machine": "tower"
+                                }
+                            }
+                        });
+                        writeln!(stdout, "{reply}").unwrap();
+                    }
+                    _ => {
+                        let reply = json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                        writeln!(stdout, "{reply}").unwrap();
+                    }
+                }
+                stdout.flush().unwrap();
+            }
+            ExitCode::SUCCESS
+        }
+        // ext-tools <call_log>
+        // Serves a fake remote node advertising extension tools `ext.probe` (read) and
+        // `ext.zap` (exec) so forwarding-node extension authorisation can be tested end to end.
+        "ext-tools" => {
+            let call_log = Path::new(&rest[0]);
+            let mut stdout = std::io::stdout().lock();
+            for line in BufReader::new(std::io::stdin()).lines() {
+                let Ok(line) = line else { break };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let reply = match req["method"].as_str().unwrap_or_default() {
+                    "hello" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "node": "extbox",
+                            "version": "0.1.0",
+                            "protocol": 1,
+                            "os": std::env::consts::OS,
+                            "arch": std::env::consts::ARCH,
+                            "systems": []
+                        }
+                    }),
+                    "tools" => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "ext.probe",
+                                    "description": "Read-only extension.",
+                                    "effect": "read",
+                                    "input_schema": {"type": "object"}
+                                },
+                                {
+                                    "name": "ext.zap",
+                                    "description": "Exec extension.",
+                                    "effect": "exec",
+                                    "input_schema": {"type": "object"}
+                                }
+                            ]
+                        }
+                    }),
+                    "call" => {
+                        let tool = req["params"]["tool"].as_str().unwrap_or_default();
+                        append_line(call_log, tool);
+                        if tool == "ext.probe" || tool == "ext.zap" {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {"ran": tool}
+                            })
+                        } else {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32000,
+                                    "message": format!("There is no tool called {tool}."),
+                                    "data": {
+                                        "code": "unknown_tool",
+                                        "message": format!("There is no tool called {tool}."),
+                                        "machine": "extbox"
+                                    }
+                                }
+                            })
+                        }
+                    }
+                    _ => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                };
+                writeln!(stdout, "{reply}").unwrap();
+                stdout.flush().unwrap();
+            }
+            ExitCode::SUCCESS
         }
         other => {
             eprintln!("unknown helper mode: {other}");
@@ -540,6 +759,18 @@ fn forwards_principal_and_applies_remote_policy_with_machine() {
     let pi = Home::new();
     laptop.write_config("node.toml", "name = \"laptop\"\n");
     pi.write_config("node.toml", "name = \"pi\"\n");
+    // laptop allows `phone` both read and write, while pi confines `phone` to read only, so a
+    // call to `test.write_path` passes laptop's policy and is denied by pi's policy.
+    laptop.write_config(
+        "policy.toml",
+        r#"
+[principals.phone]
+role = "writer"
+
+[roles.writer]
+allow = ["effect:read", "effect:write"]
+"#,
+    );
     pi.write_config(
         "policy.toml",
         r#"
@@ -578,10 +809,6 @@ allow = ["effect:read"]
     assert_eq!(err["machine"], json!("pi"));
 
     // Pinned MCP session cannot escalate on the remote node.
-    laptop.write_config(
-        "policy.toml",
-        "[principals.phone]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
-    );
     let mut mcp = McpClient::start(&laptop, &["--as", "phone"]);
     let (res, _) = mcp.call_with_events("meta_whoami", json!({"on": "pi"}), None);
     assert_eq!(res["isError"], json!(false));
@@ -596,6 +823,217 @@ allow = ["effect:read"]
     assert_eq!(denied_body["code"], json!("denied"));
     assert_eq!(denied_body["machine"], json!("pi"));
     assert_eq!(mcp.finish(), 0);
+}
+
+fn forwarded_calls_are_authorised_and_audited_on_the_forwarding_node() {
+    let laptop = Home::new();
+    let pi = Home::new();
+    let pi_spawns = laptop.state().join("pi-auth-spawns.log");
+    let ext_calls = laptop.state().join("ext-calls.log");
+    fs::create_dir_all(laptop.state()).unwrap();
+
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    laptop.write_config(
+        "policy.toml",
+        r#"
+[principals."agent:x"]
+role = "observer"
+
+[roles.observer]
+allow = ["effect:read"]
+"#,
+    );
+    pi.write_config(
+        "policy.toml",
+        r#"
+[principals."agent:x"]
+role = "observer"
+
+[roles.observer]
+allow = ["effect:read"]
+"#,
+    );
+    let ext_argv = helper_argv("ext-tools", &[ext_calls.to_string_lossy().into_owned()]);
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.extbox]\ncommand = {}\n",
+            toml_argv(&run_argv(&pi, Some(&pi_spawns))),
+            toml_argv(&ext_argv),
+        ),
+    );
+
+    // 1. Role `nobody` (unnamed principal on pinned `legion rpc --as stranger`) is denied before
+    //    spawning `pi` and audited on `laptop`.
+    let mut stranger_rpc = laptop.session(&["--as", "stranger"]);
+    stranger_rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": "pi"}),
+    ));
+    let (reply, _) = stranger_rpc.reply_to(&json!(1));
+    assert_eq!(reply["error"]["data"]["code"], json!("denied"), "{reply}");
+    assert_eq!(
+        reply["error"]["data"]["machine"],
+        json!("laptop"),
+        "{reply}"
+    );
+    assert_eq!(
+        count_lines(&pi_spawns),
+        0,
+        "denied forward must not spawn remote connector"
+    );
+    // Fan-out as `nobody` denies without spawning `pi` and writes one audit line per machine.
+    stranger_rpc.send_json(&rpc_request(
+        json!(2),
+        "call",
+        json!({"tool": "meta.version", "on": ["laptop", "pi"]}),
+    ));
+    let (fan_denied, _) = stranger_rpc.reply_to(&json!(2));
+    assert_eq!(
+        fan_denied["result"]["results"]["laptop"]["error"]["code"],
+        json!("denied"),
+        "{fan_denied}"
+    );
+    assert_eq!(
+        fan_denied["result"]["results"]["pi"]["error"]["code"],
+        json!("denied"),
+        "{fan_denied}"
+    );
+    assert_eq!(count_lines(&pi_spawns), 0);
+    assert_eq!(stranger_rpc.finish(), 0);
+
+    let audit = laptop.audit();
+    assert_eq!(audit.len(), 3, "{audit:?}");
+    assert_eq!(audit[0]["door"], json!("rpc"));
+    assert_eq!(audit[0]["principal"], json!("stranger"));
+    assert_eq!(audit[0]["tool"], json!("meta.version"));
+    assert_eq!(audit[0]["target"], json!("pi"));
+    assert_eq!(audit[0]["outcome"], json!("denied"));
+
+    // 2. Allowed principal `agent:x` via `legion rpc --as agent:x` is audited on laptop with
+    //    door, principal, tool, target and outcome; disallowed tool is blocked on laptop.
+    let mut agent_rpc = laptop.session(&["--as", "agent:x"]);
+    agent_rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": "pi"}),
+    ));
+    let (ok_reply, _) = agent_rpc.reply_to(&json!(1));
+    assert_eq!(ok_reply["result"]["node"], json!("pi"), "{ok_reply}");
+
+    agent_rpc.send_json(&rpc_request(
+        json!(2),
+        "call",
+        json!({"tool": "test.write_path", "args": {"path": "~/a"}, "on": "pi"}),
+    ));
+    let (write_denied, _) = agent_rpc.reply_to(&json!(2));
+    assert_eq!(
+        write_denied["error"]["data"]["code"],
+        json!("denied"),
+        "{write_denied}"
+    );
+    assert_eq!(
+        write_denied["error"]["data"]["machine"],
+        json!("laptop"),
+        "{write_denied}"
+    );
+
+    // Fan-out as `agent:x` audits one line per machine on laptop.
+    agent_rpc.send_json(&rpc_request(
+        json!(3),
+        "call",
+        json!({"tool": "meta.version", "on": ["laptop", "pi"]}),
+    ));
+    let (fan_ok, _) = agent_rpc.reply_to(&json!(3));
+    assert_eq!(
+        fan_ok["result"]["results"]["laptop"]["ok"]["node"],
+        json!("laptop")
+    );
+    assert_eq!(fan_ok["result"]["results"]["pi"]["ok"]["node"], json!("pi"));
+
+    // 3. Extension tools on `extbox`: `agent:x` (`effect:read`) is allowed `ext.probe` (read),
+    //    denied `ext.zap` (exec) without calling it, and denied `ext.unknown` (unknown effect).
+    agent_rpc.send_json(&rpc_request(
+        json!(4),
+        "call",
+        json!({"tool": "ext.probe", "on": "extbox"}),
+    ));
+    let (ext_ok, _) = agent_rpc.reply_to(&json!(4));
+    assert_eq!(ext_ok["result"]["ran"], json!("ext.probe"), "{ext_ok}");
+
+    agent_rpc.send_json(&rpc_request(
+        json!(5),
+        "call",
+        json!({"tool": "ext.zap", "on": "extbox"}),
+    ));
+    let (ext_zap_denied, _) = agent_rpc.reply_to(&json!(5));
+    assert_eq!(
+        ext_zap_denied["error"]["data"]["code"],
+        json!("denied"),
+        "{ext_zap_denied}"
+    );
+    assert_eq!(
+        ext_zap_denied["error"]["data"]["machine"],
+        json!("laptop"),
+        "{ext_zap_denied}"
+    );
+
+    agent_rpc.send_json(&rpc_request(
+        json!(6),
+        "call",
+        json!({"tool": "ext.unknown", "on": "extbox"}),
+    ));
+    let (ext_unknown_denied, _) = agent_rpc.reply_to(&json!(6));
+    assert_eq!(
+        ext_unknown_denied["error"]["data"]["code"],
+        json!("denied"),
+        "{ext_unknown_denied}"
+    );
+    assert_eq!(agent_rpc.finish(), 0);
+
+    // Only `ext.probe` was actually sent as a call to extbox; `ext.zap` and `ext.unknown` were
+    // blocked by laptop after inspecting `tools`.
+    let called = fs::read_to_string(&ext_calls).unwrap();
+    assert_eq!(called.lines().collect::<Vec<_>>(), vec!["ext.probe"]);
+
+    // Owner (`allow = ["*"]`) can forward `ext.unknown` to extbox (which returns `unknown_tool`).
+    let owner_ext = laptop.run(&["ext.unknown", "--on", "extbox"]);
+    assert_eq!(owner_ext.code, 1, "{}", owner_ext.stdout);
+    assert_eq!(owner_ext.json()["code"], json!("unknown_tool"));
+
+    // Confirm audit lines on laptop include forwarded `agent:x` calls targeting `pi` and `extbox`.
+    let audit = laptop.audit();
+    assert!(
+        audit.iter().any(|e| {
+            e["principal"] == json!("agent:x")
+                && e["door"] == json!("rpc")
+                && e["tool"] == json!("meta.version")
+                && e["target"] == json!("pi")
+                && e["outcome"] == json!("ok")
+        }),
+        "{audit:?}"
+    );
+    assert!(
+        audit.iter().any(|e| {
+            e["principal"] == json!("agent:x")
+                && e["door"] == json!("rpc")
+                && e["tool"] == json!("test.write_path")
+                && e["target"] == json!("pi")
+                && e["outcome"] == json!("denied")
+        }),
+        "{audit:?}"
+    );
+    assert!(
+        audit.iter().any(|e| {
+            e["principal"] == json!("agent:x")
+                && e["tool"] == json!("ext.probe")
+                && e["target"] == json!("extbox")
+                && e["outcome"] == json!("ok")
+        }),
+        "{audit:?}"
+    );
 }
 
 fn forwards_events_and_cancellation_to_remote_node() {
@@ -930,6 +1368,33 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
             "ssh: connect to host tower.example: Connection refused".to_owned(),
         ],
     );
+    // First, `fleet.toml` does NOT list this node (`laptop`): `all` must still include `laptop`
+    // alongside every machine in `fleet.toml`.
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n",
+            toml_argv(&run_argv(&pi, None)),
+            toml_argv(&fail_argv),
+        ),
+    );
+    let all_unlisted = laptop.run(&["meta.version", "--on", "all"]);
+    assert_eq!(
+        all_unlisted.code, 0,
+        "partial fan-out should exit 0: {}",
+        all_unlisted.stdout
+    );
+    let results_unlisted = &all_unlisted.json()["results"];
+    assert_eq!(results_unlisted.as_object().unwrap().len(), 3);
+    assert_eq!(results_unlisted["laptop"]["ok"]["node"], json!("laptop"));
+    assert_eq!(results_unlisted["pi"]["ok"]["node"], json!("pi"));
+    assert_eq!(
+        results_unlisted["tower"]["error"]["code"],
+        json!("unreachable")
+    );
+
+    // When `laptop` IS also listed in `fleet.toml`, `all` includes it once without duplicates.
+    let before_audit = laptop.audit().len();
     laptop.write_config(
         "fleet.toml",
         &format!(
@@ -943,10 +1408,16 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
     let all = laptop.run(&["meta.version", "--on", "all"]);
     assert_eq!(all.code, 0, "partial fan-out should exit 0: {}", all.stdout);
     let results = &all.json()["results"];
+    assert_eq!(results.as_object().unwrap().len(), 3);
     assert_eq!(results["laptop"]["ok"]["node"], json!("laptop"));
     assert_eq!(results["pi"]["ok"]["node"], json!("pi"));
     assert_eq!(results["tower"]["error"]["code"], json!("unreachable"));
     assert_eq!(results["tower"]["error"]["machine"], json!("tower"));
+    assert_eq!(
+        laptop.audit().len() - before_audit,
+        3,
+        "listing this node in fleet.toml must not run or audit it twice"
+    );
     assert!(
         results["tower"]["error"]["hint"]
             .as_str()
@@ -968,12 +1439,36 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
     assert_eq!(mcp_all_fail["isError"], json!(true), "{mcp_all_fail}");
     assert_eq!(mcp.finish(), 0);
 
-    // Unknown single machine returns not_found with hint listing known names.
+    // Duplicate target names collapse before choosing single vs fan-out shape across all doors.
+    let dup_remote = laptop.run(&["meta.version", "--on", "pi,pi"]);
+    assert_eq!(dup_remote.code, 0, "{}", dup_remote.stdout);
+    let dup_json = dup_remote.json();
+    assert!(dup_json.get("results").is_none(), "{dup_json}");
+    assert_eq!(dup_json["node"], json!("pi"));
+
+    let dup_local = laptop.run(&["meta.version", "--on", "laptop,laptop"]);
+    assert_eq!(dup_local.code, 0, "{}", dup_local.stdout);
+    let dup_local_json = dup_local.json();
+    assert!(dup_local_json.get("results").is_none(), "{dup_local_json}");
+    assert_eq!(dup_local_json["node"], json!("laptop"));
+
+    let mut rpc = laptop.session(&[]);
+    rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": ["pi", "pi"]}),
+    ));
+    let (dup_rpc, _) = rpc.reply_to(&json!(1));
+    assert!(dup_rpc["result"].get("results").is_none(), "{dup_rpc}");
+    assert_eq!(dup_rpc["result"]["node"], json!("pi"));
+    assert_eq!(rpc.finish(), 0);
+
+    // Unknown single machine returns not_found carrying this node's name and listing known names.
     let unknown = laptop.run(&["meta.version", "--on", "ghost"]);
     assert_eq!(unknown.code, 1);
     let err = unknown.json();
     assert_eq!(err["code"], json!("not_found"));
-    assert_eq!(err["machine"], json!("ghost"));
+    assert_eq!(err["machine"], json!("laptop"));
     let hint = err["hint"].as_str().unwrap();
     assert!(hint.contains("pi") && hint.contains("tower"), "{hint}");
 }
@@ -1036,12 +1531,18 @@ fn hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop() {
     node_b.write_config("node.toml", "name = \"b\"\n");
     node_c.write_config("node.toml", "name = \"c\"\n");
 
-    // Deliberate loop: A forwards `loopbox` -> B, B forwards `loopbox` -> A.
-    // Valid 2-hop: A forwards `c` -> B, B forwards `c` -> C.
+    // 1. Direct alias never re-routes on the receiver: A maps `tower` directly to B, and B maps
+    //    `tower` directly to C, and A also maps `b_alias` directly to B while B maps `b_alias` to
+    //    itself. Both run directly on B because direct forwards carry no `on`.
+    // 2. Explicit `via = "b"` relays through B with `on` naming the final target:
+    //    - `c` succeeds because B has `[machines.c]` -> C.
+    //    - `ghost` fails with `not_found` carrying relay B's machine name (never runs on B).
+    // 3. Cross-node `via` cycle (`loopbox`: A via B, B via A) stops at the 3-hop limit.
     node_a.write_config(
         "fleet.toml",
         &format!(
-            "[machines.loopbox]\ncommand = {}\n\n[machines.c]\ncommand = {}\n",
+            "[machines.b]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n\n[machines.b_alias]\ncommand = {}\n\n[machines.c]\nvia = \"b\"\n\n[machines.ghost]\nvia = \"b\"\n\n[machines.loopbox]\nvia = \"b\"\n",
+            toml_argv(&run_argv(&node_b, None)),
             toml_argv(&run_argv(&node_b, None)),
             toml_argv(&run_argv(&node_b, None)),
         ),
@@ -1049,24 +1550,98 @@ fn hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop() {
     node_b.write_config(
         "fleet.toml",
         &format!(
-            "[machines.loopbox]\ncommand = {}\n\n[machines.c]\ncommand = {}\n",
+            "[machines.a]\ncommand = {}\n\n[machines.c]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n\n[machines.b_alias]\ncommand = {}\n\n[machines.loopbox]\nvia = \"a\"\n",
             toml_argv(&run_argv(&node_a, None)),
             toml_argv(&run_argv(&node_c, None)),
+            toml_argv(&run_argv(&node_c, None)),
+            toml_argv(&run_argv(&node_b, None)),
         ),
     );
 
-    // Valid 2-hop reaches C through B.
+    // Direct forward under an alias runs on B, NOT C, even though B maps `tower` to C.
+    let direct_tower = node_a.run(&["meta.version", "--on", "tower"]);
+    assert_eq!(direct_tower.code, 0, "{}", direct_tower.stdout);
+    assert_eq!(direct_tower.json()["node"], json!("b"));
+
+    // Direct forward where receiver's own name differs from the fleet alias does not self-loop.
+    let direct_alias = node_a.run(&["meta.version", "--on", "b_alias"]);
+    assert_eq!(direct_alias.code, 0, "{}", direct_alias.stdout);
+    assert_eq!(direct_alias.json()["node"], json!("b"));
+
+    // Explicit `via = "b"` reaches C through B.
     let reached = node_a.run(&["meta.version", "--on", "c"]);
     assert_eq!(reached.code, 0, "{}", reached.stdout);
     assert_eq!(reached.json()["node"], json!("c"));
 
-    // Deliberate loop stops with `failed` after exceeding 3 hops.
+    // Explicit `via = "b"` for a target B does not know fails with `not_found` from relay B.
+    let missing_on_relay = node_a.run(&["meta.version", "--on", "ghost"]);
+    assert_eq!(missing_on_relay.code, 1, "{}", missing_on_relay.stdout);
+    let err = missing_on_relay.json();
+    assert_eq!(err["code"], json!("not_found"), "{err}");
+    assert_eq!(err["machine"], json!("b"), "{err}");
+
+    // Deliberate cross-node `via` loop stops with `failed` after exceeding 3 hops.
     let looped = node_a.run(&["meta.version", "--on", "loopbox"]);
     assert_eq!(looped.code, 1, "{}", looped.stdout);
     let err = looped.json();
     assert_eq!(err["code"], json!("failed"), "{err}");
     assert_eq!(err["machine"], json!("loopbox"), "{err}");
     assert!(err["message"].as_str().unwrap().contains("3 hops"), "{err}");
+}
+
+fn remote_machine_labels_are_overwritten_on_errors_and_events() {
+    let node_a = Home::new();
+    let node_b = Home::new();
+    node_a.write_config("node.toml", "name = \"a\"\n");
+    node_b.write_config("node.toml", "name = \"b\"\n");
+    let spoof_argv = helper_argv("spoof", &[]);
+
+    node_a.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.b]\ncommand = {}\n\n[machines.c]\nvia = \"b\"\n",
+            toml_argv(&spoof_argv),
+            toml_argv(&run_argv(&node_b, None)),
+        ),
+    );
+    node_b.write_config(
+        "fleet.toml",
+        &format!("[machines.c]\ncommand = {}\n", toml_argv(&spoof_argv)),
+    );
+
+    let mut rpc = node_a.session(&[]);
+
+    // Direct call to `pi`: remote spoofed `"tower"`, caller overwrites both event and error to `pi`.
+    rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": "pi"}),
+    ));
+    let (direct_reply, direct_events) = rpc.reply_to(&json!(1));
+    assert_eq!(direct_events.len(), 1, "{direct_events:?}");
+    assert_eq!(direct_events[0]["params"]["machine"], json!("pi"));
+    assert_eq!(
+        direct_reply["error"]["data"]["machine"],
+        json!("pi"),
+        "{direct_reply}"
+    );
+
+    // Relayed call to `c` via `b`: remote spoofed `"tower"`, caller stamps final target `c`.
+    rpc.send_json(&rpc_request(
+        json!(2),
+        "call",
+        json!({"tool": "meta.version", "on": "c"}),
+    ));
+    let (relayed_reply, relayed_events) = rpc.reply_to(&json!(2));
+    assert_eq!(relayed_events.len(), 1, "{relayed_events:?}");
+    assert_eq!(relayed_events[0]["params"]["machine"], json!("c"));
+    assert_eq!(
+        relayed_reply["error"]["data"]["machine"],
+        json!("c"),
+        "{relayed_reply}"
+    );
+
+    assert_eq!(rpc.finish(), 0);
 }
 
 fn fleet_tools_list_ping_add_remove_and_discover_permissions() {
@@ -1174,4 +1749,387 @@ allow = ["effect:read"]
     let discover_add_denied = laptop.run(&["fleet.discover", "add=true", "--as", "phone"]);
     assert_eq!(discover_add_denied.code, 1);
     assert_eq!(discover_add_denied.json()["code"], json!("denied"));
+
+    // Concurrent `fleet.add` calls across separate processes serialize via the kernel FileLock
+    // so no machine entry is lost.
+    let mut children = Vec::new();
+    for idx in 0..6 {
+        let name = format!("name=box{idx}");
+        let ssh = format!("ssh=box{idx}.example");
+        let child = laptop
+            .command(&["fleet.add", &name, &ssh])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        children.push(child);
+    }
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "concurrent fleet.add failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    let after_concurrent = laptop.run(&["fleet.list"]);
+    assert_eq!(after_concurrent.code, 0, "{}", after_concurrent.stdout);
+    let listed_json = after_concurrent.json();
+    let listed_names: Vec<&str> = listed_json["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    for idx in 0..6 {
+        let expected = format!("box{idx}");
+        assert!(
+            listed_names.contains(&expected.as_str()),
+            "{expected} lost during concurrent fleet.add: {listed_names:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .args([&format!("-{signal}"), &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill -{signal} {pid} failed: {status}");
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(unix)]
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child {} did not exit within {timeout:?}",
+            child.id()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {
+    let laptop = Home::new();
+    let pi = Home::new();
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n",
+            toml_argv(&run_argv(&pi, None))
+        ),
+    );
+
+    // 1. One-shot CLI `exec.run` forwarded to `pi`, killed with SIGTERM: cancels remote work,
+    //    stops the remote child process, audits `cancelled` on `pi`, and exits promptly.
+    let pid_file = pi.state().join("remote-hold.pid");
+    fs::create_dir_all(pi.state()).unwrap();
+    let hold_argv = helper_argv("hold", &[pid_file.to_string_lossy().into_owned()]);
+    let argv_json = serde_json::to_string(&hold_argv).unwrap();
+    let mut cli = laptop
+        .command(&["exec.run", &format!("argv={argv_json}"), "--on", "pi"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + PATIENCE;
+    let remote_pid: u32 = loop {
+        if let Ok(text) = fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote hold process never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    send_signal(cli.id(), "TERM");
+    let status = wait_for_exit(&mut cli, PATIENCE);
+    assert!(!status.success(), "cancelled CLI should exit non-zero");
+
+    // Wait briefly for OS reaping and confirm the remote child is dead and audited as cancelled.
+    let dead_deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(remote_pid) {
+        assert!(
+            Instant::now() < dead_deadline,
+            "remote child {remote_pid} survived SIGTERM on caller"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pi_audit = pi.audit();
+    assert!(
+        pi_audit
+            .iter()
+            .any(|e| e["tool"] == json!("exec.run") && e["outcome"] == json!("cancelled")),
+        "{pi_audit:?}"
+    );
+
+    // 2. `legion rpc` with an in-flight forwarded call killed with SIGHUP.
+    let mut rpc = laptop.session(&[]);
+    rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "test.sleep", "args": {"seconds": 30}, "on": "pi"}),
+    ));
+    loop {
+        let msg = rpc.next();
+        if msg["method"] == json!("event") && msg["params"]["id"] == json!(1) {
+            break;
+        }
+    }
+    send_signal(rpc.pid(), "HUP");
+    let _ = rpc.wait_exit(PATIENCE);
+
+    let audit_deadline = Instant::now() + PATIENCE;
+    loop {
+        let count = pi
+            .audit()
+            .iter()
+            .filter(|e| e["tool"] == json!("test.sleep") && e["outcome"] == json!("cancelled"))
+            .count();
+        if count >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < audit_deadline,
+            "pi did not record cancelled test.sleep after rpc SIGHUP"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 3. `legion mcp` with an in-flight forwarded call killed with SIGTERM.
+    let mut mcp = McpClient::start(&laptop, &[]);
+    mcp.next_id += 1;
+    let call_id = json!(mcp.next_id);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": {
+            "name": "test_sleep",
+            "arguments": {"seconds": 30, "on": "pi"},
+            "_meta": {"progressToken": "sig-tok"}
+        }
+    }));
+    loop {
+        let line = mcp.lines.recv_timeout(PATIENCE).unwrap();
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        if msg["method"] == json!("notifications/progress") {
+            break;
+        }
+    }
+    send_signal(mcp.child.id(), "TERM");
+    let _ = wait_for_exit(&mut mcp.child, PATIENCE);
+
+    let audit_deadline = Instant::now() + PATIENCE;
+    loop {
+        let count = pi
+            .audit()
+            .iter()
+            .filter(|e| e["tool"] == json!("test.sleep") && e["outcome"] == json!("cancelled"))
+            .count();
+        if count >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < audit_deadline,
+            "pi did not record cancelled test.sleep after mcp SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(unix))]
+fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {}
+
+#[cfg(unix)]
+fn sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process() {
+    let laptop = Home::new();
+    let pi = Home::new();
+    let tower = Home::new();
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    tower.write_config("node.toml", "name = \"tower\"\n");
+
+    fs::create_dir_all(pi.state()).unwrap();
+    fs::create_dir_all(tower.state()).unwrap();
+    let pi_pids = pi.state().join("stream-pids.log");
+    let tower_pids = tower.state().join("stream-pids.log");
+
+    let stream_argv = |target: &Home, pid_log: &Path| {
+        helper_argv(
+            "stream-slow",
+            &[
+                LEGION_BIN.to_owned(),
+                legion_home_of(target).to_string_lossy().into_owned(),
+                target.home().to_string_lossy().into_owned(),
+                pid_log.to_string_lossy().into_owned(),
+                "rpc".to_owned(),
+            ],
+        )
+    };
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.tower]\ncommand = {}\n",
+            toml_argv(&stream_argv(&pi, &pi_pids)),
+            toml_argv(&stream_argv(&tower, &tower_pids)),
+        ),
+    );
+
+    // 24 MiB file so the throttled remote-to-remote transfer stays in flight while SIGTERM lands.
+    let payload: Vec<u8> = (0..(24 * 1024 * 1024))
+        .map(|i| ((i * 31 + 7) & 0xff) as u8)
+        .collect();
+    fs::write(pi.home().join("huge.bin"), &payload).unwrap();
+
+    let mut cp = laptop
+        .command(&["cp", "pi:~/huge.bin", "tower:~/huge.bin", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let read_pids = |path: &Path| -> Vec<u32> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    };
+
+    // Wait until both remote `legion stream` data processes (get on pi, put on tower) are live.
+    let deadline = Instant::now() + PATIENCE;
+    let (src_pids, dst_pids) = loop {
+        let s = read_pids(&pi_pids);
+        let d = read_pids(&tower_pids);
+        if !s.is_empty() && !d.is_empty() {
+            break (s, d);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "legion cp never started both remote stream pipes (pi={s:?}, tower={d:?})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    send_signal(cp.id(), "TERM");
+    let started = Instant::now();
+    let status = wait_for_exit(&mut cp, PATIENCE);
+    assert!(
+        !status.success(),
+        "interrupted legion cp should exit non-zero"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "legion cp took too long to exit after SIGTERM: {:?}",
+        started.elapsed()
+    );
+
+    let mut stdout = String::new();
+    if let Some(mut out) = cp.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    let body: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
+    assert_eq!(body["code"], json!("cancelled"), "stdout={stdout}");
+
+    // Neither remote `legion stream` process may remain alive after both pipes close.
+    let reap_deadline = Instant::now() + Duration::from_secs(5);
+    for pid in src_pids.into_iter().chain(dst_pids) {
+        while pid_alive(pid) {
+            assert!(
+                Instant::now() < reap_deadline,
+                "remote legion stream process {pid} survived SIGTERM on legion cp"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    assert!(
+        !tower.home().join("huge.bin").exists(),
+        "half-written file must never take its final name"
+    );
+    let laptop_audit = laptop.audit();
+    assert!(
+        laptop_audit
+            .iter()
+            .any(|e| e["tool"] == json!("fs.transfer") && e["outcome"] == json!("cancelled")),
+        "{laptop_audit:?}"
+    );
+}
+
+#[cfg(not(unix))]
+fn sigterm_on_legion_cp_cancels_transfer_and_leaves_no_stream_process() {}
+
+fn pipe_handle_drop_is_non_blocking_and_kills_lingering_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pipe-drop.pid");
+    let hold_argv = helper_argv("hold", &[pid_file.to_string_lossy().into_owned()]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let elapsed = rt.block_on(async {
+        let pipe = legion_net::Pipe::spawn_command(&hold_argv, legion_net::Subcommand::Rpc)
+            .expect("spawn hold helper");
+        let deadline = Instant::now() + PATIENCE;
+        while !pid_file.exists() {
+            assert!(Instant::now() < deadline, "hold helper never wrote pid");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        drop(pipe);
+        let elapsed = started.elapsed();
+        #[cfg(unix)]
+        {
+            // Keep the runtime ticking briefly so Tokio's async child reaper reaps the killed
+            // child (an unreaped zombie still answers `kill -0`).
+            let pid: u32 = fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while pid_alive(pid) {
+                assert!(
+                    Instant::now() < reap_deadline,
+                    "hold child {pid} survived PipeHandle::drop"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        elapsed
+    });
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "PipeHandle::drop blocked for {elapsed:?}"
+    );
 }

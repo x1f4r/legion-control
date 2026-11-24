@@ -5,8 +5,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use legion_core::config::{ConfigStore, Document, NodeName, parse};
+use legion_os::OsError;
+use legion_os::lock::FileLock;
 use legion_proto::{ErrorBody, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,7 +18,14 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value as TomlVal
 /// The implicit system name reported when a machine uses the shorthand single-system form.
 pub const DEFAULT_SYSTEM_NAME: &str = "default";
 
-/// Serializes in-process `fleet.toml` mutations so concurrent admin calls cannot race each other.
+/// Lock file name placed in the node's state directory to serialize cross-process `fleet.toml`
+/// read-modify-write operations.
+pub const FLEET_LOCK_FILE: &str = "fleet.lock";
+
+/// Maximum time an edit waits for another process to finish updating `fleet.toml`.
+const FLEET_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serializes in-process `fleet.toml` mutations before acquiring the kernel [`FileLock`].
 static FLEET_EDIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Operating system family hint used to choose the remote ssh command shape without probing first.
@@ -74,6 +84,38 @@ impl FleetFile {
             })
         })
     }
+
+    /// Resolves the first direct machine entry for `name` by following any local `via` links.
+    ///
+    /// Returns `(direct_name, direct_entry, relayed)`, where `relayed` is `true` if at least one
+    /// `via` link was followed so the forwarded call must carry `on = name` to the relay.
+    pub fn resolve_route<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Result<(&'a str, &'a MachineEntry, bool), String> {
+        let mut current = name;
+        let mut relayed = false;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(format!(
+                    "machines.{name}.via: relay cycle involving {current:?}"
+                ));
+            }
+            let entry = self.machines.get(current).ok_or_else(|| {
+                format!(
+                    "machines.{name}.via: unknown relay machine {current:?}; define [machines.{current}] in fleet.toml"
+                )
+            })?;
+            match entry.via.as_deref() {
+                Some(next) => {
+                    relayed = true;
+                    current = next;
+                }
+                None => return Ok((current, entry, relayed)),
+            }
+        }
+    }
 }
 
 impl Document for FleetFile {
@@ -85,6 +127,11 @@ impl Document for FleetFile {
     fn validate(&self) -> Result<(), String> {
         for (name, entry) in &self.machines {
             validate_machine_entry(name, entry)?;
+        }
+        for (name, entry) in &self.machines {
+            if entry.via.is_some() {
+                self.resolve_route(name)?;
+            }
         }
         Ok(())
     }
@@ -109,6 +156,9 @@ pub struct MachineEntry {
     /// Multiple bootable systems for a dual-boot or multi-system machine.
     #[serde(default)]
     pub systems: Option<Vec<SystemEntry>>,
+    /// Relay machine in this same `fleet.toml` through which calls to this machine are forwarded.
+    #[serde(default)]
+    pub via: Option<String>,
     /// Hardware MAC address for Wake-on-LAN.
     #[serde(default)]
     pub mac: Option<String>,
@@ -227,7 +277,8 @@ pub fn validate_machine_name(name: &str) -> Result<(), String> {
     NodeName::try_from(name.to_owned()).map(|_| ())
 }
 
-/// Checks that an SSH destination string cannot be mistaken for an option or carry control bytes.
+/// Checks that an SSH destination string cannot be mistaken for an option and contains only
+/// `[A-Za-z0-9._@:\[\]-]` as defence in depth against token expansion in a user's ssh config.
 pub fn validate_ssh_target(target: &str) -> Result<(), String> {
     if target.is_empty() {
         return Err("ssh target cannot be empty".to_owned());
@@ -237,12 +288,16 @@ pub fn validate_ssh_target(target: &str) -> Result<(), String> {
             "ssh target {target:?} cannot begin with `-`, which ssh would read as an option"
         ));
     }
-    if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if let Some(bad) = target.chars().find(|&c| !is_safe_ssh_target_char(c)) {
         return Err(format!(
-            "ssh target {target:?} cannot contain spaces or control characters"
+            "ssh target {target:?} contains {bad:?}; only A-Z, a-z, 0-9, `.`, `_`, `@`, `:`, `[`, `]`, and `-` are allowed"
         ));
     }
     Ok(())
+}
+
+fn is_safe_ssh_target_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | ':' | '[' | ']' | '-')
 }
 
 /// Checks that a configured remote `program` needs no shell quoting on any supported shell.
@@ -328,7 +383,39 @@ pub fn validate_machine_entry(name: &str, entry: &MachineEntry) -> Result<(), St
         }
     }
 
-    if let Some(systems) = &entry.systems {
+    if let Some(via) = &entry.via {
+        validate_machine_name(via).map_err(|reason| format!("machines.{name}.via: {reason}"))?;
+        if via == name {
+            return Err(format!(
+                "machines.{name}.via: a machine cannot relay through itself"
+            ));
+        }
+        if entry.ssh.is_some() {
+            return Err(format!(
+                "machines.{name}.ssh cannot be combined with via; a relayed machine has no direct transport"
+            ));
+        }
+        if entry.command.is_some() {
+            return Err(format!(
+                "machines.{name}.command cannot be combined with via; a relayed machine has no direct transport"
+            ));
+        }
+        if entry.systems.is_some() {
+            return Err(format!(
+                "machines.{name}.systems cannot be combined with via; a relayed machine has no direct transport"
+            ));
+        }
+        if entry.program.is_some() {
+            return Err(format!(
+                "machines.{name}.program cannot be combined with via; set program on the relay machine instead"
+            ));
+        }
+        if entry.os.is_some() {
+            return Err(format!(
+                "machines.{name}.os cannot be combined with via; set os on the relay machine instead"
+            ));
+        }
+    } else if let Some(systems) = &entry.systems {
         if entry.ssh.is_some() {
             return Err(format!(
                 "machines.{name}.ssh cannot be combined with systems; set ssh on each system entry"
@@ -375,7 +462,9 @@ pub fn validate_machine_entry(name: &str, entry: &MachineEntry) -> Result<(), St
     } else {
         let prefix = format!("machines.{name}");
         if entry.ssh.is_none() && entry.command.is_none() {
-            return Err(format!("{prefix}: set one of ssh, command, or systems"));
+            return Err(format!(
+                "{prefix}: set one of ssh, command, systems, or via"
+            ));
         }
         validate_transport(
             &prefix,
@@ -423,11 +512,12 @@ fn validate_transport(
     Ok(())
 }
 
-/// Atomically adds or replaces one machine in `fleet.toml` through [`ConfigStore::write`],
-/// preserving comments and unrelated entries, and returns `true` if an existing entry was
-/// replaced.
+/// Atomically adds or replaces one machine in `fleet.toml` through [`ConfigStore::write`] under a
+/// cross-process kernel [`FileLock`], preserving comments and unrelated entries, and returns
+/// `true` if an existing entry was replaced.
 pub fn upsert_machine(
     store: &ConfigStore,
+    lock_path: &Path,
     name: &str,
     entry: &MachineEntry,
 ) -> Result<bool, ErrorBody> {
@@ -438,6 +528,7 @@ pub fn upsert_machine(
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = acquire_fleet_lock(lock_path)?;
     let path = store.path_of::<FleetFile>();
     let mut doc = load_editable(&path)?;
     let machines = ensure_machines_table(&mut doc, &path)?;
@@ -447,9 +538,11 @@ pub fn upsert_machine(
 }
 
 /// Atomically adds multiple new machines to `fleet.toml` in a single edit through
-/// [`ConfigStore::write`], skipping any already present and returning the names that were added.
+/// [`ConfigStore::write`] under a cross-process kernel [`FileLock`], skipping any already present
+/// and returning the names that were added.
 pub fn add_missing_machines(
     store: &ConfigStore,
+    lock_path: &Path,
     entries: &[(String, MachineEntry)],
 ) -> Result<Vec<String>, ErrorBody> {
     for (name, entry) in entries {
@@ -462,6 +555,7 @@ pub fn add_missing_machines(
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = acquire_fleet_lock(lock_path)?;
     let path = store.path_of::<FleetFile>();
     let mut doc = load_editable(&path)?;
     let machines = ensure_machines_table(&mut doc, &path)?;
@@ -478,14 +572,15 @@ pub fn add_missing_machines(
     Ok(added)
 }
 
-/// Atomically removes one machine from `fleet.toml` through [`ConfigStore::write`], preserving
-/// comments and unrelated entries.
-pub fn remove_machine(store: &ConfigStore, name: &str) -> Result<(), ErrorBody> {
+/// Atomically removes one machine from `fleet.toml` through [`ConfigStore::write`] under a
+/// cross-process kernel [`FileLock`], preserving comments and unrelated entries.
+pub fn remove_machine(store: &ConfigStore, lock_path: &Path, name: &str) -> Result<(), ErrorBody> {
     validate_machine_name(name)
         .map_err(|reason| ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}.")))?;
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = acquire_fleet_lock(lock_path)?;
     let path = store.path_of::<FleetFile>();
     let mut doc = load_editable(&path)?;
     let known: Vec<String> = doc
@@ -501,6 +596,30 @@ pub fn remove_machine(store: &ConfigStore, name: &str) -> Result<(), ErrorBody> 
     }
     save_validated(store, &doc)?;
     Ok(())
+}
+
+fn acquire_fleet_lock(lock_path: &Path) -> Result<FileLock, ErrorBody> {
+    if let Some(parent) = lock_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot create state directory {}: {err}.", parent.display()),
+        )
+        .with_hint("Make Legion's state directory writable by the account legion runs as."));
+    }
+    FileLock::lock_exclusive_timeout(lock_path, FLEET_LOCK_TIMEOUT).map_err(|err| match err {
+        OsError::TimedOut { detail } => ErrorBody::new(
+            ErrorCode::Busy,
+            format!("fleet.toml is locked by another process ({detail})."),
+        )
+        .with_hint("Retry the command once the other fleet.toml edit finishes."),
+        other => ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot lock {}: {other}.", lock_path.display()),
+        )
+        .with_hint("Make Legion's state directory writable by the account legion runs as."),
+    })
 }
 
 fn not_found_in_file(name: &str, known: &[String]) -> ErrorBody {
@@ -589,6 +708,9 @@ fn build_machine_table(entry: &MachineEntry) -> Table {
     }
     if let Some(os) = entry.os {
         table.insert("os", toml_edit::value(os.as_str()));
+    }
+    if let Some(via) = &entry.via {
+        table.insert("via", toml_edit::value(via.as_str()));
     }
     if let Some(mac) = &entry.mac {
         table.insert("mac", toml_edit::value(mac.as_str()));
@@ -767,6 +889,42 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
             msg.contains("machines.tower") && msg.contains("systems"),
             "{msg}"
         );
+
+        // `via` validation: unknown relay, self-relay, cycles, and mixing with direct transports.
+        let msg = err("[machines.c]\nvia = \"b\"\n");
+        assert!(msg.contains("machines.c.via") && msg.contains("b"), "{msg}");
+
+        let msg = err("[machines.b]\nvia = \"b\"\n");
+        assert!(
+            msg.contains("machines.b.via") && msg.contains("itself"),
+            "{msg}"
+        );
+
+        let msg = err("[machines.a]\nvia = \"b\"\n[machines.b]\nvia = \"a\"\n");
+        assert!(msg.contains("via") && msg.contains("cycle"), "{msg}");
+
+        let msg = err(
+            "[machines.a]\nvia = \"b\"\n[machines.b]\nvia = \"c\"\n[machines.c]\nvia = \"b\"\n",
+        );
+        assert!(msg.contains("via") && msg.contains("cycle"), "{msg}");
+
+        let msg = err("[machines.b]\nssh = \"b\"\n[machines.c]\nvia = \"b\"\nssh = \"c\"\n");
+        assert!(
+            msg.contains("machines.c.ssh") && msg.contains("via"),
+            "{msg}"
+        );
+
+        let valid_via = parse::<FleetFile>(
+            Path::new("fleet.toml"),
+            b"[machines.b]\nssh = \"b.example\"\n[machines.c]\nvia = \"b\"\n[machines.d]\nvia = \"c\"\n",
+        )
+        .unwrap();
+        let (direct, _, relayed) = valid_via.resolve_route("d").unwrap();
+        assert_eq!(direct, "b");
+        assert!(relayed);
+        let (direct, _, relayed) = valid_via.resolve_route("b").unwrap();
+        assert_eq!(direct, "b");
+        assert!(!relayed);
     }
 
     #[test]
@@ -806,10 +964,35 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
             assert!(validate_program(bad).is_err(), "{bad:?} was accepted");
         }
 
-        for ok in ["pi", "me@tower.example", "tower-win", "192.0.2.10"] {
+        for ok in [
+            "pi",
+            "me@tower.example",
+            "tower_1-win",
+            "192.0.2.10",
+            "[2001:db8::1]",
+            "me@[2001:db8::1]:2222",
+        ] {
             assert!(validate_ssh_target(ok).is_ok(), "{ok} was rejected");
         }
-        for bad in ["", "-", "-oProxyCommand=x", "host name", "a\nb", "a\tb"] {
+        for bad in [
+            "",
+            "-",
+            "-oProxyCommand=x",
+            "host name",
+            "a\nb",
+            "a\tb",
+            "host%h",
+            "me@%r.example",
+            "host$USER",
+            "host;id",
+            "host/path",
+            "host~1",
+            "host'q",
+            "host\"q",
+            "host*glob",
+            "host?x",
+            "höst.example",
+        ] {
             assert!(validate_ssh_target(bad).is_err(), "{bad:?} was accepted");
         }
 
@@ -836,6 +1019,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
     fn upsert_and_remove_preserve_comments_and_unrelated_entries() {
         let dir = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(dir.path());
+        let lock_path = dir.path().join("state").join(FLEET_LOCK_FILE);
         let file = store.path_of::<FleetFile>();
         std::fs::write(
             &file,
@@ -845,6 +1029,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
 
         let replaced = upsert_machine(
             &store,
+            &lock_path,
             "tower",
             &MachineEntry {
                 ssh: Some("tower.example".to_owned()),
@@ -863,6 +1048,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
 
         let replaced = upsert_machine(
             &store,
+            &lock_path,
             "pi",
             &MachineEntry {
                 ssh: Some("pi2.example".to_owned()),
@@ -875,17 +1061,68 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
         assert!(text.contains("# Always-on Raspberry Pi"), "{text}");
         assert!(text.contains("pi2.example"), "{text}");
 
-        remove_machine(&store, "tower").unwrap();
+        remove_machine(&store, &lock_path, "tower").unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("# Top-level note"), "{text}");
         assert!(text.contains("# Always-on Raspberry Pi"), "{text}");
         assert!(!text.contains("tower.example"), "{text}");
 
         // Removing the last machine leaves a comment-only file that still parses cleanly.
-        remove_machine(&store, "pi").unwrap();
+        remove_machine(&store, &lock_path, "pi").unwrap();
         assert!(store.get::<FleetFile>().unwrap().machines.is_empty());
 
-        let missing = remove_machine(&store, "tower").unwrap_err();
+        let missing = remove_machine(&store, &lock_path, "tower").unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn fleet_edits_wait_for_kernel_file_lock_before_reading_fleet_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let lock_path = state_dir.join(FLEET_LOCK_FILE);
+
+        // Hold the external kernel lock before spawning an edit.
+        let held = FileLock::lock_exclusive(&lock_path).unwrap();
+        let config_dir_thread = config_dir.clone();
+        let lock_path_thread = lock_path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let store = ConfigStore::new(config_dir_thread);
+            let res = upsert_machine(
+                &store,
+                &lock_path_thread,
+                "pi",
+                &MachineEntry {
+                    ssh: Some("pi.example".to_owned()),
+                    ..Default::default()
+                },
+            );
+            let _ = done_tx.send(res);
+        });
+
+        // While we hold the lock, the worker must still be waiting; simulate another process
+        // writing `tower` before releasing the lock.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "upsert_machine must block while FileLock is held"
+        );
+        std::fs::write(
+            config_dir.join("fleet.toml"),
+            "[machines.tower]\nssh = \"tower.example\"\n",
+        )
+        .unwrap();
+        drop(held);
+
+        let res = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(res.is_ok(), "{res:?}");
+        worker.join().unwrap();
+
+        // Both `tower` (written under our lock) and `pi` (written after) must be present.
+        let fleet = ConfigStore::new(config_dir).get::<FleetFile>().unwrap();
+        assert_eq!(fleet.names(), vec!["pi", "tower"]);
     }
 }

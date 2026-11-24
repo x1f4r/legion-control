@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use legion_core::{CANCEL_GRACE, CancellationToken, Event, EventSink, VERSION};
 use legion_proto::{
-    CallParams, CancelParams, ErrorBody, ErrorCode, EventParams, HelloParams, HelloResult, Id,
-    Notification, Outcome, PROTOCOL, Request, Response, method,
+    CallParams, CancelParams, Effect, ErrorBody, ErrorCode, EventParams, HelloParams, HelloResult,
+    Id, Notification, Outcome, PROTOCOL, Request, Response, ToolsResult, method,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -30,10 +30,20 @@ const LONGEST_LINE: usize = 16 * 1024 * 1024;
 const MAX_NOISE_LINES: usize = 64;
 /// Maximum cumulative bytes of noise skipped before the `hello` reply.
 const MAX_NOISE_BYTES: usize = 64 * 1024;
-/// How long a cancelled call waits for the remote node's reply after sending `cancel`: the remote
-/// node gives its cancelled tool [`CANCEL_GRACE`] to clean up and reply, plus transport slack so
-/// the final reply still arrives cleanly.
-const CANCEL_REPLY_TIMEOUT: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(1));
+/// Extra cancel-reply wait added per remaining hop so every outer node waits strictly longer than
+/// the inner node it forwarded to.
+const CANCEL_HOP_SLACK: Duration = Duration::from_secs(1);
+
+/// How long a cancelled call forwarded at `hops` (1..=[`crate::pool::MAX_HOPS`]) waits for the
+/// remote node's reply after sending `cancel`.
+///
+/// The leaf node gives its tool [`CANCEL_GRACE`] to clean up and reply, and each remaining hop
+/// adds [`CANCEL_HOP_SLACK`] so an outer hop always outlasts the inner hop's wait.
+pub(crate) fn cancel_reply_timeout(hops: u32) -> Duration {
+    let hop = hops.max(1);
+    let remaining = crate::pool::MAX_HOPS.saturating_sub(hop).saturating_add(1);
+    CANCEL_GRACE.saturating_add(CANCEL_HOP_SLACK.saturating_mul(remaining))
+}
 /// Grace window for clean EOF exit when closing a session.
 const CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// Brief wait for process exit + stderr drain when a pipe closes unexpectedly.
@@ -113,6 +123,7 @@ pub struct Session {
     death_error: Arc<Mutex<Option<ErrorBody>>>,
     pipe: Arc<tokio::sync::Mutex<Option<PipeHandle>>>,
     reader_task: Mutex<Option<JoinHandle<()>>>,
+    tools_cache: tokio::sync::Mutex<Option<HashMap<String, Effect>>>,
 }
 
 impl Session {
@@ -319,6 +330,7 @@ impl Session {
             death_error,
             pipe: pipe_arc,
             reader_task: Mutex::new(Some(reader_handle)),
+            tools_cache: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -350,7 +362,7 @@ impl Session {
             params_value,
             cancel,
             EventSink::discard(),
-            false,
+            None,
         );
         match tokio::time::timeout(timeout, fut).await {
             Ok(Ok(value)) => serde_json::from_value::<HelloResult>(value).map_err(|err| {
@@ -385,6 +397,11 @@ impl Session {
         cancel: CancellationToken,
         events: EventSink,
     ) -> Result<Value, CallError> {
+        let relayed_target = params
+            .on
+            .as_ref()
+            .and_then(|target| target.single().map(str::to_owned));
+        let cancel_timeout = cancel_reply_timeout(params.hops);
         let params_value = serde_json::to_value(&params).map_err(|err| {
             CallError::NotWritten(
                 ErrorBody::new(
@@ -394,8 +411,66 @@ impl Session {
                 .with_machine(&self.machine),
             )
         })?;
-        self.request(method::CALL, params_value, cancel, events, true)
-            .await
+        self.request(
+            method::CALL,
+            params_value,
+            cancel,
+            events,
+            Some(cancel_timeout),
+        )
+        .await
+        .map_err(|err| match err {
+            CallError::Remote(body) => {
+                let labelled = match relayed_target.as_deref() {
+                    // A relay returning `not_found` for a target absent from its own
+                    // `fleet.toml` carries the relay's own name; every other error carries
+                    // the target's name so a remote cannot forge another machine's label.
+                    Some(_)
+                        if body.code == ErrorCode::NotFound
+                            && body.machine.as_deref() == Some(self.info.hello.node.as_str()) =>
+                    {
+                        body.with_machine(&self.machine)
+                    }
+                    Some(target) => body.with_machine(target),
+                    None => body.with_machine(&self.machine),
+                };
+                CallError::Remote(labelled)
+            }
+            other => other,
+        })
+    }
+
+    /// Queries and caches the remote node's `tools` list so a forwarding node can authorise an
+    /// extension tool that exists only on the target by the effect the target reports for it.
+    pub async fn tool_effect(
+        &self,
+        tool: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<Effect>, CallError> {
+        let mut cache = self.tools_cache.lock().await;
+        if let Some(map) = cache.as_ref() {
+            return Ok(map.get(tool).copied());
+        }
+        let value = self
+            .request(method::TOOLS, json!({}), cancel, EventSink::discard(), None)
+            .await?;
+        let parsed: ToolsResult = serde_json::from_value(value).map_err(|err| {
+            CallError::Remote(
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} returned a malformed tools reply: {err}.", self.machine),
+                )
+                .with_machine(&self.machine),
+            )
+        })?;
+        let map: HashMap<String, Effect> = parsed
+            .tools
+            .into_iter()
+            .map(|spec| (spec.name, spec.effect))
+            .collect();
+        let effect = map.get(tool).copied();
+        *cache = Some(map);
+        Ok(effect)
     }
 
     async fn request(
@@ -404,7 +479,7 @@ impl Session {
         params: Value,
         cancel: CancellationToken,
         events: EventSink,
-        send_cancel_on_abort: bool,
+        cancel_reply_wait: Option<Duration>,
     ) -> Result<Value, CallError> {
         if cancel.is_cancelled() {
             return Err(CallError::Remote(
@@ -515,9 +590,9 @@ impl Session {
                 Err(_) => Err(CallError::LostInFlight(self.dead_session_error(true))),
             },
             () = cancel.cancelled() => {
-                if send_cancel_on_abort {
+                if let Some(wait) = cancel_reply_wait {
                     self.send_cancel(&id).await;
-                    match tokio::time::timeout(CANCEL_REPLY_TIMEOUT, &mut reply_rx).await {
+                    match tokio::time::timeout(wait, &mut reply_rx).await {
                         Ok(Ok(result)) => result,
                         Ok(Err(_)) => Err(CallError::LostInFlight(self.dead_session_error(true))),
                         Err(_) => Err(CallError::Remote(
@@ -526,7 +601,7 @@ impl Session {
                                 format!(
                                     "The call on {} was cancelled and did not reply within {}s.",
                                     self.machine,
-                                    CANCEL_REPLY_TIMEOUT.as_secs()
+                                    wait.as_secs()
                                 ),
                             )
                             .with_machine(&self.machine),
@@ -659,7 +734,8 @@ impl Drop for Session {
         {
             task.abort();
         }
-        // Dropping PipeHandle synchronously waits briefly for EOF exit then kills if needed.
+        // Dropping PipeHandle kills the connector without blocking the caller; explicit
+        // Session::close handles the graceful EOF wait.
         if let Ok(mut guard) = self.pipe.try_lock() {
             guard.take();
         }
@@ -979,7 +1055,9 @@ fn dispatch_incoming(line: &[u8], machine: &str, pending: &Arc<Mutex<HashMap<Id,
                 sink.emit_event(Event {
                     kind: event.kind,
                     data: event.data,
-                    machine: event.machine.or_else(|| Some(machine.to_owned())),
+                    // Never trust a remote-chosen `machine` label; stamp this session's name,
+                    // which a caller's `EventSink::for_machine` further overwrites for relays.
+                    machine: Some(machine.to_owned()),
                 });
             }
         }
@@ -1496,8 +1574,200 @@ mod tests {
         let err = call_task.await.unwrap().unwrap_err().into_error();
         assert_eq!(err.code, ErrorCode::Cancelled);
         assert_eq!(err.machine.as_deref(), Some("pi"));
-        assert!(cancelled_at.elapsed() >= CANCEL_REPLY_TIMEOUT);
+        assert!(cancelled_at.elapsed() >= cancel_reply_timeout(1));
         session.close().await;
         let _ = hung_server.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outer_hop_cancel_wait_exceeds_inner_hop_so_relayed_reply_arrives() {
+        assert!(cancel_reply_timeout(1) > cancel_reply_timeout(2));
+        assert!(cancel_reply_timeout(2) > cancel_reply_timeout(3));
+        assert!(cancel_reply_timeout(3) > CANCEL_GRACE);
+
+        // Simulate hop 1 waiting on a relay (hop 2) whose own cancel reply arrives just after
+        // hop 2's wait expires: hop 1 must still wait long enough to receive the relay's reply.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let (called_tx, called_rx) = oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            server_w
+                .write_all(hello_ok("relay", PROTOCOL).as_bytes())
+                .await
+                .unwrap();
+
+            let call_line = lines.next_line().await.unwrap().unwrap();
+            let call_req: Request = serde_json::from_str(&call_line).unwrap();
+            let _ = called_tx.send(());
+
+            let cancel_line = lines.next_line().await.unwrap().unwrap();
+            let cancel_req: Request = serde_json::from_str(&cancel_line).unwrap();
+            assert_eq!(cancel_req.method, method::CANCEL);
+
+            // Relay replies just after hop 2's cancel timeout elapses.
+            tokio::time::sleep(cancel_reply_timeout(2) + Duration::from_millis(100)).await;
+            let reply = Response::error(
+                call_req.id,
+                RpcError::new(
+                    TOOL_ERROR,
+                    ErrorBody::new(ErrorCode::Cancelled, "inner hop timed out after cancel")
+                        .with_machine("c"),
+                ),
+            );
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+        });
+
+        let session = Arc::new(
+            Session::open_io(
+                client_r,
+                client_w,
+                "relay",
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let s = Arc::clone(&session);
+        let call_cancel = cancel.clone();
+        let call_task = tokio::spawn(async move {
+            s.call(
+                CallParams {
+                    tool: "test.sleep".into(),
+                    args: json!({"seconds": 30}),
+                    as_principal: None,
+                    on: Some(legion_proto::Target::One("c".to_owned())),
+                    hops: 1,
+                },
+                call_cancel,
+                EventSink::discard(),
+            )
+            .await
+        });
+
+        called_rx.await.unwrap();
+        cancel.cancel();
+        let err = call_task.await.unwrap().unwrap_err().into_error();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert_eq!(err.message, "inner hop timed out after cancel");
+        assert_eq!(err.machine.as_deref(), Some("c"));
+        session.close().await;
+        relay_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overwrites_spoofed_machine_label_on_events_and_errors() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            server_w
+                .write_all(hello_ok("real-remote", PROTOCOL).as_bytes())
+                .await
+                .unwrap();
+
+            for _ in 0..2 {
+                let line = lines.next_line().await.unwrap().unwrap();
+                let req: Request = serde_json::from_str(&line).unwrap();
+                let ev = Notification::new(
+                    method::EVENT,
+                    serde_json::to_value(EventParams {
+                        id: req.id.clone().unwrap(),
+                        kind: EventKind::Log,
+                        data: json!({"level": "info", "message": "spoofed"}),
+                        machine: Some("tower".to_owned()),
+                    })
+                    .unwrap(),
+                );
+                server_w
+                    .write_all(format!("{}\n", serde_json::to_string(&ev).unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+                let reply = Response::error(
+                    req.id,
+                    RpcError::new(
+                        TOOL_ERROR,
+                        ErrorBody::new(ErrorCode::Failed, "spoofed failure").with_machine("tower"),
+                    ),
+                );
+                server_w
+                    .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+                server_w.flush().await.unwrap();
+            }
+        });
+
+        let session = Session::open_io(
+            client_r,
+            client_w,
+            "pi",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // Direct call: both event and error are stamped with `pi`, never `tower`.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let err = session
+            .call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::with_events(move |ev| seen_clone.lock().unwrap().push(ev.machine)),
+            )
+            .await
+            .unwrap_err()
+            .into_error();
+        assert_eq!(err.machine.as_deref(), Some("pi"));
+        assert_eq!(*seen.lock().unwrap(), vec![Some("pi".to_owned())]);
+
+        // Relayed call to `c` via `pi`: both event (via `for_machine("c")`) and error carry `c`.
+        let seen_relayed = Arc::new(Mutex::new(Vec::new()));
+        let seen_relayed_clone = Arc::clone(&seen_relayed);
+        let err = session
+            .call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: Some(legion_proto::Target::One("c".to_owned())),
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::with_events(move |ev| {
+                    seen_relayed_clone.lock().unwrap().push(ev.machine);
+                })
+                .for_machine("c"),
+            )
+            .await
+            .unwrap_err()
+            .into_error();
+        assert_eq!(err.machine.as_deref(), Some("c"));
+        assert_eq!(*seen_relayed.lock().unwrap(), vec![Some("c".to_owned())]);
+
+        session.close().await;
+        server_task.await.unwrap();
     }
 }

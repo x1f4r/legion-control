@@ -147,13 +147,17 @@ impl Op {
 
     /// The file tool whose permission the operation needs: what it amounts to on this node.
     fn authorised_as(&self) -> (&'static str, Effect) {
-        match self {
-            Op::Manifest { .. } | Op::Stat { .. } | Op::Get { .. } | Op::Pack { .. } => {
-                ("fs.read", Effect::Read)
-            }
-            Op::Put { .. } | Op::Unpack { .. } => ("fs.write", Effect::Write),
-            Op::Delete { .. } => ("fs.remove", Effect::Destroy),
-        }
+        op_tool(self.name()).unwrap_or(("fs.write", Effect::Write))
+    }
+}
+
+/// Maps a stream header's `op` name to the file tool and effect it corresponds to.
+pub(crate) fn op_tool(op: &str) -> Option<(&'static str, Effect)> {
+    match op {
+        "manifest" | "stat" | "get" | "pack" => Some(("fs.read", Effect::Read)),
+        "put" | "unpack" => Some(("fs.write", Effect::Write)),
+        "delete" => Some(("fs.remove", Effect::Destroy)),
+        _ => None,
     }
 }
 

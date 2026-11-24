@@ -70,6 +70,14 @@ fn main() -> ExitCode {
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
             gate_serves_only_the_connectors_commands_pinned_to_its_principal,
         ),
+        (
+            "forwarding_node_authorises_and_audits_remote_stream_pipes",
+            forwarding_node_authorises_and_audits_remote_stream_pipes,
+        ),
+        (
+            "relayed_machine_refuses_transfer_with_relay_hint",
+            relayed_machine_refuses_transfer_with_relay_hint,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -1176,5 +1184,180 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
             .contains("command=\"/home/me/.local/bin/legion gate --as agent:example\",restrict"),
         "{}",
         help.stdout
+    );
+}
+
+fn forwarding_node_authorises_and_audits_remote_stream_pipes() {
+    let laptop = node("laptop");
+    let pi = node("pi");
+    fleet(&laptop, &[("pi", &pi, "node", vec![])]);
+
+    // On pi every test principal has full access so only laptop's forwarding policy can refuse.
+    pi.write_config(
+        "policy.toml",
+        r#"
+[principals.fetcher]
+role = "full"
+
+[principals.mover]
+role = "full"
+
+[roles.full]
+allow = ["*"]
+"#,
+    );
+    laptop.write_config(
+        "policy.toml",
+        r#"
+[principals.fetcher]
+role = "fetch_only"
+
+[principals.mover]
+role = "move_only"
+
+[roles.fetch_only]
+allow = ["effect:read", "fs.transfer"]
+
+[roles.move_only]
+allow = ["effect:read", "effect:write"]
+"#,
+    );
+
+    fs::write(laptop.home().join("note.txt"), b"hello").unwrap();
+
+    // fetcher may call fs.transfer and fs.read on laptop, but NOT fs.write: pushing to pi must
+    // be refused on laptop BEFORE opening a put pipe on pi, and audited on laptop.
+    let err = refused(&transfer(
+        &laptop,
+        json!({"from": "~/note.txt", "to": "pi:~/note.txt"}),
+        &["--as", "fetcher"],
+    ));
+    assert_eq!(err["code"], "denied", "{err}");
+    assert_eq!(err["machine"], "laptop", "{err}");
+    assert!(
+        err["message"].as_str().unwrap().contains("fs.write"),
+        "{err}"
+    );
+    assert!(!pi.home().join("note.txt").exists());
+    assert!(
+        stream_lines(&pi).iter().all(|e| e["tool"] != "stream.put"),
+        "pi should never have spawned a put stream: {:?}",
+        stream_lines(&pi)
+    );
+    assert!(
+        laptop.audit().iter().any(|e| {
+            e["target"] == "pi"
+                && e["tool"] == "stream.put"
+                && e["principal"] == "fetcher"
+                && e["outcome"] == "denied"
+                && e["door"] == "cli"
+        }),
+        "{:?}",
+        laptop.audit()
+    );
+
+    // mover may read and write on laptop, but NOT fs.remove: delete=true on a remote directory
+    // must be refused on laptop BEFORE opening a delete pipe on pi.
+    fs::create_dir_all(laptop.home().join("tree")).unwrap();
+    fs::write(laptop.home().join("tree/keep.txt"), b"keep").unwrap();
+    fs::create_dir_all(pi.home().join("tree")).unwrap();
+    fs::write(pi.home().join("tree/keep.txt"), b"keep").unwrap();
+    fs::write(pi.home().join("tree/extra.txt"), b"extra").unwrap();
+    let err = refused(&transfer(
+        &laptop,
+        json!({"from": "~/tree", "to": "pi:~/tree", "delete": true}),
+        &["--as", "mover"],
+    ));
+    assert_eq!(err["code"], "denied", "{err}");
+    assert_eq!(err["machine"], "laptop", "{err}");
+    assert!(
+        err["message"].as_str().unwrap().contains("fs.remove"),
+        "{err}"
+    );
+    assert!(pi.home().join("tree/extra.txt").exists());
+    assert!(
+        stream_lines(&pi)
+            .iter()
+            .all(|e| e["tool"] != "stream.delete"),
+        "pi should never have spawned a delete stream: {:?}",
+        stream_lines(&pi)
+    );
+    assert!(
+        laptop.audit().iter().any(|e| {
+            e["target"] == "pi"
+                && e["tool"] == "stream.delete"
+                && e["principal"] == "mover"
+                && e["outcome"] == "denied"
+        }),
+        "{:?}",
+        laptop.audit()
+    );
+
+    // An allowed transfer audits every remote pipe opened on the forwarding node.
+    ok(&transfer(
+        &laptop,
+        json!({"from": "~/note.txt", "to": "pi:~/ok.txt"}),
+        &[],
+    ));
+    let forwarded_pipes: Vec<Value> = laptop
+        .audit()
+        .into_iter()
+        .filter(|e| e["target"] == "pi" && e["principal"] == "owner" && e["outcome"] == "ok")
+        .collect();
+    for expected in ["stream.stat", "stream.put"] {
+        assert!(
+            forwarded_pipes.iter().any(|e| e["tool"] == expected),
+            "{expected} missing from laptop forwarded pipe audit: {forwarded_pipes:?}"
+        );
+    }
+}
+
+fn relayed_machine_refuses_transfer_with_relay_hint() {
+    let laptop = node("laptop");
+    let pi = node("pi");
+    let pi_argv = [
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        HELPER_FLAG.to_owned(),
+        "node".to_owned(),
+        LEGION_BIN.to_owned(),
+        legion_home_of(&pi).to_string_lossy().into_owned(),
+        pi.home().to_string_lossy().into_owned(),
+        "rpc".to_owned(),
+    ];
+    let quoted: Vec<String> = pi_argv
+        .iter()
+        .map(|arg| serde_json::to_string(arg).unwrap())
+        .collect();
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = [{}]\n\n[machines.tower]\nvia = \"pi\"\n",
+            quoted.join(", ")
+        ),
+    );
+    fs::write(laptop.home().join("a.txt"), b"hello").unwrap();
+
+    for (from, to) in [("~/a.txt", "tower:~/a.txt"), ("tower:~/a.txt", "~/b.txt")] {
+        let err = refused(&transfer(&laptop, json!({"from": from, "to": to}), &[]));
+        assert_eq!(err["code"], "unsupported", "{err}");
+        assert_eq!(err["machine"], "laptop", "{err}");
+        let hint = err["hint"].as_str().unwrap_or("");
+        assert!(
+            hint.contains("pi") && hint.contains("--on pi"),
+            "hint should direct transfers to relay pi: {err}"
+        );
+    }
+
+    let cp = refused(&run_bounded(
+        &laptop,
+        &["cp", "~/a.txt", "tower:~/a.txt", "--json"],
+    ));
+    assert_eq!(cp["code"], "unsupported", "{cp}");
+    assert!(
+        cp["hint"].as_str().unwrap_or("").contains("--on pi"),
+        "{cp}"
     );
 }

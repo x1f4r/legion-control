@@ -93,8 +93,8 @@ impl EventSink {
         EventSink::default()
     }
 
-    /// Returns a sink that tags emitted events with `machine` unless an event already carries a
-    /// machine from a deeper hop.
+    /// Returns a sink that stamps emitted events with `machine`, overwriting any label the emitter
+    /// supplied so a remote cannot forge another machine's name.
     #[must_use]
     pub fn for_machine(&self, machine: impl Into<Arc<str>>) -> EventSink {
         EventSink {
@@ -112,12 +112,12 @@ impl EventSink {
         });
     }
 
-    /// Delivers one [`Event`], preserving its `machine` when already set and otherwise using the
-    /// machine bound to this sink.
+    /// Delivers one [`Event`], overwriting its `machine` with the machine bound to this sink when
+    /// one is set.
     pub fn emit_event(&self, mut event: Event) {
         if let Some(deliver) = &self.deliver {
-            if event.machine.is_none() {
-                event.machine = self.machine.as_deref().map(str::to_owned);
+            if let Some(machine) = &self.machine {
+                event.machine = Some(machine.to_string());
             }
             deliver(event);
         }
@@ -143,9 +143,16 @@ pub struct Ctx {
     pub(crate) grant: Grant,
     pub(crate) cancel: CancellationToken,
     pub(crate) events: EventSink,
+    pub(crate) hops: u32,
 }
 
 impl Ctx {
+    /// The node running this call, for tools that authorise or audit forwarded operations against
+    /// this node's live policy and audit log.
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// The name of the node the tool runs on.
     pub fn node_name(&self) -> &str {
         &self.name
@@ -174,6 +181,12 @@ impl Ctx {
     /// The door the call came through.
     pub fn door(&self) -> Door {
         self.door
+    }
+
+    /// How many nodes have already forwarded the call this tool is running for; `0` when the call
+    /// started on this node.
+    pub fn hops(&self) -> u32 {
+        self.hops
     }
 
     /// What the call is allowed. File tools check every path with

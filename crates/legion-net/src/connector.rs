@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use legion_proto::{ErrorBody, ErrorCode};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -313,20 +313,11 @@ impl PipeHandle {
 
 impl Drop for PipeHandle {
     fn drop(&mut self) {
-        // Give a process whose stdin was just closed a short window to exit cleanly before killing.
-        let deadline = Instant::now() + Duration::from_millis(150);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                _ => {
-                    let _ = self.child.start_kill();
-                    let _ = self.child.try_wait();
-                    break;
-                }
-            }
+        // Non-blocking best-effort cleanup so dropping on an async runtime thread never sleeps.
+        // Graceful EOF waiting lives in `PipeHandle::close` / `Router::shutdown`.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.start_kill();
+            let _ = self.child.try_wait();
         }
         if let Some(task) = self.stderr_task.take() {
             task.abort();

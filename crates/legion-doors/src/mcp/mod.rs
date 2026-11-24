@@ -17,9 +17,13 @@ mod events;
 
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use legion_core::proto::{ErrorBody, ErrorCode, Target};
-use legion_core::{Call, Door, EventSink, Grant, Node, RouteOutcome, Router, VERSION};
+use legion_core::{
+    CANCEL_GRACE, Call, CancellationToken, Door, EventSink, Grant, Node, RouteOutcome, Router,
+    VERSION,
+};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
@@ -30,7 +34,6 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
-use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::Authenticated;
@@ -40,6 +43,9 @@ use self::events::{Forwarder, Level};
 
 /// The hint for a tool a compact session cannot find.
 const LIST_COMPACT: &str = "legion_tools lists the tools you may use here.";
+
+/// Bounded wait for in-flight calls to stop and audit when the door is signalled to shut down.
+const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(4));
 
 /// How a session is served.
 #[derive(Clone, Debug, Default)]
@@ -159,20 +165,55 @@ impl McpDoor {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        self.serve_until(input, output, CancellationToken::new())
+            .await
+    }
+
+    /// Serves one session until `input` ends or `shutdown` is cancelled, then cancels running
+    /// calls, waits within a bounded grace for them to stop and audit, and shuts down the router.
+    pub async fn serve_until<R, W>(
+        self,
+        input: R,
+        output: W,
+        shutdown: CancellationToken,
+    ) -> io::Result<()>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         let calls = self.calls.clone();
         let router = Arc::clone(&self.router);
-        let served = match rmcp::serve_server(self, (input, output)).await {
-            Ok(running) => running
-                .waiting()
-                .await
-                .map(drop)
-                .map_err(|error| io::Error::other(format!("the session stopped: {error}"))),
-            // The input ended before a client said anything, which is a session with nothing in it.
-            Err(ServerInitializeError::ConnectionClosed(_)) => Ok(()),
-            Err(error) => Err(io::Error::other(error.to_string())),
+        let served = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Ok(()),
+            started = rmcp::serve_server(self, (input, output)) => match started {
+                Ok(running) => {
+                    let cancel = running.cancellation_token();
+                    let waiting = running.waiting();
+                    tokio::pin!(waiting);
+                    tokio::select! {
+                        biased;
+                        result = &mut waiting => result
+                            .map(drop)
+                            .map_err(|error| io::Error::other(format!("the session stopped: {error}"))),
+                        () = shutdown.cancelled() => {
+                            cancel.cancel();
+                            let _ = tokio::time::timeout(SHUTDOWN_GRACE, &mut waiting).await;
+                            Ok(())
+                        }
+                    }
+                }
+                // The input ended before a client said anything, which is a session with nothing in it.
+                Err(ServerInitializeError::ConnectionClosed(_)) => Ok(()),
+                Err(error) => Err(io::Error::other(error.to_string())),
+            },
         };
         calls.close();
-        calls.wait().await;
+        if shutdown.is_cancelled() {
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, calls.wait()).await;
+        } else {
+            calls.wait().await;
+        }
         router.shutdown().await;
         served
     }

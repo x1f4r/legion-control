@@ -15,8 +15,8 @@ use legion_core::policy::Policy;
 use legion_core::{
     BoxFuture, Call, CancellationToken, Ctx, EventSink, Node, Paths, RouteOutcome, Router, VERSION,
 };
-use legion_proto::{CallParams, ErrorBody, ErrorCode, Target};
-use serde_json::Value;
+use legion_proto::{CallParams, Effect, ErrorBody, ErrorCode, Target};
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -129,14 +129,25 @@ impl Fleet {
     ) -> Result<Arc<Session>, ErrorBody> {
         let fleet_file = config.get::<FleetFile>()?;
         let entry = lookup_machine(&fleet_file, machine, here)?;
+        if let Some(relay) = &entry.via {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                format!("Machine {machine} is reached via relay {relay}, not through a direct session."),
+            )
+            .with_hint(format!(
+                "Use Fleet::call_remote for relayed calls to {machine}, or open a direct session to {relay}."
+            ))
+            .with_machine(here));
+        }
         self.get_or_open(machine, entry, None, cancel)
             .await
             .map(|live| live.session)
     }
 
-    /// Runs a tool call on a remote `machine` from inside a tool, forwarding `ctx.principal()`,
-    /// cancellation, and events (tagged with `machine`), retrying once only if the session died
-    /// before any byte was written.
+    /// Runs a tool call on a remote `machine` from inside a tool, authorising `ctx.principal()`
+    /// against this node's live policy, writing one audit line on this node, and forwarding
+    /// `ctx.principal()`, `ctx.hops() + 1`, cancellation, and events (tagged with `machine`),
+    /// retrying once only if the session died before any byte was written.
     pub async fn call_remote(
         &self,
         ctx: &Ctx,
@@ -145,22 +156,95 @@ impl Fleet {
         args: Value,
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
+        let started = Instant::now();
+        let node = ctx.node();
         let here = ctx.node_name();
+        let principal = ctx.principal().to_owned();
+        let result = self
+            .call_remote_checked(ctx, node, here, &principal, machine, tool, &args, events)
+            .await;
+        node.record_audit(
+            machine.to_owned(),
+            Some(principal),
+            ctx.door(),
+            tool.to_owned(),
+            &args,
+            started,
+            &result,
+        )
+        .await;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_remote_checked(
+        &self,
+        ctx: &Ctx,
+        node: &Node,
+        here: &str,
+        principal: &str,
+        machine: &str,
+        tool: &str,
+        args: &Value,
+        events: EventSink,
+    ) -> Result<Value, ErrorBody> {
+        let auth = authorize_principal_for_tool(node, here, principal, tool)?;
+        let next_hops = ctx.hops().saturating_add(1);
+        if next_hops > MAX_HOPS {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Forwarding {tool} to {machine} exceeded the maximum of {MAX_HOPS} hops (possible routing loop)."
+                ),
+            )
+            .with_hint(
+                "Check fleet.toml and node.toml on the machines along the path so they do not forward to each other in a cycle.",
+            )
+            .with_machine(machine));
+        }
         let fleet_file = ctx
             .config()
             .get::<FleetFile>()
             .map_err(|err| ensure_machine(err, here))?;
-        let entry = lookup_machine(&fleet_file, machine, here)?;
+        let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, machine, here)?;
+        if relayed && direct_machine == here {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Machine {machine} relays through {here}, which is this node."),
+            )
+            .with_machine(here));
+        }
+        if let ForwardAuth::NeedsRemoteEffect { policy, .. } = auth {
+            if relayed {
+                policy
+                    .authorize_name(principal, tool, None, node.paths())
+                    .map_err(|err| err.with_machine(here))?;
+            } else {
+                let effect = self
+                    .query_remote_effect(
+                        direct_machine,
+                        direct_entry,
+                        tool,
+                        ctx.cancel_token().clone(),
+                    )
+                    .await?;
+                policy
+                    .authorize_name(principal, tool, effect, node.paths())
+                    .map_err(|err| err.with_machine(here))?;
+            }
+        }
         let params = CallParams {
             tool: tool.to_owned(),
-            args,
-            as_principal: Some(ctx.principal().to_owned()),
-            on: Some(Target::One(machine.to_owned())),
-            hops: 1,
+            args: args.clone(),
+            as_principal: Some(principal.to_owned()),
+            on: relayed.then(|| Target::One(machine.to_owned())),
+            hops: next_hops,
         };
         self.execute_on_machine(
+            direct_machine,
+            direct_entry,
             machine,
-            entry,
+            relayed,
             params,
             ctx.cancel_token().clone(),
             events.for_machine(machine),
@@ -171,6 +255,9 @@ impl Fleet {
     /// Opens a fresh dedicated pipe to `machine` running a fixed remote [`Subcommand`] (such as
     /// [`Subcommand::Stream`] for `legion stream` bulk file transfer) from inside a tool.
     ///
+    /// Authorises `ctx.principal()` against this node's live policy before spawning any pipe and
+    /// writes one audit line on this node for the attempt.
+    ///
     /// When the machine has multiple systems or an SSH transport with no cached OS shape, the pool
     /// first verifies the active system and OS through [`Fleet::session`] so the pipe targets the
     /// running system directly.
@@ -180,14 +267,90 @@ impl Fleet {
         machine: &str,
         subcommand: Subcommand,
     ) -> Result<Pipe, ErrorBody> {
-        self.open_pipe_for(
-            ctx.config(),
-            ctx.node_name(),
+        let (audit_tool, required_tool, required_effect, sub_name) = match subcommand {
+            Subcommand::Stream => ("stream.open", "fs.transfer", Some(Effect::Write), "stream"),
+            Subcommand::Rpc => ("rpc.open", "fleet.rpc", None, "rpc"),
+        };
+        let args = json!({ "subcommand": sub_name });
+        self.open_pipe_checked(
+            ctx,
             machine,
             subcommand,
-            ctx.cancel_token().clone(),
+            audit_tool,
+            &[(required_tool, required_effect)],
+            &args,
         )
         .await
+    }
+
+    /// Opens a dedicated `legion stream` pipe for `fs.transfer`, checking this node's live policy
+    /// for both `fs.transfer` and the stream operation's underlying file tool (`fs.read`,
+    /// `fs.write`, or `fs.remove`), and writing one audit line on this node.
+    pub(crate) async fn open_stream_pipe(
+        &self,
+        ctx: &Ctx,
+        machine: &str,
+        op: &str,
+        underlying_tool: &str,
+        underlying_effect: Effect,
+        recorded_args: &Value,
+    ) -> Result<Pipe, ErrorBody> {
+        let audit_tool = format!("stream.{op}");
+        self.open_pipe_checked(
+            ctx,
+            machine,
+            Subcommand::Stream,
+            &audit_tool,
+            &[
+                ("fs.transfer", Some(Effect::Write)),
+                (underlying_tool, Some(underlying_effect)),
+            ],
+            recorded_args,
+        )
+        .await
+    }
+
+    async fn open_pipe_checked(
+        &self,
+        ctx: &Ctx,
+        machine: &str,
+        subcommand: Subcommand,
+        audit_tool: &str,
+        required: &[(&str, Option<Effect>)],
+        recorded_args: &Value,
+    ) -> Result<Pipe, ErrorBody> {
+        let started = Instant::now();
+        let node = ctx.node();
+        let here = ctx.node_name();
+        let principal = ctx.principal().to_owned();
+        let result = match authorize_pipe_open(node, here, &principal, required) {
+            Ok(()) => {
+                self.open_pipe_for(
+                    ctx.config(),
+                    here,
+                    machine,
+                    subcommand,
+                    ctx.cancel_token().clone(),
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
+        let audit_outcome = match &result {
+            Ok(_) => Ok(Value::Null),
+            Err(err) => Err(err.clone()),
+        };
+        node.record_audit(
+            machine.to_owned(),
+            Some(principal),
+            ctx.door(),
+            audit_tool.to_owned(),
+            recorded_args,
+            started,
+            &audit_outcome,
+        )
+        .await;
+        result
     }
 
     /// Opens a fresh dedicated pipe to `machine` running `subcommand`, using a [`ConfigStore`]
@@ -209,8 +372,20 @@ impl Fleet {
             )
             .with_machine(machine));
         }
-        let fleet_file = config.get::<FleetFile>()?;
+        let fleet_file = config
+            .get::<FleetFile>()
+            .map_err(|err| ensure_machine(err, here))?;
         let entry = lookup_machine(&fleet_file, machine, here)?;
+        if let Some(relay) = &entry.via {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                format!("Machine {machine} is reached via relay {relay}, so a direct pipe cannot be opened to it."),
+            )
+            .with_hint(format!(
+                "Run transfers involving {machine} on {relay} instead (for example `legion fs.transfer --on {relay} from=... to=...`), or configure a direct ssh or command transport for {machine} in fleet.toml."
+            ))
+            .with_machine(here));
+        }
         let systems = entry.resolved_systems();
 
         // Reuse the verified active system and OS from an already-open session when available.
@@ -273,7 +448,12 @@ impl Fleet {
     }
 
     /// Runs `call` on a single named machine (locally if `machine` is this node, otherwise over
-    /// the pooled session).
+    /// the pooled session, or through an explicit `via` relay).
+    ///
+    /// Before forwarding, this node authorises the call against its own policy for the caller's
+    /// principal and appends one audit line for the forward with the target machine and outcome.
+    /// A node never runs a call locally when `machine` is not this node and is missing from
+    /// `fleet.toml`: unknown names fail with `not_found` carrying this node's name.
     pub async fn call_machine(
         &self,
         node: &Node,
@@ -284,22 +464,78 @@ impl Fleet {
         if machine == here {
             return node.call(call).await;
         }
-        let fleet_file = node
-            .config()
-            .get::<FleetFile>()
-            .map_err(|err| ensure_machine(err, &here))?;
-        match fleet_file.machine(machine) {
-            Some(entry) => self.forward_one(node, machine, entry, call).await,
-            None if call.hops > 0 => {
-                // This call was forwarded directly here under a fleet alias that differs from this
-                // node's own name, and this node has no forwarding entry for that name.
-                node.call(call).await
+        let started = Instant::now();
+        let auth = match authorize_for_forward(node, &call) {
+            Ok(auth) => auth,
+            Err((principal, err)) => {
+                node.record_audit(
+                    machine.to_owned(),
+                    principal,
+                    call.door,
+                    call.tool,
+                    &call.args,
+                    started,
+                    &Err(err.clone()),
+                )
+                .await;
+                return Err(err);
             }
-            None => Err(unknown_machine_error(machine, &fleet_file.names(), &here)),
-        }
+        };
+        self.call_remote_authorized(node, machine, call, auth, started)
+            .await
     }
 
-    /// Probes one machine with `hello`, returning structured reachability and latency data.
+    async fn call_remote_authorized(
+        &self,
+        node: &Node,
+        machine: &str,
+        call: Call,
+        auth: ForwardAuth,
+        started: Instant,
+    ) -> Result<Value, ErrorBody> {
+        let here = node.name();
+        let door = call.door;
+        let tool = call.tool.clone();
+        let args = call.args.clone();
+        let principal = auth.principal().to_owned();
+        let result = match node
+            .config()
+            .get::<FleetFile>()
+            .map_err(|err| ensure_machine(err, &here))
+            .and_then(|fleet_file| {
+                let (direct_machine, direct_entry, relayed) =
+                    resolve_route(&fleet_file, machine, &here)?;
+                Ok((direct_machine.to_owned(), direct_entry.clone(), relayed))
+            }) {
+            Ok((direct_machine, direct_entry, relayed)) => {
+                self.forward_authorized(
+                    node,
+                    machine,
+                    &direct_machine,
+                    &direct_entry,
+                    relayed,
+                    call,
+                    auth,
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
+        node.record_audit(
+            machine.to_owned(),
+            Some(principal),
+            door,
+            tool,
+            &args,
+            started,
+            &result,
+        )
+        .await;
+        result
+    }
+
+    /// Probes one machine with `hello` (or `meta.version` through its relay when configured with
+    /// `via`), returning structured reachability and latency data.
     pub async fn ping(
         &self,
         config: &ConfigStore,
@@ -328,12 +564,73 @@ impl Fleet {
                 return ping_failed(machine, ensure_machine(err, here));
             }
         };
-        let entry = match lookup_machine(&fleet_file, machine, here) {
-            Ok(entry) => entry,
-            Err(err) => return ping_failed(machine, err),
-        };
+        let (direct_machine, direct_entry, relayed) =
+            match resolve_route(&fleet_file, machine, here) {
+                Ok(route) => route,
+                Err(err) => return ping_failed(machine, err),
+            };
 
         let started = Instant::now();
+        if relayed {
+            if direct_machine == here {
+                return ping_failed(
+                    machine,
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("Machine {machine} relays through {here}, which is this node."),
+                    )
+                    .with_machine(here),
+                );
+            }
+            let params = CallParams {
+                tool: "meta.version".to_owned(),
+                args: serde_json::json!({}),
+                as_principal: None,
+                on: Some(Target::One(machine.to_owned())),
+                hops: 1,
+            };
+            let fut = self.execute_on_machine(
+                direct_machine,
+                direct_entry,
+                machine,
+                true,
+                params,
+                cancel,
+                EventSink::discard(),
+            );
+            return match tokio::time::timeout(timeout, fut).await {
+                Ok(Ok(value)) => PingOutcome {
+                    machine: machine.to_owned(),
+                    reachable: true,
+                    node: value.get("node").and_then(Value::as_str).map(str::to_owned),
+                    system: None,
+                    version: value
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    os: value.get("os").and_then(Value::as_str).map(str::to_owned),
+                    arch: value.get("arch").and_then(Value::as_str).map(str::to_owned),
+                    latency_ms: Some(
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ),
+                    error: None,
+                },
+                Ok(Err(err)) => ping_failed(machine, ensure_machine(err, machine)),
+                Err(_) => ping_failed(
+                    machine,
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!(
+                            "Timed out waiting for {machine} after {}s.",
+                            timeout.as_secs_f64()
+                        ),
+                    )
+                    .with_machine(machine),
+                ),
+            };
+        }
+
+        let entry = direct_entry;
         let systems = entry.resolved_systems();
         let slot = self.slot(machine);
         let existing = {
@@ -439,13 +736,26 @@ impl Fleet {
         while closing.join_next().await.is_some() {}
     }
 
-    async fn forward_one(
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_authorized(
         &self,
         node: &Node,
         machine: &str,
-        entry: &MachineEntry,
+        direct_machine: &str,
+        direct_entry: &MachineEntry,
+        relayed: bool,
         call: Call,
+        auth: ForwardAuth,
     ) -> Result<Value, ErrorBody> {
+        let here = node.name();
+        if relayed && direct_machine == here {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Machine {machine} relays through {here}, which is this node."),
+            )
+            .with_machine(&here));
+        }
+
         let next_hops = call.hops.saturating_add(1);
         if next_hops > MAX_HOPS {
             return Err(ErrorBody::new(
@@ -461,28 +771,48 @@ impl Fleet {
             .with_machine(machine));
         }
 
-        // Resolve the effective principal locally so a pinned door cannot be bypassed on forward
-        // and invalid policy.toml fails closed before anything leaves this node.
-        let here = node.name();
-        let policy = node
-            .config()
-            .get::<Policy>()
-            .map_err(|err| ensure_machine(err, &here))?;
-        let principal = policy
-            .resolve(call.as_principal.as_deref(), call.pinned.as_deref())
-            .map_err(|err| err.with_machine(&here))?;
+        let principal = match auth {
+            ForwardAuth::Authorized { principal } => principal,
+            ForwardAuth::NeedsRemoteEffect { principal, policy } => {
+                if relayed {
+                    // Cannot inspect the final target's tool list through a relay before forwarding,
+                    // so its effect is unknown here and only a `*` role may forward it.
+                    policy
+                        .authorize_name(&principal, &call.tool, None, node.paths())
+                        .map_err(|err| err.with_machine(&here))?;
+                    principal
+                } else {
+                    let effect = self
+                        .query_remote_effect(
+                            direct_machine,
+                            direct_entry,
+                            &call.tool,
+                            call.cancel.clone(),
+                        )
+                        .await?;
+                    policy
+                        .authorize_name(&principal, &call.tool, effect, node.paths())
+                        .map_err(|err| err.with_machine(&here))?;
+                    principal
+                }
+            }
+        };
 
         let params = CallParams {
             tool: call.tool,
             args: call.args,
             as_principal: Some(principal),
-            on: Some(Target::One(machine.to_owned())),
+            // Direct forwards send no `on` so the receiver runs the call locally regardless of
+            // what it calls itself. Explicit `via` relays send `on` naming the final target.
+            on: relayed.then(|| Target::One(machine.to_owned())),
             hops: next_hops,
         };
 
         self.execute_on_machine(
+            direct_machine,
+            direct_entry,
             machine,
-            entry,
+            relayed,
             params,
             call.cancel,
             call.events.for_machine(machine),
@@ -490,18 +820,69 @@ impl Fleet {
         .await
     }
 
-    async fn execute_on_machine(
+    async fn query_remote_effect(
         &self,
         machine: &str,
         entry: &MachineEntry,
+        tool: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<legion_proto::Effect>, ErrorBody> {
+        let slot = self.slot(machine);
+        let live = self
+            .get_or_open(machine, entry, None, cancel.clone())
+            .await
+            .map_err(|err| err.with_machine(machine))?;
+        match live.session.tool_effect(tool, cancel.clone()).await {
+            Ok(effect) => Ok(effect),
+            Err(CallError::NotWritten(_)) => {
+                self.invalidate_if_same(&slot, &live.session);
+                let fresh = self
+                    .get_or_open(machine, entry, None, cancel.clone())
+                    .await
+                    .map_err(|err| err.with_machine(machine))?;
+                match fresh.session.tool_effect(tool, cancel).await {
+                    Ok(effect) => Ok(effect),
+                    Err(CallError::LostInFlight(err) | CallError::NotWritten(err)) => {
+                        self.invalidate_if_same(&slot, &fresh.session);
+                        Err(err.with_machine(machine))
+                    }
+                    Err(CallError::Remote(err)) => Err(err.with_machine(machine)),
+                }
+            }
+            Err(CallError::LostInFlight(err)) => {
+                self.invalidate_if_same(&slot, &live.session);
+                Err(err.with_machine(machine))
+            }
+            Err(CallError::Remote(err)) => Err(err.with_machine(machine)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_on_machine(
+        &self,
+        direct_machine: &str,
+        direct_entry: &MachineEntry,
+        target_machine: &str,
+        relayed: bool,
         params: CallParams,
         cancel: CancellationToken,
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
-        let slot = self.slot(machine);
+        let label_error = |err: ErrorBody| {
+            if relayed
+                && err.code == ErrorCode::NotFound
+                && err.machine.as_deref() == Some(direct_machine)
+            {
+                err.with_machine(direct_machine)
+            } else {
+                err.with_machine(target_machine)
+            }
+        };
+        let slot = self.slot(direct_machine);
         let live = self
-            .get_or_open(machine, entry, None, cancel.clone())
-            .await?;
+            .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+            .await
+            .map_err(&label_error)?;
 
         match live
             .session
@@ -513,22 +894,23 @@ impl Fleet {
                 // Request was never written to the dead session: reopen once and retry.
                 self.invalidate_if_same(&slot, &live.session);
                 let fresh = self
-                    .get_or_open(machine, entry, None, cancel.clone())
-                    .await?;
+                    .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+                    .await
+                    .map_err(&label_error)?;
                 match fresh.session.call(params, cancel, events).await {
                     Ok(value) => Ok(value),
                     Err(CallError::LostInFlight(err) | CallError::NotWritten(err)) => {
                         self.invalidate_if_same(&slot, &fresh.session);
-                        Err(ensure_machine(err, machine))
+                        Err(label_error(err))
                     }
-                    Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+                    Err(CallError::Remote(err)) => Err(label_error(err)),
                 }
             }
             Err(CallError::LostInFlight(err)) => {
                 self.invalidate_if_same(&slot, &live.session);
-                Err(ensure_machine(err, machine))
+                Err(label_error(err))
             }
-            Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+            Err(CallError::Remote(err)) => Err(label_error(err)),
         }
     }
 
@@ -836,10 +1218,35 @@ impl Fleet {
     }
 
     async fn fan_out(&self, node: &Node, call: Call, machines: Vec<String>) -> RouteOutcome {
+        let started = Instant::now();
+        let here = node.name();
+        let auth = match authorize_for_forward(node, &call) {
+            Ok(auth) => auth,
+            Err((principal, err)) => {
+                let mut results = BTreeMap::new();
+                for machine in machines {
+                    node.record_audit(
+                        machine.clone(),
+                        principal.clone(),
+                        call.door,
+                        call.tool.clone(),
+                        &call.args,
+                        started,
+                        &Err(err.clone()),
+                    )
+                    .await;
+                    results.insert(machine, Err(err.clone()));
+                }
+                return RouteOutcome::Many(results);
+            }
+        };
+
         let mut set = JoinSet::new();
         for machine in machines {
             let fleet = self.clone();
             let node = node.clone();
+            let here = here.clone();
+            let auth = auth.clone();
             let sub_call = Call {
                 tool: call.tool.clone(),
                 args: call.args.clone(),
@@ -851,10 +1258,14 @@ impl Fleet {
                 hops: call.hops,
             };
             set.spawn(async move {
-                let outcome = fleet
-                    .call_machine(&node, &machine, sub_call)
-                    .await
-                    .map_err(|err| ensure_machine(err, &machine));
+                let outcome = if machine == here {
+                    node.call(sub_call).await
+                } else {
+                    fleet
+                        .call_remote_authorized(&node, &machine, sub_call, auth, started)
+                        .await
+                        .map_err(|err| ensure_machine(err, &machine))
+                };
                 (machine, outcome)
             });
         }
@@ -867,6 +1278,114 @@ impl Fleet {
         }
         RouteOutcome::Many(results)
     }
+}
+
+#[derive(Clone)]
+enum ForwardAuth {
+    /// Authorized locally by the local tool spec or a wildcard `*` role.
+    Authorized { principal: String },
+    /// Tool does not exist in this node's registry; check the target's reported effect before
+    /// sending `call`.
+    NeedsRemoteEffect {
+        principal: String,
+        policy: Arc<Policy>,
+    },
+}
+
+impl ForwardAuth {
+    fn principal(&self) -> &str {
+        match self {
+            ForwardAuth::Authorized { principal }
+            | ForwardAuth::NeedsRemoteEffect { principal, .. } => principal,
+        }
+    }
+}
+
+fn authorize_for_forward(
+    node: &Node,
+    call: &Call,
+) -> Result<ForwardAuth, (Option<String>, ErrorBody)> {
+    let here = node.name();
+    let policy = node
+        .config()
+        .get::<Policy>()
+        .map_err(|err| (call.pinned.clone(), ensure_machine(err, &here)))?;
+    let principal = match policy.resolve(call.as_principal.as_deref(), call.pinned.as_deref()) {
+        Ok(principal) => principal,
+        Err(err) => {
+            let caller = call
+                .pinned
+                .clone()
+                .unwrap_or_else(|| policy.default_principal().to_owned());
+            return Err((Some(caller), err.with_machine(&here)));
+        }
+    };
+    authorize_principal_with_policy(node, &here, &policy, &principal, &call.tool)
+        .map_err(|err| (Some(principal), err))
+}
+
+fn authorize_principal_for_tool(
+    node: &Node,
+    here: &str,
+    principal: &str,
+    tool: &str,
+) -> Result<ForwardAuth, ErrorBody> {
+    let policy = node
+        .config()
+        .get::<Policy>()
+        .map_err(|err| ensure_machine(err, here))?;
+    authorize_principal_with_policy(node, here, &policy, principal, tool)
+}
+
+fn authorize_principal_with_policy(
+    node: &Node,
+    here: &str,
+    policy: &Arc<Policy>,
+    principal: &str,
+    tool_name: &str,
+) -> Result<ForwardAuth, ErrorBody> {
+    if let Some(tool) = node.registry().get(tool_name) {
+        policy
+            .authorize(principal, tool.spec(), node.paths())
+            .map_err(|err| err.with_machine(here))?;
+        return Ok(ForwardAuth::Authorized {
+            principal: principal.to_owned(),
+        });
+    }
+    // Tool exists only on the target (or does not exist).
+    match policy.authorize_name(principal, tool_name, None, node.paths()) {
+        Ok(_) => Ok(ForwardAuth::Authorized {
+            principal: principal.to_owned(),
+        }),
+        Err(denied) => {
+            if policy.could_allow_with_remote_effect(principal, tool_name) {
+                Ok(ForwardAuth::NeedsRemoteEffect {
+                    principal: principal.to_owned(),
+                    policy: Arc::clone(policy),
+                })
+            } else {
+                Err(denied.with_machine(here))
+            }
+        }
+    }
+}
+
+fn authorize_pipe_open(
+    node: &Node,
+    here: &str,
+    principal: &str,
+    required: &[(&str, Option<Effect>)],
+) -> Result<(), ErrorBody> {
+    let policy = node
+        .config()
+        .get::<Policy>()
+        .map_err(|err| ensure_machine(err, here))?;
+    for &(tool, effect) in required {
+        policy
+            .authorize_name(principal, tool, effect, node.paths())
+            .map_err(|err| err.with_machine(here))?;
+    }
+    Ok(())
 }
 
 impl Drop for PoolInner {
@@ -903,26 +1422,33 @@ impl Router for Fleet {
                 Some(Target::One(machine)) => {
                     RouteOutcome::One(self.call_machine(node, &machine, call).await)
                 }
-                Some(Target::Many(mut names)) if names.len() == 1 => {
-                    let machine = names.pop().unwrap_or_default();
-                    RouteOutcome::One(self.call_machine(node, &machine, call).await)
-                }
                 Some(Target::All) => {
                     let here = node.name();
                     let fleet_file = match node.config().get::<FleetFile>() {
                         Ok(file) => file,
                         Err(err) => return RouteOutcome::One(Err(ensure_machine(err, &here))),
                     };
-                    let names: Vec<String> = fleet_file.machines.keys().cloned().collect();
+                    let mut names = Vec::with_capacity(fleet_file.machines.len() + 1);
+                    names.push(here.clone());
+                    for name in fleet_file.machines.keys() {
+                        if name != &here {
+                            names.push(name.clone());
+                        }
+                    }
                     self.fan_out(node, call, names).await
                 }
                 Some(Target::Many(names)) => {
                     let mut seen = HashSet::new();
-                    let unique: Vec<String> = names
+                    let mut unique: Vec<String> = names
                         .into_iter()
                         .filter(|name| seen.insert(name.clone()))
                         .collect();
-                    self.fan_out(node, call, unique).await
+                    if unique.len() == 1 {
+                        let machine = unique.pop().unwrap_or_default();
+                        RouteOutcome::One(self.call_machine(node, &machine, call).await)
+                    } else {
+                        self.fan_out(node, call, unique).await
+                    }
                 }
             }
         })
@@ -963,9 +1489,26 @@ fn default_first_os(program: Option<&str>) -> RemoteOs {
     }
 }
 
+fn resolve_route<'a>(
+    fleet_file: &'a FleetFile,
+    machine: &'a str,
+    here: &str,
+) -> Result<(&'a str, &'a MachineEntry, bool), ErrorBody> {
+    if fleet_file.machine(machine).is_none() {
+        return Err(unknown_machine_error(machine, &fleet_file.names(), here));
+    }
+    fleet_file.resolve_route(machine).map_err(|reason| {
+        ErrorBody::new(ErrorCode::Failed, format!("{reason}."))
+            .with_hint(
+                "Fix the `via` entries in fleet.toml so they name a valid relay without cycles.",
+            )
+            .with_machine(here)
+    })
+}
+
 fn lookup_machine<'a>(
     fleet_file: &'a FleetFile,
-    machine: &str,
+    machine: &'a str,
     here: &str,
 ) -> Result<&'a MachineEntry, ErrorBody> {
     fleet_file
@@ -986,10 +1529,10 @@ fn unknown_machine_error(machine: &str, known: &[&str], here: &str) -> ErrorBody
     };
     ErrorBody::new(
         ErrorCode::NotFound,
-        format!("There is no machine called {machine} in fleet.toml."),
+        format!("There is no machine called {machine} in fleet.toml on {here}."),
     )
     .with_hint(hint)
-    .with_machine(machine)
+    .with_machine(here)
 }
 
 fn ensure_machine(err: ErrorBody, machine: &str) -> ErrorBody {
@@ -1030,5 +1573,344 @@ fn ping_failed(machine: &str, error: ErrorBody) -> PingOutcome {
         arch: None,
         latency_ms: None,
         error: Some(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use legion_core::{BoxFuture, Door, NoArgs, Registry, Tool, ToolError};
+    use legion_proto::{Effect, HelloResult, Id, PROTOCOL, Request, Response, ToolSpec};
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+
+    struct RelayTool {
+        spec: ToolSpec,
+        fleet: Fleet,
+    }
+
+    impl Tool for RelayTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move {
+                self.fleet
+                    .call_remote(ctx, "pi", "meta.version", json!({}), EventSink::discard())
+                    .await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn call_remote_increments_ctx_hops_and_enforces_max_hops() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\nssh = \"pi.example\"\n",
+        )
+        .unwrap();
+
+        let fleet = Fleet::new(&paths);
+        let fleet_file = ConfigStore::new(paths.config_dir())
+            .get::<FleetFile>()
+            .unwrap();
+        let entry = fleet_file.machine("pi").unwrap();
+        let systems = entry.resolved_systems();
+
+        // Install an in-memory session for `pi` that echoes back `params.hops`.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            let hello = Response::ok(
+                Some(Id::Number(1)),
+                serde_json::to_value(HelloResult {
+                    node: "pi".to_owned(),
+                    version: "0.1.0".to_owned(),
+                    protocol: PROTOCOL,
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    systems: Vec::new(),
+                })
+                .unwrap(),
+            );
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Request = serde_json::from_str(&line).unwrap();
+                let seen_hops = req.params["hops"].as_u64().unwrap_or(0);
+                let reply = Response::ok(req.id, json!({"seen_hops": seen_hops}));
+                server_w
+                    .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+                server_w.flush().await.unwrap();
+            }
+        });
+
+        let session = Session::open_io(
+            client_r,
+            client_w,
+            "pi",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let slot = fleet.slot("pi");
+        *slot.current.lock().unwrap() = Some(LiveEntry {
+            session: Arc::new(session),
+            systems_fingerprint: systems.clone(),
+            active_system: systems[0].clone(),
+            active_os: None,
+        });
+
+        let mut registry = Registry::new();
+        registry.add(RelayTool {
+            spec: ToolSpec {
+                name: "test.relay".to_owned(),
+                description: "Calls pi via Fleet::call_remote.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+        });
+        let node = Node::new(paths, registry);
+
+        let mut call0 = Call::new(Door::Cli, "test.relay", json!({}));
+        call0.hops = 0;
+        let out0 = node.call(call0).await.unwrap();
+        assert_eq!(out0["seen_hops"], json!(1));
+
+        let mut call2 = Call::new(Door::Rpc, "test.relay", json!({}));
+        call2.hops = 2;
+        let out2 = node.call(call2).await.unwrap();
+        assert_eq!(out2["seen_hops"], json!(3));
+
+        let mut call_max = Call::new(Door::Rpc, "test.relay", json!({}));
+        call_max.hops = MAX_HOPS;
+        let err = node.call(call_max).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(err.message.contains("3 hops"), "{}", err.message);
+
+        fleet.close().await;
+        server_task.await.unwrap();
+    }
+
+    struct PipeOpenTool {
+        spec: ToolSpec,
+        fleet: Fleet,
+        machine: String,
+    }
+
+    impl Tool for PipeOpenTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move {
+                let pipe = self
+                    .fleet
+                    .open_pipe(ctx, &self.machine, Subcommand::Stream)
+                    .await?;
+                pipe.close(Duration::from_millis(50)).await;
+                Ok(json!({"opened": true}))
+            })
+        }
+    }
+
+    struct WriteRelayTool {
+        spec: ToolSpec,
+        fleet: Fleet,
+    }
+
+    impl Tool for WriteRelayTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move {
+                self.fleet
+                    .call_remote(
+                        ctx,
+                        "pi",
+                        "fs.write",
+                        json!({"path": "~/x", "content": "hi"}),
+                        EventSink::discard(),
+                    )
+                    .await
+            })
+        }
+    }
+
+    struct DummyTool {
+        spec: ToolSpec,
+    }
+
+    impl Tool for DummyTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call<'a>(
+            &'a self,
+            _ctx: &'a Ctx,
+            _args: Value,
+        ) -> BoxFuture<'a, Result<Value, ToolError>> {
+            Box::pin(async move { Ok(json!({})) })
+        }
+    }
+
+    fn read_audit_lines(paths: &Paths) -> Vec<Value> {
+        let Ok(text) = std::fs::read_to_string(paths.audit_log()) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn call_remote_and_open_pipe_authorise_and_audit_on_forwarding_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"laptop\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\nssh = \"pi.example\"\n\n[machines.leaf]\nvia = \"pi\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "[principals.reader]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+        )
+        .unwrap();
+
+        let fleet = Fleet::new(&paths);
+        let mut registry = Registry::new();
+        registry.add(DummyTool {
+            spec: ToolSpec {
+                name: "fs.write".to_owned(),
+                description: "Dummy write tool.".to_owned(),
+                effect: Effect::Write,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+        });
+        registry.add(WriteRelayTool {
+            spec: ToolSpec {
+                name: "test.write_relay".to_owned(),
+                description: "Calls remote fs.write via Fleet::call_remote.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+        });
+        registry.add(PipeOpenTool {
+            spec: ToolSpec {
+                name: "test.open_pi".to_owned(),
+                description: "Opens a stream pipe to pi.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+            machine: "pi".to_owned(),
+        });
+        registry.add(PipeOpenTool {
+            spec: ToolSpec {
+                name: "test.open_leaf".to_owned(),
+                description: "Opens a stream pipe to relayed leaf.".to_owned(),
+                effect: Effect::Read,
+                input_schema: legion_core::input_schema::<NoArgs>(),
+            },
+            fleet: fleet.clone(),
+            machine: "leaf".to_owned(),
+        });
+        let node = Node::new(paths.clone(), registry);
+
+        // 1. observer may invoke test.write_relay (Read), but Fleet::call_remote refuses
+        //    fs.write on the forwarding node and audits it as denied without touching pi.
+        let mut call = Call::new(Door::Cli, "test.write_relay", json!({}));
+        call.as_principal = Some("reader".to_owned());
+        let err = node.call(call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(err.machine.as_deref(), Some("laptop"));
+        let audit = read_audit_lines(&paths);
+        assert!(
+            audit.iter().any(|e| {
+                e["target"] == "pi"
+                    && e["tool"] == "fs.write"
+                    && e["principal"] == "reader"
+                    && e["outcome"] == "denied"
+            }),
+            "{audit:?}"
+        );
+
+        // 2. observer cannot open a stream pipe because it lacks fs.transfer; denied and audited
+        //    on laptop without attempting SSH.
+        let mut call = Call::new(Door::Cli, "test.open_pi", json!({}));
+        call.as_principal = Some("reader".to_owned());
+        let err = node.call(call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(err.machine.as_deref(), Some("laptop"));
+        let audit = read_audit_lines(&paths);
+        assert!(
+            audit.iter().any(|e| {
+                e["target"] == "pi"
+                    && e["tool"] == "stream.open"
+                    && e["principal"] == "reader"
+                    && e["outcome"] == "denied"
+            }),
+            "{audit:?}"
+        );
+
+        // 3. owner opening a pipe to a via-relayed machine gets Unsupported with a hint telling
+        //    them to run transfers on the relay.
+        let call = Call::new(Door::Cli, "test.open_leaf", json!({}));
+        let err = node.call(call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert_eq!(err.machine.as_deref(), Some("laptop"));
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(hint.contains("pi") && hint.contains("--on pi"), "{err:?}");
+        let audit = read_audit_lines(&paths);
+        assert!(
+            audit.iter().any(|e| {
+                e["target"] == "leaf"
+                    && e["tool"] == "stream.open"
+                    && e["principal"] == "owner"
+                    && e["outcome"] == "unsupported"
+            }),
+            "{audit:?}"
+        );
+
+        fleet.close().await;
     }
 }
