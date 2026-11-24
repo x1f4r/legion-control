@@ -29,7 +29,7 @@ Register this `legion` binary as an MCP server named `legion` with an AI coding 
 | --- | --- | --- | --- | --- |
 | `agent` | `string` | yes | - | Which AI coding agent to register Legion with (`claude`, `codex`, `antigravity`, `opencode`). `claude`: Claude Code (`claude`). `codex`: OpenAI Codex CLI (`codex`). `antigravity`: Antigravity CLI (`agy`). `opencode`: OpenCode (`opencode`). Allowed values: `claude`, `codex`, `antigravity`, `opencode`. |
 | `as` | `string` | yes | - | Principal every MCP call from this agent acts as. Must be named in policy.toml, or `owner` with `allow_owner=true`. Prefer a named, limited principal so the agent is confined by its role and clearly identified in the audit log. |
-| `compact` | `boolean` | no | `true` | Pass `--compact` to `legion mcp` (exposes three meta-tools instead of one per registered tool). Defaults to true because every registered tool schema costs context on every conversation. |
+| `compact` | `boolean` | no | `true` | Pass `--compact` to `legion mcp` (exposes four meta-tools instead of one per registered tool). Defaults to true because every registered tool schema costs context on every conversation. |
 | `scope` | `string` | no | - | Scope for agents that support one (`local`, `user`, or `project` for `claude`, default `user`; `global`/`user` or `project`/`local` for `opencode`, default `global`). |
 | `allow_owner` | `boolean` | no | `false` | Allow registering the agent as `owner`, which grants unrestricted access. Off unless true. |
 | `dry_run` | `boolean` | no | `false` | Return the exact registration command without running it. |
@@ -578,9 +578,9 @@ Wait until a background job is no longer starting or running and return the same
 
 | Tool | Effect | Description |
 | --- | --- | --- |
-| `meta.doctor` | `read` | Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml answers (unless quick=true). |
+| `meta.doctor` | `read` | Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). |
 | `meta.init` | `admin` | Create starter node.toml and policy.toml files where they do not already exist, leaving every existing file untouched so it is safe to run again. |
-| `meta.update` | `admin` | Replace this node's legion binary with an offline-signed GitHub release artifact. |
+| `meta.update` | `admin` | Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. |
 | `meta.version` | `read` | Say which build of legion this node runs, the protocol it speaks, and its operating system and architecture. |
 | `meta.whoami` | `read` | Say who the caller is on this node: the principal and role it acts as, the door it came through, the directories file tools are confined to, and the tools it may use. |
 
@@ -588,7 +588,7 @@ Wait until a background job is no longer starting or running and return the same
 
 Effect: `read`
 
-Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml answers (unless quick=true). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.
+Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -610,12 +610,13 @@ Create starter node.toml and policy.toml files where they do not already exist, 
 
 Effect: `admin`
 
-Replace this node's legion binary with an offline-signed GitHub release artifact. Requires a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it; to install an unsigned local build use fleet.install with from=<local file> or install scripts with --from), verifies SHA-256, and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.
+Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. Release downloads require a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it) and SHA-256 verification; passing `from=<local file>` installs an unsigned binary that the admin naming the file vouches for. Checks binary format and architecture, enforces downgrade protection unless `allow_downgrade` is set, stages and runs `--version` preflight, keeps the previous binary as `.prev` (restoring it if the replaced binary does not run), and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `version` | `string` | no | - | Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the highest published stable `legion-v*` semantic version. |
-| `dry_run` | `boolean` | no | `false` | Resolve the target release and report what would be replaced without downloading or writing. |
+| `version` | `string` | no | - | Release version to install (for example `0.2.0` or `legion-v0.2.0`). Defaults to the highest published stable `legion-v*` semantic version. Cannot be combined with `from`. |
+| `from` | `string` | no | - | Local path on this node to a `legion` binary already built for this machine. Cannot be combined with `version`. |
+| `dry_run` | `boolean` | no | `false` | Resolve the target release or local binary and report what would be replaced without downloading or writing. |
 | `allow_downgrade` | `boolean` | no | `false` | Permit replacing with a version older than the running binary or the recorded version floor. |
 
 ### `meta.version`

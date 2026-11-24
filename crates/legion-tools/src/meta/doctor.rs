@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use legion_core::Ctx;
 use legion_core::policy::{OWNER, Policy, Role};
-use legion_core::proto::{Effect, ErrorBody, ToolSpec};
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use serde::Deserialize;
@@ -437,7 +437,31 @@ fn role_allows_exec_effect_broadly(role: &Role) -> bool {
         && role.allow.iter().any(|rule| rule.matches(&probe))
 }
 
+fn is_unreachable_warning(error: Option<&ErrorBody>) -> bool {
+    match error {
+        None => true,
+        Some(err) => match err.code {
+            ErrorCode::Unreachable | ErrorCode::Timeout => {
+                let non_protocol = err
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|v| v.as_str())
+                    == Some("non_protocol_output")
+                    || err.message.contains("non-protocol lines")
+                    || err.message.contains("hello reply was invalid");
+                !non_protocol
+            }
+            _ => false,
+        },
+    }
+}
+
 /// Converts `fleet.ping` outcomes into one `meta.doctor` check per machine.
+///
+/// A machine that simply does not answer (unreachable or timed out) becomes a warning (`ok: true`,
+/// `warning: true`) because switched-off machines are normal; protocol mismatches, unparseable
+/// replies, and local configuration errors remain failures (`ok: false`).
 pub fn fleet_ping_checks(results: &[FleetPingEntry]) -> Vec<Check> {
     results
         .iter()
@@ -457,15 +481,37 @@ pub fn fleet_ping_checks(results: &[FleetPingEntry]) -> Vec<Check> {
                     detail,
                     hint: None,
                 }
+            } else if is_unreachable_warning(entry.error.as_ref()) {
+                let default_hint = format!(
+                    "If {} should be online, check ssh connectivity and that `legion` is installed on it.",
+                    entry.machine
+                );
+                let (detail, hint) = match &entry.error {
+                    Some(err) => (
+                        format!(
+                            "{} did not answer (it may simply be off): {}",
+                            entry.machine, err.message
+                        ),
+                        err.hint.clone().or(Some(default_hint)),
+                    ),
+                    None => (
+                        format!("{} did not answer (it may simply be off).", entry.machine),
+                        Some(default_hint),
+                    ),
+                };
+                Check {
+                    name,
+                    ok: true,
+                    warning: true,
+                    detail,
+                    hint,
+                }
             } else {
                 let (detail, hint) = match &entry.error {
                     Some(err) => (err.message.clone(), err.hint.clone()),
                     None => (
-                        format!("{} did not answer.", entry.machine),
-                        Some(
-                            "Check ssh connectivity and that `legion` is installed on the machine."
-                                .to_owned(),
-                        ),
+                        format!("{} returned an unexpected error.", entry.machine),
+                        None,
                     ),
                 };
                 Check {
@@ -645,7 +691,7 @@ deny = [\"effect:power\", \"effect:admin\"]
     }
 
     #[test]
-    fn fleet_ping_checks_maps_reachable_and_unreachable_machines() {
+    fn fleet_ping_checks_maps_reachable_unreachable_and_protocol_failures() {
         let checks = fleet_ping_checks(&[
             FleetPingEntry {
                 machine: "pi".to_owned(),
@@ -666,15 +712,80 @@ deny = [\"effect:power\", \"effect:admin\"]
                         .with_hint("Check ssh tower."),
                 ),
             },
+            FleetPingEntry {
+                machine: "laptop".to_owned(),
+                reachable: false,
+                node: None,
+                version: None,
+                latency_ms: None,
+                error: Some(ErrorBody::new(
+                    ErrorCode::Timeout,
+                    "Timed out waiting for laptop after 5s.",
+                )),
+            },
+            FleetPingEntry {
+                machine: "oldbox".to_owned(),
+                reachable: false,
+                node: None,
+                version: None,
+                latency_ms: None,
+                error: Some(ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    "oldbox speaks protocol 99, and this node speaks protocol 1.",
+                )),
+            },
+            FleetPingEntry {
+                machine: "garbled".to_owned(),
+                reachable: false,
+                node: None,
+                version: None,
+                latency_ms: None,
+                error: Some(ErrorBody::new(
+                    ErrorCode::Failed,
+                    "Could not open a legion session on garbled: hello reply was invalid (missing field).",
+                )),
+            },
+            FleetPingEntry {
+                machine: "noisy".to_owned(),
+                reachable: false,
+                node: None,
+                version: None,
+                latency_ms: None,
+                error: Some(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        "Could not open a legion session on noisy: received 200 non-protocol lines (4096 bytes) before hello.",
+                    )
+                    .with_details(json!({"reason": "non_protocol_output"})),
+                ),
+            },
         ]);
-        assert_eq!(checks.len(), 2);
+        assert_eq!(checks.len(), 6);
         assert_eq!(checks[0].name, "fleet: pi");
         assert!(checks[0].ok && !checks[0].warning);
         assert!(checks[0].detail.contains("12 ms"));
 
+        // Unreachable and timed-out machines are warnings (`ok: true`, `warning: true`).
         assert_eq!(checks[1].name, "fleet: tower");
-        assert!(!checks[1].ok);
-        assert_eq!(checks[1].detail, "tower did not answer.");
+        assert!(checks[1].ok && checks[1].warning);
+        assert!(checks[1].detail.contains("tower") && checks[1].detail.contains("off"));
         assert_eq!(checks[1].hint.as_deref(), Some("Check ssh tower."));
+
+        assert_eq!(checks[2].name, "fleet: laptop");
+        assert!(checks[2].ok && checks[2].warning);
+        assert!(checks[2].detail.contains("laptop") && checks[2].detail.contains("off"));
+
+        // Protocol mismatch and unparseable replies stay failures (`ok: false`).
+        assert_eq!(checks[3].name, "fleet: oldbox");
+        assert!(!checks[3].ok && !checks[3].warning);
+        assert!(checks[3].detail.contains("protocol 99"));
+
+        assert_eq!(checks[4].name, "fleet: garbled");
+        assert!(!checks[4].ok && !checks[4].warning);
+        assert!(checks[4].detail.contains("hello reply was invalid"));
+
+        assert_eq!(checks[5].name, "fleet: noisy");
+        assert!(!checks[5].ok && !checks[5].warning);
+        assert!(checks[5].detail.contains("non-protocol lines"));
     }
 }

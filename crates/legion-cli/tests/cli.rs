@@ -31,6 +31,10 @@ fn a_call_prints_its_result_as_json_when_stdout_is_not_a_terminal() {
     let version = run.json();
     assert_eq!(version["name"], json!("legion"));
     assert_eq!(version["version"], json!(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        version.get("build").and_then(Value::as_str),
+        legion_core::BUILD
+    );
     assert_eq!(run.stdout.lines().count(), 1);
 }
 
@@ -77,8 +81,13 @@ fn tools_and_help_describe_the_registry() {
     let version = home.run(&["--version"]);
     assert_eq!(
         version.stdout.trim(),
-        format!("legion {}", env!("CARGO_PKG_VERSION"))
+        legion_core::format_version_line(legion_core::VERSION, legion_core::BUILD)
     );
+    if let Some(build) = legion_core::BUILD {
+        let rev = build.strip_suffix(", modified").unwrap_or(build);
+        assert_eq!(rev.len(), 12, "unexpected build string: {build}");
+        assert!(rev.bytes().all(|b| b.is_ascii_hexdigit()), "{build}");
+    }
 }
 
 #[test]

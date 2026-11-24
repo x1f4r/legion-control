@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
 use legion_core::{
-    BoxFuture, Call, CancellationToken, Ctx, EventSink, Node, Paths, RouteOutcome, Router, VERSION,
+    BoxFuture, Call, CancellationToken, Ctx, EventSink, MachineEffects, Node, Paths, RouteOutcome,
+    Router, VERSION,
 };
 use legion_proto::{CallParams, Effect, ErrorBody, ErrorCode, Target};
 use serde_json::{Value, json};
@@ -1455,8 +1456,88 @@ impl Router for Fleet {
         })
     }
 
+    fn effects<'a>(
+        &'a self,
+        node: &'a Node,
+        tool: &'a str,
+        on: Option<&'a Target>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<MachineEffects, ErrorBody>> {
+        Box::pin(async move {
+            let here = node.name();
+            let machines = match on {
+                None => vec![here.clone()],
+                Some(Target::One(machine)) => vec![machine.clone()],
+                Some(Target::Many(names)) => {
+                    let mut seen = HashSet::new();
+                    names
+                        .iter()
+                        .filter(|name| seen.insert(name.as_str()))
+                        .cloned()
+                        .collect()
+                }
+                Some(Target::All) => {
+                    let fleet_file = node
+                        .config()
+                        .get::<FleetFile>()
+                        .map_err(|err| ensure_machine(err, &here))?;
+                    let mut names = vec![here.clone()];
+                    names.extend(
+                        fleet_file
+                            .machines
+                            .keys()
+                            .filter(|name| **name != here)
+                            .cloned(),
+                    );
+                    names
+                }
+            };
+            // A built-in tool is authorised by this node's own spec wherever it runs; any other
+            // tool that runs elsewhere, by the effect the target reports for it.
+            let built_in = node.registry().get(tool).map(|tool| tool.spec().effect);
+            let mut effects = Vec::with_capacity(machines.len());
+            for machine in machines {
+                let effect = if machine == here {
+                    Some(node.spec(tool)?.effect)
+                } else if built_in.is_some() {
+                    built_in
+                } else {
+                    self.remote_effect(node, &here, &machine, tool, cancel.clone())
+                        .await?
+                };
+                effects.push((machine, effect));
+            }
+            Ok(effects)
+        })
+    }
+
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.close())
+    }
+}
+
+impl Fleet {
+    /// The effect a tool that is not built in has on another machine, as the target reports it:
+    /// `None` when the target does not report the tool, or is reached through a relay, whose
+    /// final target's tools this node cannot ask for.
+    async fn remote_effect(
+        &self,
+        node: &Node,
+        here: &str,
+        machine: &str,
+        tool: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<Effect>, ErrorBody> {
+        let fleet_file = node
+            .config()
+            .get::<FleetFile>()
+            .map_err(|err| ensure_machine(err, here))?;
+        let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, machine, here)?;
+        if relayed {
+            return Ok(None);
+        }
+        self.query_remote_effect(direct_machine, direct_entry, tool, cancel)
+            .await
     }
 }
 
@@ -1640,6 +1721,7 @@ mod tests {
                 serde_json::to_value(HelloResult {
                     node: "pi".to_owned(),
                     version: "0.1.0".to_owned(),
+                    build: None,
                     protocol: PROTOCOL,
                     os: "linux".to_owned(),
                     arch: "x86_64".to_owned(),

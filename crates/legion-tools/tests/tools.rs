@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used)]
 
 use legion_core::proto::{ErrorBody, ErrorCode};
-use legion_core::{Call, Door, Node, Paths, VERSION};
+use legion_core::{BUILD, Call, Door, Node, Paths, VERSION};
 use serde_json::{Value, json};
 
 struct Fixture {
@@ -71,6 +71,7 @@ async fn version_says_which_build_runs() {
     let version = fixture.call("meta.version", json!({})).await.unwrap();
     assert_eq!(version["name"], json!("legion"));
     assert_eq!(version["version"], json!(VERSION));
+    assert_eq!(version.get("build").and_then(Value::as_str), BUILD);
     assert_eq!(version["protocol"], json!(1));
     assert_eq!(version["os"], json!(std::env::consts::OS));
     assert_eq!(version["node"], json!(fixture.node.name()));

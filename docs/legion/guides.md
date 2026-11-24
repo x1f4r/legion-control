@@ -737,6 +737,10 @@ event: result
 data: {"name":"legion","version":"0.1.0","protocol":1,"node":"tower","os":"linux","arch":"x86_64"}
 ```
 
+When built from git (or with `LEGION_BUILD_REV`), `meta.version` and `hello` also include an
+optional `build` field (`"<12-character commit>"` or `"<12-character commit>, modified"`), matching
+the revision printed in parentheses by `legion --version`.
+
 ### MCP over HTTP
 
 Point streamable-HTTP MCP clients at `http://127.0.0.1:7117/mcp` (or your Tailscale Serve URL) with
@@ -917,22 +921,28 @@ runtime override or skip flag: unsigned or tampered releases are always refused.
 
 Both tools also enforce a persistent SemVer downgrade floor (per node for `meta.update`, per machine
 for `fleet.install`) alongside the running version, so a validly signed older release is refused
-unless you pass `allow_downgrade=true`. Before replacing any live binary, both check the executable
-format header (ELF/Mach-O/PE and architecture), run `--version` on the staged file, and save a
-one-generation `<exe>.prev` backup beside the destination.
+unless you pass `allow_downgrade=true`. Version checks compare semantic versions rather than build
+revisions, so reinstalling the same version from a newer commit succeeds; when the installed binary
+reports a `build` revision, both tools include `build` in their result. Before replacing any live
+binary, both check the executable format header (ELF/Mach-O/PE and architecture), run `--version` on
+the staged file, and save a one-generation `<exe>.prev` backup beside the destination.
 
 - **Update this machine**:
 
   ```sh
   legion meta.update dry_run=true
   legion meta.update
+  legion meta.update from=/path/to/legion
   ```
 
   `meta.update` resolves the highest published stable `legion-v*` semantic version (or a specific
-  `version=0.2.0`), selects native arm64 on macOS under Rosetta 2 and x86-64 under emulation on
-  Windows ARM64 (with a `note`), downloads over HTTPS/TLS 1.2 via `curl` (or PowerShell on Windows),
-  verifies `SHA256SUMS.sig` and SHA-256, checks the downgrade floor and binary header, stages and
-  runs `--version` preflight, saves `<exe>.prev`, and atomically replaces the running binary. On
+  `version=0.2.0`), or installs a local binary you vouch for with `from=<local file>` (no signature
+  needed; cannot be combined with `version`). For releases, it selects native arm64 on macOS under
+  Rosetta 2 and x86-64 under emulation on Windows ARM64 (with a `note`), downloads over HTTPS/TLS
+  1.2 via `curl` (or PowerShell on Windows), and verifies `SHA256SUMS.sig` and SHA-256. In both
+  modes it checks the binary header, stages and runs `--version` preflight, enforces the downgrade
+  floor and `allow_downgrade`, saves `<exe>.prev`, atomically replaces the running binary, and
+  verifies the replaced binary runs (restoring `<exe>.prev` automatically if it does not). On
   Windows, the running executable is renamed aside to `.old.*` (restored if the replacement move
   fails, otherwise cleaned up on the next startup).
 
@@ -941,7 +951,7 @@ one-generation `<exe>.prev` backup beside the destination.
   ```sh
   legion fleet.install machine=pi dry_run=true
   legion fleet.install machine=pi
-  legion fleet.install machine=pi from=target/release/legion
+  legion fleet.install machine=pi from=/path/to/legion
   ```
 
   `fleet.install` probes the remote OS, architecture, and destination path over `ssh`, downloads and
@@ -949,8 +959,9 @@ one-generation `<exe>.prev` backup beside the destination.
   uses an unsigned self-built binary you vouch for with `from=<local file>`, checks the downgrade
   floor and binary header locally, copies to a random temporary file over `scp`, runs `--version`
   preflight on the remote host before saving `<dest>.prev` and moving it into place, and opens a
-  fresh `legion rpc` session to confirm the installed version. If the new session fails or reports a
-  different version, `fleet.install` restores `<dest>.prev` automatically.
+  fresh `legion rpc` session to confirm the installed version (reporting its `build` when present).
+  If the new session fails or reports a different version, `fleet.install` restores `<dest>.prev`
+  automatically.
 
 ### Publishing a release (owner procedure)
 

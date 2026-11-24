@@ -20,6 +20,18 @@ use crate::tool::Tool;
 /// The version of legion this is; every crate in the workspace shares it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The source revision this binary was built from (for example `a59ec0d12345` or
+/// `a59ec0d12345, modified`), or `None` when built outside git without `LEGION_BUILD_REV`.
+pub const BUILD: Option<&str> = option_env!("LEGION_BUILD_ID");
+
+/// Formats the `legion --version` line for `version` and optional `build`.
+pub fn format_version_line(version: &str, build: Option<&str>) -> String {
+    match build.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(rev) => format!("legion {version} ({rev})"),
+        None => format!("legion {version}"),
+    }
+}
+
 /// How long a cancelled tool has to stop on its own before its future is dropped.
 ///
 /// Dropping a future stops only the part of the work that runs inside it: a blocking thread it
@@ -220,6 +232,7 @@ impl Node {
         Ok(HelloResult {
             node: self.name(),
             version: VERSION.to_owned(),
+            build: BUILD.map(str::to_owned),
             protocol: PROTOCOL,
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
@@ -435,12 +448,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::new(Paths::under(dir.path()), Registry::new());
         let bare = node.hello(&hello_params()).unwrap();
+        assert_eq!(bare.build.as_deref(), BUILD);
         assert_eq!(bare.system, None);
         assert!(bare.systems.is_empty());
         assert_eq!(bare.boot_id, node.boot_id());
         if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
             assert!(bare.boot_id.is_some_and(|id| !id.is_empty()));
         }
+
+        assert_eq!(format_version_line("0.1.0", None), "legion 0.1.0");
+        assert_eq!(
+            format_version_line("0.1.0", Some("a59ec0d12345")),
+            "legion 0.1.0 (a59ec0d12345)"
+        );
+        assert_eq!(
+            format_version_line("0.1.0", Some("a59ec0d12345, modified")),
+            "legion 0.1.0 (a59ec0d12345, modified)"
+        );
 
         std::fs::create_dir_all(dir.path().join("config")).unwrap();
         std::fs::write(

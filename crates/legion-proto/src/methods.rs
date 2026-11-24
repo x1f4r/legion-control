@@ -30,6 +30,9 @@ pub struct HelloResult {
     pub node: String,
     /// The version of legion the node runs.
     pub version: String,
+    /// The source revision of legion the node runs, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// The protocol the node speaks.
     pub protocol: u32,
     /// The operating system: `linux`, `macos` or `windows`.

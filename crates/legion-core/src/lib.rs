@@ -22,11 +22,11 @@ mod tool;
 pub use config::{ConfigStore, Document};
 pub use ctx::{Ctx, Door, Event, EventSink};
 pub use exe::{current_exe, record_current_exe, validate_recorded_exe};
-pub use node::{CANCEL_GRACE, Call, Node, VERSION};
+pub use node::{BUILD, CANCEL_GRACE, Call, Node, VERSION, format_version_line};
 pub use paths::Paths;
 pub use policy::{Access, CreateKind, Grant, Place, Policy, ProtectedFilter, SECRET_LOCATIONS};
 pub use registry::{DocumentInfo, Registry, SourceCheck, ToolSource, is_tool_name};
-pub use route::{Local, RouteOutcome, Router};
+pub use route::{Local, MachineEffects, RouteOutcome, Router};
 pub use tool::{BoxFuture, Handler, NoArgs, Tool, ToolError, input_schema, parse_args};
 
 /// The wire types, so a tool family needs only this crate.
