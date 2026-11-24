@@ -53,6 +53,10 @@ mod platform;
 #[path = "detach/windows.rs"]
 mod platform;
 
+/// Maximum length of the sanitized caller-supplied prefix inside a Linux systemd scope unit name.
+#[allow(dead_code)]
+const MAX_SCOPE_PREFIX_LEN: usize = 48;
+
 /// Maximum safe command-line length accepted by Windows `Win32_Process.Create`.
 #[allow(dead_code)]
 pub(crate) const WINDOWS_WMI_MAX_CMDLINE: usize = 32_000;
@@ -62,9 +66,9 @@ pub(crate) const WINDOWS_WMI_MAX_CMDLINE: usize = 32_000;
 pub struct DetachOptions {
     /// Command to start (exact argv or platform shell string).
     pub command: CommandSpec,
-    /// Optional caller-chosen identifier used to name the Linux transient systemd scope
-    /// (`--unit=legion-job-<name>`). Must contain only ASCII letters, digits, `-`, `_`, or `.`.
-    /// When omitted, a unique name is generated automatically.
+    /// Optional caller-chosen label used as a sanitized, length-limited prefix for the Linux
+    /// transient systemd scope (`--unit=legion-job-<prefix>-<unique>`). A unique suffix is always
+    /// appended so repeated launches with the same name never collide.
     pub name: Option<String>,
     /// Working directory for the detached process; inherits the caller's cwd when `None`.
     pub cwd: Option<PathBuf>,
@@ -208,18 +212,55 @@ pub(crate) fn validate_scope_name(name: Option<&str>) -> Result<()> {
     let Some(name) = name else {
         return Ok(());
     };
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
+    if name.trim().is_empty() {
         return Err(OsError::InvalidArgument {
-            detail: format!(
-                "detached job name {name:?} must be non-empty and contain only ASCII letters, digits, '-', '_', or '.'"
-            ),
+            detail: "detached job name must not be empty".into(),
         });
     }
     Ok(())
+}
+
+/// Sanitize a caller-supplied job name into a bounded ASCII systemd unit-name prefix.
+#[allow(dead_code)]
+pub(crate) fn sanitize_scope_prefix(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_SCOPE_PREFIX_LEN));
+    let mut prev_dash = false;
+    for ch in raw.chars() {
+        if out.len() >= MAX_SCOPE_PREFIX_LEN {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with(['-', '_']) {
+        out.pop();
+    }
+    out
+}
+
+/// Return `true` when any cgroup path in `/proc/<pid>/cgroup` ends with `/<full_unit>`
+/// (tolerating the ` (deleted)` suffix Linux appends after `--collect` removes an empty scope
+/// for an already-exited unreaped child).
+#[allow(dead_code)]
+pub(crate) fn cgroup_matches_unit(contents: &str, full_unit: &str) -> bool {
+    let suffix = format!("/{full_unit}");
+    for line in contents.lines() {
+        let mut parts = line.splitn(3, ':');
+        let Some(path_raw) = parts.nth(2) else {
+            continue;
+        };
+        let trimmed = path_raw.trim();
+        let clean = trimmed.strip_suffix(" (deleted)").unwrap_or(trimmed);
+        if clean.ends_with(&suffix) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Warning recorded on [`DetachHandle::warnings`] when Linux `systemd --user` is reachable but
@@ -258,20 +299,25 @@ pub(crate) fn parse_loginctl_linger(output: &str) -> Option<bool> {
 }
 
 /// Build the `(unit_flag_value, full_scope_unit)` pair for `systemd-run --user --scope --unit=...`.
+///
+/// Always appends a unique suffix so concurrent or repeated launches with the same caller label
+/// never collide on an active or failed unit name.
 #[allow(dead_code)]
 pub(crate) fn resolve_scope_unit_name(name: Option<&str>) -> Result<(String, String)> {
     validate_scope_name(name)?;
-    let stem = match name {
-        Some(raw) => format!("legion-job-{raw}"),
-        None => {
-            let pid = std::process::id();
-            let seq = SCOPE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            format!("legion-job-{pid}-{seq}-{nanos}")
-        }
+    let pid = std::process::id();
+    let seq = SCOPE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let unique = format!("{pid}-{seq}-{nanos:x}");
+
+    let prefix = name.map(sanitize_scope_prefix).unwrap_or_default();
+    let stem = if prefix.is_empty() {
+        format!("legion-job-{unique}")
+    } else {
+        format!("legion-job-{prefix}-{unique}")
     };
     let full = format!("{stem}.scope");
     Ok((stem, full))
@@ -739,22 +785,65 @@ mod tests {
     }
 
     #[test]
-    fn scope_unit_name_validates_caller_names() {
-        let (stem, full) = resolve_scope_unit_name(Some("job_42.run-1")).unwrap();
-        assert_eq!(stem, "legion-job-job_42.run-1");
-        assert_eq!(full, "legion-job-job_42.run-1.scope");
+    fn scope_unit_name_sanitizes_limits_and_uniquifies_caller_names() {
+        let (stem1, full1) = resolve_scope_unit_name(Some("job_42.run-1")).unwrap();
+        let (stem2, full2) = resolve_scope_unit_name(Some("job_42.run-1")).unwrap();
+        assert_ne!(stem1, stem2, "repeated names must produce distinct units");
+        assert_ne!(full1, full2);
+        assert!(stem1.starts_with("legion-job-job_42-run-1-"));
+        assert!(full1.ends_with(".scope"));
 
+        // Invalid path/space characters are sanitized into safe unit-name prefixes.
+        let (san_stem, _) = resolve_scope_unit_name(Some("  my/bad name:v2!!  ")).unwrap();
+        assert!(san_stem.starts_with("legion-job-my-bad-name-v2-"));
+        assert!(
+            san_stem
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        );
+
+        // Overlong caller names are truncated to a bounded prefix before appending the suffix.
+        let long = "a".repeat(200);
+        let (long_stem, long_full) = resolve_scope_unit_name(Some(&long)).unwrap();
+        assert!(long_full.len() < 128, "unit name too long: {long_full}");
+        assert!(
+            long_stem.starts_with(&format!("legion-job-{}-", "a".repeat(MAX_SCOPE_PREFIX_LEN)))
+        );
+
+        // Empty or whitespace-only caller names are rejected.
         assert!(matches!(
             resolve_scope_unit_name(Some("")),
             Err(OsError::InvalidArgument { .. })
         ));
         assert!(matches!(
-            resolve_scope_unit_name(Some("bad/name")),
+            resolve_scope_unit_name(Some("   ")),
             Err(OsError::InvalidArgument { .. })
         ));
-        assert!(matches!(
-            resolve_scope_unit_name(Some("has space")),
-            Err(OsError::InvalidArgument { .. })
+    }
+
+    #[test]
+    fn cgroup_matches_unit_handles_live_deleted_and_non_matching_entries() {
+        let unit = "legion-job-demo-123-0-abc.scope";
+        assert!(cgroup_matches_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/legion-job-demo-123-0-abc.scope\n",
+            unit
+        ));
+        assert!(cgroup_matches_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/legion-job-demo-123-0-abc.scope (deleted)\n",
+            unit
+        ));
+        assert!(cgroup_matches_unit(
+            "2:cpu:/\n1:name=systemd:/user.slice/legion-job-demo-123-0-abc.scope\n",
+            unit
+        ));
+        // Must require a leading `/` boundary so a different unit sharing the suffix does not match.
+        assert!(!cgroup_matches_unit(
+            "0::/user.slice/other-legion-job-demo-123-0-abc.scope\n",
+            unit
+        ));
+        assert!(!cgroup_matches_unit(
+            "0::/user.slice/user-1000.slice/session-2.scope\n",
+            unit
         ));
     }
 

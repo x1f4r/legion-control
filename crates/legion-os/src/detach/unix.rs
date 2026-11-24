@@ -35,6 +35,58 @@ const SCOPE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
 const SCOPE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(target_os = "linux")]
+const SCOPE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "linux")]
+const SCOPE_CONFIRM_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(target_os = "linux")]
+const SYSTEMD_STDERR_CAPTURE_LIMIT: usize = 4096;
+
+#[cfg(target_os = "linux")]
+enum ScopeStderrCapture<'a> {
+    /// Target has a configured stderr file; read any bytes `systemd-run` appended past `offset`.
+    LogFile { path: &'a Path, offset: u64 },
+    /// Target has null stderr; a tiny `/bin/sh` exec shim redirects fd 2 to `/dev/null` once
+    /// `systemd-run` enters the scope, leaving our pipe open exclusively to `systemd-run`'s own
+    /// error output before exec.
+    Pipe(Option<std::process::ChildStderr>),
+}
+
+#[cfg(target_os = "linux")]
+impl ScopeStderrCapture<'_> {
+    fn read_error_output(&mut self) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+
+        match self {
+            Self::LogFile { path, offset } => {
+                let Ok(mut file) = std::fs::File::open(path) else {
+                    return String::new();
+                };
+                if file.seek(SeekFrom::Start(*offset)).is_err() {
+                    return String::new();
+                }
+                let mut buf = Vec::new();
+                let _ = file
+                    .take(SYSTEMD_STDERR_CAPTURE_LIMIT as u64)
+                    .read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).trim().to_owned()
+            }
+            Self::Pipe(pipe_slot) => {
+                let Some(pipe) = pipe_slot.take() else {
+                    return String::new();
+                };
+                let mut buf = Vec::new();
+                let _ = pipe
+                    .take(SYSTEMD_STDERR_CAPTURE_LIMIT as u64)
+                    .read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).trim().to_owned()
+            }
+        }
+    }
+}
+
 pub(super) async fn spawn_detached(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
@@ -59,6 +111,18 @@ pub(super) async fn spawn_detached(
         ensure_target_exists(&resolved.program, options)?;
     }
 
+    #[cfg(target_os = "linux")]
+    let stderr_log_offset = if use_systemd_scope {
+        options
+            .stderr_path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
     let (stdout_stdio, stderr_stdio) = open_append_stdio(
         options.stdout_path.as_deref(),
         options.stderr_path.as_deref(),
@@ -70,13 +134,30 @@ pub(super) async fn spawn_detached(
         {
             let (unit_stem, full_unit) = super::resolve_scope_unit_name(options.name.as_deref())?;
             let unit_arg = format!("--unit={unit_stem}");
+            let pipe_systemd_stderr = options.stderr_path.is_none();
+            let scope_stderr = if pipe_systemd_stderr {
+                Stdio::piped()
+            } else {
+                stderr_stdio
+            };
             let wrap = CommandWrap::with_new("systemd-run", |cmd| {
                 cmd.args(SYSTEMD_USER_SCOPE_ARGS);
                 cmd.arg(&unit_arg);
                 cmd.arg("--");
+                if pipe_systemd_stderr {
+                    // When the caller requested null stderr, pipe `systemd-run`'s own stderr so
+                    // scope-creation errors are surfaced while `/bin/sh` immediately redirects
+                    // fd 2 to `/dev/null` before `exec`-ing the target in the same PID.
+                    let sh = if Path::new("/bin/sh").is_file() {
+                        "/bin/sh"
+                    } else {
+                        "sh"
+                    };
+                    cmd.args([sh, "-c", "exec 2>/dev/null; exec -- \"$@\"", "_"]);
+                }
                 cmd.arg(&resolved.program);
                 cmd.args(&resolved.args);
-                configure_common_cmd(cmd, resolved, options, stdout_stdio, stderr_stdio);
+                configure_common_cmd(cmd, resolved, options, stdout_stdio, scope_stderr);
             });
             (wrap, Some(full_unit))
         }
@@ -105,16 +186,36 @@ pub(super) async fn spawn_detached(
         .map_err(|err| OsError::from_spawn_io(program_display, err))?;
     let pid = child.id();
 
-    // Capture the kernel start timestamp BEFORE spawning the reaper thread so even a fast-exiting
-    // detached process still has an unreaped entry in the process table.
+    // Capture the kernel start timestamp BEFORE confirming scope membership or spawning the
+    // reaper thread so even a fast-exiting process still has an unreaped entry in the table.
     let process = procid::of_pid_including_zombie(pid)?.ok_or_else(|| OsError::Platform {
         detail: format!("could not read process identity for detached pid {pid}"),
     })?;
 
+    let mut inner = child.into_inner();
+
+    #[cfg(target_os = "linux")]
+    if let Some(ref unit) = systemd_unit {
+        let mut capture = match options.stderr_path.as_deref() {
+            Some(path) => ScopeStderrCapture::LogFile {
+                path,
+                offset: stderr_log_offset,
+            },
+            None => ScopeStderrCapture::Pipe(inner.stderr().take()),
+        };
+        confirm_scope_entry(
+            inner.as_mut(),
+            pid,
+            unit,
+            &mut capture,
+            SCOPE_CONFIRM_TIMEOUT,
+        )
+        .await?;
+    }
+
     // If this process stays alive (for example as a long-running server), reap the detached child
     // once it eventually exits so it does not linger as a zombie. If this process exits first,
     // init/systemd adopts and reaps the detached child while it continues running.
-    let mut inner = child.into_inner();
     let _ = std::thread::Builder::new()
         .name(format!("legion-reap-{pid}"))
         .spawn(move || {
@@ -126,6 +227,81 @@ pub(super) async fn spawn_detached(
         systemd_unit,
         warnings,
     })
+}
+
+/// Poll `/proc/<pid>/cgroup` until `pid` enters `/<full_unit>`, returning an error carrying
+/// whatever `systemd-run` printed to stderr if the process exits before entering the scope or if
+/// confirmation times out.
+#[cfg(target_os = "linux")]
+async fn confirm_scope_entry(
+    child: &mut dyn process_wrap::std::ChildWrapper,
+    pid: u32,
+    full_unit: &str,
+    stderr_capture: &mut ScopeStderrCapture<'_>,
+    timeout: Duration,
+) -> Result<()> {
+    let cgroup_path = format!("/proc/{pid}/cgroup");
+    let stat_path = format!("/proc/{pid}/stat");
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Ok(cgroup) = std::fs::read_to_string(&cgroup_path)
+            && super::cgroup_matches_unit(&cgroup, full_unit)
+        {
+            return Ok(());
+        }
+
+        // Inspect `/proc/<pid>/stat` BEFORE calling `try_wait()` (which reaps the zombie and
+        // removes `/proc/<pid>/cgroup`). Once the child is a zombie its cgroup is frozen, so one
+        // final cgroup check reliably distinguishes a fast-exiting scoped job from a failed
+        // `systemd-run` invocation.
+        let exited_zombie = match std::fs::read_to_string(&stat_path) {
+            Ok(stat) => super::super::procid::parse_linux_proc_stat(&stat)
+                .is_some_and(|(state, _)| matches!(state, 'Z' | 'X' | 'x')),
+            Err(_) => true,
+        };
+
+        if exited_zombie {
+            if let Ok(cgroup) = std::fs::read_to_string(&cgroup_path)
+                && super::cgroup_matches_unit(&cgroup, full_unit)
+            {
+                return Ok(());
+            }
+            let status_desc = match child.wait() {
+                Ok(status) => status.to_string(),
+                Err(err) => format!("wait failed: {err}"),
+            };
+            let stderr_text = stderr_capture.read_error_output();
+            let detail = if stderr_text.is_empty() {
+                format!(
+                    "systemd-run exited ({status_desc}) before process {pid} entered scope {full_unit}"
+                )
+            } else {
+                format!(
+                    "systemd-run exited ({status_desc}) before process {pid} entered scope {full_unit}: {stderr_text}"
+                )
+            };
+            return Err(OsError::Platform { detail });
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr_text = stderr_capture.read_error_output();
+            let detail = if stderr_text.is_empty() {
+                format!("timed out waiting for process {pid} to enter systemd scope {full_unit}")
+            } else {
+                format!(
+                    "timed out waiting for process {pid} to enter systemd scope {full_unit}: {stderr_text}"
+                )
+            };
+            return Err(OsError::TimedOut { detail });
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(SCOPE_CONFIRM_POLL.min(remaining)).await;
+    }
 }
 
 pub(super) async fn stop_detached(
@@ -444,4 +620,88 @@ fn ensure_target_exists(program: &OsStr, options: &DetachOptions) -> Result<()> 
         });
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn confirm_scope_entry_reports_stderr_on_early_exit() {
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "echo 'Failed to start transient scope unit: Unit exists.' >&2; exit 1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut capture = ScopeStderrCapture::Pipe(child.stderr.take());
+
+        let err = confirm_scope_entry(
+            &mut child,
+            pid,
+            "legion-job-never-entered-1.scope",
+            &mut capture,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            matches!(err, OsError::Platform { .. }),
+            "expected Platform error, got {err:?}"
+        );
+        assert!(
+            msg.contains("Unit exists"),
+            "error must include systemd-run stderr, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_scope_entry_reports_log_file_stderr_and_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("err.log");
+        std::fs::write(&log_path, b"pre-existing-line\n").unwrap();
+        let offset = std::fs::metadata(&log_path).unwrap().len();
+
+        let log_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "echo 'bus disconnected' >&2; sleep 5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut capture = ScopeStderrCapture::LogFile {
+            path: &log_path,
+            offset,
+        };
+
+        let err = confirm_scope_entry(
+            &mut child,
+            pid,
+            "legion-job-never-entered-2.scope",
+            &mut capture,
+            Duration::from_millis(120),
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(matches!(err, OsError::TimedOut { .. }), "got {err:?}");
+        assert!(msg.contains("bus disconnected"), "got: {msg}");
+        assert!(
+            !msg.contains("pre-existing-line"),
+            "must not include log bytes written before spawn: {msg}"
+        );
+    }
 }

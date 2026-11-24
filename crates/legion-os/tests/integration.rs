@@ -82,6 +82,10 @@ fn main() -> ExitCode {
             || Box::pin(test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree()),
         ),
         (
+            "detach_duplicate_names_get_distinct_scopes_and_isolate_stop",
+            || Box::pin(test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop()),
+        ),
+        (
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
             || Box::pin(test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time()),
         ),
@@ -940,7 +944,10 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
 
     #[cfg(unix)]
     if let Some(ref unit) = handle.systemd_unit {
-        assert_eq!(unit, &format!("legion-job-{job_name}.scope"));
+        assert!(
+            unit.starts_with(&format!("legion-job-{job_name}-")) && unit.ends_with(".scope"),
+            "unexpected systemd scope unit name: {unit}"
+        );
         assert!(
             !procid::is_alive(&setsid_id),
             "setsid grandchild {setsid_id} survived stop_detached on systemd scope {unit}"
@@ -948,6 +955,59 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
     } else if procid::is_alive(&setsid_id) {
         let _ = procid::kill_tree(&setsid_id, Duration::from_millis(200)).await;
     }
+}
+
+async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let id1_file = dir.path().join("dup1.pid");
+    let id2_file = dir.path().join("dup2.pid");
+    let id1_str = id1_file.to_string_lossy().into_owned();
+    let id2_str = id2_file.to_string_lossy().into_owned();
+
+    let (spec1, env1) = helper_spec("sleep", &["30000", &id1_str]);
+    let (spec2, env2) = helper_spec("sleep", &["30000", &id2_str]);
+
+    let h1 = spawn_detached(DetachOptions::new(spec1).name("dup").envs(env1))
+        .await
+        .unwrap();
+    let h2 = spawn_detached(DetachOptions::new(spec2).name("dup").envs(env2))
+        .await
+        .unwrap();
+
+    let _ = wait_for_file(&id1_file, Duration::from_secs(5)).await;
+    let _ = wait_for_file(&id2_file, Duration::from_secs(5)).await;
+    assert!(procid::is_alive(&h1.process));
+    assert!(procid::is_alive(&h2.process));
+
+    if let (Some(u1), Some(u2)) = (&h1.systemd_unit, &h2.systemd_unit) {
+        assert_ne!(u1, u2, "duplicate caller names collided on scope {u1}");
+        assert!(u1.starts_with("legion-job-dup-") && u1.ends_with(".scope"));
+        assert!(u2.starts_with("legion-job-dup-") && u2.ends_with(".scope"));
+    }
+
+    // Also confirm fast-exiting commands succeed cleanly under systemd scope confirmation.
+    let (fast_spec, fast_env) = helper_spec("echo", &["0"]);
+    let fast = spawn_detached(DetachOptions::new(fast_spec).name("dup").envs(fast_env))
+        .await
+        .unwrap();
+    assert_ne!(fast.process, h1.process);
+
+    // Stopping the second handle must not stop the first.
+    let r2 = stop_detached(&h2, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(r2.all_gone);
+    assert!(!procid::is_alive(&h2.process));
+    assert!(
+        procid::is_alive(&h1.process),
+        "stopping second handle unexpectedly stopped first handle"
+    );
+
+    let r1 = stop_detached(&h1, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(r1.all_gone);
+    assert!(!procid::is_alive(&h1.process));
 }
 
 async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time() {
