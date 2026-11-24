@@ -5,6 +5,7 @@
 //! `legion-os::atomic`, and long walks or reads run on Tokio's blocking pool while watching
 //! cancellation and emitting `progress` events.
 
+mod manage;
 mod platform;
 mod read;
 mod write;
@@ -29,6 +30,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 pub fn register(registry: &mut Registry) {
     read::register(registry);
     write::register(registry);
+    manage::register(registry);
 }
 
 /// The kind of a filesystem entry, reported without following symbolic links.
@@ -143,7 +145,6 @@ pub(crate) fn is_hidden(name: &str, meta: &Metadata) -> bool {
 }
 
 /// Parses an octal Unix permission string such as `"0600"`, `"644"` or `"0o755"`.
-#[allow(dead_code)]
 pub(crate) fn parse_unix_mode(text: &str) -> Result<u32, ErrorBody> {
     let trimmed = text.trim();
     let digits = trimmed
@@ -213,7 +214,6 @@ pub(crate) fn map_io_error(action: &str, path: &Path, error: io::Error) -> Error
 }
 
 /// Maps a [`legion_os::OsError`] on `path` into the nearest closed [`ErrorCode`].
-#[allow(dead_code)]
 pub(crate) fn map_os_error(action: &str, path: &Path, error: OsError) -> ErrorBody {
     match error {
         OsError::NotFound { detail } => ErrorBody::new(
@@ -247,7 +247,6 @@ pub(crate) fn map_os_error(action: &str, path: &Path, error: OsError) -> ErrorBo
 
 /// Resolves every existing prefix of `path` (following symlinks and folding `..`) and appends any
 /// trailing non-existent components, so paths can be compared even before a directory exists.
-#[allow(dead_code)]
 pub(crate) fn resolve_best_effort(path: &Path) -> PathBuf {
     let mut existing = path.to_path_buf();
     let mut missing: Vec<OsString> = Vec::new();
@@ -273,7 +272,6 @@ pub(crate) fn resolve_best_effort(path: &Path) -> PathBuf {
 }
 
 /// Whether `path` names a filesystem root (such as `/` on Unix or `C:\` on Windows).
-#[allow(dead_code)]
 pub(crate) fn is_filesystem_root(path: &Path) -> bool {
     path.parent().is_none()
         || path.components().all(|component| {
@@ -285,7 +283,6 @@ pub(crate) fn is_filesystem_root(path: &Path) -> bool {
 }
 
 /// Whether `a` and `b` refer to the same path, accounting for platform filename casing.
-#[allow(dead_code)]
 pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
     let mut ca = a.components();
     let mut cb = b.components();
@@ -303,7 +300,6 @@ pub(crate) fn paths_equal(a: &Path, b: &Path) -> bool {
 }
 
 /// Whether `candidate` is equal to `base` or lives anywhere beneath `base`.
-#[allow(dead_code)]
 pub(crate) fn is_same_or_descendant(candidate: &Path, base: &Path) -> bool {
     let mut cc = candidate.components();
     for bc in base.components() {
@@ -318,7 +314,6 @@ pub(crate) fn is_same_or_descendant(candidate: &Path, base: &Path) -> bool {
 }
 
 /// Whether `ancestor` is a strict ancestor of `descendant` (not equal to it).
-#[allow(dead_code)]
 pub(crate) fn is_strict_ancestor(ancestor: &Path, descendant: &Path) -> bool {
     is_same_or_descendant(descendant, ancestor) && !paths_equal(ancestor, descendant)
 }

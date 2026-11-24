@@ -148,31 +148,26 @@ pub(crate) fn unix_mode(meta: &Metadata) -> Option<String> {
 }
 
 /// Returns Unix permission bits (`0..=0o7777`), or `None` on Windows.
-#[allow(dead_code)]
 pub(crate) fn unix_mode_bits(meta: &Metadata) -> Option<u32> {
     imp::unix_mode_bits(meta)
 }
 
 /// Applies Unix permission bits to `path`, doing nothing on Windows.
-#[allow(dead_code)]
 pub(crate) fn set_unix_mode(path: &Path, mode: u32) -> io::Result<()> {
     imp::set_unix_mode(path, mode)
 }
 
 /// On Windows, whether a symbolic link's metadata marks it as a directory symlink.
-#[allow(dead_code)]
 pub(crate) fn symlink_is_dir(meta: &Metadata) -> bool {
     imp::symlink_is_dir(meta)
 }
 
 /// Creates a symbolic link at `link` pointing to `target`.
-#[allow(dead_code)]
 pub(crate) fn create_symlink(target: &Path, link: &Path, is_dir: bool) -> io::Result<()> {
     imp::create_symlink(target, link, is_dir)
 }
 
 /// Removes a symbolic link without touching its target.
-#[allow(dead_code)]
 pub(crate) fn remove_symlink(path: &Path, meta: &Metadata) -> io::Result<()> {
     imp::remove_symlink(path, meta)
 }
@@ -183,7 +178,6 @@ pub(crate) fn is_hidden_attr(meta: &Metadata) -> bool {
 }
 
 /// Compares two path components using the platform's filename case rules.
-#[allow(dead_code)]
 pub(crate) fn path_component_eq(a: &OsStr, b: &OsStr) -> bool {
     imp::path_component_eq(a, b)
 }
