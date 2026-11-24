@@ -1551,67 +1551,130 @@ fn classify_line(raw: &[u8]) -> LineKind {
     let Some(parsed_opts) = parse_openssh_options(options_str) else {
         return LineKind::Foreign;
     };
-    let has_restrict = parsed_opts
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("restrict") && v.is_none());
-    if !has_restrict {
-        return LineKind::Foreign;
-    }
 
-    let mut command_values = parsed_opts
-        .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case("command"));
-    let Some((_, Some(command))) = command_values.next() else {
-        return LineKind::Foreign;
+    match parsed_opts.as_slice() {
+        [(opt0, None), (opt1, Some(command))] if opt0 == "restrict" && opt1 == "command" => {
+            let Some(name) = comment.strip_prefix(DEVICE_COMMENT_PREFIX) else {
+                return LineKind::Foreign;
+            };
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                return LineKind::Foreign;
+            }
+            let Some(parsed_cmd) = parse_exact_gate_command(command) else {
+                return LineKind::Foreign;
+            };
+            let GateCommandMode::Device {
+                principal,
+                device,
+                pairing_id,
+            } = parsed_cmd.mode
+            else {
+                return LineKind::Foreign;
+            };
+            if device != name {
+                return LineKind::Foreign;
+            }
+            let mut owned_args = vec![
+                "gate".to_owned(),
+                "--as".to_owned(),
+                principal.clone(),
+                "--device".to_owned(),
+                device,
+                "--pairing".to_owned(),
+                pairing_id.clone(),
+            ];
+            if let Some(acct) = &parsed_cmd.account {
+                owned_args.push("--account".to_owned());
+                owned_args.push(acct.clone());
+            }
+            if parsed_cmd.home.push_cli_args(&mut owned_args).is_err() {
+                return LineKind::Foreign;
+            }
+            let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+            if !matches_exact_forced_command(&parsed_cmd.exe, &arg_refs, command, |expected_cmd| {
+                options_str == format!("restrict,command=\"{expected_cmd}\"")
+            }) {
+                return LineKind::Foreign;
+            }
+            LineKind::Device {
+                name: name.to_owned(),
+                pairing_id,
+                key_b64: key_b64.to_owned(),
+                principal,
+                home: Some(parsed_cmd.home),
+                account: parsed_cmd.account,
+            }
+        }
+        [(opt0, None), (opt1, Some(expiry)), (opt2, Some(command))]
+            if opt0 == "restrict" && opt1 == "expiry-time" && opt2 == "command" =>
+        {
+            if expiry.len() != 12 || !expiry.bytes().all(|b| b.is_ascii_digit()) {
+                return LineKind::Foreign;
+            }
+            let Some(id) = comment.strip_prefix(INVITE_COMMENT_PREFIX) else {
+                return LineKind::Foreign;
+            };
+            if id.is_empty() || id.chars().any(char::is_whitespace) {
+                return LineKind::Foreign;
+            }
+            let Some(parsed_cmd) = parse_exact_gate_command(command) else {
+                return LineKind::Foreign;
+            };
+            let GateCommandMode::Invite { id: cmd_id } = parsed_cmd.mode else {
+                return LineKind::Foreign;
+            };
+            if cmd_id != id {
+                return LineKind::Foreign;
+            }
+            let mut owned_args = vec!["gate".to_owned(), "--enrol".to_owned(), id.to_owned()];
+            if let Some(acct) = &parsed_cmd.account {
+                owned_args.push("--account".to_owned());
+                owned_args.push(acct.clone());
+            }
+            if parsed_cmd.home.push_cli_args(&mut owned_args).is_err() {
+                return LineKind::Foreign;
+            }
+            let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+            if !matches_exact_forced_command(&parsed_cmd.exe, &arg_refs, command, |expected_cmd| {
+                options_str
+                    == format!("restrict,expiry-time=\"{expiry}\",command=\"{expected_cmd}\"")
+            }) {
+                return LineKind::Foreign;
+            }
+            LineKind::Invite {
+                id: id.to_owned(),
+                key_b64: key_b64.to_owned(),
+                expiry_time: Some(expiry.clone()),
+                home: Some(parsed_cmd.home),
+                account: parsed_cmd.account,
+            }
+        }
+        _ => LineKind::Foreign,
+    }
+}
+
+fn matches_exact_forced_command(
+    exe: &str,
+    args: &[&str],
+    raw_command: &str,
+    check_options: impl Fn(&str) -> bool,
+) -> bool {
+    let exe_path = Path::new(exe);
+    let shells: &[ForcedCommandShell] = if looks_windows_absolute(exe_path) {
+        if raw_command.starts_with("& '") {
+            &[ForcedCommandShell::WindowsPowerShell]
+        } else {
+            &[ForcedCommandShell::WindowsCmd, ForcedCommandShell::Posix]
+        }
+    } else if looks_posix_absolute(exe_path) {
+        &[ForcedCommandShell::Posix]
+    } else {
+        return false;
     };
-    if command_values.next().is_some() {
-        return LineKind::Foreign;
-    }
-
-    let Some(parsed_cmd) = parse_exact_gate_command(command) else {
-        return LineKind::Foreign;
-    };
-
-    if let Some(id) = comment.strip_prefix(INVITE_COMMENT_PREFIX)
-        && !id.is_empty()
-        && !id.chars().any(char::is_whitespace)
-        && let GateCommandMode::Invite { id: ref cmd_id } = parsed_cmd.mode
-        && cmd_id == id
-    {
-        let expiry_time = parsed_opts
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("expiry-time"))
-            .and_then(|(_, v)| v.clone());
-        return LineKind::Invite {
-            id: id.to_owned(),
-            key_b64: key_b64.to_owned(),
-            expiry_time,
-            home: parsed_cmd.home,
-            account: parsed_cmd.account,
-        };
-    }
-
-    if let Some(name) = comment.strip_prefix(DEVICE_COMMENT_PREFIX)
-        && !name.is_empty()
-        && !name.chars().any(char::is_whitespace)
-        && let GateCommandMode::Device {
-            principal,
-            device,
-            pairing_id,
-        } = parsed_cmd.mode
-        && device == name
-    {
-        return LineKind::Device {
-            name: name.to_owned(),
-            pairing_id,
-            key_b64: key_b64.to_owned(),
-            principal,
-            home: parsed_cmd.home,
-            account: parsed_cmd.account,
-        };
-    }
-
-    LineKind::Foreign
+    shells.iter().any(|&shell| {
+        format_forced_command(exe_path, args, shell)
+            .is_ok_and(|expected_cmd| check_options(&expected_cmd))
+    })
 }
 
 fn trim_leading_ws_bytes(mut bytes: &[u8]) -> &[u8] {
@@ -1769,8 +1832,9 @@ enum GateCommandMode {
 }
 
 struct ParsedGateCommand {
+    exe: String,
     mode: GateCommandMode,
-    home: Option<PinnedHome>,
+    home: PinnedHome,
     account: Option<String>,
 }
 
@@ -1900,12 +1964,11 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
     }
 
     let home = match (home_root, config_dir, state_dir) {
-        (Some(root), None, None) => Some(PinnedHome::Root(root)),
-        (None, Some(config_dir), Some(state_dir)) => Some(PinnedHome::Split {
+        (Some(root), None, None) => PinnedHome::Root(root),
+        (None, Some(config_dir), Some(state_dir)) => PinnedHome::Split {
             config_dir,
             state_dir,
-        }),
-        (None, None, None) => None,
+        },
         _ => return None,
     };
 
@@ -1919,6 +1982,7 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
         _ => return None,
     };
     Some(ParsedGateCommand {
+        exe: exe.clone(),
         mode,
         home,
         account,
@@ -2912,6 +2976,113 @@ Match Group users
             LineKind::Device { name, pairing_id, .. }
                 if name == "pixel" && pairing_id == "0123456789abcdef0123456789abcdef"
         ));
+    }
+
+    #[test]
+    fn exact_classifier_rejects_extra_options_reordered_options_and_shell_substitutions() {
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000";
+        let pid = "0123456789abcdef0123456789abcdef";
+        let valid_dev_cmd = format!(
+            "/home/me/legion gate --as phone --device pixel --pairing {pid} --home /home/me/legion"
+        );
+        let valid_inv_cmd = "/home/me/legion gate --enrol abc123 --home /home/me/legion";
+
+        let attacks = [
+            // Re-enabling options after `restrict`.
+            format!(
+                "restrict,port-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            format!("restrict,pty,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"),
+            format!(
+                "restrict,permitopen=\"127.0.0.1:80\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,agent-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,X11-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            // `cert-authority`, `environment=`, or `from=` alongside `restrict`.
+            format!(
+                "cert-authority,restrict,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,environment=\"FOO=1\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,from=\"10.0.0.1\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,expiry-time=\"202611241215\",port-forwarding,command=\"{valid_inv_cmd}\" {key} legion-invite:abc123\n"
+            ),
+            // Reordered or differently cased or unquoted options.
+            format!("command=\"{valid_dev_cmd}\",restrict {key} legion-device:pixel\n"),
+            format!("RESTRICT,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"),
+            format!(
+                "restrict,command=\"{valid_inv_cmd}\",expiry-time=\"202611241215\" {key} legion-invite:abc123\n"
+            ),
+            format!(
+                "restrict,expiry-time=202611241215,command=\"{valid_inv_cmd}\" {key} legion-invite:abc123\n"
+            ),
+            // Wrong option set for the kind (device with expiry-time; invite without or malformed expiry-time).
+            format!(
+                "restrict,expiry-time=\"202611241215\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+            ),
+            format!("restrict,command=\"{valid_inv_cmd}\" {key} legion-invite:abc123\n"),
+            format!(
+                "restrict,expiry-time=\"202611241215Z\",command=\"{valid_inv_cmd}\" {key} legion-invite:abc123\n"
+            ),
+            format!(
+                "restrict,expiry-time=\"20261124\",command=\"{valid_inv_cmd}\" {key} legion-invite:abc123\n"
+            ),
+            // Double-quoted POSIX command / shell substitutions / stray backslashes.
+            format!(
+                "restrict,command=\"\\\"/home/me/legion\\\" gate --as phone --device pixel --pairing {pid} --home /home/me/legion\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid} --home \\\"$HOME/legion\\\"\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid} --home \\\"/tmp/$(id)\\\"\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid} --home /home/me/a\\\\b\" {key} legion-device:pixel\n"
+            ),
+            // Windows cmd.exe env var expansion inside double quotes.
+            format!(
+                "restrict,command=\"\\\"C:\\Users\\%USERNAME%\\legion.exe\\\" gate --as phone --device pixel --pairing {pid} --home C:\\Users\\me\\legion\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"C:\\Users\\me\\legion.exe gate --as phone --device pixel --pairing {pid} --home \\\"C:\\Users\\%USERNAME%\\legion\\\"\" {key} legion-device:pixel\n"
+            ),
+            // Non-canonical command shapes: `--flag=value`, extra spaces, reordered flags, missing home.
+            format!(
+                "restrict,command=\"/home/me/legion gate --as=phone --device pixel --pairing {pid} --home /home/me/legion\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion  gate --as phone --device pixel --pairing {pid} --home /home/me/legion\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --home /home/me/legion --as phone --device pixel --pairing {pid}\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid}\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,expiry-time=\"202611241215\",command=\"/home/me/legion gate --enrol abc123\" {key} legion-invite:abc123\n"
+            ),
+        ];
+
+        for raw in attacks {
+            let parsed = AuthKeysFile::parse(raw.as_bytes());
+            assert_eq!(parsed.lines.len(), 1);
+            assert_eq!(
+                parsed.lines[0].kind,
+                LineKind::Foreign,
+                "crafted line must stay Foreign: {raw}"
+            );
+        }
     }
 
     #[test]
