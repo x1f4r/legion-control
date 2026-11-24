@@ -41,6 +41,7 @@ use super::{
     build_wmi_launcher_script, generate_detach_marker, merge_recheck_survivors, merge_windows_env,
     parse_wmi_cim_output, parse_wmi_handoff, reconcile_wmi_identity, resolve_windows_job_name,
     resolve_windows_powershell_exe, resolve_wmi_program, validate_wmi_batch_target,
+    wmi_unavailable_error,
 };
 
 const WMI_CREATE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -476,6 +477,9 @@ async fn spawn_via_wmi(
             }
         }
         WmiCreateOutcome::Unavailable(wmi_reason) => {
+            if !options.allow_in_job_fallback {
+                return Err(wmi_unavailable_error(&wmi_reason));
+            }
             let (process, windows_job) = win_proc::spawn_detached_in_current_job(
                 direct_fallback.program_display,
                 direct_fallback.application_name,
@@ -489,7 +493,7 @@ async fn spawn_via_wmi(
             )
             .map_err(|direct_err| OsError::Platform {
                 detail: format!(
-                    "WMI detached launch unavailable ({wmi_reason}) and direct fallback failed ({direct_err}); ensure the Windows Management Instrumentation (Winmgmt) service is running and check permissions"
+                    "WMI detached launch unavailable ({wmi_reason}) and opt-in in-job fallback failed ({direct_err}); ensure the Windows Management Instrumentation (Winmgmt) service is running and check permissions"
                 ),
             })?;
             resolved.disarm_temp_script();

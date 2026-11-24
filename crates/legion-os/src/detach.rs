@@ -94,6 +94,12 @@ pub struct DetachOptions {
     pub stdout_path: Option<PathBuf>,
     /// File path to append standard error to; redirected to null when `None`.
     pub stderr_path: Option<PathBuf>,
+    /// Windows only: allow falling back to launching inside the caller's Job Object when job
+    /// breakaway is refused and WMI `Win32_Process.Create` is provably unavailable.
+    ///
+    /// Defaults to `false` because launching inside an SSH session's job object causes the process
+    /// to die when the session closes. Production callers must leave this `false`.
+    pub allow_in_job_fallback: bool,
 }
 
 impl DetachOptions {
@@ -107,6 +113,7 @@ impl DetachOptions {
             env_remove: Vec::new(),
             stdout_path: None,
             stderr_path: None,
+            allow_in_job_fallback: false,
         }
     }
 
@@ -174,6 +181,16 @@ impl DetachOptions {
         let p = path.into();
         self.stdout_path = Some(p.clone());
         self.stderr_path = Some(p);
+        self
+    }
+
+    /// Opt in to launching inside the caller's Windows Job Object when breakaway is refused and
+    /// WMI `Win32_Process.Create` is provably unavailable.
+    ///
+    /// Processes started this way may be terminated when the parent session closes, so callers
+    /// that promise survival across SSH disconnect should leave this `false` (the default).
+    pub fn allow_in_job_fallback(mut self, allow: bool) -> Self {
+        self.allow_in_job_fallback = allow;
         self
     }
 }
@@ -445,10 +462,22 @@ pub(crate) fn cgroup_matches_unit(contents: &str, full_unit: &str) -> bool {
 pub(crate) const LINGER_DISABLED_WARNING: &str = "systemd user lingering is disabled for this account, so the process was detached with setsid instead of a systemd user scope and may be stopped on logout; run `loginctl enable-linger` to keep user scopes alive across sessions";
 
 /// Warning recorded on [`DetachHandle::warnings`] when Windows `CREATE_BREAKAWAY_FROM_JOB` was
-/// refused and WMI `Win32_Process.Create` was unavailable, so the process started inside the
-/// caller's Job Object without breaking away.
+/// refused, WMI `Win32_Process.Create` was unavailable, and the caller explicitly opted into
+/// [`DetachOptions::allow_in_job_fallback`], so the process started inside the caller's Job Object
+/// without breaking away.
 #[allow(dead_code)]
 pub(crate) const WMI_FALLBACK_WARNING: &str = "Windows Job Object breakaway was refused and WMI Win32_Process.Create was unavailable, so the process started inside the caller's Job Object and may stop if the parent session ends; ensure the Windows Management Instrumentation (Winmgmt) service is running";
+
+/// Build the error returned when Windows Job Object breakaway is refused, WMI is provably
+/// unavailable, and [`DetachOptions::allow_in_job_fallback`] is `false` (the default).
+#[allow(dead_code)]
+pub(crate) fn wmi_unavailable_error(reason: &str) -> OsError {
+    OsError::Platform {
+        detail: format!(
+            "cannot detach process outside the current session because the Windows Management Instrumentation service (Winmgmt) is not answering ({reason}); refusing to start inside the session job where it would stop on disconnect. Check the service with `Get-Service Winmgmt` (or `sc query winmgmt`) and start it from an elevated prompt with `Start-Service Winmgmt` (or `sc start winmgmt`), then retry"
+        ),
+    }
+}
 
 /// Resolve the full path to Windows PowerShell 5.1 under `SystemRoot` when available, falling back
 /// to `"powershell.exe"` on `PATH`.
@@ -1798,6 +1827,13 @@ mod tests {
         assert!(LINGER_DISABLED_WARNING.contains("loginctl enable-linger"));
         assert!(LINGER_DISABLED_WARNING.contains("setsid"));
         assert!(WMI_FALLBACK_WARNING.contains("Winmgmt"));
+        let opts = DetachOptions::new(CommandSpec::argv("cmd", Vec::<&str>::new()));
+        assert!(!opts.allow_in_job_fallback);
+        assert!(opts.allow_in_job_fallback(true).allow_in_job_fallback);
+        let unavail = wmi_unavailable_error("access denied").to_string();
+        assert!(unavail.contains("Winmgmt"), "{unavail}");
+        assert!(unavail.contains("Get-Service Winmgmt"), "{unavail}");
+        assert!(unavail.contains("Start-Service Winmgmt"), "{unavail}");
         assert_eq!(
             resolve_windows_powershell_exe(Some(r"C:\Windows\")),
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
