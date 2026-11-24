@@ -19,6 +19,8 @@ legion-xfer = { path = "crates/legion-xfer" }
 dunce = "1.0.5"
 gethostname = "1.1.0"
 jiff = { version = "1.0.2", default-features = false, features = ["std"] }
+libc = "0.2.191"
+process-wrap = { version = "10.0.1", default-features = false }
 same-file = "1.0.6"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,12 +29,15 @@ serde_ignored = "0.1.14"
 # person reads them in.
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 serde_path_to_error = "0.1.20"
+tar = "0.4.46"
 tempfile = "3.27.0"
+thiserror = "2.0.21"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
 # Edits fleet.toml and projects.toml in place, keeping the comments and layout a person gave them.
 toml_edit = { version = "0.25.20", default-features = false, features = ["parse", "display"] }
+windows = { version = "0.62.2", default-features = false }
 legion-os = { path = "crates/legion-os" }
 nix = { version = "0.31.1", default-features = false, features = ["signal"] }
 # Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.
@@ -70,3 +75,11 @@ dbg_macro = "warn"
 # Failing is the rare path and the type crosses crate and process boundaries as a plain value, so
 # boxing it everywhere would cost readability for no measurable gain.
 result_large_err = "allow"
+
+[profile.release]
+# Produce a small, stripped static binary for fleet distribution. `panic` is intentionally left at
+# the default `unwind` rather than `abort` because a long-lived server (`legion serve`, `legion
+# rpc`, `legion mcp`) must survive a panicking call without taking down every active session.
+lto = true
+codegen-units = 1
+strip = true
