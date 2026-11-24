@@ -633,3 +633,127 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
 
     link.close().await;
 }
+
+#[tokio::test]
+async fn real_node_endpoint_superset_host_keys_does_not_flag_identity_changed() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!("skipping real-node host-key subset test: sshd/ssh-keygen unavailable");
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        panic!(
+            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
+        );
+    };
+    let ssh_keygen_bin = find_tool("ssh-keygen").unwrap();
+
+    let root = strict_tempdir();
+    let user_a = root.path().join("home-a");
+    let home_a = root.path().join("legion-a");
+    let auth_a = user_a.join(".ssh").join("authorized_keys");
+    for dir in [home_a.join("config"), user_a.join(".ssh")] {
+        fs::create_dir_all(&dir).unwrap();
+    }
+    #[cfg(unix)]
+    for dir in [&user_a, &user_a.join(".ssh")] {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd_a) = ManagedSshd::new(&root.path().join("sshd-a"), &auth_a, &user_a) else {
+        return;
+    };
+
+    // Generate a second valid host key so `node.toml` can advertise a superset `[key1, key2]`
+    // after pairing pinned only `[key1]`.
+    let extra_key = root.path().join("sshd-a").join("host_ed25519_extra");
+    let extra_key_pub = root.path().join("sshd-a").join("host_ed25519_extra.pub");
+    let keygen = Command::new(&ssh_keygen_bin)
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "extra-host-key"])
+        .arg("-f")
+        .arg(&extra_key)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(keygen.status.success());
+
+    // Start with only the primary host key pinned in the invite.
+    fs::write(
+        home_a.join("config/node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            sshd_a.port,
+            sshd_a.user,
+            toml_literal(&auth_a),
+            toml_literal(&sshd_a.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(home_a.join("config/policy.toml"), "default = \"owner\"\n").unwrap();
+    fs::write(
+        home_a.join("config/fleet.toml"),
+        "[machines.tower]\nssh = \"127.0.0.1\"\n",
+    )
+    .unwrap();
+
+    let invite_out = run_legion(
+        &legion_bin,
+        &home_a,
+        &user_a,
+        &[
+            "device.invite",
+            "name=pixel",
+            "role=owner",
+            "allow_owner=true",
+        ],
+    );
+    let invite_text = invite_out["invite"].as_str().unwrap();
+
+    let link = Link::with_options(
+        LinkConfig::default(),
+        LinkOptions {
+            allow_loopback_endpoints: true,
+            ..LinkOptions::default()
+        },
+    );
+    link.pair(invite_text, "pixel").await.unwrap();
+    assert_eq!(
+        link.config()
+            .node("tower")
+            .unwrap()
+            .target
+            .as_ref()
+            .unwrap()
+            .host_keys
+            .len(),
+        1
+    );
+
+    // Now configure the real node so `device.endpoint` advertises BOTH host keys (a superset of
+    // the pinned key), and verify `learn()` does NOT falsely flag `identity_changed`.
+    fs::write(
+        home_a.join("config/node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}, {}]\n",
+            sshd_a.port,
+            sshd_a.user,
+            toml_literal(&auth_a),
+            toml_literal(&sshd_a.host_key_pub),
+            toml_literal(&extra_key_pub),
+        ),
+    )
+    .unwrap();
+
+    let report = link.learn().await.unwrap();
+    assert!(
+        report.identity_changed.is_empty(),
+        "superset of pinned host keys from real node must not flag identity_changed: {report:?}"
+    );
+    assert!(
+        link.config()
+            .node("tower")
+            .unwrap()
+            .identity_changed
+            .is_none()
+    );
+    link.close().await;
+}

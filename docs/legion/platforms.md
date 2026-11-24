@@ -195,9 +195,10 @@ asks for that from every machine through whichever node answers, and keeps it. I
 each machine directly where it can and through another node where it cannot, and shows which.
 A machine added to the fleet later appears in the app by itself once the fleet has synced.
 
-What a device is told about a machine comes from a node it already trusts; the host keys it pins
-for a new machine are the ones that node reports. A node with the owner role over the fleet could
-lie about them, and could equally do anything else.
+Only directly paired machines may act as introducers; learned machines never introduce other
+machines. When only one paired node is reachable, you trust it to supply the host keys pinned for
+brand-new machines it reports, though it can never alter a paired machine's pins or silently replace
+an existing machine's keys or route.
 
 ## The browser door
 

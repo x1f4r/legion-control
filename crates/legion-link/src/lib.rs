@@ -38,6 +38,13 @@
 //! - **`events` callback**: `{"kind": "stdout"|"stderr"|"progress"|"log", "data": ..., "machine"?: "..."}`.
 //! - **Errors**: [`legion_proto::ErrorBody`] (`{"code", "message", "hint"?, "machine"?, "details"?}`).
 //!
+//! # Introducer trust
+//!
+//! Only directly paired machines may act as introducers or preferred relays; learned machines never
+//! introduce other machines. When only one paired node is reachable, you trust it to supply the
+//! host keys pinned for brand-new machines it reports, though it can never alter a paired machine's
+//! pins or silently replace an already known machine's keys or route.
+//!
 //! # Stable error reasons
 //!
 //! Because [`legion_proto::ErrorCode`] is a closed 13-code wire set, callers and GUIs can branch
@@ -139,11 +146,13 @@ pub use invite::{
     SshTimeouts,
 };
 #[cfg(feature = "ssh")]
-pub use key::{DeviceKey, public_key_fingerprint};
+pub use key::DeviceKey;
 pub use link::{
-    DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, LearnReport, Link, LinkConfig, LinkOptions,
-    MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
-    SessionOpener, parse_optional_target,
+    ConflictingIdentityReport, DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, LearnReport, Link,
+    LinkConfig, LinkOptions, MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN,
+    MAX_ENDPOINT_HOST_KEY_LEN, MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS, MachineRouteStatus,
+    NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue, SessionOpener,
+    parse_optional_target, public_key_fingerprint,
 };
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
