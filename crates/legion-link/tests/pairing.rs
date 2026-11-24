@@ -446,7 +446,7 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
         .unwrap();
     assert_eq!(whoami["principal"], json!("phone"));
     assert_eq!(whoami["role"], json!("operator"));
-    assert_eq!(whoami["door"], json!("rpc"));
+    assert_eq!(whoami["door"], json!("ssh"));
 
     let mut streamed_events: Vec<Value> = Vec::new();
     let exec_res = link
@@ -485,6 +485,21 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
         .await
         .unwrap_err();
     assert_eq!(denied.code, ErrorCode::Denied, "{denied}");
+
+    // Audit records from the paired session carry door="ssh" and device="link-phone".
+    let audit_lines: Vec<Value> = fs::read_to_string(legion_home.join("state").join("audit.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for tool_name in ["meta.whoami", "exec.run", "fs.write"] {
+        let entry = audit_lines
+            .iter()
+            .rfind(|e| e["tool"] == json!(tool_name))
+            .unwrap_or_else(|| panic!("missing audit line for {tool_name}: {audit_lines:?}"));
+        assert_eq!(entry["door"], json!("ssh"), "{entry}");
+        assert_eq!(entry["device"], json!("link-phone"), "{entry}");
+    }
 
     // 4. Remove the device on the node; the live paired session must be terminated immediately and
     //    subsequent `Link` calls must fail cleanly without hanging.

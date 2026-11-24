@@ -208,7 +208,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Rpc { pinned } => {
             let shutdown = install_shutdown_token();
-            serve_rpc(node, router, pinned, shutdown).await
+            serve_rpc(node, router, pinned, Door::Rpc, None, shutdown).await
         }
         Command::Mcp { pinned, compact } => {
             let shutdown = install_shutdown_token();
@@ -216,7 +216,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Stream { pinned } => {
             let shutdown = install_shutdown_token();
-            let code = serve_stream(&node, pinned, shutdown).await;
+            let code = serve_stream(&node, pinned, Door::Stream, None, shutdown).await;
             router.shutdown().await;
             code
         }
@@ -255,6 +255,8 @@ async fn serve_rpc(
     node: Node,
     router: Arc<dyn Router>,
     pinned: Option<String>,
+    door: Door,
+    device: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     match rpc::serve_until(
@@ -263,6 +265,8 @@ async fn serve_rpc(
         node,
         router,
         pinned,
+        door,
+        device,
         shutdown,
     )
     .await
@@ -280,13 +284,17 @@ async fn serve_rpc(
 async fn serve_stream(
     node: &Node,
     pinned: Option<String>,
+    door: Door,
+    device: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
     let mut served = tokio::task::spawn_blocking(move || {
-        legion_net::stream::serve(
+        legion_net::stream::serve_with_door(
             &host,
             pinned.as_deref(),
+            door,
+            device.as_deref(),
             io::stdin().lock(),
             io::stdout().lock(),
         )
@@ -362,9 +370,9 @@ async fn gate(
         None
     };
     match subcommand {
-        Subcommand::Rpc => serve_rpc(node, router, Some(pinned), shutdown).await,
+        Subcommand::Rpc => serve_rpc(node, router, Some(pinned), Door::Ssh, device, shutdown).await,
         Subcommand::Stream => {
-            let code = serve_stream(&node, Some(pinned), shutdown).await;
+            let code = serve_stream(&node, Some(pinned), Door::Ssh, device, shutdown).await;
             router.shutdown().await;
             code
         }

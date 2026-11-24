@@ -30,7 +30,8 @@ pub enum Door {
     /// `legion stream`, the pipe bulk file data moves over, and the ends of a transfer this node
     /// serves itself.
     Stream,
-    /// `legion gate --enrol`, a single-use SSH forced command enrolling a paired device.
+    /// `legion gate --as` and `legion gate --enrol`, calls arriving through a restricted SSH
+    /// forced command (paired devices and hand-written restricted SSH keys).
     Ssh,
 }
 
@@ -60,6 +61,7 @@ pub struct Ctx {
     pub(crate) node: Node,
     pub(crate) name: String,
     pub(crate) door: Door,
+    pub(crate) device: Option<String>,
     pub(crate) grant: Grant,
     pub(crate) cancel: CancellationToken,
     pub(crate) events: EventSink,
@@ -114,6 +116,11 @@ impl Ctx {
     /// The door the call came through.
     pub fn door(&self) -> Door {
         self.door
+    }
+
+    /// The paired device name when the call arrived through `legion gate --as ... --device <name>`.
+    pub fn device(&self) -> Option<&str> {
+        self.device.as_deref()
     }
 
     /// How many nodes have already forwarded the call this tool is running for; `0` when the call

@@ -162,10 +162,11 @@ impl Fleet {
         let result = self
             .call_remote_checked(ctx, node, here, &principal, machine, tool, &args, events)
             .await;
-        node.record_audit(
+        node.record_audit_with_device(
             machine.to_owned(),
             Some(principal),
             ctx.door(),
+            ctx.device().map(str::to_owned),
             tool.to_owned(),
             &args,
             started,
@@ -340,10 +341,11 @@ impl Fleet {
             Ok(_) => Ok(Value::Null),
             Err(err) => Err(err.clone()),
         };
-        node.record_audit(
+        node.record_audit_with_device(
             machine.to_owned(),
             Some(principal),
             ctx.door(),
+            ctx.device().map(str::to_owned),
             audit_tool.to_owned(),
             recorded_args,
             started,
@@ -468,10 +470,11 @@ impl Fleet {
         let auth = match authorize_for_forward(node, &call) {
             Ok(auth) => auth,
             Err((principal, err)) => {
-                node.record_audit(
+                node.record_audit_with_device(
                     machine.to_owned(),
                     principal,
                     call.door,
+                    call.device,
                     call.tool,
                     &call.args,
                     started,
@@ -495,6 +498,7 @@ impl Fleet {
     ) -> Result<Value, ErrorBody> {
         let here = node.name();
         let door = call.door;
+        let device = call.device.clone();
         let tool = call.tool.clone();
         let args = call.args.clone();
         let principal = auth.principal().to_owned();
@@ -523,10 +527,11 @@ impl Fleet {
             }
             Err(err) => Err(err),
         };
-        node.record_audit(
+        node.record_audit_with_device(
             machine.to_owned(),
             Some(principal),
             door,
+            device,
             tool,
             &args,
             started,
@@ -1227,10 +1232,11 @@ impl Fleet {
             Err((principal, err)) => {
                 let mut results = BTreeMap::new();
                 for machine in machines {
-                    node.record_audit(
+                    node.record_audit_with_device(
                         machine.clone(),
                         principal.clone(),
                         call.door,
+                        call.device.clone(),
                         call.tool.clone(),
                         &call.args,
                         started,
@@ -1255,6 +1261,7 @@ impl Fleet {
                 as_principal: call.as_principal.clone(),
                 door: call.door,
                 pinned: call.pinned.clone(),
+                device: call.device.clone(),
                 cancel: call.cancel.child_token(),
                 events: call.events.for_machine(machine.as_str()),
                 hops: call.hops,

@@ -262,6 +262,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     assert_eq!(enrol_entries[1]["outcome"], json!("conflict"));
     let enrol_entry = enrol_entries[2];
     assert_eq!(enrol_entry["door"], json!("ssh"));
+    assert_eq!(enrol_entry["device"], json!("my-pixel-phone"));
     assert_eq!(enrol_entry["principal"], json!("phone"));
     assert_eq!(enrol_entry["outcome"], json!("ok"));
 
@@ -307,7 +308,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     let whoami = read_json_line(&mut rpc_stdout, "whoami reply");
     assert_eq!(whoami["result"]["principal"], json!("phone"));
     assert_eq!(whoami["result"]["role"], json!("observer"));
-    assert_eq!(whoami["result"]["door"], json!("rpc"));
+    assert_eq!(whoami["result"]["door"], json!("ssh"));
 
     // Allowed read inside observer's `paths` succeeds.
     writeln!(
@@ -356,6 +357,17 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     drop(rpc_stdin);
     let rpc_status = rpc_child.wait().unwrap();
     assert!(rpc_status.success(), "legion rpc exited {rpc_status}");
+
+    // Every call served through the paired device gate records door="ssh" and device="my-pixel-phone".
+    let audit_after_rpc = home.audit();
+    for tool_name in ["meta.whoami", "fs.read", "fs.write", "audit.tail"] {
+        let entry = audit_after_rpc
+            .iter()
+            .rfind(|e| e["tool"] == json!(tool_name))
+            .unwrap_or_else(|| panic!("missing audit entry for {tool_name}: {audit_after_rpc:?}"));
+        assert_eq!(entry["door"], json!("ssh"), "{entry}");
+        assert_eq!(entry["device"], json!("my-pixel-phone"), "{entry}");
+    }
 
     // 5. (b) Any other command over the enrolled device key gets `legion gate:` refusal.
     for cmd in ["whoami", "echo pwned", "legion rpc --as owner"] {

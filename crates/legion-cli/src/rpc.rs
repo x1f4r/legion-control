@@ -60,6 +60,8 @@ where
         node,
         router,
         pinned,
+        Door::Rpc,
+        None,
         CancellationToken::new(),
     )
     .await
@@ -67,14 +69,20 @@ where
 
 /// Serves one session until `input` ends, `output` closes, or `shutdown` is cancelled.
 ///
+/// `door` is [`Door::Rpc`] for a standalone `legion rpc` session and [`Door::Ssh`] when served
+/// behind `legion gate --as` (with `device` set whenever `--device` was passed).
+///
 /// When `shutdown` fires, every running call is cancelled, drained within [`SHUTDOWN_GRACE`], and
 /// the router is shut down cleanly before returning.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_until<R, W>(
     input: R,
     output: W,
     node: Node,
     router: Arc<dyn Router>,
     pinned: Option<String>,
+    door: Door,
+    device: Option<String>,
     shutdown: CancellationToken,
 ) -> io::Result<()>
 where
@@ -98,6 +106,8 @@ where
         node,
         router,
         pinned,
+        door,
+        device,
         out: lines,
         running: Arc::new(Mutex::new(HashMap::new())),
         calls: JoinSet::new(),
@@ -259,6 +269,8 @@ struct Session {
     node: Node,
     router: Arc<dyn Router>,
     pinned: Option<String>,
+    door: Door,
+    device: Option<String>,
     out: Sender<String>,
     running: Arc<Mutex<HashMap<Id, CancellationToken>>>,
     calls: JoinSet<()>,
@@ -468,8 +480,9 @@ impl Session {
             tool: params.tool,
             args: params.args,
             as_principal: params.as_principal,
-            door: Door::Rpc,
+            door: self.door,
             pinned: self.pinned.clone(),
+            device: self.device.clone(),
             cancel,
             events,
             hops: params.hops,
@@ -884,6 +897,8 @@ mod tests {
             session_output,
             node,
             Arc::new(Local),
+            None,
+            Door::Rpc,
             None,
             shutdown.clone(),
         ));

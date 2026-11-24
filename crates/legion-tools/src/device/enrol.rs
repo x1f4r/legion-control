@@ -135,14 +135,19 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
         }
     };
 
+    let enrolled_device = outcome.as_ref().ok().and_then(|reply| match reply {
+        EnrolReply::Ok { device, .. } => Some(device.clone()),
+        EnrolReply::Err { .. } => None,
+    });
     let audit_result = outcome
         .as_ref()
         .map(|reply| serde_json::to_value(reply).unwrap_or_else(|_| json!({ "ok": true })))
         .map_err(Clone::clone);
-    node.record_audit(
+    node.record_audit_with_device(
         target_node,
         principal,
         Door::Ssh,
+        enrolled_device,
         "device.enrol".to_owned(),
         &audit_args,
         started,

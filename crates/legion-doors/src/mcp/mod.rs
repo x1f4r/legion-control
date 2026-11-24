@@ -362,6 +362,7 @@ impl McpDoor {
                 Door::Mcp
             },
             pinned,
+            device: None,
             // Cancelled when the client cancels the request, and when the session ends.
             cancel,
             events,

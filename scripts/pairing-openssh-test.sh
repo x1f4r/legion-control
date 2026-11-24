@@ -304,8 +304,16 @@ for line in sys.argv[1].splitlines():
 assert replies[1]["result"]["node"] == "box", replies[1]
 assert replies[2]["result"]["principal"] == "phone", replies[2]
 assert replies[2]["result"]["role"] == "observer", replies[2]
+assert replies[2]["result"]["door"] == "ssh", replies[2]
 assert replies[3]["result"]["content"] == "hello-from-container\n", replies[3]
 assert replies[4]["error"]["data"]["code"] == "denied", replies[4]
+PY
+python3 - "$HOME/.local/state/legion/audit.jsonl" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    entries = [json.loads(line) for line in fh if line.strip()]
+whoami = [e for e in entries if e["tool"] == "meta.whoami" and e.get("device") == "container-phone"]
+assert whoami and whoami[-1]["door"] == "ssh", entries
 PY
 echo "    legion rpc session verified (system ssh)"
 
@@ -398,7 +406,7 @@ link_tools_out="$(legion-link-cli tools --config "$work/link_config.json")"
 python3 -c 'import json,sys; names=[t["name"] for t in json.loads(sys.argv[1])["tools"]]; assert "meta.whoami" in names and "exec.run" in names, names' "$link_tools_out"
 
 link_whoami_out="$(legion-link-cli call --config "$work/link_config.json" meta.whoami '{}')"
-python3 -c 'import json,sys; w=json.loads(sys.argv[1]); assert w["principal"]=="phone_link" and w["role"]=="operator" and w["door"]=="rpc", w' "$link_whoami_out"
+python3 -c 'import json,sys; w=json.loads(sys.argv[1]); assert w["principal"]=="phone_link" and w["role"]=="operator" and w["door"]=="ssh", w' "$link_whoami_out"
 
 link_exec_out="$(legion-link-cli call --config "$work/link_config.json" exec.run '{"cmd":"printf '\''from-legion-link\\n'\''"}' 2>"$work/link_exec.stderr")"
 python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["exit_code"]==0 and e["stdout"]=="from-legion-link\n", e' "$link_exec_out"

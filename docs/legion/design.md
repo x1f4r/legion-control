@@ -36,7 +36,7 @@ neither touches the other's files.
 | tool | a named operation with a schema and an effect |
 | principal | who is calling: `owner`, `agent:claude`, `agent:gemini`, `phone`, … |
 | role | a named set of allow and deny rules a principal is given |
-| door | how a call arrives: `cli`, `mcp`, `http`, `rpc` |
+| door | how a call arrives: `cli`, `mcp`, `http`, `rpc`, `stream`, `ssh` |
 | job | a command that outlives the call that started it |
 
 ## Workspace

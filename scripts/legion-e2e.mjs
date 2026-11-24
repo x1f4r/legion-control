@@ -988,7 +988,11 @@ step('g7 the paired device key speaks legion rpc as e2e:gate, refuses other comm
     }
   }
   check(replies.get(1)?.result?.node === 'far', 'paired hello did not answer as far', replies.get(1));
-  check(replies.get(2)?.result?.principal === 'e2e:gate' && replies.get(2)?.result?.role === 'editor', 'paired session is not pinned to e2e:gate', replies.get(2));
+  check(
+    replies.get(2)?.result?.principal === 'e2e:gate' && replies.get(2)?.result?.role === 'editor' && replies.get(2)?.result?.door === 'ssh',
+    'paired session is not pinned to e2e:gate via ssh door',
+    replies.get(2),
+  );
   check(replies.get(3)?.result?.size === 7, 'paired allowed fs.write failed', replies.get(3));
   check(replies.get(4)?.error?.data?.code === 'denied', 'paired exec.run was not denied', replies.get(4));
 

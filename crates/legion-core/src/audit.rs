@@ -44,6 +44,10 @@ pub struct Entry {
     pub principal: Option<String>,
     /// The door it came through.
     pub door: Door,
+    /// The paired device name when the call arrived through `legion gate --device <name>` (or
+    /// completed `device.enrol`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     /// The tool it called.
     pub tool: String,
     /// The machine it ran on.
@@ -573,6 +577,7 @@ mod tests {
             time: now(),
             principal: Some(principal.to_owned()),
             door: Door::Cli,
+            device: None,
             tool: tool.to_owned(),
             target: "tower".to_owned(),
             outcome,
