@@ -23,6 +23,34 @@ const SAME_BOOT_TOLERANCE_TICKS: u64 = SAME_BOOT_TOLERANCE_SECS * TICKS_PER_SEC;
 const BOOT_TICKS_PREFIX: &str = "boot-ticks-";
 const BOOT_SEC_PREFIX: &str = "boot-sec-";
 
+/// Generous backward wall-clock step tolerance (24 hours) applied when comparing parent and child
+/// creation times on platforms whose kernel process start timestamps are wall-clock based
+/// (Windows `FILETIME` and macOS `proc_bsdinfo` epoch time).
+///
+/// Dual-boot machines and NTP syncs can step the system wall clock backward (up to ~14 hours for
+/// UTC/local RTC timezone mismatches); without tolerance, a real child started after a backward
+/// step looks older than its parent and would be skipped. Linux uses monotonic boot-relative
+/// jiffies and needs zero backward tolerance.
+#[allow(dead_code)]
+pub(crate) const WALL_CLOCK_BACKWARD_TOLERANCE_SECS: u64 = 86_400;
+#[allow(dead_code)]
+pub(crate) const WALL_CLOCK_BACKWARD_TOLERANCE_MICROS: u64 =
+    WALL_CLOCK_BACKWARD_TOLERANCE_SECS * 1_000_000;
+#[allow(dead_code)]
+pub(crate) const WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME: u64 =
+    WALL_CLOCK_BACKWARD_TOLERANCE_SECS * TICKS_PER_SEC;
+
+/// Return `true` when `child_start` is no more than `backward_tolerance` units earlier than
+/// `parent_start`.
+#[allow(dead_code)]
+pub(crate) const fn child_not_older_than_parent(
+    child_start: u64,
+    parent_start: u64,
+    backward_tolerance: u64,
+) -> bool {
+    child_start.saturating_add(backward_tolerance) >= parent_start
+}
+
 #[cfg(unix)]
 #[path = "procid/unix.rs"]
 mod platform;
@@ -45,12 +73,14 @@ pub struct ProcessId {
     /// Full-precision kernel start timestamp for the process.
     ///
     /// Units per platform (never compared across machines or operating systems):
-    /// - **Linux:** clock ticks (jiffies) since boot from `/proc/<pid>/stat` field 22, immune to
-    ///   wall-clock adjustments.
+    /// - **Linux:** clock ticks (jiffies) since boot from `/proc/<pid>/stat` field 22, monotonic
+    ///   and immune to wall-clock adjustments.
     /// - **macOS:** microseconds since the Unix epoch from `proc_bsdinfo`
-    ///   (`pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`).
+    ///   (`pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`); wall-clock based, so parent-before-child
+    ///   ordering allows up to 24 hours of backward clock-step tolerance.
     /// - **Windows:** 100-nanosecond `FILETIME` ticks since 1601-01-01 UTC from
-    ///   `GetProcessTimes` (`CreationTime`).
+    ///   `GetProcessTimes` (`CreationTime`); wall-clock based, so parent-before-child ordering
+    ///   allows up to 24 hours of backward clock-step tolerance.
     pub start_time: u64,
 }
 
@@ -593,6 +623,35 @@ mod tests {
         assert!(!same_boot(&a, uuid_a));
         assert!(!same_boot(&a, "boot-sec-1700000000"));
         assert!(!same_boot("boot-ticks-abc", "boot-ticks-abc-2"));
+    }
+
+    #[test]
+    fn child_not_older_than_parent_respects_platform_clock_tolerance() {
+        // Monotonic (Linux): exact ordering only.
+        assert!(child_not_older_than_parent(100, 100, 0));
+        assert!(child_not_older_than_parent(101, 100, 0));
+        assert!(!child_not_older_than_parent(99, 100, 0));
+
+        // Wall-clock (macOS / Windows): tolerates backward steps up to 24 hours (e.g. dual-boot
+        // RTC timezone step), while still rejecting much older unrelated processes.
+        let parent_ft: u64 = 133_700_000_000_000_000;
+        let two_hours_ft = 2 * 3_600 * TICKS_PER_SEC;
+        let twenty_five_hours_ft = 25 * 3_600 * TICKS_PER_SEC;
+        assert!(child_not_older_than_parent(
+            parent_ft - two_hours_ft,
+            parent_ft,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME
+        ));
+        assert!(child_not_older_than_parent(
+            parent_ft - WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+            parent_ft,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME
+        ));
+        assert!(!child_not_older_than_parent(
+            parent_ft - twenty_five_hours_ft,
+            parent_ft,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME
+        ));
     }
 
     #[test]

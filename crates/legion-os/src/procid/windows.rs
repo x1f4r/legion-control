@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 use crate::win_proc::{self, OpenPinnedOutcome, PinnedProcess, TerminateOutcome};
 use crate::{OsError, Result};
 
-use super::{KillTreeReport, ProcessId, is_alive};
+use super::{
+    KillTreeReport, ProcessId, WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME, child_not_older_than_parent,
+    is_alive,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,8 +48,13 @@ fn is_ancestor_of_current(identity: &ProcessId) -> bool {
         }
         match win_proc::open_pinned(parent_pid, false) {
             OpenPinnedOutcome::Pinned(parent_proc) => {
-                // Stop if `parent_pid` has been recycled by a process newer than its child.
-                if parent_proc.id.start_time > child_start {
+                // Stop if `parent_pid` has been recycled by a process newer than its child (allowing
+                // wall-clock backward-step tolerance for dual-boot/NTP clock jumps).
+                if !child_not_older_than_parent(
+                    child_start,
+                    parent_proc.id.start_time,
+                    WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                ) {
                     break;
                 }
                 if parent_proc.id.pid == identity.pid
@@ -125,7 +133,11 @@ pub(super) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
             if let OpenPinnedOutcome::Pinned(child) =
                 win_proc::open_pinned_query_only(entry.pid, false)
                 && child.parent_pid == identity.pid
-                && child.id.start_time >= identity.start_time
+                && child_not_older_than_parent(
+                    child.id.start_time,
+                    identity.start_time,
+                    WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                )
                 && direct_child_max_start.is_none_or(|limit| child.id.start_time < limit)
             {
                 return Ok(true);
@@ -372,10 +384,14 @@ fn discover_and_terminate_pass(
             match win_proc::open_pinned(child_pid, false) {
                 OpenPinnedOutcome::Pinned(child_proc) => {
                     // Validate parent_pid directly on the opened handle (not just the snapshot)
-                    // AND verify full 100-ns FILETIME parent-before-child ordering (plus the upper
-                    // bound when `root.pid` was recycled by a newer process).
+                    // AND verify parent-before-child ordering with wall-clock backward-step
+                    // tolerance (plus the upper bound when `root.pid` was recycled by a newer process).
                     if child_proc.parent_pid != parent.pid
-                        || child_proc.id.start_time < parent.start_time
+                        || !child_not_older_than_parent(
+                            child_proc.id.start_time,
+                            parent.start_time,
+                            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                        )
                         || max_start.is_some_and(|limit| child_proc.id.start_time >= limit)
                     {
                         continue;

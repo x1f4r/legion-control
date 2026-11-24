@@ -10,11 +10,27 @@ use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::{OsError, Result};
 
-use super::{KillTreeReport, ProcessId, is_alive};
+use super::{KillTreeReport, ProcessId, child_not_older_than_parent, is_alive};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ANCESTOR_HOPS: usize = 256;
+
+/// Backward clock-step tolerance for exact `ProcessId.start_time` parent-before-child checks:
+/// Linux `/proc/<pid>/stat` jiffies are monotonic (zero tolerance); macOS `proc_bsdinfo` uses
+/// wall-clock microseconds and can step backward across NTP or dual-boot RTC adjustments.
+#[cfg(target_os = "linux")]
+const EXACT_START_BACKWARD_TOLERANCE: u64 = 0;
+#[cfg(target_os = "macos")]
+const EXACT_START_BACKWARD_TOLERANCE: u64 = super::WALL_CLOCK_BACKWARD_TOLERANCE_MICROS;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const EXACT_START_BACKWARD_TOLERANCE: u64 = super::WALL_CLOCK_BACKWARD_TOLERANCE_SECS;
+
+/// Tolerance for second-resolution `sysinfo` start times in BFS parent checks.
+#[cfg(target_os = "linux")]
+const SYSINFO_START_BACKWARD_TOLERANCE_SECS: u64 = 1;
+#[cfg(not(target_os = "linux"))]
+const SYSINFO_START_BACKWARD_TOLERANCE_SECS: u64 = super::WALL_CLOCK_BACKWARD_TOLERANCE_SECS;
 
 pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
     if identity.pid == 1 {
@@ -85,7 +101,11 @@ fn is_ancestor_of_current(identity: &ProcessId) -> bool {
         }
         match macos_proc::parent_and_start(parent_pid) {
             Some((next_ppid, parent_start)) => {
-                if parent_start > child_start {
+                if !child_not_older_than_parent(
+                    child_start,
+                    parent_start,
+                    EXACT_START_BACKWARD_TOLERANCE,
+                ) {
                     break;
                 }
                 if parent_pid == identity.pid && parent_start == identity.start_time {
@@ -384,7 +404,11 @@ fn has_live_group_or_session_member(
         let in_session = check_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
         if (in_group || in_session)
             && let Ok(Some(id)) = super::of_pid(pid)
-            && id.start_time >= root.start_time
+            && child_not_older_than_parent(
+                id.start_time,
+                root.start_time,
+                EXACT_START_BACKWARD_TOLERANCE,
+            )
         {
             return true;
         }
@@ -424,7 +448,11 @@ fn has_live_group_or_session_member(
         let in_session = check_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
         if (in_group || in_session)
             && let Ok(Some(id)) = super::of_pid(pid)
-            && id.start_time >= root.start_time
+            && child_not_older_than_parent(
+                id.start_time,
+                root.start_time,
+                EXACT_START_BACKWARD_TOLERANCE,
+            )
         {
             return true;
         }
@@ -799,7 +827,11 @@ fn collect_tree_into(
         let in_session = allow_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
         if (in_group || in_session)
             && let Ok(Some(id)) = super::of_pid(pid)
-            && id.start_time >= root.start_time
+            && child_not_older_than_parent(
+                id.start_time,
+                root.start_time,
+                EXACT_START_BACKWARD_TOLERANCE,
+            )
         {
             if in_group {
                 found_in_group = true;
@@ -831,14 +863,23 @@ fn collect_tree_into(
                 if child_pid == own_pid || !visited.insert(child_pid) {
                     continue;
                 }
-                // Allow 1 second of rounding slack because sysinfo exposes epoch seconds.
-                if parent_start > 0 && child_start.saturating_add(1) < parent_start {
+                if parent_start > 0
+                    && !child_not_older_than_parent(
+                        child_start,
+                        parent_start,
+                        SYSINFO_START_BACKWARD_TOLERANCE_SECS,
+                    )
+                {
                     continue;
                 }
                 if !tracked.contains_key(&child_pid)
                     && let Ok(Some(child_id)) = super::of_pid(child_pid)
                 {
-                    if child_id.start_time < root.start_time {
+                    if !child_not_older_than_parent(
+                        child_id.start_time,
+                        root.start_time,
+                        EXACT_START_BACKWARD_TOLERANCE,
+                    ) {
                         continue;
                     }
                     tracked.insert(child_pid, child_id);
