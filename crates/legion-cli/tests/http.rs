@@ -99,6 +99,10 @@ fn main() -> ExitCode {
             "an_mcp_session_belongs_to_its_token",
             an_mcp_session_belongs_to_its_token,
         ),
+        (
+            "headers_the_gate_decides_by_come_once",
+            headers_the_gate_decides_by_come_once,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -1446,4 +1450,63 @@ fn an_mcp_session_belongs_to_its_token() {
         in_session(&server, &fixture.admin, &admins, "POST").status,
         404
     );
+}
+
+/// The status a request written byte for byte gets.
+fn raw_status(port: u16, request: &[u8]) -> u16 {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    stream.write_all(request).unwrap();
+    read_head(&mut BufReader::new(stream)).0
+}
+
+fn headers_the_gate_decides_by_come_once() {
+    let fixture = Fixture::new();
+    fixture.home.write_config(
+        "node.toml",
+        "name = \"laptop\"\n\n[serve]\norigins = [\"https://app.example.net\"]\n",
+    );
+    let server = Server::start(&fixture.home);
+    let port = server.port;
+    let host = format!("Host: 127.0.0.1:{port}\r\n");
+    let good = format!("Authorization: Bearer {}\r\n", fixture.phone);
+    let get = |lines: &str| {
+        raw_status(
+            port,
+            format!("GET /v1/tools HTTP/1.1\r\nConnection: close\r\n{lines}\r\n").as_bytes(),
+        )
+    };
+    assert_eq!(get(&format!("{host}{good}")), 200);
+    for (what, lines) in [
+        (
+            "a second Host",
+            format!("{host}Host: evil.example\r\n{good}"),
+        ),
+        (
+            "a second Authorization",
+            format!("{host}{good}Authorization: Bearer lgn_x\r\n"),
+        ),
+        (
+            "a second Origin",
+            format!(
+                "{host}{good}Origin: https://app.example.net\r\nOrigin: https://evil.example\r\n"
+            ),
+        ),
+        ("no Host", good.clone()),
+    ] {
+        assert_eq!(get(&lines), 400, "{what}");
+    }
+    let mut binary =
+        format!("GET /v1/tools HTTP/1.1\r\nConnection: close\r\n{good}Host: 127.0.0.1:{port}")
+            .into_bytes();
+    binary.extend_from_slice(b"\xff\r\n\r\n");
+    assert_eq!(raw_status(port, &binary), 400);
+    let elsewhere = format!(
+        "GET http://evil.example:{port}/v1/tools HTTP/1.1\r\nConnection: close\r\n{host}{good}\r\n"
+    );
+    assert_eq!(raw_status(port, elsewhere.as_bytes()), 400);
+    let here = format!(
+        "GET http://127.0.0.1:{port}/v1/tools HTTP/1.1\r\nConnection: close\r\n{host}{good}\r\n"
+    );
+    assert_eq!(raw_status(port, here.as_bytes()), 200);
 }

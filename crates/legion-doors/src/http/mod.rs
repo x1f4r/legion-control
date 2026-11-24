@@ -343,7 +343,9 @@ async fn gate(
         .map(|file| file.serve.clone())
         .unwrap_or_default();
     let mut principal = None;
-    let response = if !gate::host_allowed(request.headers(), request.uri(), shared.port, &config) {
+    let response = if let Some(problem) = gate::malformed(request.headers(), request.uri()) {
+        reply::refusal(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgs, problem)
+    } else if !gate::host_allowed(request.headers(), shared.port, &config) {
         reply::refusal(
             StatusCode::MISDIRECTED_REQUEST,
             ErrorCode::Denied,
