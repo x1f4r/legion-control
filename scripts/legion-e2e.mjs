@@ -127,14 +127,40 @@ export function blockerOf(needs, failedNames, skippedNames) {
   return [...failedNames, ...skippedNames].find(other => needs.some(prefix => other.startsWith(prefix)));
 }
 
+const knownSecrets = new Set();
+
+function rememberSecret(value) {
+  if (typeof value === 'string' && value.length >= 16) knownSecrets.add(value);
+}
+
+/** Redacts pairing invite strings, decoded key seeds, and PEM private keys from logs and failure text. */
+export function redactSecrets(text, extraSecrets = knownSecrets) {
+  if (typeof text !== 'string') return text;
+  let out = text
+    .replace(/legion-invite-1\.[A-Za-z0-9_-]+/g, 'legion-invite-1.<redacted>')
+    .replace(
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+      '<redacted private key>',
+    );
+  for (const secret of extraSecrets) {
+    if (typeof secret === 'string' && secret.length > 0 && out.includes(secret)) {
+      out = out.split(secret).join('<redacted>');
+    }
+  }
+  return out;
+}
+
 /** Decodes a `legion-invite-1.<base64url>` invite text into its JSON payload object. */
 export function decodeInvite(inviteText) {
   const prefix = 'legion-invite-1.';
   if (typeof inviteText !== 'string' || !inviteText.startsWith(prefix)) {
     throw new Error('invite does not start with legion-invite-1.');
   }
+  rememberSecret(inviteText);
   const jsonText = Buffer.from(inviteText.slice(prefix.length), 'base64url').toString('utf8');
-  return JSON.parse(jsonText);
+  const payload = JSON.parse(jsonText);
+  rememberSecret(payload?.key);
+  return payload;
 }
 
 /** Encodes a 32-byte Ed25519 seed into an unencrypted OpenSSH (`openssh-key-v1`) PEM private key. */
@@ -209,7 +235,8 @@ class Failure extends Error {}
 
 function check(condition, message, detail) {
   if (!condition) {
-    throw new Failure(detail === undefined ? message : `${message}\n${typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2)}`);
+    const raw = detail === undefined ? message : `${message}\n${typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2)}`;
+    throw new Failure(redactSecrets(raw));
   }
 }
 
@@ -218,14 +245,10 @@ function clip(text, limit = 4000) {
   return value.length > limit ? `${value.slice(0, limit)}... (${value.length - limit} more characters)` : value;
 }
 
-function redactSecrets(text) {
-  if (typeof text !== 'string') return text;
-  return text.replace(/legion-invite-1\.[A-Za-z0-9_-]+/g, 'legion-invite-1.<redacted>');
-}
-
 function record(entry) {
   transcript.push({
     ...entry,
+    args: Array.isArray(entry.args) ? entry.args.map(arg => redactSecrets(String(arg))) : entry.args,
     stdin: redactSecrets(entry.stdin),
     stdout: redactSecrets(entry.stdout),
     stderr: redactSecrets(entry.stderr),
@@ -288,11 +311,11 @@ function parseOutcome(result, what) {
   try {
     value = JSON.parse(lines.at(-1));
   } catch {
-    throw new Failure(`${what} exited ${result.status} without a JSON answer on stdout.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`);
+    throw new Failure(redactSecrets(`${what} exited ${result.status} without a JSON answer on stdout.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`));
   }
   if (result.status === 0) return { ok: true, value, stderr: result.stderr };
   if (result.status === 1) return { ok: false, error: value, stderr: result.stderr };
-  throw new Failure(`${what} exited ${result.status}.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`);
+  throw new Failure(redactSecrets(`${what} exited ${result.status}.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`));
 }
 
 function ok(tool, args, options) {
@@ -1435,7 +1458,7 @@ async function main() {
       const note = await body();
       process.stdout.write(`    ok (${Date.now() - started} ms)${note ? `: ${note}` : ''}\n`);
     } catch (error) {
-      const message = error instanceof Failure ? error.message : error.stack;
+      const message = redactSecrets(error instanceof Failure ? error.message : String(error?.stack ?? error));
       failed.push({ name, message });
       process.stdout.write(`    FAILED (${Date.now() - started} ms):\n${message.replace(/^/gm, '      ')}\n`);
       if (fatal) break;
@@ -1461,7 +1484,7 @@ if (isMain) {
     process.exit(0);
   } catch (error) {
     abortPowerOutright();
-    console.error(`legion e2e: the driver itself failed: ${error.stack}`);
+    console.error(`legion e2e: the driver itself failed: ${redactSecrets(String(error?.stack ?? error))}`);
     process.exit(1);
   }
 }

@@ -8,6 +8,7 @@ import {
   decodeInvite,
   emergencyAbort,
   realPowerRefusal,
+  redactSecrets,
 } from '../scripts/legion-e2e.mjs';
 
 // scripts/legion-e2e.mjs restarts the machine it runs on if calling the restart off fails, so the
@@ -74,4 +75,12 @@ test('decodeInvite and buildOpenSshEd25519Key handle the pairing invite contract
     'base64',
   );
   assert.equal(raw.subarray(0, 15).toString('ascii'), 'openssh-key-v1\0');
+
+  // Redaction strips invite strings, the decoded base64 seed remembered by decodeInvite, and PEM keys.
+  const leaked = `invite=${encoded}\npayload=${JSON.stringify(payload)}\npem=${pem}`;
+  const redacted = redactSecrets(leaked);
+  assert.ok(!redacted.includes(encoded), 'invite text leaked');
+  assert.ok(!redacted.includes(payload.key), 'decoded seed leaked');
+  assert.ok(!redacted.includes('BEGIN OPENSSH PRIVATE KEY'), 'private key leaked');
+  assert.ok(redacted.includes('legion-invite-1.<redacted>'));
 });
