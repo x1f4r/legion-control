@@ -137,20 +137,29 @@ can, including pairing further devices. `--as <principal>` still pairs under an 
 No role and no device name is built in; what a person prefers lives in their own policy.
 
 **Paired devices are fleet configuration.** They are kept in `devices.toml` beside `policy.toml`:
-the device's name, public key, principal, recorded role (for `device:*` principals), when and where
-it was paired and updated, and, once removed, a tombstone. `fleet.sync` carries the file like the
-policy, but merges it in both directions instead of replacing it: entries are added from both sides
-and a tombstone always wins, so two nodes that each paired or removed something while apart agree
-again when they meet (and `meta.doctor` warns if any reachable peer's `devices.toml` differs).
-Every node adopts any pre-existing `--pairing` lines on first run, keeps its own `authorized_keys`
-and `device:*` principals in step with the file whenever it pairs, syncs, lists, updates, or
-removes (failing closed to `nobody` if a synced role is undefined locally), and the gate refuses a
-device the file no longer names (ending its parent `sshd` on `Denied`). Pairing, updating, and
-removing push in parallel to every node that can be reached at that moment and say which ones could
-not; those catch up at their next sync (and immediately tear down active sessions for any newly
-tombstoned devices on sync). Until then a removed device is still accepted by a node that has not
-heard: that is the price of having no hub, and `device.remove` says so by name in
-`still_trusted_by`.
+the device's name, public key, principal, recorded role (for registry-owned `device:*` principals,
+marked `device = "<pairing id>"` in `policy.toml`), creator (`paired_by`), timestamps, and, once
+removed, a permanent tombstone. Syncing `devices.toml` obeys a one-way trust rule: pushing
+(`fleet.sync direction=push`, and the automatic pushes after pairing, `device.set`, and
+`device.remove`) sends local entries to peers and imports **only tombstones** back — never a peer's
+live device entries — so syncing out to a less-trusted or compromised peer cannot inject keys onto
+the pushing node. Importing live devices paired on another machine requires an explicit
+`fleet.sync direction=pull from=<peer> documents='["devices.toml"]'` (while `fleet.sync
+direction=status`, `device.list`, and `meta.doctor` show which peers are out of date). Every node
+adopts only pre-existing `--pairing` lines verified against its own `state/devices.json` on first
+run (leaving unmatched Legion-shaped lines local-only, never synced), keeps its own
+`authorized_keys` and registry-owned `device:*` principals in step with `devices.toml` whenever it
+pairs, syncs, lists, updates, or removes (failing closed to `nobody` if a synced role is undefined
+locally), and quarantines any unconfirmed descendant paired at or after its creator device was
+tombstoned until an owner explicitly runs `device.set id=<id> confirm=true`. The gate verifies the
+on-disk key and registry state before serving and refuses removed, stale, colliding, or quarantined
+devices (ending its parent `sshd` on `Denied`). Pairing, updating, and removing push in parallel to
+every reachable node and report every peer that was not reached; those catch up at their next sync
+(immediately tearing down active sessions for newly tombstoned or quarantined devices). **Honest
+limit without a central hub:** a removed device that held an `owner` or `exec` role can still act
+with that machine's own authority on any node that has not yet heard about the removal; removal is
+complete only once every machine has received the tombstone, and `device.remove` names every
+machine still waiting in `still_trusted_by`.
 
 **The device learns every way in.** Each node can describe how a device reaches it (`device.endpoint`:
 names, port, account, ssh host keys). After pairing, and from then on in the background, the app

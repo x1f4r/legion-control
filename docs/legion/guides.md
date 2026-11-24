@@ -698,8 +698,10 @@ legion pair --name tablet --role owner --allow-owner
 legion pair --as phone
 ```
 
-When pairing with `--name` and `--role` (or interactively), Legion creates a dedicated
-`[principals."device:<name>"]` entry in `policy.toml` so two devices never share an identity.
+When pairing with `--name` and `--role` (or interactively), Legion reserves the device name in the
+pending invite and creates its dedicated `[principals."device:<name>"]` entry (marked with
+`device = "<pairing id>"`) atomically in `policy.toml` when the device enrols, so two devices never
+share an identity and an unused invite leaves `policy.toml` untouched.
 `legion pair` calls `device.invite`, prints who the device will act as and when the invite expires,
 draws the invite as a terminal QR code, prints the invite text on one line (for copying and pasting
 when a camera is inconvenient), and prints the commands to list and remove devices. Pass `--invert`
@@ -746,45 +748,66 @@ What happens during pairing:
 ### Managing devices across the fleet (`device.list`, `device.set`, `device.endpoint`, `device.remove`)
 
 Paired devices are stored in `devices.toml` beside `policy.toml`, and each node derives its own
-`authorized_keys` device lines from `devices.toml` (adopting any pre-existing `--pairing` lines
-automatically on first run so existing pairings keep working). Foreign `authorized_keys` lines,
-pending invites, and entries belonging to other Legion homes or OS accounts are preserved byte for
-byte.
+`authorized_keys` device lines from `devices.toml`. On first run, Legion adopts only pre-existing
+`--pairing` lines verified against this node's own `state/devices.json` (equal principal, key
+fingerprint, and pairing id); any other Legion-shaped line stays local-only (kept working locally,
+never synced to peers, flagged as `local_only: true` in `device.list`, refused by `device.set`,
+and removable via `device.remove`). Foreign `authorized_keys` lines, pending invites, and entries
+belonging to other Legion homes or OS accounts are preserved byte for byte.
+
+**Sync trust rule:** `fleet.sync direction=push documents='["devices.toml"]'` (and the automatic
+pushes after enrolment, `device.set`, and `device.remove`) pushes local entries to peers and
+imports **only tombstones** back — never live device entries from a peer. To import live devices
+paired on another machine, run `legion fleet.sync direction=pull from=<machine>
+documents='["devices.toml"]'` explicitly as owner (`fleet.sync direction=status` compares
+read-only).
 
 - **List devices and invites**: `legion device.list` reconciles `authorized_keys` with
   `devices.toml`, sweeps expired invites recorded by this home, and shows each device's `id`,
-  `name`, `principal`, effective `role`, `fingerprint`, `added`, and `paired_on`. For owner
-  callers, it also shows Legion lines pointing at another or deleted Legion home (`foreign: true`,
-  `missing_home: true`, `home`), and `meta.doctor` warns about orphaned keys or fleet device drift.
-- **Change role or rename**: `legion device.set` changes a paired device's role (owner role only,
-  requiring `allow_owner=true` to raise to `owner`, and refusing expiring credentials) or renames
-  it, updating `policy.toml`, `devices.toml`, and `authorized_keys`, then pushing `devices.toml`
-  to reachable fleet peers.
+  `name`, `principal`, effective `role`, `fingerprint`, `added`, `paired_on`, `not_synced_to`, and
+  any collision or quarantine `status`. For owner callers, it also shows Legion lines pointing at
+  another or deleted Legion home (`foreign: true`, `missing_home: true`, `home`), and
+  `device.list prune_tombstones=true` drops tombstones older than 400 days once every peer in
+  `fleet.toml` has acknowledged them. `meta.doctor` warns about orphaned keys, unmarked `device:*`
+  principals, key collisions, quarantined devices, and unsynced or drifted fleet peers.
+- **Change role, rename, or confirm**: `legion device.set` changes a paired device's role (owner
+  role only, only for a registry-owned `device:*` principal marked with `device = "<pairing id>"`,
+  requiring `allow_owner=true` to raise to `owner`, and refusing expiring credentials), renames it,
+  or confirms a quarantined descendant (`confirm=true`, owner role only), updating `policy.toml`,
+  `devices.toml`, and `authorized_keys`, then pushing `devices.toml` to reachable fleet peers.
 - **Discover endpoints**: `legion device.endpoint` (`effect: read`) returns this node's SSH
   connection details (`node`, `hosts`, `port`, `user`, `host_keys`) using the same detection as
   `device.invite` (caching auto-discovered host-key scans briefly per node). Controllers call
-  `device.endpoint` with `on: "all"` through
-  any reachable node to learn every machine's direct SSH address and pinned host keys.
+  `device.endpoint` with `on: "all"` through any reachable node to learn every machine's direct SSH
+  address and pinned host keys.
 - **Remove a device**: `legion device.remove` accepts `name=<device>` or `id=<pairing-or-invite-id>`,
-  writes a tombstone to `devices.toml`, cleans up its unused `device:*` principal in `policy.toml`,
-  removes its `authorized_keys` line, immediately terminates any active sessions and verified
-  same-account parent `sshd` connections (including multiplexed `ControlMaster` connections,
-  reporting `sessions_ended`), reports any still-running background jobs started by that device in
+  writes a tombstone to `devices.toml` first before cleaning up its unused registry-owned
+  `device:*` principal and `authorized_keys` line, immediately terminates any active sessions and
+  verified same-account parent `sshd` connections (disambiguated by pairing id, including
+  multiplexed `ControlMaster` connections, reporting `sessions_ended`, even if a later step fails
+  after saving `devices.toml`), reports any still-running background jobs started by that device in
   `jobs_left_running` without killing them, and pushes the tombstone to reachable peers in
-  `fleet.toml`. **Honest limit without a central hub:** any machine that could not be reached
-  continues trusting the removed device until its next `fleet.sync`; `device.remove` names every
-  such machine in `still_trusted_by` and prints the `fleet.sync` command to finish revoking once
-  they return. On refusal, `legion gate` re-checks `devices.toml` for its exact `--device` and
-  `--pairing` id after registering and tears down its verified same-account parent `sshd` only on
-  `Denied`, so neither a newly opened channel on an already-open connection nor a later re-pair
-  under the same name can revive a removed pairing, while transient local config errors do not
-  kill an unrelated healthy connection. Owner callers can clean up foreign/orphaned Legion lines
-  with `device.remove ... foreign=true` (reporting `sessions_not_ended: true`).
+  `fleet.toml` (non-owner removals push independently of unrelated entries). Any live descendant
+  created by a removed device at or after `removed_at` (and transitively its unconfirmed
+  descendants) is automatically quarantined until an owner runs `device.set id=<id> confirm=true`.
+  **Honest limit without a central hub:** a removed device that held an `owner` or `exec` role can,
+  on any machine that has not yet heard about the removal, still act with that machine's own
+  authority until the tombstone arrives; removal is complete only once every machine has received
+  the tombstone, and `device.remove` names every machine that was not reached in `still_trusted_by`
+  and prints the `fleet.sync` command to finish revoking once they return. On refusal, `legion gate`
+  verifies the on-disk key and `devices.toml` for its exact `--device`, `--pairing` id, and
+  principal after registering and tears down its verified same-account parent `sshd` only on
+  `Denied`, so neither a newly opened channel on an already-open connection, a stale key on disk,
+  nor a later re-pair under the same name can revive a removed pairing, while transient local config
+  errors do not kill an unrelated healthy connection. Owner callers can clean up foreign/orphaned
+  Legion lines with `device.remove ... foreign=true` (reporting `sessions_not_ended: true`).
 
 ```sh
 legion device.list
+legion device.list prune_tombstones=true
 legion device.set name=pixel role=editor
 legion device.set name=pixel rename=pixel-10
+legion device.set id=<pairing-id> confirm=true
 legion device.endpoint --on all
 legion device.remove name=pixel-10
 legion device.remove id=<pairing-or-invite-id>
@@ -1031,11 +1054,13 @@ requiring `effect:admin`, built on `config.list`, `config.read`, and `config.wri
   `tools.d/<name>.toml`. Extension files may contain internal dots (matching `ext.define` files
   such as `tools.d/ops.greet.toml`); on write, the receiver enforces the same rules as `ext.define`
   — the filename stem must match the `name` field inside the file, duplicate tool names across
-  files are refused, and reserved families are rejected. `devices.toml` merges cleanly in both
-  directions (entries combine from both sides, tombstones always win, `device:*` principals and
-  `authorized_keys` are reconciled, and active sessions for newly removed devices are ended), so
-  two machines that paired or removed devices while apart converge without conflict when they meet.
-  `meta.doctor` warns if any reachable peer has a different `devices.toml`.
+  files are refused, and reserved families are rejected. `devices.toml` merges without conflicts
+  (tombstones always win, registry-owned `device:*` principals and `authorized_keys` are
+  reconciled, and active sessions for newly removed or quarantined devices are ended) while obeying
+  the one-way trust rule: `direction=push` sends local entries to peers and imports **only
+  tombstones** back (never live peer entries), whereas `direction=pull from=<peer>` imports live
+  devices from that named peer without writing back. `meta.doctor` warns if any reachable peer has
+  a different `devices.toml` or has not acknowledged local devices yet.
 - **Machine-local (never synced)**: `node.toml` and `tokens.toml`.
 
 Inspect differences with `direction=status` (reporting per-document status `same`, `only_here`,

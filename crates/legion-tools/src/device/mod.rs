@@ -80,7 +80,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.set",
         Effect::Admin,
-        "Change a paired device's role (only for a dedicated `device:*` principal marked with `device = \"<pairing_id>\"` in policy.toml; refuses shared or unmarked principals) or rename it in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. Changing a role requires the owner role (plus allow_owner=true for the owner role) and is refused through an expiring credential.",
+        "Change a paired device's role (only for a dedicated `device:*` principal marked with `device = \"<pairing_id>\"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a quarantined descendant (`confirm=true`, owner role only) in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for the owner role) and every `device.set` call is refused through an expiring credential.",
         set_device,
     );
     registry.add_fn(

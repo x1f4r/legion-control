@@ -193,24 +193,28 @@ pinned to `<principal>` with `door: "ssh"`, and refuses anything else with exit 
 ### Paired devices
 
 Paired devices are kept in `devices.toml` beside `policy.toml`, and every node derives its own
-`authorized_keys` device lines from `devices.toml` (adopting pre-existing `--pairing` lines on
-first run). A device paired with `legion pair` (`device.invite`) chooses a role from `policy.toml`
-(creating its own `[principals."device:<name>"]` entry) or pairs under an existing principal via
-`--as <principal>`. Its derived `authorized_keys` line forces
-`legion gate --as <principal> --device <name> --pairing <id>` with `restrict`, always pinning a
-random per-pairing id and the node's resolved `--home` or `--config-dir`/`--state-dir` (plus
-`--account` on Windows's shared `administrators_authorized_keys`). Legion only classifies a line
-as managed when its option list and forced command match byte-for-byte what Legion emits for the
-host shell (`restrict,command="..."` for devices,
-`restrict,expiry-time="<12-digits>",command="..."` for invites, with matching `--device`/`--enrol`
-and `legion-device:`/`legion-invite:` comment, and no extra or reordered options), leaving every
-other line untouched byte for byte. Once paired, the device can only speak `legion rpc` and
-`legion stream` pinned to `<principal>` (reported and audited with `door: "ssh"` and
-`device: "<name>"`) — never an interactive shell, arbitrary command, PTY, or forwarding — and may
-do only what `<principal>`'s role in `policy.toml` allows (a real wall for roles without `exec`,
-and still as strong as the OS account if given `exec`). Requests naming a different `as` are
-ignored, and calls forwarded to other nodes with `on` are re-checked by each target node's own
-`policy.toml`.
+`authorized_keys` device lines from `devices.toml`. On first run (when `devices.toml` does not
+exist yet), Legion adopts only pre-existing `--pairing` lines that match a record in this node's
+own `state/devices.json` (with equal principal, key fingerprint, and pairing id); any other
+Legion-shaped line is preserved byte for byte as local-only (kept working locally, never offered to
+peers, flagged as `local_only: true` in `device.list`, refused by `device.set`, and removable via
+`device.remove`). A device paired with `legion pair` (`device.invite`) chooses a role from
+`policy.toml` (creating its dedicated `[principals."device:<name>"]` entry atomically at enrolment,
+not at invite time) or pairs under an existing principal via `--as <principal>`. Its derived
+`authorized_keys` line forces `legion gate --as <principal> --device <name> --pairing <id>` with
+`restrict`, always pinning a random per-pairing id and the node's resolved `--home` or
+`--config-dir`/`--state-dir` (plus `--account` on Windows's shared
+`administrators_authorized_keys`). Legion only classifies a line as managed when its option list
+and forced command match byte-for-byte what Legion emits for the host shell
+(`restrict,command="..."` for devices, `restrict,expiry-time="<12-digits>",command="..."` for
+invites, with matching `--device`/`--enrol` and `legion-device:`/`legion-invite:` comment, and no
+extra or reordered options), leaving every other line untouched byte for byte. Once paired, the
+device can only speak `legion rpc` and `legion stream` pinned to `<principal>` (reported and
+audited with `door: "ssh"` and `device: "<name>"`) — never an interactive shell, arbitrary command,
+PTY, or forwarding — and may do only what `<principal>`'s role in `policy.toml` allows (a real wall
+for roles without `exec`, and still as strong as the OS account if given `exec`). Requests naming a
+different `as` are ignored, and calls forwarded to other nodes with `on` are re-checked by each
+target node's own `policy.toml`.
 
 During pairing itself, the temporary key in the invite is single-use, carries a portable 12-digit
 `expiry-time` upper bound for OpenSSH 8.9+ compatibility, and is forced to
@@ -227,46 +231,76 @@ Creating, listing, updating, or removing invites and paired devices (`device.inv
 `effect:read` so paired controllers can discover fleet endpoints: any role with `read` learns the
 node name, candidate host names / Tailscale addresses, SSH port, OS account name, and public sshd
 host keys (with auto-discovered host-key scans cached briefly per node, and without exposing how
-host keys were resolved). Device management follows the
-same caller-scoping and `allow_owner` rules as `token.*`: creating a `device:<name>` principal or
-changing a device's role with `device.set` requires the `owner` role and `allow_owner=true` to
-grant `owner`. Expiring credentials (such as expiring HTTP bearer tokens) cannot mint or modify
-permanent device access: locally, `device.invite`, `device.set`, and any `devices.toml` merge that
-adds or changes a live entry are refused (pure tombstones are still allowed locally so an expiring
-credential can revoke a device); across remote hops (`on`), forwarding `device.invite`,
-`token.add`, `device.set`, `config.write` for `devices.toml` or `policy.toml`, and `fleet.sync`
-`push`/`pull` is refused by the forwarding node because credential expiry is not carried over RPC.
+host keys were resolved). Device management follows the same caller-scoping and `allow_owner` rules
+as `token.*`: creating a `device:<name>` principal or changing a device's role with `device.set`
+requires the `owner` role and `allow_owner=true` to grant `owner`. Expiring credentials (such as
+expiring HTTP bearer tokens) cannot mint or modify permanent device access: locally,
+`device.invite`, `device.set`, and any `devices.toml` merge that adds or changes a live entry are
+refused (pure tombstones are still allowed locally so an expiring credential can revoke a device);
+across remote hops (`on`), forwarding `device.invite`, `token.add`, `device.set`, `config.write`
+for `devices.toml` or `policy.toml`, and `fleet.sync` `push`/`pull` is refused by the forwarding
+node because credential expiry is not carried over RPC.
+
+**Trust rule for syncing paired devices:** a node trusts a paired device only if (a) it paired the
+device itself, (b) a caller with accepted credentials pushed it via `config.write` under this
+node's `policy.toml`, or (c) an owner on this node explicitly pulled it with
+`fleet.sync direction=pull from=<machine> documents='["devices.toml"]'`. Pushing
+(`fleet.sync direction=push`, and the automatic pushes after enrolment, `device.set`, and
+`device.remove`) sends local entries to peers and imports **only tombstones** back — never live
+device entries from a peer — so syncing out to a less-trusted or compromised peer cannot silently
+inject keys back onto the pushing machine. `fleet.sync direction=status` compares read-only.
+
 The registry owns only `device:*` principals it created for one pairing id — marked with
 `device = "<pairing id>"` in `policy.toml` — and refuses creating tokens, agents, or `--as`
-pairings on a registry-owned principal. Syncing `devices.toml` via `fleet.sync` or `config.write`
-always merges with the local file (tombstones always win and can never be dropped), restricts
-non-owner admins to devices pinned to their own principal without role changes, and reconciles only
-registry-owned `device:*` principals in `policy.toml` to the exact recorded role — leaving shared
-and unmarked `device:*` principals untouched (with a warning in the result and `meta.doctor`) and
-failing closed to `nobody` when a role is undefined on the receiving node or two live devices
-collide on one `device:*` principal.
+pairings on a registry-owned principal. Merging `devices.toml` via `fleet.sync` or `config.write`
+refuses incoming timestamps more than 10 minutes in the future, refuses introducing duplicate live
+public keys, always merges with the local file (tombstones always win and can never be dropped by
+syncing), restricts non-owner admins to devices pinned to their own principal (and pushes
+non-owner revocations independently of unrelated entries), and reconciles only registry-owned
+`device:*` principals in `policy.toml` to the exact recorded role — leaving shared and unmarked
+`device:*` principals untouched (with a warning in the result and `meta.doctor`) and failing closed
+to `nobody` when a role is undefined on the receiving node or two live devices collide on one
+`device:*` principal. If two live entries in `devices.toml` ever share a public key (or collide
+with a foreign line in `authorized_keys`), no `authorized_keys` line is written for any colliding
+entry and both `device.list` and `meta.doctor` warn loudly. Tombstones stay permanently through
+syncs; an owner can drop tombstones older than 400 days with `device.list prune_tombstones=true`
+only after every peer in `fleet.toml` has acknowledged them.
 
-Removing a device with `legion device.remove` writes a tombstone to `devices.toml`, removes its
-unused `device:*` principal and `authorized_keys` line, immediately terminates any live gate
-processes (after verifying each target PID runs this `legion` executable) and verified same-account
-parent `sshd` connections (including multiplexed `ControlMaster` connections, reporting
-`sessions_ended`), reports any still-running background jobs started by that device in
-`jobs_left_running` without killing them, and pushes the tombstone to reachable peers in
+Each device records `paired_by = { principal, device }` captured from the invite creator. When a
+device is tombstoned, any live descendant with `paired_by.device == <tombstoned id>` and
+`paired_at >= tomb.removed_at` — and transitively its unconfirmed descendants — is automatically
+quarantined (omitted from `authorized_keys`, restricted to `nobody`, refused by `legion gate`, and
+flagged loudly in `device.list` and `meta.doctor`) until an owner explicitly confirms it with
+`legion device.set id=<pairing_id> confirm=true` (recording `confirmed_by`).
+
+Removing a device with `legion device.remove` writes the tombstone to `devices.toml` first before
+cleaning up its unused `device:*` principal and `authorized_keys` line, immediately terminates any
+live gate processes (after verifying each target PID runs this `legion` executable) and verified
+same-account parent `sshd` connections (disambiguated by pairing id, including multiplexed
+`ControlMaster` connections, reporting `sessions_ended`, even if a later reconciliation step fails
+after `devices.toml` was saved), reports any still-running background jobs started by that device
+in `jobs_left_running` without killing them, and pushes the tombstone to reachable peers in
 `fleet.toml` (any peer that receives a tombstone via `fleet.sync` / `config.write` immediately
-ends that device's active sessions too). Machines that could not be reached keep trusting the
-removed device until their next `fleet.sync`, and `device.remove` names them in `still_trusted_by`.
-After registering its session record, `legion gate` re-checks `devices.toml` for its exact
-`--device`, `--pairing` id, and principal before serving and terminates its verified same-account
-parent `sshd` only on `Denied`, so neither a newly opened channel on an already-open connection
+ends that device's active sessions too). **Honest limit without a central hub:** a removed device
+that held an `owner` or `exec` role can, on any machine that has not yet heard about the removal,
+still act with that machine's own authority until the tombstone arrives (including creating further
+devices, which are quarantined once the removal syncs unless the machine itself was altered outside
+Legion). Removal is complete only when every machine in the fleet has received the tombstone, and
+`device.remove` names every machine that was not reached in `still_trusted_by` (never silently
+returning an empty map when a push fails or cannot run). After registering its session record,
+`legion gate` verifies the on-disk `authorized_keys` public key against `devices.toml`, checks
+quarantine and key conflicts, and terminates its verified same-account parent `sshd` only on
+`Denied`, so neither a newly opened channel on an already-open connection, a stale key on disk,
 nor a later re-pair under the same name can revive a removed pairing, while transient non-`Denied`
 errors refuse only that session without tearing down an unrelated healthy connection. Owner callers
 can inspect foreign or orphaned Legion lines in `device.list` and remove them explicitly with
-`device.remove ... foreign=true` (`meta.doctor` warns when orphaned keys exist or when a reachable
-peer's `devices.toml` differs; removing a foreign device deletes its key without ending sessions
-tracked under that other home and reports `sessions_not_ended: true`). On Windows, forced commands
-on shared `administrators_authorized_keys` pin `--account`, set file ownership to
-`BUILTIN\Administrators`, refuse PowerShell Unicode single-quote delimiters (`U+2018`–`U+201B`),
-and scope `device.list` / `device.remove` to the caller's own account.
+`device.remove ... foreign=true` (`meta.doctor` warns when orphaned keys exist, when devices are
+quarantined, when keys collide, or when peers have not synced yet; removing a foreign device
+deletes its key without ending sessions tracked under that other home and reports
+`sessions_not_ended: true`). On Windows, forced commands on shared
+`administrators_authorized_keys` pin `--account`, set file ownership to `BUILTIN\Administrators`,
+refuse PowerShell Unicode single-quote delimiters (`U+2018`–`U+201B`), and scope `device.list` /
+`device.remove` to the caller's own account.
 
 ### HTTP bearer tokens and MCP sessions
 
