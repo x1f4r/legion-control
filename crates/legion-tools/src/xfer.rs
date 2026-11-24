@@ -60,6 +60,7 @@ struct ManifestResult {
     total: usize,
     truncated: bool,
     skipped: Vec<SkippedEntry>,
+    skipped_total: usize,
 }
 
 async fn manifest_tool(ctx: &Ctx, args: ManifestArgs) -> Result<ManifestResult, ToolError> {
@@ -98,14 +99,18 @@ async fn manifest_tool(ctx: &Ctx, args: ManifestArgs) -> Result<ManifestResult, 
         }
     };
     let total = manifest.entries.len();
+    let skipped_total = manifest.skipped.len();
     let mut entries = manifest.entries;
     entries.truncate(limit);
+    let mut skipped = manifest.skipped;
+    skipped.truncate(limit);
     Ok(ManifestResult {
         path: root.to_string_lossy().into_owned(),
-        truncated: total > entries.len(),
+        truncated: total > entries.len() || skipped_total > skipped.len(),
         entries,
         total,
-        skipped: manifest.skipped,
+        skipped,
+        skipped_total,
     })
 }
 
@@ -129,49 +134,52 @@ pub fn resolve_root(grant: &Grant, path: &str, access: Access) -> Result<PathBuf
 /// Lists `root`, already checked with [`resolve_root`], the way a transfer compares it.
 ///
 /// A role without `effect:admin` may list a tree that holds Legion's own configuration or state
-/// (a home directory does), but not what is in them, so those entries are left out and named in
-/// `skipped`, just as every file tool refuses them one by one.
+/// (a home directory does), but not what is in them: the walk does not go into them at all, so
+/// nothing there is read, hashed or named, and each is named in `skipped` instead, just as every
+/// file tool refuses them one by one.
 pub fn manifest(
     grant: &Grant,
     paths: &Paths,
     root: &Path,
     options: &ManifestOptions,
 ) -> Result<Manifest, ErrorBody> {
-    let mut manifest = legion_xfer::manifest::build(root, options).map_err(error)?;
     if grant.allows_effect(Effect::Admin) {
-        return Ok(manifest);
+        return legion_xfer::manifest::build(root, options).map_err(error);
     }
-    let Ok(canonical_root) = dunce::canonicalize(root) else {
-        return Ok(manifest);
-    };
-    for (dir, what) in [
+    let own: Vec<(PathBuf, &str)> = [
         (paths.config_dir(), "Legion's own configuration"),
         (paths.state_dir(), "Legion's own state"),
-    ] {
-        let Ok(canonical) = dunce::canonicalize(dir) else {
-            continue;
-        };
-        let Some(rel) = relative_name(&canonical_root, &canonical) else {
-            continue;
-        };
-        let inside = |path: &str| {
-            path == rel
-                || path
-                    .strip_prefix(rel.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-        };
-        let before = manifest.entries.len();
-        manifest.entries.retain(|entry| !inside(&entry.path));
-        if manifest.entries.len() != before {
-            manifest.skipped.push(SkippedEntry {
-                path: rel.clone(),
-                reason: format!(
-                    "{what}, which only a role that allows effect:admin may read or change"
-                ),
-            });
+    ]
+    .into_iter()
+    .filter_map(|(dir, what)| dunce::canonicalize(dir).ok().map(|dir| (dir, what)))
+    .collect();
+    let prune = |dir: &Path| {
+        // Only a directory with the same name can be one of them; only those are resolved.
+        own.iter()
+            .find(|(own, _)| {
+                own.file_name() == dir.file_name()
+                    && dunce::canonicalize(dir).is_ok_and(|dir| dir == *own)
+            })
+            .map(|(_, what)| {
+                format!("{what}, which only a role that allows effect:admin may read or change")
+            })
+    };
+    let mut manifest = legion_xfer::manifest::build_pruned(root, options, prune).map_err(error)?;
+    // Whatever names the walk still reported from inside them, which it should not have, is
+    // dropped as well.
+    if let Ok(canonical_root) = dunce::canonicalize(root) {
+        for (dir, _) in &own {
+            if let Some(rel) = relative_name(&canonical_root, dir) {
+                let below = format!("{rel}/");
+                manifest
+                    .entries
+                    .retain(|entry| entry.path != rel && !entry.path.starts_with(&below));
+                manifest
+                    .skipped
+                    .retain(|entry| !entry.path.starts_with(&below));
+            }
         }
     }
-    manifest.skipped.sort();
     Ok(manifest)
 }
 

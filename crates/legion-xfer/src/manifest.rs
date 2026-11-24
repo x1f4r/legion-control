@@ -147,6 +147,16 @@ pub struct ManifestOptions {
 /// Symlinks are recorded with their targets and never followed. Individual entries inside a tree
 /// that fail to read are reported in [`Manifest::skipped`] instead of aborting the listing.
 pub fn build(root: &Path, options: &ManifestOptions) -> Result<Manifest> {
+    build_pruned(root, options, |_| None)
+}
+
+/// Like [`build`], asking `prune` about each directory below `root` before looking inside it: a
+/// directory for which it gives a reason is left out with everything in it, and named in
+/// [`Manifest::skipped`] with that reason. Nothing inside it is read, listed or hashed.
+pub fn build_pruned<F>(root: &Path, options: &ManifestOptions, mut prune: F) -> Result<Manifest>
+where
+    F: FnMut(&Path) -> Option<String>,
+{
     let matcher = ExcludeMatcher::compile(&options.exclude)?;
     let root_meta = fs::symlink_metadata(root).map_err(|e| classify_io(root, e))?;
 
@@ -161,6 +171,7 @@ pub fn build(root: &Path, options: &ManifestOptions) -> Result<Manifest> {
             "",
             &matcher,
             options.checksum,
+            &mut prune,
             &mut manifest.entries,
             &mut manifest.skipped,
         );
@@ -264,6 +275,7 @@ fn walk_entries(
     prefix: &str,
     matcher: &ExcludeMatcher,
     checksum: bool,
+    prune: &mut dyn FnMut(&Path) -> Option<String>,
     entries: &mut Vec<Entry>,
     skipped: &mut Vec<SkippedEntry>,
 ) {
@@ -302,6 +314,10 @@ fn walk_entries(
         }
 
         if is_dir {
+            if let Some(reason) = prune(&child.path) {
+                skipped.push(SkippedEntry { path: rel, reason });
+                continue;
+            }
             let sub_children = match read_dir_sorted(&child.path) {
                 Ok(c) => c,
                 Err(err) => {
@@ -321,7 +337,15 @@ fn walk_entries(
                 link_target: None,
                 hash: None,
             });
-            walk_entries(sub_children, &rel, matcher, checksum, entries, skipped);
+            walk_entries(
+                sub_children,
+                &rel,
+                matcher,
+                checksum,
+                prune,
+                entries,
+                skipped,
+            );
         } else {
             record_non_dir(&child.path, &rel, &meta, checksum, entries, skipped);
         }
@@ -634,6 +658,51 @@ mod tests {
 
         let paths: Vec<&str> = manifest.entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec!["keep.txt", "src", "src/main.rs"]);
+    }
+
+    #[test]
+    fn pruned_directories_are_named_and_never_entered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("keep/inner")).unwrap();
+        fs::create_dir_all(root.join("private/deeper")).unwrap();
+        fs::write(root.join("keep/inner/a.txt"), b"a").unwrap();
+        fs::write(root.join("private/deeper/secret.txt"), b"s").unwrap();
+
+        let mut asked = Vec::new();
+        let manifest = build_pruned(
+            root,
+            &ManifestOptions {
+                checksum: true,
+                exclude: Vec::new(),
+            },
+            |path| {
+                asked.push(path.strip_prefix(root).unwrap().to_path_buf());
+                (path.file_name() == Some(std::ffi::OsStr::new("private")))
+                    .then(|| "not for you".to_string())
+            },
+        )
+        .unwrap();
+
+        let paths: Vec<&str> = manifest.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["keep", "keep/inner", "keep/inner/a.txt"]);
+        assert_eq!(
+            manifest.skipped,
+            vec![SkippedEntry {
+                path: "private".to_string(),
+                reason: "not for you".to_string(),
+            }]
+        );
+        // Asked about each directory once, and never about what is inside a pruned one.
+        asked.sort();
+        assert_eq!(
+            asked,
+            vec![
+                Path::new("keep").to_path_buf(),
+                Path::new("keep/inner").to_path_buf(),
+                Path::new("private").to_path_buf(),
+            ]
+        );
     }
 
     #[test]

@@ -79,6 +79,10 @@ const EXIT_WAIT: Duration = Duration::from_secs(2);
 /// cleanly; over a slow link the exit status can trail the last byte.
 const FINISH_WAIT: Duration = Duration::from_secs(10);
 
+/// The most entries a listing from another node may hold. Both listings of a tree are compared
+/// in this node's memory; a tree bigger than this is transferred a subdirectory at a time.
+const MOST_LISTED_ENTRIES: usize = 1_000_000;
+
 /// How many paths a result lists in each of its lists; the counts are always whole.
 const MOST_LISTED: usize = 100;
 
@@ -1257,11 +1261,27 @@ impl Conn {
         }
     }
 
-    /// Reads a `manifest` reply: one entry per line, then the line that ends it.
+    /// Reads a `manifest` reply: one entry per line, then the line that ends it, which must come
+    /// and must count what came before it.
     async fn manifest(&mut self) -> Result<Manifest, ErrorBody> {
+        self.manifest_at_most(MOST_LISTED_ENTRIES).await
+    }
+
+    async fn manifest_at_most(&mut self, most: usize) -> Result<Manifest, ErrorBody> {
         let mut manifest = Manifest::default();
         loop {
             match self.first::<Listed>().await? {
+                Listed::Entry(_) if manifest.entries.len() == most => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "The tree on {} holds more than {most} entries, more than one transfer compares.",
+                            self.machine
+                        ),
+                    )
+                    .with_hint("Transfer its subdirectories one at a time.")
+                    .with_machine(self.machine.clone()));
+                }
                 Listed::Entry(entry) => manifest.entries.push(entry),
                 Listed::Done(done) => {
                     if done.entries != manifest.entries.len() as u64 {
@@ -1917,6 +1937,48 @@ mod tests {
         assert_eq!(error.machine.as_deref(), Some("tower"));
         assert_eq!(drain.await.unwrap(), 100);
         drop(source_out);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_is_bounded_and_must_end_with_its_count() {
+        let entry = |path: &str| {
+            format!(
+                "{{\"path\":\"{path}\",\"kind\":\"file\",\"size\":1,\"mtime\":{{\"secs\":1,\"nanos\":0}}}}\n"
+            )
+        };
+        let listing = |count: usize, done: Option<usize>| {
+            let mut text: String = (0..count).map(|at| entry(&format!("f{at}"))).collect();
+            if let Some(said) = done {
+                text.push_str(&format!("{{\"done\":true,\"entries\":{said}}}\n"));
+            }
+            text
+        };
+        for (text, most, code, says) in [
+            (
+                listing(4, Some(4)),
+                3,
+                ErrorCode::Failed,
+                "more than 3 entries",
+            ),
+            (
+                listing(2, Some(3)),
+                10,
+                ErrorCode::Failed,
+                "said it listed 3",
+            ),
+            (listing(2, None), 10, ErrorCode::Failed, "ended"),
+        ] {
+            let (mut conn, mut out, _in) = conn("pi");
+            out.write_all(text.as_bytes()).await.unwrap();
+            drop(out);
+            let error = conn.manifest_at_most(most).await.unwrap_err();
+            assert_eq!(error.code, code, "{error:?}");
+            assert!(error.message.contains(says), "{error:?}");
+            assert_eq!(error.machine.as_deref(), Some("pi"));
+        }
+        let (mut conn, mut out, _in) = conn("pi");
+        out.write_all(listing(3, Some(3)).as_bytes()).await.unwrap();
+        assert_eq!(conn.manifest_at_most(3).await.unwrap().entries.len(), 3);
     }
 
     #[test]
