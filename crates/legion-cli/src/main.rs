@@ -35,6 +35,7 @@ const USAGE_ERROR: u8 = 2;
 const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(4));
 
 fn main() -> ExitCode {
+    legion_core::record_current_exe();
     if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
         return code;
     }

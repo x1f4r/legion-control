@@ -155,7 +155,7 @@ impl<'a> Git<'a> {
 fn read_only_settings() -> Vec<String> {
     // Nothing can exist below a file, so a hooks directory under the running program is one that
     // is certainly missing, on every platform.
-    let no_hooks = std::env::current_exe()
+    let no_hooks = legion_core::current_exe()
         .map(|exe| exe.join("no-hooks"))
         .unwrap_or_else(|_| std::path::PathBuf::from("/dev/null/no-hooks"));
     vec![

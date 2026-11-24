@@ -507,12 +507,11 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
         CreateOutcome::Created { dir, record } => (dir, *record),
     };
 
-    let exe = match std::env::current_exe() {
+    let exe = match legion_core::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
-            let message = format!("Cannot locate the current legion executable: {err}.");
-            record_start_failure(&dir, &message).await;
-            return Err(ErrorBody::new(ErrorCode::Failed, message));
+            record_start_failure(&dir, &err.message).await;
+            return Err(err);
         }
     };
 

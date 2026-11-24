@@ -559,12 +559,7 @@ fn looks_like_already_exists(output: &str) -> bool {
 /// Resolves the absolute path of the running `legion` binary so registered MCP configs remain
 /// valid even when the agent spawns subprocesses with a minimal `PATH`.
 fn current_legion_exe() -> Result<String, ErrorBody> {
-    let exe = std::env::current_exe().map_err(|error| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Cannot determine the path of the running legion executable: {error}."),
-        )
-    })?;
+    let exe = legion_core::current_exe()?;
     let resolved = dunce::canonicalize(&exe).unwrap_or(exe);
     resolved.into_os_string().into_string().map_err(|path| {
         ErrorBody::new(

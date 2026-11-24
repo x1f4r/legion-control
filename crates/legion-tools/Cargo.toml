@@ -21,6 +21,7 @@ testing = ["legion-core/testing"]
 base64.workspace = true
 blake3.workspace = true
 dunce.workspace = true
+ed25519-dalek.workspace = true
 getrandom.workspace = true
 globset.workspace = true
 ignore.workspace = true

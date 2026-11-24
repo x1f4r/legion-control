@@ -27,6 +27,7 @@ toml.workspace = true
 toml_edit.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
 legion-tools = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }

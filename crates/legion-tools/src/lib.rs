@@ -7,8 +7,10 @@
 
 pub mod agent;
 pub mod audit;
+pub mod binfmt;
 pub mod exec;
 pub mod ext;
+pub mod floor;
 pub mod fs;
 pub mod job;
 pub mod meta;
@@ -19,6 +21,7 @@ pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod token;
+pub mod trust;
 pub mod update;
 pub mod xfer;
 

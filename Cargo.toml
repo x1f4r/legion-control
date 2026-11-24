@@ -17,6 +17,8 @@ legion-net = { path = "crates/legion-net" }
 legion-tools = { path = "crates/legion-tools" }
 legion-xfer = { path = "crates/legion-xfer" }
 dunce = "1.0.5"
+# Verifies offline Ed25519 release signatures over SHA256SUMS against the compiled-in public key.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast"] }
 gethostname = "1.1.0"
 jiff = { version = "1.0.2", default-features = false, features = ["std"] }
 libc = "0.2.191"
