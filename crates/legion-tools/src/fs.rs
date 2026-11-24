@@ -7,6 +7,7 @@
 
 mod platform;
 mod read;
+mod write;
 
 use std::ffi::OsString;
 use std::fs::{FileType, Metadata};
@@ -27,6 +28,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 /// Adds the `fs` tools.
 pub fn register(registry: &mut Registry) {
     read::register(registry);
+    write::register(registry);
 }
 
 /// The kind of a filesystem entry, reported without following symbolic links.
