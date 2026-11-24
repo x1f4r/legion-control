@@ -138,7 +138,7 @@ impl Backend for Launchd {
                             return Err(classify_error(
                                 &out.stderr.text,
                                 scope,
-                                Some((action, name)),
+                                Some((action, name, &boot)),
                                 use_sudo,
                                 &format!("bootstrap service {name:?}"),
                             ));
@@ -154,7 +154,7 @@ impl Backend for Launchd {
                         return Err(classify_error(
                             &out.stderr.text,
                             scope,
-                            Some((action, name)),
+                            Some((action, name, &cmd)),
                             use_sudo,
                             &format!("{} service {name:?}", action.as_str()),
                         ));
@@ -177,7 +177,7 @@ impl Backend for Launchd {
                         return Err(classify_error(
                             &out.stderr.text,
                             scope,
-                            Some((action, name)),
+                            Some((action, name, &cmd)),
                             use_sudo,
                             &format!("{} service {name:?}", action.as_str()),
                         ));
@@ -799,20 +799,20 @@ fn classify_print_error(stderr: &str, name: &str, scope: Scope) -> ErrorBody {
 pub(crate) fn classify_error(
     stderr: &str,
     scope: Scope,
-    control: Option<(Action, &str)>,
+    control: Option<(Action, &str, &CmdSpec)>,
     use_sudo: bool,
     what: &str,
 ) -> ErrorBody {
     let trimmed = stderr.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if let Some((action, name)) = control {
+    if let Some((action, name, cmd)) = control {
         let denied = is_sudo_denied(trimmed)
             || lower.contains("operation not permitted")
             || lower.contains("permission denied")
             || lower.contains("not privileged")
             || lower.contains("privileged");
         if scope == Scope::System && denied {
-            return unix_privilege_denied(action, name, use_sudo, trimmed);
+            return unix_privilege_denied(action, name, use_sudo, cmd, trimmed);
         }
         if lower.contains("could not find service") {
             return ErrorBody::new(
@@ -1126,5 +1126,29 @@ gui/501/com.example.plain = {
             Some(renamed.as_path())
         );
         assert_eq!(find_plist_in_dirs("com.example.absent", &dirs), None);
+    }
+
+    #[test]
+    fn privilege_refusal_includes_exact_sudo_argv_in_details() {
+        let cmd = kickstart_cmd("system", "com.example.daemon", true, Scope::System, false);
+        let denied = classify_error(
+            "Operation not permitted\n",
+            Scope::System,
+            Some((Action::Restart, "com.example.daemon", &cmd)),
+            false,
+            "restart service",
+        );
+        assert_eq!(denied.code, ErrorCode::Denied);
+        assert_eq!(
+            denied.details.as_ref().and_then(|d| d.get("argv")),
+            Some(&json!([
+                "sudo",
+                "-n",
+                "launchctl",
+                "kickstart",
+                "-k",
+                "system/com.example.daemon"
+            ]))
+        );
     }
 }

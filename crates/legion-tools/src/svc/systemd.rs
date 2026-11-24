@@ -93,7 +93,7 @@ impl Backend for Systemd {
                 return Err(classify_error(
                     &out.stderr.text,
                     scope,
-                    Some((action, name)),
+                    Some((action, name, &cmd)),
                     use_sudo,
                     &format!("{} service {name:?}", action.as_str()),
                 ));
@@ -641,7 +641,7 @@ pub(crate) fn is_missing_user_manager(stderr: &str) -> bool {
 pub(crate) fn classify_error(
     stderr: &str,
     scope: Scope,
-    control: Option<(Action, &str)>,
+    control: Option<(Action, &str, &CmdSpec)>,
     use_sudo: bool,
     what: &str,
 ) -> ErrorBody {
@@ -668,7 +668,7 @@ pub(crate) fn classify_error(
         .with_hint("This machine does not appear to be booted with systemd.");
     }
 
-    if let Some((action, name)) = control {
+    if let Some((action, name, cmd)) = control {
         let perm_denied = is_sudo_denied(trimmed)
             || lower.contains("interactive authentication required")
             || lower.contains("access denied")
@@ -676,7 +676,7 @@ pub(crate) fn classify_error(
             || lower.contains("authentication is required")
             || lower.contains("not authorized");
         if scope == Scope::System && perm_denied {
-            return unix_privilege_denied(action, name, use_sudo, trimmed);
+            return unix_privilege_denied(action, name, use_sudo, cmd, trimmed);
         }
         if lower.contains("not found")
             || lower.contains("not loaded")
@@ -1002,10 +1002,11 @@ InvocationID=abc123
         assert_eq!(missing.code, ErrorCode::Failed);
         assert!(missing.message.contains("user manager"));
 
+        let restart_cmd = control_cmd("nginx.service", Scope::System, Action::Restart, false);
         let denied = classify_error(
             "Failed to restart nginx.service: Interactive authentication required.\n",
             Scope::System,
-            Some((Action::Restart, "nginx.service")),
+            Some((Action::Restart, "nginx.service", &restart_cmd)),
             false,
             "restart service",
         );
@@ -1017,11 +1018,24 @@ InvocationID=abc123
                 .unwrap_or("")
                 .contains("[svc] sudo = true")
         );
+        assert_eq!(
+            denied.details.as_ref().and_then(|d| d.get("argv")),
+            Some(&json!([
+                "sudo",
+                "-n",
+                "systemctl",
+                "restart",
+                "--no-pager",
+                "--",
+                "nginx.service"
+            ]))
+        );
 
+        let stop_cmd = control_cmd("nginx.service", Scope::System, Action::Stop, true);
         let sudo_denied = classify_error(
             "sudo: a password is required\n",
             Scope::System,
-            Some((Action::Stop, "nginx.service")),
+            Some((Action::Stop, "nginx.service", &stop_cmd)),
             true,
             "stop service",
         );
@@ -1032,6 +1046,18 @@ InvocationID=abc123
                 .as_deref()
                 .unwrap_or("")
                 .contains("NOPASSWD")
+        );
+        assert_eq!(
+            sudo_denied.details.as_ref().and_then(|d| d.get("argv")),
+            Some(&json!([
+                "sudo",
+                "-n",
+                "systemctl",
+                "stop",
+                "--no-pager",
+                "--",
+                "nginx.service"
+            ]))
         );
     }
 

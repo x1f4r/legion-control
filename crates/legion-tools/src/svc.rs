@@ -280,6 +280,31 @@ pub struct ServiceSummary {
     pub description: Option<String>,
 }
 
+/// A scope that could not be queried when `svc.list` was called with `scope: "all"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScopeError {
+    /// Which scope failed (`"user"` or `"system"`).
+    pub scope: Scope,
+    /// Closed error code explaining the failure.
+    pub code: ErrorCode,
+    /// One-sentence description of why the scope could not be listed.
+    pub message: String,
+    /// What to do about it, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl ScopeError {
+    fn from_error(scope: Scope, error: ErrorBody) -> Self {
+        Self {
+            scope,
+            code: error.code,
+            message: error.message,
+            hint: error.hint,
+        }
+    }
+}
+
 /// What `svc.list` returns.
 #[derive(Debug, Serialize)]
 pub struct ListResult {
@@ -289,6 +314,10 @@ pub struct ListResult {
     pub services: Vec<ServiceSummary>,
     /// Whether more matching services existed beyond `limit`.
     pub truncated: bool,
+    /// Any scopes that failed when `scope: "all"` was requested; omitted when all queried scopes
+    /// succeeded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scope_errors: Vec<ScopeError>,
 }
 
 /// Arguments of `svc.status`.
@@ -458,6 +487,15 @@ impl StartIdentity {
 }
 
 async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
+    let backend = backend_for_os(ctx.os())?;
+    list_with_backend(backend, ctx, args).await
+}
+
+async fn list_with_backend(
+    backend: &dyn Backend,
+    ctx: &Ctx,
+    args: ListArgs,
+) -> Result<ListResult, ToolError> {
     if !(1..=LIST_LIMIT.1).contains(&args.limit) {
         return Err(ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -468,7 +506,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
         )
         .with_hint("Use `filter` or `state` to narrow the list."));
     }
-    let backend = backend_for_os(ctx.os())?;
+    let mut scope_errors = Vec::new();
     let mut services = match args.scope {
         ListScope::User => backend.list(ctx, Scope::User).await?,
         ListScope::System => backend.list(ctx, Scope::System).await?,
@@ -483,8 +521,14 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                         u.extend(s);
                         u
                     }
-                    (Err(_), Ok(s)) => s,
-                    (Ok(u), Err(_)) => u,
+                    (Err(u_err), Ok(s)) => {
+                        scope_errors.push(ScopeError::from_error(Scope::User, u_err));
+                        s
+                    }
+                    (Ok(u), Err(s_err)) => {
+                        scope_errors.push(ScopeError::from_error(Scope::System, s_err));
+                        u
+                    }
                     (Err(u_err), Err(_)) => return Err(u_err),
                 }
             }
@@ -514,6 +558,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
         backend: backend.kind(),
         services,
         truncated,
+        scope_errors,
     })
 }
 
@@ -1320,12 +1365,14 @@ mod tests {
     }
 
     type StatusQueueMap = BTreeMap<(Scope, String), Vec<Result<BackendStatus, ErrorBody>>>;
+    type ListResultMap = BTreeMap<Scope, Result<Vec<ServiceSummary>, ErrorBody>>;
     type ControlCall = (String, Scope, Action, bool);
 
     #[derive(Clone)]
     struct FakeBackend {
         kind: BackendKind,
         supports_user: bool,
+        lists: Arc<Mutex<ListResultMap>>,
         statuses: Arc<Mutex<StatusQueueMap>>,
         control_log: Arc<Mutex<Vec<ControlCall>>>,
         logs: Vec<String>,
@@ -1336,10 +1383,15 @@ mod tests {
             Self {
                 kind,
                 supports_user,
+                lists: Arc::new(Mutex::new(BTreeMap::new())),
                 statuses: Arc::new(Mutex::new(BTreeMap::new())),
                 control_log: Arc::new(Mutex::new(Vec::new())),
                 logs: vec!["boom: exit 1".to_owned()],
             }
+        }
+
+        fn set_list(&self, scope: Scope, result: Result<Vec<ServiceSummary>, ErrorBody>) {
+            self.lists.lock().unwrap().insert(scope, result);
         }
 
         fn push_status(&self, scope: Scope, name: &str, state: ServiceState) {
@@ -1394,9 +1446,16 @@ mod tests {
         fn list<'a>(
             &'a self,
             _ctx: &'a Ctx,
-            _scope: Scope,
+            scope: Scope,
         ) -> BoxFuture<'a, Result<Vec<ServiceSummary>, ErrorBody>> {
-            Box::pin(async { Ok(Vec::new()) })
+            let res = self
+                .lists
+                .lock()
+                .unwrap()
+                .get(&scope)
+                .cloned()
+                .unwrap_or_else(|| Ok(Vec::new()));
+            Box::pin(async move { res })
         }
 
         fn status<'a>(
@@ -1770,6 +1829,43 @@ mod tests {
             assert_eq!(err.code, ErrorCode::Failed);
             assert!(err.message.contains("still `running`"), "{}", err.message);
             assert!(err.hint.as_deref().unwrap_or("").contains("KeepAlive"));
+
+            // `svc.list` with scope `all` returns available scopes and reports which scope failed.
+            let partial = FakeBackend::new(BackendKind::Systemd, true);
+            partial.set_list(
+                Scope::User,
+                Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    "No systemd user manager is running for this session.",
+                )),
+            );
+            partial.set_list(
+                Scope::System,
+                Ok(vec![ServiceSummary {
+                    name: "sshd.service".to_owned(),
+                    scope: Scope::System,
+                    state: ServiceState::Running,
+                    enabled: Some(true),
+                    description: Some("OpenSSH daemon".to_owned()),
+                }]),
+            );
+            let listed = list_with_backend(
+                &partial,
+                ctx,
+                ListArgs {
+                    scope: ListScope::All,
+                    filter: None,
+                    state: None,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(listed.services.len(), 1);
+            assert_eq!(listed.services[0].name, "sshd.service");
+            assert_eq!(listed.scope_errors.len(), 1);
+            assert_eq!(listed.scope_errors[0].scope, Scope::User);
+            assert!(listed.scope_errors[0].message.contains("user manager"));
 
             Ok(json!({}))
         }

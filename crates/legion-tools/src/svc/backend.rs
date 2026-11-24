@@ -75,6 +75,14 @@ impl CmdSpec {
             env: self.env,
         }
     }
+
+    /// Returns `[program, args...]` as a single vector for diagnostics and sudoers hints.
+    pub(crate) fn argv(&self) -> Vec<String> {
+        let mut full = Vec::with_capacity(self.args.len() + 1);
+        full.push(self.program.clone());
+        full.extend(self.args.iter().cloned());
+        full
+    }
 }
 
 /// Detailed status returned by a backend for a single service.
@@ -260,29 +268,38 @@ fn map_os_error(error: OsError, program: &str) -> ErrorBody {
     }
 }
 
-/// Builds the privilege-refusal error for Unix system-scope control actions.
+/// Builds the privilege-refusal error for Unix system-scope control actions, including the exact
+/// `sudo -n` argv Legion would run in `details.argv`.
 pub(crate) fn unix_privilege_denied(
     action: Action,
     name: &str,
     use_sudo: bool,
+    cmd: &CmdSpec,
     stderr: &str,
 ) -> ErrorBody {
     let verb = action.as_str();
-    let hint = if use_sudo {
-        "Allow non-interactive sudo (`NOPASSWD`) for this command in sudoers, or set `[svc] sudo = false` in node.toml if this node should not escalate privileges."
+    let sudo_argv = if use_sudo {
+        cmd.argv()
     } else {
-        "Set `[svc] sudo = true` in node.toml and configure non-interactive sudoers rules (`NOPASSWD`) to let legion run system service changes through `sudo -n`. Enabling this lets any principal allowed svc.start, svc.stop or svc.restart control system services as root."
+        cmd.clone().with_sudo_n().argv()
     };
-    let mut err = ErrorBody::new(
+    let hint = if use_sudo {
+        "Allow the command in `details.argv` with `NOPASSWD` in sudoers, or set `[svc] sudo = false` in node.toml if this node should not escalate privileges."
+    } else {
+        "Set `[svc] sudo = true` in node.toml and allow the command in `details.argv` with `NOPASSWD` in sudoers so legion can run system service changes through `sudo -n`. Enabling this lets any principal allowed svc.start, svc.stop or svc.restart control system services as root."
+    };
+    let mut details = serde_json::Map::new();
+    details.insert("argv".to_owned(), json!(sudo_argv));
+    let detail = stderr.trim();
+    if !detail.is_empty() {
+        details.insert("stderr".to_owned(), Value::String(detail.to_owned()));
+    }
+    ErrorBody::new(
         ErrorCode::Denied,
         format!("Permission denied while trying to {verb} system service {name:?}."),
     )
-    .with_hint(hint);
-    let detail = stderr.trim();
-    if !detail.is_empty() {
-        err = err.with_details(json!({"stderr": detail}));
-    }
-    err
+    .with_hint(hint)
+    .with_details(Value::Object(details))
 }
 
 /// Whether `stderr` indicates a non-interactive `sudo -n` refusal.
