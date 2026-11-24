@@ -11,18 +11,17 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::ptr::null_mut;
+use std::sync::Mutex;
 
 use windows::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemTimeOfDayInformation,
 };
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-    ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    STILL_ACTIVE,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, STILL_ACTIVE,
 };
-use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
@@ -33,7 +32,7 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessTimes,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
     InitializeProcThreadAttributeList, IsProcessCritical, LPPROC_THREAD_ATTRIBUTE_LIST,
     OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
     PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -44,6 +43,16 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 
 use crate::procid::ProcessId;
 use crate::{OsError, Result};
+
+/// Serializes direct Windows detach spawns while temporary inheritable stdio duplicates exist
+/// across `CreateProcessW`.
+///
+/// Base log and `NUL` handles are opened non-inheritable; only short-lived duplicates created
+/// inside this lock are marked inheritable for `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` and closed
+/// immediately after `CreateProcessW` returns, before releasing the lock. (`std`'s own process
+/// spawn mutex is private, so this both serializes crate-internal spawns and shrinks the
+/// inheritable window against external `std::process::Command` spawns to the single syscall.)
+static DIRECT_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// RAII wrapper that closes a Win32 `HANDLE` on drop.
 struct OwnedHandle(HANDLE);
@@ -392,20 +401,16 @@ pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()
     }
 }
 
-fn open_inheritable_nul(access: u32) -> Result<OwnedHandle> {
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: BOOL(1),
-    };
+fn open_non_inheritable_nul(access: u32) -> Result<OwnedHandle> {
     let nul_wide = to_wide_null(OsStr::new("NUL"));
-    // SAFETY: `nul_wide` is NUL-terminated UTF-16 and `sa` is an initialized stack struct.
+    // SAFETY: `nul_wide` is NUL-terminated UTF-16; `None` security attributes mark the handle
+    // non-inheritable so concurrent spawns on other threads can never inherit it.
     let handle = unsafe {
         CreateFileW(
             PCWSTR::from_raw(nul_wide.as_ptr()),
             access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            Some(&sa),
+            None,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
             None,
@@ -417,20 +422,16 @@ fn open_inheritable_nul(access: u32) -> Result<OwnedHandle> {
     Ok(OwnedHandle(handle))
 }
 
-fn open_inheritable_append(path: &Path) -> Result<OwnedHandle> {
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: BOOL(1),
-    };
+fn open_non_inheritable_append(path: &Path) -> Result<OwnedHandle> {
     let path_wide = to_wide_null(path.as_os_str());
-    // SAFETY: `path_wide` is NUL-terminated UTF-16 and `sa` is an initialized stack struct.
+    // SAFETY: `path_wide` is NUL-terminated UTF-16; `None` security attributes mark the handle
+    // non-inheritable until a short-lived duplicate is created under `DIRECT_SPAWN_LOCK`.
     let handle = unsafe {
         CreateFileW(
             PCWSTR::from_raw(path_wide.as_ptr()),
             (FILE_APPEND_DATA | SYNCHRONIZE).0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            Some(&sa),
+            None,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             None,
@@ -440,6 +441,20 @@ fn open_inheritable_append(path: &Path) -> Result<OwnedHandle> {
         detail: format!("cannot open log file {}: {err}", path.display()),
     })?;
     Ok(OwnedHandle(handle))
+}
+
+fn duplicate_inheritable(source: HANDLE) -> Result<OwnedHandle> {
+    let mut dup = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns the current-process pseudo-handle, `source` is a valid
+    // open handle owned by this process, and `dup` is immediately wrapped in `OwnedHandle`.
+    unsafe {
+        let me = GetCurrentProcess();
+        DuplicateHandle(me, source, me, &mut dup, 0, true, DUPLICATE_SAME_ACCESS)
+    }
+    .map_err(|err| OsError::Platform {
+        detail: format!("DuplicateHandle for inheritable stdio failed: {err}"),
+    })?;
+    Ok(OwnedHandle(dup))
 }
 
 fn build_unicode_env_block(
@@ -488,9 +503,12 @@ fn build_unicode_env_block(
 }
 
 /// Spawn a detached Windows process via `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
-/// restricted strictly to the three freshly opened standard handles (`stdin` null, `stdout` and
-/// `stderr` log files or null), preventing any other inheritable handle in the parent process
-/// (such as parent stdout/stderr pipes) from leaking into the detached job.
+/// restricted strictly to short-lived inheritable duplicates of the three standard handles
+/// (`stdin` null, `stdout` and `stderr` log files or null).
+///
+/// The base log and `NUL` handles are opened non-inheritable before acquiring `DIRECT_SPAWN_LOCK`;
+/// inheritable duplicates exist only inside `DIRECT_SPAWN_LOCK` across `CreateProcessW` and are
+/// closed immediately afterwards so they cannot leak into other spawns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_detached_direct(
     program_display: &str,
@@ -502,7 +520,8 @@ pub(crate) fn spawn_detached_direct(
     stdout_path: Option<&Path>,
     stderr_path: Option<&Path>,
 ) -> std::result::Result<ProcessId, DirectSpawnError> {
-    let stdin_handle = open_inheritable_nul(GENERIC_READ.0).map_err(DirectSpawnError::Other)?;
+    // Open base stdio handles non-inheritable before taking the spawn lock.
+    let stdin_base = open_non_inheritable_nul(GENERIC_READ.0).map_err(DirectSpawnError::Other)?;
 
     let shared_logs = match (stdout_path, stderr_path) {
         (Some(out), Some(err)) => {
@@ -511,30 +530,34 @@ pub(crate) fn spawn_detached_direct(
         _ => false,
     };
 
-    let stdout_handle = match stdout_path {
-        Some(path) => open_inheritable_append(path).map_err(DirectSpawnError::Other)?,
-        None => open_inheritable_nul(GENERIC_WRITE.0).map_err(DirectSpawnError::Other)?,
+    let stdout_base = match stdout_path {
+        Some(path) => open_non_inheritable_append(path).map_err(DirectSpawnError::Other)?,
+        None => open_non_inheritable_nul(GENERIC_WRITE.0).map_err(DirectSpawnError::Other)?,
     };
-    let stderr_handle = if shared_logs || (stdout_path.is_none() && stderr_path.is_none()) {
+    let stderr_base = if shared_logs || (stdout_path.is_none() && stderr_path.is_none()) {
         None
     } else {
         Some(match stderr_path {
-            Some(path) => open_inheritable_append(path).map_err(DirectSpawnError::Other)?,
-            None => open_inheritable_nul(GENERIC_WRITE.0).map_err(DirectSpawnError::Other)?,
+            Some(path) => open_non_inheritable_append(path).map_err(DirectSpawnError::Other)?,
+            None => open_non_inheritable_nul(GENERIC_WRITE.0).map_err(DirectSpawnError::Other)?,
         })
     };
 
-    let h_in = stdin_handle.0;
-    let h_out = stdout_handle.0;
-    let h_err = stderr_handle.as_ref().map_or(h_out, |h| h.0);
-
-    // Build a deduplicated handle whitelist so ONLY these standard handles are inheritable.
-    let mut handle_list = Vec::with_capacity(3);
-    for h in [h_in, h_out, h_err] {
-        if !handle_list.contains(&h) {
-            handle_list.push(h);
-        }
-    }
+    let app_wide = application_name.map(|app| to_wide_null(OsStr::new(app)));
+    let app_pcwstr = match app_wide {
+        Some(ref buf) => PCWSTR::from_raw(buf.as_ptr()),
+        None => PCWSTR::null(),
+    };
+    let mut cmdline_wide: Vec<u16> = command_line
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let env_block = build_unicode_env_block(env_remove, env_overrides);
+    let cwd_wide = cwd.map(|dir| to_wide_null(dir.as_os_str()));
+    let cwd_pcwstr = match cwd_wide {
+        Some(ref buf) => PCWSTR::from_raw(buf.as_ptr()),
+        None => PCWSTR::null(),
+    };
 
     let mut attr_size = 0usize;
     // SAFETY: Querying the required attribute-list size passes `None` and a valid mutable `usize`.
@@ -560,49 +583,6 @@ pub(crate) fn spawn_detached_direct(
         ptr: attr_ptr,
     };
 
-    // SAFETY: `attr_list.ptr` is initialized for 1 attribute and `handle_list` stays alive
-    // through the `CreateProcessW` call below.
-    unsafe {
-        UpdateProcThreadAttribute(
-            attr_list.ptr,
-            0,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-            Some(handle_list.as_ptr().cast::<c_void>()),
-            handle_list.len() * size_of::<HANDLE>(),
-            None,
-            None,
-        )
-    }
-    .map_err(|err| {
-        DirectSpawnError::Other(OsError::Platform {
-            detail: format!("UpdateProcThreadAttribute(HANDLE_LIST) failed: {err}"),
-        })
-    })?;
-
-    let mut si = STARTUPINFOEXW::default();
-    si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    si.StartupInfo.hStdInput = h_in;
-    si.StartupInfo.hStdOutput = h_out;
-    si.StartupInfo.hStdError = h_err;
-    si.lpAttributeList = attr_list.ptr;
-
-    let app_wide = application_name.map(|app| to_wide_null(OsStr::new(app)));
-    let app_pcwstr = match app_wide {
-        Some(ref buf) => PCWSTR::from_raw(buf.as_ptr()),
-        None => PCWSTR::null(),
-    };
-    let mut cmdline_wide: Vec<u16> = command_line
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let env_block = build_unicode_env_block(env_remove, env_overrides);
-    let cwd_wide = cwd.map(|dir| to_wide_null(dir.as_os_str()));
-    let cwd_pcwstr = match cwd_wide {
-        Some(ref buf) => PCWSTR::from_raw(buf.as_ptr()),
-        None => PCWSTR::null(),
-    };
-
     let flags = CREATE_BREAKAWAY_FROM_JOB
         | CREATE_NO_WINDOW
         | CREATE_NEW_PROCESS_GROUP
@@ -610,31 +590,87 @@ pub(crate) fn spawn_detached_direct(
         | EXTENDED_STARTUPINFO_PRESENT;
 
     let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: All pointers (`app_wide`, `cmdline_wide`, `env_block`, `cwd_wide`, `si`,
-    // `attr_list`, `handle_list`) remain live and properly aligned/terminated across
-    // `CreateProcessW`, and `si.StartupInfo.cb == size_of::<STARTUPINFOEXW>()` matches
-    // `EXTENDED_STARTUPINFO_PRESENT`.
-    let create_res = unsafe {
-        CreateProcessW(
-            app_pcwstr,
-            Some(PWSTR::from_raw(cmdline_wide.as_mut_ptr())),
-            None,
-            None,
-            true,
-            flags,
-            Some(env_block.as_ptr().cast::<c_void>()),
-            cwd_pcwstr,
-            &si.StartupInfo,
-            &mut pi,
-        )
+    let create_res = {
+        let _spawn_guard = DIRECT_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let stdin_dup = duplicate_inheritable(stdin_base.0).map_err(DirectSpawnError::Other)?;
+        let stdout_dup = duplicate_inheritable(stdout_base.0).map_err(DirectSpawnError::Other)?;
+        let stderr_dup = match stderr_base {
+            Some(ref base) => Some(duplicate_inheritable(base.0).map_err(DirectSpawnError::Other)?),
+            None => None,
+        };
+
+        let h_in = stdin_dup.0;
+        let h_out = stdout_dup.0;
+        let h_err = stderr_dup.as_ref().map_or(h_out, |h| h.0);
+
+        let mut handle_list = Vec::with_capacity(3);
+        for h in [h_in, h_out, h_err] {
+            if !handle_list.contains(&h) {
+                handle_list.push(h);
+            }
+        }
+
+        // SAFETY: `attr_list.ptr` is initialized for 1 attribute and `handle_list` stays alive
+        // through the `CreateProcessW` call below.
+        unsafe {
+            UpdateProcThreadAttribute(
+                attr_list.ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(handle_list.as_ptr().cast::<c_void>()),
+                handle_list.len() * size_of::<HANDLE>(),
+                None,
+                None,
+            )
+        }
+        .map_err(|err| {
+            DirectSpawnError::Other(OsError::Platform {
+                detail: format!("UpdateProcThreadAttribute(HANDLE_LIST) failed: {err}"),
+            })
+        })?;
+
+        let mut si = STARTUPINFOEXW::default();
+        si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = h_in;
+        si.StartupInfo.hStdOutput = h_out;
+        si.StartupInfo.hStdError = h_err;
+        si.lpAttributeList = attr_list.ptr;
+
+        // SAFETY: All pointers (`app_wide`, `cmdline_wide`, `env_block`, `cwd_wide`, `si`,
+        // `attr_list`, `handle_list`) remain live and properly aligned/terminated across
+        // `CreateProcessW`, and `si.StartupInfo.cb == size_of::<STARTUPINFOEXW>()` matches
+        // `EXTENDED_STARTUPINFO_PRESENT`.
+        let res = unsafe {
+            CreateProcessW(
+                app_pcwstr,
+                Some(PWSTR::from_raw(cmdline_wide.as_mut_ptr())),
+                None,
+                None,
+                true,
+                flags,
+                Some(env_block.as_ptr().cast::<c_void>()),
+                cwd_pcwstr,
+                &si.StartupInfo,
+                &mut pi,
+            )
+        };
+
+        // Close all inheritable duplicates before releasing `DIRECT_SPAWN_LOCK`.
+        drop(attr_list);
+        drop(handle_list);
+        drop(stderr_dup);
+        drop(stdout_dup);
+        drop(stdin_dup);
+        res
     };
 
-    // Keep `attr_list`, `handle_list`, and stdio handles alive until `CreateProcessW` returns.
-    drop(attr_list);
-    drop(handle_list);
-    drop(stderr_handle);
-    drop(stdout_handle);
-    drop(stdin_handle);
+    drop(stderr_base);
+    drop(stdout_base);
+    drop(stdin_base);
 
     if let Err(err) = create_res {
         if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
