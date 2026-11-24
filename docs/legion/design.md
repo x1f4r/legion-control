@@ -266,6 +266,9 @@ A rule is a tool name, a glob over tool names, or `effect:<effect>`. Deny wins o
 principal the node has never heard of gets the built-in role `nobody`, which allows nothing. With
 no policy file at all, the only principal is `owner`, allowed everything: the default install
 behaves like the shell it was started from.
+Whatever its `paths`, a role's file tools stay out of the node's own configuration and state
+directories unless the role allows `effect:admin`, so a role that may write files cannot rewrite
+its own policy or the audit log of what it did.
 
 How far a principal can be trusted depends on the door, and the design says so plainly:
 

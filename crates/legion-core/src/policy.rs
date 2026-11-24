@@ -19,7 +19,12 @@
 //! anyone else, and `nobody`, which allows nothing and is what a principal the file does not name
 //! gets. With no file at all the only principal is `owner`, so a fresh install behaves like the
 //! shell it was started from.
+//!
+//! Whatever its `paths`, a role keeps its file tools out of the node's own configuration and state
+//! unless it allows `effect:admin`: a role that may write files could otherwise rewrite its own
+//! policy, or the audit log of what it did.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -28,11 +33,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use same_file::Handle;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::Document;
 use crate::glob;
+use crate::paths::Paths;
 
 /// The principal a local shell is, and the role that may do anything.
 pub const OWNER: &str = "owner";
@@ -327,14 +334,16 @@ impl Policy {
         }
     }
 
-    /// Whether `principal` may call the tool, and if so the grant its call carries.
+    /// Whether `principal` may call the tool, and if so the grant its call carries. `paths` are
+    /// the node's: the grant expands `~` to its home and keeps file tools out of its configuration
+    /// and state.
     pub fn authorize(
         &self,
         principal: &str,
         spec: &ToolSpec,
-        home: Option<&Path>,
+        paths: &Paths,
     ) -> Result<Grant, ErrorBody> {
-        let grant = self.grant(principal, home);
+        let grant = self.grant(principal, paths);
         let tool = &spec.name;
         let role = &grant.role;
         if let Some(rule) = grant.rules.deny.iter().find(|rule| rule.matches(spec)) {
@@ -375,13 +384,13 @@ impl Policy {
     }
 
     /// The grant a principal has, whatever it calls; what `meta.whoami` reports.
-    pub fn grant(&self, principal: &str, home: Option<&Path>) -> Grant {
+    pub fn grant(&self, principal: &str, paths: &Paths) -> Grant {
         let (role, rules) = self.role_of(principal);
         Grant {
             principal: principal.to_owned(),
             role,
             rules: Arc::new(rules),
-            home: home.map(Path::to_path_buf),
+            paths: paths.clone(),
         }
     }
 }
@@ -393,7 +402,7 @@ pub struct Grant {
     principal: String,
     role: String,
     rules: Arc<Role>,
-    home: Option<PathBuf>,
+    paths: Paths,
 }
 
 /// Whether a path is wanted for reading or for writing.
@@ -416,8 +425,8 @@ impl Access {
 
 impl Grant {
     /// The grant of the owner, for a node with no policy at all.
-    pub fn owner(home: Option<&Path>) -> Grant {
-        Policy::default().grant(OWNER, home)
+    pub fn owner(paths: &Paths) -> Grant {
+        Policy::default().grant(OWNER, paths)
     }
 
     /// The principal the call acts as.
@@ -439,6 +448,17 @@ impl Grant {
     pub fn allows(&self, spec: &ToolSpec) -> bool {
         !self.rules.deny.iter().any(|rule| rule.matches(spec))
             && self.rules.allow.iter().any(|rule| rule.matches(spec))
+    }
+
+    /// Whether this grant's role may use tools of this effect at all, decided as authorising a call
+    /// decides: a rule for the effect, or `*`, which covers every tool, allows it, and the same in
+    /// `deny` forbids it. A rule that names some tools says nothing about the effect as a whole.
+    pub fn allows_effect(&self, effect: Effect) -> bool {
+        let covers = |rule: &Rule| match rule {
+            Rule::Effect(of) => *of == effect,
+            Rule::Tools(pattern) => pattern.chars().all(|c| c == '*'),
+        };
+        !self.rules.deny.iter().any(covers) && self.rules.allow.iter().any(covers)
     }
 
     /// The directories file tools are confined to, as written in the policy, or `None` when they
@@ -472,7 +492,7 @@ impl Grant {
     /// does not protect the machine from a local attacker racing it.
     pub fn check_path(&self, path: impl AsRef<Path>, access: Access) -> Result<PathBuf, ErrorBody> {
         let given = path.as_ref();
-        let expanded = expand_tilde(given, self.home.as_deref())?;
+        let expanded = expand_tilde(given, self.paths.home())?;
         if !expanded.is_absolute() {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
@@ -495,9 +515,10 @@ impl Grant {
         }
 
         let Some(roots) = &self.rules.paths else {
-            return resolve_keeping_last(&expanded)
-                .map(|resolved| resolved.path())
-                .map_err(|error| error.unconfined(given));
+            let resolved =
+                resolve_keeping_last(&expanded).map_err(|error| error.unconfined(given))?;
+            self.keep_out_of_own_dirs(&resolved, given, access)?;
+            return Ok(resolved.path());
         };
         let denied = |reason: &str| {
             ErrorBody::new(
@@ -518,7 +539,7 @@ impl Grant {
         })?;
         let mut resolved_roots = Vec::with_capacity(roots.len());
         for root in roots {
-            let expanded = expand_tilde(Path::new(root.as_str()), self.home.as_deref())?;
+            let expanded = expand_tilde(Path::new(root.as_str()), self.paths.home())?;
             let resolved_root = resolve(&expanded).map_err(|error| {
                 let reason = match error {
                     Unresolved::Invalid(error) => error.message,
@@ -558,8 +579,124 @@ impl Grant {
                 return Err(outside());
             }
         }
+        self.keep_out_of_own_dirs(&resolved, given, access)?;
         Ok(resolved.path())
     }
+
+    /// The node's configuration and state directories, resolved as far as they exist, with the
+    /// identity of each that does.
+    fn own_dirs(&self) -> Result<Vec<OwnDir>, (PathBuf, Unresolved)> {
+        [
+            ("Legion's own configuration", self.paths.config_dir()),
+            ("Legion's own state", self.paths.state_dir()),
+        ]
+        .into_iter()
+        .map(|(what, dir)| {
+            let resolved = resolve(dir).map_err(|error| (dir.to_path_buf(), error))?;
+            let identity = if resolved.missing.is_empty() {
+                Handle::from_path(&resolved.existing).ok()
+            } else {
+                None
+            };
+            Ok(OwnDir {
+                what,
+                dir: dir.to_path_buf(),
+                resolved,
+                identity,
+            })
+        })
+        .collect()
+    }
+
+    /// Refuses a path in the node's own configuration or state to a role that does not allow
+    /// `effect:admin`, and so does a last part that is a symbolic link leading there, which a tool
+    /// writing through it would change.
+    fn keep_out_of_own_dirs(
+        &self,
+        resolved: &Resolved,
+        given: &Path,
+        access: Access,
+    ) -> Result<(), ErrorBody> {
+        if self.allows_effect(Effect::Admin) {
+            return Ok(());
+        }
+        let refuse = |reason: String| {
+            ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "{} may not {} {}: {reason}.",
+                    self.principal,
+                    access.verb(),
+                    given.display()
+                ),
+            )
+        };
+        let own = self.own_dirs().map_err(|(dir, error)| {
+            let reason = match error {
+                Unresolved::Invalid(error) => error.message,
+                Unresolved::Unclear(_, reason) => reason,
+            };
+            refuse(format!(
+                "Legion's own directory {} cannot be resolved ({reason}), so no path can be told apart from it",
+                dir.display()
+            ))
+            .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
+        })?;
+        let mut places = vec![Cow::Borrowed(resolved)];
+        if resolved.link.is_some() {
+            let target = link_target(resolved).map_err(|_| {
+                refuse("it is a symbolic link, and where it leads cannot be told".to_owned())
+            })?;
+            places.push(Cow::Owned(target));
+        }
+        for place in &places {
+            let ancestors: Vec<Handle> = place
+                .existing
+                .ancestors()
+                .filter_map(|ancestor| Handle::from_path(ancestor).ok())
+                .collect();
+            for dir in &own {
+                let inside = within(place, &dir.resolved, Platform::HOST)
+                    || dir
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| ancestors.contains(identity));
+                if inside {
+                    return Err(refuse(format!(
+                        "it is in {}, {}, which only a role that allows effect:admin may read or change",
+                        dir.dir.display(),
+                        dir.what
+                    ))
+                    .with_hint("Legion's own files are read through its tools, such as audit.tail and meta.whoami; ask the owner of this machine for more.")
+                    .with_details(json!({"path": resolved.path(), "directory": dir.dir})));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One of the node's own directories.
+struct OwnDir {
+    what: &'static str,
+    /// As the node's paths name it.
+    dir: PathBuf,
+    resolved: Resolved,
+    /// Which directory it is, when it exists, so a second name for it is known for what it is.
+    identity: Option<Handle>,
+}
+
+/// Where a last part that is a symbolic link leads, resolved as far as that exists.
+fn link_target(resolved: &Resolved) -> Result<Resolved, Unresolved> {
+    let link = resolved.path();
+    let target = std::fs::read_link(&link).map_err(|error| {
+        Unresolved::Unclear(
+            ErrorCode::Failed,
+            format!("{} cannot be read as a link ({error})", link.display()),
+        )
+    })?;
+    // A relative target is relative to the directory the link is in, which is what exists.
+    resolve(&resolved.existing.join(target))
 }
 
 /// Expands a leading `~` to the home directory. `~user` is refused rather than guessed at.
@@ -908,6 +1045,16 @@ mod tests {
     use super::*;
     use crate::config::parse;
 
+    /// Paths for a check that never looks at the disk.
+    fn nowhere() -> Paths {
+        Paths::under("/legion")
+    }
+
+    /// A node's directories under `dir`, with its home at `dir/home`.
+    fn under(dir: &Path) -> Paths {
+        Paths::under(dir.join("legion")).with_home(dir.join("home"))
+    }
+
     fn policy(text: &str) -> Policy {
         parse::<Policy>(Path::new("policy.toml"), text.as_bytes()).unwrap()
     }
@@ -945,11 +1092,15 @@ paths = ["~/projects/**"]
         assert_eq!(empty.default_principal(), "owner");
         assert!(
             empty
-                .authorize("owner", &spec("power.reboot", Effect::Power), None)
+                .authorize("owner", &spec("power.reboot", Effect::Power), &nowhere())
                 .is_ok()
         );
         let error = empty
-            .authorize("agent:claude", &spec("meta.version", Effect::Read), None)
+            .authorize(
+                "agent:claude",
+                &spec("meta.version", Effect::Read),
+                &nowhere(),
+            )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Denied);
         assert!(error.message.contains("nobody"), "{}", error.message);
@@ -959,7 +1110,9 @@ paths = ["~/projects/**"]
     fn rules_match_names_globs_and_effects_and_deny_wins() {
         let policy = policy(DESIGN_EXAMPLE);
         let allowed = |who: &str, name: &str, effect: Effect| {
-            policy.authorize(who, &spec(name, effect), None).is_ok()
+            policy
+                .authorize(who, &spec(name, effect), &nowhere())
+                .is_ok()
         };
         assert!(allowed("phone", "sys.info", Effect::Read));
         assert!(!allowed("phone", "fs.write", Effect::Write));
@@ -971,7 +1124,11 @@ paths = ["~/projects/**"]
         assert!(!allowed("agent:claude", "power.targets", Effect::Read));
         assert!(!allowed("agent:claude", "fleet.add", Effect::Admin));
         let error = policy
-            .authorize("agent:claude", &spec("fs.remove", Effect::Destroy), None)
+            .authorize(
+                "agent:claude",
+                &spec("fs.remove", Effect::Destroy),
+                &nowhere(),
+            )
             .unwrap_err();
         assert!(
             error.message.contains("rule fs.remove"),
@@ -986,7 +1143,11 @@ paths = ["~/projects/**"]
         let (role, _) = policy.role_of("agent:gemini");
         assert_eq!(role, "nobody");
         let error = policy
-            .authorize("agent:gemini", &spec("meta.version", Effect::Read), None)
+            .authorize(
+                "agent:gemini",
+                &spec("meta.version", Effect::Read),
+                &nowhere(),
+            )
             .unwrap_err();
         assert!(
             error
@@ -1069,14 +1230,14 @@ paths = ["~/projects/**"]
     #[test]
     fn a_grant_reports_what_its_role_allows() {
         let policy = policy(DESIGN_EXAMPLE);
-        let grant = policy.grant("agent:claude", None);
+        let grant = policy.grant("agent:claude", &nowhere());
         assert_eq!(grant.role(), "operator");
         assert!(!grant.delegates());
         assert!(grant.allows(&spec("fs.read", Effect::Read)));
         assert!(!grant.allows(&spec("fs.remove", Effect::Destroy)));
         assert_eq!(grant.roots(), Some(vec!["~/projects".to_owned()]));
-        assert!(Grant::owner(None).delegates());
-        assert_eq!(Grant::owner(None).roots(), None);
+        assert!(Grant::owner(&nowhere()).delegates());
+        assert_eq!(Grant::owner(&nowhere()).roots(), None);
     }
 
     #[test]
@@ -1115,8 +1276,7 @@ paths = ["~/projects/**"]
             std::fs::create_dir_all(dir.path().join("home").join("projects").join("app")).unwrap();
             std::fs::create_dir_all(dir.path().join("home").join(".ssh")).unwrap();
             std::fs::write(dir.path().join("home").join(".ssh").join("id"), "key").unwrap();
-            let grant =
-                policy(DESIGN_EXAMPLE).grant("agent:claude", Some(&dir.path().join("home")));
+            let grant = policy(DESIGN_EXAMPLE).grant("agent:claude", &under(dir.path()));
             Confined { dir, grant }
         }
 
@@ -1260,7 +1420,7 @@ paths = ["~/projects/**"]
         std::fs::create_dir_all(&real).unwrap();
         std::fs::create_dir_all(dir.path().join("home")).unwrap();
         symlink(&real, dir.path().join("home").join("projects")).unwrap();
-        let grant = policy(DESIGN_EXAMPLE).grant("agent:claude", Some(&dir.path().join("home")));
+        let grant = policy(DESIGN_EXAMPLE).grant("agent:claude", &under(dir.path()));
         let resolved = grant.check_path("~/projects/a.txt", Access::Write).unwrap();
         assert_eq!(resolved, dunce::canonicalize(&real).unwrap().join("a.txt"));
     }
@@ -1294,6 +1454,191 @@ paths = ["~/projects/**"]
         assert!(long.as_os_str().len() > 260);
         let checked = confined.grant.check_path(&long, Access::Write).unwrap();
         assert!(checked.ends_with(Path::new("directory29").join("file.txt")));
+    }
+
+    const KEEPERS: &str = r#"
+[principals."agent:claude"]
+role = "operator"
+
+[principals.phone]
+role = "observer"
+
+[principals.keeper]
+role = "keeper"
+
+[roles.operator]
+allow = ["effect:read", "effect:write"]
+deny = ["fs.remove"]
+paths = ["~/**"]
+
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.keeper]
+allow = ["effect:read", "effect:write", "effect:admin"]
+paths = ["~/**"]
+"#;
+
+    /// A node whose configuration and state live under its home, as they do by default.
+    struct Own {
+        _dir: tempfile::TempDir,
+        paths: Paths,
+        home: PathBuf,
+    }
+
+    impl Own {
+        fn new() -> Own {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            let paths = Paths::under(home.join(".legion")).with_home(&home);
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::write(paths.config_file("policy.toml"), KEEPERS).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+            std::fs::write(paths.audit_log(), "").unwrap();
+            std::fs::create_dir_all(home.join("projects")).unwrap();
+            let home = dunce::canonicalize(home).unwrap();
+            Own {
+                _dir: dir,
+                paths,
+                home,
+            }
+        }
+
+        fn grant(&self, who: &str) -> Grant {
+            policy(KEEPERS).grant(who, &self.paths)
+        }
+
+        fn check(&self, who: &str, path: &str, access: Access) -> Result<PathBuf, ErrorBody> {
+            self.grant(who).check_path(path, access)
+        }
+    }
+
+    #[test]
+    fn legion_s_own_files_are_kept_from_every_role_without_the_admin_effect() {
+        let own = Own::new();
+        for (who, path, access) in [
+            (
+                "agent:claude",
+                "~/.legion/config/policy.toml",
+                Access::Write,
+            ),
+            ("agent:claude", "~/.legion/config", Access::Write),
+            (
+                "agent:claude",
+                "~/.legion/config/tokens.toml",
+                Access::Write,
+            ),
+            ("agent:claude", "~/.legion/config/new/deeper", Access::Write),
+            ("agent:claude", "~/.legion/state/audit.jsonl", Access::Write),
+            ("agent:claude", "~/.legion/state/audit.jsonl", Access::Read),
+            (
+                "agent:claude",
+                "~/projects/../.legion/config/policy.toml",
+                Access::Read,
+            ),
+            ("phone", "~/.legion/state/audit.jsonl", Access::Read),
+        ] {
+            let error = own.check(who, path, access).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Denied, "{who} {path}");
+            assert!(
+                error.message.contains("effect:admin") && error.message.contains(".legion"),
+                "{}",
+                error.message
+            );
+        }
+        assert!(
+            own.check("agent:claude", "~/projects/notes.txt", Access::Write)
+                .is_ok()
+        );
+        assert!(own.check("agent:claude", "~/.legion", Access::Read).is_ok());
+        assert!(
+            own.check("keeper", "~/.legion/config/policy.toml", Access::Write)
+                .is_ok()
+        );
+        let audit_log = own.home.join(".legion").join("state").join("audit.jsonl");
+        assert!(
+            Grant::owner(&own.paths)
+                .check_path(&audit_log, Access::Write)
+                .is_ok()
+        );
+
+        // Before the node has written anything there, its directories are kept all the same.
+        std::fs::remove_dir_all(own.paths.config_dir()).unwrap();
+        let error = own
+            .check(
+                "agent:claude",
+                "~/.legion/config/policy.toml",
+                Access::Write,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_do_not_lead_a_role_into_legion_s_own_files() {
+        use std::os::unix::fs::symlink;
+        let own = Own::new();
+        let legion = own.home.join(".legion");
+        let projects = own.home.join("projects");
+        symlink(legion.join("config"), projects.join("conf")).unwrap();
+        symlink(
+            legion.join("config").join("policy.toml"),
+            projects.join("policy"),
+        )
+        .unwrap();
+        // It leads nowhere yet; written through, it would create tokens.toml.
+        symlink(
+            legion.join("config").join("tokens.toml"),
+            projects.join("tokens"),
+        )
+        .unwrap();
+        for path in [
+            "~/projects/conf/policy.toml",
+            "~/projects/policy",
+            "~/projects/tokens",
+        ] {
+            for who in ["agent:claude", "phone"] {
+                let checked = own.check(who, path, Access::Write);
+                assert_eq!(
+                    checked.map_err(|error| error.code),
+                    Err(ErrorCode::Denied),
+                    "{who} {path}"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn another_spelling_does_not_lead_a_role_into_legion_s_own_files() {
+        let own = Own::new();
+        let error = own
+            .check(
+                "agent:claude",
+                "~/.LEGION/Config/policy.toml",
+                Access::Write,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+    }
+
+    #[test]
+    fn a_role_allows_an_effect_as_a_whole_only_by_the_effect_or_by_star() {
+        let policy = policy(&format!(
+            "{KEEPERS}\n[principals.most]\nrole = \"most\"\n[roles.most]\nallow = [\"*\"]\ndeny = [\"effect:admin\"]\n\n[principals.files]\nrole = \"files\"\n[roles.files]\nallow = [\"fs.*\"]\n"
+        ));
+        let allows =
+            |who: &str, effect: Effect| policy.grant(who, &nowhere()).allows_effect(effect);
+        assert!(allows("agent:claude", Effect::Write));
+        assert!(!allows("agent:claude", Effect::Admin));
+        assert!(!allows("agent:claude", Effect::Exec));
+        assert!(allows("keeper", Effect::Admin));
+        assert!(allows("owner", Effect::Admin));
+        assert!(allows("most", Effect::Destroy));
+        assert!(!allows("most", Effect::Admin));
+        assert!(!allows("files", Effect::Write));
+        assert!(!allows("stranger", Effect::Read));
     }
 
     fn resolved(existing: &str, missing: &[&str]) -> Resolved {
@@ -1379,7 +1724,7 @@ paths = ["~/projects/**"]
     #[test]
     fn an_unconfined_grant_still_resolves_and_refuses_relative_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let grant = Grant::owner(Some(dir.path()));
+        let grant = Grant::owner(&Paths::under(dir.path().join("legion")).with_home(dir.path()));
         let resolved = grant
             .check_path("~/anything/at/all", Access::Write)
             .unwrap();

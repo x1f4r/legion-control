@@ -12,6 +12,7 @@ dunce.workspace = true
 gethostname.workspace = true
 jiff.workspace = true
 legion-proto.workspace = true
+same-file.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_ignored.workspace = true

@@ -245,7 +245,7 @@ impl Node {
         let Some(tool) = self.inner.registry.get(&call.tool) else {
             return (Some(principal), Err(self.unknown_tool(&call.tool, name)));
         };
-        let grant = match policy.authorize(&principal, tool.spec(), self.inner.paths.home()) {
+        let grant = match policy.authorize(&principal, tool.spec(), &self.inner.paths) {
             Ok(grant) => grant,
             Err(error) => return (Some(principal), Err(error)),
         };

@@ -335,6 +335,25 @@ async fn the_grant_confines_paths_for_the_tool() {
     );
 }
 
+#[tokio::test]
+async fn file_tools_keep_out_of_the_node_s_own_files_unless_the_role_administers_it() {
+    let fixture = Fixture::new();
+    fixture.write_config("policy.toml", POLICY);
+    let policy_file = fixture.dir.path().join("config").join("policy.toml");
+    let mut call = Call::new(Door::Cli, "t.path", json!({"path": policy_file}));
+    call.as_principal = Some("phone".to_owned());
+    let error = fixture.node.call(call).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    assert!(error.message.contains("effect:admin"), "{}", error.message);
+    // The owner's role allows everything, admin included.
+    assert!(
+        fixture
+            .call("t.path", json!({"path": policy_file}))
+            .await
+            .is_ok()
+    );
+}
+
 // The clock is paused and moves on only when nothing else can, so the grace a tool that never looks
 // at its token is given passes at once.
 #[tokio::test(start_paused = true)]
