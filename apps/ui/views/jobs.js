@@ -96,7 +96,7 @@ export function JobsView({
       ${jobs === null
         ? html`<div class="empty">Loading jobs…</div>`
         : jobs.length === 0
-          ? html`<div class="empty">No background jobs yet.</div>`
+          ? html`<div class="empty">No background jobs recorded.</div>`
           : html`
               ${running.length > 0
                 ? html`

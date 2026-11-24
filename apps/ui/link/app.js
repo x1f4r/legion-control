@@ -1,8 +1,16 @@
-// Native app link: calls the Tauri 2 shell through window.__TAURI__.core.invoke.
+// Native app link: calls the Tauri 2 shell through window.__TAURI__.core.invoke and Channel.
 
-function invoke(command, payload) {
+function tauriCore() {
   const tauri = typeof window !== 'undefined' ? window.__TAURI__ : null;
   if (!tauri || !tauri.core || typeof tauri.core.invoke !== 'function') {
+    return null;
+  }
+  return tauri.core;
+}
+
+function invoke(command, payload) {
+  const core = tauriCore();
+  if (!core) {
     return Promise.reject({
       code: 'unsupported',
       message: 'The native Legion shell is not available in this window.',
@@ -10,7 +18,7 @@ function invoke(command, payload) {
       machine: null,
     });
   }
-  return tauri.core.invoke(command, payload);
+  return core.invoke(command, payload);
 }
 
 function normalizeError(err) {
@@ -51,25 +59,26 @@ export function createAppLink() {
 
   async function call(tool, args = {}, options = {}) {
     const { on, onEvent, signal } = options || {};
-    const callId = `c${nextCallId++}`;
-    let unlisten = null;
+    const id = `c${nextCallId++}`;
+    const core = tauriCore();
 
-    if (typeof onEvent === 'function' && window.__TAURI__?.event?.listen) {
-      try {
-        unlisten = await window.__TAURI__.event.listen(`legion:event:${callId}`, (evt) => {
-          onEvent(evt?.payload ?? evt);
-        });
-      } catch {
-        unlisten = null;
-      }
+    let channel = null;
+    if (typeof onEvent === 'function' && core && typeof core.Channel === 'function') {
+      channel = new core.Channel();
+      channel.onmessage = (evt) => {
+        try {
+          onEvent(evt);
+        } catch {
+          // Keep receiving events if a view callback throws.
+        }
+      };
     }
 
     const onAbort = () => {
-      invoke('cancel', { callId }).catch(() => {});
+      invoke('cancel', { id }).catch(() => {});
     };
     if (signal) {
       if (signal.aborted) {
-        if (unlisten) unlisten();
         throw {
           code: 'cancelled',
           message: 'The call was cancelled.',
@@ -81,23 +90,36 @@ export function createAppLink() {
     }
 
     try {
-      return await invoke('call', {
-        callId,
+      const payload = {
+        id,
         tool,
         args: args && typeof args === 'object' ? args : {},
         on: on ?? null,
-      });
+      };
+      if (channel) {
+        payload.onEvent = channel;
+      }
+      return await invoke('call', payload);
     } catch (err) {
       throw normalizeError(err);
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
-      if (typeof unlisten === 'function') unlisten();
     }
   }
 
-  async function pair(inviteText, deviceName) {
+  async function deviceName() {
     try {
-      return await invoke('pair', { inviteText, deviceName });
+      const name = await invoke('device_name');
+      return typeof name === 'string' ? name : '';
+    } catch {
+      return '';
+    }
+  }
+
+  async function pair(inviteText, name) {
+    try {
+      await invoke('pair', { inviteText, deviceName: name });
+      return await state();
     } catch (err) {
       throw normalizeError(err);
     }
@@ -113,7 +135,17 @@ export function createAppLink() {
 
   async function scanInvite() {
     try {
-      return await invoke('scanInvite');
+      const reply = await invoke('scan_invite');
+      if (typeof reply === 'string') return reply;
+      if (reply && (reply.use_plugin || reply.usePlugin || reply.mode === 'use_plugin')) {
+        const scanned = await invoke('plugin:barcode-scanner|scan', {
+          windowed: false,
+          formats: ['QR_CODE'],
+        });
+        if (typeof scanned === 'string') return scanned;
+        return scanned?.content || '';
+      }
+      return reply?.invite || reply?.content || '';
     } catch (err) {
       throw normalizeError(err);
     }
@@ -124,6 +156,7 @@ export function createAppLink() {
     state,
     tools,
     call,
+    deviceName,
     pair,
     unpair,
     scanInvite,

@@ -3,6 +3,7 @@
 import { html } from '../vendor/preact-htm.js';
 import { Meter, Notice } from './common.js';
 import {
+  firstSentence,
   formatDuration,
   formatElapsed,
   formatRelativeTime,
@@ -14,7 +15,7 @@ import { MachineDetail } from './machine.js';
 
 function machineSubtext(m) {
   if (!m.reachable) {
-    return m.reason || 'Did not answer';
+    return firstSentence(m.reason || m.error?.message) || 'Did not answer';
   }
   const parts = [];
   if (m.os) parts.push(osLabel(m.os));
@@ -120,9 +121,9 @@ export function MachinesView({
               )}
             </div>
           `
-        : !loading
-          ? html`<div class="empty">No machines found yet.</div>`
-          : null}
+        : loading
+          ? html`<div class="empty">Loading machines…</div>`
+          : html`<div class="empty">No machines configured yet.</div>`}
 
       ${runningJobs.length > 0
         ? html`

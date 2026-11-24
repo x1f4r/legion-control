@@ -1,6 +1,6 @@
 // First-start screen: bearer token entry for HTTP, or device pairing for the native app.
 
-import { html, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useState } from '../vendor/preact-htm.js';
 import { CopyButton, Notice } from './common.js';
 
 export function StartView({ link, linkState, onConnected }) {
@@ -14,6 +14,22 @@ export function StartView({ link, linkState, onConnected }) {
   const nodeName = linkState?.health?.node || 'this machine';
   const needsPairing = linkState?.needs === 'pairing' || link.kind === 'app';
 
+  useEffect(() => {
+    if (!needsPairing || typeof link.deviceName !== 'function') return;
+    let alive = true;
+    link
+      .deviceName()
+      .then((name) => {
+        if (alive && name) {
+          setDeviceName((prev) => (prev ? prev : name));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [link, needsPairing]);
+
   async function submitToken(e) {
     e.preventDefault();
     setError(null);
@@ -21,6 +37,7 @@ export function StartView({ link, linkState, onConnected }) {
     try {
       const next = await link.setToken(token);
       setToken('');
+      window.location.hash = '#/machines';
       onConnected(next);
     } catch (err) {
       setError(err);
@@ -35,7 +52,8 @@ export function StartView({ link, linkState, onConnected }) {
     try {
       const scanned = await link.scanInvite();
       if (scanned) {
-        const next = await link.pair(scanned, deviceName || undefined);
+        const next = await link.pair(scanned, deviceName.trim() || undefined);
+        window.location.hash = '#/machines';
         onConnected(next);
       }
     } catch (err) {
@@ -52,6 +70,7 @@ export function StartView({ link, linkState, onConnected }) {
     try {
       const next = await link.pair(invite.trim(), deviceName.trim() || undefined);
       setInvite('');
+      window.location.hash = '#/machines';
       onConnected(next);
     } catch (err) {
       setError(err);
@@ -74,6 +93,15 @@ export function StartView({ link, linkState, onConnected }) {
             <${CopyButton} text="legion pair --as phone" label="Copy command" iconOnly=${true} />
           </div>
           <p class="lede spaced">It shows a code. Scan it here, or paste the line under it.</p>
+          <label class="field">
+            <span>Name this device</span>
+            <input
+              type="text"
+              value=${deviceName}
+              onInput=${(e) => setDeviceName(e.target.value)}
+              placeholder="phone"
+            />
+          </label>
           ${error ? html`<${Notice} error=${error} />` : null}
           <div class="actions">
             <button type="button" class="btn primary" disabled=${busy} onClick=${onScan}>
@@ -99,15 +127,6 @@ export function StartView({ link, linkState, onConnected }) {
                       placeholder="Paste the invite line from legion pair"
                       required
                     ></textarea>
-                  </label>
-                  <label class="field">
-                    <span>Device name <em>optional</em></span>
-                    <input
-                      type="text"
-                      value=${deviceName}
-                      onInput=${(e) => setDeviceName(e.target.value)}
-                      placeholder="phone"
-                    />
                   </label>
                   <div class="actions">
                     <button type="submit" class="btn primary" disabled=${busy}>
@@ -136,17 +155,18 @@ export function StartView({ link, linkState, onConnected }) {
       </header>
       <main class="main">
         <h2 class="start-heading">Connect this browser to ${nodeName}.</h2>
-        <p class="lede">
-          Make a bearer token on that machine for a principal in policy.toml, then paste it below:
-        </p>
+        <p class="lede">On that machine, make a token for this browser and paste it here.</p>
         <div class="code">
           <code>legion token.add phone phone</code>
           <${CopyButton} text="legion token.add phone phone" label="Copy command" iconOnly=${true} />
         </div>
         <form onSubmit=${submitToken}>
-          <label class="field">
-            <span>Bearer token</span>
+          <div class="field">
+            <label htmlFor="start-token" class="field-label">
+              <span>Token</span>
+            </label>
             <input
+              id="start-token"
               type="password"
               autocomplete="off"
               spellcheck="false"
@@ -156,7 +176,7 @@ export function StartView({ link, linkState, onConnected }) {
               required
             />
             <small>Kept in this browser only. You can remove it anytime under This device.</small>
-          </label>
+          </div>
           ${error ? html`<${Notice} error=${error} />` : null}
           <div class="actions">
             <button type="submit" class="btn primary" disabled=${busy}>
@@ -165,10 +185,10 @@ export function StartView({ link, linkState, onConnected }) {
           </div>
         </form>
         <div class="notice spaced-lg">
-          <strong>What this token allows</strong>
+          <strong>What a token allows</strong>
           <span>
-            Every call runs as the token's principal and obeys that machine's policy.toml. Revoking
-            the token on the node disconnects this browser on the next request.
+            Everything this browser does runs as the role you gave the token, and that machine
+            keeps a record. Remove the token there and this browser is locked out at once.
           </span>
         </div>
       </main>

@@ -2,8 +2,16 @@
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
-import { clampPct, meterLevel } from '../lib/format.js';
+import { clampPct, meterLevel, tokenizeCode } from '../lib/format.js';
 import { classifyResult, fanOutEntries, isFanOut } from '../lib/result.js';
+
+// Renders text with single-backtick spans turned into inline <code> elements (text nodes only).
+export function CodeText({ text }) {
+  const parts = tokenizeCode(text);
+  return parts.map((part, i) =>
+    part.code ? html`<code key=${i}>${part.text}</code>` : part.text,
+  );
+}
 
 // Sets the --v custom property through CSSOM (allowed by strict style-src 'self' CSP).
 export function Meter({ value, level, className = '' }) {

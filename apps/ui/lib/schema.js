@@ -245,6 +245,130 @@ export function unavailableReason(tool, whoami) {
   return `Role "${role}" (${principal}) does not allow ${tool.name} (${tool.effect}).`;
 }
 
+const ALL_EFFECTS = ['read', 'write', 'exec', 'destroy', 'power', 'admin'];
+
+const MISSING_EFFECT_PHRASES = {
+  read: 'read machine state (read)',
+  write: 'change files (write)',
+  exec: 'run commands (exec)',
+  destroy: 'remove files or stop processes (destroy)',
+  power: 'change power state (power)',
+  admin: 'change settings or permissions (admin)',
+};
+
+function joinList(items, conj = 'or') {
+  if (items.length === 0) return '';
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return `${items[0]} ${conj} ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')} ${conj} ${items[items.length - 1]}`;
+}
+
+export function describeRoleAccess(whoami, tools) {
+  if (!whoami) return ['Permissions are decided by the node policy.'];
+  const allowed = new Set(whoami.tools || []);
+  const presentEffects = new Set();
+  const allowedEffects = new Set();
+  for (const t of tools || []) {
+    if (t.effect) presentEffects.add(t.effect);
+    if (allowed.has(t.name) && t.effect) allowedEffects.add(t.effect);
+  }
+  const orderedAllowed = ALL_EFFECTS.filter((e) => allowedEffects.has(e));
+  const missingPool = presentEffects.size > 0 ? ALL_EFFECTS.filter((e) => presentEffects.has(e)) : ALL_EFFECTS;
+  const missing = missingPool.filter((e) => !allowedEffects.has(e));
+
+  const lines = [];
+  if (orderedAllowed.length > 0) {
+    lines.push(`May run ${allowed.size} tools (${orderedAllowed.join(', ')}).`);
+  } else {
+    lines.push('May not run any tools.');
+  }
+  if (missing.length > 0 && orderedAllowed.length > 0) {
+    const phrases = missing.map((e) => MISSING_EFFECT_PHRASES[e] || e);
+    lines.push(`May not ${joinList(phrases, 'or')}.`);
+  }
+  if (Array.isArray(whoami.paths) && whoami.paths.length > 0) {
+    lines.push(`File tools are confined to ${whoami.paths.join(', ')}.`);
+  } else if (whoami.paths === null) {
+    lines.push('File tools have no extra path limit.');
+  }
+  if (whoami.delegate) {
+    lines.push('May act as another principal.');
+  }
+  return lines;
+}
+
+export function describePowerConfirm(toolName, target, args = {}, runningJobs = [], busyReasons = []) {
+  const machine = args?.machine || target || 'this machine';
+  const jobs = Array.isArray(runningJobs) ? runningJobs : [];
+  const reasons = Array.isArray(busyReasons) ? busyReasons : [];
+
+  function interruptionSummary() {
+    if (jobs.length === 1) return 'One job is running on it and will be interrupted.';
+    if (jobs.length > 1) return `${jobs.length} jobs are running on it and will be interrupted.`;
+    if (reasons.length > 0) return `It is busy right now: ${reasons.join(', ')}.`;
+    return 'Nothing is running on it.';
+  }
+
+  switch (toolName) {
+    case 'power.restart':
+      return args?.into
+        ? {
+            title: `Restart ${target} into ${args.into}?`,
+            confirmLabel: `Restart into ${args.into}`,
+            buttonLabel: `Restart ${target}`,
+            summary: interruptionSummary(),
+          }
+        : {
+            title: `Restart ${target} now?`,
+            confirmLabel: jobs.length > 0 ? 'Restart anyway' : `Restart ${target}`,
+            buttonLabel: `Restart ${target}`,
+            summary: interruptionSummary(),
+          };
+    case 'power.shutdown':
+      return {
+        title: `Shut down ${target} now?`,
+        confirmLabel: jobs.length > 0 ? 'Shut down anyway' : `Shut down ${target}`,
+        buttonLabel: `Shut down ${target}`,
+        summary: interruptionSummary(),
+      };
+    case 'power.sleep':
+      return {
+        title: `Put ${target} to sleep now?`,
+        confirmLabel: jobs.length > 0 ? 'Sleep anyway' : 'Sleep',
+        buttonLabel: `Sleep ${target}`,
+        summary: interruptionSummary(),
+      };
+    case 'power.wake':
+      return {
+        title: `Wake ${machine}?`,
+        confirmLabel: 'Wake',
+        buttonLabel: `Wake ${machine}`,
+        summary: `Send Wake-on-LAN packets for ${machine}.`,
+      };
+    case 'power.switch':
+      return {
+        title: args?.into ? `Switch ${machine} to ${args.into}?` : `Switch ${machine}?`,
+        confirmLabel: args?.into ? `Switch to ${args.into}` : `Switch ${machine}`,
+        buttonLabel: args?.into ? `Switch ${machine} to ${args.into}` : `Switch ${machine}`,
+        summary: interruptionSummary(),
+      };
+    case 'power.cancel':
+      return {
+        title: `Cancel pending power action on ${target}?`,
+        confirmLabel: 'Cancel action',
+        buttonLabel: 'Cancel pending action',
+        summary: `Stops any sleep, restart, or shutdown scheduled on ${target}.`,
+      };
+    default:
+      return {
+        title: `Run ${toolName} on ${target}?`,
+        confirmLabel: `Run ${toolName}`,
+        buttonLabel: `Run ${toolName}`,
+        summary: `This action will run on ${target}.`,
+      };
+  }
+}
+
 export function groupToolsByFamily(tools, query, allowedNames, whoami) {
   const needle = String(query || '').trim().toLowerCase();
   const allowedSet = allowedNames ? new Set(allowedNames) : null;

@@ -208,7 +208,8 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     await setTheme(page, 'dark');
 
     // Enter token and connect.
-    await page.getByLabel(/Bearer token/i).fill(fleet.token);
+    await page.getByText('What a token allows').waitFor();
+    await page.getByLabel('Token', { exact: true }).fill(fleet.token);
     await page.getByRole('button', { name: 'Connect' }).click();
 
     // Machines appear (both local tower and remote pi over command pipe).
@@ -253,13 +254,20 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     // Files tab: browse docs/ and preview hello.txt.
     await page.getByRole('tab', { name: 'Files' }).click();
     await page.locator('button.row', { hasText: 'docs/' }).click();
+    await page.locator('.crumbs a', { hasText: 'docs' }).waitFor();
+    await page.getByRole('button', { name: 'Copy path' }).waitFor();
     await page.locator('button.row', { hasText: 'hello.txt' }).click();
     await page.locator('pre.out').getByText('Hello from Legion real server preview.').waitFor();
+    await page.locator('button.btn.quiet', { hasText: 'Back to folder' }).waitFor();
     await maybeShot(page, 'real-phone-dark-machine-files');
 
-    // Power tab screenshot.
+    // Power tab screenshot and verb-labeled buttons.
     await page.getByRole('tab', { name: 'Power' }).click();
     await page.getByText('Power actions').waitFor();
+    await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
+    await page.getByRole('button', { name: 'Sleep', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Restart', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Shut down', exact: true }).waitFor();
     await maybeShot(page, 'real-phone-dark-machine-power');
 
     // Jobs top-level tab.
@@ -279,19 +287,30 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     await page.locator('.label', { hasText: /^tower$/i }).waitFor();
     await maybeShot(page, 'real-phone-dark-tools-fanout');
 
-    // Power tool: dry run runs without confirmation; real button opens confirmation sheet.
+    // Power tool: long description collapses behind disclosure, inline code has no raw backticks,
+    // dry run runs without confirmation, real button opens plain-word confirmation sheet.
     await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Tools' }).click();
     await page.getByLabel('Search tools').fill('power.restart');
     await page.locator('a.row', { hasText: 'power.restart' }).first().click();
+    const ledeText = await page.locator('.lede').innerText();
+    assert.ok(!ledeText.includes('`'), `raw backtick in tool lede: ${ledeText}`);
+    const moreDetails = page.locator('details.more', { hasText: 'More about this tool' });
+    if ((await moreDetails.count()) > 0) {
+      assert.equal(await moreDetails.first().getAttribute('open'), null);
+      await moreDetails.first().locator('summary').click();
+      assert.notEqual(await moreDetails.first().getAttribute('open'), null);
+      await moreDetails.first().locator('summary').click();
+    }
     await page.getByRole('button', { name: 'Try it (dry run)' }).click();
     await page.locator('dl.kv').getByText('restart').first().waitFor({ timeout: 10_000 });
     const dryText = await page.locator('.main').innerText();
     assert.match(dryText, /dry_run/);
     assert.match(dryText, /scheduled\s+no/i);
 
-    await page.getByRole('button', { name: 'Run power.restart' }).click();
+    await page.getByRole('button', { name: 'Restart tower', exact: true }).click();
     const dialog = page.getByRole('dialog');
     await dialog.waitFor();
+    await dialog.getByRole('heading', { name: 'Restart tower now?' }).waitFor();
     await maybeShot(page, 'real-phone-dark-power-sheet');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-power-sheet');
@@ -305,12 +324,22 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     );
     assert.equal(powerStatus.pending, undefined);
 
-    // This device screen.
+    // This device screen: multi-line allows + calm Forget this browser with confirmation sheet.
     await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /device/i }).click();
-    await page.getByText('Forget this browser').waitFor();
+    await page.getByText(/May not change settings or permissions/i).waitFor();
+    const forgetBtn = page.getByRole('button', { name: 'Forget this browser' });
+    await forgetBtn.waitFor();
+    assert.ok(!(await forgetBtn.getAttribute('class')).includes('danger'));
     await maybeShot(page, 'real-phone-dark-device');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-device');
+    await setTheme(page, 'dark');
+    await forgetBtn.click();
+    const forgetDialog = page.getByRole('dialog');
+    await forgetDialog.waitFor();
+    await forgetDialog.getByText('This browser will need a token again.').waitFor();
+    await forgetDialog.getByRole('button', { name: 'Cancel' }).click();
+    await forgetDialog.waitFor({ state: 'hidden' });
 
     await phoneCtx.close();
 
@@ -353,40 +382,75 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
 
     await wideCtx.close();
 
-    // ── Capture ?mock screenshots when requested ───────────────────────────────────────────────
-    if (SHOTS_DIR) {
-      for (const [label, viewport] of [
-        ['phone', { width: 390, height: 844 }],
-        ['wide', { width: 1100, height: 720 }],
-      ]) {
-        const ctx = await browser.newContext({ viewport, colorScheme: 'dark' });
-        const p = await ctx.newPage();
-        p.on('console', (msg) => {
-          if (msg.type() === 'error') consoleErrors.push(msg.text());
-        });
-        p.on('pageerror', (err) => pageErrors.push(String(err)));
+    // ── Mock mode checks (unreachable machine detail, remote tool error, pairing defaults) ────
+    const mockViewports = SHOTS_DIR
+      ? [
+          ['phone', { width: 390, height: 844 }],
+          ['wide', { width: 1100, height: 720 }],
+        ]
+      : [['phone', { width: 390, height: 844 }]];
 
-        await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
-        await p.getByText(/Pair this device/).waitFor();
-        await maybeShot(p, `mock-${label}-dark-start-pair`);
+    for (const [label, viewport] of mockViewports) {
+      const ctx = await browser.newContext({ viewport, colorScheme: 'dark' });
+      const p = await ctx.newPage();
+      p.on('console', (msg) => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      });
+      p.on('pageerror', (err) => pageErrors.push(String(err)));
+
+      await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
+      await p.getByText(/Pair this device/).waitFor();
+      assert.equal(await p.getByLabel('Name this device').inputValue(), 'Pixel 10');
+      await maybeShot(p, `mock-${label}-dark-start-pair`);
+      if (SHOTS_DIR) {
         await setTheme(p, 'light');
         await maybeShot(p, `mock-${label}-light-start-pair`);
+      }
 
+      if (SHOTS_DIR) {
         await p.goto(`${server.url}/?mock=token`, { waitUntil: 'domcontentloaded' });
         await p.getByText(/Connect this browser/).waitFor();
         await setTheme(p, 'dark');
         await maybeShot(p, `mock-${label}-dark-start-token`);
         await setTheme(p, 'light');
         await maybeShot(p, `mock-${label}-light-start-token`);
+      }
 
-        await p.goto(`${server.url}/?mock`, { waitUntil: 'domcontentloaded' });
-        await p.getByText('Machines · 3 of 4 answering').waitFor();
-        await setTheme(p, 'dark');
-        await maybeShot(p, `mock-${label}-dark-machines`);
+      await p.goto(`${server.url}/?mock`, { waitUntil: 'domcontentloaded' });
+      await p.getByText('Machines · 3 of 4 answering').waitFor();
+      await setTheme(p, 'dark');
+      await maybeShot(p, `mock-${label}-dark-machines`);
+      if (SHOTS_DIR) {
         await setTheme(p, 'light');
         await maybeShot(p, `mock-${label}-light-machines`);
         await setTheme(p, 'dark');
+      }
 
+      // Unreachable machine detail shows full message and hint.
+      await p.goto(`${server.url}/?mock#/machines/laptop`, { waitUntil: 'domcontentloaded' });
+      await p.getByText(/SSH timed out after 8 s/i).waitFor();
+      await p.getByText(/Check that laptop is powered on/i).waitFor();
+      await maybeShot(p, `mock-${label}-dark-laptop`);
+      if (SHOTS_DIR) {
+        await setTheme(p, 'light');
+        await maybeShot(p, `mock-${label}-light-laptop`);
+        await setTheme(p, 'dark');
+      }
+
+      // Remote tool target shows honest note and displays remote error cleanly.
+      await p.goto(`${server.url}/?mock#/tools/audit.tail`, { waitUntil: 'domcontentloaded' });
+      await p.locator('#tool-target-on').selectOption('pi');
+      await p.getByText(/pi checks its own tools and permissions\s+when you run/i).waitFor();
+      await p.getByRole('button', { name: 'Run', exact: true }).click();
+      await p.locator('.notice.bad').getByText(/may not call audit\.tail on pi/i).waitFor();
+      await maybeShot(p, `mock-${label}-dark-remote-error`);
+      if (SHOTS_DIR) {
+        await setTheme(p, 'light');
+        await maybeShot(p, `mock-${label}-light-remote-error`);
+        await setTheme(p, 'dark');
+      }
+
+      if (SHOTS_DIR) {
         await p.goto(`${server.url}/?mock#/machines/tower`, { waitUntil: 'domcontentloaded' });
         await p.getByText('Processor').waitFor();
         await setTheme(p, 'dark');
@@ -419,7 +483,7 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
         await setTheme(p, 'dark');
 
         await p.goto(`${server.url}/?mock#/tools/power.restart`, { waitUntil: 'domcontentloaded' });
-        await p.getByRole('button', { name: 'Run power.restart' }).click();
+        await p.getByRole('button', { name: 'Restart tower', exact: true }).click();
         await p.getByRole('dialog').waitFor();
         await maybeShot(p, `mock-${label}-dark-tools-sheet`);
         await setTheme(p, 'light');
@@ -431,9 +495,9 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
         await maybeShot(p, `mock-${label}-dark-device`);
         await setTheme(p, 'light');
         await maybeShot(p, `mock-${label}-light-device`);
-
-        await ctx.close();
       }
+
+      await ctx.close();
     }
 
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);

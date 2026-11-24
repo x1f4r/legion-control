@@ -3,9 +3,10 @@
 import { html, render, useCallback, useEffect, useMemo, useRef, useState } from './vendor/preact-htm.js';
 import { Icon, IconSprite } from './icons.js';
 import { createCache } from './lib/cache.js';
-import { formatRelativeTime } from './lib/format.js';
+import { firstSentence, formatRelativeTime } from './lib/format.js';
 import { fanOutEntries, isFanOut } from './lib/result.js';
 import { extractHashToken, parseRoute, routeHref } from './lib/route.js';
+import { describePowerConfirm } from './lib/schema.js';
 import { createLink } from './link/index.js';
 import { Notice, Sheet } from './views/common.js';
 import { DeviceView } from './views/device.js';
@@ -129,12 +130,16 @@ async function fetchFleetSnapshot(link, localNode) {
         ? Boolean(ping.reachable)
         : Boolean(sysEntry?.ok);
 
+    let error = null;
     let reason = null;
     if (!reachable) {
-      reason =
-        ping?.error?.message ||
-        sysEntry?.error?.message ||
-        'Did not answer';
+      error = ping?.error || sysEntry?.error || {
+        code: 'unreachable',
+        message: 'Did not answer.',
+        hint: null,
+        machine: name,
+      };
+      reason = firstSentence(error.message) || 'Did not answer';
     }
 
     for (const job of jobs) {
@@ -149,9 +154,11 @@ async function fetchFleetSnapshot(link, localNode) {
       thisNode: isLocal,
       reachable,
       reason,
+      error,
       busy,
       busyReasons,
       runningJobs: jobs.length,
+      jobs,
       os: sys?.os?.family || ping?.os || (isLocal ? localVersion?.os : null),
       arch: sys?.os?.arch || ping?.arch || (isLocal ? localVersion?.arch : null),
       version: ping?.version || (isLocal ? localVersion?.version : null),
@@ -258,7 +265,12 @@ function ConfirmSheet({ request, onClose }) {
               </button>
             `
           : null}
-        <button type="button" class="btn danger" disabled=${busy} onClick=${runReal}>
+        <button
+          type="button"
+          class=${request.danger === false ? 'btn primary full' : 'btn danger full'}
+          disabled=${busy}
+          onClick=${runReal}
+        >
           ${busy ? 'Running…' : request.confirmLabel || 'Confirm'}
         </button>
       </div>
@@ -270,6 +282,7 @@ function App() {
   const link = useMemo(() => createLink(), []);
   const cache = useMemo(() => createBrowserCache(), []);
   const shellRef = useRef(null);
+  const mainRef = useRef(null);
 
   const [theme, setTheme] = useState(() => readTheme());
   const [wide, setWide] = useState(() => window.innerWidth >= 820);
@@ -287,6 +300,8 @@ function App() {
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
   nodeInfoRef.current = nodeInfo;
+  const wideRef = useRef(wide);
+  wideRef.current = wide;
   const allowedSet = useMemo(
     () => (nodeInfo?.whoami?.tools ? new Set(nodeInfo.whoami.tools) : null),
     [nodeInfo],
@@ -295,6 +310,14 @@ function App() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  useEffect(() => {
+    if (mainRef.current) mainRef.current.scrollTop = 0;
+  }, [route.section]);
+
+  useEffect(() => {
+    if (!wide && mainRef.current) mainRef.current.scrollTop = 0;
+  }, [wide, route.machine, route.tab, route.tool, route.jobId]);
 
   useEffect(() => {
     const el = shellRef.current;
@@ -309,20 +332,26 @@ function App() {
   }, []);
 
   useEffect(() => {
-    function onHashChange() {
-      setRoute(parseRoute(window.location.hash));
+    function syncRoute() {
+      const next = parseRoute(window.location.hash);
+      setRoute((prev) => {
+        if (mainRef.current && (prev.section !== next.section || !wideRef.current)) {
+          mainRef.current.scrollTop = 0;
+        }
+        return next;
+      });
     }
     function onPopState() {
       if (sheetHistoryRef.current) {
         sheetHistoryRef.current = false;
         setConfirmRequest(null);
       }
-      setRoute(parseRoute(window.location.hash));
+      syncRoute();
     }
-    window.addEventListener('hashchange', onHashChange);
+    window.addEventListener('hashchange', syncRoute);
     window.addEventListener('popstate', onPopState);
     return () => {
-      window.removeEventListener('hashchange', onHashChange);
+      window.removeEventListener('hashchange', syncRoute);
       window.removeEventListener('popstate', onPopState);
     };
   }, []);
@@ -435,12 +464,13 @@ function App() {
 
   const onWakeMachine = useCallback(
     (machine) => {
+      const copy = describePowerConfirm('power.wake', machine.name, { machine: machine.name });
       openConfirm({
-        title: `Wake ${machine.name}?`,
-        summary: `Send Wake-on-LAN packets for ${machine.name}.`,
+        title: copy.title,
+        summary: copy.summary,
         tool: 'power.wake',
         effect: 'power',
-        confirmLabel: `Wake ${machine.name}`,
+        confirmLabel: copy.confirmLabel,
         canDryRun: true,
         async onDryRun() {
           return link.call('power.wake', { machine: machine.name, dry_run: true });
@@ -551,7 +581,7 @@ function App() {
           : html`
               <div class="app">
                 ${renderHeader()}
-                <main class="main">
+                <main ref=${mainRef} class="main">
                   ${route.section === 'machines'
                     ? html`
                         <${MachinesView}
@@ -604,6 +634,7 @@ function App() {
                               tools=${tools}
                               theme=${theme}
                               onChangeTheme=${setTheme}
+                              onRequestConfirm=${openConfirm}
                               onDisconnected=${async () => {
                                 cache.clear();
                                 setSnapshot(null);

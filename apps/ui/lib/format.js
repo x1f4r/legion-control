@@ -88,11 +88,36 @@ export function formatRelativeTime(value, nowMs = Date.now()) {
   return days === 1 ? '1 day ago' : `${days} days ago`;
 }
 
-export function firstSentence(text) {
-  if (!text) return '';
+export function splitFirstSentence(text) {
+  if (!text) return { first: '', rest: '' };
   const clean = String(text).replace(/\s+/g, ' ').trim();
-  const match = clean.match(/^(.+?[.!?])(?:\s|$)/);
-  return match ? match[1] : clean;
+  const match = clean.match(/^(.+?[.!?])(?:\s+([\s\S]+))?$/);
+  if (!match) return { first: clean, rest: '' };
+  return { first: match[1].trim(), rest: (match[2] || '').trim() };
+}
+
+export function firstSentence(text) {
+  return splitFirstSentence(text).first;
+}
+
+export function tokenizeCode(text) {
+  if (!text) return [];
+  const str = String(text);
+  const parts = [];
+  const regex = /`([^`\n]+)`/g;
+  let last = 0;
+  let match;
+  while ((match = regex.exec(str)) !== null) {
+    if (match.index > last) {
+      parts.push({ code: false, text: str.slice(last, match.index) });
+    }
+    parts.push({ code: true, text: match[1] });
+    last = match.index + match[0].length;
+  }
+  if (last < str.length) {
+    parts.push({ code: false, text: str.slice(last) });
+  }
+  return parts;
 }
 
 export function osLabel(family) {

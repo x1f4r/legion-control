@@ -1,36 +1,10 @@
 // This device screen: identity, role summary, link management, theme, and versions.
 
 import { html, useState } from '../vendor/preact-htm.js';
+import { describeRoleAccess } from '../lib/schema.js';
 import { Notice } from './common.js';
 
 export const UI_VERSION = '0.1.0';
-
-function roleSummary(whoami, tools) {
-  if (!whoami) return 'Permissions are decided by the node policy.';
-  const allowed = new Set(whoami.tools || []);
-  const effects = new Set();
-  for (const t of tools || []) {
-    if (allowed.has(t.name)) effects.add(t.effect);
-  }
-  const ordered = ['read', 'write', 'exec', 'destroy', 'power', 'admin'].filter((e) =>
-    effects.has(e),
-  );
-  const parts = [];
-  if (ordered.length > 0) {
-    parts.push(`May run ${allowed.size} tools (${ordered.join(', ')}).`);
-  } else {
-    parts.push('May not run any tools.');
-  }
-  if (Array.isArray(whoami.paths) && whoami.paths.length > 0) {
-    parts.push(`File tools are confined to ${whoami.paths.join(', ')}.`);
-  } else if (whoami.paths === null) {
-    parts.push('File tools have no extra path limit.');
-  }
-  if (whoami.delegate) {
-    parts.push('May act as another principal.');
-  }
-  return parts.join(' ');
-}
 
 export function DeviceView({
   link,
@@ -39,23 +13,33 @@ export function DeviceView({
   tools,
   theme,
   onChangeTheme,
+  onRequestConfirm,
   onDisconnected,
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const whoami = nodeInfo?.whoami;
+  const allowLines = describeRoleAccess(whoami, tools);
 
-  async function onForget() {
-    setBusy(true);
-    setError(null);
-    try {
-      await link.forget();
-      onDisconnected();
-    } catch (err) {
-      setError(err);
-    } finally {
-      setBusy(false);
-    }
+  function askForget() {
+    onRequestConfirm({
+      title: 'Forget this browser?',
+      summary: 'This browser will need a token again.',
+      confirmLabel: 'Forget this browser',
+      danger: false,
+      async onConfirm() {
+        setBusy(true);
+        setError(null);
+        try {
+          await link.forget();
+          await onDisconnected();
+        } catch (err) {
+          setError(err);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
   }
 
   async function onUnpair(node) {
@@ -63,7 +47,7 @@ export function DeviceView({
     setError(null);
     try {
       await link.unpair(node);
-      onDisconnected();
+      await onDisconnected();
     } catch (err) {
       setError(err);
     } finally {
@@ -87,34 +71,38 @@ export function DeviceView({
           <dt>door</dt>
           <dd>${whoami?.door || link.kind}</dd>
           <dt>allows</dt>
-          <dd>${roleSummary(whoami, tools)}</dd>
+          <dd class="allows-lines">
+            ${allowLines.map((line, i) => html`<span key=${i}>${line}</span>`)}
+          </dd>
         </dl>
       </div>
 
       <p class="label">Link</p>
       ${link.kind === 'app'
-        ? html`
-            <div class="list">
-              ${(linkState?.nodes || []).map(
-                (n) => html`
-                  <div class="row" key=${n.node}>
-                    <div class="body">
-                      <div class="title mono">${n.node}</div>
-                      <div class="sub">${n.principal} · ${n.role} · ${n.via}</div>
+        ? (linkState?.nodes || []).length > 0
+          ? html`
+              <div class="list">
+                ${linkState.nodes.map(
+                  (n) => html`
+                    <div class="row" key=${n.node}>
+                      <div class="body">
+                        <div class="title mono">${n.node}</div>
+                        <div class="sub">${n.principal} · ${n.role} · ${n.via}</div>
+                      </div>
+                      <button
+                        type="button"
+                        class="btn small"
+                        disabled=${busy}
+                        onClick=${() => onUnpair(n.node)}
+                      >
+                        Remove
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      class="btn small"
-                      disabled=${busy}
-                      onClick=${() => onUnpair(n.node)}
-                    >
-                      Remove
-                    </button>
-                  </div>
-                `,
-              )}
-            </div>
-          `
+                  `,
+                )}
+              </div>
+            `
+          : html`<div class="empty">No paired machines.</div>`
         : html`
             <div class="list">
               <dl class="kv">
@@ -124,8 +112,8 @@ export function DeviceView({
                 <dd>${link.kind}</dd>
               </dl>
             </div>
-            <div class="actions">
-              <button type="button" class="btn danger" disabled=${busy} onClick=${onForget}>
+            <div class="spaced">
+              <button type="button" class="btn" disabled=${busy} onClick=${askForget}>
                 Forget this browser
               </button>
             </div>

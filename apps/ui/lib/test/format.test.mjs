@@ -15,6 +15,8 @@ import {
   osLabel,
   primaryDisk,
   realDisks,
+  splitFirstSentence,
+  tokenizeCode,
 } from '../format.js';
 
 test('clampPct and meterLevel handle bounds and thresholds', () => {
@@ -63,12 +65,32 @@ test('duration, elapsed, and relative time formatting', () => {
   assert.equal(formatRelativeTime('2026-11-10T12:00:00Z', now), '14 days ago');
 });
 
-test('firstSentence and osLabel', () => {
+test('firstSentence, splitFirstSentence, tokenizeCode, and osLabel', () => {
   assert.equal(
     firstSentence('Restart this machine.\nSecond sentence here.'),
     'Restart this machine.',
   );
+  assert.deepEqual(splitFirstSentence('First sentence. Second one. Third.'), {
+    first: 'First sentence.',
+    rest: 'Second one. Third.',
+  });
+  assert.deepEqual(splitFirstSentence('Only one sentence.'), {
+    first: 'Only one sentence.',
+    rest: '',
+  });
   assert.equal(firstSentence('Single line without period'), 'Single line without period');
+
+  assert.deepEqual(tokenizeCode('Wait `delay_s` seconds, or check `would_refuse`.'), [
+    { code: false, text: 'Wait ' },
+    { code: true, text: 'delay_s' },
+    { code: false, text: ' seconds, or check ' },
+    { code: true, text: 'would_refuse' },
+    { code: false, text: '.' },
+  ]);
+  assert.deepEqual(tokenizeCode('Plain text with `unclosed tick'), [
+    { code: false, text: 'Plain text with `unclosed tick' },
+  ]);
+
   assert.equal(osLabel('linux'), 'Linux');
   assert.equal(osLabel('macos'), 'macOS');
   assert.equal(osLabel('windows'), 'Windows');

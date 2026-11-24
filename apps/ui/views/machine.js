@@ -15,7 +15,7 @@ import {
   realDisks,
 } from '../lib/format.js';
 import { MACHINE_TABS, routeHref } from '../lib/route.js';
-import { unavailableReason } from '../lib/schema.js';
+import { describePowerConfirm, unavailableReason } from '../lib/schema.js';
 
 const TAB_LABELS = {
   overview: 'Overview',
@@ -66,10 +66,15 @@ function splitCrumbs(fullPath) {
 
 function OverviewTab({ machine, allowedSet, onWake }) {
   if (!machine.reachable) {
+    const err = machine.error || {
+      message: machine.reason || `${machine.name} did not answer.`,
+      hint: 'Check that the machine is awake and reachable.',
+    };
     return html`
       <${Notice}
-        title=${`${machine.name} did not answer.`}
-        hint=${machine.reason || 'Check that the machine is awake and reachable.'}
+        kind="warn"
+        title=${err.message || `${machine.name} did not answer.`}
+        hint=${err.hint || null}
       />
       ${machine.canWake && allowedSet?.has('power.wake')
         ? html`
@@ -424,6 +429,7 @@ function FilesTab({ machine, nodeInfo, link }) {
   const [preview, setPreview] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const crumbsRef = useRef(null);
   const on = targetFor(machine.name, nodeInfo?.node);
 
   async function loadDir(path) {
@@ -462,24 +468,45 @@ function FilesTab({ machine, nodeInfo, link }) {
     loadDir(defaultRoot(nodeInfo?.whoami));
   }, [machine.name]);
 
-  const crumbs = splitCrumbs(listing?.path || dirPath);
+  const currentPath = listing?.path || dirPath;
+  const crumbs = splitCrumbs(currentPath);
+
+  useEffect(() => {
+    if (crumbsRef.current) {
+      crumbsRef.current.scrollLeft = crumbsRef.current.scrollWidth;
+    }
+  }, [currentPath]);
+
+  const filesHref = routeHref({ section: 'machines', machine: machine.name, tab: 'files' });
 
   return html`
     <div>
       <div class="crumbs-bar">
-        <nav class="crumbs" aria-label="Directory path">
+        <nav ref=${crumbsRef} class="crumbs" aria-label="Directory path">
           ${crumbs.map(
             (c, i) => html`
               <span key=${c.path} class="crumb-item">
                 ${i > 0 && crumbs[i - 1].label !== '/'
                   ? html`<span class="dim" aria-hidden="true">/</span>`
                   : null}
-                <button type="button" onClick=${() => loadDir(c.path)}>${c.label}</button>
+                <a
+                  href=${filesHref}
+                  onClick=${(e) => {
+                    e.preventDefault();
+                    loadDir(c.path);
+                  }}
+                >
+                  ${c.label}
+                </a>
               </span>
             `,
           )}
         </nav>
-        <${CopyButton} text=${preview ? preview.data.path : listing?.path || dirPath} label="Copy path" />
+        <${CopyButton}
+          text=${preview ? preview.data.path : currentPath}
+          label="Copy path"
+          iconOnly=${true}
+        />
       </div>
 
       ${error ? html`<${Notice} error=${error} />` : null}
@@ -489,7 +516,7 @@ function FilesTab({ machine, nodeInfo, link }) {
             <div>
               <div class="result-head">
                 <p class="label">${preview.entry.name} · ${formatBytes(preview.data.size)}</p>
-                <button type="button" class="btn small" onClick=${() => setPreview(null)}>
+                <button type="button" class="btn small quiet" onClick=${() => setPreview(null)}>
                   Back to folder
                 </button>
               </div>
@@ -891,7 +918,11 @@ ${logs === null
         : services === null
           ? html`<div class="empty">Loading services…</div>`
           : services.length === 0
-            ? html`<div class="empty">No matching services.</div>`
+            ? html`
+                <div class="empty">
+                  ${filter.trim() ? `No services match "${filter.trim()}".` : `No services found on ${machine.name}.`}
+                </div>
+              `
             : html`
                 <div class="list spaced">
                   ${services.map(
@@ -1020,7 +1051,7 @@ function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
       ${projects === null
         ? html`<div class="empty">Loading projects…</div>`
         : projects.length === 0
-          ? html`<div class="empty">No projects recorded in projects.toml.</div>`
+          ? html`<div class="empty">No projects recorded on ${machine.name}.</div>`
           : html`
               <div class="list">
                 ${projects.map((p) => {
@@ -1117,16 +1148,20 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
     load();
   }, [machine.name, machine.reachable]);
 
-  async function runAction(tool, args, target, label, description, hasDry) {
+  async function runAction(tool, args, target, hasDry) {
     setError(null);
     setResult(null);
+    const liveJobs = Array.isArray(machine.jobs) ? machine.jobs : [];
+    const busyReasons = status?.busy?.state === 'busy' ? status.busy.reasons || [] : machine.busyReasons || [];
+    const copy = describePowerConfirm(tool, machine.name, args, liveJobs, busyReasons);
     onRequestConfirm({
-      title: `${label}?`,
-      summary: description,
+      title: copy.title,
+      summary: copy.summary,
+      jobs: tool === 'power.wake' ? [] : liveJobs,
       target: target || nodeInfo?.node,
       tool,
       effect: 'power',
-      confirmLabel: label,
+      confirmLabel: copy.confirmLabel,
       canDryRun: hasDry,
       async onDryRun() {
         const dry = await link.call(tool, { ...args, dry_run: true }, { on: target });
@@ -1151,14 +1186,18 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
 
   if (!machine.reachable) {
     const canWake = allowedSet?.has('power.wake');
+    const err = machine.error || {
+      message: machine.reason || `${machine.name} did not answer.`,
+      hint: machine.canWake
+        ? 'You can send a Wake-on-LAN packet from a reachable helper.'
+        : 'No Wake-on-LAN address is configured for this machine in fleet.toml.',
+    };
     return html`
       <div>
         <${Notice}
           kind="warn"
-          title=${`${machine.name} did not answer.`}
-          hint=${machine.canWake
-            ? 'You can send a Wake-on-LAN packet from a reachable helper.'
-            : 'No Wake-on-LAN address is configured for this machine in fleet.toml.'}
+          title=${err.message || `${machine.name} did not answer.`}
+          hint=${err.hint || null}
         />
         ${machine.canWake
           ? html`
@@ -1177,14 +1216,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
                     class="btn small"
                     disabled=${!canWake || busy}
                     onClick=${() =>
-                      runAction(
-                        'power.wake',
-                        { machine: machine.name },
-                        undefined,
-                        `Wake ${machine.name}`,
-                        `Send Wake-on-LAN packets for ${machine.name}.`,
-                        true,
-                      )}
+                      runAction('power.wake', { machine: machine.name }, undefined, true)}
                   >
                     Wake
                   </button>
@@ -1202,6 +1234,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
     {
       tool: 'power.sleep',
       label: `Sleep ${machine.name}`,
+      verb: 'Sleep',
       desc: `Put ${machine.name} to sleep after about 3 seconds.`,
       args: {},
       dry: true,
@@ -1209,6 +1242,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
     {
       tool: 'power.restart',
       label: `Restart ${machine.name}`,
+      verb: 'Restart',
       desc: `Restart ${machine.name} after a short delay.`,
       args: {},
       dry: true,
@@ -1216,6 +1250,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
     ...(status?.targets || []).map((t) => ({
       tool: 'power.restart',
       label: `Restart into ${t.name}`,
+      verb: `Restart into ${t.name}`,
       desc: `Arm boot target "${t.name}" (${t.how}) once and restart ${machine.name}.`,
       args: { into: t.name },
       dry: true,
@@ -1223,6 +1258,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
     {
       tool: 'power.shutdown',
       label: `Shut down ${machine.name}`,
+      verb: 'Shut down',
       desc: `Power off ${machine.name} after a short delay.`,
       args: {},
       dry: true,
@@ -1287,7 +1323,9 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
               </dl>
             </div>
           `
-        : null}
+        : !error
+          ? html`<div class="empty">Loading power state…</div>`
+          : null}
 
       <p class="label">Power actions</p>
       <div class="list">
@@ -1310,9 +1348,9 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
                 type="button"
                 class="btn small"
                 disabled=${!allowed || busy}
-                onClick=${() => runAction(item.tool, item.args, on, item.label, item.desc, item.dry)}
+                onClick=${() => runAction(item.tool, item.args, on, item.dry)}
               >
-                ${allowed ? 'Run…' : 'Unavailable'}
+                ${allowed ? item.verb : 'Unavailable'}
               </button>
             </div>
           `;

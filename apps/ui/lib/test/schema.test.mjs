@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildArgs,
+  describePowerConfirm,
+  describeRoleAccess,
   describeSchema,
   groupToolsByFamily,
   hasDryRun,
@@ -125,4 +127,55 @@ test('hasDryRun, needsConfirmation, and groupToolsByFamily', () => {
   const filtered = groupToolsByFamily(tools, 'restart', ['fs.list'], { role: 'observer' });
   assert.equal(filtered.length, 1);
   assert.equal(filtered[0].tools[0].name, 'power.restart');
+});
+
+test('describeRoleAccess returns one line per fact including missing effects', () => {
+  const catalog = [
+    { name: 'sys.info', effect: 'read' },
+    { name: 'fs.write', effect: 'write' },
+    { name: 'exec.run', effect: 'exec' },
+    { name: 'fs.remove', effect: 'destroy' },
+    { name: 'power.restart', effect: 'power' },
+    { name: 'token.add', effect: 'admin' },
+  ];
+  const lines = describeRoleAccess(
+    {
+      principal: 'ui',
+      role: 'operator',
+      paths: null,
+      delegate: false,
+      tools: ['sys.info', 'fs.write', 'exec.run', 'fs.remove', 'power.restart'],
+    },
+    catalog,
+  );
+  assert.equal(lines[0], 'May run 5 tools (read, write, exec, destroy, power).');
+  assert.equal(lines[1], 'May not change settings or permissions (admin).');
+  assert.equal(lines[2], 'File tools have no extra path limit.');
+});
+
+test('describePowerConfirm generates plain wording from tool, target, jobs, and busy state', () => {
+  const idle = describePowerConfirm('power.restart', 'tower', {}, [], []);
+  assert.equal(idle.title, 'Restart tower now?');
+  assert.equal(idle.confirmLabel, 'Restart tower');
+  assert.equal(idle.summary, 'Nothing is running on it.');
+
+  const busy = describePowerConfirm('power.restart', 'tower', {}, [{ id: '1' }, { id: '2' }], []);
+  assert.equal(busy.title, 'Restart tower now?');
+  assert.equal(busy.confirmLabel, 'Restart anyway');
+  assert.equal(busy.summary, '2 jobs are running on it and will be interrupted.');
+
+  const sleep = describePowerConfirm('power.sleep', 'pi', {}, [], ['render']);
+  assert.equal(sleep.title, 'Put pi to sleep now?');
+  assert.equal(sleep.confirmLabel, 'Sleep');
+  assert.match(sleep.summary, /render/);
+
+  const wake = describePowerConfirm('power.wake', 'tower', { machine: 'laptop' }, [], []);
+  assert.equal(wake.title, 'Wake laptop?');
+  assert.equal(wake.confirmLabel, 'Wake');
+
+  const sw = describePowerConfirm('power.switch', 'tower', { machine: 'tower', into: 'windows' }, [], []);
+  assert.equal(sw.title, 'Switch tower to windows?');
+
+  const fallback = describePowerConfirm('fs.remove', 'tower', {}, [], []);
+  assert.equal(fallback.title, 'Run fs.remove on tower?');
 });

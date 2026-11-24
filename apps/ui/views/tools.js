@@ -1,10 +1,12 @@
 // Tools screen: searchable family catalog, JSON Schema form builder, target picker, and result view.
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
-import { Notice, ResultView } from './common.js';
+import { CodeText, Notice, ResultView } from './common.js';
+import { splitFirstSentence } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
 import {
   buildArgs,
+  describePowerConfirm,
   describeSchema,
   groupToolsByFamily,
   hasDryRun,
@@ -15,10 +17,27 @@ import {
   valuesFromArgs,
 } from '../lib/schema.js';
 
+function FieldHelp({ description }) {
+  if (!description) return null;
+  const { first, rest } = splitFirstSentence(description);
+  return html`
+    <small><${CodeText} text=${first} /></small>
+    ${rest
+      ? html`
+          <details class="more">
+            <summary>More</summary>
+            <p><${CodeText} text=${rest} /></p>
+          </details>
+        `
+      : null}
+  `;
+}
+
 function FieldInput({ field, value, onChange, error, idPrefix }) {
   const id = `${idPrefix}-${field.name}`;
   const placeholder =
     field.defaultValue !== undefined ? String(field.defaultValue) : undefined;
+  const helpParts = splitFirstSentence(field.description);
 
   if (field.kind === 'boolean') {
     return html`
@@ -27,7 +46,9 @@ function FieldInput({ field, value, onChange, error, idPrefix }) {
           <span>
             <span class="mono">${field.name}</span>
             ${field.required ? html` <em class="dim">required</em>` : null}
-            ${field.description ? html`<small class="help">${field.description}</small>` : null}
+            ${helpParts.first
+              ? html`<small class="help"><${CodeText} text=${helpParts.first} /></small>`
+              : null}
           </span>
           <input
             id=${id}
@@ -36,6 +57,14 @@ function FieldInput({ field, value, onChange, error, idPrefix }) {
             onChange=${(e) => onChange(e.target.checked)}
           />
         </label>
+        ${helpParts.rest
+          ? html`
+              <details class="more">
+                <summary>More</summary>
+                <p><${CodeText} text=${helpParts.rest} /></p>
+              </details>
+            `
+          : null}
         ${error ? html`<small class="field-err">${error}</small>` : null}
       </div>
     `;
@@ -49,7 +78,7 @@ function FieldInput({ field, value, onChange, error, idPrefix }) {
           ${field.name}
           <em>${field.required ? 'required' : 'optional'}</em>
         </span>
-        ${field.description ? html`<small>${field.description}</small>` : null}
+        <${FieldHelp} description=${field.description} />
         <div class="nested">
           ${field.fields.map(
             (sub) => html`
@@ -69,11 +98,13 @@ function FieldInput({ field, value, onChange, error, idPrefix }) {
   }
 
   return html`
-    <label class="field" htmlFor=${id}>
-      <span>
-        ${field.name}
-        <em>${field.required ? 'required' : 'optional'}</em>
-      </span>
+    <div class="field">
+      <label htmlFor=${id} class="field-label">
+        <span>
+          ${field.name}
+          <em>${field.required ? 'required' : 'optional'}</em>
+        </span>
+      </label>
       ${field.kind === 'enum'
         ? html`
             <select id=${id} value=${value ?? ''} onChange=${(e) => onChange(e.target.value)}>
@@ -108,9 +139,9 @@ function FieldInput({ field, value, onChange, error, idPrefix }) {
                 spellcheck="false"
               />
             `}
-      ${field.description ? html`<small>${field.description}</small>` : null}
+      <${FieldHelp} description=${field.description} />
       ${error ? html`<small class="field-err">${error}</small>` : null}
-    </label>
+    </div>
   `;
 }
 
@@ -124,6 +155,7 @@ function ToolDetail({
   onRequestConfirm,
 }) {
   const fields = useMemo(() => describeSchema(tool.input_schema), [tool.name]);
+  const descParts = useMemo(() => splitFirstSentence(tool.description), [tool.description]);
   const [values, setValues] = useState(() => initialValues(tool.input_schema));
   const [rawMode, setRawMode] = useState(false);
   const [rawText, setRawText] = useState('{}');
@@ -139,6 +171,8 @@ function ToolDetail({
   const localNode = nodeInfo?.node || 'this node';
   const machineNames = (machines || []).map((m) => m.name);
   const remoteNames = machineNames.filter((n) => n !== localNode);
+  const isSingleRemote =
+    targetMode !== 'local' && targetMode !== 'all' && targetMode !== 'multi';
 
   useEffect(() => {
     return () => {
@@ -257,19 +291,28 @@ function ToolDetail({
     const effectiveDry = toolHasDry && Boolean(args.dry_run);
     if (needsConfirmation(tool.effect) && !effectiveDry) {
       const where = targetLabel();
+      const targetOn = resolveOn();
       const targetJobs = (runningJobs || []).filter(
-        (j) => where === 'all machines' || j.machine === where || (Array.isArray(resolveOn()) && resolveOn().includes(j.machine)),
+        (j) =>
+          where === 'all machines' ||
+          j.machine === where ||
+          (Array.isArray(targetOn) && targetOn.includes(j.machine)),
       );
+      const matchedMachines = (machines || []).filter(
+        (m) =>
+          where === 'all machines' ||
+          m.name === where ||
+          (Array.isArray(targetOn) && targetOn.includes(m.name)),
+      );
+      const busyReasons = matchedMachines.flatMap((m) => m.busyReasons || []);
+      const copy = describePowerConfirm(tool.name, where, args, targetJobs, busyReasons);
       onRequestConfirm({
-        title: `Run ${tool.name} on ${where}?`,
-        summary:
-          targetJobs.length > 0 && tool.effect === 'power'
-            ? `${targetJobs.length} ${targetJobs.length === 1 ? 'job is' : 'jobs are'} running there and may be interrupted.`
-            : `This ${tool.effect} tool will run on ${where}.`,
-        jobs: tool.effect === 'power' ? targetJobs : [],
+        title: copy.title,
+        summary: copy.summary,
+        jobs: tool.effect === 'power' && tool.name !== 'power.wake' ? targetJobs : [],
         tool: tool.name,
         effect: tool.effect,
-        confirmLabel: `Run ${tool.name}`,
+        confirmLabel: copy.confirmLabel,
         canDryRun: toolHasDry,
         async onDryRun() {
           return executeCall({ ...args, dry_run: true });
@@ -287,6 +330,11 @@ function ToolDetail({
   const toolHasDry = hasDryRun(tool.input_schema);
   const danger = needsConfirmation(tool.effect);
   const visibleFields = fields.filter((f) => !(danger && f.name === 'dry_run'));
+  const where = targetLabel();
+  const actionButtonLabel = danger
+    ? describePowerConfirm(tool.name, where, values).buttonLabel
+    : 'Run';
+  const canSubmit = allowed || isSingleRemote;
 
   function toggleMulti(name) {
     setMultiTargets((prev) =>
@@ -296,9 +344,17 @@ function ToolDetail({
 
   return html`
     <div>
-      <p class="lede">${tool.description}</p>
+      <p class="lede"><${CodeText} text=${descParts.first} /></p>
+      ${descParts.rest
+        ? html`
+            <details class="more">
+              <summary>More about this tool</summary>
+              <p><${CodeText} text=${descParts.rest} /></p>
+            </details>
+          `
+        : null}
 
-      ${!allowed
+      ${!allowed && !isSingleRemote
         ? html`
             <${Notice}
               kind="warn"
@@ -313,7 +369,11 @@ function ToolDetail({
         <select
           id="tool-target-on"
           value=${targetMode}
-          onChange=${(e) => setTargetMode(e.target.value)}
+          onChange=${(e) => {
+            setTargetMode(e.target.value);
+            setError(null);
+            setResult(null);
+          }}
         >
           <option value="local">${localNode} (this node)</option>
           ${remoteNames.map((name) => html`<option key=${name} value=${name}>${name}</option>`)}
@@ -324,6 +384,13 @@ function ToolDetail({
             ? html`<option value="multi">Choose several machines…</option>`
             : null}
         </select>
+        ${isSingleRemote
+          ? html`
+              <small>
+                ${`Showing tools from ${localNode}; ${targetMode} checks its own tools and permissions when you run.`}
+              </small>
+            `
+          : null}
       </label>
 
       ${targetMode === 'multi'
@@ -396,7 +463,7 @@ function ToolDetail({
                 <button
                   type="button"
                   class="btn"
-                  disabled=${!allowed || running}
+                  disabled=${!canSubmit || running}
                   onClick=${() => handleRun(true)}
                 >
                   Try it (dry run)
@@ -406,9 +473,9 @@ function ToolDetail({
           <button
             type="submit"
             class=${running ? 'btn danger' : danger ? 'btn danger' : 'btn primary'}
-            disabled=${!allowed && !running}
+            disabled=${!canSubmit && !running}
           >
-            ${running ? 'Stop' : danger ? `Run ${tool.name}` : 'Run'}
+            ${running ? 'Stop' : actionButtonLabel}
           </button>
         </div>
       </form>
@@ -467,46 +534,50 @@ export function ToolsView({
         aria-label="Search tools"
       />
 
-      ${groups.length === 0
-        ? html`<div class="empty">No tools match "${query}".</div>`
-        : groups.map(
-            (group) => html`
-              <div key=${group.family}>
-                <p class="label">${group.family}</p>
-                <div class="list">
-                  ${group.tools.map((tool) => {
-                    const selected = wide && tool.name === selectedName;
-                    const cls = [
-                      'row',
-                      !tool.allowed ? 'off' : '',
-                      selected ? 'selected' : '',
-                    ]
-                      .filter(Boolean)
-                      .join(' ');
-                    return html`
-                      <a
-                        key=${tool.name}
-                        class=${cls}
-                        href=${routeHref({ section: 'tools', tool: tool.name })}
-                        aria-current=${selected ? 'true' : undefined}
-                      >
-                        <span class="body">
-                          <span class="title mono">
-                            <span>${tool.name}</span>
-                            <span class=${`chip fx ${tool.effect}`}>${tool.effect}</span>
-                            ${!tool.allowed ? html`<span class="chip">unavailable</span>` : null}
+      ${!tools || tools.length === 0
+        ? html`<div class="empty">No tools available.</div>`
+        : groups.length === 0
+          ? html`<div class="empty">No tools match "${query}".</div>`
+          : groups.map(
+              (group) => html`
+                <div key=${group.family}>
+                  <p class="label">${group.family}</p>
+                  <div class="list">
+                    ${group.tools.map((tool) => {
+                      const selected = wide && tool.name === selectedName;
+                      const cls = [
+                        'row',
+                        !tool.allowed ? 'off' : '',
+                        selected ? 'selected' : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ');
+                      return html`
+                        <a
+                          key=${tool.name}
+                          class=${cls}
+                          href=${routeHref({ section: 'tools', tool: tool.name })}
+                          aria-current=${selected ? 'true' : undefined}
+                        >
+                          <span class="body">
+                            <span class="title mono">
+                              <span>${tool.name}</span>
+                              <span class=${`chip fx ${tool.effect}`}>${tool.effect}</span>
+                              ${!tool.allowed ? html`<span class="chip">unavailable</span>` : null}
+                            </span>
+                            <span class="sub">
+                              ${tool.allowed
+                                ? html`<${CodeText} text=${tool.summary} />`
+                                : tool.reason}
+                            </span>
                           </span>
-                          <span class="sub">
-                            ${tool.allowed ? tool.summary : tool.reason}
-                          </span>
-                        </span>
-                      </a>
-                    `;
-                  })}
+                        </a>
+                      `;
+                    })}
+                  </div>
                 </div>
-              </div>
-            `,
-          )}
+              `,
+            )}
     </section>
   `;
 

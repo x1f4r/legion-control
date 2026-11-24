@@ -553,8 +553,8 @@ export function createMockLink(mode = '') {
       reachable: false,
       error: {
         code: 'unreachable',
-        message: 'Did not answer · last seen 14 days ago',
-        hint: 'Check that the machine is awake and reachable on your tailnet.',
+        message: 'Did not answer · last seen 14 days ago. SSH timed out after 8 s.',
+        hint: 'Check that laptop is powered on and reachable on your tailnet, or wake it via pi.',
         machine: 'laptop',
       },
     },
@@ -603,6 +603,14 @@ export function createMockLink(mode = '') {
         message: `Principal "phone" (role "operator") may not call ${tool}.`,
         hint: 'Ask the machine owner to grant access in policy.toml.',
         machine: name,
+      };
+    }
+    if (name === 'pi' && tool === 'audit.tail') {
+      throw {
+        code: 'denied',
+        message: 'Principal "phone" may not call audit.tail on pi.',
+        hint: 'Each machine checks its own policy.toml before running a tool.',
+        machine: 'pi',
       };
     }
 
@@ -925,6 +933,10 @@ export function createMockLink(mode = '') {
     authed = false;
   }
 
+  async function deviceName() {
+    return 'Pixel 10';
+  }
+
   async function scanInvite() {
     return 'legion-invite:mock';
   }
@@ -936,6 +948,7 @@ export function createMockLink(mode = '') {
     call,
     setToken,
     forget,
+    deviceName,
     pair,
     unpair,
     scanInvite,
