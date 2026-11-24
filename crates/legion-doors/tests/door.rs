@@ -94,9 +94,10 @@ async fn on_is_taken_out_of_the_arguments_and_handed_to_the_router() {
         let reply: Value = serde_json::from_str(&line).unwrap();
         answered.push(reply["id"].clone());
         if reply["id"] != json!(1) {
+            assert_eq!(reply["result"].get("structuredContent"), None);
             assert_eq!(
-                reply["result"]["structuredContent"],
-                json!({"routed": true})
+                reply["result"]["content"][0]["text"],
+                json!(r#"{"routed":true}"#)
             );
         }
     }

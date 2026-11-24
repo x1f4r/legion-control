@@ -1,9 +1,7 @@
 //! `meta`: which build this is, who the caller is, and whether the node is healthy.
 
-use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use legion_core::proto::{Effect, PROTOCOL};
 use legion_core::{Ctx, Door, NoArgs, Registry, ToolError, VERSION};
@@ -26,7 +24,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration and state directories exist and are writable, and every configuration file parses. Each check says what it found and, when something is wrong, what to do.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, and every configuration file parses. Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
 }
@@ -124,8 +122,8 @@ pub struct Check {
 async fn doctor(ctx: &Ctx, _args: NoArgs) -> Result<Doctor, ToolError> {
     let paths = ctx.paths();
     let mut checks = vec![
-        directory_check("configuration directory", paths.config_dir(), false),
-        directory_check("state directory", paths.state_dir(), true),
+        directory_check("configuration directory", paths.config_dir(), Use::Read),
+        directory_check("state directory", paths.state_dir(), Use::Write),
     ];
     for document in ctx.documents() {
         let file = paths.config_file(document.file());
@@ -158,10 +156,20 @@ async fn doctor(ctx: &Ctx, _args: NoArgs) -> Result<Doctor, ToolError> {
     })
 }
 
-/// Whether a directory exists and can be written to. The configuration directory may be missing,
-/// since every file then takes its default; the state directory must be there, since every call
-/// writes its audit line into it.
-fn directory_check(name: &str, dir: &Path, required: bool) -> Check {
+/// What the node does with a directory, and so what its check asks of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Use {
+    /// Only read: the configuration directory, which may be missing, since every file then takes
+    /// its default, and which an owner may keep read-only, so nothing is written to it to check.
+    Read,
+    /// Written: the state directory, which must be there, since every call writes its audit line
+    /// into it.
+    Write,
+}
+
+/// Whether a directory is there and does what the node needs of it.
+fn directory_check(name: &str, dir: &Path, needed: Use) -> Check {
+    let required = needed == Use::Write;
     let check = |ok: bool, detail: String, hint: Option<&str>| Check {
         name: name.to_owned(),
         ok,
@@ -192,6 +200,18 @@ fn directory_check(name: &str, dir: &Path, required: bool) -> Check {
             format!("{} is not a directory.", dir.display()),
             Some("Move the file that is in its place."),
         ),
+        Ok(_) if needed == Use::Read => match std::fs::read_dir(dir) {
+            Ok(_) => check(
+                true,
+                format!("{} exists and is readable.", dir.display()),
+                None,
+            ),
+            Err(error) => check(
+                false,
+                format!("{} exists but cannot be read: {error}.", dir.display()),
+                Some("Give the account legion runs as read access to it."),
+            ),
+        },
         Ok(_) => match probe_write(dir) {
             Ok(()) => check(
                 true,
@@ -211,15 +231,11 @@ fn directory_check(name: &str, dir: &Path, required: bool) -> Check {
 }
 
 /// Creates and removes an empty file, which is the one way to know a directory is writable on every
-/// platform. It leaves nothing behind.
+/// platform. Its name is random and taken only if free, so concurrent checks never meet, and it is
+/// removed whether or not the check passes.
 fn probe_write(dir: &Path) -> io::Result<()> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.subsec_nanos());
-    let probe = dir.join(format!(".legion-doctor-{}-{nanos}", std::process::id()));
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)?;
-    std::fs::remove_file(&probe)
+    tempfile::Builder::new()
+        .prefix(".legion-doctor-")
+        .tempfile_in(dir)?
+        .close()
 }

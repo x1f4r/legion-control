@@ -266,6 +266,9 @@ A rule is a tool name, a glob over tool names, or `effect:<effect>`. Deny wins o
 principal the node has never heard of gets the built-in role `nobody`, which allows nothing. With
 no policy file at all, the only principal is `owner`, allowed everything: the default install
 behaves like the shell it was started from.
+Whatever its `paths`, a role's file tools stay out of the node's own configuration and state
+directories unless the role allows `effect:admin`, so a role that may write files cannot rewrite
+its own policy or the audit log of what it did.
 
 How far a principal can be trusted depends on the door, and the design says so plainly:
 
@@ -305,7 +308,7 @@ replaced by their size.
   schema. Output is a readable rendering on a terminal and the raw JSON object otherwise.
 - **MCP.** `legion mcp` serves the registry over stdio. Tool names swap the dot for an underscore
   (`fs_read`), every tool gains the optional `on` argument, and effects become the standard
-  annotations (`readOnlyHint` for `read`, `destructiveHint` for `destroy` and `power`). A failed
+  annotations (`readOnlyHint` for `read`, `destructiveHint` for every other effect). A failed
   call is a result with `isError` and the same error object as text, so the agent can read the
   code and the hint. `--compact` serves three tools instead (`legion_tools`, `legion_describe`,
   `legion_call`) for agents that should not carry forty schemas in their context. Two revisions
@@ -332,7 +335,10 @@ test runs under its own.
 Configuration is TOML: `node.toml` (this node's name, boot targets, busy probes), `fleet.toml`,
 `projects.toml`, `policy.toml`, `tokens.toml`, `tools.d/*.toml`. A missing file means its empty
 default; a file that does not parse fails the one call that needed it with the line it failed on,
-and never falls back silently to a default that would widen access.
+and never falls back silently to a default that would widen access. A file that is there but says
+nothing is refused the same way, unless its default grants nothing (`node.toml`): a file caught
+half way through a rewrite reads as empty. Legion itself writes them atomically, beside the
+target and renamed over it.
 
 ## Platforms
 

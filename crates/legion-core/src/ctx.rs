@@ -178,17 +178,21 @@ impl Ctx {
         &self.grant
     }
 
-    /// Whether the caller has cancelled the call.
+    /// Whether the caller has cancelled the call. Once it has, the tool has
+    /// [`CANCEL_GRACE`](crate::CANCEL_GRACE) to clean up and return before it is dropped.
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
 
-    /// Completes when the caller cancels the call.
+    /// Completes when the caller cancels the call. A long operation waits on this alongside its
+    /// work (`tokio::select!`), so it can stop what it started and return within
+    /// [`CANCEL_GRACE`](crate::CANCEL_GRACE).
     pub async fn cancelled(&self) {
         self.cancel.cancelled().await;
     }
 
-    /// The token that is cancelled with the call, for handing to work the tool spawns.
+    /// The token that is cancelled with the call. Work handed to `spawn_blocking` cannot be dropped
+    /// and keeps going after a cancel unless it checks a clone of this between steps.
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel
     }

@@ -46,12 +46,42 @@ pub struct WriteOptions {
     /// When the target file already exists, its existing permissions are preserved instead so
     /// atomic rewrites never widen or alter permissions unexpectedly. Ignored on Windows.
     pub mode: Option<u32>,
+    /// When `true`, create the target exclusively and fail with [`OsError::AlreadyExists`] if it
+    /// already exists instead of replacing it.
+    ///
+    /// Commits atomically via hard-link (`std::fs::hard_link`) followed by unlinking the temporary
+    /// name so concurrent creators never overwrite each other. On filesystems that do not support
+    /// hard links (such as FAT/exFAT), falls back to a best-effort existence check plus rename.
+    pub no_replace: bool,
 }
 
 impl WriteOptions {
     /// Create options requesting a specific Unix mode for newly created files.
     pub fn with_mode(mode: u32) -> Self {
-        Self { mode: Some(mode) }
+        Self {
+            mode: Some(mode),
+            no_replace: false,
+        }
+    }
+
+    /// Create options requesting exclusive file creation (`no_replace = true`).
+    pub fn create_new() -> Self {
+        Self {
+            mode: None,
+            no_replace: true,
+        }
+    }
+
+    /// Set the Unix permission mode applied to newly created files.
+    pub fn mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    /// Require that the target path does not already exist.
+    pub fn no_replace(mut self, no_replace: bool) -> Self {
+        self.no_replace = no_replace;
+        self
     }
 }
 
@@ -76,7 +106,7 @@ pub fn write_atomic_from_reader<R: Read>(
     options: WriteOptions,
 ) -> Result<u64> {
     let target = path.as_ref();
-    let (parent, existing_meta) = inspect_target(target)?;
+    let (parent, existing_meta) = inspect_target(target, options.no_replace)?;
     let (mut file, mut guard) =
         create_sibling_temp(parent, target, existing_meta.as_ref(), options)?;
 
@@ -101,11 +131,15 @@ pub fn write_atomic_from_reader<R: Read>(
 
     apply_final_permissions(&file, existing_meta.as_ref(), options, target)?;
 
-    // Drop the open file handle before renaming so Windows does not reject the rename.
+    // Drop the open file handle before committing so Windows does not reject rename/link.
     drop(file);
 
-    replace_file(&guard.path, target)?;
-    guard.disarm();
+    if options.no_replace {
+        commit_exclusive(&mut guard, target)?;
+    } else {
+        replace_file(&guard.path, target)?;
+        guard.disarm();
+    }
     sync_parent_dir(parent);
     Ok(written)
 }
@@ -123,7 +157,7 @@ where
     R: AsyncRead + Unpin,
 {
     let target = path.as_ref();
-    let (parent, existing_meta) = inspect_target(target)?;
+    let (parent, existing_meta) = inspect_target(target, options.no_replace)?;
     let (std_file, mut guard) =
         create_sibling_temp(parent, target, existing_meta.as_ref(), options)?;
 
@@ -153,8 +187,12 @@ where
     apply_final_permissions(&std_file, existing_meta.as_ref(), options, target)?;
     drop(std_file);
 
-    replace_file_async(&guard.path, target).await?;
-    guard.disarm();
+    if options.no_replace {
+        commit_exclusive_async(&mut guard, target).await?;
+    } else {
+        replace_file_async(&guard.path, target).await?;
+        guard.disarm();
+    }
 
     let parent_owned = parent.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || sync_parent_dir(&parent_owned)).await;
@@ -199,11 +237,29 @@ impl Drop for TempFileGuard {
     }
 }
 
-fn inspect_target(target: &Path) -> Result<(&Path, Option<Metadata>)> {
+fn inspect_target(target: &Path, no_replace: bool) -> Result<(&Path, Option<Metadata>)> {
     let parent = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
+    if no_replace {
+        // Check symlink_metadata so even a dangling symlink counts as an existing target and is
+        // refused before creating a temporary file.
+        match fs::symlink_metadata(target) {
+            Ok(_) => {
+                return Err(OsError::AlreadyExists {
+                    path: target.to_path_buf(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((parent, None)),
+            Err(err) => {
+                return Err(OsError::from_io(
+                    format!("cannot inspect {}", target.display()),
+                    err,
+                ));
+            }
+        }
+    }
     let existing_meta = match fs::metadata(target) {
         Ok(meta) => {
             if meta.is_dir() {
@@ -222,6 +278,100 @@ fn inspect_target(target: &Path) -> Result<(&Path, Option<Metadata>)> {
         }
     };
     Ok((parent, existing_meta))
+}
+
+/// Atomically publish `guard.path` at `target` only if `target` does not yet exist.
+///
+/// Uses `hard_link` + unlink of the temporary name, which fails atomically with `AlreadyExists`
+/// on POSIX and NTFS/ReFS. Where the underlying filesystem does not support hard links (for
+/// example FAT/exFAT or certain FUSE mounts), falls back to a best-effort existence check and
+/// rename, which carries a narrow TOCTOU window only on those filesystems.
+fn commit_exclusive(guard: &mut TempFileGuard, target: &Path) -> Result<()> {
+    match fs::hard_link(&guard.path, target) {
+        Ok(()) => {
+            // Target now points to the synced inode; remove the temporary name.
+            let _ = fs::remove_file(&guard.path);
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(OsError::AlreadyExists {
+            path: target.to_path_buf(),
+        }),
+        Err(err) if is_hard_link_unsupported(&err) => {
+            if fs::symlink_metadata(target).is_ok() {
+                return Err(OsError::AlreadyExists {
+                    path: target.to_path_buf(),
+                });
+            }
+            replace_file(&guard.path, target)?;
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) => Err(OsError::from_io(
+            format!(
+                "cannot link temporary file {} to {}",
+                guard.path.display(),
+                target.display()
+            ),
+            err,
+        )),
+    }
+}
+
+async fn commit_exclusive_async(guard: &mut TempFileGuard, target: &Path) -> Result<()> {
+    match fs::hard_link(&guard.path, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(&guard.path);
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(OsError::AlreadyExists {
+            path: target.to_path_buf(),
+        }),
+        Err(err) if is_hard_link_unsupported(&err) => {
+            if fs::symlink_metadata(target).is_ok() {
+                return Err(OsError::AlreadyExists {
+                    path: target.to_path_buf(),
+                });
+            }
+            replace_file_async(&guard.path, target).await?;
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) => Err(OsError::from_io(
+            format!(
+                "cannot link temporary file {} to {}",
+                guard.path.display(),
+                target.display()
+            ),
+            err,
+        )),
+    }
+}
+
+fn is_hard_link_unsupported(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // EOPNOTSUPP (95 on Linux, 45 on macOS), ENOSYS (38/78), EPERM (1 on FAT/VFAT),
+        // EXDEV (18), EMLINK (31).
+        matches!(
+            err.raw_os_error(),
+            Some(1 | 18 | 31 | 38 | 45 | 78 | 95 | 122)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_INVALID_FUNCTION (1), ERROR_NOT_SUPPORTED (50), ERROR_NOT_SAME_DEVICE (17).
+        matches!(err.raw_os_error(), Some(1 | 17 | 50))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = err;
+        false
+    }
 }
 
 fn create_sibling_temp(
@@ -594,5 +744,76 @@ mod tests {
         .unwrap_err();
         assert_eq!(attempts, 1);
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn no_replace_creates_new_file_and_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("exclusive.json");
+
+        write_atomic(&target, b"winner", WriteOptions::create_new()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"winner");
+        assert_eq!(list_dir_names(dir.path()), vec!["exclusive.json"]);
+
+        let err = write_atomic(&target, b"loser", WriteOptions::create_new()).unwrap_err();
+        assert!(matches!(err, OsError::AlreadyExists { ref path } if path == &target));
+        assert_eq!(fs::read(&target).unwrap(), b"winner");
+        assert_eq!(list_dir_names(dir.path()), vec!["exclusive.json"]);
+    }
+
+    #[tokio::test]
+    async fn no_replace_async_refuses_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("exclusive-async.txt");
+        let mut c1 = io::Cursor::new(b"first".as_slice());
+        write_atomic_async(&target, &mut c1, WriteOptions::create_new())
+            .await
+            .unwrap();
+
+        let mut c2 = io::Cursor::new(b"second".as_slice());
+        let err = write_atomic_async(&target, &mut c2, WriteOptions::create_new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OsError::AlreadyExists { .. }));
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        assert_eq!(list_dir_names(dir.path()), vec!["exclusive-async.txt"]);
+    }
+
+    #[test]
+    fn no_replace_allows_exactly_one_concurrent_creator() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("race.txt");
+        let threads = 8usize;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|idx| {
+                let target = target.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_atomic(
+                        &target,
+                        format!("writer-{idx}").as_bytes(),
+                        WriteOptions::create_new(),
+                    )
+                })
+            })
+            .collect();
+
+        let mut successes = 0usize;
+        let mut already_exists = 0usize;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => successes += 1,
+                Err(OsError::AlreadyExists { .. }) => already_exists += 1,
+                Err(other) => panic!("unexpected error in exclusive create race: {other:?}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(already_exists, threads - 1);
+        assert_eq!(list_dir_names(dir.path()), vec!["race.txt"]);
     }
 }

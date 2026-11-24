@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill, killpg};
-use nix::unistd::{Pid, getpgid, getpgrp};
+use nix::unistd::{Pid, getpgid, getpgrp, getsid};
 use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::{OsError, Result};
@@ -14,6 +14,121 @@ use super::{KillTreeReport, ProcessId, is_alive};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_ANCESTOR_HOPS: usize = 256;
+
+pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
+    if identity.pid == 1 {
+        return Some("init process (pid 1)");
+    }
+    if is_ancestor_of_current(identity) {
+        return Some("ancestor of current process");
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_and_start(pid: u32) -> Option<(u32, u64)> {
+    let contents = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (state, ppid, start_ticks) = super::parse_linux_proc_stat_full(&contents)?;
+    if matches!(state, 'Z' | 'X' | 'x') {
+        return None;
+    }
+    Some((ppid, start_ticks))
+}
+
+#[cfg(target_os = "linux")]
+fn is_ancestor_of_current(identity: &ProcessId) -> bool {
+    let Some((mut parent_pid, mut child_start)) = linux_parent_and_start(std::process::id()) else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    seen.insert(std::process::id());
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match linux_parent_and_start(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                // A genuine ancestor cannot have started after its child.
+                if parent_start > child_start {
+                    break;
+                }
+                if parent_pid == identity.pid && parent_start == identity.start_time {
+                    return true;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => {
+                // Under Linux `hidepid`, reading a privileged ancestor's `/proc/<pid>/stat` can
+                // fail even though our own `ppid` revealed it; err on the side of protecting it.
+                return parent_pid == identity.pid;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn is_ancestor_of_current(identity: &ProcessId) -> bool {
+    let Some((mut parent_pid, mut child_start)) = macos_proc::parent_and_start(std::process::id())
+    else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    seen.insert(std::process::id());
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match macos_proc::parent_and_start(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                if parent_start > child_start {
+                    break;
+                }
+                if parent_pid == identity.pid && parent_start == identity.start_time {
+                    return true;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => return parent_pid == identity.pid,
+        }
+    }
+    false
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_ancestor_of_current(identity: &ProcessId) -> bool {
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    let mut cur = sysinfo::Pid::from_u32(std::process::id());
+    let mut seen = HashSet::new();
+    seen.insert(cur.as_u32());
+
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        let Some(parent) = system.process(cur).and_then(|p| p.parent()) else {
+            break;
+        };
+        let parent_pid = parent.as_u32();
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        if parent_pid == identity.pid {
+            return match super::of_pid(parent_pid) {
+                Ok(Some(observed)) => identity.matches(&observed),
+                _ => true,
+            };
+        }
+        cur = parent;
+    }
+    false
+}
 
 #[cfg(target_os = "linux")]
 pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
@@ -95,6 +210,34 @@ mod macos_proc {
         }
         Ok(Some(ProcessId::new(pid, start_us)))
     }
+
+    pub(super) fn parent_and_start(pid: u32) -> Option<(u32, u64)> {
+        let raw_pid = i32::try_from(pid).ok()?;
+        // SAFETY: `libc::proc_bsdinfo` is a plain C struct safe to zero-initialize; `proc_pidinfo`
+        // writes at most `size_of::<libc::proc_bsdinfo>()` bytes into `info`.
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let expected = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                raw_pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                expected,
+            )
+        };
+        if written != expected || info.pbi_status == SZOMB {
+            return None;
+        }
+        let start_us = info
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec);
+        if start_us == 0 {
+            return None;
+        }
+        Some((info.pbi_ppid, start_us))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -169,6 +312,231 @@ pub(super) fn boot_id() -> Result<String> {
     Ok(format!("boot-sec-{secs}"))
 }
 
+pub(super) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
+    let raw_pid = match i32::try_from(identity.pid) {
+        Ok(p) => p,
+        Err(_) => return Ok(false),
+    };
+    let root_nix_pid = Pid::from_raw(raw_pid);
+    let identity = *identity;
+    let own_pid = std::process::id();
+
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        // Fast path: check root identity directly first (single /proc/<pid>/stat or proc_pidinfo).
+        match super::of_pid(identity.pid)? {
+            Some(observed) if identity.matches(&observed) => return Ok(true),
+            // PID has been recycled; per POSIX no live process can still hold it as pgid or sid.
+            Some(_) => return Ok(false),
+            None => {}
+        }
+
+        let own_pgid = getpgrp();
+        let own_sid = getsid(None).ok();
+        let check_group = root_nix_pid != own_pgid;
+        let check_session = Some(root_nix_pid) != own_sid;
+        if !check_group && !check_session {
+            return Ok(false);
+        }
+
+        Ok(has_live_group_or_session_member(
+            &identity,
+            root_nix_pid,
+            check_group,
+            check_session,
+            own_pid,
+        ))
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("tree_is_active worker task failed: {err}"),
+    })?
+}
+
+#[cfg(target_os = "linux")]
+fn has_live_group_or_session_member(
+    root: &ProcessId,
+    root_nix_pid: Pid,
+    check_group: bool,
+    check_session: bool,
+    own_pid: u32,
+) -> bool {
+    // Walk `/proc` numeric PIDs and call lightweight `getpgid`/`getsid` syscalls before opening
+    // `/proc/<pid>/stat`, avoiding full process-table parsing when scanning many jobs.
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || pid == own_pid || pid == root.pid {
+            continue;
+        }
+        let Ok(raw) = i32::try_from(pid) else {
+            continue;
+        };
+        let nix_p = Pid::from_raw(raw);
+        let in_group = check_group && getpgid(Some(nix_p)).ok() == Some(root_nix_pid);
+        let in_session = check_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
+        if (in_group || in_session)
+            && let Ok(Some(id)) = super::of_pid(pid)
+            && id.start_time >= root.start_time
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_live_group_or_session_member(
+    root: &ProcessId,
+    root_nix_pid: Pid,
+    check_group: bool,
+    check_session: bool,
+    own_pid: u32,
+) -> bool {
+    let Ok(mut system) = System::new() else {
+        return false;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    for (sys_pid, proc_info) in system.processes() {
+        if matches!(
+            proc_info.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ) {
+            continue;
+        }
+        let pid = sys_pid.as_u32();
+        if pid == 0 || pid == own_pid || pid == root.pid {
+            continue;
+        }
+        let Ok(raw) = i32::try_from(pid) else {
+            continue;
+        };
+        let nix_p = Pid::from_raw(raw);
+        let in_group = check_group && getpgid(Some(nix_p)).ok() == Some(root_nix_pid);
+        let in_session = check_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
+        if (in_group || in_session)
+            && let Ok(Some(id)) = super::of_pid(pid)
+            && id.start_time >= root.start_time
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(super) async fn kill_process(
+    identity: &ProcessId,
+    force: bool,
+    grace: Duration,
+) -> Result<bool> {
+    let raw_pid = i32::try_from(identity.pid).map_err(|_| OsError::InvalidArgument {
+        detail: format!("pid {} exceeds Unix pid_t range", identity.pid),
+    })?;
+    let nix_pid = Pid::from_raw(raw_pid);
+    let identity = *identity;
+
+    let initial_sig = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    let already_gone = tokio::task::spawn_blocking(move || -> Result<bool> {
+        if !is_alive(&identity) {
+            return Ok(true);
+        }
+        match kill(nix_pid, initial_sig) {
+            Ok(()) => Ok(false),
+            Err(Errno::ESRCH) => Ok(true),
+            Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                detail: format!("permission denied signaling process {}", identity.pid),
+                source: None,
+            }),
+            Err(err) => Err(OsError::Platform {
+                detail: format!("failed signaling process {}: {err}", identity.pid),
+            }),
+        }
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_process worker task failed: {err}"),
+    })??;
+
+    if already_gone {
+        return Ok(true);
+    }
+
+    if !force {
+        let grace_deadline = Instant::now() + grace;
+        loop {
+            let alive = tokio::task::spawn_blocking(move || is_alive(&identity))
+                .await
+                .map_err(|err| OsError::Platform {
+                    detail: format!("kill_process poll task failed: {err}"),
+                })?;
+            if !alive {
+                return Ok(true);
+            }
+            let now = Instant::now();
+            if now >= grace_deadline {
+                break;
+            }
+            let remaining = grace_deadline.saturating_duration_since(now);
+            tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+        }
+
+        let gone_on_escalate = tokio::task::spawn_blocking(move || -> Result<bool> {
+            if !is_alive(&identity) {
+                return Ok(true);
+            }
+            match kill(nix_pid, Signal::SIGKILL) {
+                Ok(()) => Ok(false),
+                Err(Errno::ESRCH) => Ok(true),
+                Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                    detail: format!("permission denied escalating process {}", identity.pid),
+                    source: None,
+                }),
+                Err(err) => Err(OsError::Platform {
+                    detail: format!("failed sending SIGKILL to process {}: {err}", identity.pid),
+                }),
+            }
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_process SIGKILL task failed: {err}"),
+        })??;
+
+        if gone_on_escalate {
+            return Ok(true);
+        }
+    }
+
+    let settle_deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        let alive = tokio::task::spawn_blocking(move || is_alive(&identity))
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("kill_process settle task failed: {err}"),
+            })?;
+        if !alive {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= settle_deadline {
+            return Ok(false);
+        }
+        let remaining = settle_deadline.saturating_duration_since(now);
+        tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     let raw_pid = i32::try_from(identity.pid).map_err(|_| OsError::InvalidArgument {
         detail: format!("pid {} exceeds Unix pid_t range", identity.pid),
@@ -177,23 +545,55 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
     let identity = *identity;
     let own_pid = std::process::id();
 
-    // Run the initial liveness check, full-table descendant discovery, and SIGTERM wave off the
-    // async worker thread.
+    // Run the initial identity check, full-table descendant/session/group discovery, and SIGTERM
+    // wave off the async worker thread. Even if the root already exited, any surviving processes
+    // still in its session (`sid == root.pid`) or process group (`pgid == root.pid`) started at or
+    // after `root.start_time` are discovered and stopped.
     let (mut tracked, target_pgid) = tokio::task::spawn_blocking(move || {
-        if !is_alive(&identity) {
-            return (HashMap::new(), None);
-        }
+        let root_alive = match super::of_pid(identity.pid) {
+            Ok(Some(observed)) if identity.matches(&observed) => true,
+            // PID has already been recycled by a different process; per POSIX the kernel cannot
+            // reuse a PID while any process still has it as its pgid or sid, so nothing remains.
+            Ok(Some(_)) => return (HashMap::new(), None),
+            Ok(None) => false,
+            Err(_) => return (HashMap::new(), None),
+        };
 
         let own_pgid = getpgrp();
-        // Only signal the process group as a whole when the target leads its own group and that
-        // group is not ours; otherwise signaling the group would hit unrelated siblings or ourselves.
-        let target_pgid = getpgid(Some(root_nix_pid))
-            .ok()
-            .filter(|&pgid| pgid == root_nix_pid && pgid != own_pgid);
+        let own_sid = getsid(None).ok();
+        let allow_group = root_nix_pid != own_pgid;
+        let allow_session = Some(root_nix_pid) != own_sid;
 
         let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
-        tracked.insert(identity.pid, identity);
-        collect_tree_into(&identity, target_pgid, own_pid, &mut tracked);
+        if root_alive {
+            tracked.insert(identity.pid, identity);
+        }
+
+        let found_in_group = collect_tree_into(
+            &identity,
+            root_nix_pid,
+            allow_group,
+            allow_session,
+            own_pid,
+            &mut tracked,
+        );
+
+        // Only signal the process group as a whole when `root` led that distinct group (either
+        // observed live or confirmed via a surviving group member whose start_time >= root).
+        let target_pgid = if allow_group {
+            let live_leader = root_alive && getpgid(Some(root_nix_pid)).ok() == Some(root_nix_pid);
+            if live_leader || found_in_group {
+                Some(root_nix_pid)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if tracked.is_empty() && target_pgid.is_none() {
+            return (tracked, None);
+        }
 
         if let Some(pgid) = target_pgid
             && root_not_recycled(&identity)
@@ -208,7 +608,7 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         detail: format!("kill_tree worker task failed: {err}"),
     })?;
 
-    if tracked.is_empty() {
+    if tracked.is_empty() && target_pgid.is_none() {
         return Ok(KillTreeReport {
             all_gone: true,
             survivors: Vec::new(),
@@ -240,11 +640,20 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 
-    // Phase 2: one last descendant discovery pass to catch any child spawned during grace, then
-    // escalate all survivors to SIGKILL.
+    // Phase 2: one last descendant/session/group discovery pass to catch any child spawned during
+    // grace, then escalate all survivors to SIGKILL.
     tracked = tokio::task::spawn_blocking(move || {
         if root_not_recycled(&identity) {
-            collect_tree_into(&identity, target_pgid, own_pid, &mut tracked);
+            let own_pgid = getpgrp();
+            let own_sid = getsid(None).ok();
+            let _ = collect_tree_into(
+                &identity,
+                root_nix_pid,
+                root_nix_pid != own_pgid,
+                Some(root_nix_pid) != own_sid,
+                own_pid,
+                &mut tracked,
+            );
             if let Some(pgid) = target_pgid {
                 let _ = killpg(pgid, Signal::SIGKILL);
             }
@@ -336,19 +745,28 @@ fn signal_tracked(tracked: &HashMap<u32, ProcessId>, sig: Signal, own_pid: u32) 
     }
 }
 
+/// Discover descendants of `root` (and of any already-tracked members) as well as any live
+/// processes still belonging to `root`'s process group or session whose exact kernel start time
+/// is at least `root.start_time`. Returns `true` if at least one live member was found in
+/// process group `root_nix_pid`.
 fn collect_tree_into(
     root: &ProcessId,
-    target_pgid: Option<Pid>,
+    root_nix_pid: Pid,
+    allow_group: bool,
+    allow_session: bool,
     own_pid: u32,
     tracked: &mut HashMap<u32, ProcessId>,
-) {
+) -> bool {
     let Ok(mut system) = System::new() else {
-        return;
+        return false;
     };
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
     let mut children_by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
     let mut start_by_pid: HashMap<u32, u64> = HashMap::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut queue: VecDeque<(u32, u64)> = VecDeque::new();
+    let mut found_in_group = false;
 
     for (sys_pid, proc_info) in system.processes() {
         if matches!(
@@ -367,28 +785,45 @@ fn collect_tree_into(
                 .push((pid, started));
         }
 
-        // Also capture any process still in the target's isolated process group even if its
-        // direct parent exited and it was reparented to init.
-        if let Some(pgid) = target_pgid
-            && pid != own_pid
-            && let Ok(raw) = i32::try_from(pid)
-            && getpgid(Some(Pid::from_raw(raw))).ok() == Some(pgid)
-            && !tracked.contains_key(&pid)
+        if pid == own_pid || pid == root.pid {
+            continue;
+        }
+
+        // Capture any process still in `root`'s process group or session—even after `root` itself
+        // has exited and reparented its children to init—verified by `start_time >= root.start_time`.
+        let Ok(raw) = i32::try_from(pid) else {
+            continue;
+        };
+        let nix_p = Pid::from_raw(raw);
+        let in_group = allow_group && getpgid(Some(nix_p)).ok() == Some(root_nix_pid);
+        let in_session = allow_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
+        if (in_group || in_session)
             && let Ok(Some(id)) = super::of_pid(pid)
+            && id.start_time >= root.start_time
         {
-            tracked.insert(pid, id);
+            if in_group {
+                found_in_group = true;
+            }
+            tracked.entry(pid).or_insert(id);
+            if visited.insert(pid) {
+                queue.push_back((pid, started));
+            }
         }
     }
 
-    if !is_alive(root) {
-        return;
+    if is_alive(root) && visited.insert(root.pid) {
+        let root_sys_start = start_by_pid.get(&root.pid).copied().unwrap_or(0);
+        queue.push_back((root.pid, root_sys_start));
     }
 
-    let mut visited: HashSet<u32> = HashSet::new();
-    let mut queue: VecDeque<(u32, u64)> = VecDeque::new();
-    let root_sys_start = start_by_pid.get(&root.pid).copied().unwrap_or(0);
-    visited.insert(root.pid);
-    queue.push_back((root.pid, root_sys_start));
+    // Also walk from any live already-tracked process so children spawned during grace are found
+    // even if the root itself exited earlier.
+    for (&pid, proc_id) in tracked.iter() {
+        if pid != own_pid && is_alive(proc_id) && visited.insert(pid) {
+            let sys_start = start_by_pid.get(&pid).copied().unwrap_or(0);
+            queue.push_back((pid, sys_start));
+        }
+    }
 
     while let Some((parent_pid, parent_start)) = queue.pop_front() {
         if let Some(children) = children_by_parent.get(&parent_pid) {
@@ -403,10 +838,15 @@ fn collect_tree_into(
                 if !tracked.contains_key(&child_pid)
                     && let Ok(Some(child_id)) = super::of_pid(child_pid)
                 {
+                    if child_id.start_time < root.start_time {
+                        continue;
+                    }
                     tracked.insert(child_pid, child_id);
                 }
                 queue.push_back((child_pid, child_start));
             }
         }
     }
+
+    found_in_group
 }

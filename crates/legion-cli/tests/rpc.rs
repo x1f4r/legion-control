@@ -202,3 +202,108 @@ fn a_pinned_session_keeps_its_principal_whatever_a_call_asks_for() {
             .all(|line| line["principal"] == json!("phone"))
     );
 }
+
+#[test]
+fn a_null_id_and_params_that_are_not_an_object_are_refused() {
+    let home = Home::new();
+    let mut session = home.session(&[]);
+    session.send(
+        r#"{"jsonrpc": "2.0", "id": null, "method": "call", "params": {"tool": "meta.version"}}"#,
+    );
+    let refused = session.next();
+    assert_eq!(refused["id"], Value::Null);
+    assert_eq!(refused["error"]["code"], json!(-32600));
+    for (id, method, params) in [
+        (1, "tools", json!([1])),
+        (2, "tools", json!("all")),
+        (3, "call", json!(["meta.version"])),
+        (4, "hello", json!([])),
+    ] {
+        session.send_json(&request(json!(id), method, params));
+        let (reply, _) = session.reply_to(&json!(id));
+        assert_eq!(reply["error"]["code"], json!(-32602), "{method}: {reply}");
+    }
+    assert_eq!(session.finish(), 0);
+    assert!(home.audit().is_empty());
+}
+
+// A relative LEGION_HOME cannot be resolved once the directory it is relative to has gone.
+#[cfg(unix)]
+#[test]
+fn a_session_that_cannot_start_says_why_on_stderr_and_leaves_stdout_to_the_protocol() {
+    let home = Home::new();
+    let gone = home.home().join("gone");
+    std::fs::create_dir(&gone).unwrap();
+    let output = std::process::Command::new("sh")
+        .args(["-c", r#"cd "$1" && rmdir "$1" && exec "$2" rpc"#, "sh"])
+        .arg(&gone)
+        .arg(env!("CARGO_BIN_EXE_legion"))
+        .env("LEGION_HOME", "legion-home")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("LEGION_HOME"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_session_that_cannot_start_says_why_on_stderr_and_leaves_stdout_to_the_protocol() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_legion"))
+        .arg("rpc")
+        .env_remove("LEGION_HOME")
+        .env_remove("APPDATA")
+        .env_remove("LOCALAPPDATA")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("LEGION_HOME"));
+}
+
+#[test]
+fn a_session_whose_output_closes_cancels_its_calls_and_exits_though_its_input_is_open() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let home = Home::new();
+    let mut child = home
+        .command(&["rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let line = request(
+        json!(1),
+        "call",
+        json!({"tool": "test.sleep", "args": {"seconds": 600}}),
+    );
+    writeln!(stdin, "{line}").unwrap();
+    stdin.flush().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    assert!(first.contains("\"event\""), "{first}");
+    drop(stdout);
+
+    let deadline = std::time::Instant::now() + common::PATIENCE;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "legion rpc went on after its output had closed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    drop(stdin);
+    assert_eq!(status.code(), Some(1));
+    let audit = home.audit();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0]["outcome"], json!("cancelled"));
+}

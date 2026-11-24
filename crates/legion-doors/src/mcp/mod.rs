@@ -35,6 +35,9 @@ use tokio_util::task::TaskTracker;
 use self::catalog::{Catalog, ON, summary};
 use self::events::{Forwarder, Level};
 
+/// The hint for a tool a compact session cannot find.
+const LIST_COMPACT: &str = "legion_tools lists the tools you may use here.";
+
 /// How a session is served.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -108,22 +111,41 @@ impl McpDoor {
         served
     }
 
-    /// What the session's principal may use, or `None` when the policy cannot be read: then every
-    /// tool is listed, and calling one says what is wrong with the file.
-    fn grant(&self) -> Option<Grant> {
-        let policy = self.node.config().get::<Policy>().ok()?;
-        let principal = policy.resolve(None, self.options.pinned.as_deref()).ok()?;
-        Some(policy.grant(&principal, self.node.paths().home()))
+    /// What the session's principal may use, or why that cannot be known: a policy file that
+    /// does not parse grants nothing, the same as it does for every call the node runs.
+    fn grant(&self) -> Result<Grant, ErrorBody> {
+        let here = |error: ErrorBody| match error.machine {
+            Some(_) => error,
+            None => error.with_machine(self.node.name()),
+        };
+        let policy = self.node.config().get::<Policy>().map_err(here)?;
+        let principal = policy
+            .resolve(None, self.options.pinned.as_deref())
+            .map_err(here)?;
+        Ok(policy.grant(&principal, self.node.paths()))
     }
 
-    /// The tools listed in full mode: those the principal may use. Listing is a courtesy that
-    /// keeps an agent from trying what will be refused; the node checks every call regardless.
+    /// The tool a client names, when the principal may use it. A tool beyond its role is treated
+    /// exactly like one that does not exist, so a session learns nothing about what it may not
+    /// use.
+    fn visible<'a>(&'a self, grant: &Grant, name: &str) -> Option<&'a catalog::Entry> {
+        self.catalog
+            .get(name)
+            .filter(|entry| grant.allows(&entry.spec))
+    }
+
+    /// The tools listed in full mode: those the principal may use, and none while the policy
+    /// cannot be read. Listing is a courtesy that keeps an agent from trying what will be refused;
+    /// the node checks every call regardless, and a call is how an agent learns what is wrong with
+    /// the policy.
     fn listed(&self) -> Vec<Tool> {
-        let grant = self.grant();
+        let Ok(grant) = self.grant() else {
+            return Vec::new();
+        };
         self.catalog
             .entries()
             .iter()
-            .filter(|entry| grant.as_ref().is_none_or(|grant| grant.allows(&entry.spec)))
+            .filter(|entry| grant.allows(&entry.spec))
             .map(|entry| entry.tool.clone())
             .collect()
     }
@@ -200,22 +222,12 @@ impl McpDoor {
         mut args: JsonObject,
         context: &RequestContext<RoleServer>,
     ) -> RouteOutcome {
-        let on = match args.remove(ON) {
-            None | Some(Value::Null) => None,
-            Some(value) => match serde_json::from_value::<Target>(value) {
-                Ok(target) => Some(target),
-                Err(error) => {
-                    return RouteOutcome::One(Err(self
-                        .door_error(ErrorCode::InvalidArgs, format!("on: {error}."))
-                        .with_hint("Give on as a machine's name, a list of names, or \"all\", or leave it out to run on this machine.")));
-                }
-            },
+        let on = match self.on(args.remove(ON)) {
+            Ok(on) => on,
+            Err(error) => return RouteOutcome::One(Err(error)),
         };
         let tool = self.catalog.resolve(name);
-        map_unknown_tool_hint(
-            self.run(tool, Value::Object(args), on, context).await,
-            "tools/list shows the tools here. Their names have an underscore where Legion's have a dot, such as meta_whoami for meta.whoami.",
-        )
+        self.rewrite_outcome(self.run(tool, Value::Object(args), on, context).await, tool)
     }
 
     /// A call to one of the three tools compact mode serves.
@@ -232,30 +244,42 @@ impl McpDoor {
             ),
             compact::DESCRIBE => RouteOutcome::One(
                 compact::parse::<compact::DescribeArgs>(name, args).and_then(|args| {
-                    let spec = self
-                        .node
-                        .spec(self.catalog.resolve(&args.tool))
-                        .map_err(|error| error.with_hint("legion_tools lists the tools here."))?;
-                    to_object(&spec)
+                    let grant = self.grant()?;
+                    match self.visible(&grant, &args.tool) {
+                        Some(entry) => to_object(&entry.spec),
+                        None => Err(self
+                            .door_error(
+                                ErrorCode::UnknownTool,
+                                format!(
+                                    "There is no tool called {} on {}.",
+                                    args.tool,
+                                    self.node.name()
+                                ),
+                            )
+                            .with_hint(LIST_COMPACT)),
+                    }
                 }),
             ),
             compact::CALL => match compact::parse::<compact::CallArgs>(name, args) {
                 Ok(args) => {
                     let tool = self.catalog.resolve(&args.tool);
                     let tool_args = Value::Object(args.args.unwrap_or_default());
-                    map_unknown_tool_hint(
-                        self.run(tool, tool_args, args.on, context).await,
-                        "legion_tools lists the tools here.",
-                    )
+                    let on = match self.on(args.on) {
+                        Ok(on) => on,
+                        Err(error) => return RouteOutcome::One(Err(error)),
+                    };
+                    self.rewrite_outcome(self.run(tool, tool_args, on, context).await, tool)
                 }
                 Err(error) => RouteOutcome::One(Err(error)),
             },
             other => {
-                let tool = self.catalog.resolve(other);
-                let hint = if self.node.spec(tool).is_ok() {
-                    format!("Run it with legion_call, giving tool \"{tool}\".")
-                } else {
-                    "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned()
+                let hint = match self
+                    .grant()
+                    .ok()
+                    .and_then(|grant| self.visible(&grant, other).map(|entry| entry.spec.name.clone()))
+                {
+                    Some(tool) => format!("Run it with legion_call, giving tool \"{tool}\"."),
+                    None => "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned(),
                 };
                 RouteOutcome::One(Err(self
                     .door_error(
@@ -279,12 +303,12 @@ impl McpDoor {
             effect: &'a str,
             description: &'a str,
         }
-        let grant = self.grant();
+        let grant = self.grant()?;
         let allowed: Vec<&catalog::Entry> = self
             .catalog
             .entries()
             .iter()
-            .filter(|entry| grant.as_ref().is_none_or(|grant| grant.allows(&entry.spec)))
+            .filter(|entry| grant.allows(&entry.spec))
             .collect();
         let chosen: Vec<Listed<'_>> = allowed
             .iter()
@@ -302,6 +326,20 @@ impl McpDoor {
         if let Some(family) = family
             && chosen.is_empty()
         {
+            if allowed.is_empty() {
+                return Err(self
+                    .door_error(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may use no tools on {}.",
+                            grant.principal(),
+                            self.node.name()
+                        ),
+                    )
+                    .with_hint(
+                        "The owner of this machine decides in policy.toml which tools each principal may use.",
+                    ));
+            }
             let mut families: Vec<&str> = allowed
                 .iter()
                 .filter_map(|entry| entry.spec.name.split('.').next())
@@ -320,6 +358,60 @@ impl McpDoor {
         to_object(&Listing { tools: chosen })
     }
 
+    /// A call's error with any hint written for the command line rewritten to point at what an
+    /// MCP client has: `tools/list` and the tool's schema there, or `legion_tools` and
+    /// `legion_describe` in compact mode.
+    fn for_client(&self, error: ErrorBody, tool: &str) -> ErrorBody {
+        let hint = error.hint.as_deref().unwrap_or_default();
+        let compact = self.options.compact;
+        if error.code == ErrorCode::UnknownTool || hint.contains("`legion tools`") {
+            error.with_hint(if compact {
+                LIST_COMPACT
+            } else {
+                "tools/list shows the tools you may use here. Their names have an underscore where Legion's have a dot, such as meta_whoami for meta.whoami."
+            })
+        } else if hint.contains("`legion help ") {
+            error.with_hint(if compact {
+                format!("legion_describe with tool \"{tool}\" shows the arguments it takes.")
+            } else {
+                format!(
+                    "The input schema of {} in tools/list shows the arguments it takes.",
+                    catalog::mcp_name(tool)
+                )
+            })
+        } else {
+            error
+        }
+    }
+
+    /// Applies [`Self::for_client`] to every error inside a routed outcome.
+    fn rewrite_outcome(&self, outcome: RouteOutcome, tool: &str) -> RouteOutcome {
+        match outcome {
+            RouteOutcome::One(result) => {
+                RouteOutcome::One(result.map_err(|error| self.for_client(error, tool)))
+            }
+            RouteOutcome::Many(results) => RouteOutcome::Many(
+                results
+                    .into_iter()
+                    .map(|(machine, result)| {
+                        (
+                            machine,
+                            result.map_err(|error| self.for_client(error, tool)),
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The machines an `on` argument names.
+    fn on(&self, on: Option<Value>) -> Result<Option<Target>, ErrorBody> {
+        catalog::target(on.unwrap_or(Value::Null)).map_err(|error| {
+            self.door_error(ErrorCode::InvalidArgs, format!("on: {error}."))
+                .with_hint("Give on as a machine's name, several names separated by commas, or \"all\", or leave it out to run on this machine.")
+        })
+    }
+
     /// An error the door itself finds, before any call reaches the node, naming the node as the
     /// node's own errors do.
     fn door_error(&self, code: ErrorCode, message: String) -> ErrorBody {
@@ -327,36 +419,22 @@ impl McpDoor {
     }
 }
 
-/// Rewrites an `unknown_tool` hint on single-machine outcomes to point MCP callers at MCP listings.
-fn map_unknown_tool_hint(outcome: RouteOutcome, hint: &str) -> RouteOutcome {
-    match outcome {
-        RouteOutcome::One(Err(error)) if error.code == ErrorCode::UnknownTool => {
-            RouteOutcome::One(Err(error.with_hint(hint)))
-        }
-        other => other,
-    }
-}
-
-/// A tool's outcome as an MCP result: the JSON object as indented text, which every client shows
-/// the model, and as structured content for clients that read that instead. A failure (or a
-/// fan-out where every machine failed) is marked as an error.
+/// A tool's outcome as an MCP result: the JSON object as one line of text, which every client
+/// shows the model. It is not sent as structured content as well: no tool declares an output
+/// schema to check that against, and a client that passes on both would cost the model every
+/// byte twice. A failure (or a fan-out where every machine failed) is marked as an error.
 fn tool_result(outcome: RouteOutcome) -> CallToolResult {
     let failed = outcome.all_failed();
-    let value = match outcome.into_wire() {
-        Ok(value) => value,
-        Err(error) => match serde_json::to_value(&error) {
-            Ok(value) => value,
-            Err(_) => json!({"code": "internal", "message": error.message}),
-        },
+    let text = match outcome.into_wire() {
+        Ok(value) => value.to_string(),
+        Err(error) => serde_json::to_string(&error)
+            .unwrap_or_else(|_| json!({"code": "internal", "message": error.message}).to_string()),
     };
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    let mut result = if failed {
+    if failed {
         CallToolResult::error(vec![ContentBlock::text(text)])
     } else {
         CallToolResult::success(vec![ContentBlock::text(text)])
-    };
-    result.structured_content = Some(value);
-    result
+    }
 }
 
 fn to_object<T: Serialize>(value: &T) -> Result<Value, ErrorBody> {

@@ -6,8 +6,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
-use legion_core::config::{Document, NodeName, parse};
-use legion_os::atomic::{WriteOptions, write_atomic};
+use legion_core::config::{ConfigStore, Document, NodeName, parse};
 use legion_proto::{ErrorBody, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -79,6 +78,9 @@ impl FleetFile {
 
 impl Document for FleetFile {
     const FILE: &'static str = "fleet.toml";
+    // Its default is an empty fleet, which grants nothing, so removing the last machine or keeping
+    // a comment-only file stays valid.
+    const EMPTY_IS_DEFAULT: bool = true;
 
     fn validate(&self) -> Result<(), String> {
         for (name, entry) in &self.machines {
@@ -421,9 +423,14 @@ fn validate_transport(
     Ok(())
 }
 
-/// Atomically adds or replaces one machine in `fleet.toml`, preserving comments and unrelated
-/// entries, and returns `true` if an existing entry was replaced.
-pub fn upsert_machine(path: &Path, name: &str, entry: &MachineEntry) -> Result<bool, ErrorBody> {
+/// Atomically adds or replaces one machine in `fleet.toml` through [`ConfigStore::write`],
+/// preserving comments and unrelated entries, and returns `true` if an existing entry was
+/// replaced.
+pub fn upsert_machine(
+    store: &ConfigStore,
+    name: &str,
+    entry: &MachineEntry,
+) -> Result<bool, ErrorBody> {
     validate_machine_entry(name, entry).map_err(|reason| {
         ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}."))
             .with_hint("Fix the machine settings and try again.")
@@ -431,17 +438,18 @@ pub fn upsert_machine(path: &Path, name: &str, entry: &MachineEntry) -> Result<b
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut doc = load_editable(path)?;
-    let machines = ensure_machines_table(&mut doc, path)?;
+    let path = store.path_of::<FleetFile>();
+    let mut doc = load_editable(&path)?;
+    let machines = ensure_machines_table(&mut doc, &path)?;
     let replaced = apply_upsert(machines, name, entry);
-    save_validated(path, &doc)?;
+    save_validated(store, &doc)?;
     Ok(replaced)
 }
 
-/// Atomically adds multiple new machines to `fleet.toml` in a single edit, skipping any already
-/// present and returning the names that were added.
+/// Atomically adds multiple new machines to `fleet.toml` in a single edit through
+/// [`ConfigStore::write`], skipping any already present and returning the names that were added.
 pub fn add_missing_machines(
-    path: &Path,
+    store: &ConfigStore,
     entries: &[(String, MachineEntry)],
 ) -> Result<Vec<String>, ErrorBody> {
     for (name, entry) in entries {
@@ -454,8 +462,9 @@ pub fn add_missing_machines(
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut doc = load_editable(path)?;
-    let machines = ensure_machines_table(&mut doc, path)?;
+    let path = store.path_of::<FleetFile>();
+    let mut doc = load_editable(&path)?;
+    let machines = ensure_machines_table(&mut doc, &path)?;
     let mut added = Vec::new();
     for (name, entry) in entries {
         if !machines.contains_key(name) {
@@ -464,19 +473,21 @@ pub fn add_missing_machines(
         }
     }
     if !added.is_empty() {
-        save_validated(path, &doc)?;
+        save_validated(store, &doc)?;
     }
     Ok(added)
 }
 
-/// Atomically removes one machine from `fleet.toml`, preserving comments and unrelated entries.
-pub fn remove_machine(path: &Path, name: &str) -> Result<(), ErrorBody> {
+/// Atomically removes one machine from `fleet.toml` through [`ConfigStore::write`], preserving
+/// comments and unrelated entries.
+pub fn remove_machine(store: &ConfigStore, name: &str) -> Result<(), ErrorBody> {
     validate_machine_name(name)
         .map_err(|reason| ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}.")))?;
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut doc = load_editable(path)?;
+    let path = store.path_of::<FleetFile>();
+    let mut doc = load_editable(&path)?;
     let known: Vec<String> = doc
         .get("machines")
         .and_then(Item::as_table)
@@ -488,7 +499,7 @@ pub fn remove_machine(path: &Path, name: &str) -> Result<(), ErrorBody> {
     if machines.remove(name).is_none() {
         return Err(not_found_in_file(name, &known));
     }
-    save_validated(path, &doc)?;
+    save_validated(store, &doc)?;
     Ok(())
 }
 
@@ -623,34 +634,12 @@ fn string_array(items: &[String]) -> Array {
     array
 }
 
-fn save_validated(path: &Path, doc: &DocumentMut) -> Result<(), ErrorBody> {
+fn save_validated(store: &ConfigStore, doc: &DocumentMut) -> Result<(), ErrorBody> {
     let mut rendered = doc.to_string();
     if !rendered.is_empty() && !rendered.ends_with('\n') {
         rendered.push('\n');
     }
-    // Validate the exact bytes about to be written through legion-core's strict loader.
-    parse::<FleetFile>(path, rendered.as_bytes())?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be created: {err}.", parent.display()),
-            )
-            .with_hint(
-                "Give the account legion runs as write access to the configuration directory.",
-            )
-        })?;
-    }
-    write_atomic(path, rendered.as_bytes(), WriteOptions::default()).map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("{} cannot be written: {err}.", path.display()),
-        )
-        .with_hint("Give the account legion runs as write access to the configuration directory.")
-    })?;
-    Ok(())
+    store.write::<FleetFile>(&rendered)
 }
 
 #[cfg(test)]
@@ -846,7 +835,8 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
     #[test]
     fn upsert_and_remove_preserve_comments_and_unrelated_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("fleet.toml");
+        let store = ConfigStore::new(dir.path());
+        let file = store.path_of::<FleetFile>();
         std::fs::write(
             &file,
             "# Top-level note\n\n# Always-on Raspberry Pi\n[machines.pi]\nssh = \"pi.example\" # inline note\n",
@@ -854,7 +844,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
         .unwrap();
 
         let replaced = upsert_machine(
-            &file,
+            &store,
             "tower",
             &MachineEntry {
                 ssh: Some("tower.example".to_owned()),
@@ -872,7 +862,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
         assert!(text.contains("# inline note"), "{text}");
 
         let replaced = upsert_machine(
-            &file,
+            &store,
             "pi",
             &MachineEntry {
                 ssh: Some("pi2.example".to_owned()),
@@ -885,13 +875,17 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
         assert!(text.contains("# Always-on Raspberry Pi"), "{text}");
         assert!(text.contains("pi2.example"), "{text}");
 
-        remove_machine(&file, "tower").unwrap();
+        remove_machine(&store, "tower").unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("# Top-level note"), "{text}");
         assert!(text.contains("# Always-on Raspberry Pi"), "{text}");
         assert!(!text.contains("tower.example"), "{text}");
 
-        let missing = remove_machine(&file, "tower").unwrap_err();
+        // Removing the last machine leaves a comment-only file that still parses cleanly.
+        remove_machine(&store, "pi").unwrap();
+        assert!(store.get::<FleetFile>().unwrap().machines.is_empty());
+
+        let missing = remove_machine(&store, "tower").unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
     }
 }

@@ -471,6 +471,14 @@ impl Drop for McpClient {
     }
 }
 
+/// Extracts the single compact JSON text payload from an MCP tool result.
+fn mcp_payload(result: &Value) -> Value {
+    assert_eq!(result.get("structuredContent"), None, "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains('\n'), "{text}");
+    serde_json::from_str(text).unwrap()
+}
+
 fn routes_call_to_remote_node_via_cli_rpc_and_mcp() {
     let laptop = Home::new();
     let pi = Home::new();
@@ -523,7 +531,7 @@ fn routes_call_to_remote_node_via_cli_rpc_and_mcp() {
     }
     let (res, _) = mcp.call_with_events("meta_version", json!({"on": "pi"}), None);
     assert_eq!(res["isError"], json!(false), "{res}");
-    assert_eq!(res["structuredContent"]["node"], json!("pi"));
+    assert_eq!(mcp_payload(&res)["node"], json!("pi"));
     assert_eq!(mcp.finish(), 0);
 }
 
@@ -577,15 +585,16 @@ allow = ["effect:read"]
     let mut mcp = McpClient::start(&laptop, &["--as", "phone"]);
     let (res, _) = mcp.call_with_events("meta_whoami", json!({"on": "pi"}), None);
     assert_eq!(res["isError"], json!(false));
-    assert_eq!(res["structuredContent"]["principal"], json!("phone"));
+    assert_eq!(mcp_payload(&res)["principal"], json!("phone"));
     let (denied_mcp, _) = mcp.call_with_events(
         "test_write_path",
         json!({"path": "~/projects/a", "on": "pi"}),
         None,
     );
     assert_eq!(denied_mcp["isError"], json!(true));
-    assert_eq!(denied_mcp["structuredContent"]["code"], json!("denied"));
-    assert_eq!(denied_mcp["structuredContent"]["machine"], json!("pi"));
+    let denied_body = mcp_payload(&denied_mcp);
+    assert_eq!(denied_body["code"], json!("denied"));
+    assert_eq!(denied_body["machine"], json!("pi"));
     assert_eq!(mcp.finish(), 0);
 }
 

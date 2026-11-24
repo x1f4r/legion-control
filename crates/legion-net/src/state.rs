@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use legion_os::atomic::{WriteOptions, write_atomic};
+use legion_core::config::write_atomically;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RemoteOs;
@@ -94,7 +94,7 @@ impl StateStore {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = write_atomic(&self.path, &bytes, WriteOptions::default());
+        let _ = write_atomically(&self.path, &bytes);
     }
 }
 

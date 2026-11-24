@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic, write_atomic_from_reader};
-use legion_os::detach::{DetachHandle, DetachOptions, spawn_detached, stop_detached};
+use legion_os::detach::{
+    DetachHandle, DetachOptions, detached_active, spawn_detached, stop_detached,
+};
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid::{self, ProcessId};
 use legion_os::run::{OutputStream, RunOptions, run};
@@ -82,8 +84,28 @@ fn main() -> ExitCode {
             || Box::pin(test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree()),
         ),
         (
+            "detach_duplicate_names_get_distinct_scopes_and_isolate_stop",
+            || Box::pin(test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop()),
+        ),
+        (
+            "detach_does_not_inherit_extra_open_file_descriptors",
+            || Box::pin(test_detach_does_not_inherit_extra_open_file_descriptors()),
+        ),
+        (
+            "detach_active_tracks_root_and_surviving_descendants",
+            || Box::pin(test_detach_active_tracks_root_and_surviving_descendants()),
+        ),
+        (
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
             || Box::pin(test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time()),
+        ),
+        (
+            "procid_kill_tree_stops_surviving_descendants_after_root_exits",
+            || Box::pin(test_procid_kill_tree_stops_surviving_descendants_after_root_exits()),
+        ),
+        (
+            "procid_kill_process_stops_only_verified_target_and_respects_force",
+            || Box::pin(test_procid_kill_process_stops_only_verified_target_and_respects_force()),
         ),
         ("atomic_write_interrupted_leaves_no_partial_file", || {
             Box::pin(test_atomic_write_interrupted_leaves_no_partial_file())
@@ -171,6 +193,9 @@ fn run_helper(mode: &str) -> ExitCode {
         "detach_worker" => helper_detach_worker(&args),
         "lock_holder" => helper_lock_holder(&args),
         "count_sigterm" => helper_count_sigterm(),
+        "orphan_root_exit" => helper_orphan_root_exit(&args),
+        "detach_fd_parent" => helper_detach_fd_parent(&args),
+        "report_open_fds" => helper_report_open_fds(&args),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -466,6 +491,107 @@ fn helper_count_sigterm() -> ExitCode {
             }
         });
     }
+    ExitCode::SUCCESS
+}
+
+fn helper_orphan_root_exit(args: &[String]) -> ExitCode {
+    let root_id_file = Path::new(&args[0]);
+    let child_id_file = &args[1];
+
+    write_current_procid(root_id_file);
+
+    // Spawn a long-lived child and exit immediately while the child stays alive in our session
+    // (on Unix) or with our PID recorded as its parent_pid (on Windows).
+    #[allow(clippy::zombie_processes)]
+    let _child = Command::new(current_exe())
+        .env(HELPER_ENV, "sleep")
+        .args(["30000", child_id_file])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn surviving child");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(child_id_file).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn helper_detach_fd_parent(args: &[String]) -> ExitCode {
+    let handle_file = PathBuf::from(&args[0]);
+    let report_file = args[1].clone();
+    let canary_file = PathBuf::from(&args[2]);
+    let disable_systemd = args.get(3).is_some_and(|s| s == "--no-systemd");
+
+    // Verify fd 3 really is open and points to `canary_file` in the parent calling spawn_detached.
+    #[cfg(target_os = "linux")]
+    {
+        let fd3_target = fs::read_link("/proc/self/fd/3")
+            .expect("expected inheritable fd 3 to be open in parent");
+        assert_eq!(
+            fs::canonicalize(&fd3_target).unwrap(),
+            fs::canonicalize(&canary_file).unwrap(),
+            "fd 3 in parent did not point to canary file"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = canary_file;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("helper tokio runtime");
+
+    let mut opts = DetachOptions::new(CommandSpec::argv(current_exe(), [report_file]))
+        .name("fd-leak-check")
+        .env(HELPER_ENV, "report_open_fds");
+    if disable_systemd {
+        // Point XDG_RUNTIME_DIR at a nonexistent path so `systemd-run --user` is unreachable and
+        // `spawn_detached` exercises the direct `setsid` branch too.
+        opts = opts
+            .env("XDG_RUNTIME_DIR", "/nonexistent-legion-fd-test-dir")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent-legion-bus",
+            );
+    }
+
+    let handle = rt
+        .block_on(spawn_detached(opts))
+        .expect("spawn_detached failed inside detach_fd_parent");
+
+    let serialized = serde_json::to_string(&handle).expect("failed to serialize DetachHandle");
+    write_atomic(&handle_file, serialized.as_bytes(), WriteOptions::default())
+        .expect("failed to write DetachHandle");
+    ExitCode::SUCCESS
+}
+
+fn helper_report_open_fds(args: &[String]) -> ExitCode {
+    let report_file = Path::new(&args[0]);
+    let mut lines: Vec<String> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(entries) = fs::read_dir("/proc/self/fd") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let target = fs::read_link(entry.path())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_owned());
+                lines.push(format!("{name}->{target}"));
+            }
+        }
+    }
+    lines.sort();
+    write_atomic(
+        report_file,
+        (lines.join("\n") + "\n").as_bytes(),
+        WriteOptions::default(),
+    )
+    .expect("failed to write open fd report");
+    std::thread::sleep(Duration::from_secs(30));
     ExitCode::SUCCESS
 }
 
@@ -905,13 +1031,199 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
 
     #[cfg(unix)]
     if let Some(ref unit) = handle.systemd_unit {
-        assert_eq!(unit, &format!("legion-job-{job_name}.scope"));
+        assert!(
+            unit.starts_with(&format!("legion-job-{job_name}-")) && unit.ends_with(".scope"),
+            "unexpected systemd scope unit name: {unit}"
+        );
         assert!(
             !procid::is_alive(&setsid_id),
             "setsid grandchild {setsid_id} survived stop_detached on systemd scope {unit}"
         );
     } else if procid::is_alive(&setsid_id) {
         let _ = procid::kill_tree(&setsid_id, Duration::from_millis(200)).await;
+    }
+}
+
+async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let id1_file = dir.path().join("dup1.pid");
+    let id2_file = dir.path().join("dup2.pid");
+    let id1_str = id1_file.to_string_lossy().into_owned();
+    let id2_str = id2_file.to_string_lossy().into_owned();
+
+    let (spec1, env1) = helper_spec("sleep", &["30000", &id1_str]);
+    let (spec2, env2) = helper_spec("sleep", &["30000", &id2_str]);
+
+    let h1 = spawn_detached(DetachOptions::new(spec1).name("dup").envs(env1))
+        .await
+        .unwrap();
+    let h2 = spawn_detached(DetachOptions::new(spec2).name("dup").envs(env2))
+        .await
+        .unwrap();
+
+    let _ = wait_for_file(&id1_file, Duration::from_secs(5)).await;
+    let _ = wait_for_file(&id2_file, Duration::from_secs(5)).await;
+    assert!(procid::is_alive(&h1.process));
+    assert!(procid::is_alive(&h2.process));
+
+    if let (Some(u1), Some(u2)) = (&h1.systemd_unit, &h2.systemd_unit) {
+        assert_ne!(u1, u2, "duplicate caller names collided on scope {u1}");
+        assert!(u1.starts_with("legion-job-dup-") && u1.ends_with(".scope"));
+        assert!(u2.starts_with("legion-job-dup-") && u2.ends_with(".scope"));
+    }
+
+    // Also confirm fast-exiting commands succeed cleanly under systemd scope confirmation.
+    let (fast_spec, fast_env) = helper_spec("echo", &["0"]);
+    let fast = spawn_detached(DetachOptions::new(fast_spec).name("dup").envs(fast_env))
+        .await
+        .unwrap();
+    assert_ne!(fast.process, h1.process);
+
+    // Stopping the second handle must not stop the first.
+    let r2 = stop_detached(&h2, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(r2.all_gone);
+    assert!(!procid::is_alive(&h2.process));
+    assert!(
+        procid::is_alive(&h1.process),
+        "stopping second handle unexpectedly stopped first handle"
+    );
+
+    let r1 = stop_detached(&h1, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(r1.all_gone);
+    assert!(!procid::is_alive(&h1.process));
+}
+
+async fn test_detach_does_not_inherit_extra_open_file_descriptors() {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let canary = dir.path().join("leaked-canary-fd3.txt");
+        let canary_str = canary.to_string_lossy().into_owned();
+        let exe_str = current_exe().to_string_lossy().into_owned();
+
+        // Exercise both the default Linux branch (`systemd-run --user --scope` when available)
+        // and the direct `setsid` fallback branch (`--no-systemd`).
+        for (label, extra_flag) in [("systemd", ""), ("setsid", "--no-systemd")] {
+            let handle_file = dir.path().join(format!("fd-handle-{label}.json"));
+            let report_file = dir.path().join(format!("fd-report-{label}.txt"));
+            let handle_str = handle_file.to_string_lossy().into_owned();
+            let report_str = report_file.to_string_lossy().into_owned();
+
+            // `exec 3>"$1"` opens `canary` on fd 3 WITHOUT O_CLOEXEC, matching `cmd ... 3>/file`.
+            let mut cmd = Command::new("sh");
+            cmd.args([
+                "-c",
+                "exec 3>\"$1\"; shift; exec \"$@\"",
+                "_",
+                &canary_str,
+                &exe_str,
+                &handle_str,
+                &report_str,
+                &canary_str,
+            ]);
+            if !extra_flag.is_empty() {
+                cmd.arg(extra_flag);
+            }
+            let status = cmd
+                .env(HELPER_ENV, "detach_fd_parent")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .status()
+                .unwrap();
+            assert!(status.success(), "detach_fd_parent ({label}) failed");
+
+            let handle_json = wait_for_file(&handle_file, Duration::from_secs(5)).await;
+            let handle: DetachHandle = serde_json::from_str(&handle_json).unwrap();
+            let fd_report = wait_for_file(&report_file, Duration::from_secs(5)).await;
+
+            assert!(
+                !fd_report.contains("leaked-canary-fd3.txt"),
+                "detached child ({label}) inherited caller's fd 3 canary file:\n{fd_report}"
+            );
+
+            let stop = stop_detached(&handle, Duration::from_millis(300))
+                .await
+                .unwrap();
+            assert!(stop.all_gone);
+            assert!(!procid::is_alive(&handle.process));
+        }
+    }
+}
+
+async fn test_detach_active_tracks_root_and_surviving_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Test both the default detach mode (systemd scope on Linux, direct/WMI on Windows) and
+    // the non-scope `setsid` path on Linux.
+    #[cfg(target_os = "linux")]
+    let modes: &[(&str, bool)] = &[("default", false), ("setsid", true)];
+    #[cfg(not(target_os = "linux"))]
+    let modes: &[(&str, bool)] = &[("default", false)];
+
+    for &(label, disable_systemd) in modes {
+        let root_id_file = dir.path().join(format!("active-root-{label}.pid"));
+        let child_id_file = dir.path().join(format!("active-child-{label}.pid"));
+        let root_str = root_id_file.to_string_lossy().into_owned();
+        let child_str = child_id_file.to_string_lossy().into_owned();
+
+        let (spec, env_vars) = helper_spec("orphan_root_exit", &[&root_str, &child_str]);
+        let mut opts = DetachOptions::new(spec)
+            .name(format!("active-{label}"))
+            .envs(env_vars);
+        if disable_systemd {
+            opts = opts
+                .env("XDG_RUNTIME_DIR", "/nonexistent-legion-active-test-dir")
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/nonexistent-legion-bus",
+                );
+        }
+
+        let handle = spawn_detached(opts).await.unwrap();
+        if disable_systemd {
+            assert!(handle.systemd_unit.is_none());
+        }
+
+        let child_id = parse_procid(&wait_for_file(&child_id_file, Duration::from_secs(5)).await);
+
+        // Wait for the root process to finish exiting while its child keeps running.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while procid::is_alive(&handle.process) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !procid::is_alive(&handle.process),
+            "root {} ({label}) should have exited",
+            handle.process
+        );
+        assert!(
+            procid::is_alive(&child_id),
+            "surviving child {child_id} ({label}) should still be alive"
+        );
+
+        // `detached_active` must still report true because a descendant under the handle is alive.
+        assert!(
+            detached_active(&handle).await.unwrap(),
+            "detached_active ({label}) returned false while descendant {child_id} was still running"
+        );
+
+        let report = stop_detached(&handle, Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(
+            report.all_gone,
+            "stop_detached ({label}) left survivors: {report:?}"
+        );
+        assert!(!procid::is_alive(&child_id));
+        assert!(
+            !detached_active(&handle).await.unwrap(),
+            "detached_active ({label}) still returned true after tree stopped"
+        );
     }
 }
 
@@ -945,6 +1257,162 @@ async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time
     let _ = child.kill();
     let _ = child.wait();
     assert!(!procid::is_alive(&real_id));
+}
+
+async fn test_procid_kill_tree_stops_surviving_descendants_after_root_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_id_file = dir.path().join("orphan_root.pid");
+    let child_id_file = dir.path().join("orphan_child.pid");
+    let root_id_str = root_id_file.to_string_lossy().into_owned();
+    let child_id_str = child_id_file.to_string_lossy().into_owned();
+
+    #[cfg(unix)]
+    {
+        use process_wrap::std::{CommandWrap, ProcessSession};
+        let mut wrapped = CommandWrap::with_new(current_exe(), |cmd| {
+            cmd.env(HELPER_ENV, "orphan_root_exit")
+                .args([&root_id_str, &child_id_str])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        });
+        wrapped.wrap(ProcessSession);
+        let mut child = wrapped.spawn().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+    }
+    #[cfg(not(unix))]
+    {
+        let status = Command::new(current_exe())
+            .env(HELPER_ENV, "orphan_root_exit")
+            .args([&root_id_str, &child_id_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let root_id = parse_procid(&wait_for_file(&root_id_file, Duration::from_secs(5)).await);
+    let child_id = parse_procid(&wait_for_file(&child_id_file, Duration::from_secs(5)).await);
+
+    // Confirm root is completely gone while its child is still running.
+    assert!(
+        !procid::is_alive(&root_id),
+        "root {root_id} should have exited before kill_tree"
+    );
+    assert!(
+        procid::is_alive(&child_id),
+        "child {child_id} should still be running after root exited"
+    );
+
+    let report = procid::kill_tree(&root_id, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(
+        report.all_gone,
+        "kill_tree left surviving descendants after root exit: {report:?}"
+    );
+    assert!(report.survivors.is_empty());
+    assert!(
+        !procid::is_alive(&child_id),
+        "surviving child {child_id} was not stopped by kill_tree after root exited"
+    );
+}
+
+async fn test_procid_kill_process_stops_only_verified_target_and_respects_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild_file = dir.path().join("single_grandchild.pid");
+    let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+
+    // 1. Verify kill_process kills only the target PID (leaving its child running) and ignores
+    //    mismatched start times.
+    let mut parent = Command::new(current_exe())
+        .env(HELPER_ENV, "spawn_tree")
+        .arg(&grandchild_str)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut ready_line = String::new();
+    let mut reader = BufReader::new(parent.stdout.take().unwrap());
+    reader.read_line(&mut ready_line).unwrap();
+    assert_eq!(ready_line.trim(), "READY");
+
+    let parent_id = procid::of_pid(parent.id()).unwrap().unwrap();
+    let grandchild_id =
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(5)).await);
+    assert!(procid::is_alive(&parent_id));
+    assert!(procid::is_alive(&grandchild_id));
+    assert!(
+        procid::is_protected(&parent_id).is_none(),
+        "ordinary child process {parent_id} must not be marked protected"
+    );
+    assert!(
+        procid::is_protected(&grandchild_id).is_none(),
+        "ordinary grandchild process {grandchild_id} must not be marked protected"
+    );
+
+    let mismatched = ProcessId::new(parent_id.pid, parent_id.start_time.wrapping_add(7));
+    assert!(
+        procid::kill_process(&mismatched, true, Duration::from_millis(50))
+            .await
+            .unwrap()
+    );
+    assert!(
+        procid::is_alive(&parent_id),
+        "kill_process killed a process with mismatched start_time"
+    );
+
+    // Reap the direct child in a background thread so wait() does not leave a zombie blocking
+    // is_alive checks if needed (of_pid already treats zombies as not alive).
+    let gone = procid::kill_process(&parent_id, false, Duration::from_millis(300))
+        .await
+        .unwrap();
+    let _ = parent.wait();
+    assert!(gone);
+    assert!(!procid::is_alive(&parent_id));
+    assert!(
+        procid::is_alive(&grandchild_id),
+        "kill_process unexpectedly killed child process {grandchild_id}"
+    );
+
+    // Clean up the surviving grandchild via kill_process.
+    assert!(
+        procid::kill_process(&grandchild_id, true, Duration::from_millis(100))
+            .await
+            .unwrap()
+    );
+    assert!(!procid::is_alive(&grandchild_id));
+
+    // 2. Verify force = true kills a SIGTERM-ignoring process immediately without waiting grace.
+    let stubborn_file = dir.path().join("stubborn.pid");
+    let stubborn_str = stubborn_file.to_string_lossy().into_owned();
+    let mut stubborn = Command::new(current_exe())
+        .env(HELPER_ENV, "sleep")
+        .args(["30000", &stubborn_str, "--ignore-term"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stubborn_id = parse_procid(&wait_for_file(&stubborn_file, Duration::from_secs(5)).await);
+    let started = Instant::now();
+    let gone = procid::kill_process(&stubborn_id, true, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let _ = stubborn.wait();
+    assert!(gone);
+    assert!(!procid::is_alive(&stubborn_id));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "force = true waited for grace instead of killing immediately ({elapsed:?})"
+    );
 }
 
 async fn test_atomic_write_interrupted_leaves_no_partial_file() {

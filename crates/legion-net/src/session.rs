@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use legion_core::{CancellationToken, Event, EventSink, VERSION};
+use legion_core::{CANCEL_GRACE, CancellationToken, Event, EventSink, VERSION};
 use legion_proto::{
     CallParams, CancelParams, ErrorBody, ErrorCode, EventParams, HelloParams, HelloResult, Id,
     Notification, Outcome, PROTOCOL, Request, Response, method,
@@ -30,8 +30,10 @@ const LONGEST_LINE: usize = 16 * 1024 * 1024;
 const MAX_NOISE_LINES: usize = 64;
 /// Maximum cumulative bytes of noise skipped before the `hello` reply.
 const MAX_NOISE_BYTES: usize = 64 * 1024;
-/// How long a cancelled call waits for the remote node's reply after sending `cancel`.
-const CANCEL_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a cancelled call waits for the remote node's reply after sending `cancel`: the remote
+/// node gives its cancelled tool [`CANCEL_GRACE`] to clean up and reply, plus transport slack so
+/// the final reply still arrives cleanly.
+const CANCEL_REPLY_TIMEOUT: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(1));
 /// Grace window for clean EOF exit when closing a session.
 const CLOSE_GRACE: Duration = Duration::from_millis(500);
 /// Brief wait for process exit + stderr drain when a pipe closes unexpectedly.
@@ -1353,5 +1355,149 @@ mod tests {
             .unwrap_err();
         assert!(matches!(after, CallError::NotWritten(_)), "{after:?}");
         server_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_forwards_to_remote_and_waits_through_cancel_grace() {
+        // Case 1: remote finishes cleanup near the end of CANCEL_GRACE and returns a reply.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let (called_tx, called_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            server_w
+                .write_all(hello_ok("pi", PROTOCOL).as_bytes())
+                .await
+                .unwrap();
+
+            let call_line = lines.next_line().await.unwrap().unwrap();
+            let call_req: Request = serde_json::from_str(&call_line).unwrap();
+            let _ = called_tx.send(());
+
+            let cancel_line = lines.next_line().await.unwrap().unwrap();
+            let cancel_req: Request = serde_json::from_str(&cancel_line).unwrap();
+            assert_eq!(cancel_req.method, method::CANCEL);
+            let cancel_params: CancelParams = serde_json::from_value(cancel_req.params).unwrap();
+            assert_eq!(cancel_params.id, call_req.id.clone().unwrap());
+
+            let cancel_ack = Response::ok(cancel_req.id, json!({}));
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&cancel_ack).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            // Simulate a remote tool that takes almost the full CANCEL_GRACE to clean up.
+            tokio::time::sleep(CANCEL_GRACE - Duration::from_millis(200)).await;
+            let reply = Response::ok(call_req.id, json!({"cleaned": true}));
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+        });
+
+        let session = Arc::new(
+            Session::open_io(
+                client_r,
+                client_w,
+                "pi",
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let s = Arc::clone(&session);
+        let call_cancel = cancel.clone();
+        let call_task = tokio::spawn(async move {
+            s.call(
+                CallParams {
+                    tool: "test.sleep".into(),
+                    args: json!({"seconds": 30}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                call_cancel,
+                EventSink::discard(),
+            )
+            .await
+        });
+
+        called_rx.await.unwrap();
+        cancel.cancel();
+        let result = call_task.await.unwrap().unwrap();
+        assert_eq!(result, json!({"cleaned": true}));
+        session.close().await;
+        server_task.await.unwrap();
+
+        // Case 2: remote ignores cancel and never replies -> times out with Cancelled after
+        // CANCEL_REPLY_TIMEOUT.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let (called_tx, called_rx) = oneshot::channel();
+        let hung_server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            server_w
+                .write_all(hello_ok("pi", PROTOCOL).as_bytes())
+                .await
+                .unwrap();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            let _ = called_tx.send(());
+            let cancel_line = lines.next_line().await.unwrap().unwrap();
+            let cancel_req: Request = serde_json::from_str(&cancel_line).unwrap();
+            assert_eq!(cancel_req.method, method::CANCEL);
+            // Never reply; keep stream open until client closes.
+            let _ = lines.next_line().await;
+        });
+
+        let session = Arc::new(
+            Session::open_io(
+                client_r,
+                client_w,
+                "pi",
+                None,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let s = Arc::clone(&session);
+        let call_cancel = cancel.clone();
+        let call_task = tokio::spawn(async move {
+            s.call(
+                CallParams {
+                    tool: "test.sleep".into(),
+                    args: json!({"seconds": 30}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                call_cancel,
+                EventSink::discard(),
+            )
+            .await
+        });
+
+        called_rx.await.unwrap();
+        let cancelled_at = tokio::time::Instant::now();
+        cancel.cancel();
+        let err = call_task.await.unwrap().unwrap_err().into_error();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert_eq!(err.machine.as_deref(), Some("pi"));
+        assert!(cancelled_at.elapsed() >= CANCEL_REPLY_TIMEOUT);
+        session.close().await;
+        let _ = hung_server.await;
     }
 }

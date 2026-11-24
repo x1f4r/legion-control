@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use legion_core::config::{Document, NodeName};
+use legion_core::config::{ConfigStore, NodeName};
 use legion_core::{BoxFuture, Ctx, NoArgs, Registry, Tool, ToolError, input_schema, parse_args};
 use legion_os::OsError;
 use legion_os::run::{RunOptions, run};
@@ -298,6 +298,13 @@ async fn fleet_ping(fleet: &Fleet, ctx: &Ctx, args: PingArgs) -> Result<PingResu
         }
     }
 
+    if ctx.is_cancelled() {
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            "The call to fleet.ping was cancelled.",
+        ));
+    }
+
     Ok(PingResult {
         results: ordered.into_values().collect(),
     })
@@ -381,8 +388,19 @@ async fn fleet_add(fleet: &Fleet, ctx: &Ctx, args: AddArgs) -> Result<AddResult,
         mac: args.mac,
         wake_via: args.wake_via.unwrap_or_default(),
     };
-    let path = ctx.paths().config_file(FleetFile::FILE);
-    let replaced = upsert_machine(&path, &args.name, &entry)?;
+    let config_dir = ctx.config().dir().to_path_buf();
+    let name = args.name.clone();
+    let replaced = tokio::task::spawn_blocking(move || {
+        let store = ConfigStore::new(config_dir);
+        upsert_machine(&store, &name, &entry)
+    })
+    .await
+    .map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Updating fleet.toml stopped unexpectedly: {err}."),
+        )
+    })??;
     fleet.evict(&args.name).await;
     Ok(AddResult {
         name: args.name,
@@ -410,8 +428,19 @@ async fn fleet_remove(
     ctx: &Ctx,
     args: RemoveArgs,
 ) -> Result<RemoveResult, ToolError> {
-    let path = ctx.paths().config_file(FleetFile::FILE);
-    remove_machine(&path, &args.name)?;
+    let config_dir = ctx.config().dir().to_path_buf();
+    let name = args.name.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = ConfigStore::new(config_dir);
+        remove_machine(&store, &name)
+    })
+    .await
+    .map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Updating fleet.toml stopped unexpectedly: {err}."),
+        )
+    })??;
     fleet.evict(&args.name).await;
     Ok(RemoveResult {
         name: args.name,
@@ -454,26 +483,18 @@ async fn fleet_discover(
     ctx: &Ctx,
     args: DiscoverArgs,
 ) -> Result<DiscoverResult, ToolError> {
-    if args.add {
-        let add_spec = ToolSpec {
-            name: "fleet.add".to_owned(),
-            description: String::new(),
-            effect: Effect::Admin,
-            input_schema: Value::Null,
-        };
-        if !ctx.grant().allows(&add_spec) {
-            return Err(ErrorBody::new(
-                ErrorCode::Denied,
-                format!(
-                    "{} may not use fleet.discover with add = true: its role {} is not allowed to call fleet.add (effect admin).",
-                    ctx.grant().principal(),
-                    ctx.grant().role(),
-                ),
-            )
-            .with_hint(
-                "Call fleet.discover without add, or ask the owner to allow fleet.add or effect:admin in policy.toml.",
-            ));
-        }
+    if args.add && !ctx.grant().allows_effect(Effect::Admin) {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "{} may not use fleet.discover with add = true: its role {} does not allow effect:admin.",
+                ctx.grant().principal(),
+                ctx.grant().role(),
+            ),
+        )
+        .with_hint(
+            "Call fleet.discover without add, or ask the owner to allow effect:admin in policy.toml.",
+        ));
     }
 
     let existing = ctx.config().get::<FleetFile>()?;
@@ -538,8 +559,18 @@ async fn fleet_discover(
                 (c.name.clone(), entry)
             })
             .collect();
-        let path = ctx.paths().config_file(FleetFile::FILE);
-        let added = add_missing_machines(&path, &to_add)?;
+        let config_dir = ctx.config().dir().to_path_buf();
+        let added = tokio::task::spawn_blocking(move || {
+            let store = ConfigStore::new(config_dir);
+            add_missing_machines(&store, &to_add)
+        })
+        .await
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Updating fleet.toml stopped unexpectedly: {err}."),
+            )
+        })??;
         for name in &added {
             fleet.evict(name).await;
         }
@@ -705,5 +736,26 @@ mod tests {
     fn invalid_tailscale_json_returns_unsupported() {
         let err = parse_tailscale_status("not json", &FleetFile::default(), "laptop").unwrap_err();
         assert_eq!(err.code, ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn every_fleet_tool_schema_is_one_a_strict_client_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = legion_core::Paths::under(dir.path());
+        let mut registry = Registry::new();
+        register(&mut registry, Fleet::new(&paths));
+
+        let mut found = Vec::new();
+        for spec in registry.specs() {
+            if spec.input_schema["type"] != serde_json::json!("object") {
+                found.push(format!("{}: the schema is not an object schema", spec.name));
+            }
+            found.extend(
+                legion_core::schema::problems(&spec.input_schema)
+                    .into_iter()
+                    .map(|problem| format!("{}: {problem}", spec.name)),
+            );
+        }
+        assert!(found.is_empty(), "{}", found.join("\n"));
     }
 }

@@ -24,6 +24,7 @@ tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi
 [dev-dependencies]
 legion-tools = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 # Re-executes its own binary as cross-platform connector wrappers (setting LEGION_HOME per remote
 # node, emitting banners, simulating disconnects) without relying on sh, env, or sleep.
