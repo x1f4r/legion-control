@@ -112,7 +112,7 @@ pub fn exclusive_running_jobs(paths: &Paths) -> Result<Vec<ExclusiveJob>, ErrorB
 /// Arguments of `job.start`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct StartArgs {
+pub(crate) struct StartArgs {
     /// A command line handed whole to the platform shell: sh on Linux and macOS, PowerShell on
     /// Windows. Give this or `argv`, not both.
     #[serde(default)]
@@ -346,7 +346,7 @@ pub struct CancelledJob {
     pub survivors: Vec<u32>,
 }
 
-async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolError> {
+pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolError> {
     validate_command(args.cmd.as_deref(), args.argv.as_deref())?;
     let env = args.env.unwrap_or_default();
     validate_env(&env)?;
