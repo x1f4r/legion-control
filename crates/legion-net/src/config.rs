@@ -5,8 +5,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use legion_core::config::{ConfigStore, Document, NodeName, parse};
+use legion_os::OsError;
+use legion_os::lock::FileLock;
 use legion_proto::{ErrorBody, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,7 +18,14 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value as TomlVal
 /// The implicit system name reported when a machine uses the shorthand single-system form.
 pub const DEFAULT_SYSTEM_NAME: &str = "default";
 
-/// Serializes in-process `fleet.toml` mutations so concurrent admin calls cannot race each other.
+/// Lock file name placed in the node's state directory to serialize cross-process `fleet.toml`
+/// read-modify-write operations.
+pub const FLEET_LOCK_FILE: &str = "fleet.lock";
+
+/// Maximum time an edit waits for another process to finish updating `fleet.toml`.
+const FLEET_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serializes in-process `fleet.toml` mutations before acquiring the kernel [`FileLock`].
 static FLEET_EDIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Operating system family hint used to choose the remote ssh command shape without probing first.
@@ -497,11 +507,12 @@ fn validate_transport(
     Ok(())
 }
 
-/// Atomically adds or replaces one machine in `fleet.toml` through [`ConfigStore::write`],
-/// preserving comments and unrelated entries, and returns `true` if an existing entry was
-/// replaced.
+/// Atomically adds or replaces one machine in `fleet.toml` through [`ConfigStore::write`] under a
+/// cross-process kernel [`FileLock`], preserving comments and unrelated entries, and returns
+/// `true` if an existing entry was replaced.
 pub fn upsert_machine(
     store: &ConfigStore,
+    lock_path: &Path,
     name: &str,
     entry: &MachineEntry,
 ) -> Result<bool, ErrorBody> {
@@ -512,6 +523,7 @@ pub fn upsert_machine(
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = acquire_fleet_lock(lock_path)?;
     let path = store.path_of::<FleetFile>();
     let mut doc = load_editable(&path)?;
     let machines = ensure_machines_table(&mut doc, &path)?;
@@ -521,9 +533,11 @@ pub fn upsert_machine(
 }
 
 /// Atomically adds multiple new machines to `fleet.toml` in a single edit through
-/// [`ConfigStore::write`], skipping any already present and returning the names that were added.
+/// [`ConfigStore::write`] under a cross-process kernel [`FileLock`], skipping any already present
+/// and returning the names that were added.
 pub fn add_missing_machines(
     store: &ConfigStore,
+    lock_path: &Path,
     entries: &[(String, MachineEntry)],
 ) -> Result<Vec<String>, ErrorBody> {
     for (name, entry) in entries {
@@ -536,6 +550,7 @@ pub fn add_missing_machines(
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = acquire_fleet_lock(lock_path)?;
     let path = store.path_of::<FleetFile>();
     let mut doc = load_editable(&path)?;
     let machines = ensure_machines_table(&mut doc, &path)?;
@@ -552,14 +567,15 @@ pub fn add_missing_machines(
     Ok(added)
 }
 
-/// Atomically removes one machine from `fleet.toml` through [`ConfigStore::write`], preserving
-/// comments and unrelated entries.
-pub fn remove_machine(store: &ConfigStore, name: &str) -> Result<(), ErrorBody> {
+/// Atomically removes one machine from `fleet.toml` through [`ConfigStore::write`] under a
+/// cross-process kernel [`FileLock`], preserving comments and unrelated entries.
+pub fn remove_machine(store: &ConfigStore, lock_path: &Path, name: &str) -> Result<(), ErrorBody> {
     validate_machine_name(name)
         .map_err(|reason| ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}.")))?;
     let _guard = FLEET_EDIT_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = acquire_fleet_lock(lock_path)?;
     let path = store.path_of::<FleetFile>();
     let mut doc = load_editable(&path)?;
     let known: Vec<String> = doc
@@ -575,6 +591,30 @@ pub fn remove_machine(store: &ConfigStore, name: &str) -> Result<(), ErrorBody> 
     }
     save_validated(store, &doc)?;
     Ok(())
+}
+
+fn acquire_fleet_lock(lock_path: &Path) -> Result<FileLock, ErrorBody> {
+    if let Some(parent) = lock_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot create state directory {}: {err}.", parent.display()),
+        )
+        .with_hint("Make Legion's state directory writable by the account legion runs as."));
+    }
+    FileLock::lock_exclusive_timeout(lock_path, FLEET_LOCK_TIMEOUT).map_err(|err| match err {
+        OsError::TimedOut { detail } => ErrorBody::new(
+            ErrorCode::Busy,
+            format!("fleet.toml is locked by another process ({detail})."),
+        )
+        .with_hint("Retry the command once the other fleet.toml edit finishes."),
+        other => ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot lock {}: {other}.", lock_path.display()),
+        )
+        .with_hint("Make Legion's state directory writable by the account legion runs as."),
+    })
 }
 
 fn not_found_in_file(name: &str, known: &[String]) -> ErrorBody {
@@ -949,6 +989,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
     fn upsert_and_remove_preserve_comments_and_unrelated_entries() {
         let dir = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(dir.path());
+        let lock_path = dir.path().join("state").join(FLEET_LOCK_FILE);
         let file = store.path_of::<FleetFile>();
         std::fs::write(
             &file,
@@ -958,6 +999,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
 
         let replaced = upsert_machine(
             &store,
+            &lock_path,
             "tower",
             &MachineEntry {
                 ssh: Some("tower.example".to_owned()),
@@ -976,6 +1018,7 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
 
         let replaced = upsert_machine(
             &store,
+            &lock_path,
             "pi",
             &MachineEntry {
                 ssh: Some("pi2.example".to_owned()),
@@ -988,17 +1031,68 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
         assert!(text.contains("# Always-on Raspberry Pi"), "{text}");
         assert!(text.contains("pi2.example"), "{text}");
 
-        remove_machine(&store, "tower").unwrap();
+        remove_machine(&store, &lock_path, "tower").unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("# Top-level note"), "{text}");
         assert!(text.contains("# Always-on Raspberry Pi"), "{text}");
         assert!(!text.contains("tower.example"), "{text}");
 
         // Removing the last machine leaves a comment-only file that still parses cleanly.
-        remove_machine(&store, "pi").unwrap();
+        remove_machine(&store, &lock_path, "pi").unwrap();
         assert!(store.get::<FleetFile>().unwrap().machines.is_empty());
 
-        let missing = remove_machine(&store, "tower").unwrap_err();
+        let missing = remove_machine(&store, &lock_path, "tower").unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn fleet_edits_wait_for_kernel_file_lock_before_reading_fleet_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let lock_path = state_dir.join(FLEET_LOCK_FILE);
+
+        // Hold the external kernel lock before spawning an edit.
+        let held = FileLock::lock_exclusive(&lock_path).unwrap();
+        let config_dir_thread = config_dir.clone();
+        let lock_path_thread = lock_path.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let store = ConfigStore::new(config_dir_thread);
+            let res = upsert_machine(
+                &store,
+                &lock_path_thread,
+                "pi",
+                &MachineEntry {
+                    ssh: Some("pi.example".to_owned()),
+                    ..Default::default()
+                },
+            );
+            let _ = done_tx.send(res);
+        });
+
+        // While we hold the lock, the worker must still be waiting; simulate another process
+        // writing `tower` before releasing the lock.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "upsert_machine must block while FileLock is held"
+        );
+        std::fs::write(
+            config_dir.join("fleet.toml"),
+            "[machines.tower]\nssh = \"tower.example\"\n",
+        )
+        .unwrap();
+        drop(held);
+
+        let res = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(res.is_ok(), "{res:?}");
+        worker.join().unwrap();
+
+        // Both `tower` (written under our lock) and `pi` (written after) must be present.
+        let fleet = ConfigStore::new(config_dir).get::<FleetFile>().unwrap();
+        assert_eq!(fleet.names(), vec!["pi", "tower"]);
     }
 }

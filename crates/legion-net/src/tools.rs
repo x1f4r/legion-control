@@ -20,8 +20,8 @@ use serde_json::Value;
 use tokio::task::JoinSet;
 
 use crate::config::{
-    FleetFile, MachineEntry, RemoteOs, SystemEntry, Transport, add_missing_machines,
-    remove_machine, upsert_machine, validate_ssh_target,
+    FLEET_LOCK_FILE, FleetFile, MachineEntry, RemoteOs, SystemEntry, Transport,
+    add_missing_machines, remove_machine, upsert_machine, validate_ssh_target,
 };
 use crate::pool::Fleet;
 
@@ -396,10 +396,11 @@ async fn fleet_add(fleet: &Fleet, ctx: &Ctx, args: AddArgs) -> Result<AddResult,
         wake_via: args.wake_via.unwrap_or_default(),
     };
     let config_dir = ctx.config().dir().to_path_buf();
+    let lock_path = ctx.paths().state_dir().join(FLEET_LOCK_FILE);
     let name = args.name.clone();
     let replaced = tokio::task::spawn_blocking(move || {
         let store = ConfigStore::new(config_dir);
-        upsert_machine(&store, &name, &entry)
+        upsert_machine(&store, &lock_path, &name, &entry)
     })
     .await
     .map_err(|err| {
@@ -436,10 +437,11 @@ async fn fleet_remove(
     args: RemoveArgs,
 ) -> Result<RemoveResult, ToolError> {
     let config_dir = ctx.config().dir().to_path_buf();
+    let lock_path = ctx.paths().state_dir().join(FLEET_LOCK_FILE);
     let name = args.name.clone();
     tokio::task::spawn_blocking(move || {
         let store = ConfigStore::new(config_dir);
-        remove_machine(&store, &name)
+        remove_machine(&store, &lock_path, &name)
     })
     .await
     .map_err(|err| {
@@ -561,9 +563,10 @@ async fn fleet_discover(
     if args.add {
         let to_add = addable_entries(&candidates);
         let config_dir = ctx.config().dir().to_path_buf();
+        let lock_path = ctx.paths().state_dir().join(FLEET_LOCK_FILE);
         let added = tokio::task::spawn_blocking(move || {
             let store = ConfigStore::new(config_dir);
-            add_missing_machines(&store, &to_add)
+            add_missing_machines(&store, &lock_path, &to_add)
         })
         .await
         .map_err(|err| {

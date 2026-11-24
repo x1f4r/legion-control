@@ -1692,6 +1692,47 @@ allow = ["effect:read"]
     let discover_add_denied = laptop.run(&["fleet.discover", "add=true", "--as", "phone"]);
     assert_eq!(discover_add_denied.code, 1);
     assert_eq!(discover_add_denied.json()["code"], json!("denied"));
+
+    // Concurrent `fleet.add` calls across separate processes serialize via the kernel FileLock
+    // so no machine entry is lost.
+    let mut children = Vec::new();
+    for idx in 0..6 {
+        let name = format!("name=box{idx}");
+        let ssh = format!("ssh=box{idx}.example");
+        let child = laptop
+            .command(&["fleet.add", &name, &ssh])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        children.push(child);
+    }
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "concurrent fleet.add failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    let after_concurrent = laptop.run(&["fleet.list"]);
+    assert_eq!(after_concurrent.code, 0, "{}", after_concurrent.stdout);
+    let listed_json = after_concurrent.json();
+    let listed_names: Vec<&str> = listed_json["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    for idx in 0..6 {
+        let expected = format!("box{idx}");
+        assert!(
+            listed_names.contains(&expected.as_str()),
+            "{expected} lost during concurrent fleet.add: {listed_names:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
