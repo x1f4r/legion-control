@@ -1,8 +1,9 @@
 //! Windows detached process launcher with WMI fallback.
 //!
-//! Primary path: `CreateProcessW` with `CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS |
-//! CREATE_NEW_PROCESS_GROUP` starts the process outside the caller's Job Object with no console
-//! attached and in its own console process group.
+//! Primary path: `CreateProcessW` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW |
+//! CREATE_NEW_PROCESS_GROUP` starts the process outside the caller's Job Object in its own console
+//! process group without allowing child console programs to open visible console windows (unlike
+//! `DETACHED_PROCESS`, which causes console children to allocate new visible windows).
 //!
 //! Fallback path: when the caller runs inside a Job Object that forbids breakaway (OpenSSH's
 //! `sshd` session job does), `CreateProcessW` returns `ERROR_ACCESS_DENIED`. In that case we
@@ -17,7 +18,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use windows::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
 };
 
 use crate::procid::{self, ProcessId};
@@ -54,7 +55,7 @@ pub(super) async fn spawn_detached(
         .stdout(stdout_stdio)
         .stderr(stderr_stdio)
         .creation_flags(
-            (CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP).0,
+            (CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP).0,
         );
 
     let spawn_result = cmd.spawn();

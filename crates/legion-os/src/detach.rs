@@ -15,9 +15,10 @@
 //! - **Other Unix systems (macOS, containers, or Linux without a user manager):** starting the
 //!   child in a new session via `setsid()` detaches it from the caller's controlling terminal and
 //!   process group so `SIGHUP` on terminal or session close does not reach it.
-//! - **Windows (direct path):** spawning with `CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS |
-//!   CREATE_NEW_PROCESS_GROUP` creates a console-less process in its own process group outside the
-//!   caller's Job Object so closing the caller's console or job leaves the child running.
+//! - **Windows (direct path):** spawning with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW |
+//!   CREATE_NEW_PROCESS_GROUP` creates a process in its own process group outside the caller's Job
+//!   Object without opening visible console windows for console children (unlike `DETACHED_PROCESS`,
+//!   which causes console programs spawned by the job to allocate visible console windows).
 //! - **Windows (WMI fallback):** OpenSSH's `sshd` places each SSH session in a Job Object that
 //!   forbids breakaway, causing `CreateProcessW` with `CREATE_BREAKAWAY_FROM_JOB` to fail with
 //!   `ERROR_ACCESS_DENIED`. Falling back to `Win32_Process.Create` via `Invoke-CimMethod` asks the
