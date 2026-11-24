@@ -57,6 +57,9 @@
 //!   offered a host key that did not match any pinned key in `host_keys`. Includes `details.host`,
 //!   `details.port`, and either `details.offered` / `details.expected` SHA-256 fingerprints or
 //!   `details.offered_algorithms` / `details.pinned_algorithms`.
+//! - **`"node_mismatch"`** ([`REASON_NODE_MISMATCH`], `code: "denied"`): the connected SSH server
+//!   reported a different `hello.node` name than the configured entry; the session is closed
+//!   without executing any tool or failing over. Includes `details.expected` and `details.actual`.
 //! - **`"timeout"`** ([`REASON_TIMEOUT`], `code: "timeout"`): DNS lookup, TCP connect, or SSH
 //!   handshake timed out. Includes `details.host` and `details.port` when a single host failed.
 //! - **`"unreachable"`** ([`REASON_UNREACHABLE`], `code: "unreachable"`): DNS lookup failed, TCP
@@ -92,6 +95,9 @@ pub mod stderr;
 
 /// Structured `details.reason` for a pinned host key mismatch (`code: "denied"`).
 pub const REASON_HOST_KEY_MISMATCH: &str = "host_key_mismatch";
+/// Structured `details.reason` when a connected SSH server's `hello` handshake reports a different
+/// node name than the configured entry (`code: "denied"`).
+pub const REASON_NODE_MISMATCH: &str = "node_mismatch";
 /// Structured `details.reason` for rejected SSH key authentication on a low-level SSH open or
 /// invite enrolment (`code: "denied"`).
 pub const REASON_AUTH_FAILED: &str = "auth_failed";

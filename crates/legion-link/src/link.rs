@@ -767,7 +767,35 @@ impl Link {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let introducer_principal = cfg.node(introducer).and_then(|n| n.principal.clone());
 
+        let mut batch_key_owners: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (machine, new_target) in &validated {
+            for key in canonical_host_keys(&new_target.host_keys) {
+                batch_key_owners
+                    .entry(key)
+                    .or_default()
+                    .insert(machine.clone());
+            }
+        }
+
         for (machine, new_target) in validated {
+            let new_keys = canonical_host_keys(&new_target.host_keys);
+            let overlaps_other_configured = cfg.nodes.iter().any(|other| {
+                other.node != machine
+                    && other
+                        .target
+                        .as_ref()
+                        .is_some_and(|t| !canonical_host_keys(&t.host_keys).is_disjoint(&new_keys))
+            });
+            let overlaps_batch = new_keys.iter().any(|k| {
+                batch_key_owners
+                    .get(k)
+                    .is_some_and(|owners| owners.len() > 1)
+            });
+            if overlaps_other_configured || (overlaps_batch && cfg.node(&machine).is_none()) {
+                report.rejected.push(machine);
+                continue;
+            }
+
             if let Some(existing) = cfg.nodes.iter_mut().find(|n| n.node == machine) {
                 let Some(old_target) = &mut existing.target else {
                     // Local desktop pipe (`target: None`): never overwrite with an SSH target.
@@ -1954,6 +1982,30 @@ impl Link {
         let session = (self.inner.opener)(entry.clone(), device_key, cancel)
             .await
             .map_err(|err| mark_not_sent(classify_open_error(node, err)))?;
+        if entry.target.is_some() {
+            let actual = session.info().hello.node.clone();
+            if actual != entry.node {
+                session.close().await;
+                return Err(mark_not_sent(
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Connected to {actual:?} when expecting {:?}.",
+                            entry.node
+                        ),
+                    )
+                    .with_hint(
+                        "Check that the endpoint points to the intended machine and has not been redirected.",
+                    )
+                    .with_machine(&entry.node)
+                    .with_details(json!({
+                        "reason": crate::REASON_NODE_MISMATCH,
+                        "expected": entry.node,
+                        "actual": actual,
+                    })),
+                ));
+            }
+        }
         let live = LiveSession {
             session: Arc::new(session),
             config_snapshot: entry,
@@ -4251,6 +4303,246 @@ mod tests {
             "remote details.sent must be stripped: {details}"
         );
         assert_eq!(details.get("keep"), Some(&json!("yes")));
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn hello_node_mismatch_fails_with_denied_and_no_failover() {
+        let seen_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_calls_c = Arc::clone(&seen_calls);
+
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let seen_calls_c = Arc::clone(&seen_calls_c);
+            Box::pin(async move {
+                let entry_name = entry.node.clone();
+                // Entry `m` connects to a server whose `hello.node` is `pi`!
+                let advertised_name = if entry_name == "m" {
+                    "pi".to_owned()
+                } else {
+                    entry_name.clone()
+                };
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let resp = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: advertised_name.clone(),
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        } else if req.method == method::CALL {
+                            seen_calls_c.lock().unwrap().push(entry_name.clone());
+                            let resp = Response::ok(req.id, json!({ "ok": true }));
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        }
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let cfg = LinkConfig {
+            device_key: Some("dummy".to_owned()),
+            nodes: vec![
+                NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![test_host_key(10)],
+                    },
+                    Some("device:pixel".to_owned()),
+                ),
+                NodeLink::learned(
+                    "m",
+                    SshTarget {
+                        hosts: vec!["pi.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![test_host_key(11)],
+                    },
+                    None,
+                    "tower",
+                ),
+            ],
+        };
+        let link = Link::with_opener(cfg, LinkOptions::default(), opener);
+        let err = link
+            .call_machine("m", "power.shutdown", json!({}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        let details = err.details.as_ref().expect("details expected");
+        assert_eq!(details["reason"], json!(crate::REASON_NODE_MISMATCH));
+        assert_eq!(details[crate::DETAIL_SENT], json!(false));
+        assert!(
+            seen_calls.lock().unwrap().is_empty(),
+            "mismatched hello node must execute zero calls and never fail over"
+        );
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn learn_rejects_host_keys_overlapping_another_configured_machine() {
+        let key_tower = test_host_key(20);
+        let key_pi = test_host_key(21);
+        let key_pi_extra = test_host_key(22);
+
+        let key_tower_c = key_tower.clone();
+        let key_pi_c = key_pi.clone();
+        let key_pi_extra_c = key_pi_extra.clone();
+
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let key_tower_c = key_tower_c.clone();
+            let key_pi_c = key_pi_c.clone();
+            let key_pi_extra_c = key_pi_extra_c.clone();
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let resp = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        } else if req.method == method::CALL {
+                            let resp = Response::ok(
+                                req.id,
+                                json!({
+                                    "results": {
+                                        "tower": {
+                                            "ok": {
+                                                "node": "tower",
+                                                "hosts": ["tower.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [key_tower_c],
+                                            }
+                                        },
+                                        // Malicious answer pointing fake machine `spoof` at `pi`'s pinned host key.
+                                        "spoof": {
+                                            "ok": {
+                                                "node": "spoof",
+                                                "hosts": ["pi.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [key_pi_c, key_pi_extra_c],
+                                            }
+                                        }
+                                    }
+                                }),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        }
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let cfg = LinkConfig {
+            device_key: Some("dummy".to_owned()),
+            nodes: vec![
+                NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![key_tower],
+                    },
+                    Some("device:pixel".to_owned()),
+                ),
+                NodeLink::ssh(
+                    "pi",
+                    SshTarget {
+                        hosts: vec!["pi.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![key_pi],
+                    },
+                    Some("device:pixel".to_owned()),
+                ),
+            ],
+        };
+        let link = Link::with_opener(cfg, LinkOptions::default(), opener);
+        let report = link.learn().await.unwrap();
+        assert!(report.rejected.contains(&"spoof".to_owned()));
+        assert!(report.added.is_empty());
+        assert!(link.config().node("spoof").is_none());
         link.close().await;
     }
 }
