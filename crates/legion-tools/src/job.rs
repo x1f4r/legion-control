@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, Ctx, Paths, Registry, ToolError};
 use legion_os::OsError;
-use legion_os::detach::{DetachHandle, DetachOptions, spawn_detached, stop_detached};
+use legion_os::detach::{
+    DetachHandle, DetachOptions, detached_active, spawn_detached, stop_detached,
+};
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid;
 use legion_os::shell::CommandSpec;
@@ -861,20 +863,40 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
 
     let dir_for_read = dir.clone();
     let id_for_read = id.clone();
-    let initial_record = blocking("job.cancel", move || {
-        read_job_record(&dir_for_read, &id_for_read)
+    let (initial_record, current_boot) = blocking("job.cancel", move || {
+        let record = read_job_record(&dir_for_read, &id_for_read)?;
+        let boot = procid::boot_id().ok();
+        Ok((record, boot))
     })
     .await?;
+    let same_boot = current_boot
+        .as_deref()
+        .is_none_or(|cur| procid::same_boot(&initial_record.boot_id, cur));
+
+    let stop_grace = if args.force {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(1)
+    };
 
     // Cancelling a job that already has an exit record is not an error: wait briefly if the
-    // supervisor is still releasing its lock, then return its final state unchanged.
+    // supervisor is still releasing its lock, sweep any surviving detached descendants on the
+    // same boot, and return the job's final state unchanged (or `running` if descendants survive).
     let dir_for_exit = dir.clone();
     if let Some(exit) = blocking("job.cancel", move || Ok(read_exit_record(&dir_for_exit))).await? {
         wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
+        let record = reload_job_record(&dir, &id, initial_record).await;
+        let (survivors, still_active) =
+            sweep_job_handle(&id, &record, same_boot, stop_grace).await?;
+        let state = if still_active {
+            JobState::Running
+        } else {
+            JobState::from(exit.outcome)
+        };
         return Ok(CancelledJob {
             id,
-            state: JobState::from(exit.outcome),
-            survivors: Vec::new(),
+            state,
+            survivors,
         });
     }
 
@@ -908,10 +930,18 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
                     if lock_held {
                         wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
                     }
+                    let record = reload_job_record(&dir, &id, initial_record).await;
+                    let (survivors, still_active) =
+                        sweep_job_handle(&id, &record, same_boot, Duration::from_secs(1)).await?;
+                    let reported_state = if still_active {
+                        JobState::Running
+                    } else {
+                        state
+                    };
                     return Ok(CancelledJob {
                         id,
-                        state,
-                        survivors: Vec::new(),
+                        state: reported_state,
+                        survivors,
                     });
                 }
                 CancelPoll::SupervisorGone => break,
@@ -928,33 +958,10 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
     }
 
     // Re-read the record in case `job.start` attached the detach handle while we waited.
-    let dir_for_reload = dir.clone();
-    let id_for_reload = id.clone();
-    let record = blocking("job.cancel", move || {
-        read_job_record(&dir_for_reload, &id_for_reload)
-    })
-    .await
-    .unwrap_or(initial_record);
+    let record = reload_job_record(&dir, &id, initial_record).await;
+    let (survivors, still_active) = sweep_job_handle(&id, &record, same_boot, stop_grace).await?;
 
-    let stop_grace = if args.force {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(1)
-    };
-    let survivors = if let Some(ref handle) = record.detach {
-        let report = stop_detached(handle, stop_grace).await.map_err(|err| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Could not stop detached job {id}: {err}."),
-            )
-            .with_hint("Inspect remaining processes with `sys.procs` or retry with `force: true`.")
-        })?;
-        report.survivors.iter().map(|proc_id| proc_id.pid).collect()
-    } else {
-        Vec::new()
-    };
-
-    if survivors.is_empty() {
+    if !still_active && survivors.is_empty() {
         wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
         let dir_for_finalize = dir.clone();
         let final_state = blocking("job.cancel", move || {
@@ -980,12 +987,49 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
         });
     }
 
-    let state = load_status_async(&state_dir, &id).await?.state;
     Ok(CancelledJob {
         id: record.id,
-        state,
+        state: JobState::Running,
         survivors,
     })
+}
+
+async fn reload_job_record(dir: &Path, id: &str, fallback: JobRecord) -> JobRecord {
+    let dir = dir.to_path_buf();
+    let id = id.to_owned();
+    blocking("job.cancel", move || read_job_record(&dir, &id))
+        .await
+        .unwrap_or(fallback)
+}
+
+/// Calls `stop_detached` on the job's stored handle (when on the same boot) and confirms via
+/// `detached_active` that no processes remain under the handle.
+async fn sweep_job_handle(
+    id: &str,
+    record: &JobRecord,
+    same_boot: bool,
+    grace: Duration,
+) -> Result<(Vec<u32>, bool), ErrorBody> {
+    if !same_boot {
+        return Ok((Vec::new(), false));
+    }
+    let Some(ref handle) = record.detach else {
+        return Ok((Vec::new(), false));
+    };
+    let report = stop_detached(handle, grace).await.map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Could not stop detached job {id}: {err}."),
+        )
+        .with_hint("Inspect remaining processes with `sys.procs` or retry with `force: true`.")
+    })?;
+    let survivors: Vec<u32> = report.survivors.iter().map(|proc_id| proc_id.pid).collect();
+    let still_active = if !survivors.is_empty() {
+        true
+    } else {
+        detached_active(handle).await.unwrap_or(true)
+    };
+    Ok((survivors, still_active))
 }
 
 enum CancelPoll {

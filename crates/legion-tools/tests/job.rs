@@ -62,6 +62,9 @@ fn main() -> ExitCode {
         ("cancel_stops_the_whole_tree_and_reports_cancelled", || {
             Box::pin(cancel_stops_the_whole_tree_and_reports_cancelled())
         }),
+        ("cancel_stops_setsid_descendants_even_after_exit", || {
+            Box::pin(cancel_stops_setsid_descendants_even_after_exit())
+        }),
         (
             "forced_cancel_works_when_supervisor_was_killed_first",
             || Box::pin(forced_cancel_works_when_supervisor_was_killed_first()),
@@ -637,6 +640,127 @@ async fn cancel_stops_the_whole_tree_and_reports_cancelled() {
     let status = fixture.call("job.status", json!({"id": id})).await.unwrap();
     assert_eq!(status["state"], json!("cancelled"));
     assert!(status["finished"].is_string());
+}
+
+async fn cancel_stops_setsid_descendants_even_after_exit() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Linux transient systemd user scopes contain `setsid` descendants; other platforms have
+        // no cgroup boundary for a child that creates a new session.
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use legion_os::detach::detached_active;
+        let fixture = Fixture::new();
+        let mut cleanup = Cleanup::new(&fixture);
+
+        // Case 1: Normal `job.cancel` (force: false) must also sweep a `setsid` child inside the
+        // detached scope after the supervisor finishes cooperative cancellation.
+        let pids_file = fixture.dir.path().join("setsid-live.pids");
+        let cmd = concat!(
+            "setsid \"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
+            "p1=$!; ",
+            "\"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
+            "p2=$!; ",
+            "printf '%s %s\\n' \"$p1\" \"$p2\" > \"$PIDS_FILE.partial\" && ",
+            "mv \"$PIDS_FILE.partial\" \"$PIDS_FILE\"; ",
+            "wait \"$p2\""
+        );
+        let started = fixture
+            .call(
+                "job.start",
+                json!({
+                    "cmd": cmd,
+                    "env": {
+                        HELPER: "sleep",
+                        "LEGION_BIN": this_binary(),
+                        "PIDS_FILE": pids_file.to_string_lossy(),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap().to_owned();
+        cleanup.track_job(&id);
+
+        let pids = read_pids(&pids_file).await;
+        cleanup.track_pids(&pids);
+        assert_eq!(pids.len(), 2);
+
+        let status = fixture.call("job.status", json!({"id": id})).await.unwrap();
+        let handle: DetachHandle = serde_json::from_value(status["detach"].clone()).unwrap();
+        let has_scope = handle.systemd_unit.is_some();
+
+        let cancelled = fixture.call("job.cancel", json!({"id": id})).await.unwrap();
+        assert_eq!(cancelled["state"], json!("cancelled"), "{cancelled:#}");
+        assert_eq!(cancelled["survivors"], json!([]));
+        assert!(gone(pids[1]).await, "foreground child survived cancel");
+        if has_scope {
+            assert!(
+                gone(pids[0]).await,
+                "setsid child {} survived normal job.cancel",
+                pids[0]
+            );
+            assert!(
+                !detached_active(&handle).await.unwrap(),
+                "detached scope remained active after cancel reported cancelled"
+            );
+        }
+
+        // Case 2: A command exits 0 (writing `exit.json`) while leaving a `setsid` child running;
+        // calling `job.cancel` on the finished job sweeps the detached handle and keeps `succeeded`.
+        let orphan_file = fixture.dir.path().join("setsid-after-exit.pids");
+        let exit_cmd = concat!(
+            "setsid \"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
+            "printf '%s\\n' \"$!\" > \"$PIDS_FILE.partial\" && ",
+            "mv \"$PIDS_FILE.partial\" \"$PIDS_FILE\""
+        );
+        let started2 = fixture
+            .call(
+                "job.start",
+                json!({
+                    "cmd": exit_cmd,
+                    "env": {
+                        HELPER: "sleep",
+                        "LEGION_BIN": this_binary(),
+                        "PIDS_FILE": orphan_file.to_string_lossy(),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let id2 = started2["id"].as_str().unwrap().to_owned();
+        cleanup.track_job(&id2);
+
+        let orphan_pids = read_pids(&orphan_file).await;
+        cleanup.track_pids(&orphan_pids);
+        assert_eq!(orphan_pids.len(), 1);
+        let waited = fixture
+            .call("job.wait", json!({"id": id2, "timeout_s": 15}))
+            .await
+            .unwrap();
+        assert_eq!(waited["state"], json!("succeeded"), "{waited:#}");
+        let handle2: DetachHandle = serde_json::from_value(waited["detach"].clone()).unwrap();
+        if handle2.systemd_unit.is_some() {
+            assert!(
+                alive(orphan_pids[0]),
+                "setsid descendant exited before cancel was tested"
+            );
+            let swept = fixture
+                .call("job.cancel", json!({"id": id2}))
+                .await
+                .unwrap();
+            assert_eq!(swept["state"], json!("succeeded"), "{swept:#}");
+            assert_eq!(swept["survivors"], json!([]));
+            assert!(
+                gone(orphan_pids[0]).await,
+                "setsid child {} survived cancel on finished job",
+                orphan_pids[0]
+            );
+            assert!(!detached_active(&handle2).await.unwrap());
+        }
+    }
 }
 
 async fn forced_cancel_works_when_supervisor_was_killed_first() {
