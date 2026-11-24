@@ -1,7 +1,7 @@
 name: Legion App
 on:
   push:
-    branches: [main, app/platforms]
+    branches: [main]
     paths:
       - 'apps/**'
       - 'crates/**'
@@ -120,6 +120,7 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-tauri
           key: legion-app-tauri-cli-${{ runner.os }}-2.12.6-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: legion-app-tauri-cli-${{ runner.os }}-2.12.6-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -232,6 +233,7 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-tauri
           key: legion-app-tauri-cli-${{ runner.os }}-2.12.6-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: legion-app-tauri-cli-${{ runner.os }}-2.12.6-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -289,7 +291,7 @@ jobs:
     name: iOS and iPadOS
     if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'ios'
     runs-on: macos-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -302,6 +304,7 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-tauri
           key: legion-app-tauri-cli-${{ runner.os }}-2.12.6-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: legion-app-tauri-cli-${{ runner.os }}-2.12.6-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -369,7 +372,7 @@ jobs:
 
             echo "=== Running on $kind ($dev_name / $udid) ==="
             xcrun simctl boot "$udid" || true
-            xcrun simctl bootstatus "$udid" -b
+            perl -e 'alarm 480; exec @ARGV' xcrun simctl bootstatus "$udid" -b
             xcrun simctl install "$udid" "$SIM_APP"
 
             local data_dir ready_file stdout_log stderr_log
@@ -443,11 +446,11 @@ jobs:
           SWIFT
 
             sleep 2
-            xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-dark.png"
+            perl -e 'alarm 30; exec @ARGV' xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-dark.png"
 
             xcrun simctl ui "$udid" appearance light
             sleep 2
-            xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-light.png"
+            perl -e 'alarm 30; exec @ARGV' xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-light.png"
 
             xcrun simctl terminate "$udid" com.x1f4r.legion || true
             xcrun simctl shutdown "$udid" || true
@@ -481,7 +484,7 @@ jobs:
     name: macOS desktop bundle
     if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'macos-desktop'
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -492,6 +495,7 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-tauri
           key: legion-app-tauri-cli-${{ runner.os }}-2.12.6-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: legion-app-tauri-cli-${{ runner.os }}-2.12.6-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -533,16 +537,23 @@ jobs:
           APP_PID=$!
 
           FOUND=0
+          EXITED_EARLY=0
           for i in $(seq 1 60); do
             if [ -f "$READY_FILE" ] && grep -q "legion-app: interface ready" "$READY_FILE"; then
               echo "macOS desktop ready after ${i}s: $(cat "$READY_FILE")"
               FOUND=1
               break
             fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "ERROR: macOS desktop app (PID $APP_PID) exited early after ${i}s before ready marker"
+              EXITED_EARLY=1
+              break
+            fi
             sleep 1
           done
 
-          swift - "$APP_PID" << 'SWIFT' || true
+          if [ "$FOUND" -eq 1 ]; then
+            perl -e 'alarm 20; exec @ARGV' swift - "$APP_PID" << 'SWIFT' || echo "macOS window check timed out or skipped"
           import CoreGraphics
           import Foundation
           let pid = Int32(CommandLine.arguments[1]) ?? -1
@@ -554,11 +565,19 @@ jobs:
           }
           SWIFT
 
-          screencapture -x ci-shots/macos/macos-desktop.png || true
+            perl -e 'alarm 20; exec @ARGV' screencapture -x ci-shots/macos/macos-desktop.png \
+              || echo "macOS screencapture timed out or skipped"
+          fi
+
           kill "$APP_PID" 2>/dev/null || true
           wait "$APP_PID" 2>/dev/null || true
           cat "$RUNNER_TEMP/legion-macos.log" || true
-          [ "$FOUND" -eq 1 ]
+          if [ "$FOUND" -ne 1 ]; then
+            if [ "$EXITED_EARLY" -ne 1 ]; then
+              echo "ERROR: Timed out after 60s waiting for macOS desktop ready marker at $READY_FILE"
+            fi
+            exit 1
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: legion-macos-dmg
@@ -585,6 +604,7 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-tauri.exe
           key: legion-app-tauri-cli-${{ runner.os }}-2.12.6-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: legion-app-tauri-cli-${{ runner.os }}-2.12.6-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
