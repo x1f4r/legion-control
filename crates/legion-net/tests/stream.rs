@@ -244,6 +244,44 @@ fn stat_tells_whether_a_directory_ignores_letter_case_without_writing() {
     assert_eq!(before, after);
 }
 
+#[cfg(unix)]
+#[test]
+fn the_line_that_ends_a_listing_stays_short_however_much_could_not_be_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let node = Node::new();
+    let root = node.home().join("projects/locked");
+    fs::create_dir_all(&root).unwrap();
+    let probe = root.join("probe");
+    fs::create_dir(&probe).unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o000)).unwrap();
+    let reads_anything = fs::read_dir(&probe).is_ok();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir(&probe).unwrap();
+    if reads_anything {
+        return;
+    }
+    let names: Vec<_> = (0..3000)
+        .map(|at| root.join(format!("an-unreadable-directory-with-a-long-name-{at:05}")))
+        .collect();
+    for dir in &names {
+        fs::create_dir(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let ran = node.run(
+        None,
+        &json!({"op": "manifest", "root": "~/projects/locked"}),
+        b"",
+    );
+    for dir in &names {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let done = ran.ok().lines().pop().unwrap();
+    assert_eq!(done["skipped_total"], 3000);
+    let kept = done["skipped"].as_array().unwrap().len();
+    assert!(kept > 0 && kept < 3000, "{kept}");
+    assert!(done.to_string().len() < 512 * 1024);
+}
+
 #[test]
 fn get_sends_the_size_then_the_bytes_from_the_offset() {
     let node = Node::new();

@@ -247,6 +247,9 @@ pub(crate) struct ManifestDone {
     pub entries: u64,
     #[serde(default)]
     pub skipped: Vec<SkippedEntry>,
+    /// How many entries could not be read, when `skipped` names only the first of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_total: Option<u64>,
 }
 
 /// The line that answers a `get` before its bytes.
@@ -608,20 +611,35 @@ fn list<W: Write>(
         .map_err(|error| Failure::Raw(gone(&error)))
 }
 
+/// How much of the line that ends a listing may go to naming what could not be read, so the line
+/// stays well inside what a reader takes.
+const MOST_SKIPPED_BYTES: usize = 256 * 1024;
+
 fn write_listing<W: Write>(
     output: &mut W,
     entries: Vec<Entry>,
-    skipped: Vec<SkippedEntry>,
+    mut skipped: Vec<SkippedEntry>,
 ) -> io::Result<()> {
     for entry in &entries {
         line(output, entry)?;
     }
+    let total = skipped.len();
+    let mut used = 0;
+    let kept = skipped
+        .iter()
+        .take_while(|entry| {
+            used += entry.path.len() + entry.reason.len() + 32;
+            used <= MOST_SKIPPED_BYTES
+        })
+        .count();
+    skipped.truncate(kept);
     line(
         output,
         &ManifestDone {
             done: true,
             entries: entries.len() as u64,
             skipped,
+            skipped_total: (kept < total).then_some(total as u64),
         },
     )?;
     output.flush()

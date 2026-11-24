@@ -91,6 +91,15 @@ const FINISH_WAIT: Duration = Duration::from_secs(10);
 /// in this node's memory; a tree bigger than this is transferred a subdirectory at a time.
 const MOST_LISTED_ENTRIES: usize = 1_000_000;
 
+/// The longest line of a listing from another node: an entry, whose path and link target a file
+/// system keeps far shorter, or the line that ends it, whose list of what could not be read the
+/// listing node keeps well within this.
+const MOST_LISTING_LINE: usize = 1024 * 1024;
+
+/// The most bytes a listing from another node may take in all: a million entries with ordinary
+/// names fit several times over, a listing built to exhaust memory does not.
+const MOST_LISTING_BYTES: usize = 512 * 1024 * 1024;
+
 /// How many paths a result lists in each of its lists; the counts are always whole.
 const MOST_LISTED: usize = 100;
 
@@ -1147,8 +1156,19 @@ struct Conn {
     noise_bytes: usize,
     /// Whether the other end has said, on its first line, that it speaks this protocol.
     greeted: bool,
+    /// The longest reply line taken once the other end has answered.
+    longest: usize,
+    /// How many bytes of lines have been read, which bounds a listing as a whole.
+    received: usize,
     /// When the pipe was opened, which the first reply's time limit counts from.
     opened: tokio::time::Instant,
+}
+
+/// How much a listing from another node may hold: entries, bytes in all, and bytes in one line.
+struct Bounds {
+    entries: usize,
+    bytes: usize,
+    line: usize,
 }
 
 /// One line of a `manifest` reply.
@@ -1238,6 +1258,8 @@ impl Conn {
             noise_lines: 0,
             noise_bytes: 0,
             greeted: false,
+            longest: LONGEST_REPLY,
+            received: 0,
             opened: tokio::time::Instant::now(),
         };
         let mut line = header.to_string().into_bytes();
@@ -1367,7 +1389,7 @@ impl Conn {
         // A reply is a JSON object however long it is; only other text, a banner, is held to
         // what noise may take before the first reply.
         let (wait, noise) = if self.answered {
-            (IDLE_TIMEOUT, LONGEST_REPLY)
+            (IDLE_TIMEOUT, self.longest)
         } else {
             (
                 FIRST_REPLY_TIMEOUT.saturating_sub(self.opened.elapsed()),
@@ -1382,7 +1404,7 @@ impl Conn {
                 &mut self.reader,
                 &mut line,
                 Longest {
-                    reply: LONGEST_REPLY,
+                    reply: self.longest,
                     noise,
                 },
                 binary_is_foreign,
@@ -1395,7 +1417,10 @@ impl Conn {
             } else {
                 FIRST_REPLY_TIMEOUT
             })),
-            Ok(Ok(Read::Line)) => Ok(line),
+            Ok(Ok(Read::Line)) => {
+                self.received += line.len();
+                Ok(line)
+            }
             Ok(Ok(Read::End)) => Err(self.ended("before it answered").await),
             Ok(Ok(Read::Binary)) => Err(self.mismatch("with bytes that are not text")),
             Ok(Ok(Read::TooLong { reply: false })) if !self.answered => {
@@ -1404,8 +1429,8 @@ impl Conn {
             Ok(Ok(Read::TooLong { .. })) => Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
-                    "{} answered a stream with a line longer than {LONGEST_REPLY} bytes.",
-                    self.machine
+                    "{} answered a stream with a line longer than {} bytes.",
+                    self.machine, self.longest
                 ),
             )
             .with_machine(self.machine.clone())),
@@ -1474,13 +1499,32 @@ impl Conn {
     /// Reads a `manifest` reply: one entry per line, then the line that ends it, which must come
     /// and must count what came before it.
     async fn manifest(&mut self) -> Result<Manifest, ErrorBody> {
-        self.manifest_at_most(MOST_LISTED_ENTRIES).await
+        self.manifest_within(Bounds {
+            entries: MOST_LISTED_ENTRIES,
+            bytes: MOST_LISTING_BYTES,
+            line: MOST_LISTING_LINE,
+        })
+        .await
     }
 
-    async fn manifest_at_most(&mut self, most: usize) -> Result<Manifest, ErrorBody> {
+    async fn manifest_within(&mut self, bounds: Bounds) -> Result<Manifest, ErrorBody> {
+        let most = bounds.entries;
+        self.longest = bounds.line;
         let mut manifest = Manifest::default();
         loop {
-            match self.first::<Listed>().await? {
+            let listed = self.first::<Listed>().await?;
+            if self.received > bounds.bytes {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "The listing from {} is larger than {} bytes, more than one transfer compares.",
+                        self.machine, bounds.bytes
+                    ),
+                )
+                .with_hint("Transfer its subdirectories one at a time.")
+                .with_machine(self.machine.clone()));
+            }
+            match listed {
                 Listed::Entry(_) if manifest.entries.len() == most => {
                     return Err(ErrorBody::new(
                         ErrorCode::Failed,
@@ -2081,6 +2125,15 @@ mod tests {
         assert_eq!(join("~", "a.txt"), "~/a.txt");
     }
 
+    /// A listing's usual bounds, with at most `entries` entries.
+    fn bounded(entries: usize) -> Bounds {
+        Bounds {
+            entries,
+            bytes: MOST_LISTING_BYTES,
+            line: MOST_LISTING_LINE,
+        }
+    }
+
     /// The line a node opens every stream with.
     const HELLO: &[u8] = b"{\"protocol\":1}\n";
 
@@ -2150,6 +2203,8 @@ mod tests {
             noise_lines: 0,
             noise_bytes: 0,
             greeted: false,
+            longest: LONGEST_REPLY,
+            received: 0,
             opened: tokio::time::Instant::now(),
         };
         (conn, peer_out, peer_in)
@@ -2265,14 +2320,68 @@ mod tests {
             let (mut conn, mut out, _in) = conn("pi");
             out.write_all(text.as_bytes()).await.unwrap();
             drop(out);
-            let error = conn.manifest_at_most(most).await.unwrap_err();
+            let error = conn.manifest_within(bounded(most)).await.unwrap_err();
             assert_eq!(error.code, code, "{error:?}");
             assert!(error.message.contains(says), "{error:?}");
             assert_eq!(error.machine.as_deref(), Some("pi"));
         }
         let (mut conn, mut out, _in) = conn("pi");
         out.write_all(listing(3, Some(3)).as_bytes()).await.unwrap();
-        assert_eq!(conn.manifest_at_most(3).await.unwrap().entries.len(), 3);
+        assert_eq!(
+            conn.manifest_within(bounded(3))
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_line_is_bounded_in_bytes() {
+        // A link whose target alone is far longer than any path a file system takes.
+        let target = "t".repeat(2 * 1024 * 1024);
+        let line = format!(
+            "{{\"path\":\"l\",\"kind\":\"symlink\",\"size\":0,\"mtime\":{{\"secs\":1,\"nanos\":0}},\"link_target\":\"{target}\"}}\n"
+        );
+        let (mut listing, mut out, _in) = conn("pi");
+        let writer = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
+            let _ = out.write_all(line.as_bytes()).await;
+            let _ = out.write_all(b"{\"done\":true,\"entries\":1}\n").await;
+            out
+        });
+        let error = listing.manifest_within(bounded(10)).await.unwrap_err();
+        drop(writer);
+        assert_eq!(error.code, ErrorCode::Failed, "{error:?}");
+        assert_eq!(error.machine.as_deref(), Some("pi"));
+        assert!(error.message.contains("longer than"), "{error:?}");
+
+        // Many ordinary lines may not add up to more than a listing may take in all.
+        let (mut listing, mut out, _in) = conn("pi");
+        let writer = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
+            for at in 0..50 {
+                let line = format!(
+                    "{{\"path\":\"f{at}\",\"kind\":\"file\",\"size\":1,\"mtime\":{{\"secs\":1,\"nanos\":0}}}}\n"
+                );
+                if out.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            out
+        });
+        let error = listing
+            .manifest_within(Bounds {
+                entries: 1000,
+                bytes: 1000,
+                line: MOST_LISTING_LINE,
+            })
+            .await
+            .unwrap_err();
+        drop(writer);
+        assert_eq!(error.code, ErrorCode::Failed, "{error:?}");
+        assert!(error.hint.unwrap().contains("subdirectories"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2291,7 +2400,7 @@ mod tests {
             out.write_all(format!("{done}\n").as_bytes()).await.unwrap();
             out
         });
-        let listed = listing.manifest_at_most(10).await.unwrap();
+        let listed = listing.manifest_within(bounded(10)).await.unwrap();
         assert_eq!(listed.skipped.len(), 800);
         drop(writer);
 
