@@ -348,9 +348,9 @@ async fn gate(
         .map(|file| file.serve.clone())
         .unwrap_or_default();
     let mut principal = None;
-    // The origin of a page allowed to call, which its responses name so the browser shows them to
-    // it. Only read once the gate has let the origin through.
-    let origin = request.headers().get(ORIGIN).cloned();
+    // The origin of a page allowed to call, which every response past the origin check names, so
+    // the browser shows the page its errors as well as its results.
+    let mut accepted_origin = None;
     let mut response = if let Some(problem) = gate::malformed(request.headers(), request.uri()) {
         reply::refusal(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgs, problem)
     } else if !gate::host_allowed(request.headers(), shared.port, &config) {
@@ -365,42 +365,39 @@ async fn gate(
             ErrorCode::Denied,
             "Pages from that origin may not use this server.",
         )
-    } else if method == Method::OPTIONS && request.headers().contains_key(ORIGIN) {
-        // A browser's preflight carries no token; a listed origin is told what it may send.
-        preflight()
-    } else if method == Method::GET && path == "/v1/health" {
-        next.run(request).await
     } else {
-        let tokens = shared
-            .node
-            .config()
-            .get::<Tokens>()
-            .unwrap_or_else(|error| {
-                log(&format!(
-                    "every token is refused until tokens.toml is mended: {}",
-                    error.message
-                ));
-                Arc::new(Tokens::default())
-            });
-        match gate::principal(request.headers(), &tokens) {
-            Ok(found) => {
-                principal = Some(found.principal.clone());
-                request.extensions_mut().insert(found);
-                next.run(request).await
-            }
-            Err(refusal) => {
-                tokio::time::sleep(REFUSAL_DELAY).await;
-                unauthorized(&refusal)
+        accepted_origin = request.headers().get(ORIGIN).cloned();
+        if method == Method::OPTIONS && accepted_origin.is_some() {
+            // A browser's preflight carries no token; a listed origin is told what it may send.
+            preflight()
+        } else if method == Method::GET && path == "/v1/health" {
+            next.run(request).await
+        } else {
+            let tokens = shared
+                .node
+                .config()
+                .get::<Tokens>()
+                .unwrap_or_else(|error| {
+                    log(&format!(
+                        "every token is refused until tokens.toml is mended: {}",
+                        error.message
+                    ));
+                    Arc::new(Tokens::default())
+                });
+            match gate::principal(request.headers(), &tokens) {
+                Ok(found) => {
+                    principal = Some(found.principal.clone());
+                    request.extensions_mut().insert(found);
+                    next.run(request).await
+                }
+                Err(refusal) => {
+                    tokio::time::sleep(REFUSAL_DELAY).await;
+                    unauthorized(&refusal)
+                }
             }
         }
     };
-    if let Some(origin) = origin
-        && gate::origin_allowed(&origin_only(&origin), &config)
-        && !matches!(
-            response.status(),
-            StatusCode::BAD_REQUEST | StatusCode::MISDIRECTED_REQUEST
-        )
-    {
+    if let Some(origin) = accepted_origin {
         let headers = response.headers_mut();
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         headers.insert(
@@ -437,13 +434,6 @@ fn preflight() -> Response<Body> {
     );
     headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
     response
-}
-
-/// A header map holding only `origin`, to ask the gate about it.
-fn origin_only(origin: &HeaderValue) -> axum::http::HeaderMap {
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(ORIGIN, origin.clone());
-    headers
 }
 
 /// 401, saying a token is needed or that the one given will not do, and never which of the two

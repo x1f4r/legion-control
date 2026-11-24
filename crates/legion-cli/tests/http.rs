@@ -1627,6 +1627,36 @@ fn a_listed_origin_can_call_from_a_browser() {
         Some(page.as_str())
     );
 
+    // Errors too, whatever their status, so the page can read what went wrong.
+    for body in [
+        json!({"tool": "test.sleep", "args": {"secs": 1}}),
+        json!({"tool": "fs.frobnicate"}),
+        json!({"tool": "test.fail", "args": {"code": "busy"}}),
+    ] {
+        let failed = http(
+            server.port,
+            "POST",
+            "/v1/call",
+            &headers,
+            body.to_string().as_bytes(),
+        );
+        assert!(failed.status >= 400, "{body}");
+        assert_eq!(
+            failed.header("access-control-allow-origin"),
+            Some(page.as_str()),
+            "{} {body}",
+            failed.status
+        );
+    }
+    let mut malformed = headers.clone();
+    malformed.push(("Content-Type", "application/json".to_owned()));
+    let not_json = http(server.port, "POST", "/v1/call", &malformed, b"not json");
+    assert_eq!(not_json.status, 400);
+    assert_eq!(
+        not_json.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+
     // Any other page gets nothing it could use.
     let other = http(
         server.port,
