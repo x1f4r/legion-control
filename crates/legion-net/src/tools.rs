@@ -37,6 +37,7 @@ const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add_document::<FleetFile>();
     crate::transfer::register(registry, fleet.clone());
+    crate::install::register(registry, fleet.clone());
 
     registry.add(FleetTool::<NoArgs, ListResult, _>::new(
         "fleet.list",
