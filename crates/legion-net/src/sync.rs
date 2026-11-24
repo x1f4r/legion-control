@@ -69,13 +69,13 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add_fn(
         "config.write",
         Effect::Admin,
-        "Validate and atomically replace one shared configuration document (fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
+        "Validate and atomically replace one shared configuration document (fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
         config_write,
     );
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
         "fleet.sync",
         Effect::Admin,
-        "Compare, push, or pull shared configuration documents (fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
+        "Compare, push, or pull shared configuration documents (fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_sync(fleet, ctx, args)),
     ));
@@ -605,16 +605,27 @@ struct WriteOutcome {
     backup: Option<String>,
 }
 
+/// Precondition on the existing target document before `config.write` replaces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePrecondition<'a> {
+    /// Overwrite whether the document exists or not.
+    Any,
+    /// Target must exist with this exact BLAKE3 hash.
+    Hash(&'a str),
+    /// Target must not currently exist.
+    Absent,
+}
+
 /// Validates, backs up, and atomically writes one shared configuration document.
 fn write_local_document_blocking(
     config_dir: &Path,
     state_dir: &Path,
     doc: &SharedDocument,
     content: &str,
-    expect_hash: Option<&str>,
+    precondition: WritePrecondition<'_>,
     is_builtin: &dyn Fn(&str) -> bool,
 ) -> Result<WriteOutcome, ErrorBody> {
-    if let Some(expected) = expect_hash {
+    if let WritePrecondition::Hash(expected) = precondition {
         expected.parse::<Hash>().map_err(|_| {
             ErrorBody::new(
                 ErrorCode::InvalidArgs,
@@ -640,23 +651,43 @@ fn write_local_document_blocking(
     };
     let hash_before = existing.as_deref().map(|b| hash_bytes(b).to_string());
 
-    if let Some(expected) = expect_hash
-        && hash_before.as_deref() != Some(expected)
-    {
-        return Err(ErrorBody::new(
-            ErrorCode::Conflict,
-            format!(
-                "{} changed on this node before it could be replaced (expected {expected}, found {}).",
-                doc.canonical_name(),
-                hash_before.as_deref().unwrap_or("missing")
-            ),
-        )
-        .with_hint("Read the current document again, or pass force=true to overwrite.")
-        .with_details(json!({
-            "document": doc.canonical_name(),
-            "expected": expected,
-            "actual": hash_before,
-        })));
+    match precondition {
+        WritePrecondition::Any => {}
+        WritePrecondition::Hash(expected) => {
+            if hash_before.as_deref() != Some(expected) {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "{} changed on this node before it could be replaced (expected {expected}, found {}).",
+                        doc.canonical_name(),
+                        hash_before.as_deref().unwrap_or("missing")
+                    ),
+                )
+                .with_hint("Read the current document again, or pass force=true to overwrite.")
+                .with_details(json!({
+                    "document": doc.canonical_name(),
+                    "expected": expected,
+                    "actual": hash_before,
+                })));
+            }
+        }
+        WritePrecondition::Absent => {
+            if let Some(ref actual) = hash_before {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "{} already exists on this node before it could be created (expected absent, found {actual}).",
+                        doc.canonical_name(),
+                    ),
+                )
+                .with_hint("Read the current document again, or pass force=true to overwrite.")
+                .with_details(json!({
+                    "document": doc.canonical_name(),
+                    "expected": "absent",
+                    "actual": actual,
+                })));
+            }
+        }
     }
 
     // Validate strictly with the receiving node's own loader BEFORE touching backup or target.
@@ -715,7 +746,15 @@ async fn apply_local_write(
     doc: SharedDocument,
     content: String,
     expect_hash: Option<String>,
+    expect_absent: bool,
 ) -> Result<WriteOutcome, ErrorBody> {
+    if expect_hash.is_some() && expect_absent {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Cannot set both `expect_hash` and `expect_absent` on config.write.",
+        )
+        .with_hint("Pass `expect_hash` when replacing an existing file, or `expect_absent=true` when creating a new one."));
+    }
     let started = Instant::now();
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let state_dir = ctx.paths().state_dir().to_path_buf();
@@ -728,12 +767,17 @@ async fn apply_local_write(
         .collect();
     let outcome = tokio::task::spawn_blocking(move || {
         let is_builtin = |name: &str| builtins.contains(name);
+        let precondition = match (expect_hash.as_deref(), expect_absent) {
+            (Some(hash), false) => WritePrecondition::Hash(hash),
+            (None, true) => WritePrecondition::Absent,
+            _ => WritePrecondition::Any,
+        };
         write_local_document_blocking(
             &config_dir,
             &state_dir,
             &doc,
             &content,
-            expect_hash.as_deref(),
+            precondition,
             &is_builtin,
         )
     })
@@ -824,6 +868,9 @@ struct ConfigWriteArgs {
     /// Expected BLAKE3 hash (`blake3:<hex>`) of the existing file; fails with `conflict` if different.
     #[serde(default)]
     expect_hash: Option<String>,
+    /// Require that the document does not currently exist; fails with `conflict` if already present.
+    #[serde(default)]
+    expect_absent: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -836,7 +883,8 @@ struct ConfigWriteResult {
 
 async fn config_write(ctx: &Ctx, args: ConfigWriteArgs) -> Result<ConfigWriteResult, ToolError> {
     let doc = SharedDocument::parse(&args.document)?;
-    let outcome = apply_local_write(ctx, doc, args.content, args.expect_hash).await?;
+    let outcome =
+        apply_local_write(ctx, doc, args.content, args.expect_hash, args.expect_absent).await?;
     Ok(ConfigWriteResult {
         document: outcome.document,
         hash: outcome.hash_after,
@@ -859,7 +907,7 @@ pub enum SyncDirection {
 
 /// Per-document sync status reported by `fleet.sync`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SyncStatus {
     /// Local and remote bytes have the same hash (or both are absent).
     Same,
@@ -867,8 +915,16 @@ pub enum SyncStatus {
     Pushed,
     /// Remote document was pulled locally (or would be under `dry_run`).
     Pulled,
-    /// Local and remote hashes differ (reported by `status`, or when the source lacks the file).
-    Differs,
+    /// Only the local node changed since the last recorded sync with this peer.
+    ChangedHere,
+    /// Only the remote node changed since the last recorded sync with this peer.
+    ChangedThere,
+    /// Both nodes differ from the last recorded sync (or both exist with different bytes and no prior sync).
+    Both,
+    /// The document exists only on this node (not on the remote).
+    OnlyHere,
+    /// The document exists only on the remote node (not on this node).
+    OnlyThere,
     /// The destination changed since the last recorded sync with this peer (or existed without one).
     Conflict,
     /// Reading, validating, or writing failed; see `error`.
@@ -1302,8 +1358,8 @@ async fn sync_one_document(
                 error: None,
             }
         }
-        SyncDecision::Differs(reason) => DocSyncOutcome {
-            status: SyncStatus::Differs,
+        SyncDecision::Report(status, reason) => DocSyncOutcome {
+            status,
             local_hash: local.hash,
             remote_hash: remote.hash,
             last_synced_hash,
@@ -1323,7 +1379,7 @@ async fn sync_one_document(
         SyncDecision::Push => {
             let Some(local_content) = local.content else {
                 return DocSyncOutcome {
-                    status: SyncStatus::Differs,
+                    status: SyncStatus::OnlyThere,
                     local_hash: local.hash,
                     remote_hash: remote.hash,
                     last_synced_hash,
@@ -1353,11 +1409,15 @@ async fn sync_one_document(
                 "document": doc.canonical_name(),
                 "content": local_content,
             });
-            if !force
-                && let Some(ref rh) = remote.hash
-                && let Some(obj) = write_args.as_object_mut()
-            {
-                obj.insert("expect_hash".to_owned(), json!(rh));
+            if !force && let Some(obj) = write_args.as_object_mut() {
+                match remote.hash {
+                    Some(ref rh) => {
+                        obj.insert("expect_hash".to_owned(), json!(rh));
+                    }
+                    None => {
+                        obj.insert("expect_absent".to_owned(), json!(true));
+                    }
+                }
             }
             match fleet
                 .call_remote(
@@ -1453,8 +1513,17 @@ async fn sync_one_document(
                     error: None,
                 };
             }
-            let expect = if force { None } else { local.hash.clone() };
-            match apply_local_write(ctx, doc.clone(), remote_content, expect).await {
+            let (expect_hash, expect_absent) = if force {
+                (None, false)
+            } else {
+                match local.hash.clone() {
+                    Some(lh) => (Some(lh), false),
+                    None => (None, true),
+                }
+            };
+            match apply_local_write(ctx, doc.clone(), remote_content, expect_hash, expect_absent)
+                .await
+            {
                 Ok(written) => {
                     if let Err(error) =
                         record_sidecar_async(&state_dir, doc, machine, &written.hash_after).await
@@ -1531,8 +1600,8 @@ fn error_outcome(error: ErrorBody) -> DocSyncOutcome {
 pub enum SyncDecision {
     /// Local and remote match (or both are absent).
     Same,
-    /// Hashes differ (status mode, or source side does not have the file).
-    Differs(Option<String>),
+    /// Non-mutating report (`status` mode, or one-sided presence where push/pull does not delete).
+    Report(SyncStatus, Option<String>),
     /// Destination diverged since last sync (or exists with no prior sync) and `force` is false.
     Conflict(String),
     /// Safe (or forced) to push local content to remote.
@@ -1553,13 +1622,39 @@ pub fn decide_sync(
         return SyncDecision::Same;
     }
     match direction {
-        SyncDirection::Status => SyncDecision::Differs(None),
+        SyncDirection::Status => match (local_hash, remote_hash) {
+            (Some(_), None) => SyncDecision::Report(SyncStatus::OnlyHere, None),
+            (None, Some(_)) => SyncDecision::Report(SyncStatus::OnlyThere, None),
+            (Some(local), Some(remote)) => match last_synced_hash {
+                Some(synced) if synced == remote => {
+                    SyncDecision::Report(SyncStatus::ChangedHere, None)
+                }
+                Some(synced) if synced == local => {
+                    SyncDecision::Report(SyncStatus::ChangedThere, None)
+                }
+                Some(_) => SyncDecision::Report(
+                    SyncStatus::Both,
+                    Some("Both machines changed since the last sync.".to_owned()),
+                ),
+                None => SyncDecision::Report(
+                    SyncStatus::Both,
+                    Some(
+                        "Both machines have different copies and no prior sync is recorded."
+                            .to_owned(),
+                    ),
+                ),
+            },
+            (None, None) => SyncDecision::Same,
+        },
         SyncDirection::Push => {
             if local_hash.is_none() {
-                return SyncDecision::Differs(Some(
-                    "Document does not exist locally; push does not delete remote files."
-                        .to_owned(),
-                ));
+                return SyncDecision::Report(
+                    SyncStatus::OnlyThere,
+                    Some(
+                        "Document does not exist locally; push does not delete remote files."
+                            .to_owned(),
+                    ),
+                );
             }
             if force || remote_hash.is_none() || remote_hash == last_synced_hash {
                 SyncDecision::Push
@@ -1573,10 +1668,13 @@ pub fn decide_sync(
         }
         SyncDirection::Pull => {
             if remote_hash.is_none() {
-                return SyncDecision::Differs(Some(
-                    "Document does not exist on the remote; pull does not delete local files."
-                        .to_owned(),
-                ));
+                return SyncDecision::Report(
+                    SyncStatus::OnlyHere,
+                    Some(
+                        "Document does not exist on the remote; pull does not delete local files."
+                            .to_owned(),
+                    ),
+                );
             }
             if force || local_hash.is_none() || local_hash == last_synced_hash {
                 SyncDecision::Pull
@@ -1652,9 +1750,47 @@ mod tests {
             SyncDecision::Same
         );
         assert_eq!(
-            decide_sync(SyncDirection::Status, Some("h1"), Some("h2"), None, false),
-            SyncDecision::Differs(None)
+            decide_sync(SyncDirection::Status, Some("h1"), None, None, false),
+            SyncDecision::Report(SyncStatus::OnlyHere, None)
         );
+        assert_eq!(
+            decide_sync(SyncDirection::Status, None, Some("h1"), Some("h1"), false),
+            SyncDecision::Report(SyncStatus::OnlyThere, None)
+        );
+        assert_eq!(
+            decide_sync(
+                SyncDirection::Status,
+                Some("h2"),
+                Some("h1"),
+                Some("h1"),
+                false
+            ),
+            SyncDecision::Report(SyncStatus::ChangedHere, None)
+        );
+        assert_eq!(
+            decide_sync(
+                SyncDirection::Status,
+                Some("h1"),
+                Some("h2"),
+                Some("h1"),
+                false
+            ),
+            SyncDecision::Report(SyncStatus::ChangedThere, None)
+        );
+        assert!(matches!(
+            decide_sync(
+                SyncDirection::Status,
+                Some("h2"),
+                Some("h3"),
+                Some("h1"),
+                false
+            ),
+            SyncDecision::Report(SyncStatus::Both, Some(_))
+        ));
+        assert!(matches!(
+            decide_sync(SyncDirection::Status, Some("h1"), Some("h2"), None, false),
+            SyncDecision::Report(SyncStatus::Both, Some(_))
+        ));
         // Push to empty remote succeeds without prior sync.
         assert_eq!(
             decide_sync(SyncDirection::Push, Some("h1"), None, None, false),
@@ -1738,25 +1874,43 @@ mod tests {
             &state,
             &SharedDocument::Policy,
             "default = 123\n",
-            None,
+            WritePrecondition::Any,
             &no_builtins,
         );
         assert!(bad.is_err());
         assert!(!cfg.join("policy.toml").exists());
 
-        // First valid write creates the file with no backup.
+        // First valid write with Absent precondition creates the file with no backup.
         let v1 = "default = \"owner\"\n";
         let first = write_local_document_blocking(
             &cfg,
             &state,
             &SharedDocument::Policy,
             v1,
-            None,
+            WritePrecondition::Absent,
             &no_builtins,
         )
         .unwrap();
         assert!(first.backup.is_none());
         assert!(first.hash_before.is_none());
+
+        // Second write with Absent precondition fails with Conflict and leaves v1 intact.
+        let already_exists = write_local_document_blocking(
+            &cfg,
+            &state,
+            &SharedDocument::Policy,
+            "default = \"owner\"\n# racing\n",
+            WritePrecondition::Absent,
+            &no_builtins,
+        );
+        assert_eq!(
+            already_exists.err().map(|e| e.code),
+            Some(ErrorCode::Conflict)
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.join("policy.toml")).unwrap(),
+            v1
+        );
 
         // Second valid write with matching expect_hash backs up v1 and replaces atomically.
         let v2 = "default = \"owner\"\n\n[roles.viewer]\nallow = [\"effect:read\"]\n";
@@ -1765,7 +1919,7 @@ mod tests {
             &state,
             &SharedDocument::Policy,
             v2,
-            Some(&first.hash_after),
+            WritePrecondition::Hash(&first.hash_after),
             &no_builtins,
         )
         .unwrap();
@@ -1782,7 +1936,7 @@ mod tests {
             &state,
             &SharedDocument::Policy,
             v1,
-            Some(&first.hash_after),
+            WritePrecondition::Hash(&first.hash_after),
             &no_builtins,
         );
         assert_eq!(stale.err().map(|e| e.code), Some(ErrorCode::Conflict));
@@ -1805,34 +1959,60 @@ mod tests {
         let unknown = format!("{valid}bogus = 1\n");
         let doc = SharedDocument::parse("tools.d/demo.hello.toml").unwrap();
         assert!(
-            write_local_document_blocking(&cfg, &state, &doc, &unknown, None, &is_builtin).is_err()
+            write_local_document_blocking(
+                &cfg,
+                &state,
+                &doc,
+                &unknown,
+                WritePrecondition::Any,
+                &is_builtin,
+            )
+            .is_err()
         );
 
         // Reserved family is refused.
         let reserved_doc = SharedDocument::parse("tools.d/meta.evil.toml").unwrap();
         let reserved =
             "name = \"meta.evil\"\ndescription = \"Evil.\"\neffect = \"read\"\ncmd = \"echo x\"\n";
-        let err =
-            write_local_document_blocking(&cfg, &state, &reserved_doc, reserved, None, &is_builtin)
-                .err()
-                .unwrap();
+        let err = write_local_document_blocking(
+            &cfg,
+            &state,
+            &reserved_doc,
+            reserved,
+            WritePrecondition::Any,
+            &is_builtin,
+        )
+        .err()
+        .unwrap();
         assert!(err.message.contains("reserved"), "{err:?}");
 
         // Built-in shadowing is refused.
         let shadow_doc = SharedDocument::parse("tools.d/agent.list.toml").unwrap();
         let shadow = "name = \"agent.list\"\ndescription = \"Shadow.\"\neffect = \"read\"\ncmd = \"echo x\"\n";
-        let err =
-            write_local_document_blocking(&cfg, &state, &shadow_doc, shadow, None, &is_builtin)
-                .err()
-                .unwrap();
+        let err = write_local_document_blocking(
+            &cfg,
+            &state,
+            &shadow_doc,
+            shadow,
+            WritePrecondition::Any,
+            &is_builtin,
+        )
+        .err()
+        .unwrap();
         assert!(err.message.contains("built-in"), "{err:?}");
 
         // File stem mismatch is refused.
         let wrong_stem = SharedDocument::parse("tools.d/other.toml").unwrap();
-        let err =
-            write_local_document_blocking(&cfg, &state, &wrong_stem, valid, None, &is_builtin)
-                .err()
-                .unwrap();
+        let err = write_local_document_blocking(
+            &cfg,
+            &state,
+            &wrong_stem,
+            valid,
+            WritePrecondition::Any,
+            &is_builtin,
+        )
+        .err()
+        .unwrap();
         assert!(
             err.message.contains("does not match file name stem"),
             "{err:?}"
@@ -1841,22 +2021,36 @@ mod tests {
         // Duplicate tool name already defined in another tools.d file is refused.
         std::fs::create_dir_all(cfg.join("tools.d")).unwrap();
         std::fs::write(cfg.join("tools.d").join("legacy.toml"), valid).unwrap();
-        let err = write_local_document_blocking(&cfg, &state, &doc, valid, None, &is_builtin)
-            .err()
-            .unwrap();
+        let err = write_local_document_blocking(
+            &cfg,
+            &state,
+            &doc,
+            valid,
+            WritePrecondition::Any,
+            &is_builtin,
+        )
+        .err()
+        .unwrap();
         assert!(err.message.contains("already defined"), "{err:?}");
 
         // Removing the conflicting file allows writing and updating tools.d/demo.hello.toml.
         std::fs::remove_file(cfg.join("tools.d").join("legacy.toml")).unwrap();
-        let first =
-            write_local_document_blocking(&cfg, &state, &doc, valid, None, &is_builtin).unwrap();
+        let first = write_local_document_blocking(
+            &cfg,
+            &state,
+            &doc,
+            valid,
+            WritePrecondition::Absent,
+            &is_builtin,
+        )
+        .unwrap();
         let updated = "name = \"demo.hello\"\ndescription = \"Say hi.\"\neffect = \"read\"\ncmd = \"echo hi2\"\n";
         write_local_document_blocking(
             &cfg,
             &state,
             &doc,
             updated,
-            Some(&first.hash_after),
+            WritePrecondition::Hash(&first.hash_after),
             &is_builtin,
         )
         .unwrap();

@@ -7,7 +7,7 @@
 mod common;
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -60,6 +60,10 @@ fn main() -> ExitCode {
         (
             "config_write_and_sync_validate_tools_d_strictly",
             config_write_and_sync_validate_tools_d_strictly,
+        ),
+        (
+            "fleet_sync_expect_absent_race_directional_status_and_only_one_side",
+            fleet_sync_expect_absent_race_directional_status_and_only_one_side,
         ),
     ];
 
@@ -114,6 +118,53 @@ fn run_helper(args: &[String]) -> ExitCode {
                 .stderr(Stdio::inherit())
                 .status()
                 .unwrap();
+            exit_from_status(status)
+        }
+        // race-create <legion_bin> <legion_home> <user_home> <file_to_create> <content>
+        // Proxies `legion rpc` and creates <file_to_create> right before forwarding `config.write`,
+        // simulating a concurrent file creation after `config.read` reported it absent.
+        "race-create" => {
+            let mut child = Command::new(&rest[0])
+                .arg("rpc")
+                .env("LEGION_HOME", &rest[1])
+                .env("HOME", &rest[2])
+                .env("USERPROFILE", &rest[2])
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_STATE_HOME")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            let mut child_out = child.stdout.take().unwrap();
+            let out_pump = std::thread::spawn(move || {
+                let mut stdout = io::stdout().lock();
+                let _ = io::copy(&mut child_out, &mut stdout);
+                let _ = stdout.flush();
+            });
+            let race_path = PathBuf::from(&rest[3]);
+            let race_content = rest[4].clone();
+            let mut created = false;
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                if !created && line.contains("\"config.write\"") {
+                    if let Some(parent) = race_path.parent() {
+                        fs::create_dir_all(parent).unwrap();
+                    }
+                    fs::write(&race_path, &race_content).unwrap();
+                    created = true;
+                }
+                if child_in.write_all(line.as_bytes()).is_err() || child_in.flush().is_err() {
+                    break;
+                }
+                line.clear();
+            }
+            drop(child_in);
+            let _ = out_pump.join();
+            let status = child.wait().unwrap();
             exit_from_status(status)
         }
         // fail: simulates an unreachable machine immediately.
@@ -562,18 +613,18 @@ role = \"owner\"
     assert_eq!(local_denied.code, 1);
     assert_eq!(local_denied.json()["code"], json!("denied"));
 
-    // 3. Initial status shows differs without writing anything to pi or sidecars.
+    // 3. Initial status shows only_here without writing anything to pi or sidecars.
     let status = laptop.run(&[
         "fleet.sync",
         "documents=[\"policy.toml\",\"projects.toml\",\"tools.d/demo.hello.toml\"]",
     ]);
     assert_eq!(status.code, 0, "{}", status.stdout);
     let pi_status = &status.json()["results"]["pi"];
-    assert_eq!(pi_status["policy.toml"]["status"], json!("differs"));
-    assert_eq!(pi_status["projects.toml"]["status"], json!("differs"));
+    assert_eq!(pi_status["policy.toml"]["status"], json!("only_here"));
+    assert_eq!(pi_status["projects.toml"]["status"], json!("only_here"));
     assert_eq!(
         pi_status["tools.d/demo.hello.toml"]["status"],
-        json!("differs")
+        json!("only_here")
     );
     assert!(!config_dir(&pi).join("policy.toml").exists());
 
@@ -1246,5 +1297,243 @@ fn config_write_and_sync_validate_tools_d_strictly() {
             .join("tools.d")
             .join("demo.greet.toml")
             .exists()
+    );
+}
+
+fn fleet_sync_expect_absent_race_directional_status_and_only_one_side() {
+    let laptop = Home::new();
+    let pi = Home::new();
+    let racer = Home::new();
+
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    racer.write_config("node.toml", "name = \"racer\"\n");
+
+    let racer_projects_path = config_dir(&racer).join("projects.toml");
+    let racer_created = "[projects.raced.on]\nracer = \"~/projects/raced\"\n";
+    let racer_argv = vec![
+        self_exe(),
+        HELPER_FLAG.to_owned(),
+        "race-create".to_owned(),
+        LEGION_BIN.to_owned(),
+        racer
+            .state()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        racer.home().to_string_lossy().into_owned(),
+        racer_projects_path.to_string_lossy().into_owned(),
+        racer_created.to_owned(),
+    ];
+
+    let fleet_toml = format!(
+        "[machines.pi]\ncommand = {}\n\n[machines.racer]\ncommand = {}\n",
+        toml_argv(&run_argv(&pi)),
+        toml_argv(&racer_argv),
+    );
+    laptop.write_config("fleet.toml", &fleet_toml);
+
+    // 1. Direct config.write with expect_absent=true creates once, then returns conflict.
+    let v1 = "[projects.app.on]\nlaptop = \"~/projects/app\"\n";
+    let created = laptop.run(&[
+        "config.write",
+        "document=projects.toml",
+        &format!("content={v1}"),
+        "expect_absent=true",
+    ]);
+    assert_eq!(created.code, 0, "{}", created.stdout);
+
+    let exists_conflict = laptop.run(&[
+        "config.write",
+        "document=projects.toml",
+        "content=[projects.other.on]\nlaptop = \"~/projects/other\"\n",
+        "expect_absent=true",
+    ]);
+    assert_eq!(exists_conflict.code, 1, "{}", exists_conflict.stdout);
+    assert_eq!(exists_conflict.json()["code"], json!("conflict"));
+    assert_eq!(
+        fs::read_to_string(config_dir(&laptop).join("projects.toml")).unwrap(),
+        v1
+    );
+
+    // Combining expect_hash and expect_absent is refused with invalid_args.
+    let both_preconds = laptop.run(&[
+        "config.write",
+        "document=projects.toml",
+        &format!("content={v1}"),
+        &format!("expect_hash={}", created.json()["hash"].as_str().unwrap()),
+        "expect_absent=true",
+    ]);
+    assert_eq!(both_preconds.code, 1, "{}", both_preconds.stdout);
+    assert_eq!(both_preconds.json()["code"], json!("invalid_args"));
+
+    // 2. Pushing to a peer where the file appears between config.read and config.write conflicts
+    // because fleet.sync sends expect_absent=true; the peer's newly created file stays intact.
+    let race_push = laptop.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"racer\"]",
+        "documents=[\"projects.toml\"]",
+    ]);
+    assert_eq!(race_push.code, 0, "{}", race_push.stdout);
+    assert_eq!(
+        race_push.json()["results"]["racer"]["projects.toml"]["status"],
+        json!("conflict"),
+        "{}",
+        race_push.stdout
+    );
+    assert_eq!(
+        fs::read_to_string(&racer_projects_path).unwrap(),
+        racer_created
+    );
+
+    // 3. Directional status: same -> changed_here -> changed_there -> both.
+    let push_pi = laptop.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"pi\"]",
+        "documents=[\"projects.toml\"]",
+    ]);
+    assert_eq!(
+        push_pi.json()["results"]["pi"]["projects.toml"]["status"],
+        json!("pushed")
+    );
+
+    let local_edit = "[projects.app.on]\nlaptop = \"~/projects/app_local\"\n";
+    laptop.write_config("projects.toml", local_edit);
+    let st_here = laptop.run(&[
+        "fleet.sync",
+        "machines=[\"pi\"]",
+        "documents=[\"projects.toml\"]",
+    ]);
+    assert_eq!(
+        st_here.json()["results"]["pi"]["projects.toml"]["status"],
+        json!("changed_here"),
+        "{}",
+        st_here.stdout
+    );
+
+    laptop.write_config("projects.toml", v1);
+    let remote_edit = "[projects.app.on]\npi = \"~/projects/app_pi\"\n";
+    pi.write_config("projects.toml", remote_edit);
+    let st_there = laptop.run(&[
+        "fleet.sync",
+        "machines=[\"pi\"]",
+        "documents=[\"projects.toml\"]",
+    ]);
+    assert_eq!(
+        st_there.json()["results"]["pi"]["projects.toml"]["status"],
+        json!("changed_there"),
+        "{}",
+        st_there.stdout
+    );
+
+    laptop.write_config("projects.toml", local_edit);
+    let st_both = laptop.run(&[
+        "fleet.sync",
+        "machines=[\"pi\"]",
+        "documents=[\"projects.toml\"]",
+    ]);
+    assert_eq!(
+        st_both.json()["results"]["pi"]["projects.toml"]["status"],
+        json!("both"),
+        "{}",
+        st_both.stdout
+    );
+
+    // 4. Removal of a tools.d file is never propagated and status reports only_here / only_there.
+    let one_def =
+        "name = \"demo.one\"\ndescription = \"One.\"\neffect = \"read\"\ncmd = \"echo 1\"\n";
+    let two_def =
+        "name = \"demo.two\"\ndescription = \"Two.\"\neffect = \"read\"\ncmd = \"echo 2\"\n";
+    fs::create_dir_all(config_dir(&laptop).join("tools.d")).unwrap();
+    fs::write(
+        config_dir(&laptop).join("tools.d").join("demo.one.toml"),
+        one_def,
+    )
+    .unwrap();
+    fs::write(
+        config_dir(&laptop).join("tools.d").join("demo.two.toml"),
+        two_def,
+    )
+    .unwrap();
+
+    let push_tools = laptop.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"pi\"]",
+        "documents=[\"tools.d/demo.one.toml\",\"tools.d/demo.two.toml\"]",
+    ]);
+    assert_eq!(
+        push_tools.json()["results"]["pi"]["tools.d/demo.one.toml"]["status"],
+        json!("pushed")
+    );
+    assert_eq!(
+        push_tools.json()["results"]["pi"]["tools.d/demo.two.toml"]["status"],
+        json!("pushed")
+    );
+
+    // Remove demo.one locally and demo.two on pi.
+    fs::remove_file(config_dir(&laptop).join("tools.d").join("demo.one.toml")).unwrap();
+    fs::remove_file(config_dir(&pi).join("tools.d").join("demo.two.toml")).unwrap();
+
+    let st_removed = laptop.run(&["fleet.sync", "machines=[\"pi\"]"]);
+    let st_pi = &st_removed.json()["results"]["pi"];
+    assert_eq!(
+        st_pi["tools.d/demo.one.toml"]["status"],
+        json!("only_there"),
+        "{st_pi}"
+    );
+    assert_eq!(
+        st_pi["tools.d/demo.two.toml"]["status"],
+        json!("only_here"),
+        "{st_pi}"
+    );
+
+    // Push does not delete demo.one on pi; pull does not delete demo.two on laptop.
+    let push_after_rm = laptop.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"pi\"]",
+        "documents=[\"tools.d/demo.one.toml\"]",
+    ]);
+    assert_eq!(
+        push_after_rm.json()["results"]["pi"]["tools.d/demo.one.toml"]["status"],
+        json!("only_there")
+    );
+    assert!(
+        config_dir(&pi)
+            .join("tools.d")
+            .join("demo.one.toml")
+            .is_file()
+    );
+
+    let pull_after_rm = laptop.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=pi",
+        "documents=[\"tools.d/demo.two.toml\"]",
+    ]);
+    assert_eq!(
+        pull_after_rm.json()["results"]["pi"]["tools.d/demo.two.toml"]["status"],
+        json!("only_here")
+    );
+    assert!(
+        config_dir(&laptop)
+            .join("tools.d")
+            .join("demo.two.toml")
+            .is_file()
+    );
+
+    // Tool description states that removal of a tools.d file is never propagated.
+    let help = laptop.run(&["help", "fleet.sync", "--json"]);
+    assert_eq!(help.code, 0, "{}", help.stdout);
+    let help_json = help.json();
+    let desc = help_json["description"].as_str().unwrap();
+    assert!(desc.contains("never propagated"), "{desc}");
+    assert!(
+        desc.contains("only_here") && desc.contains("only_there"),
+        "{desc}"
     );
 }
