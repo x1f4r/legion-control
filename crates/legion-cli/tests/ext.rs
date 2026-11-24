@@ -127,16 +127,17 @@ fn calls_extension_only_present_on_remote_node_over_command_connector() {
 
     laptop.write_config("node.toml", "name = \"laptop\"\n");
     tower.write_config("node.toml", "name = \"tower\"\n");
-    tower.write_config(
-        "policy.toml",
-        r#"
+    // A call has to be allowed by every node it passes through, so the forwarding node knows the
+    // observer as well as the node that runs the tool.
+    let policy = r#"
 [principals.observer]
 role = "observer"
 
 [roles.observer]
 allow = ["effect:read"]
-"#,
-    );
+"#;
+    laptop.write_config("policy.toml", policy);
+    tower.write_config("policy.toml", policy);
 
     // Point laptop -> tower via the command connector.
     let fleet_toml = format!(
@@ -223,7 +224,9 @@ allow = ["effect:read"]
     let remote_exec = laptop.run(&["gpu.reset", "--on", "tower", "--as", "observer", "--json"]);
     assert_ne!(remote_exec.code, 0);
     assert_eq!(remote_exec.json()["code"], json!("denied"));
-    assert_eq!(remote_exec.json()["machine"], json!("tower"));
+    // The forwarding node asks the target for the tool's effect and applies its own policy first,
+    // so the refusal comes from the node the call started on.
+    assert_eq!(remote_exec.json()["machine"], json!("laptop"));
 }
 
 fn cli_tools_and_help_include_extension_tools() {
