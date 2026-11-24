@@ -464,10 +464,11 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let invite_text = payload.encode()?;
 
     let creator_policy = ctx.config().get::<Policy>()?;
-    let created_by_device = ctx
-        .pairing_id()
-        .map(str::to_owned)
-        .or_else(|| creator_policy.device_owner(ctx.principal()).map(str::to_owned));
+    let created_by_device = ctx.pairing_id().map(str::to_owned).or_else(|| {
+        creator_policy
+            .device_owner(ctx.principal())
+            .map(str::to_owned)
+    });
     let record = InviteRecord {
         id: id.clone(),
         principal: principal.clone(),
@@ -1118,7 +1119,9 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             ErrorCode::Denied,
             "Only a caller with the owner role may prune acknowledged device tombstones.",
         )
-        .with_hint("Run `legion device.list prune_tombstones=true` as the owner of this machine."));
+        .with_hint(
+            "Run `legion device.list prune_tombstones=true` as the owner of this machine.",
+        ));
     }
     let node_file = ctx.config().get::<NodeFile>()?;
     let policy = ctx.config().get::<Policy>()?;
@@ -3608,12 +3611,7 @@ role = "owner"
             ep.get("host_keys_source").is_none(),
             "device.endpoint must not expose host_keys_source: {ep}"
         );
-        let mut keys: Vec<&str> = ep
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
+        let mut keys: Vec<&str> = ep.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["host_keys", "hosts", "node", "port", "user"]);
 
@@ -3759,7 +3757,7 @@ role = "owner"
 
     #[tokio::test]
     async fn role_invite_does_not_write_policy_refuses_duplicate_pending_and_checks_policy_at_enrol()
-    {
+     {
         let h = Harness::new();
 
         // 1. Invite `pixel` as `observer` — policy.toml must NOT be touched at invite time.
@@ -3817,7 +3815,12 @@ role = "owner"
             }
         );
         assert_eq!(
-            h.node.config().get::<Policy>().unwrap().role_of("device:pixel").0,
+            h.node
+                .config()
+                .get::<Policy>()
+                .unwrap()
+                .role_of("device:pixel")
+                .0,
             "observer"
         );
 
@@ -3882,14 +3885,19 @@ role = "owner"
             "enrol must fail when policy.toml already disagrees: {reply_race:?}"
         );
         assert_eq!(
-            h.node.config().get::<Policy>().unwrap().role_of("device:raced").0,
+            h.node
+                .config()
+                .get::<Policy>()
+                .unwrap()
+                .role_of("device:raced")
+                .0,
             "owner"
         );
     }
 
     #[tokio::test]
     async fn device_set_role_refuses_shared_principal_and_credentials_refuse_registry_owned_principal()
-    {
+     {
         let h = Harness::new();
 
         // 1. Pair a device under shared principal `tablet` via `--as` (`principal`).
@@ -3906,7 +3914,11 @@ role = "owner"
             "{{\"enrol\":1,\"id\":\"{shared_id}\",\"public_key\":\"{}\",\"name\":\"shared-tab\"}}\n",
             shared_key.public_key
         );
-        assert!(run_enrol(&h.node, shared_id, shared_req.as_bytes()).await.is_ok());
+        assert!(
+            run_enrol(&h.node, shared_id, shared_req.as_bytes())
+                .await
+                .is_ok()
+        );
 
         // `device.set role=` on a shared principal must be refused with a policy.toml hint.
         let shared_err = h
@@ -3943,7 +3955,11 @@ role = "owner"
             "{{\"enrol\":1,\"id\":\"{owned_inv_id}\",\"public_key\":\"{}\",\"name\":\"ignored\"}}\n",
             owned_key.public_key
         );
-        assert!(run_enrol(&h.node, owned_inv_id, owned_req.as_bytes()).await.is_ok());
+        assert!(
+            run_enrol(&h.node, owned_inv_id, owned_req.as_bytes())
+                .await
+                .is_ok()
+        );
 
         let policy_text =
             std::fs::read_to_string(h.node.paths().config_file("policy.toml")).unwrap();
@@ -4040,7 +4056,7 @@ allow = ["effect:read", "effect:write"]
 
     #[tokio::test]
     async fn duplicate_live_keys_and_foreign_key_collision_write_no_line_and_warn_in_list_and_doctor()
-    {
+     {
         use crate::device::keys::ed25519_public_key_from_seed;
         use crate::device::registry::{DevicesFile, FleetDevice};
 
@@ -4111,8 +4127,14 @@ allow = ["effect:read", "effect:write"]
             foreign_entry["status"],
             json!("not active here: this key is already on another line of authorized_keys")
         );
-        let dup_a = devices.iter().find(|d| d["name"] == json!("dup-a")).unwrap();
-        let dup_b = devices.iter().find(|d| d["name"] == json!("dup-b")).unwrap();
+        let dup_a = devices
+            .iter()
+            .find(|d| d["name"] == json!("dup-a"))
+            .unwrap();
+        let dup_b = devices
+            .iter()
+            .find(|d| d["name"] == json!("dup-b"))
+            .unwrap();
         assert!(
             dup_a["status"]
                 .as_str()
@@ -4126,7 +4148,10 @@ allow = ["effect:read", "effect:write"]
             "{dup_b}"
         );
         let warnings = listed["warnings"].as_array().unwrap();
-        assert!(!warnings.is_empty(), "expected warnings in device.list: {listed}");
+        assert!(
+            !warnings.is_empty(),
+            "expected warnings in device.list: {listed}"
+        );
 
         let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
         let checks = doctor["checks"].as_array().unwrap();
@@ -4203,7 +4228,10 @@ allow = ["effect:read", "effect:write"]
             &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
         )
         .unwrap();
-        assert!(saved.devices.is_empty(), "device should be removed from live map");
+        assert!(
+            saved.devices.is_empty(),
+            "device should be removed from live map"
+        );
         assert_eq!(saved.removed.len(), 1, "tombstone must be saved durably");
         assert!(
             !marker_session.exists(),
@@ -4225,7 +4253,9 @@ allow = ["effect:read", "effect:write"]
 
         let adopted_id = "11".repeat(16);
         let adopted_key = ed25519_public_key_from_seed(&[11u8; 32]);
-        let adopted_fp = validate_ed25519_public_key(&adopted_key).unwrap().fingerprint;
+        let adopted_fp = validate_ed25519_public_key(&adopted_key)
+            .unwrap()
+            .fingerprint;
 
         let local_only_id = "22".repeat(16);
         let local_only_key = ed25519_public_key_from_seed(&[22u8; 32]);
@@ -4320,8 +4350,14 @@ allow = ["effect:read", "effect:write"]
 
         // Both unmatched lines stay intact in authorized_keys and keep working locally.
         let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
-        assert!(auth_text.contains("legion-device:untracked-phone"), "{auth_text}");
-        assert!(auth_text.contains("legion-device:mismatch-phone"), "{auth_text}");
+        assert!(
+            auth_text.contains("legion-device:untracked-phone"),
+            "{auth_text}"
+        );
+        assert!(
+            auth_text.contains("legion-device:mismatch-phone"),
+            "{auth_text}"
+        );
 
         let node_file = h.node.config().get::<NodeFile>().unwrap();
         verify_gate_device(
@@ -4389,7 +4425,7 @@ allow = ["effect:read", "effect:write"]
 
     #[tokio::test]
     async fn paired_by_and_tombstone_quarantine_block_post_removal_descendants_until_owner_confirms()
-    {
+     {
         let h = Harness::new();
 
         // 1. Enrol creator device A (`device:dev-a`, owner role) from a local shell.

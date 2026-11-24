@@ -2116,12 +2116,27 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
     // Forwarding device.set, config.write (devices.toml / policy.toml), and fleet.sync push/pull
     // must also be refused by `laptop` when the caller arrived with an expiring credential.
     for (tool, args) in [
-        ("device.set", json!({"name": "phone", "role": "owner", "allow_owner": true})),
+        (
+            "device.set",
+            json!({"name": "phone", "role": "owner", "allow_owner": true}),
+        ),
         ("device.set", json!({"name": "phone", "rename": "phone2"})),
-        ("config.write", json!({"document": "devices.toml", "content": ""})),
-        ("config.write", json!({"document": "policy.toml", "content": POLICY})),
-        ("fleet.sync", json!({"direction": "push", "documents": ["devices.toml"]})),
-        ("fleet.sync", json!({"direction": "pull", "from": "laptop", "documents": ["devices.toml"]})),
+        (
+            "config.write",
+            json!({"document": "devices.toml", "content": ""}),
+        ),
+        (
+            "config.write",
+            json!({"document": "policy.toml", "content": POLICY}),
+        ),
+        (
+            "fleet.sync",
+            json!({"direction": "push", "documents": ["devices.toml"]}),
+        ),
+        (
+            "fleet.sync",
+            json!({"direction": "pull", "from": "laptop", "documents": ["devices.toml"]}),
+        ),
     ] {
         let reply = server.call(
             &expiring_admin,

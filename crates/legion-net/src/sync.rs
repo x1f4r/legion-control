@@ -2109,30 +2109,32 @@ async fn sync_devices_document(
                 scoped
             };
 
-            let filter_remote_tombstones =
-                |remote_removed: &BTreeMap<String, legion_tools::device::registry::DeviceTombstone>,
-                 local_now: &DevicesFile|
-                 -> DevicesFile {
-                    let removed = if caller_is_owner {
-                        remote_removed.clone()
-                    } else {
-                        remote_removed
-                            .iter()
-                            .filter(|(id, _)| {
-                                local_now
-                                    .devices
-                                    .get(*id)
-                                    .is_some_and(|prev| prev.principal == caller_principal)
-                            })
-                            .map(|(id, tomb)| (id.clone(), tomb.clone()))
-                            .collect()
-                    };
-                    DevicesFile {
-                        version: DEVICES_VERSION,
-                        devices: BTreeMap::new(),
-                        removed,
-                    }
+            let filter_remote_tombstones = |remote_removed: &BTreeMap<
+                String,
+                legion_tools::device::registry::DeviceTombstone,
+            >,
+                                            local_now: &DevicesFile|
+             -> DevicesFile {
+                let removed = if caller_is_owner {
+                    remote_removed.clone()
+                } else {
+                    remote_removed
+                        .iter()
+                        .filter(|(id, _)| {
+                            local_now
+                                .devices
+                                .get(*id)
+                                .is_some_and(|prev| prev.principal == caller_principal)
+                        })
+                        .map(|(id, tomb)| (id.clone(), tomb.clone()))
+                        .collect()
                 };
+                DevicesFile {
+                    version: DEVICES_VERSION,
+                    devices: BTreeMap::new(),
+                    removed,
+                }
+            };
 
             let remote_tombstones_only =
                 filter_remote_tombstones(&remote_devices.removed, &local_devices);
@@ -2195,14 +2197,14 @@ async fn sync_devices_document(
             }
 
             let mut current_local = local_devices.clone();
-            let mut current_local_hash = local
-                .hash
-                .clone()
-                .unwrap_or_else(|| hash_bytes(local_devices.to_toml_string().as_bytes()).to_string());
+            let mut current_local_hash = local.hash.clone().unwrap_or_else(|| {
+                hash_bytes(local_devices.to_toml_string().as_bytes()).to_string()
+            });
             let mut local_backup = None;
             let mut warnings = Vec::new();
             let mut final_remote_hash = remote.hash.clone();
-            let mut remote_has_extra_live = remote_after_push.devices.len() > current_local.devices.len()
+            let mut remote_has_extra_live = remote_after_push.devices.len()
+                > current_local.devices.len()
                 || remote_after_push
                     .devices
                     .iter()
@@ -2233,7 +2235,9 @@ async fn sync_devices_document(
                             Err(error) => {
                                 return error_outcome(ErrorBody::new(
                                     ErrorCode::Failed,
-                                    format!("Remote config.write returned an unexpected shape: {error}."),
+                                    format!(
+                                        "Remote config.write returned an unexpected shape: {error}."
+                                    ),
                                 ));
                             }
                         };
@@ -2254,8 +2258,10 @@ async fn sync_devices_document(
                                 .await
                             && let Ok(again) = serde_json::from_value::<ConfigReadResult>(again_val)
                             && let Some(again_content) = again.content
-                            && let Ok(again_devices) =
-                                parse::<DevicesFile>(Path::new("devices.toml"), again_content.as_bytes())
+                            && let Ok(again_devices) = parse::<DevicesFile>(
+                                Path::new("devices.toml"),
+                                again_content.as_bytes(),
+                            )
                         {
                             let extra_tombs =
                                 filter_remote_tombstones(&again_devices.removed, &current_local);
@@ -2289,7 +2295,8 @@ async fn sync_devices_document(
                                     EventSink::discard(),
                                 )
                                 .await
-                                && let Ok(written) = serde_json::from_value::<ConfigWriteResult>(val)
+                                && let Ok(written) =
+                                    serde_json::from_value::<ConfigWriteResult>(val)
                             {
                                 let paths = ctx.paths().clone();
                                 let peer_name = machine.to_owned();
@@ -3438,7 +3445,9 @@ device = \"11111111111111111111111111111111\"
             json!({"document": "devices.toml", "content": revoke.to_toml_string()}),
         );
         tomb_call.credential_expires = expires;
-        node.call(tomb_call).await.expect("tombstone should be allowed with expiring credential");
+        node.call(tomb_call)
+            .await
+            .expect("tombstone should be allowed with expiring credential");
 
         let saved: DevicesFile = parse(
             &paths.config_file("devices.toml"),
@@ -3531,7 +3540,11 @@ role = \"phone_admin\"
         );
         hijack_call.pinned = Some("tablet".to_owned());
         let err = node.call(hijack_call).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::Denied, "hijack must be denied: {err:?}");
+        assert_eq!(
+            err.code,
+            ErrorCode::Denied,
+            "hijack must be denied: {err:?}"
+        );
 
         // 2. Non-owner admin (`tablet`) cannot plant a tombstone for an id that is not live locally.
         let mut phantom_tomb = DevicesFile::default();
@@ -3710,7 +3723,9 @@ role = \"phone_admin\"
     async fn config_read_devices_does_not_expose_unsaved_adopted_list_and_size_limit_has_way_out() {
         use legion_core::{Call, Door, Node, Paths};
         use legion_tools::device::authkeys::{ForcedCommandShell, PinnedHome, format_device_line};
-        use legion_tools::device::keys::{ed25519_public_key_from_seed, validate_ed25519_public_key};
+        use legion_tools::device::keys::{
+            ed25519_public_key_from_seed, validate_ed25519_public_key,
+        };
         use legion_tools::device::store::{DeviceRecord, DevicesState, save_state};
 
         let dir = tempfile::tempdir().unwrap();

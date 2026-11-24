@@ -889,13 +889,9 @@ mod tests {
         let sess_dir = sessions_dir(&paths);
 
         let recorded_path = {
-            let guard = DeviceSessionGuard::register(
-                &paths,
-                "pixel",
-                Some(&"aa".repeat(16)),
-                "phone",
-            )
-            .unwrap();
+            let guard =
+                DeviceSessionGuard::register(&paths, "pixel", Some(&"aa".repeat(16)), "phone")
+                    .unwrap();
             let dir_mode = std::fs::metadata(&sess_dir).unwrap().permissions().mode() & 0o777;
             let file_mode = std::fs::metadata(guard.path())
                 .unwrap()

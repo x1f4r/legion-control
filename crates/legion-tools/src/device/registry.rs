@@ -378,7 +378,9 @@ pub fn next_updated_timestamp_at(
             let prev = raw.parse::<Timestamp>().map_err(|error| {
                 ErrorBody::new(
                     ErrorCode::Failed,
-                    format!("Existing device timestamp {raw:?} is not valid RFC 3339 UTC: {error}."),
+                    format!(
+                        "Existing device timestamp {raw:?} is not valid RFC 3339 UTC: {error}."
+                    ),
                 )
             })?;
             if now <= prev {
@@ -403,7 +405,10 @@ pub fn next_updated_timestamp_at(
 
 /// Rejects any incoming `devices.toml` entry whose `paired_at`, `updated_at`, or `removed_at`
 /// lies further in the future than `now + MAX_FUTURE_SKEW`.
-pub fn validate_incoming_timestamps(devices: &DevicesFile, now: Timestamp) -> Result<(), ErrorBody> {
+pub fn validate_incoming_timestamps(
+    devices: &DevicesFile,
+    now: Timestamp,
+) -> Result<(), ErrorBody> {
     let limit = now.checked_add(MAX_FUTURE_SKEW).unwrap_or(Timestamp::MAX);
     let check = |section: &str, id: &str, field: &str, raw: &str| -> Result<(), ErrorBody> {
         let parsed = raw.parse::<Timestamp>().map_err(|error| {
@@ -521,7 +526,8 @@ pub fn quarantined_devices(devices: &DevicesFile) -> BTreeMap<String, String> {
             if entry.confirmed_by.is_some() || quarantined.contains_key(id) {
                 continue;
             }
-            let Some(creator_id) = entry.paired_by.as_ref().and_then(|p| p.device.as_deref()) else {
+            let Some(creator_id) = entry.paired_by.as_ref().and_then(|p| p.device.as_deref())
+            else {
                 continue;
             };
             if quarantined.contains_key(creator_id) {
@@ -1434,7 +1440,10 @@ pub fn reconcile_authorized_keys_in_memory(
     for (id, entry) in &devices.devices {
         let validated = validate_ed25519_public_key(&entry.public_key)?;
         let blob = validated.wire_blob.to_vec();
-        ids_by_blob.entry(blob.clone()).or_default().push(id.as_str());
+        ids_by_blob
+            .entry(blob.clone())
+            .or_default()
+            .push(id.as_str());
         validated_keys.insert(id.as_str(), (validated.canonical, blob));
     }
 
@@ -2050,17 +2059,20 @@ pub fn apply_devices_merge_blocking(
         }
     };
     check_precondition(bytes_before.as_deref()).map_err(MergeApplyError::BeforeSave)?;
-    validate_incoming_timestamps(incoming, Timestamp::now()).map_err(MergeApplyError::BeforeSave)?;
+    validate_incoming_timestamps(incoming, Timestamp::now())
+        .map_err(MergeApplyError::BeforeSave)?;
 
     let had_existing_file = bytes_before.is_some();
     let local = match bytes_before.as_deref() {
-        Some(bytes) => parse::<DevicesFile>(&devices_path, bytes).map_err(MergeApplyError::BeforeSave)?,
+        Some(bytes) => {
+            parse::<DevicesFile>(&devices_path, bytes).map_err(MergeApplyError::BeforeSave)?
+        }
         None => {
             let target = resolve_target(paths, node_file).map_err(MergeApplyError::BeforeSave)?;
             let caller_account =
                 caller_account_for_target(&target).map_err(MergeApplyError::BeforeSave)?;
-            let write_path =
-                resolve_safe_write_path(&target, paths.home()).map_err(MergeApplyError::BeforeSave)?;
+            let write_path = resolve_safe_write_path(&target, paths.home())
+                .map_err(MergeApplyError::BeforeSave)?;
             let auth_keys = if write_path.is_file() {
                 read_auth_keys(&write_path).map_err(MergeApplyError::BeforeSave)?
             } else {
@@ -2813,7 +2825,10 @@ mod tests {
             var_file.removed.insert(id.clone(), variant.clone());
             let ab = merge_devices(&tomb_base_file, &var_file);
             let ba = merge_devices(&var_file, &tomb_base_file);
-            assert_eq!(ab, ba, "tombstone tie-break must be commutative for {variant:?}");
+            assert_eq!(
+                ab, ba,
+                "tombstone tie-break must be commutative for {variant:?}"
+            );
         }
     }
 
@@ -3084,7 +3099,9 @@ role = "editor"
         let foreign_line = format!("{} me@laptop", sample_key(99));
         let legacy_id = sample_id(7);
         let legacy_key = sample_key(7);
-        let legacy_fp = validate_ed25519_public_key(&legacy_key).unwrap().fingerprint;
+        let legacy_fp = validate_ed25519_public_key(&legacy_key)
+            .unwrap()
+            .fingerprint;
         let legacy_line = format_device_line(
             &exe,
             "phone",
@@ -3343,7 +3360,10 @@ role = \"observer\"
 
         let updated = std::fs::read_to_string(&auth_keys).unwrap();
         assert!(updated.contains(&k2), "expected K2 on disk:\n{updated}");
-        assert!(!updated.contains(&k1), "expected K1 removed from disk:\n{updated}");
+        assert!(
+            !updated.contains(&k1),
+            "expected K1 removed from disk:\n{updated}"
+        );
 
         // Once disk matches K2, a subsequent gate check succeeds.
         verify_gate_device(
@@ -3423,7 +3443,11 @@ role = \"observer\"
         // No `fleet.sync` registered AND no recorded creator -> must report EVERY fleet peer as
         // `not_reached` with a reason, never an empty map `{}`.
         let outcomes = push_devices_to_fleet(&node, None, None).await;
-        assert_eq!(outcomes.len(), 2, "expected both peers reported: {outcomes:?}");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "expected both peers reported: {outcomes:?}"
+        );
         for peer in ["pi", "nas"] {
             let entry = outcomes.get(peer).expect("peer must be present");
             assert_eq!(entry.status, "not_reached", "{peer}: {entry:?}");

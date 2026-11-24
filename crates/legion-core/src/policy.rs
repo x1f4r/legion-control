@@ -4455,10 +4455,7 @@ role = "observer"
 device = "not-a-hex-id"
 "#,
         );
-        assert!(
-            bad_hex.is_err(),
-            "non-hex device marker must be rejected"
-        );
+        assert!(bad_hex.is_err(), "non-hex device marker must be rejected");
 
         let duplicate_owner = parse::<Policy>(
             Path::new("policy.toml"),

@@ -3245,7 +3245,11 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
         json!({}),
         None,
     );
-    assert_eq!(rogue_now_on_a["result"]["node"], json!("a"), "{rogue_now_on_a}");
+    assert_eq!(
+        rogue_now_on_a["result"]["node"],
+        json!("a"),
+        "{rogue_now_on_a}"
+    );
     assert_eq!(rogue_now_on_a["result"]["principal"], json!("owner"));
 }
 
@@ -3378,9 +3382,11 @@ role = \"phone_admin\"
     node_b.write_config("devices.toml", &devices_b.to_toml_string());
     assert_eq!(node_a.run(&["device.list"]).code, 0);
     assert_eq!(node_b.run(&["device.list"]).code, 0);
-    assert!(std::fs::read_to_string(&auth_b)
-        .unwrap()
-        .contains("legion-device:tablet-dev"));
+    assert!(
+        std::fs::read_to_string(&auth_b)
+            .unwrap()
+            .contains("legion-device:tablet-dev")
+    );
 
     // Non-owner `tablet` removes its own device on A: its tombstone MUST push cleanly to B
     // despite A's unrelated `owner` device and B's unrelated `owner` tombstone!
@@ -3388,7 +3394,11 @@ role = \"phone_admin\"
     assert_eq!(rm.code, 0, "tablet remove failed: {}", rm.stderr);
     let rm_json = rm.json();
     assert_eq!(rm_json["removed"], json!(true), "{rm_json}");
-    assert_eq!(rm_json["fleet"]["b"]["status"], json!("synced"), "{rm_json}");
+    assert_eq!(
+        rm_json["fleet"]["b"]["status"],
+        json!("synced"),
+        "{rm_json}"
+    );
     assert!(rm_json.get("still_trusted_by").is_none(), "{rm_json}");
 
     // Verify B tombstoned `tablet-dev`, removed its authorized_keys line, and did NOT import A's
@@ -3486,7 +3496,12 @@ fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
 
     // Update devices.toml to record K2 for the same pairing id while leaving stale K1 in
     // authorized_keys (simulating a stale authorized_keys file before reconciliation).
-    let devices_path = home.state().parent().unwrap().join("config").join("devices.toml");
+    let devices_path = home
+        .state()
+        .parent()
+        .unwrap()
+        .join("config")
+        .join("devices.toml");
     let mut devices: DevicesFile =
         legion_core::config::parse(&devices_path, &std::fs::read(&devices_path).unwrap()).unwrap();
     let entry = devices.devices.values_mut().next().unwrap();
@@ -3555,6 +3570,10 @@ fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
     assert!(k2_out.status.success(), "{k2_out:?}");
     let k2_stdout = String::from_utf8_lossy(&k2_out.stdout);
     let reply: Value = serde_json::from_str(k2_stdout.trim()).unwrap();
-    assert_eq!(reply["result"]["principal"], json!("device:pixel"), "{reply}");
+    assert_eq!(
+        reply["result"]["principal"],
+        json!("device:pixel"),
+        "{reply}"
+    );
     assert_eq!(reply["result"]["door"], json!("ssh"), "{reply}");
 }

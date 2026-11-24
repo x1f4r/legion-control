@@ -118,7 +118,8 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check);
     }
 
-    let unsynced = crate::device::registry::unsynced_fleet_peers_summary(ctx.paths(), ctx.node_name());
+    let unsynced =
+        crate::device::registry::unsynced_fleet_peers_summary(ctx.paths(), ctx.node_name());
     if let Some(check) = check_unsynced_fleet_devices(&unsynced) {
         checks.push(check);
     }
@@ -1376,9 +1377,9 @@ deny = [\"effect:power\", \"effect:admin\"]
         assert!(!warn.detail.contains("offline"), "{}", warn.detail);
         assert!(!warn.detail.contains("pi"), "{}", warn.detail);
         assert!(
-            warn.hint
-                .as_deref()
-                .is_some_and(|h| h.contains("direction=push") && h.contains("direction=pull from=tower")),
+            warn.hint.as_deref().is_some_and(
+                |h| h.contains("direction=push") && h.contains("direction=pull from=tower")
+            ),
             "{:?}",
             warn.hint
         );

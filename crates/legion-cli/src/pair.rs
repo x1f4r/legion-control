@@ -674,17 +674,23 @@ deny = ["effect:power", "effect:admin"]
         // Blank role is refused (nothing preset).
         let mut out = Vec::new();
         let mut blank_role = Cursor::new(b"tablet\n\n".to_vec());
-        let err =
-            prompt_pair_choices(&policy, &specs, None, None, false, &mut blank_role, &mut out)
-                .unwrap_err();
+        let err = prompt_pair_choices(
+            &policy,
+            &specs,
+            None,
+            None,
+            false,
+            &mut blank_role,
+            &mut out,
+        )
+        .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
 
         // Picking `owner` interactively requires explicit confirmation.
         let mut out = Vec::new();
         let mut decline = Cursor::new(b"laptop\nowner\nn\n".to_vec());
-        let err =
-            prompt_pair_choices(&policy, &specs, None, None, false, &mut decline, &mut out)
-                .unwrap_err();
+        let err = prompt_pair_choices(&policy, &specs, None, None, false, &mut decline, &mut out)
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::Cancelled);
 
         let mut out = Vec::new();

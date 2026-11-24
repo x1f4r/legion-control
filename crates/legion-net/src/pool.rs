@@ -509,29 +509,29 @@ impl Fleet {
         let result =
             match check_credential_minting_forward(&here, &tool, &args, call.credential_expires)
                 .and_then(|()| {
-                node.config()
-                    .get::<FleetFile>()
-                    .map_err(|err| ensure_machine(err, &here))
-            })
-            .and_then(|fleet_file| {
-                let (direct_machine, direct_entry, relayed) =
-                    resolve_route(&fleet_file, machine, &here)?;
-                Ok((direct_machine.to_owned(), direct_entry.clone(), relayed))
-            }) {
-            Ok((direct_machine, direct_entry, relayed)) => {
-                self.forward_authorized(
-                    node,
-                    machine,
-                    &direct_machine,
-                    &direct_entry,
-                    relayed,
-                    call,
-                    auth,
-                )
-                .await
-            }
-            Err(err) => Err(err),
-        };
+                    node.config()
+                        .get::<FleetFile>()
+                        .map_err(|err| ensure_machine(err, &here))
+                })
+                .and_then(|fleet_file| {
+                    let (direct_machine, direct_entry, relayed) =
+                        resolve_route(&fleet_file, machine, &here)?;
+                    Ok((direct_machine.to_owned(), direct_entry.clone(), relayed))
+                }) {
+                Ok((direct_machine, direct_entry, relayed)) => {
+                    self.forward_authorized(
+                        node,
+                        machine,
+                        &direct_machine,
+                        &direct_entry,
+                        relayed,
+                        call,
+                        auth,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
         node.record_audit_with_device(
             machine.to_owned(),
             Some(principal),
