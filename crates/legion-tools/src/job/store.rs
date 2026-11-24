@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::RandomState;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,12 +18,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic};
-use legion_os::detach::DetachHandle;
+use legion_os::detach::{DetachHandle, detached_active};
 use legion_os::lock::FileLock;
 use legion_os::procid;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use super::platform;
 
 /// Subdirectory of `<state dir>` holding one directory per job.
 pub(super) const JOBS_DIR: &str = "jobs";
@@ -35,12 +37,27 @@ pub(super) const JOB_FILE: &str = "job.json";
 pub(super) const ENV_FILE: &str = "env.json";
 /// Exit record written atomically when the command finishes or is forcefully stopped.
 pub(super) const EXIT_FILE: &str = "exit.json";
+/// Placeholder file allocated by the supervisor on startup and removed immediately before
+/// `exit.json` is written so a full disk cannot lose a finished job's exit code.
+pub(super) const EXIT_RESERVE_FILE: &str = "exit.reserve";
+/// Size of [`EXIT_RESERVE_FILE`] in bytes (16 KiB, comfortably above any `exit.json`).
+pub(super) const EXIT_RESERVE_BYTES: usize = 16 * 1024;
 /// Combined stdout and stderr output appended as chunks arrive.
 pub(super) const LOG_FILE: &str = "output.log";
+/// Single rotated segment holding the previous [`MAX_LOG_FILE_BYTES`] chunk of output.
+pub(super) const LOG_ROTATED_FILE: &str = "output.log.1";
+/// Rotation metadata recording how many earliest log bytes were dropped.
+pub(super) const LOG_META_FILE: &str = "output.meta";
+/// Maximum size of a single `output.log` segment before rotating once to `output.log.1` (256 MiB).
+/// At most twice this cap is kept on disk across `output.log.1` and `output.log`.
+pub(super) const MAX_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Kernel lock file held exclusively by the supervisor for its whole life.
 pub(super) const LOCK_FILE: &str = "lock";
 /// Cancel request marker file polled by the supervisor.
 pub(super) const CANCEL_FILE: &str = "cancel";
+/// Prefix used for atomic tombstone renames when pruning expired or excess job directories.
+/// Leading `.` cannot occur in any validated job id.
+const TOMBSTONE_PREFIX: &str = ".deleting-";
 
 /// Maximum number of finished jobs retained when starting a new job.
 pub(super) const RETENTION_MAX_FINISHED: usize = 200;
@@ -139,14 +156,20 @@ pub(super) struct ExitRecord {
     pub finished: String,
     #[serde(default)]
     pub forced: bool,
+    /// `true` when `job.start` failed before the detached supervisor ever acquired `lock`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub startup_failed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
-/// Status derived on read from `job.json`, `exit.json`, `lock`, and `output.log`.
+/// Status derived on read from `job.json`, `exit.json`, `lock`, `detached_active`, and
+/// `output.log`.
 #[derive(Clone, Debug)]
 pub(super) struct DerivedStatus {
     pub state: JobState,
+    pub supervised: Option<bool>,
+    pub startup_failed: bool,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
     pub finished: Option<String>,
@@ -367,7 +390,11 @@ pub(super) fn write_job_record(dir: &Path, record: &JobRecord) -> Result<(), Err
     })
 }
 
-/// Atomically writes `<job_dir>/env.json` with owner-only permissions.
+/// Atomically writes `<job_dir>/env.json` with owner-only permissions on Unix (`0o600`).
+///
+/// On Windows the file has no access control list of its own beyond what its parent directory
+/// inherits; the supervisor deletes `env.json` immediately after reading it so secret values sit
+/// on disk only for milliseconds rather than for the job's retention period.
 pub(super) fn write_env_file(dir: &Path, env: &BTreeMap<String, String>) -> Result<(), ErrorBody> {
     let path = dir.join(ENV_FILE);
     let bytes = serde_json::to_vec(env).map_err(|err| {
@@ -384,8 +411,84 @@ pub(super) fn write_env_file(dir: &Path, env: &BTreeMap<String, String>) -> Resu
     })
 }
 
+/// Removes `<job_dir>/env.json` once the supervisor has loaded it (or when startup fails).
+pub(super) fn remove_env_file(dir: &Path) {
+    let _ = fs::remove_file(dir.join(ENV_FILE));
+}
+
+/// Metadata written atomically to `<job_dir>/output.meta` when log rotation discards earlier
+/// output beyond `output.log.1`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LogMeta {
+    #[serde(default)]
+    pub dropped_bytes: u64,
+}
+
+/// Reads `<job_dir>/output.meta`, defaulting to zero dropped bytes when absent.
+pub(super) fn read_log_meta(dir: &Path) -> LogMeta {
+    fs::read(dir.join(LOG_META_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Atomically updates `<job_dir>/output.meta` with the total number of dropped log bytes.
+pub(super) fn write_log_meta(dir: &Path, dropped_bytes: u64) -> Result<(), ErrorBody> {
+    let path = dir.join(LOG_META_FILE);
+    let meta = LogMeta { dropped_bytes };
+    let bytes = serde_json::to_vec(&meta).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Cannot serialize job log metadata: {err}."),
+        )
+    })?;
+    write_atomic(&path, &bytes, WriteOptions::with_mode(0o600)).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot write log metadata {}: {err}.", path.display()),
+        )
+    })
+}
+
+/// Allocates real incompressible disk blocks in `<job_dir>/exit.reserve` so removing it right
+/// before writing `exit.json` guarantees space even if the job fills the filesystem.
+pub(super) fn create_exit_reserve(dir: &Path) -> io::Result<()> {
+    let path = dir.join(EXIT_RESERVE_FILE);
+    let mut file = platform::create_private_file(&path)?;
+    // Fill with deterministic incompressible bytes (blake3 XOF) so compressing filesystems such as
+    // btrfs or ZFS still allocate real physical blocks.
+    let mut buf = [0u8; EXIT_RESERVE_BYTES];
+    blake3::Hasher::new()
+        .update(b"legion-job-exit-reserve")
+        .finalize_xof()
+        .fill(&mut buf);
+    file.write_all(&buf)?;
+    file.sync_all()
+}
+
+/// Removes `<job_dir>/exit.reserve` to release reserved disk space right before writing
+/// `exit.json` (or on early supervisor exit).
+pub(super) fn remove_exit_reserve(dir: &Path) {
+    let _ = fs::remove_file(dir.join(EXIT_RESERVE_FILE));
+}
+
+/// Total bytes currently stored across `output.log.1` and `output.log`.
+pub(super) fn total_log_bytes(dir: &Path) -> u64 {
+    let active = fs::metadata(dir.join(LOG_FILE))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let rotated = fs::metadata(dir.join(LOG_ROTATED_FILE))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    active.saturating_add(rotated)
+}
+
 /// Atomically writes `<job_dir>/exit.json` with owner-only permissions.
+///
+/// Always removes `<job_dir>/exit.reserve` immediately beforehand so reserved disk blocks are
+/// freed for the exit record when the filesystem is full.
 pub(super) fn write_exit_record(dir: &Path, exit: &ExitRecord) -> Result<(), ErrorBody> {
+    remove_exit_reserve(dir);
     let path = dir.join(EXIT_FILE);
     let bytes = serde_json::to_vec_pretty(exit).map_err(|err| {
         ErrorBody::new(
@@ -433,41 +536,139 @@ pub(super) fn probe_lock(dir: &Path) -> (bool, bool) {
     }
 }
 
-/// Derives a job's live state purely from disk state and kernel locks without writing anything.
+/// Intermediate result of synchronous local file/lock inspection before an optional
+/// `detached_active` check.
+enum LocalInspect {
+    Ready(DerivedStatus),
+    NeedsTreeCheck {
+        handle: DetachHandle,
+        lock_exists: bool,
+        age_ms: i64,
+        created_ts: Option<jiff::Timestamp>,
+        output_bytes: u64,
+    },
+}
+
+/// Checks `legion_os::detach::detached_active` from synchronous code without panicking when
+/// invoked inside a Tokio runtime worker thread.
+pub(super) fn detached_active_sync(handle: &DetachHandle) -> bool {
+    let handle = handle.clone();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return false;
+                };
+                rt.block_on(detached_active(&handle)).unwrap_or(false)
+            })
+            .join()
+            .unwrap_or(false)
+    })
+}
+
+/// Derives a job's live state purely from disk state, kernel locks, and `detached_active` without
+/// writing anything (async path for tool handlers).
+pub(super) async fn derive_status_async(
+    dir: &Path,
+    record: &JobRecord,
+    current_boot_id: Option<&str>,
+    now: jiff::Timestamp,
+) -> DerivedStatus {
+    match inspect_local(dir, record, current_boot_id, now) {
+        LocalInspect::Ready(status) => status,
+        LocalInspect::NeedsTreeCheck {
+            handle,
+            lock_exists,
+            age_ms,
+            created_ts,
+            output_bytes,
+        } => {
+            let active = detached_active(&handle).await.unwrap_or(false);
+            finish_same_boot_unlocked(
+                dir,
+                record,
+                &handle,
+                lock_exists,
+                age_ms,
+                created_ts,
+                output_bytes,
+                active,
+                now,
+            )
+        }
+    }
+}
+
+/// Derives a job's live state purely from disk state, kernel locks, and `detached_active` without
+/// writing anything (sync path for `exclusive_running_jobs`, retention, and unit tests).
 pub(super) fn derive_status(
     dir: &Path,
     record: &JobRecord,
     current_boot_id: Option<&str>,
     now: jiff::Timestamp,
 ) -> DerivedStatus {
-    let output_bytes = fs::metadata(dir.join(LOG_FILE))
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+    match inspect_local(dir, record, current_boot_id, now) {
+        LocalInspect::Ready(status) => status,
+        LocalInspect::NeedsTreeCheck {
+            handle,
+            lock_exists,
+            age_ms,
+            created_ts,
+            output_bytes,
+        } => {
+            let active = detached_active_sync(&handle);
+            finish_same_boot_unlocked(
+                dir,
+                record,
+                &handle,
+                lock_exists,
+                age_ms,
+                created_ts,
+                output_bytes,
+                active,
+                now,
+            )
+        }
+    }
+}
+
+fn inspect_local(
+    dir: &Path,
+    record: &JobRecord,
+    current_boot_id: Option<&str>,
+    now: jiff::Timestamp,
+) -> LocalInspect {
+    let output_bytes = total_log_bytes(dir);
     let created_ts = parse_timestamp(&record.created);
 
     if let Some(exit) = read_exit_record(dir) {
-        return derived_from_exit(exit, created_ts, output_bytes);
+        return LocalInspect::Ready(derived_from_exit(exit, created_ts, output_bytes));
     }
 
     let (lock_exists, lock_held) = probe_lock(dir);
     if lock_held {
         let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
-        return DerivedStatus {
+        return LocalInspect::Ready(DerivedStatus {
             state: JobState::Running,
+            supervised: Some(true),
+            startup_failed: false,
             exit_code: None,
             signal: None,
             finished: None,
             duration_s,
             output_bytes,
             detail: None,
-        };
+        });
     }
 
     // The supervisor writes `exit.json` before releasing `lock`. Re-checking after seeing the lock
     // free closes the window where a job finished cleanly between our first check and the lock
     // probe.
     if let Some(exit) = read_exit_record(dir) {
-        return derived_from_exit(exit, created_ts, output_bytes);
+        return LocalInspect::Ready(derived_from_exit(exit, created_ts, output_bytes));
     }
 
     let same_boot = current_boot_id.is_none_or(|cur| procid::same_boot(&record.boot_id, cur));
@@ -478,28 +679,114 @@ pub(super) fn derive_status(
         })
         .unwrap_or(STARTING_GRACE_MS);
 
-    if same_boot && age_ms < STARTING_GRACE_MS {
-        let supervisor_alive = record
-            .detach
-            .as_ref()
-            .is_none_or(|handle| procid::is_alive(&handle.process));
-        if supervisor_alive {
-            let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
-            return DerivedStatus {
-                state: JobState::Starting,
-                exit_code: None,
-                signal: None,
-                finished: None,
-                duration_s,
-                output_bytes,
-                detail: None,
-            };
-        }
+    if !same_boot {
+        let detail = interrupted_detail(dir, record, false, lock_exists, created_ts, now);
+        return LocalInspect::Ready(DerivedStatus {
+            state: JobState::Interrupted,
+            supervised: None,
+            startup_failed: false,
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s: None,
+            output_bytes,
+            detail: Some(detail),
+        });
     }
 
-    let detail = interrupted_detail(dir, record, same_boot, lock_exists, created_ts, now);
+    if let Some(handle) = record.detach.clone() {
+        return LocalInspect::NeedsTreeCheck {
+            handle,
+            lock_exists,
+            age_ms,
+            created_ts,
+            output_bytes,
+        };
+    }
+
+    if age_ms < STARTING_GRACE_MS {
+        let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
+        return LocalInspect::Ready(DerivedStatus {
+            state: JobState::Starting,
+            supervised: Some(true),
+            startup_failed: false,
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s,
+            output_bytes,
+            detail: None,
+        });
+    }
+
+    let detail = interrupted_detail(dir, record, true, lock_exists, created_ts, now);
+    LocalInspect::Ready(DerivedStatus {
+        state: JobState::Interrupted,
+        supervised: None,
+        startup_failed: false,
+        exit_code: None,
+        signal: None,
+        finished: None,
+        duration_s: None,
+        output_bytes,
+        detail: Some(detail),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_same_boot_unlocked(
+    dir: &Path,
+    record: &JobRecord,
+    handle: &DetachHandle,
+    lock_exists: bool,
+    age_ms: i64,
+    created_ts: Option<jiff::Timestamp>,
+    output_bytes: u64,
+    tree_active: bool,
+    now: jiff::Timestamp,
+) -> DerivedStatus {
+    // Before the supervisor has created `lock`, a live root within the startup grace window is
+    // still starting normally.
+    if !lock_exists && age_ms < STARTING_GRACE_MS && procid::is_alive(&handle.process) {
+        let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
+        return DerivedStatus {
+            state: JobState::Starting,
+            supervised: Some(true),
+            startup_failed: false,
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s,
+            output_bytes,
+            detail: None,
+        };
+    }
+
+    // With no exit record and the lock free, if anything started under the detach handle is still
+    // active on the same boot, the job is still running without its supervisor.
+    if tree_active {
+        let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
+        return DerivedStatus {
+            state: JobState::Running,
+            supervised: Some(false),
+            startup_failed: false,
+            exit_code: None,
+            signal: None,
+            finished: None,
+            duration_s,
+            output_bytes,
+            detail: Some(
+                "The job supervisor is gone, so output is no longer captured; the command is still running and `job.cancel` will stop it."
+                    .to_owned(),
+            ),
+        };
+    }
+
+    let detail = interrupted_detail(dir, record, true, lock_exists, created_ts, now);
     DerivedStatus {
         state: JobState::Interrupted,
+        supervised: None,
+        startup_failed: false,
         exit_code: None,
         signal: None,
         finished: None,
@@ -519,6 +806,8 @@ fn derived_from_exit(
         .map(|(started, finished)| elapsed_seconds(started, finished));
     DerivedStatus {
         state: JobState::from(exit.outcome),
+        supervised: None,
+        startup_failed: exit.startup_failed,
         exit_code: exit.exit_code,
         signal: exit.signal,
         finished: Some(exit.finished),
@@ -568,11 +857,17 @@ fn interrupted_runtime_phrase(
         return "an unknown duration".to_owned();
     };
     let since_created = elapsed_seconds(created, now);
-    let last_log = fs::metadata(dir.join(LOG_FILE))
-        .ok()
-        .and_then(|meta| (meta.len() > 0).then(|| meta.modified().ok()).flatten())
-        .and_then(|mtime| jiff::Timestamp::try_from(mtime).ok())
-        .filter(|&mtime| mtime >= created);
+    let last_log = [LOG_FILE, LOG_ROTATED_FILE]
+        .into_iter()
+        .filter_map(|name| {
+            let meta = fs::metadata(dir.join(name)).ok()?;
+            (meta.len() > 0)
+                .then(|| meta.modified().ok())
+                .flatten()
+                .and_then(|mtime| jiff::Timestamp::try_from(mtime).ok())
+        })
+        .filter(|&mtime| mtime >= created)
+        .max();
 
     match last_log {
         Some(last_write) => {
@@ -631,6 +926,13 @@ pub(super) fn load_all_records(state_dir: &Path) -> Result<Vec<(PathBuf, JobReco
     let mut records = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else { continue };
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(TOMBSTONE_PREFIX))
+        {
+            continue;
+        }
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -646,17 +948,41 @@ pub(super) fn load_all_records(state_dir: &Path) -> Result<Vec<(PathBuf, JobReco
     Ok(records)
 }
 
-/// Finds the newest job with matching `key` under `state_dir`.
+/// Finds the newest matching job with `key` under `state_dir`.
+///
+/// A key matches a job that is active (`starting` or `running`) or that ran (its supervisor took
+/// `lock` and finished as `succeeded`, `failed`, `cancelled`, or was interrupted mid-run). A job
+/// whose start failed before the supervisor ever acquired `lock` does not match and is skipped so
+/// retries can replace it.
 pub(super) fn find_by_key(
     state_dir: &Path,
     key: &str,
-) -> Result<Option<(PathBuf, JobRecord)>, ErrorBody> {
+    current_boot_id: Option<&str>,
+    now: jiff::Timestamp,
+) -> Result<Option<(PathBuf, JobRecord, DerivedStatus)>, ErrorBody> {
     let mut matches: Vec<(PathBuf, JobRecord)> = load_all_records(state_dir)?
         .into_iter()
         .filter(|(_, record)| record.key.as_deref() == Some(key))
         .collect();
     matches.sort_by(|(_, a), (_, b)| compare_newest_first(a, b));
-    Ok(matches.into_iter().next())
+    for (dir, record) in matches {
+        let derived = derive_status(&dir, &record, current_boot_id, now);
+        if key_matches_job(&dir, &derived) {
+            return Ok(Some((dir, record, derived)));
+        }
+    }
+    Ok(None)
+}
+
+fn key_matches_job(dir: &Path, derived: &DerivedStatus) -> bool {
+    if derived.state.is_active() {
+        return true;
+    }
+    if derived.state == JobState::Interrupted {
+        // Matches only if the supervisor ever got far enough to create and take `lock`.
+        return probe_lock(dir).0;
+    }
+    !derived.startup_failed
 }
 
 /// Ordering comparator sorting newer jobs first, breaking ties by id descending.
@@ -668,9 +994,14 @@ pub(super) fn compare_newest_first(a: &JobRecord, b: &JobRecord) -> std::cmp::Or
 
 /// Removes finished jobs beyond [`RETENTION_MAX_FINISHED`] or finished more than 30 days ago.
 ///
-/// Running and starting jobs are never removed. Called under the node-wide jobs lock on
-/// `job.start`.
+/// Running and starting jobs are never removed. Each pruned directory is first renamed atomically
+/// to a `.deleting-*` tombstone before removal so a concurrent reader (especially on Windows)
+/// never leaves a half-deleted directory without `job.json`; leftover tombstones are swept on
+/// every pass. Called under the node-wide jobs lock on `job.start`.
 pub(super) fn prune_retention(state_dir: &Path, now: jiff::Timestamp) {
+    let root = jobs_dir(state_dir);
+    sweep_tombstones(&root);
+
     let Ok(records) = load_all_records(state_dir) else {
         return;
     };
@@ -696,15 +1027,39 @@ pub(super) fn prune_retention(state_dir: &Path, now: jiff::Timestamp) {
     terminal.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     let now_ms = now.as_millisecond();
 
-    for (index, (stamp_ms, _id, dir)) in terminal.into_iter().enumerate() {
+    for (index, (stamp_ms, id, dir)) in terminal.into_iter().enumerate() {
         let too_many = index >= RETENTION_MAX_FINISHED;
         let too_old = now_ms.saturating_sub(stamp_ms) > RETENTION_MAX_AGE_MS;
         if too_many || too_old {
-            // Double-check the supervisor lock is not held before deleting the directory.
+            // Double-check the supervisor lock is not held before renaming the directory.
             if !probe_lock(&dir).1 {
-                let _ = fs::remove_dir_all(&dir);
+                remove_job_dir_with_tombstone(&root, &dir, &id);
             }
         }
+    }
+}
+
+fn sweep_tombstones(jobs_root: &Path) {
+    let Ok(entries) = fs::read_dir(jobs_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(TOMBSTONE_PREFIX))
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn remove_job_dir_with_tombstone(jobs_root: &Path, dir: &Path, id: &str) {
+    let tombstone = jobs_root.join(format!("{TOMBSTONE_PREFIX}{id}-{}", generate_job_id()));
+    // If renaming fails (for example a Windows reader holds a file open inside `dir`), leave the
+    // directory intact so `job.json` stays valid until the next retention pass retries.
+    if fs::rename(dir, &tombstone).is_ok() {
+        let _ = fs::remove_dir_all(&tombstone);
     }
 }
 
@@ -846,5 +1201,24 @@ mod tests {
         let summary = command_summary(&rec);
         assert_eq!(summary.chars().count(), 201);
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn tombstones_are_ignored_on_read_and_swept_on_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        let root = jobs_dir(state_dir);
+        let stale = root.join(format!("{TOMBSTONE_PREFIX}leftover"));
+        fs::create_dir_all(&stale).unwrap();
+        write_job_record(
+            &stale,
+            &sample_record("leftover", "2026-01-01T00:00:00.000Z", "b"),
+        )
+        .unwrap();
+        fs::write(stale.join(LOG_FILE), b"partial").unwrap();
+
+        assert!(load_all_records(state_dir).unwrap().is_empty());
+        prune_retention(state_dir, jiff::Timestamp::now());
+        assert!(!stale.exists());
     }
 }

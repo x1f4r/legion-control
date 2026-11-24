@@ -5,8 +5,8 @@
 //! `output.log` with `capture_limit(0)` so memory stays bounded regardless of output volume.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -14,14 +14,17 @@ use std::time::Duration;
 
 use legion_core::{CancellationToken, Paths};
 use legion_os::OsError;
-use legion_os::lock::FileLock;
+use legion_os::atomic::replace_file;
+use legion_os::lock::{FileLock, LockMode};
 use legion_os::run::{ChunkCallback, OutputChunk, RunOptions, run};
 use legion_os::shell::CommandSpec;
 
 use super::platform;
 use super::store::{
-    self, CANCEL_FILE, EXIT_FILE, ExitOutcome, ExitRecord, JobRecord, LOCK_FILE, LOG_FILE, job_dir,
-    now_rfc3339, read_env_file, read_job_record, validate_job_id, write_exit_record,
+    self, CANCEL_FILE, EXIT_FILE, ExitOutcome, ExitRecord, JobRecord, LOCK_FILE, LOG_FILE,
+    LOG_ROTATED_FILE, MAX_LOG_FILE_BYTES, create_exit_reserve, job_dir, now_rfc3339, read_env_file,
+    read_job_record, read_log_meta, remove_env_file, remove_exit_reserve, validate_job_id,
+    write_exit_record, write_log_meta,
 };
 
 /// Hidden CLI subcommand name used when `job.start` re-executes the current binary.
@@ -32,6 +35,9 @@ pub(super) const STATE_DIR_FLAG: &str = "--state-dir";
 
 /// How often the supervisor checks for `<job_dir>/cancel`.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the supervisor retries taking the exclusive job lock so a reader's brief shared probe
+/// landing between lock creation and locking never aborts startup.
+const SUPERVISOR_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Runs the hidden `job-supervise` subcommand when `args` starts with `"job-supervise"`.
 ///
@@ -136,21 +142,118 @@ fn parse_args(rest: &[OsString]) -> Result<(String, Option<PathBuf>), String> {
 }
 
 struct LogSink {
-    file: File,
+    dir: PathBuf,
+    file: Option<File>,
+    current_bytes: u64,
+    dropped_bytes: u64,
+    cap: u64,
     write_error: Option<String>,
 }
 
-/// Runs the supervisor lifecycle for one job: acquires the exclusive lock, executes the command
-/// without a timeout, streams output to `output.log`, watches for cancellation, writes
-/// `exit.json`, and releases the lock.
+impl LogSink {
+    fn open(dir: PathBuf, cap: u64) -> io::Result<Self> {
+        let file = platform::open_private_append(&dir.join(LOG_FILE))?;
+        let current_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let dropped_bytes = read_log_meta(&dir).dropped_bytes;
+        Ok(Self {
+            dir,
+            file: Some(file),
+            current_bytes,
+            dropped_bytes,
+            cap,
+            write_error: None,
+        })
+    }
+
+    fn write_chunk(&mut self, mut bytes: &[u8]) {
+        if self.write_error.is_some() || bytes.is_empty() {
+            return;
+        }
+        while !bytes.is_empty() {
+            if self.cap > 0
+                && self.current_bytes >= self.cap
+                && let Err(err) = self.rotate()
+            {
+                self.write_error = Some(err.to_string());
+                return;
+            }
+            let take = if self.cap == 0 {
+                bytes.len()
+            } else {
+                let room = usize::try_from(self.cap.saturating_sub(self.current_bytes))
+                    .unwrap_or(usize::MAX);
+                bytes.len().min(room)
+            };
+            let Some(ref mut file) = self.file else {
+                self.write_error = Some("job log file handle is closed".to_owned());
+                return;
+            };
+            if let Err(err) = file.write_all(&bytes[..take]) {
+                self.write_error = Some(err.to_string());
+                return;
+            }
+            self.current_bytes = self
+                .current_bytes
+                .saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
+            bytes = &bytes[take..];
+        }
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        // Sync and close the active log handle before renaming (required on Windows).
+        if let Some(file) = self.file.take() {
+            let _ = file.sync_data();
+        }
+        let active_path = self.dir.join(LOG_FILE);
+        let rotated_path = self.dir.join(LOG_ROTATED_FILE);
+        let old_rotated_len = fs::metadata(&rotated_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+
+        replace_file(&active_path, &rotated_path)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        if old_rotated_len > 0 {
+            self.dropped_bytes = self.dropped_bytes.saturating_add(old_rotated_len);
+            let _ = write_log_meta(&self.dir, self.dropped_bytes);
+        }
+
+        let fresh = platform::open_private_append(&active_path)?;
+        self.file = Some(fresh);
+        self.current_bytes = 0;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        if let Some(file) = self.file.take() {
+            let _ = file.sync_data();
+        }
+        self.write_error.take()
+    }
+}
+
+/// Runs the supervisor lifecycle for one job: acquires the exclusive lock, reserves space for
+/// `exit.json`, executes the command without a timeout, streams capped output to `output.log`
+/// (rotating once to `output.log.1`), watches for cancellation, writes `exit.json`, and releases
+/// the lock.
 async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
+    supervise_with_cap(state_dir, id, MAX_LOG_FILE_BYTES).await
+}
+
+async fn supervise_with_cap(state_dir: &Path, id: &str, max_log_bytes: u64) -> Result<(), String> {
     let dir = job_dir(state_dir, id);
     let lock_path = dir.join(LOCK_FILE);
 
-    let lock = match FileLock::try_lock_exclusive(&lock_path) {
+    let lock = match FileLock::acquire_async(
+        &lock_path,
+        LockMode::Exclusive,
+        Some(SUPERVISOR_LOCK_TIMEOUT),
+    )
+    .await
+    {
         Ok(guard) => guard,
-        Err(OsError::WouldBlock { .. }) => {
-            // Another supervisor already owns this job; exit without touching its state.
+        Err(OsError::WouldBlock { .. } | OsError::TimedOut { .. }) => {
+            // Another supervisor genuinely holds this job's lock; exit without touching its state.
             return Ok(());
         }
         Err(err) => {
@@ -164,17 +267,21 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     // If a forced cancel already finalized the job before the supervisor acquired the lock, do not
     // run the command.
     if dir.join(EXIT_FILE).exists() {
+        remove_env_file(&dir);
+        remove_exit_reserve(&dir);
         let _ = lock.unlock();
         return Ok(());
     }
 
     if dir.join(CANCEL_FILE).exists() {
+        remove_env_file(&dir);
         let exit = ExitRecord {
             outcome: ExitOutcome::Cancelled,
             exit_code: None,
             signal: None,
             finished: now_rfc3339(),
             forced: false,
+            startup_failed: false,
             detail: Some("Cancelled before the command started.".to_owned()),
         };
         let _ = write_exit_record(&dir, &exit);
@@ -182,9 +289,15 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    // Reserve disk blocks for `exit.json` before starting the command so filling the filesystem
+    // cannot lose the exit code; `write_exit_record` removes the reserve file immediately before
+    // writing `exit.json`.
+    let _ = create_exit_reserve(&dir);
+
     let record = match read_job_record(&dir, id) {
         Ok(record) => record,
         Err(error) => {
+            remove_env_file(&dir);
             record_failure(&dir, error.message);
             let _ = lock.unlock();
             return Ok(());
@@ -192,8 +305,14 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     };
 
     let env = match read_env_file(&dir) {
-        Ok(env) => env,
+        Ok(env) => {
+            // Delete `env.json` as soon as it is loaded into memory so secret values do not sit on
+            // disk while the job runs or during retention.
+            remove_env_file(&dir);
+            env
+        }
         Err(message) => {
+            remove_env_file(&dir);
             record_failure(&dir, format!("Could not read job environment: {message}."));
             let _ = lock.unlock();
             return Ok(());
@@ -209,8 +328,8 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
         }
     };
 
-    let log_file = match platform::open_private_append(&dir.join(LOG_FILE)) {
-        Ok(file) => file,
+    let log_sink = match LogSink::open(dir.clone(), max_log_bytes) {
+        Ok(sink) => sink,
         Err(err) => {
             record_failure(
                 &dir,
@@ -221,18 +340,12 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
         }
     };
 
-    let sink = Arc::new(Mutex::new(LogSink {
-        file: log_file,
-        write_error: None,
-    }));
+    let sink = Arc::new(Mutex::new(log_sink));
     let on_output: ChunkCallback = {
         let sink = Arc::clone(&sink);
         Arc::new(move |chunk: OutputChunk| {
-            if let Ok(mut guard) = sink.lock()
-                && guard.write_error.is_none()
-                && let Err(err) = guard.file.write_all(&chunk.bytes)
-            {
-                guard.write_error = Some(err.to_string());
+            if let Ok(mut guard) = sink.lock() {
+                guard.write_chunk(&chunk.bytes);
             }
         })
     };
@@ -259,7 +372,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     });
 
     // Bounded memory regardless of output size: `capture_limit(0)` retains nothing in memory while
-    // `on_output` appends every raw chunk straight to `output.log`.
+    // `on_output` appends every raw chunk straight to `output.log` with bounded single rotation.
     let mut options = RunOptions::new(command)
         .envs(env)
         .capture_limit(0)
@@ -275,8 +388,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     let _ = watcher.await;
 
     let write_error = if let Ok(mut guard) = sink.lock() {
-        let _ = guard.file.sync_data();
-        guard.write_error.take()
+        guard.finish()
     } else {
         None
     };
@@ -297,6 +409,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
                 signal: output.signal,
                 finished: now_rfc3339(),
                 forced: false,
+                startup_failed: false,
                 detail: write_error.map(|err| format!("Writing output.log failed: {err}.")),
             }
         }
@@ -306,6 +419,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
             signal: None,
             finished: now_rfc3339(),
             forced: false,
+            startup_failed: false,
             detail: Some(describe_spawn_error(&os_err, &record)),
         },
     };
@@ -322,6 +436,7 @@ fn record_failure(dir: &Path, detail: String) {
         signal: None,
         finished: now_rfc3339(),
         forced: false,
+        startup_failed: false,
         detail: Some(detail),
     };
     let _ = write_exit_record(dir, &exit);
@@ -357,4 +472,127 @@ fn describe_spawn_error(error: &OsError, record: &JobRecord) -> String {
 
 fn write_stderr(text: &str) {
     let _ = std::io::stderr().lock().write_all(text.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::job::store::{read_exit_record, write_job_record};
+
+    #[tokio::test]
+    async fn supervisor_retries_exclusive_lock_past_transient_shared_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let id = "lock-probe-race";
+        let dir = job_dir(&state_dir, id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let record = JobRecord {
+            id: id.to_owned(),
+            name: "probe-test".to_owned(),
+            key: None,
+            cmd: Some("echo lock-retry-ok".to_owned()),
+            argv: None,
+            cwd: None,
+            env_names: Vec::new(),
+            principal: "owner".to_owned(),
+            created: now_rfc3339(),
+            boot_id: "test-boot".to_owned(),
+            exclusive: false,
+            detach: None,
+        };
+        write_job_record(&dir, &record).unwrap();
+
+        // Simulate a reader holding a brief shared lock right as the supervisor starts.
+        let shared = FileLock::try_lock_shared(dir.join(LOCK_FILE)).unwrap();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = shared.unlock();
+        });
+
+        supervise(&state_dir, id).await.unwrap();
+        releaser.await.unwrap();
+
+        let exit = read_exit_record(&dir).expect("exit.json was not written");
+        assert_eq!(exit.outcome, ExitOutcome::Succeeded);
+        assert_eq!(exit.exit_code, Some(0));
+        assert!(!dir.join(store::EXIT_RESERVE_FILE).exists());
+        let log = fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert_eq!(log.trim(), "lock-retry-ok");
+    }
+
+    #[tokio::test]
+    async fn supervisor_rotates_log_at_cap_and_removes_exit_reserve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let id = "rotate-cap-test";
+        let dir = job_dir(&state_dir, id);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Emit 900 bytes (~3.5x a 256-byte cap) with distinct numbered lines and exit with code 3.
+        let mut expected = String::new();
+        for idx in 0..90 {
+            expected.push_str(&format!("line-{idx:04}\n"));
+        }
+        let payload_file = tmp.path().join("payload.txt");
+        fs::write(&payload_file, &expected).unwrap();
+        #[cfg(unix)]
+        let cmd = format!("cat {:?} && exit 3", payload_file.to_string_lossy());
+        #[cfg(windows)]
+        let cmd = format!(
+            "[Console]::Write([System.IO.File]::ReadAllText({:?})); exit 3",
+            payload_file.to_string_lossy()
+        );
+
+        let record = JobRecord {
+            id: id.to_owned(),
+            name: "rotate-test".to_owned(),
+            key: None,
+            cmd: Some(cmd),
+            argv: None,
+            cwd: None,
+            env_names: Vec::new(),
+            principal: "owner".to_owned(),
+            created: now_rfc3339(),
+            boot_id: "test-boot".to_owned(),
+            exclusive: false,
+            detach: None,
+        };
+        write_job_record(&dir, &record).unwrap();
+
+        let cap = 256u64;
+        supervise_with_cap(&state_dir, id, cap).await.unwrap();
+
+        // Exit code is preserved and `exit.reserve` was removed before writing `exit.json`.
+        let exit = read_exit_record(&dir).expect("exit.json missing");
+        assert_eq!(exit.outcome, ExitOutcome::Failed);
+        assert_eq!(exit.exit_code, Some(3));
+        assert!(!dir.join(store::EXIT_RESERVE_FILE).exists());
+
+        // Each segment stays within `cap`, so on-disk storage never exceeds `2 * cap`.
+        let rot_len = fs::metadata(dir.join(LOG_ROTATED_FILE)).unwrap().len();
+        let cur_len = fs::metadata(dir.join(LOG_FILE)).unwrap().len();
+        assert!(rot_len <= cap, "output.log.1 exceeded cap: {rot_len}");
+        assert!(cur_len <= cap, "output.log exceeded cap: {cur_len}");
+        assert!(rot_len + cur_len <= 2 * cap);
+
+        let meta = read_log_meta(&dir);
+        assert!(meta.dropped_bytes > 0, "expected dropped_bytes > 0");
+        assert_eq!(
+            meta.dropped_bytes + rot_len + cur_len,
+            expected.len() as u64
+        );
+
+        // `logs::read_offset` reads seamlessly across `output.log.1` + `output.log` and reports
+        // `output_dropped: true`.
+        let slice = crate::job::logs::read_offset(&dir, 0, 1024, false).unwrap();
+        assert!(slice.output_dropped);
+        assert_eq!(slice.dropped_bytes, Some(meta.dropped_bytes));
+        assert_eq!(slice.offset, meta.dropped_bytes);
+        assert_eq!(slice.next_offset, expected.len() as u64);
+        assert!(slice.eof);
+        assert_eq!(slice.content, &expected[meta.dropped_bytes as usize..]);
+    }
 }

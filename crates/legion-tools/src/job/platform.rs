@@ -51,6 +51,15 @@ mod imp {
             .mode(FILE_MODE)
             .open(path)
     }
+
+    pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(FILE_MODE)
+            .open(path)
+    }
 }
 
 #[cfg(not(unix))]
@@ -70,6 +79,14 @@ mod imp {
     pub(super) fn open_private_append(path: &Path) -> io::Result<File> {
         OpenOptions::new().create(true).append(true).open(path)
     }
+
+    pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+    }
 }
 
 /// Ensures `path` exists as a directory private to the current user (`0o700` on Unix).
@@ -87,4 +104,9 @@ pub(super) fn create_private_dir_new(path: &Path) -> io::Result<()> {
 /// absent.
 pub(super) fn open_private_append(path: &Path) -> io::Result<File> {
     imp::open_private_append(path)
+}
+
+/// Creates or truncates `path` for writing with owner-only permissions (`0o600` on Unix).
+pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
+    imp::create_private_file(path)
 }

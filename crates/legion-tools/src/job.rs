@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, Ctx, Paths, Registry, ToolError};
 use legion_os::OsError;
-use legion_os::detach::{DetachHandle, DetachOptions, spawn_detached, stop_detached};
+use legion_os::detach::{
+    DetachHandle, DetachOptions, detached_active, spawn_detached, stop_detached,
+};
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid;
 use legion_os::shell::CommandSpec;
@@ -34,9 +36,10 @@ pub use supervise::try_supervise_cli;
 use logs::{DEFAULT_LOG_LIMIT, DEFAULT_TAIL_LINES, MAX_LOG_LIMIT, MAX_TAIL_LINES};
 use store::{
     ExitOutcome, ExitRecord, JobRecord, command_summary, compare_newest_first, default_job_name,
-    derive_status, find_by_key, generate_job_id, job_dir, jobs_dir, jobs_lock_path,
+    derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir, jobs_lock_path,
     load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record, read_job_record,
-    validate_job_id, write_cancel_request, write_env_file, write_exit_record, write_job_record,
+    remove_env_file, validate_job_id, write_cancel_request, write_env_file, write_exit_record,
+    write_job_record,
 };
 
 /// Default and maximum `limit` for `job.list`.
@@ -66,13 +69,13 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.start",
         Effect::Exec,
-        "Start a command as a detached background job that outlives this call, this legion process, and any ssh session. Give `argv` to run a program with exact arguments or `cmd` for the platform shell (sh on Linux and macOS, PowerShell on Windows). Returns as soon as the job supervisor holds its lock; afterwards poll `job.logs` with `next_offset` to read output as it arrives, call `job.wait` to wait for completion, or inspect `job.status`. Pass `key` to make retries after a dropped connection idempotent, and set `exclusive: true` when the job should mark this machine busy.",
+        "Start a command as a detached background job that outlives this call, this legion process, and any ssh session. Give `argv` to run a program with exact arguments or `cmd` for the platform shell (sh on Linux and macOS, PowerShell on Windows). Returns as soon as the job supervisor holds its lock; afterwards poll `job.logs` with `next_offset` to read output as it arrives, call `job.wait` to wait for completion, or inspect `job.status`. Pass `key` to make retries after a dropped connection idempotent: a key matches an active job or one whose supervisor took the lock and ran (succeeded, failed, cancelled, or interrupted mid-run); a failed start whose supervisor never took the lock does not match and is replaced. Set `exclusive: true` when the job should mark this machine busy.",
         start,
     );
     registry.add_fn(
         "job.list",
         Effect::Read,
-        "List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Reading never modifies job files.",
+        "List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Any principal with the read effect sees every job's command and output on this node. Reading never modifies job files.",
         list,
     );
     registry.add_fn(
@@ -84,7 +87,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.logs",
         Effect::Read,
-        "Read captured stdout and stderr from a background job without loading the whole log into memory. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes.",
+        "Read captured stdout and stderr from a background job without loading the whole log into memory. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation. Any principal with the read effect sees every job's command and output on this node.",
         read_logs,
     );
     registry.add_fn(
@@ -96,7 +99,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.cancel",
         Effect::Exec,
-        "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Cancelling a job that already finished is not an error and returns its final state.",
+        "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any job on this node. Cancelling a job that already finished is not an error and returns its final state.",
         cancel,
     );
 }
@@ -131,8 +134,11 @@ pub(crate) struct StartArgs {
     /// Short human-readable name for the job; defaults to the command's program name.
     #[serde(default)]
     name: Option<String>,
-    /// Caller-chosen idempotency key. Re-calling with the same key and identical command, `cwd`,
-    /// and environment variable names returns the existing job instead of starting a second one.
+    /// Caller-chosen idempotency key. Matches an active job or one whose supervisor took the lock
+    /// and ran (succeeded, failed, cancelled, or interrupted mid-run): re-calling with the same
+    /// key and identical command, `cwd`, and environment variable names returns that job instead
+    /// of starting a second one, while differing arguments fail with `conflict`. A failed start
+    /// whose supervisor never took the lock does not match and is replaced.
     #[serde(default)]
     key: Option<String>,
     /// Mark this machine busy while the job runs (blocks unattended `power.*` operations).
@@ -243,6 +249,10 @@ pub struct JobStatus {
     pub detach: Option<DetachHandle>,
     /// Current derived state.
     pub state: JobState,
+    /// Whether the job supervisor is attached while the job is active (`false` when the supervisor
+    /// died while the command tree keeps running; omitted once finished or interrupted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervised: Option<bool>,
     /// Exit code when the command exited normally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -255,7 +265,7 @@ pub struct JobStatus {
     /// Duration in seconds (elapsed so far while running, or total once finished).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
-    /// Current size of `output.log` in bytes.
+    /// Current size of captured log files (`output.log.1` and `output.log`) in bytes.
     pub output_bytes: u64,
     /// Explanation when the job was interrupted or failed to start.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -291,15 +301,22 @@ pub struct JobLogs {
     pub state: JobState,
     /// Log text for the returned byte range (invalid UTF-8 replaced with U+FFFD).
     pub content: String,
-    /// Byte offset where `content` starts in `output.log`.
+    /// Logical byte offset where `content` starts in the job's output stream.
     pub offset: u64,
-    /// Byte offset immediately after `content`; pass as `offset` on the next call to follow output.
+    /// Logical byte offset immediately after `content`; pass as `offset` on the next call to
+    /// follow output.
     pub next_offset: u64,
-    /// Whether this read reached the current end of `output.log`.
+    /// Whether this read reached the current end of captured output.
     pub eof: bool,
     /// Whether bytes exist outside the returned range (earlier bytes in tail mode, or later bytes
     /// in offset mode).
     pub truncated: bool,
+    /// `true` when earlier output was discarded because the log rotated past its size cap.
+    pub output_dropped: bool,
+    /// Number of earliest bytes dropped due to log rotation, present when `output_dropped` is
+    /// `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_bytes: Option<u64>,
 }
 
 /// Arguments of `job.wait`.
@@ -403,16 +420,16 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
     let state_dir_for_create = state_dir.clone();
     let create_outcome = blocking("job.start", move || {
         let now = jiff::Timestamp::now();
+        let boot = procid::boot_id().ok();
         if let Some(ref key_str) = key
-            && let Some((existing_dir, existing)) = find_by_key(&state_dir_for_create, key_str)?
+            && let Some((_existing_dir, existing, derived)) =
+                find_by_key(&state_dir_for_create, key_str, boot.as_deref(), now)?
         {
             if existing.cmd == args.cmd
                 && existing.argv == args.argv
                 && existing.cwd == cwd_str
                 && existing.env_names == env_names
             {
-                let boot = procid::boot_id().ok();
-                let derived = derive_status(&existing_dir, &existing, boot.as_deref(), now);
                 return Ok(CreateOutcome::Existing(Started {
                     id: existing.id,
                     name: existing.name,
@@ -528,7 +545,7 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
     })
     .await?;
 
-    let state = wait_for_supervisor_ready(&dir, &handle).await?;
+    let state = wait_for_supervisor_ready(&dir, &record.id, &handle).await?;
 
     Ok(Started {
         id: record.id,
@@ -577,14 +594,24 @@ async fn record_start_failure(dir: &Path, detail: &str) {
         signal: None,
         finished: now_rfc3339(),
         forced: false,
+        startup_failed: true,
         detail: Some(detail.to_owned()),
     };
-    let _ = tokio::task::spawn_blocking(move || write_exit_record(&dir, &exit)).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        // Never overwrite an existing exit record or write one while the supervisor holds `lock`.
+        if read_exit_record(&dir).is_some() || probe_lock(&dir).1 {
+            return Ok(());
+        }
+        remove_env_file(&dir);
+        write_exit_record(&dir, &exit)
+    })
+    .await;
 }
 
 /// Waits until the newly detached supervisor holds the job lock or has already written `exit.json`.
 async fn wait_for_supervisor_ready(
     dir: &Path,
+    id: &str,
     handle: &DetachHandle,
 ) -> Result<JobState, ErrorBody> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -616,6 +643,9 @@ async fn wait_for_supervisor_ready(
             ReadyProbe::Running => return Ok(JobState::Running),
             ReadyProbe::Finished(state) => return Ok(state),
             ReadyProbe::SupervisorExited => {
+                if detached_active(handle).await.unwrap_or(false) {
+                    return Ok(JobState::Running);
+                }
                 let message =
                     "The detached job supervisor exited before taking the job lock.".to_owned();
                 record_start_failure(dir, &message).await;
@@ -626,19 +656,107 @@ async fn wait_for_supervisor_ready(
             ReadyProbe::Pending => {
                 let now = Instant::now();
                 if now >= deadline {
-                    let _ = stop_detached(handle, Duration::from_secs(1)).await;
-                    let message =
-                        "The detached job supervisor did not become ready within 10 seconds and was stopped."
-                            .to_owned();
-                    record_start_failure(dir, &message).await;
-                    return Err(ErrorBody::new(ErrorCode::Timeout, message)
-                        .with_hint("Retry `job.start` or check system load with `sys.info`."));
+                    let stop_result = stop_detached(handle, Duration::from_secs(1)).await;
+                    return finish_startup_timeout(
+                        dir,
+                        id,
+                        handle,
+                        stop_result,
+                        LOCK_SETTLE_TIMEOUT,
+                    )
+                    .await;
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 tokio::time::sleep(STARTUP_POLL.min(remaining)).await;
             }
         }
     }
+}
+
+/// Finalizes a `job.start` startup timeout after attempting `stop_detached`.
+///
+/// Writes `exit.json` only once the stop succeeded with no survivors, the lock is free, and
+/// `detached_active` is false; otherwise leaves `exit.json` unwritten and reports that the job is
+/// still running along with any surviving process ids.
+async fn finish_startup_timeout(
+    dir: &Path,
+    id: &str,
+    handle: &DetachHandle,
+    stop_result: Result<procid::KillTreeReport, OsError>,
+    lock_settle: Duration,
+) -> Result<JobState, ErrorBody> {
+    let (stop_err, survivors) = match stop_result {
+        Ok(report) => (
+            None,
+            report
+                .survivors
+                .into_iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+        ),
+        Err(err) => (Some(err.to_string()), Vec::new()),
+    };
+
+    if stop_err.is_none() && survivors.is_empty() {
+        wait_for_lock_release(dir, lock_settle).await;
+    }
+
+    let tree_active = if stop_err.is_some() || !survivors.is_empty() {
+        true
+    } else {
+        detached_active(handle).await.unwrap_or(true)
+    };
+
+    let dir_check = dir.to_path_buf();
+    let (existing_exit, lock_held) = blocking("job.start", move || {
+        let exit = read_exit_record(&dir_check);
+        let lock_held = probe_lock(&dir_check).1;
+        let exit = exit.or_else(|| read_exit_record(&dir_check));
+        Ok((exit, lock_held))
+    })
+    .await?;
+
+    if let Some(exit) = existing_exit
+        && !tree_active
+        && !lock_held
+    {
+        return Ok(JobState::from(exit.outcome));
+    }
+
+    if stop_err.is_none() && survivors.is_empty() && !tree_active && !lock_held {
+        let message =
+            "The detached job supervisor did not become ready within 10 seconds and was stopped."
+                .to_owned();
+        record_start_failure(dir, &message).await;
+        return Err(ErrorBody::new(ErrorCode::Timeout, message)
+            .with_hint("Retry `job.start` or check system load with `sys.info`.")
+            .with_details(json!({
+                "id": id,
+                "state": JobState::Failed,
+                "survivors": [],
+            })));
+    }
+
+    let detail = match stop_err {
+        Some(err) => format!(
+            "The detached job supervisor for {id} did not become ready within 10 seconds and stopping it failed ({err}); the job is still running."
+        ),
+        None if !survivors.is_empty() => format!(
+            "The detached job supervisor for {id} did not become ready within 10 seconds and could not be stopped; the job is still running (surviving pids: {survivors:?})."
+        ),
+        None => format!(
+            "The detached job supervisor for {id} did not become ready within 10 seconds and is still running."
+        ),
+    };
+    Err(ErrorBody::new(ErrorCode::Timeout, detail)
+        .with_hint(
+            "Inspect the job with `job.status` or stop it with `job.cancel` (`force: true`).",
+        )
+        .with_details(json!({
+            "id": id,
+            "state": JobState::Running,
+            "survivors": survivors,
+        })))
 }
 
 enum ReadyProbe {
@@ -664,51 +782,58 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<JobList, ToolError> {
     let filter_state = args.state;
     let keep = usize::try_from(limit).unwrap_or(usize::MAX);
 
-    blocking("job.list", move || {
+    let (records, boot) = blocking("job.list", move || {
         let mut records = load_all_records(&state_dir)?;
         records.sort_by(|(_, a), (_, b)| compare_newest_first(a, b));
         let boot = procid::boot_id().ok();
-        let now = jiff::Timestamp::now();
-
-        let mut jobs = Vec::new();
-        let mut truncated = false;
-        for (dir, record) in records {
-            let derived = derive_status(&dir, &record, boot.as_deref(), now);
-            if filter_state.is_some_and(|want| derived.state != want) {
-                continue;
-            }
-            if jobs.len() == keep {
-                truncated = true;
-                break;
-            }
-            jobs.push(JobSummary {
-                command: command_summary(&record),
-                id: record.id,
-                name: record.name,
-                state: derived.state,
-                created: record.created,
-                finished: derived.finished,
-                exit_code: derived.exit_code,
-            });
-        }
-        Ok(JobList { jobs, truncated })
+        Ok((records, boot))
     })
-    .await
+    .await?;
+
+    let now = jiff::Timestamp::now();
+    let mut jobs = Vec::new();
+    let mut truncated = false;
+    for (dir, record) in records {
+        let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
+        if filter_state.is_some_and(|want| derived.state != want) {
+            continue;
+        }
+        if jobs.len() == keep {
+            truncated = true;
+            break;
+        }
+        jobs.push(JobSummary {
+            command: command_summary(&record),
+            id: record.id,
+            name: record.name,
+            state: derived.state,
+            created: record.created,
+            finished: derived.finished,
+            exit_code: derived.exit_code,
+        });
+    }
+    Ok(JobList { jobs, truncated })
 }
 
 async fn status(ctx: &Ctx, args: StatusArgs) -> Result<JobStatus, ToolError> {
     validate_job_id(&args.id)?;
     let state_dir = ctx.paths().state_dir().to_path_buf();
-    let id = args.id;
-    blocking("job.status", move || load_status(&state_dir, &id)).await
+    load_status_async(&state_dir, &args.id).await
 }
 
-fn load_status(state_dir: &Path, id: &str) -> Result<JobStatus, ErrorBody> {
+async fn load_status_async(state_dir: &Path, id: &str) -> Result<JobStatus, ErrorBody> {
     let dir = job_dir(state_dir, id);
-    let record = read_job_record(&dir, id)?;
-    let boot = procid::boot_id().ok();
+    let dir_for_read = dir.clone();
+    let id_for_read = id.to_owned();
+    let (record, boot) = blocking("job.status", move || {
+        let record = read_job_record(&dir_for_read, &id_for_read)?;
+        let boot = procid::boot_id().ok();
+        Ok((record, boot))
+    })
+    .await?;
+
     let now = jiff::Timestamp::now();
-    let derived = derive_status(&dir, &record, boot.as_deref(), now);
+    let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
     Ok(JobStatus {
         id: record.id,
         name: record.name,
@@ -723,6 +848,7 @@ fn load_status(state_dir: &Path, id: &str) -> Result<JobStatus, ErrorBody> {
         exclusive: record.exclusive,
         detach: record.detach,
         state: derived.state,
+        supervised: derived.supervised,
         exit_code: derived.exit_code,
         signal: derived.signal,
         finished: derived.finished,
@@ -766,33 +892,36 @@ async fn read_logs(ctx: &Ctx, args: LogsArgs) -> Result<JobLogs, ToolError> {
     let tail_usize = usize::try_from(tail).unwrap_or(usize::MAX);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
-    blocking("job.logs", move || {
-        let dir = job_dir(&state_dir, &id);
-        let record = read_job_record(&dir, &id)?;
+    let dir = job_dir(&state_dir, &id);
+    let dir_for_read = dir.clone();
+    let id_for_read = id.clone();
+    let (record, boot) = blocking("job.logs", move || {
+        let record = read_job_record(&dir_for_read, &id_for_read)?;
         let boot = procid::boot_id().ok();
-        let now = jiff::Timestamp::now();
-        let derived = derive_status(&dir, &record, boot.as_deref(), now);
-        let log_path = dir.join(store::LOG_FILE);
-        let slice = match offset {
-            Some(off) => logs::read_offset(&log_path, off, limit_usize, derived.state.is_active())?,
-            None => logs::read_tail(
-                &log_path,
-                tail_usize,
-                limit_usize,
-                derived.state.is_active(),
-            )?,
-        };
-        Ok(JobLogs {
-            id,
-            state: derived.state,
-            content: slice.content,
-            offset: slice.offset,
-            next_offset: slice.next_offset,
-            eof: slice.eof,
-            truncated: slice.truncated,
-        })
+        Ok((record, boot))
     })
-    .await
+    .await?;
+
+    let derived = derive_status_async(&dir, &record, boot.as_deref(), jiff::Timestamp::now()).await;
+    let actively_writing = derived.supervised == Some(true);
+
+    let slice = blocking("job.logs", move || match offset {
+        Some(off) => logs::read_offset(&dir, off, limit_usize, actively_writing),
+        None => logs::read_tail(&dir, tail_usize, limit_usize, actively_writing),
+    })
+    .await?;
+
+    Ok(JobLogs {
+        id,
+        state: derived.state,
+        content: slice.content,
+        offset: slice.offset,
+        next_offset: slice.next_offset,
+        eof: slice.eof,
+        truncated: slice.truncated,
+        output_dropped: slice.output_dropped,
+        dropped_bytes: slice.dropped_bytes,
+    })
 }
 
 async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
@@ -805,9 +934,7 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
     let mut pause = WAIT_INITIAL_POLL;
 
     loop {
-        let dir_clone = state_dir.clone();
-        let id_clone = id.clone();
-        let current = blocking("job.wait", move || load_status(&dir_clone, &id_clone)).await?;
+        let current = load_status_async(&state_dir, &id).await?;
         if !current.state.is_active() {
             return Ok(JobWait {
                 status: current,
@@ -844,20 +971,87 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
 
     let dir_for_read = dir.clone();
     let id_for_read = id.clone();
-    let initial_record = blocking("job.cancel", move || {
-        read_job_record(&dir_for_read, &id_for_read)
+    let (initial_record, current_boot) = blocking("job.cancel", move || {
+        let record = read_job_record(&dir_for_read, &id_for_read)?;
+        let boot = procid::boot_id().ok();
+        Ok((record, boot))
     })
     .await?;
+    let same_boot = current_boot
+        .as_deref()
+        .is_none_or(|cur| procid::same_boot(&initial_record.boot_id, cur));
+
+    let stop_grace = if args.force {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(1)
+    };
+
+    // Never touch records from a previous boot: nothing from that boot can still be running, so
+    // report the true derived state without writing `cancel` or `exit.json`.
+    if !same_boot {
+        let derived = derive_status_async(
+            &dir,
+            &initial_record,
+            current_boot.as_deref(),
+            jiff::Timestamp::now(),
+        )
+        .await;
+        return Ok(CancelledJob {
+            id,
+            state: derived.state,
+            survivors: Vec::new(),
+        });
+    }
 
     // Cancelling a job that already has an exit record is not an error: wait briefly if the
-    // supervisor is still releasing its lock, then return its final state unchanged.
+    // supervisor is still releasing its lock, sweep any surviving detached descendants on the
+    // same boot, and return the job's final state unchanged (or `running` if descendants survive).
     let dir_for_exit = dir.clone();
     if let Some(exit) = blocking("job.cancel", move || Ok(read_exit_record(&dir_for_exit))).await? {
         wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
+        let record = reload_job_record(&dir, &id, initial_record).await;
+        let (survivors, still_active) =
+            sweep_job_handle(&id, &record, same_boot, stop_grace).await?;
+        let state = if still_active {
+            JobState::Running
+        } else {
+            JobState::from(exit.outcome)
+        };
         return Ok(CancelledJob {
             id,
-            state: JobState::from(exit.outcome),
-            survivors: Vec::new(),
+            state,
+            survivors,
+        });
+    }
+
+    // If the job is already dead (`interrupted`) and nothing under its handle is active, leave its
+    // directory untouched so cancel never rewrites history.
+    let initial_status = derive_status_async(
+        &dir,
+        &initial_record,
+        current_boot.as_deref(),
+        jiff::Timestamp::now(),
+    )
+    .await;
+    if !initial_status.state.is_active() {
+        let (survivors, still_active) = if initial_status.state == JobState::Interrupted {
+            (Vec::new(), false)
+        } else {
+            // `exit.json` appeared between the earlier check and `derive_status_async`.
+            wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
+            let record = reload_job_record(&dir, &id, initial_record).await;
+            sweep_job_handle(&id, &record, same_boot, stop_grace).await?
+        };
+        let state = if still_active {
+            JobState::Running
+        } else {
+            initial_status.state
+        };
+        return Ok(CancelledJob {
+            id,
+            state,
+            survivors,
         });
     }
 
@@ -891,10 +1085,18 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
                     if lock_held {
                         wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
                     }
+                    let record = reload_job_record(&dir, &id, initial_record).await;
+                    let (survivors, still_active) =
+                        sweep_job_handle(&id, &record, same_boot, Duration::from_secs(1)).await?;
+                    let reported_state = if still_active {
+                        JobState::Running
+                    } else {
+                        state
+                    };
                     return Ok(CancelledJob {
                         id,
-                        state,
-                        survivors: Vec::new(),
+                        state: reported_state,
+                        survivors,
                     });
                 }
                 CancelPoll::SupervisorGone => break,
@@ -911,67 +1113,98 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
     }
 
     // Re-read the record in case `job.start` attached the detach handle while we waited.
-    let dir_for_reload = dir.clone();
-    let id_for_reload = id.clone();
-    let record = blocking("job.cancel", move || {
-        read_job_record(&dir_for_reload, &id_for_reload)
-    })
-    .await
-    .unwrap_or(initial_record);
+    let record = reload_job_record(&dir, &id, initial_record).await;
+    let (survivors, still_active) = sweep_job_handle(&id, &record, same_boot, stop_grace).await?;
 
-    let stop_grace = if args.force {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(1)
-    };
-    let survivors = if let Some(ref handle) = record.detach {
-        let report = stop_detached(handle, stop_grace).await.map_err(|err| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Could not stop detached job {id}: {err}."),
-            )
-            .with_hint("Inspect remaining processes with `sys.procs` or retry with `force: true`.")
-        })?;
-        report.survivors.iter().map(|proc_id| proc_id.pid).collect()
-    } else {
-        Vec::new()
-    };
-
-    if survivors.is_empty() {
+    if !still_active && survivors.is_empty() {
         wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
-        let dir_for_finalize = dir.clone();
-        let final_state = blocking("job.cancel", move || {
-            if let Some(exit) = read_exit_record(&dir_for_finalize) {
-                return Ok(JobState::from(exit.outcome));
+        // Re-check both the detached tree and the kernel lock right before writing `exit.json`.
+        // Never write an exit record while the lock is held (for example if the starter died
+        // before writing `detach` into `job.json`) or while anything under the handle is active.
+        let tree_still_active = match record.detach.as_ref() {
+            Some(handle) if same_boot => detached_active(handle).await.unwrap_or(true),
+            _ => false,
+        };
+        if !tree_still_active {
+            let dir_for_finalize = dir.clone();
+            let final_state = blocking("job.cancel", move || {
+                if let Some(exit) = read_exit_record(&dir_for_finalize) {
+                    return Ok(Some(JobState::from(exit.outcome)));
+                }
+                if probe_lock(&dir_for_finalize).1 {
+                    return Ok(None);
+                }
+                if let Some(exit) = read_exit_record(&dir_for_finalize) {
+                    return Ok(Some(JobState::from(exit.outcome)));
+                }
+                let exit = ExitRecord {
+                    outcome: ExitOutcome::Cancelled,
+                    exit_code: None,
+                    signal: None,
+                    finished: now_rfc3339(),
+                    forced: true,
+                    startup_failed: false,
+                    detail: Some(
+                        "Cancelled forcefully; detached process tree was stopped.".to_owned(),
+                    ),
+                };
+                write_exit_record(&dir_for_finalize, &exit)?;
+                Ok(Some(JobState::Cancelled))
+            })
+            .await?;
+            if let Some(state) = final_state {
+                return Ok(CancelledJob {
+                    id,
+                    state,
+                    survivors,
+                });
             }
-            let exit = ExitRecord {
-                outcome: ExitOutcome::Cancelled,
-                exit_code: None,
-                signal: None,
-                finished: now_rfc3339(),
-                forced: true,
-                detail: Some("Cancelled forcefully; detached process tree was stopped.".to_owned()),
-            };
-            write_exit_record(&dir_for_finalize, &exit)?;
-            Ok(JobState::Cancelled)
-        })
-        .await?;
-        return Ok(CancelledJob {
-            id,
-            state: final_state,
-            survivors,
-        });
+        }
     }
 
-    let state = blocking("job.cancel", move || {
-        load_status(&state_dir, &id).map(|status| status.state)
-    })
-    .await?;
     Ok(CancelledJob {
         id: record.id,
-        state,
+        state: JobState::Running,
         survivors,
     })
+}
+
+async fn reload_job_record(dir: &Path, id: &str, fallback: JobRecord) -> JobRecord {
+    let dir = dir.to_path_buf();
+    let id = id.to_owned();
+    blocking("job.cancel", move || read_job_record(&dir, &id))
+        .await
+        .unwrap_or(fallback)
+}
+
+/// Calls `stop_detached` on the job's stored handle (when on the same boot) and confirms via
+/// `detached_active` that no processes remain under the handle.
+async fn sweep_job_handle(
+    id: &str,
+    record: &JobRecord,
+    same_boot: bool,
+    grace: Duration,
+) -> Result<(Vec<u32>, bool), ErrorBody> {
+    if !same_boot {
+        return Ok((Vec::new(), false));
+    }
+    let Some(ref handle) = record.detach else {
+        return Ok((Vec::new(), false));
+    };
+    let report = stop_detached(handle, grace).await.map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Could not stop detached job {id}: {err}."),
+        )
+        .with_hint("Inspect remaining processes with `sys.procs` or retry with `force: true`.")
+    })?;
+    let survivors: Vec<u32> = report.survivors.iter().map(|proc_id| proc_id.pid).collect();
+    let still_active = if !survivors.is_empty() {
+        true
+    } else {
+        detached_active(handle).await.unwrap_or(true)
+    };
+    Ok((survivors, still_active))
 }
 
 enum CancelPoll {
@@ -1170,5 +1403,95 @@ mod tests {
         assert!(wait_timeout_of(Some(0.0)).is_err());
         assert!(wait_timeout_of(Some(3601.0)).is_err());
         assert_eq!(wait_timeout_of(None).unwrap(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_refuses_exit_record_when_survivors_or_lock_remain() {
+        let dead_handle = DetachHandle {
+            process: procid::ProcessId {
+                pid: u32::MAX,
+                start_time: 1,
+            },
+            systemd_unit: None,
+            warnings: Vec::new(),
+        };
+
+        // 1. Survivors reported by `stop_detached`: never write `exit.json`, report `running`.
+        let tmp1 = tempfile::tempdir().unwrap();
+        let current = procid::current().unwrap();
+        let err = finish_startup_timeout(
+            tmp1.path(),
+            "job-surv",
+            &dead_handle,
+            Ok(procid::KillTreeReport {
+                all_gone: false,
+                survivors: vec![current],
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(!tmp1.path().join(store::EXIT_FILE).exists());
+        let details = err.details.unwrap();
+        assert_eq!(details["state"], json!("running"));
+        assert_eq!(details["survivors"], json!([current.pid]));
+
+        // 2. Empty `stop_detached` report while the supervisor still holds `lock`: never write
+        //    `exit.json`, report `running`.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let guard = FileLock::try_lock_exclusive(tmp2.path().join(store::LOCK_FILE)).unwrap();
+        let err = finish_startup_timeout(
+            tmp2.path(),
+            "job-locked",
+            &dead_handle,
+            Ok(procid::KillTreeReport {
+                all_gone: true,
+                survivors: Vec::new(),
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(!tmp2.path().join(store::EXIT_FILE).exists());
+        assert_eq!(err.details.unwrap()["state"], json!("running"));
+        drop(guard);
+
+        // 3. `stop_detached` returned an error: never write `exit.json`, report `running`.
+        let tmp3 = tempfile::tempdir().unwrap();
+        let err = finish_startup_timeout(
+            tmp3.path(),
+            "job-stop-err",
+            &dead_handle,
+            Err(OsError::Platform {
+                detail: "simulated stop failure".into(),
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(!tmp3.path().join(store::EXIT_FILE).exists());
+        assert_eq!(err.details.unwrap()["state"], json!("running"));
+
+        // 4. Clean stop, free lock, inactive tree: writes `exit.json` as failed.
+        let tmp4 = tempfile::tempdir().unwrap();
+        let err = finish_startup_timeout(
+            tmp4.path(),
+            "job-clean",
+            &dead_handle,
+            Ok(procid::KillTreeReport {
+                all_gone: true,
+                survivors: Vec::new(),
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        let exit = read_exit_record(tmp4.path()).expect("exit.json should be written");
+        assert_eq!(exit.outcome, ExitOutcome::Failed);
+        assert_eq!(err.details.unwrap()["state"], json!("failed"));
     }
 }

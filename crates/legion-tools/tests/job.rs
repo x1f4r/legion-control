@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use legion_core::proto::ErrorCode;
 use legion_core::{Call, CancellationToken, Door, Node, Paths};
 use legion_os::detach::{DetachHandle, stop_detached};
+use legion_os::lock::FileLock;
 use legion_os::procid;
 use legion_tools::job::exclusive_running_jobs;
 use serde_json::{Value, json};
@@ -62,9 +63,16 @@ fn main() -> ExitCode {
         ("cancel_stops_the_whole_tree_and_reports_cancelled", || {
             Box::pin(cancel_stops_the_whole_tree_and_reports_cancelled())
         }),
+        ("cancel_stops_setsid_descendants_even_after_exit", || {
+            Box::pin(cancel_stops_setsid_descendants_even_after_exit())
+        }),
         (
             "forced_cancel_works_when_supervisor_was_killed_first",
             || Box::pin(forced_cancel_works_when_supervisor_was_killed_first()),
+        ),
+        (
+            "forced_cancel_without_handle_keeps_running_while_lock_held",
+            || Box::pin(forced_cancel_without_handle_keeps_running_while_lock_held()),
         ),
         ("killed_supervisor_and_reboot_yield_interrupted", || {
             Box::pin(killed_supervisor_and_reboot_yield_interrupted())
@@ -395,6 +403,60 @@ async fn output_is_captured_and_readable_incrementally() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgs);
+
+    // Non-rotated logs report `output_dropped: false` and omit `dropped_bytes`.
+    assert_eq!(rest["output_dropped"], json!(false));
+    assert!(rest.get("dropped_bytes").is_none());
+
+    // Rotated logs (`output.log.1` + `output.log` + `output.meta`) are read transparently across
+    // both segments and report `output_dropped: true` with `dropped_bytes`.
+    let jobs_root = fixture.node.paths().state_dir().join("jobs");
+    let boot = procid::boot_id().unwrap();
+    let rotated_dir = jobs_root.join("rotated-log-job");
+    write_synthetic_finished_job(
+        &jobs_root,
+        "rotated-log-job",
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:05.000Z",
+        &boot,
+    );
+    fs::write(rotated_dir.join("output.log.1"), "older-1\nolder-2\n").unwrap();
+    fs::write(rotated_dir.join("output.log"), "newer-3\nnewer-4\n").unwrap();
+    fs::write(
+        rotated_dir.join("output.meta"),
+        serde_json::to_vec(&json!({"dropped_bytes": 1024})).unwrap(),
+    )
+    .unwrap();
+
+    let rotated_status = fixture
+        .call("job.status", json!({"id": "rotated-log-job"}))
+        .await
+        .unwrap();
+    assert_eq!(rotated_status["output_bytes"], json!(32));
+
+    let rotated_offset = fixture
+        .call("job.logs", json!({"id": "rotated-log-job", "offset": 0}))
+        .await
+        .unwrap();
+    assert_eq!(rotated_offset["output_dropped"], json!(true));
+    assert_eq!(rotated_offset["dropped_bytes"], json!(1024));
+    assert_eq!(rotated_offset["offset"], json!(1024));
+    assert_eq!(rotated_offset["next_offset"], json!(1056));
+    assert_eq!(
+        rotated_offset["content"],
+        json!("older-1\nolder-2\nnewer-3\nnewer-4\n")
+    );
+
+    let rotated_tail = fixture
+        .call("job.logs", json!({"id": "rotated-log-job", "tail": 3}))
+        .await
+        .unwrap();
+    assert_eq!(rotated_tail["output_dropped"], json!(true));
+    assert_eq!(rotated_tail["dropped_bytes"], json!(1024));
+    assert_eq!(
+        rotated_tail["content"],
+        json!("older-2\nnewer-3\nnewer-4\n")
+    );
 }
 
 async fn exit_code_env_secrecy_and_wait_are_reported() {
@@ -438,13 +500,15 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         json!(["LEGION_TEST_EXIT", "LEGION_TEST_HELPER", "MY_API_SECRET"])
     );
 
-    // Confirm `job.json` never holds the secret value while private `env.json` does, and verify
-    // private permissions on Unix.
+    // Confirm `job.json` never holds the secret value, `env.json` was deleted as soon as the
+    // supervisor read it, and directory/file permissions stay private on Unix.
     let job_dir = fixture.node.paths().state_dir().join("jobs").join(&id);
     let record_text = fs::read_to_string(job_dir.join("job.json")).unwrap();
     assert!(!record_text.contains(secret), "{record_text}");
-    let env_text = fs::read_to_string(job_dir.join("env.json")).unwrap();
-    assert!(env_text.contains(secret));
+    assert!(
+        !job_dir.join("env.json").exists(),
+        "env.json should be deleted by the supervisor immediately after reading"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -452,10 +516,44 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         assert_eq!(mode(&fixture.node.paths().state_dir().join("jobs")), 0o700);
         assert_eq!(mode(&job_dir), 0o700);
         assert_eq!(mode(&job_dir.join("job.json")), 0o600);
-        assert_eq!(mode(&job_dir.join("env.json")), 0o600);
         assert_eq!(mode(&job_dir.join("exit.json")), 0o600);
         assert_eq!(mode(&job_dir.join("output.log")), 0o600);
     }
+
+    // Also verify `env.json` is deleted while a long-running job is still active, and
+    // `exit.reserve` is held while running and removed when `exit.json` is written.
+    let live = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("sleep", &["30"]),
+                json!({"env": {"EPHEMERAL_SECRET": "gone-fast"}}),
+            ),
+        )
+        .await
+        .unwrap();
+    let live_id = live["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&live_id);
+    let live_dir = fixture.node.paths().state_dir().join("jobs").join(&live_id);
+    let live_env = live_dir.join("env.json");
+    let live_reserve = live_dir.join("exit.reserve");
+    assert!(
+        wait_for(Duration::from_secs(5), || (!live_env.exists()
+            && live_reserve.exists())
+        .then_some(()))
+        .await
+        .is_some(),
+        "env.json persisted or exit.reserve was missing while job was running"
+    );
+    assert_eq!(fs::metadata(&live_reserve).unwrap().len(), 16 * 1024);
+    fixture
+        .call("job.cancel", json!({"id": live_id, "force": true}))
+        .await
+        .unwrap();
+    assert!(
+        !live_reserve.exists(),
+        "exit.reserve should be removed once exit.json is written"
+    );
 
     // Confirm `cmd` works through the platform shell and a missing executable records `failed`
     // with a clear detail.
@@ -539,6 +637,26 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         .unwrap();
     assert_eq!(env_logs["content"], json!("passed-through"));
 
+    // Confirm `state/audit.jsonl` kept the env variable names while redacting every value,
+    // including plain-named variables like `LEGION_CHECK_VAL`.
+    let audit_text = fs::read_to_string(fixture.node.paths().audit_log()).unwrap();
+    assert!(!audit_text.contains(secret), "{audit_text}");
+    assert!(!audit_text.contains("passed-through"), "{audit_text}");
+    assert!(audit_text.contains("MY_API_SECRET"), "{audit_text}");
+    assert!(audit_text.contains("LEGION_CHECK_VAL"), "{audit_text}");
+    let env_start_entry: Value = audit_text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|entry| {
+            entry["tool"] == json!("job.start")
+                && entry["args"]["env"].get("LEGION_CHECK_VAL").is_some()
+        })
+        .unwrap();
+    assert_eq!(
+        env_start_entry["args"]["env"]["LEGION_CHECK_VAL"],
+        json!({"redacted_bytes": "passed-through".len()})
+    );
+
     // Cancelling a finished job is not an error and returns its final state.
     let cancel_finished = fixture.call("job.cancel", json!({"id": id})).await.unwrap();
     assert_eq!(cancel_finished["state"], json!("failed"));
@@ -586,6 +704,127 @@ async fn cancel_stops_the_whole_tree_and_reports_cancelled() {
     assert!(status["finished"].is_string());
 }
 
+async fn cancel_stops_setsid_descendants_even_after_exit() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Linux transient systemd user scopes contain `setsid` descendants; other platforms have
+        // no cgroup boundary for a child that creates a new session.
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use legion_os::detach::detached_active;
+        let fixture = Fixture::new();
+        let mut cleanup = Cleanup::new(&fixture);
+
+        // Case 1: Normal `job.cancel` (force: false) must also sweep a `setsid` child inside the
+        // detached scope after the supervisor finishes cooperative cancellation.
+        let pids_file = fixture.dir.path().join("setsid-live.pids");
+        let cmd = concat!(
+            "setsid \"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
+            "p1=$!; ",
+            "\"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
+            "p2=$!; ",
+            "printf '%s %s\\n' \"$p1\" \"$p2\" > \"$PIDS_FILE.partial\" && ",
+            "mv \"$PIDS_FILE.partial\" \"$PIDS_FILE\"; ",
+            "wait \"$p2\""
+        );
+        let started = fixture
+            .call(
+                "job.start",
+                json!({
+                    "cmd": cmd,
+                    "env": {
+                        HELPER: "sleep",
+                        "LEGION_BIN": this_binary(),
+                        "PIDS_FILE": pids_file.to_string_lossy(),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap().to_owned();
+        cleanup.track_job(&id);
+
+        let pids = read_pids(&pids_file).await;
+        cleanup.track_pids(&pids);
+        assert_eq!(pids.len(), 2);
+
+        let status = fixture.call("job.status", json!({"id": id})).await.unwrap();
+        let handle: DetachHandle = serde_json::from_value(status["detach"].clone()).unwrap();
+        let has_scope = handle.systemd_unit.is_some();
+
+        let cancelled = fixture.call("job.cancel", json!({"id": id})).await.unwrap();
+        assert_eq!(cancelled["state"], json!("cancelled"), "{cancelled:#}");
+        assert_eq!(cancelled["survivors"], json!([]));
+        assert!(gone(pids[1]).await, "foreground child survived cancel");
+        if has_scope {
+            assert!(
+                gone(pids[0]).await,
+                "setsid child {} survived normal job.cancel",
+                pids[0]
+            );
+            assert!(
+                !detached_active(&handle).await.unwrap(),
+                "detached scope remained active after cancel reported cancelled"
+            );
+        }
+
+        // Case 2: A command exits 0 (writing `exit.json`) while leaving a `setsid` child running;
+        // calling `job.cancel` on the finished job sweeps the detached handle and keeps `succeeded`.
+        let orphan_file = fixture.dir.path().join("setsid-after-exit.pids");
+        let exit_cmd = concat!(
+            "setsid \"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
+            "printf '%s\\n' \"$!\" > \"$PIDS_FILE.partial\" && ",
+            "mv \"$PIDS_FILE.partial\" \"$PIDS_FILE\""
+        );
+        let started2 = fixture
+            .call(
+                "job.start",
+                json!({
+                    "cmd": exit_cmd,
+                    "env": {
+                        HELPER: "sleep",
+                        "LEGION_BIN": this_binary(),
+                        "PIDS_FILE": orphan_file.to_string_lossy(),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let id2 = started2["id"].as_str().unwrap().to_owned();
+        cleanup.track_job(&id2);
+
+        let orphan_pids = read_pids(&orphan_file).await;
+        cleanup.track_pids(&orphan_pids);
+        assert_eq!(orphan_pids.len(), 1);
+        let waited = fixture
+            .call("job.wait", json!({"id": id2, "timeout_s": 15}))
+            .await
+            .unwrap();
+        assert_eq!(waited["state"], json!("succeeded"), "{waited:#}");
+        let handle2: DetachHandle = serde_json::from_value(waited["detach"].clone()).unwrap();
+        if handle2.systemd_unit.is_some() {
+            assert!(
+                alive(orphan_pids[0]),
+                "setsid descendant exited before cancel was tested"
+            );
+            let swept = fixture
+                .call("job.cancel", json!({"id": id2}))
+                .await
+                .unwrap();
+            assert_eq!(swept["state"], json!("succeeded"), "{swept:#}");
+            assert_eq!(swept["survivors"], json!([]));
+            assert!(
+                gone(orphan_pids[0]).await,
+                "setsid child {} survived cancel on finished job",
+                orphan_pids[0]
+            );
+            assert!(!detached_active(&handle2).await.unwrap());
+        }
+    }
+}
+
 async fn forced_cancel_works_when_supervisor_was_killed_first() {
     let fixture = Fixture::new();
     let mut cleanup = Cleanup::new(&fixture);
@@ -619,46 +858,100 @@ async fn forced_cancel_works_when_supervisor_was_killed_first() {
     assert_eq!(killed["stopped"], json!(true), "{killed:#}");
     assert!(gone(sup_pid).await, "supervisor {sup_pid} stayed alive");
 
-    // With the supervisor gone and no exit record, state is `interrupted`.
+    // With the supervisor gone while the command tree still runs, the job stays `running` with
+    // `supervised: false`, and forced cancel stops the detached handle and records `cancelled`.
     let mid = fixture.call("job.status", json!({"id": id})).await.unwrap();
-    assert_eq!(mid["state"], json!("interrupted"), "{mid:#}");
+    if mid["state"] == json!("running") {
+        assert_eq!(mid["supervised"], json!(false), "{mid:#}");
 
-    // Forced cancel stops the detached handle and records the job as cancelled & forced.
-    let cancelled = fixture
-        .call("job.cancel", json!({"id": id, "force": true}))
-        .await
-        .unwrap();
-    assert_eq!(cancelled["state"], json!("cancelled"), "{cancelled:#}");
-    assert_eq!(cancelled["survivors"], json!([]));
+        let cancelled = fixture
+            .call("job.cancel", json!({"id": id, "force": true}))
+            .await
+            .unwrap();
+        assert_eq!(cancelled["state"], json!("cancelled"), "{cancelled:#}");
+        assert_eq!(cancelled["survivors"], json!([]));
 
-    let after = fixture.call("job.status", json!({"id": id})).await.unwrap();
-    assert_eq!(after["state"], json!("cancelled"), "{after:#}");
+        let after = fixture.call("job.status", json!({"id": id})).await.unwrap();
+        assert_eq!(after["state"], json!("cancelled"), "{after:#}");
 
-    let exit_json: Value = serde_json::from_slice(
-        &fs::read(
-            fixture
-                .node
-                .paths()
-                .state_dir()
-                .join("jobs")
-                .join(&id)
-                .join("exit.json"),
+        let exit_json: Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .node
+                    .paths()
+                    .state_dir()
+                    .join("jobs")
+                    .join(&id)
+                    .join("exit.json"),
+            )
+            .unwrap(),
         )
+        .unwrap();
+        assert_eq!(exit_json["forced"], json!(true));
+
+        if has_systemd_unit || cfg!(windows) {
+            for pid in family {
+                assert!(
+                    gone(pid).await,
+                    "descendant {pid} survived forced cancel of systemd scope"
+                );
+            }
+        }
+    } else {
+        assert_eq!(mid["state"], json!("interrupted"), "{mid:#}");
+        let cancelled = fixture
+            .call("job.cancel", json!({"id": id, "force": true}))
+            .await
+            .unwrap();
+        assert_eq!(cancelled["state"], json!("interrupted"), "{cancelled:#}");
+        assert_eq!(cancelled["survivors"], json!([]));
+    }
+}
+
+async fn forced_cancel_without_handle_keeps_running_while_lock_held() {
+    let fixture = Fixture::new();
+    let jobs_root = fixture.node.paths().state_dir().join("jobs");
+    let id = "locked-no-handle";
+    let dir = jobs_root.join(id);
+    fs::create_dir_all(&dir).unwrap();
+
+    // Simulate a job whose starter died between spawning the supervisor and writing `detach`
+    // into `job.json`, while the supervisor still holds `lock`.
+    let boot = procid::boot_id().unwrap();
+    let created = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    fs::write(
+        dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": id,
+            "name": "no-handle",
+            "cmd": "sleep 60",
+            "env_names": [],
+            "principal": "owner",
+            "created": created,
+            "boot_id": boot,
+            "exclusive": false
+        }))
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(exit_json["forced"], json!(true));
+    let guard = FileLock::try_lock_exclusive(dir.join("lock")).unwrap();
 
-    // When Linux systemd scope containment is active (or on Windows where closing the Job Object
-    // kills descendants), verify the orphaned command tree is also gone.
-    if has_systemd_unit || cfg!(windows) {
-        for pid in family {
-            assert!(
-                gone(pid).await,
-                "descendant {pid} survived forced cancel of systemd scope"
-            );
-        }
-    }
+    let res = fixture
+        .call("job.cancel", json!({"id": id, "force": true}))
+        .await
+        .unwrap();
+    assert_eq!(res["state"], json!("running"), "{res:#}");
+    assert_eq!(res["survivors"], json!([]));
+    assert!(
+        !dir.join("exit.json").exists(),
+        "forced cancel wrote exit.json while the job lock was still held"
+    );
+
+    let status = fixture.call("job.status", json!({"id": id})).await.unwrap();
+    assert_eq!(status["state"], json!("running"), "{status:#}");
+    let _ = guard.unlock();
 }
 
 async fn killed_supervisor_and_reboot_yield_interrupted() {
@@ -669,7 +962,10 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
     let started = fixture
         .call(
             "job.start",
-            job_helper_args("family", &[&pids_file.to_string_lossy()]),
+            merge_args(
+                job_helper_args("family", &[&pids_file.to_string_lossy()]),
+                json!({"name": "unsupervised-test", "exclusive": true}),
+            ),
         )
         .await
         .unwrap();
@@ -680,8 +976,12 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
     cleanup.track_pids(&family);
 
     let running = fixture.call("job.status", json!({"id": id})).await.unwrap();
+    assert_eq!(running["state"], json!("running"));
+    assert_eq!(running["supervised"], json!(true));
     let sup_pid = running["detach"]["process"]["pid"].as_u64().unwrap() as u32;
 
+    // Kill ONLY the supervisor: on Unix the command family keeps running under the detached handle,
+    // so derived state must stay `running` with `supervised: false` and keep counting as busy.
     fixture
         .call(
             "sys.kill",
@@ -691,12 +991,40 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
         .unwrap();
     assert!(gone(sup_pid).await);
 
+    if family.iter().any(|&pid| alive(pid)) {
+        let unsupervised = fixture.call("job.status", json!({"id": id})).await.unwrap();
+        assert_eq!(unsupervised["state"], json!("running"), "{unsupervised:#}");
+        assert_eq!(unsupervised["supervised"], json!(false), "{unsupervised:#}");
+        let detail = unsupervised["detail"].as_str().unwrap();
+        assert!(detail.contains("supervisor"), "{detail}");
+        assert!(detail.contains("output"), "{detail}");
+        assert!(detail.contains("job.cancel"), "{detail}");
+
+        let busy = exclusive_running_jobs(fixture.node.paths()).unwrap();
+        assert!(
+            busy.iter().any(|job| job.id == id),
+            "unsupervised exclusive job stopped counting as busy: {busy:?}"
+        );
+
+        // Now kill the remaining command processes so nothing under the handle is active.
+        for &pid in &family {
+            if alive(pid) {
+                let _ = fixture
+                    .call("sys.kill", json!({"pid": pid, "tree": true, "force": true}))
+                    .await;
+                assert!(gone(pid).await, "process {pid} stayed alive");
+            }
+        }
+    }
+
+    // Once nothing is active and no exit record exists, state becomes `interrupted` and busy clears.
     let interrupted = fixture.call("job.status", json!({"id": id})).await.unwrap();
     assert_eq!(
         interrupted["state"],
         json!("interrupted"),
         "{interrupted:#}"
     );
+    assert!(interrupted.get("supervised").is_none());
     let detail = interrupted["detail"].as_str().unwrap();
     assert!(
         detail.contains("supervisor") && detail.contains(&sup_pid.to_string()),
@@ -706,15 +1034,34 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
         detail.contains('s'),
         "detail should mention duration: {detail}"
     );
+    assert!(
+        exclusive_running_jobs(fixture.node.paths())
+            .unwrap()
+            .is_empty()
+    );
+
+    // Cancelling an already-dead same-boot interrupted job (normal or forced) must NOT write
+    // `exit.json` or `cancel`, and must report `interrupted`.
+    let job_dir = fixture.node.paths().state_dir().join("jobs").join(&id);
+    for force in [false, true] {
+        let res = fixture
+            .call("job.cancel", json!({"id": id, "force": force}))
+            .await
+            .unwrap();
+        assert_eq!(res["state"], json!("interrupted"), "force={force}: {res:#}");
+        assert_eq!(res["survivors"], json!([]));
+        assert!(
+            !job_dir.join("exit.json").exists(),
+            "cancel overwrote interrupted job with exit.json (force={force})"
+        );
+        assert!(
+            !job_dir.join("cancel").exists(),
+            "cancel created cancel marker on interrupted job (force={force})"
+        );
+    }
 
     // Also simulate a machine reboot by replacing `boot_id` in `job.json`.
-    let job_json_path = fixture
-        .node
-        .paths()
-        .state_dir()
-        .join("jobs")
-        .join(&id)
-        .join("job.json");
+    let job_json_path = job_dir.join("job.json");
     let mut rec: Value = serde_json::from_slice(&fs::read(&job_json_path).unwrap()).unwrap();
     rec["boot_id"] = json!("00000000-0000-0000-0000-000000000000");
     fs::write(&job_json_path, serde_json::to_vec(&rec).unwrap()).unwrap();
@@ -724,6 +1071,28 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
     assert!(
         rebooted["detail"].as_str().unwrap().contains("rebooted"),
         "{rebooted:#}"
+    );
+
+    // Cancelling a rebooted job (normal or forced) must preserve `interrupted` without touching
+    // disk.
+    for force in [false, true] {
+        let res = fixture
+            .call("job.cancel", json!({"id": id, "force": force}))
+            .await
+            .unwrap();
+        assert_eq!(res["state"], json!("interrupted"), "force={force}: {res:#}");
+        assert_eq!(res["survivors"], json!([]));
+        assert!(!job_dir.join("exit.json").exists());
+        assert!(!job_dir.join("cancel").exists());
+    }
+    let after_cancel = fixture.call("job.status", json!({"id": id})).await.unwrap();
+    assert_eq!(after_cancel["state"], json!("interrupted"));
+    assert!(
+        after_cancel["detail"]
+            .as_str()
+            .unwrap()
+            .contains("rebooted"),
+        "{after_cancel:#}"
     );
 }
 
@@ -829,6 +1198,155 @@ async fn idempotent_key_deduplicates_conflicts_and_concurrent_starts() {
         .call("job.cancel", json!({"id": race_id, "force": true}))
         .await
         .unwrap();
+
+    // Failed starts whose supervisor never took the lock do not match `key` and are replaced on
+    // retry (even if the retried command differs).
+    let jobs_root = fixture.node.paths().state_dir().join("jobs");
+    let boot = procid::boot_id().unwrap();
+    let old_created = "2026-01-01T00:00:00.000Z";
+
+    // (a) `exit.json` recorded with `startup_failed: true`.
+    let startup_fail_dir = jobs_root.join("seed-startup-fail");
+    fs::create_dir_all(&startup_fail_dir).unwrap();
+    fs::write(
+        startup_fail_dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": "seed-startup-fail",
+            "name": "bad-start",
+            "key": "retry-after-startup-fail",
+            "cmd": "echo broken",
+            "env_names": [],
+            "principal": "owner",
+            "created": old_created,
+            "boot_id": boot,
+            "exclusive": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        startup_fail_dir.join("exit.json"),
+        serde_json::to_vec(&json!({
+            "outcome": "failed",
+            "finished": old_created,
+            "forced": false,
+            "startup_failed": true,
+            "detail": "Could not launch the detached job supervisor."
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let replaced = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("args", &["recovered"]),
+                json!({"key": "retry-after-startup-fail"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let replaced_id = replaced["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&replaced_id);
+    assert_eq!(replaced["existing"], json!(false), "{replaced:#}");
+    assert_ne!(replaced_id, "seed-startup-fail");
+    fixture
+        .call("job.wait", json!({"id": replaced_id, "timeout_s": 15}))
+        .await
+        .unwrap();
+    let again = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("args", &["recovered"]),
+                json!({"key": "retry-after-startup-fail"}),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["id"], json!(replaced_id));
+    assert_eq!(again["existing"], json!(true));
+
+    // (b) Expired interrupted job whose supervisor never created `lock`.
+    let never_locked_dir = jobs_root.join("seed-never-locked");
+    fs::create_dir_all(&never_locked_dir).unwrap();
+    fs::write(
+        never_locked_dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": "seed-never-locked",
+            "name": "aborted-start",
+            "key": "retry-after-never-locked",
+            "cmd": "echo never-ran",
+            "env_names": [],
+            "principal": "owner",
+            "created": old_created,
+            "boot_id": boot,
+            "exclusive": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let replaced2 = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("args", &["started-now"]),
+                json!({"key": "retry-after-never-locked"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let replaced2_id = replaced2["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&replaced2_id);
+    assert_eq!(replaced2["existing"], json!(false), "{replaced2:#}");
+    assert_ne!(replaced2_id, "seed-never-locked");
+    fixture
+        .call("job.wait", json!({"id": replaced2_id, "timeout_s": 15}))
+        .await
+        .unwrap();
+
+    // (c) An interrupted job whose supervisor DID take `lock` (ran before crashing/rebooting)
+    // still matches its key.
+    let ran_interrupted_dir = jobs_root.join("seed-ran-interrupted");
+    fs::create_dir_all(&ran_interrupted_dir).unwrap();
+    fs::write(
+        ran_interrupted_dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": "seed-ran-interrupted",
+            "name": "ran-before-reboot",
+            "key": "ran-then-rebooted",
+            "cmd": "echo ran",
+            "env_names": [],
+            "principal": "owner",
+            "created": old_created,
+            "boot_id": "00000000-0000-0000-0000-000000000000",
+            "exclusive": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(ran_interrupted_dir.join("lock"), b"").unwrap();
+    let matched_interrupted = fixture
+        .call(
+            "job.start",
+            json!({"cmd": "echo ran", "key": "ran-then-rebooted"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(matched_interrupted["id"], json!("seed-ran-interrupted"));
+    assert_eq!(matched_interrupted["existing"], json!(true));
+    assert_eq!(matched_interrupted["state"], json!("interrupted"));
+
+    // Confirm the `job.start` tool description documents the key-matching rule.
+    let tools = legion_tools::registry().specs();
+    let start_spec = tools.iter().find(|spec| spec.name == "job.start").unwrap();
+    assert!(
+        start_spec.description.contains("never took the lock"),
+        "{}",
+        start_spec.description
+    );
 }
 
 async fn retention_prunes_old_and_excess_finished_jobs_only() {
@@ -863,6 +1381,30 @@ async fn retention_prunes_old_and_excess_finished_jobs_only() {
     let old_str = old_ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     write_synthetic_finished_job(&jobs_root, "expired-old", &old_str, &old_str, &boot);
 
+    // Seed a leftover `.deleting-*` tombstone directory containing a `job.json` and `output.log`:
+    // `job.list` must ignore it and the next `job.start` retention pass must sweep it.
+    let tombstone = jobs_root.join(".deleting-stale-tombstone");
+    write_synthetic_finished_job(
+        &jobs_root,
+        ".deleting-stale-tombstone",
+        &old_str,
+        &old_str,
+        &boot,
+    );
+    fs::write(tombstone.join("output.log"), b"leftover").unwrap();
+    let before_list = fixture
+        .call("job.list", json!({"limit": 500}))
+        .await
+        .unwrap();
+    assert!(
+        !before_list["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == json!(".deleting-stale-tombstone")),
+        "job.list must ignore tombstone directories"
+    );
+
     // Starting a new job triggers retention pruning.
     let fresh = fixture
         .call("job.start", support_helper_args("args", &["trigger"]))
@@ -875,7 +1417,16 @@ async fn retention_prunes_old_and_excess_finished_jobs_only() {
         .await
         .unwrap();
 
-    // The 31-day-old job and the 3 oldest excess finished jobs are gone; the newest 200 survive.
+    // The leftover tombstone, 31-day-old job, and 3 oldest excess finished jobs are gone; no
+    // `.deleting-*` tombstones remain; the newest 200 survive.
+    assert!(!tombstone.exists(), "tombstone directory was not swept");
+    assert!(
+        !fs::read_dir(&jobs_root)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".deleting-")),
+        "leftover tombstone remained after retention"
+    );
     assert!(!jobs_root.join("expired-old").exists());
     for oldest in &seeded_recent[..3] {
         assert!(!jobs_root.join(oldest).exists(), "{oldest} was not pruned");
@@ -933,6 +1484,7 @@ async fn a_role_without_exec_is_denied_and_cwd_is_confined() {
         "policy.toml",
         concat!(
             "[principals.observer]\nrole = \"observer\"\n",
+            "[principals.operator]\nrole = \"builder\"\n",
             "[principals.\"agent:claude\"]\nrole = \"builder\"\n",
             "[roles.observer]\nallow = [\"effect:read\"]\n",
             "[roles.builder]\nallow = [\"effect:read\", \"effect:exec\"]\npaths = [\"~/projects/**\"]\n",
@@ -993,6 +1545,59 @@ async fn a_role_without_exec_is_denied_and_cwd_is_confined() {
         .await
         .unwrap_err();
     assert_eq!(denied_cwd.code, ErrorCode::Denied);
+
+    // Cross-principal visibility model: any `read` principal sees every job's command and output,
+    // and any `exec` principal can cancel any job; `job.list`, `job.logs`, and `job.cancel` state
+    // this in their tool descriptions.
+    let observer_list = fixture
+        .call_as("observer", "job.list", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        observer_list["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == json!(ok_id) && !j["command"].as_str().unwrap().is_empty())
+    );
+    let observer_logs = fixture
+        .call_as("observer", "job.logs", json!({"id": ok_id}))
+        .await
+        .unwrap();
+    assert!(!observer_logs["content"].as_str().unwrap().is_empty());
+
+    let sleeper = fixture
+        .call_as(
+            "agent:claude",
+            "job.start",
+            merge_args(
+                support_helper_args("sleep", &["30"]),
+                json!({"cwd": "~/projects/app"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let sleep_id = sleeper["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&sleep_id);
+    let cancelled = fixture
+        .call_as("operator", "job.cancel", json!({"id": sleep_id}))
+        .await
+        .unwrap();
+    assert_eq!(cancelled["state"], json!("cancelled"));
+
+    let specs = legion_tools::registry().specs();
+    for (name, needle) in [
+        ("job.list", "Any principal with the read effect"),
+        ("job.logs", "Any principal with the read effect"),
+        ("job.cancel", "Any principal with the exec effect"),
+    ] {
+        let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+        assert!(
+            spec.description.contains(needle),
+            "{name} description missing visibility rule: {}",
+            spec.description
+        );
+    }
 }
 
 async fn reading_state_never_writes() {
