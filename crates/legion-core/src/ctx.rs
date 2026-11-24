@@ -27,6 +27,9 @@ pub enum Door {
     Http,
     /// `legion rpc`, the pipe other nodes and clients use.
     Rpc,
+    /// `legion stream`, the pipe bulk file data moves over, and the ends of a transfer this node
+    /// serves itself.
+    Stream,
 }
 
 impl Door {
@@ -37,6 +40,7 @@ impl Door {
             Door::Mcp => "mcp",
             Door::Http => "http",
             Door::Rpc => "rpc",
+            Door::Stream => "stream",
         }
     }
 }
