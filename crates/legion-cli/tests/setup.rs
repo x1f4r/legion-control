@@ -960,6 +960,36 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
             .starts_with("fleet: ")),
         "{quick_checks:?}"
     );
+
+    // Roles that allow a specific built-in exec tool (`proj.pull`) or a live exec extension
+    // (`ops.deploy` matched by `ops.*`) are both caught and named in the warning.
+    let defined = laptop.run(&[
+        "ext.define",
+        "name=ops.deploy",
+        "description=Deploy service.",
+        "effect=exec",
+        "cmd=echo deploy",
+    ]);
+    assert_eq!(defined.code, 0, "{}", defined.stdout);
+    let mut policy = fs::read_to_string(config_dir(&laptop).join("policy.toml")).unwrap();
+    policy.push_str(
+        "\n[roles.puller]\nallow = [\"proj.pull\"]\n\
+         [roles.deployer]\nallow = [\"ops.*\"]\n",
+    );
+    laptop.write_config("policy.toml", &policy);
+
+    let after_ext = laptop.run(&["meta.doctor", "quick=true"]);
+    assert_eq!(after_ext.code, 0, "{}", after_ext.stderr);
+    let ext_warn = after_ext.json()["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == json!("policy exec roles"))
+        .unwrap()
+        .clone();
+    let ext_detail = ext_warn["detail"].as_str().unwrap();
+    assert!(ext_detail.contains("puller (proj.pull)"), "{ext_warn}");
+    assert!(ext_detail.contains("deployer (ops.deploy)"), "{ext_warn}");
 }
 
 fn secret_locations_refused_and_skipped_in_recursive_tools() {
