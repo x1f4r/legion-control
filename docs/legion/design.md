@@ -429,6 +429,10 @@ Traps the Node agent already paid for, which the Rust code handles from the star
 - Routing, sessions, fan-out and transfer are tested against a second node started through the
   `command` connector with its own `LEGION_HOME`: the same code path as ssh without needing an
   ssh server.
+- What only ssh brings (the client, sshd, the far side's shell, the fixed remote commands, scp,
+  `legion gate`) is tested end to end by `.github/workflows/legion-e2e.yml` on Linux, macOS and
+  Windows, the last with cmd and with PowerShell as sshd's shell, against a second node on the
+  same runner reached through a loopback sshd.
 - Nothing in a test reads or writes outside its temporary directory, the network, or the real
   configuration of the machine it runs on.
 

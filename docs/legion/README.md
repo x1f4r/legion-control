@@ -188,6 +188,21 @@ dry_run          false
 Output is formatted for reading on a terminal and printed as compact JSON when piped to another
 program; pass `--json` to get JSON anywhere.
 
+## What is tested where
+
+The unit and integration suites run on Linux, macOS, and Windows on every pull request; they reach
+"another machine" through a local `command` connector with its own `LEGION_HOME`, so routing,
+sessions, transfer, jobs, and policy are covered on each OS, but without ssh. The `Legion e2e`
+workflow (`scripts/legion-e2e.mjs`) covers that last part: on each of the three, and on Windows
+once with cmd and once with PowerShell as sshd's shell, it installs with the install script,
+reaches a second node on the same runner through a real loopback sshd, and runs `fleet.install`,
+routed calls with awkward arguments, file transfer, jobs that outlive their session, policy and
+both audit logs across the hop, a key forced to `legion gate`, services, power as read-only and dry
+runs, MCP, and an extension tool. By hand, Legion has run between real Linux and macOS machines,
+but the power tools only ever with `dry_run`: a real sleep, restart, shutdown, or wake of a
+physical machine and switching a dual-boot machine to its other system have never been tested,
+and neither has Legion between two separate Windows machines or user accounts.
+
 ## Documentation map
 
 | Page | What it covers |

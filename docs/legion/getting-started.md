@@ -61,11 +61,13 @@ sh install/legion.sh --from target/release/legion # install a local binary offli
 sh install/legion.sh --insecure-skip-verify       # skip signature/attestation (still checks SHA-256)
 ```
 
-macOS behaviour was verified from code (`install/legion.sh`) rather than run here.
+On macOS, `--from` runs in CI (the `Legion e2e` workflow); downloading and verifying a release was
+checked from code (`install/legion.sh`).
 
 ### Windows (installer script)
 
-*(Not run here; documented from `install/legion.ps1`.)*
+*(`-From` runs in CI, in the `Legion e2e` workflow; downloading and verifying a release is
+documented from `install/legion.ps1`.)*
 
 Run the PowerShell installer as your own user (no administrator rights required):
 
