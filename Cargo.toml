@@ -17,6 +17,7 @@ legion-tools = { path = "crates/legion-tools" }
 dunce = "1.0.5"
 gethostname = "1.1.0"
 jiff = { version = "1.0.2", default-features = false, features = ["std"] }
+same-file = "1.0.6"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_ignored = "0.1.14"
@@ -28,6 +29,18 @@ tempfile = "3.27.0"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
+legion-os = { path = "crates/legion-os" }
+nix = { version = "0.31.1", default-features = false, features = ["signal"] }
+# Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.
+sysinfo = { version = "0.40.4", default-features = false, features = ["system", "disk", "user"] }
+base64 = "0.23.1"
+blake3 = "1.8.7"
+globset = "0.4.22"
+ignore = "0.4.35"
+regex = "1.13.2"
+legion-doors = { path = "crates/legion-doors" }
+# The official MCP SDK; it speaks the revisions with and without the initialize handshake.
+rmcp = { version = "3.11.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

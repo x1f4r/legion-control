@@ -1,5 +1,7 @@
 //! `audit`: what was called on this node, by whom, and how it ended.
 
+use std::io;
+
 use legion_core::audit::{AuditLog, Filter, Tail};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Ctx, Registry, ToolError};
@@ -70,7 +72,9 @@ async fn tail(ctx: &Ctx, args: TailArgs) -> Result<Tail, ToolError> {
     };
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
     let path = log.path().to_path_buf();
-    tokio::task::spawn_blocking(move || log.tail(limit, &filter))
+    // A blocking read cannot be dropped, so it is handed the call's token and stops at it.
+    let cancel = ctx.cancel_token().clone();
+    tokio::task::spawn_blocking(move || log.tail(limit, &filter, &cancel))
         .await
         .map_err(|error| {
             ErrorBody::new(
@@ -79,9 +83,16 @@ async fn tail(ctx: &Ctx, args: TailArgs) -> Result<Tail, ToolError> {
             )
         })?
         .map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("The audit log {} cannot be read: {error}.", path.display()),
-            )
+            if error.kind() == io::ErrorKind::Interrupted {
+                ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "audit.tail was cancelled before it had read far enough.",
+                )
+            } else {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("The audit log {} cannot be read: {error}.", path.display()),
+                )
+            }
         })
 }

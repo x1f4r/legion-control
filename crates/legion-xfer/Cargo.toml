@@ -1,0 +1,17 @@
+[package]
+name = "legion-xfer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "File transfer engine for trees, hashes, archives, and resumable byte streams"
+
+[dependencies]
+blake3 = "1.8.7"
+globset = "0.4.22"
+serde = { version = "1.0.229", features = ["derive"] }
+tar = "0.4.46"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+serde_json = "1.0.154"
+tempfile = "3.27.0"

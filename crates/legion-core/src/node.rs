@@ -2,7 +2,7 @@
 //! through.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use legion_proto::{ErrorBody, ErrorCode, HelloParams, HelloResult, PROTOCOL, ToolSpec};
 use serde_json::Value;
@@ -17,6 +17,15 @@ use crate::registry::Registry;
 
 /// The version of legion this is; every crate in the workspace shares it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long a cancelled tool has to stop on its own before its future is dropped.
+///
+/// Dropping a future stops only the part of the work that runs inside it: a blocking thread it
+/// started, a child process or a call it forwarded carry on, and would still be changing things
+/// after the call was reported as cancelled. So a cancel first cancels the context's token, and
+/// whatever the tool returns within this time is the call's result. Long enough to stop a process
+/// tree or pass the cancel on, short enough that a tool that never looks does not hold the caller.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 /// One call, as a door hands it to [`Node::call`].
 #[derive(Debug)]
@@ -166,6 +175,9 @@ impl Node {
     ///
     /// `policy.toml` is read for every call, so an edit applies to the next one. A file that does
     /// not parse fails the call; nothing falls back to a default that could allow more.
+    ///
+    /// Cancelling `call.cancel` cancels the tool's context, and the call ends with what the tool
+    /// returns within [`CANCEL_GRACE`], or as `cancelled` when it has not returned by then.
     pub async fn call(&self, call: Call) -> Result<Value, ErrorBody> {
         let started = Instant::now();
         let name = self.name();
@@ -191,7 +203,10 @@ impl Node {
             },
             duration: (started.elapsed().as_secs_f64() * 1e6).round() / 1e6,
             args: recorded_args,
-            message: result.as_ref().err().map(|error| error.message.clone()),
+            message: result
+                .as_ref()
+                .err()
+                .map(|error| audit::redact_message(&error.message)),
         };
         let log = self.inner.audit.clone();
         let written = tokio::task::spawn_blocking(move || log.append(&entry)).await;
@@ -230,7 +245,7 @@ impl Node {
         let Some(tool) = self.inner.registry.get(&call.tool) else {
             return (Some(principal), Err(self.unknown_tool(&call.tool, name)));
         };
-        let grant = match policy.authorize(&principal, tool.spec(), self.inner.paths.home()) {
+        let grant = match policy.authorize(&principal, tool.spec(), &self.inner.paths) {
             Ok(grant) => grant,
             Err(error) => return (Some(principal), Err(error)),
         };
@@ -246,13 +261,18 @@ impl Node {
             cancel: call.cancel.clone(),
             events: call.events,
         };
-        // The tool's future is dropped the moment the call is cancelled, so a cancel is honoured
-        // even by a tool that never looks; tools that hold something outside the process release
-        // it in a Drop guard.
+        let work = tool.call(&ctx, call.args);
+        tokio::pin!(work);
         let result = tokio::select! {
-            biased;
-            () = call.cancel.cancelled() => Err(cancelled(&call.tool)),
-            result = tool.call(&ctx, call.args) => result,
+            result = &mut work => result,
+            () = call.cancel.cancelled() => {
+                // The tool sees the same token through its context. A result it had ready when the
+                // cancel came, or returns after cleaning up, is the call's result.
+                match tokio::time::timeout(CANCEL_GRACE, &mut work).await {
+                    Ok(result) => result,
+                    Err(_) => Err(cancelled(&call.tool)),
+                }
+            }
         };
         (Some(principal), result)
     }

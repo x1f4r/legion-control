@@ -1,0 +1,819 @@
+//! Atomic file creation, replacement, and streaming writes.
+//!
+//! Files are always written to a sibling temporary file in the destination directory, flushed
+//! and synced to storage, and then atomically renamed over the target. On Windows, renames
+//! over an existing file can transiently fail while search indexers, antivirus scanners, or
+//! concurrent readers hold a handle, so [`replace_file`] retries the rename with short backoff
+//! rather than ever deleting the destination first.
+
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::io::{AsyncRead, AsyncWriteExt};
+
+use crate::{OsError, Result};
+
+#[cfg(unix)]
+#[path = "atomic/unix.rs"]
+mod platform;
+
+#[cfg(windows)]
+#[path = "atomic/windows.rs"]
+mod platform;
+
+/// How long [`replace_file`] keeps retrying transient Windows sharing violations.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_REPLACE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Initial backoff pause between Windows rename retries.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Maximum backoff pause between Windows rename retries.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_MAX_BACKOFF: Duration = Duration::from_millis(100);
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Options controlling atomic file writes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteOptions {
+    /// Unix permission bits (for example `0o600` or `0o644`) to apply when creating a new file.
+    ///
+    /// When the target file already exists, its existing permissions are preserved instead so
+    /// atomic rewrites never widen or alter permissions unexpectedly. Ignored on Windows.
+    pub mode: Option<u32>,
+    /// When `true`, create the target exclusively and fail with [`OsError::AlreadyExists`] if it
+    /// already exists instead of replacing it.
+    ///
+    /// Commits atomically via hard-link (`std::fs::hard_link`) followed by unlinking the temporary
+    /// name so concurrent creators never overwrite each other. On filesystems that do not support
+    /// hard links (such as FAT/exFAT), falls back to a best-effort existence check plus rename.
+    pub no_replace: bool,
+}
+
+impl WriteOptions {
+    /// Create options requesting a specific Unix mode for newly created files.
+    pub fn with_mode(mode: u32) -> Self {
+        Self {
+            mode: Some(mode),
+            no_replace: false,
+        }
+    }
+
+    /// Create options requesting exclusive file creation (`no_replace = true`).
+    pub fn create_new() -> Self {
+        Self {
+            mode: None,
+            no_replace: true,
+        }
+    }
+
+    /// Set the Unix permission mode applied to newly created files.
+    pub fn mode(mut self, mode: u32) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    /// Require that the target path does not already exist.
+    pub fn no_replace(mut self, no_replace: bool) -> Self {
+        self.no_replace = no_replace;
+        self
+    }
+}
+
+/// Write `bytes` to `path` atomically.
+///
+/// The data is written to a temporary file in the same directory, flushed and synced to disk,
+/// and renamed over `path`. If any step fails, the temporary file is removed and `path` is
+/// left untouched.
+pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8], options: WriteOptions) -> Result<()> {
+    let mut cursor = io::Cursor::new(bytes);
+    write_atomic_from_reader(path, &mut cursor, options)?;
+    Ok(())
+}
+
+/// Stream all bytes from `reader` into `path` atomically, returning the number of bytes written.
+///
+/// If reading, writing, syncing, or renaming fails, the temporary file is removed and the
+/// target path is never left partially written.
+pub fn write_atomic_from_reader<R: Read>(
+    path: impl AsRef<Path>,
+    reader: &mut R,
+    options: WriteOptions,
+) -> Result<u64> {
+    let target = path.as_ref();
+    let (parent, existing_meta) = inspect_target(target, options.no_replace)?;
+    let (mut file, mut guard) =
+        create_sibling_temp(parent, target, existing_meta.as_ref(), options)?;
+
+    let written = io::copy(reader, &mut file).map_err(|err| {
+        OsError::from_io(
+            format!("failed writing temporary file for {}", target.display()),
+            err,
+        )
+    })?;
+    file.flush().map_err(|err| {
+        OsError::from_io(
+            format!("failed flushing temporary file for {}", target.display()),
+            err,
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        OsError::from_io(
+            format!("failed syncing temporary file for {}", target.display()),
+            err,
+        )
+    })?;
+
+    apply_final_permissions(&file, existing_meta.as_ref(), options, target)?;
+
+    // Drop the open file handle before committing so Windows does not reject rename/link.
+    drop(file);
+
+    if options.no_replace {
+        commit_exclusive(&mut guard, target)?;
+    } else {
+        replace_file(&guard.path, target)?;
+        guard.disarm();
+    }
+    sync_parent_dir(parent);
+    Ok(written)
+}
+
+/// Stream all bytes from an async `reader` into `path` atomically, returning the bytes written.
+///
+/// Dropping or cancelling the returned future mid-stream removes the temporary sibling file
+/// without modifying `path`.
+pub async fn write_atomic_async<R>(
+    path: impl AsRef<Path>,
+    reader: &mut R,
+    options: WriteOptions,
+) -> Result<u64>
+where
+    R: AsyncRead + Unpin,
+{
+    let target = path.as_ref();
+    let (parent, existing_meta) = inspect_target(target, options.no_replace)?;
+    let (std_file, mut guard) =
+        create_sibling_temp(parent, target, existing_meta.as_ref(), options)?;
+
+    let mut async_file = tokio::fs::File::from_std(std_file);
+    let written = tokio::io::copy(reader, &mut async_file)
+        .await
+        .map_err(|err| {
+            OsError::from_io(
+                format!("failed writing temporary file for {}", target.display()),
+                err,
+            )
+        })?;
+    async_file.flush().await.map_err(|err| {
+        OsError::from_io(
+            format!("failed flushing temporary file for {}", target.display()),
+            err,
+        )
+    })?;
+    async_file.sync_all().await.map_err(|err| {
+        OsError::from_io(
+            format!("failed syncing temporary file for {}", target.display()),
+            err,
+        )
+    })?;
+
+    let std_file = async_file.into_std().await;
+    apply_final_permissions(&std_file, existing_meta.as_ref(), options, target)?;
+    drop(std_file);
+
+    if options.no_replace {
+        commit_exclusive_async(&mut guard, target).await?;
+    } else {
+        replace_file_async(&guard.path, target).await?;
+        guard.disarm();
+    }
+
+    let parent_owned = parent.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || sync_parent_dir(&parent_owned)).await;
+    Ok(written)
+}
+
+/// Atomically replace `to` with `from`.
+///
+/// On Windows, retries `PermissionDenied` and sharing/lock violations with short backoff for up
+/// to three seconds so transient holds by antivirus scanners or indexers do not fail writes.
+/// Never deletes `to` before renaming.
+pub fn replace_file(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+    replace_file_impl(from.as_ref(), to.as_ref())
+}
+
+/// Async variant of [`replace_file`] that yields to the Tokio timer between Windows retries.
+pub async fn replace_file_async(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
+    replace_file_async_impl(from.as_ref(), to.as_ref()).await
+}
+
+/// RAII guard that unlinks the temporary sibling file unless [`TempFileGuard::disarm`] is called.
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn inspect_target(target: &Path, no_replace: bool) -> Result<(&Path, Option<Metadata>)> {
+    let parent = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    if no_replace {
+        // Check symlink_metadata so even a dangling symlink counts as an existing target and is
+        // refused before creating a temporary file.
+        match fs::symlink_metadata(target) {
+            Ok(_) => {
+                return Err(OsError::AlreadyExists {
+                    path: target.to_path_buf(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((parent, None)),
+            Err(err) => {
+                return Err(OsError::from_io(
+                    format!("cannot inspect {}", target.display()),
+                    err,
+                ));
+            }
+        }
+    }
+    let existing_meta = match fs::metadata(target) {
+        Ok(meta) => {
+            if meta.is_dir() {
+                return Err(OsError::InvalidArgument {
+                    detail: format!("target path is a directory: {}", target.display()),
+                });
+            }
+            Some(meta)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(OsError::from_io(
+                format!("cannot inspect {}", target.display()),
+                err,
+            ));
+        }
+    };
+    Ok((parent, existing_meta))
+}
+
+/// Atomically publish `guard.path` at `target` only if `target` does not yet exist.
+///
+/// Uses `hard_link` + unlink of the temporary name, which fails atomically with `AlreadyExists`
+/// on POSIX and NTFS/ReFS. Where the underlying filesystem does not support hard links (for
+/// example FAT/exFAT or certain FUSE mounts), falls back to a best-effort existence check and
+/// rename, which carries a narrow TOCTOU window only on those filesystems.
+fn commit_exclusive(guard: &mut TempFileGuard, target: &Path) -> Result<()> {
+    match fs::hard_link(&guard.path, target) {
+        Ok(()) => {
+            // Target now points to the synced inode; remove the temporary name.
+            let _ = fs::remove_file(&guard.path);
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(OsError::AlreadyExists {
+            path: target.to_path_buf(),
+        }),
+        Err(err) if is_hard_link_unsupported(&err) => {
+            if fs::symlink_metadata(target).is_ok() {
+                return Err(OsError::AlreadyExists {
+                    path: target.to_path_buf(),
+                });
+            }
+            replace_file(&guard.path, target)?;
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) => Err(OsError::from_io(
+            format!(
+                "cannot link temporary file {} to {}",
+                guard.path.display(),
+                target.display()
+            ),
+            err,
+        )),
+    }
+}
+
+async fn commit_exclusive_async(guard: &mut TempFileGuard, target: &Path) -> Result<()> {
+    match fs::hard_link(&guard.path, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(&guard.path);
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(OsError::AlreadyExists {
+            path: target.to_path_buf(),
+        }),
+        Err(err) if is_hard_link_unsupported(&err) => {
+            if fs::symlink_metadata(target).is_ok() {
+                return Err(OsError::AlreadyExists {
+                    path: target.to_path_buf(),
+                });
+            }
+            replace_file_async(&guard.path, target).await?;
+            guard.disarm();
+            Ok(())
+        }
+        Err(err) => Err(OsError::from_io(
+            format!(
+                "cannot link temporary file {} to {}",
+                guard.path.display(),
+                target.display()
+            ),
+            err,
+        )),
+    }
+}
+
+fn is_hard_link_unsupported(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // EOPNOTSUPP (95 on Linux, 45 on macOS), ENOSYS (38/78), EPERM (1 on FAT/VFAT),
+        // EXDEV (18), EMLINK (31).
+        matches!(
+            err.raw_os_error(),
+            Some(1 | 18 | 31 | 38 | 45 | 78 | 95 | 122)
+        )
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_INVALID_FUNCTION (1), ERROR_NOT_SUPPORTED (50), ERROR_NOT_SAME_DEVICE (17).
+        matches!(err.raw_os_error(), Some(1 | 17 | 50))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+fn create_sibling_temp(
+    parent: &Path,
+    target: &Path,
+    existing_meta: Option<&Metadata>,
+    options: WriteOptions,
+) -> Result<(File, TempFileGuard)> {
+    let base_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("file");
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+
+    // When explicit permissions will be set (either preserving an existing file's mode or
+    // applying options.mode), open the temp file restrictively first so there is no window where
+    // contents are exposed wider than requested.
+    let restrictive = existing_meta.is_some() || options.mode.is_some();
+
+    for _ in 0..64 {
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{base_name}.legion-tmp-{pid}-{seq}-{nanos}"));
+        let mut open = OpenOptions::new();
+        open.write(true).create_new(true);
+        configure_temp_open(&mut open, restrictive);
+
+        match open.open(&candidate) {
+            Ok(file) => return Ok((file, TempFileGuard::new(candidate))),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(OsError::from_io(
+                    format!("cannot create temporary file in {}", parent.display()),
+                    err,
+                ));
+            }
+        }
+    }
+
+    Err(OsError::Platform {
+        detail: format!(
+            "failed to allocate a unique temporary file name in {}",
+            parent.display()
+        ),
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn configure_temp_open(open: &mut OpenOptions, restrictive: bool) {
+    platform::configure_temp_open(open, restrictive);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_temp_open(_open: &mut OpenOptions, _restrictive: bool) {}
+
+#[cfg(any(unix, windows))]
+fn apply_final_permissions(
+    file: &File,
+    existing_meta: Option<&Metadata>,
+    options: WriteOptions,
+    target: &Path,
+) -> Result<()> {
+    platform::apply_final_permissions(file, existing_meta, options, target)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn apply_final_permissions(
+    _file: &File,
+    _existing_meta: Option<&Metadata>,
+    _options: WriteOptions,
+    _target: &Path,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn replace_file_impl(from: &Path, to: &Path) -> Result<()> {
+    platform::replace_file(from, to)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_file_impl(from: &Path, to: &Path) -> Result<()> {
+    fs::rename(from, to).map_err(|err| {
+        OsError::from_io(
+            format!("cannot rename {} to {}", from.display(), to.display()),
+            err,
+        )
+    })
+}
+
+#[cfg(any(unix, windows))]
+async fn replace_file_async_impl(from: &Path, to: &Path) -> Result<()> {
+    platform::replace_file_async(from, to).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn replace_file_async_impl(from: &Path, to: &Path) -> Result<()> {
+    replace_file_impl(from, to)
+}
+
+#[cfg(any(unix, windows))]
+fn sync_parent_dir(parent: &Path) {
+    platform::sync_parent_dir(parent);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_dir(_parent: &Path) {}
+
+/// Return `true` when `err` represents a transient Windows sharing or permission conflict that
+/// warrants retrying an atomic rename.
+#[allow(dead_code)]
+pub(crate) fn is_retryable_windows_replace_error(err: &io::Error) -> bool {
+    // Win32 codes: ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
+    // ERROR_LOCK_VIOLATION (33), ERROR_BUSY (170).
+    err.kind() == io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(5 | 32 | 33 | 170))
+}
+
+/// Retry `op` on retryable errors with capped exponential backoff until `timeout` elapses.
+#[allow(dead_code)]
+pub(crate) fn retry_sync_with_backoff<F, P>(
+    mut op: F,
+    mut is_retryable: P,
+    timeout: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+    P: FnMut(&io::Error) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    let mut pause = initial_backoff;
+
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let now = Instant::now();
+                if !is_retryable(&err) || now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(pause.min(remaining));
+                pause = (pause * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// Async counterpart of [`retry_sync_with_backoff`] using Tokio sleep between attempts.
+#[allow(dead_code)]
+pub(crate) async fn retry_async_with_backoff<F, P>(
+    mut op: F,
+    mut is_retryable: P,
+    timeout: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+    P: FnMut(&io::Error) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut pause = initial_backoff;
+
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let now = tokio::time::Instant::now();
+                if !is_retryable(&err) || now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                tokio::time::sleep(pause.min(remaining)).await;
+                pause = (pause * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::ReadBuf;
+
+    use super::*;
+
+    struct FailingReader {
+        prefix: &'static [u8],
+        sent: bool,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                let n = self.prefix.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.prefix[..n]);
+                return Ok(n);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simulated mid-stream failure",
+            ))
+        }
+    }
+
+    struct PendingAfterPrefixAsyncReader {
+        prefix: &'static [u8],
+        sent: bool,
+    }
+
+    impl AsyncRead for PendingAfterPrefixAsyncReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.sent {
+                self.sent = true;
+                let n = self.prefix.len().min(buf.remaining());
+                buf.put_slice(&self.prefix[..n]);
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        }
+    }
+
+    fn list_dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn write_atomic_creates_and_replaces_without_leftover_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+
+        write_atomic(&target, b"first version\n", WriteOptions::default()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first version\n");
+        assert_eq!(list_dir_names(dir.path()), vec!["config.toml"]);
+
+        write_atomic(&target, b"second version\n", WriteOptions::default()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second version\n");
+        assert_eq!(list_dir_names(dir.path()), vec!["config.toml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_sets_mode_for_new_file_and_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.txt");
+
+        write_atomic(&target, b"v1", WriteOptions::with_mode(0o600)).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // Overwriting with a wider mode in options must preserve the existing target's 0o600 mode.
+        write_atomic(&target, b"v2", WriteOptions::with_mode(0o644)).unwrap();
+        let mode_after = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_after, 0o600);
+        assert_eq!(fs::read(&target).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn failed_sync_stream_leaves_target_intact_and_cleans_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("state.json");
+        write_atomic(&target, b"{\"ok\":true}", WriteOptions::default()).unwrap();
+
+        let mut reader = FailingReader {
+            prefix: b"partial data",
+            sent: false,
+        };
+        let err =
+            write_atomic_from_reader(&target, &mut reader, WriteOptions::default()).unwrap_err();
+        assert!(matches!(err, OsError::Io { .. }));
+        assert_eq!(fs::read(&target).unwrap(), b"{\"ok\":true}");
+        assert_eq!(list_dir_names(dir.path()), vec!["state.json"]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_stream_leaves_no_partial_or_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("streamed.bin");
+        write_atomic(&target, b"original", WriteOptions::default()).unwrap();
+
+        let mut reader = PendingAfterPrefixAsyncReader {
+            prefix: b"half-written",
+            sent: false,
+        };
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(40),
+            write_atomic_async(&target, &mut reader, WriteOptions::default()),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        // Original content is untouched and no sibling temp file remains.
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(list_dir_names(dir.path()), vec!["streamed.bin"]);
+    }
+
+    #[tokio::test]
+    async fn write_atomic_async_streams_and_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("async.txt");
+        let payload = b"streamed asynchronously";
+        let mut cursor = io::Cursor::new(payload.as_slice());
+
+        let n = write_atomic_async(&target, &mut cursor, WriteOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(n, payload.len() as u64);
+        assert_eq!(fs::read(&target).unwrap(), payload);
+        assert_eq!(list_dir_names(dir.path()), vec!["async.txt"]);
+    }
+
+    #[test]
+    fn retry_backoff_recovers_from_transient_permission_denied() {
+        let mut attempts = 0usize;
+        retry_sync_with_backoff(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "held by scanner",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            is_retryable_windows_replace_error,
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_backoff_does_not_retry_non_sharing_errors() {
+        let mut attempts = 0usize;
+        let err = retry_sync_with_backoff(
+            || {
+                attempts += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "missing source"))
+            },
+            is_retryable_windows_replace_error,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn no_replace_creates_new_file_and_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("exclusive.json");
+
+        write_atomic(&target, b"winner", WriteOptions::create_new()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"winner");
+        assert_eq!(list_dir_names(dir.path()), vec!["exclusive.json"]);
+
+        let err = write_atomic(&target, b"loser", WriteOptions::create_new()).unwrap_err();
+        assert!(matches!(err, OsError::AlreadyExists { ref path } if path == &target));
+        assert_eq!(fs::read(&target).unwrap(), b"winner");
+        assert_eq!(list_dir_names(dir.path()), vec!["exclusive.json"]);
+    }
+
+    #[tokio::test]
+    async fn no_replace_async_refuses_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("exclusive-async.txt");
+        let mut c1 = io::Cursor::new(b"first".as_slice());
+        write_atomic_async(&target, &mut c1, WriteOptions::create_new())
+            .await
+            .unwrap();
+
+        let mut c2 = io::Cursor::new(b"second".as_slice());
+        let err = write_atomic_async(&target, &mut c2, WriteOptions::create_new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OsError::AlreadyExists { .. }));
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        assert_eq!(list_dir_names(dir.path()), vec!["exclusive-async.txt"]);
+    }
+
+    #[test]
+    fn no_replace_allows_exactly_one_concurrent_creator() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("race.txt");
+        let threads = 8usize;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|idx| {
+                let target = target.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_atomic(
+                        &target,
+                        format!("writer-{idx}").as_bytes(),
+                        WriteOptions::create_new(),
+                    )
+                })
+            })
+            .collect();
+
+        let mut successes = 0usize;
+        let mut already_exists = 0usize;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(()) => successes += 1,
+                Err(OsError::AlreadyExists { .. }) => already_exists += 1,
+                Err(other) => panic!("unexpected error in exclusive create race: {other:?}"),
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(already_exists, threads - 1);
+        assert_eq!(list_dir_names(dir.path()), vec!["race.txt"]);
+    }
+}
