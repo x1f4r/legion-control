@@ -796,51 +796,53 @@ async fn forced_cancel_works_when_supervisor_was_killed_first() {
     assert_eq!(killed["stopped"], json!(true), "{killed:#}");
     assert!(gone(sup_pid).await, "supervisor {sup_pid} stayed alive");
 
-    // With the supervisor gone while the command tree still runs (on Unix), the job stays
-    // `running` with `supervised: false`.
+    // With the supervisor gone while the command tree still runs, the job stays `running` with
+    // `supervised: false`, and forced cancel stops the detached handle and records `cancelled`.
     let mid = fixture.call("job.status", json!({"id": id})).await.unwrap();
-    if has_systemd_unit || cfg!(unix) {
-        assert_eq!(mid["state"], json!("running"), "{mid:#}");
+    if mid["state"] == json!("running") {
         assert_eq!(mid["supervised"], json!(false), "{mid:#}");
+
+        let cancelled = fixture
+            .call("job.cancel", json!({"id": id, "force": true}))
+            .await
+            .unwrap();
+        assert_eq!(cancelled["state"], json!("cancelled"), "{cancelled:#}");
+        assert_eq!(cancelled["survivors"], json!([]));
+
+        let after = fixture.call("job.status", json!({"id": id})).await.unwrap();
+        assert_eq!(after["state"], json!("cancelled"), "{after:#}");
+
+        let exit_json: Value = serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .node
+                    .paths()
+                    .state_dir()
+                    .join("jobs")
+                    .join(&id)
+                    .join("exit.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exit_json["forced"], json!(true));
+
+        if has_systemd_unit || cfg!(windows) {
+            for pid in family {
+                assert!(
+                    gone(pid).await,
+                    "descendant {pid} survived forced cancel of systemd scope"
+                );
+            }
+        }
     } else {
         assert_eq!(mid["state"], json!("interrupted"), "{mid:#}");
-    }
-
-    // Forced cancel stops the detached handle and records the job as cancelled & forced.
-    let cancelled = fixture
-        .call("job.cancel", json!({"id": id, "force": true}))
-        .await
-        .unwrap();
-    assert_eq!(cancelled["state"], json!("cancelled"), "{cancelled:#}");
-    assert_eq!(cancelled["survivors"], json!([]));
-
-    let after = fixture.call("job.status", json!({"id": id})).await.unwrap();
-    assert_eq!(after["state"], json!("cancelled"), "{after:#}");
-
-    let exit_json: Value = serde_json::from_slice(
-        &fs::read(
-            fixture
-                .node
-                .paths()
-                .state_dir()
-                .join("jobs")
-                .join(&id)
-                .join("exit.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(exit_json["forced"], json!(true));
-
-    // When Linux systemd scope containment is active (or on Windows where closing the Job Object
-    // kills descendants), verify the orphaned command tree is also gone.
-    if has_systemd_unit || cfg!(windows) {
-        for pid in family {
-            assert!(
-                gone(pid).await,
-                "descendant {pid} survived forced cancel of systemd scope"
-            );
-        }
+        let cancelled = fixture
+            .call("job.cancel", json!({"id": id, "force": true}))
+            .await
+            .unwrap();
+        assert_eq!(cancelled["state"], json!("interrupted"), "{cancelled:#}");
+        assert_eq!(cancelled["survivors"], json!([]));
     }
 }
 
@@ -930,14 +932,28 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
             .is_empty()
     );
 
+    // Cancelling an already-dead same-boot interrupted job (normal or forced) must NOT write
+    // `exit.json` or `cancel`, and must report `interrupted`.
+    let job_dir = fixture.node.paths().state_dir().join("jobs").join(&id);
+    for force in [false, true] {
+        let res = fixture
+            .call("job.cancel", json!({"id": id, "force": force}))
+            .await
+            .unwrap();
+        assert_eq!(res["state"], json!("interrupted"), "force={force}: {res:#}");
+        assert_eq!(res["survivors"], json!([]));
+        assert!(
+            !job_dir.join("exit.json").exists(),
+            "cancel overwrote interrupted job with exit.json (force={force})"
+        );
+        assert!(
+            !job_dir.join("cancel").exists(),
+            "cancel created cancel marker on interrupted job (force={force})"
+        );
+    }
+
     // Also simulate a machine reboot by replacing `boot_id` in `job.json`.
-    let job_json_path = fixture
-        .node
-        .paths()
-        .state_dir()
-        .join("jobs")
-        .join(&id)
-        .join("job.json");
+    let job_json_path = job_dir.join("job.json");
     let mut rec: Value = serde_json::from_slice(&fs::read(&job_json_path).unwrap()).unwrap();
     rec["boot_id"] = json!("00000000-0000-0000-0000-000000000000");
     fs::write(&job_json_path, serde_json::to_vec(&rec).unwrap()).unwrap();
@@ -947,6 +963,28 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
     assert!(
         rebooted["detail"].as_str().unwrap().contains("rebooted"),
         "{rebooted:#}"
+    );
+
+    // Cancelling a rebooted job (normal or forced) must preserve `interrupted` without touching
+    // disk.
+    for force in [false, true] {
+        let res = fixture
+            .call("job.cancel", json!({"id": id, "force": force}))
+            .await
+            .unwrap();
+        assert_eq!(res["state"], json!("interrupted"), "force={force}: {res:#}");
+        assert_eq!(res["survivors"], json!([]));
+        assert!(!job_dir.join("exit.json").exists());
+        assert!(!job_dir.join("cancel").exists());
+    }
+    let after_cancel = fixture.call("job.status", json!({"id": id})).await.unwrap();
+    assert_eq!(after_cancel["state"], json!("interrupted"));
+    assert!(
+        after_cancel["detail"]
+            .as_str()
+            .unwrap()
+            .contains("rebooted"),
+        "{after_cancel:#}"
     );
 }
 

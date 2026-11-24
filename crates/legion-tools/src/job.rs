@@ -879,6 +879,23 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
         Duration::from_secs(1)
     };
 
+    // Never touch records from a previous boot: nothing from that boot can still be running, so
+    // report the true derived state without writing `cancel` or `exit.json`.
+    if !same_boot {
+        let derived = derive_status_async(
+            &dir,
+            &initial_record,
+            current_boot.as_deref(),
+            jiff::Timestamp::now(),
+        )
+        .await;
+        return Ok(CancelledJob {
+            id,
+            state: derived.state,
+            survivors: Vec::new(),
+        });
+    }
+
     // Cancelling a job that already has an exit record is not an error: wait briefly if the
     // supervisor is still releasing its lock, sweep any surviving detached descendants on the
     // same boot, and return the job's final state unchanged (or `running` if descendants survive).
@@ -892,6 +909,36 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
             JobState::Running
         } else {
             JobState::from(exit.outcome)
+        };
+        return Ok(CancelledJob {
+            id,
+            state,
+            survivors,
+        });
+    }
+
+    // If the job is already dead (`interrupted`) and nothing under its handle is active, leave its
+    // directory untouched so cancel never rewrites history.
+    let initial_status = derive_status_async(
+        &dir,
+        &initial_record,
+        current_boot.as_deref(),
+        jiff::Timestamp::now(),
+    )
+    .await;
+    if !initial_status.state.is_active() {
+        let (survivors, still_active) = if initial_status.state == JobState::Interrupted {
+            (Vec::new(), false)
+        } else {
+            // `exit.json` appeared between the earlier check and `derive_status_async`.
+            wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
+            let record = reload_job_record(&dir, &id, initial_record).await;
+            sweep_job_handle(&id, &record, same_boot, stop_grace).await?
+        };
+        let state = if still_active {
+            JobState::Running
+        } else {
+            initial_status.state
         };
         return Ok(CancelledJob {
             id,
