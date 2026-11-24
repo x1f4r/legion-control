@@ -1,15 +1,18 @@
 //! Streaming log reader for `job.logs`.
 //!
-//! Reads at most `limit` bytes (plus a few peek bytes for UTF-8 boundary checks) from `output.log`,
-//! whether polling forward from `offset` or reading the last `tail` lines, so a multi-gigabyte log
-//! never loads into memory. Never splits a valid multi-byte UTF-8 character across chunks, and
-//! replaces genuinely invalid UTF-8 bytes with U+FFFD.
+//! Reads at most `limit` bytes (plus a few peek bytes for UTF-8 boundary checks) transparently
+//! across the optional rotated segment `output.log.1` and active `output.log`, whether polling
+//! forward from `offset` or reading the last `tail` lines, so a multi-gigabyte log never loads
+//! into memory. Never splits a valid multi-byte UTF-8 character across chunks, replaces genuinely
+//! invalid UTF-8 bytes with U+FFFD, and reports when rotation dropped early output.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use legion_core::proto::{ErrorBody, ErrorCode};
+
+use super::store::{LOG_FILE, LOG_ROTATED_FILE, read_log_meta};
 
 /// Default number of trailing lines returned when `offset` is omitted.
 pub(super) const DEFAULT_TAIL_LINES: u32 = 100;
@@ -21,8 +24,11 @@ pub(super) const DEFAULT_LOG_LIMIT: u64 = 65_536;
 pub(super) const MAX_LOG_LIMIT: u64 = 1_048_576;
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;
+/// Maximum retries to open a consistent snapshot of `output.meta` + `output.log.1` + `output.log`
+/// if the supervisor rotates mid-open.
+const SNAPSHOT_RETRIES: usize = 3;
 
-/// Decoded slice of a job's log file.
+/// Decoded slice of a job's log stream.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct LogSlice {
     pub content: String,
@@ -30,27 +36,126 @@ pub(super) struct LogSlice {
     pub next_offset: u64,
     pub eof: bool,
     pub truncated: bool,
+    pub output_dropped: bool,
+    pub dropped_bytes: Option<u64>,
 }
 
-/// Reads forward from byte `offset`, returning at most `limit` bytes (or a single leading
-/// multi-byte UTF-8 character if `limit` is smaller than 4 bytes so `next_offset` always moves).
-pub(super) fn read_offset(
-    path: &Path,
-    offset: u64,
-    limit: usize,
-    job_active: bool,
-) -> Result<LogSlice, ErrorBody> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(LogSlice {
-                content: String::new(),
-                offset,
-                next_offset: offset,
-                eof: true,
-                truncated: false,
-            });
+/// Consistent view spanning optional `output.log.1` (older) and `output.log` (newer), positioned
+/// at logical offset `base_offset` (`dropped_bytes`).
+struct LogStream {
+    base_offset: u64,
+    rotated: Option<(PathBuf, File, u64)>,
+    active: Option<(PathBuf, File, u64)>,
+}
+
+impl LogStream {
+    fn open(job_dir: &Path) -> Result<Self, ErrorBody> {
+        let rotated_path = job_dir.join(LOG_ROTATED_FILE);
+        let active_path = job_dir.join(LOG_FILE);
+
+        let mut last = None;
+        for _ in 0..SNAPSHOT_RETRIES {
+            let meta_before = read_log_meta(job_dir).dropped_bytes;
+            let had_rot_before = rotated_path.exists();
+
+            let rotated = open_optional(&rotated_path)?;
+            let active = open_optional(&active_path)?;
+
+            let meta_after = read_log_meta(job_dir).dropped_bytes;
+            let has_rot_after = rotated_path.exists();
+            let stream = Self {
+                base_offset: meta_after,
+                rotated,
+                active,
+            };
+            if meta_before == meta_after && had_rot_before == has_rot_after {
+                return Ok(stream);
+            }
+            last = Some(stream);
         }
+        Ok(last.unwrap_or(Self {
+            base_offset: read_log_meta(job_dir).dropped_bytes,
+            rotated: None,
+            active: None,
+        }))
+    }
+
+    fn output_dropped(&self) -> bool {
+        self.base_offset > 0
+    }
+
+    fn dropped_bytes(&self) -> Option<u64> {
+        (self.base_offset > 0).then_some(self.base_offset)
+    }
+
+    fn rotated_len(&self) -> u64 {
+        self.rotated.as_ref().map_or(0, |(_, _, len)| *len)
+    }
+
+    fn active_len(&self) -> u64 {
+        self.active.as_ref().map_or(0, |(_, _, len)| *len)
+    }
+
+    fn mid_offset(&self) -> u64 {
+        self.base_offset.saturating_add(self.rotated_len())
+    }
+
+    fn end_offset(&self) -> u64 {
+        self.mid_offset().saturating_add(self.active_len())
+    }
+
+    /// Reads up to `want` bytes starting at logical `logical_offset`, crossing transparently from
+    /// `output.log.1` into `output.log`.
+    fn read_at(&mut self, logical_offset: u64, want: usize) -> Result<Vec<u8>, ErrorBody> {
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let base = self.base_offset;
+        let mid = self.mid_offset();
+        let mut pos = logical_offset.max(base);
+        let mut buf = Vec::with_capacity(want.min(READ_CHUNK_BYTES));
+
+        if pos < mid
+            && let Some((ref path, ref mut file, _)) = self.rotated
+        {
+            let rel = pos - base;
+            let avail = usize::try_from(mid - pos).unwrap_or(usize::MAX);
+            let take = want.min(avail);
+            file.seek(SeekFrom::Start(rel)).map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Cannot seek job log {}: {err}.", path.display()),
+                )
+            })?;
+            let chunk = read_up_to(file, take, path)?;
+            pos = pos.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            buf.extend_from_slice(&chunk);
+        }
+
+        if buf.len() < want
+            && pos >= mid
+            && let Some((ref path, ref mut file, _)) = self.active
+        {
+            let rel = pos - mid;
+            let remaining = want - buf.len();
+            file.seek(SeekFrom::Start(rel)).map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Cannot seek job log {}: {err}.", path.display()),
+                )
+            })?;
+            let chunk = read_up_to(file, remaining, path)?;
+            buf.extend_from_slice(&chunk);
+        }
+
+        Ok(buf)
+    }
+}
+
+fn open_optional(path: &Path) -> Result<Option<(PathBuf, File, u64)>, ErrorBody> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
@@ -58,26 +163,44 @@ pub(super) fn read_offset(
             ));
         }
     };
+    let len = file
+        .metadata()
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Cannot inspect job log {}: {err}.", path.display()),
+            )
+        })?
+        .len();
+    Ok(Some((path.to_path_buf(), file, len)))
+}
 
-    file.seek(SeekFrom::Start(offset)).map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Cannot seek job log {}: {err}.", path.display()),
-        )
-    })?;
+/// Reads forward from logical byte `offset` in `job_dir`, returning at most `limit` bytes (or a
+/// single leading multi-byte UTF-8 character if `limit` is smaller than 4 bytes so `next_offset`
+/// always moves).
+pub(super) fn read_offset(
+    job_dir: &Path,
+    offset: u64,
+    limit: usize,
+    job_active: bool,
+) -> Result<LogSlice, ErrorBody> {
+    let mut stream = LogStream::open(job_dir)?;
+    let effective_offset = offset.max(stream.base_offset);
 
     // Read up to `limit + 4` bytes: up to 3 bytes beyond `limit` distinguish a split multi-byte
     // UTF-8 character from invalid bytes, and the 4th byte tells whether more data follows.
     let want = limit.saturating_add(4);
-    let raw = read_up_to(&mut file, want, path)?;
+    let raw = stream.read_at(effective_offset, want)?;
 
     if raw.is_empty() {
         return Ok(LogSlice {
             content: String::new(),
-            offset,
-            next_offset: offset,
+            offset: effective_offset,
+            next_offset: effective_offset,
             eof: true,
             truncated: false,
+            output_dropped: stream.output_dropped(),
+            dropped_bytes: stream.dropped_bytes(),
         });
     }
 
@@ -101,82 +224,59 @@ pub(super) fn read_offset(
         } else {
             slice.len() - split
         };
-        let eof = used >= raw.len() && read_up_to(&mut file, 1, path)?.is_empty();
+        let probe_pos = effective_offset.saturating_add(u64::try_from(used).unwrap_or(u64::MAX));
+        let eof = used >= raw.len() && stream.read_at(probe_pos, 1)?.is_empty();
         (used, eof)
     };
 
     let content = String::from_utf8_lossy(&raw[..used]).into_owned();
-    let next_offset = offset.saturating_add(u64::try_from(used).unwrap_or(u64::MAX));
+    let next_offset = effective_offset.saturating_add(u64::try_from(used).unwrap_or(u64::MAX));
     Ok(LogSlice {
         content,
-        offset,
+        offset: effective_offset,
         next_offset,
         eof,
         truncated: !eof,
+        output_dropped: stream.output_dropped(),
+        dropped_bytes: stream.dropped_bytes(),
     })
 }
 
-/// Reads up to the last `tail_lines` lines capped at `limit` bytes from the end of `path` without
-/// loading the earlier part of the file into memory.
+/// Reads up to the last `tail_lines` lines capped at `limit` bytes from the end of `job_dir`'s
+/// log stream without loading the earlier bytes into memory.
 pub(super) fn read_tail(
-    path: &Path,
+    job_dir: &Path,
     tail_lines: usize,
     limit: usize,
     job_active: bool,
 ) -> Result<LogSlice, ErrorBody> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(LogSlice {
-                content: String::new(),
-                offset: 0,
-                next_offset: 0,
-                eof: true,
-                truncated: false,
-            });
-        }
-        Err(err) => {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Cannot open job log {}: {err}.", path.display()),
-            ));
-        }
-    };
+    let mut stream = LogStream::open(job_dir)?;
+    let base = stream.base_offset;
+    let end = stream.end_offset();
 
-    let file_len = file
-        .metadata()
-        .map_err(|err| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Cannot inspect job log {}: {err}.", path.display()),
-            )
-        })?
-        .len();
-    if file_len == 0 {
+    if end <= base {
         return Ok(LogSlice {
             content: String::new(),
-            offset: 0,
-            next_offset: 0,
+            offset: base,
+            next_offset: base,
             eof: true,
-            truncated: false,
+            truncated: stream.output_dropped(),
+            output_dropped: stream.output_dropped(),
+            dropped_bytes: stream.dropped_bytes(),
         });
     }
 
-    // Any byte earlier than `file_len - limit` cannot fit into the `limit`-byte suffix. Read up to
-    // 3 extra leading bytes so we can detect whether `file_len - limit` lands mid-character.
+    // Any byte earlier than `end - limit` cannot fit into the `limit`-byte suffix. Read up to 3
+    // extra leading bytes (bounded by `base`) so we can detect whether `end - limit` lands
+    // mid-character.
     let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
-    let window_start = file_len.saturating_sub(limit_u64);
-    let read_start = window_start.saturating_sub(3);
-    let target_bytes = usize::try_from(file_len.saturating_sub(read_start)).unwrap_or(usize::MAX);
+    let window_start = end.saturating_sub(limit_u64).max(base);
+    let read_start = window_start.saturating_sub(3).max(base);
+    let target_bytes = usize::try_from(end.saturating_sub(read_start)).unwrap_or(usize::MAX);
 
-    file.seek(SeekFrom::Start(read_start)).map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Cannot seek job log {}: {err}.", path.display()),
-        )
-    })?;
-    let raw = read_up_to(&mut file, target_bytes, path)?;
-    let more_appended = !read_up_to(&mut file, 1, path)?.is_empty();
+    let raw = stream.read_at(read_start, target_bytes)?;
+    let after_raw = read_start.saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
+    let more_appended = !stream.read_at(after_raw, 1)?.is_empty();
 
     let end_hold = if job_active && !more_appended {
         incomplete_utf8_tail(&raw)
@@ -190,7 +290,7 @@ pub(super) fn read_tail(
     let limit_start = effective_end.saturating_sub(limit);
     let mut cut = line_start.max(limit_start);
 
-    if read_start.saturating_add(u64::try_from(cut).unwrap_or(u64::MAX)) > 0 {
+    if read_start.saturating_add(u64::try_from(cut).unwrap_or(u64::MAX)) > base {
         cut = advance_past_split_utf8_start(slice, cut);
     }
 
@@ -206,6 +306,8 @@ pub(super) fn read_tail(
         next_offset,
         eof,
         truncated,
+        output_dropped: stream.output_dropped(),
+        dropped_bytes: stream.dropped_bytes(),
     })
 }
 
@@ -344,13 +446,13 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::job::store::write_log_meta;
 
     #[test]
     fn offset_reads_incrementally_without_splitting_utf8() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("output.log");
         let text = "aé€😀b";
-        fs::write(&path, text.as_bytes()).unwrap();
+        fs::write(dir.path().join(LOG_FILE), text.as_bytes()).unwrap();
 
         for limit in 1..=text.len() + 2 {
             let mut offset = 0u64;
@@ -359,8 +461,10 @@ mod tests {
             loop {
                 steps += 1;
                 assert!(steps < 32, "stalled at offset {offset} for limit {limit}");
-                let slice = read_offset(&path, offset, limit, false).unwrap();
+                let slice = read_offset(dir.path(), offset, limit, false).unwrap();
                 assert_eq!(slice.offset, offset);
+                assert!(!slice.output_dropped);
+                assert_eq!(slice.dropped_bytes, None);
                 assert!(!slice.content.contains('\u{fffd}'), "limit={limit}");
                 assembled.push_str(&slice.content);
                 offset = slice.next_offset;
@@ -377,25 +481,25 @@ mod tests {
     #[test]
     fn active_job_holds_back_partial_trailing_utf8_until_finished() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("output.log");
+        let path = dir.path().join(LOG_FILE);
         // First 2 bytes of '€' (0xE2 0x82 0xAC).
         fs::write(&path, [b'o', b'k', 0xE2, 0x82]).unwrap();
 
-        let active = read_offset(&path, 0, 100, true).unwrap();
+        let active = read_offset(dir.path(), 0, 100, true).unwrap();
         assert_eq!(active.content, "ok");
         assert_eq!(active.next_offset, 2);
         assert!(!active.eof);
 
         // Once the remaining byte arrives, polling from next_offset decodes '€' cleanly.
         fs::write(&path, [b'o', b'k', 0xE2, 0x82, 0xAC]).unwrap();
-        let next = read_offset(&path, active.next_offset, 100, true).unwrap();
+        let next = read_offset(dir.path(), active.next_offset, 100, true).unwrap();
         assert_eq!(next.content, "€");
         assert_eq!(next.next_offset, 5);
         assert!(next.eof);
 
         // When finished with dangling incomplete bytes at EOF, they become U+FFFD.
         fs::write(&path, [b'o', b'k', 0xE2, 0x82]).unwrap();
-        let done = read_offset(&path, 0, 100, false).unwrap();
+        let done = read_offset(dir.path(), 0, 100, false).unwrap();
         assert_eq!(done.content, "ok\u{fffd}");
         assert_eq!(done.next_offset, 4);
         assert!(done.eof);
@@ -404,15 +508,14 @@ mod tests {
     #[test]
     fn invalid_utf8_is_replaced_without_stalling() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("output.log");
-        fs::write(&path, [b'a', 0xFF, 0xFE, b'b']).unwrap();
+        fs::write(dir.path().join(LOG_FILE), [b'a', 0xFF, 0xFE, b'b']).unwrap();
 
-        let slice = read_offset(&path, 0, 2, false).unwrap();
+        let slice = read_offset(dir.path(), 0, 2, false).unwrap();
         assert_eq!(slice.content, "a\u{fffd}");
         assert_eq!(slice.next_offset, 2);
         assert!(!slice.eof);
 
-        let rest = read_offset(&path, slice.next_offset, 10, false).unwrap();
+        let rest = read_offset(dir.path(), slice.next_offset, 10, false).unwrap();
         assert_eq!(rest.content, "\u{fffd}b");
         assert_eq!(rest.next_offset, 4);
         assert!(rest.eof);
@@ -421,24 +524,25 @@ mod tests {
     #[test]
     fn tail_respects_line_count_byte_limit_and_utf8_boundaries() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("output.log");
+        let path = dir.path().join(LOG_FILE);
         fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
 
-        let last2 = read_tail(&path, 2, 1024, false).unwrap();
+        let last2 = read_tail(dir.path(), 2, 1024, false).unwrap();
         assert_eq!(last2.content, "three\nfour\n");
         assert_eq!(last2.offset, 8);
         assert_eq!(last2.next_offset, 19);
         assert!(last2.eof);
         assert!(last2.truncated);
+        assert!(!last2.output_dropped);
 
-        let all = read_tail(&path, 10, 1024, false).unwrap();
+        let all = read_tail(dir.path(), 10, 1024, false).unwrap();
         assert_eq!(all.content, "one\ntwo\nthree\nfour\n");
         assert_eq!(all.offset, 0);
         assert!(!all.truncated);
 
         // Byte cap landing mid-character skips past the split character cleanly.
         fs::write(&path, "éééé").unwrap();
-        let capped = read_tail(&path, 100, 5, false).unwrap();
+        let capped = read_tail(dir.path(), 100, 5, false).unwrap();
         assert_eq!(capped.content, "éé");
         assert_eq!(capped.offset, 4);
         assert_eq!(capped.next_offset, 8);
@@ -448,39 +552,100 @@ mod tests {
     #[test]
     fn missing_or_empty_log_returns_empty_eof() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("absent.log");
-        let tail = read_tail(&missing, 100, 1024, false).unwrap();
+        let tail = read_tail(dir.path(), 100, 1024, false).unwrap();
         assert_eq!(tail.content, "");
         assert_eq!(tail.offset, 0);
         assert_eq!(tail.next_offset, 0);
         assert!(tail.eof);
         assert!(!tail.truncated);
+        assert!(!tail.output_dropped);
 
-        let off = read_offset(&missing, 42, 1024, false).unwrap();
+        let off = read_offset(dir.path(), 42, 1024, false).unwrap();
         assert_eq!(off.offset, 42);
         assert_eq!(off.next_offset, 42);
         assert!(off.eof);
+        assert!(!off.output_dropped);
     }
 
     #[test]
     fn tail_and_offset_handle_multi_megabyte_logs_bounded() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.log");
         let mut data = vec![b'a'; 2 * 1024 * 1024];
         data.extend_from_slice(b"\npenultimate\nfinal-line\n");
-        fs::write(&path, &data).unwrap();
+        fs::write(dir.path().join(LOG_FILE), &data).unwrap();
 
-        let tail = read_tail(&path, 2, 1024, false).unwrap();
+        let tail = read_tail(dir.path(), 2, 1024, false).unwrap();
         assert_eq!(tail.content, "penultimate\nfinal-line\n");
         assert!(tail.eof);
         assert!(tail.truncated);
         assert_eq!(tail.next_offset, data.len() as u64);
 
-        let mid = read_offset(&path, 1024 * 1024, 64, false).unwrap();
+        let mid = read_offset(dir.path(), 1024 * 1024, 64, false).unwrap();
         assert_eq!(mid.content.len(), 64);
         assert_eq!(mid.offset, 1024 * 1024);
         assert_eq!(mid.next_offset, 1024 * 1024 + 64);
         assert!(!mid.eof);
         assert!(mid.truncated);
+    }
+
+    #[test]
+    fn reads_transparently_across_rotated_and_active_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        // Split a 3-byte UTF-8 character '€' (0xE2 0x82 0xAC) right across output.log.1 and
+        // output.log to prove the reader stitches segments seamlessly.
+        let full = "first\nsec€nd\nthird\n";
+        let split_at = full.find('€').unwrap() + 1;
+        fs::write(
+            dir.path().join(LOG_ROTATED_FILE),
+            &full.as_bytes()[..split_at],
+        )
+        .unwrap();
+        fs::write(dir.path().join(LOG_FILE), &full.as_bytes()[split_at..]).unwrap();
+
+        // After one rotation (no dropped bytes yet), reading across all limits yields exact text.
+        for limit in [1usize, 3, 5, 64] {
+            let mut off = 0u64;
+            let mut out = String::new();
+            loop {
+                let slice = read_offset(dir.path(), off, limit, false).unwrap();
+                assert!(!slice.output_dropped);
+                assert_eq!(slice.dropped_bytes, None);
+                assert!(!slice.content.contains('\u{fffd}'), "limit={limit}");
+                out.push_str(&slice.content);
+                off = slice.next_offset;
+                if slice.eof {
+                    break;
+                }
+            }
+            assert_eq!(out, full, "limit={limit}");
+        }
+
+        let tail = read_tail(dir.path(), 2, 1024, false).unwrap();
+        assert_eq!(tail.content, "sec€nd\nthird\n");
+        assert!(!tail.output_dropped);
+        assert!(tail.truncated);
+
+        // Once earlier bytes were dropped (rotation 2+), offsets below `dropped_bytes` advance to
+        // `dropped_bytes` and both offset and tail modes report `output_dropped: true`.
+        write_log_meta(dir.path(), 500).unwrap();
+        let jumped = read_offset(dir.path(), 0, 1024, false).unwrap();
+        assert!(jumped.output_dropped);
+        assert_eq!(jumped.dropped_bytes, Some(500));
+        assert_eq!(jumped.offset, 500);
+        assert_eq!(jumped.next_offset, 500 + full.len() as u64);
+        assert_eq!(jumped.content, full);
+        assert!(jumped.eof);
+
+        let mid_read = read_offset(dir.path(), 506, 1024, false).unwrap();
+        assert!(mid_read.output_dropped);
+        assert_eq!(mid_read.offset, 506);
+        assert_eq!(mid_read.content, "sec€nd\nthird\n");
+
+        let dropped_tail = read_tail(dir.path(), 10, 1024, false).unwrap();
+        assert!(dropped_tail.output_dropped);
+        assert_eq!(dropped_tail.dropped_bytes, Some(500));
+        assert_eq!(dropped_tail.offset, 500);
+        assert!(dropped_tail.truncated);
+        assert_eq!(dropped_tail.content, full);
     }
 }

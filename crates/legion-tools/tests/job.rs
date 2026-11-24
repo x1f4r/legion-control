@@ -403,6 +403,60 @@ async fn output_is_captured_and_readable_incrementally() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgs);
+
+    // Non-rotated logs report `output_dropped: false` and omit `dropped_bytes`.
+    assert_eq!(rest["output_dropped"], json!(false));
+    assert!(rest.get("dropped_bytes").is_none());
+
+    // Rotated logs (`output.log.1` + `output.log` + `output.meta`) are read transparently across
+    // both segments and report `output_dropped: true` with `dropped_bytes`.
+    let jobs_root = fixture.node.paths().state_dir().join("jobs");
+    let boot = procid::boot_id().unwrap();
+    let rotated_dir = jobs_root.join("rotated-log-job");
+    write_synthetic_finished_job(
+        &jobs_root,
+        "rotated-log-job",
+        "2026-01-01T00:00:00.000Z",
+        "2026-01-01T00:00:05.000Z",
+        &boot,
+    );
+    fs::write(rotated_dir.join("output.log.1"), "older-1\nolder-2\n").unwrap();
+    fs::write(rotated_dir.join("output.log"), "newer-3\nnewer-4\n").unwrap();
+    fs::write(
+        rotated_dir.join("output.meta"),
+        serde_json::to_vec(&json!({"dropped_bytes": 1024})).unwrap(),
+    )
+    .unwrap();
+
+    let rotated_status = fixture
+        .call("job.status", json!({"id": "rotated-log-job"}))
+        .await
+        .unwrap();
+    assert_eq!(rotated_status["output_bytes"], json!(32));
+
+    let rotated_offset = fixture
+        .call("job.logs", json!({"id": "rotated-log-job", "offset": 0}))
+        .await
+        .unwrap();
+    assert_eq!(rotated_offset["output_dropped"], json!(true));
+    assert_eq!(rotated_offset["dropped_bytes"], json!(1024));
+    assert_eq!(rotated_offset["offset"], json!(1024));
+    assert_eq!(rotated_offset["next_offset"], json!(1056));
+    assert_eq!(
+        rotated_offset["content"],
+        json!("older-1\nolder-2\nnewer-3\nnewer-4\n")
+    );
+
+    let rotated_tail = fixture
+        .call("job.logs", json!({"id": "rotated-log-job", "tail": 3}))
+        .await
+        .unwrap();
+    assert_eq!(rotated_tail["output_dropped"], json!(true));
+    assert_eq!(rotated_tail["dropped_bytes"], json!(1024));
+    assert_eq!(
+        rotated_tail["content"],
+        json!("older-2\nnewer-3\nnewer-4\n")
+    );
 }
 
 async fn exit_code_env_secrecy_and_wait_are_reported() {
@@ -466,7 +520,8 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         assert_eq!(mode(&job_dir.join("output.log")), 0o600);
     }
 
-    // Also verify `env.json` is deleted while a long-running job is still active.
+    // Also verify `env.json` is deleted while a long-running job is still active, and
+    // `exit.reserve` is held while running and removed when `exit.json` is written.
     let live = fixture
         .call(
             "job.start",
@@ -479,24 +534,26 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         .unwrap();
     let live_id = live["id"].as_str().unwrap().to_owned();
     cleanup.track_job(&live_id);
-    let live_env = fixture
-        .node
-        .paths()
-        .state_dir()
-        .join("jobs")
-        .join(&live_id)
-        .join("env.json");
+    let live_dir = fixture.node.paths().state_dir().join("jobs").join(&live_id);
+    let live_env = live_dir.join("env.json");
+    let live_reserve = live_dir.join("exit.reserve");
     assert!(
-        wait_for(Duration::from_secs(5), || (!live_env.exists())
-            .then_some(()))
+        wait_for(Duration::from_secs(5), || (!live_env.exists()
+            && live_reserve.exists())
+        .then_some(()))
         .await
         .is_some(),
-        "env.json persisted while job was still running"
+        "env.json persisted or exit.reserve was missing while job was running"
     );
+    assert_eq!(fs::metadata(&live_reserve).unwrap().len(), 16 * 1024);
     fixture
         .call("job.cancel", json!({"id": live_id, "force": true}))
         .await
         .unwrap();
+    assert!(
+        !live_reserve.exists(),
+        "exit.reserve should be removed once exit.json is written"
+    );
 
     // Confirm `cmd` works through the platform shell and a missing executable records `failed`
     // with a clear detail.

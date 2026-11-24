@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::RandomState;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +25,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::platform;
+
 /// Subdirectory of `<state dir>` holding one directory per job.
 pub(super) const JOBS_DIR: &str = "jobs";
 /// Node-wide kernel lock serializing job creation, idempotent key checks, and retention.
@@ -35,8 +37,20 @@ pub(super) const JOB_FILE: &str = "job.json";
 pub(super) const ENV_FILE: &str = "env.json";
 /// Exit record written atomically when the command finishes or is forcefully stopped.
 pub(super) const EXIT_FILE: &str = "exit.json";
+/// Placeholder file allocated by the supervisor on startup and removed immediately before
+/// `exit.json` is written so a full disk cannot lose a finished job's exit code.
+pub(super) const EXIT_RESERVE_FILE: &str = "exit.reserve";
+/// Size of [`EXIT_RESERVE_FILE`] in bytes (16 KiB, comfortably above any `exit.json`).
+pub(super) const EXIT_RESERVE_BYTES: usize = 16 * 1024;
 /// Combined stdout and stderr output appended as chunks arrive.
 pub(super) const LOG_FILE: &str = "output.log";
+/// Single rotated segment holding the previous [`MAX_LOG_FILE_BYTES`] chunk of output.
+pub(super) const LOG_ROTATED_FILE: &str = "output.log.1";
+/// Rotation metadata recording how many earliest log bytes were dropped.
+pub(super) const LOG_META_FILE: &str = "output.meta";
+/// Maximum size of a single `output.log` segment before rotating once to `output.log.1` (256 MiB).
+/// At most twice this cap is kept on disk across `output.log.1` and `output.log`.
+pub(super) const MAX_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Kernel lock file held exclusively by the supervisor for its whole life.
 pub(super) const LOCK_FILE: &str = "lock";
 /// Cancel request marker file polled by the supervisor.
@@ -399,8 +413,79 @@ pub(super) fn remove_env_file(dir: &Path) {
     let _ = fs::remove_file(dir.join(ENV_FILE));
 }
 
+/// Metadata written atomically to `<job_dir>/output.meta` when log rotation discards earlier
+/// output beyond `output.log.1`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LogMeta {
+    #[serde(default)]
+    pub dropped_bytes: u64,
+}
+
+/// Reads `<job_dir>/output.meta`, defaulting to zero dropped bytes when absent.
+pub(super) fn read_log_meta(dir: &Path) -> LogMeta {
+    fs::read(dir.join(LOG_META_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Atomically updates `<job_dir>/output.meta` with the total number of dropped log bytes.
+pub(super) fn write_log_meta(dir: &Path, dropped_bytes: u64) -> Result<(), ErrorBody> {
+    let path = dir.join(LOG_META_FILE);
+    let meta = LogMeta { dropped_bytes };
+    let bytes = serde_json::to_vec(&meta).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Cannot serialize job log metadata: {err}."),
+        )
+    })?;
+    write_atomic(&path, &bytes, WriteOptions::with_mode(0o600)).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot write log metadata {}: {err}.", path.display()),
+        )
+    })
+}
+
+/// Allocates real incompressible disk blocks in `<job_dir>/exit.reserve` so removing it right
+/// before writing `exit.json` guarantees space even if the job fills the filesystem.
+pub(super) fn create_exit_reserve(dir: &Path) -> io::Result<()> {
+    let path = dir.join(EXIT_RESERVE_FILE);
+    let mut file = platform::create_private_file(&path)?;
+    // Fill with deterministic incompressible bytes (blake3 XOF) so compressing filesystems such as
+    // btrfs or ZFS still allocate real physical blocks.
+    let mut buf = [0u8; EXIT_RESERVE_BYTES];
+    blake3::Hasher::new()
+        .update(b"legion-job-exit-reserve")
+        .finalize_xof()
+        .fill(&mut buf);
+    file.write_all(&buf)?;
+    file.sync_all()
+}
+
+/// Removes `<job_dir>/exit.reserve` to release reserved disk space right before writing
+/// `exit.json` (or on early supervisor exit).
+pub(super) fn remove_exit_reserve(dir: &Path) {
+    let _ = fs::remove_file(dir.join(EXIT_RESERVE_FILE));
+}
+
+/// Total bytes currently stored across `output.log.1` and `output.log`.
+pub(super) fn total_log_bytes(dir: &Path) -> u64 {
+    let active = fs::metadata(dir.join(LOG_FILE))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let rotated = fs::metadata(dir.join(LOG_ROTATED_FILE))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    active.saturating_add(rotated)
+}
+
 /// Atomically writes `<job_dir>/exit.json` with owner-only permissions.
+///
+/// Always removes `<job_dir>/exit.reserve` immediately beforehand so reserved disk blocks are
+/// freed for the exit record when the filesystem is full.
 pub(super) fn write_exit_record(dir: &Path, exit: &ExitRecord) -> Result<(), ErrorBody> {
+    remove_exit_reserve(dir);
     let path = dir.join(EXIT_FILE);
     let bytes = serde_json::to_vec_pretty(exit).map_err(|err| {
         ErrorBody::new(
@@ -553,9 +638,7 @@ fn inspect_local(
     current_boot_id: Option<&str>,
     now: jiff::Timestamp,
 ) -> LocalInspect {
-    let output_bytes = fs::metadata(dir.join(LOG_FILE))
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+    let output_bytes = total_log_bytes(dir);
     let created_ts = parse_timestamp(&record.created);
 
     if let Some(exit) = read_exit_record(dir) {
@@ -771,11 +854,17 @@ fn interrupted_runtime_phrase(
         return "an unknown duration".to_owned();
     };
     let since_created = elapsed_seconds(created, now);
-    let last_log = fs::metadata(dir.join(LOG_FILE))
-        .ok()
-        .and_then(|meta| (meta.len() > 0).then(|| meta.modified().ok()).flatten())
-        .and_then(|mtime| jiff::Timestamp::try_from(mtime).ok())
-        .filter(|&mtime| mtime >= created);
+    let last_log = [LOG_FILE, LOG_ROTATED_FILE]
+        .into_iter()
+        .filter_map(|name| {
+            let meta = fs::metadata(dir.join(name)).ok()?;
+            (meta.len() > 0)
+                .then(|| meta.modified().ok())
+                .flatten()
+                .and_then(|mtime| jiff::Timestamp::try_from(mtime).ok())
+        })
+        .filter(|&mtime| mtime >= created)
+        .max();
 
     match last_log {
         Some(last_write) => {

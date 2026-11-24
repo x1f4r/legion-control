@@ -87,7 +87,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.logs",
         Effect::Read,
-        "Read captured stdout and stderr from a background job without loading the whole log into memory. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes.",
+        "Read captured stdout and stderr from a background job without loading the whole log into memory. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation.",
         read_logs,
     );
     registry.add_fn(
@@ -265,7 +265,7 @@ pub struct JobStatus {
     /// Duration in seconds (elapsed so far while running, or total once finished).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
-    /// Current size of `output.log` in bytes.
+    /// Current size of captured log files (`output.log.1` and `output.log`) in bytes.
     pub output_bytes: u64,
     /// Explanation when the job was interrupted or failed to start.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,15 +301,22 @@ pub struct JobLogs {
     pub state: JobState,
     /// Log text for the returned byte range (invalid UTF-8 replaced with U+FFFD).
     pub content: String,
-    /// Byte offset where `content` starts in `output.log`.
+    /// Logical byte offset where `content` starts in the job's output stream.
     pub offset: u64,
-    /// Byte offset immediately after `content`; pass as `offset` on the next call to follow output.
+    /// Logical byte offset immediately after `content`; pass as `offset` on the next call to
+    /// follow output.
     pub next_offset: u64,
-    /// Whether this read reached the current end of `output.log`.
+    /// Whether this read reached the current end of captured output.
     pub eof: bool,
     /// Whether bytes exist outside the returned range (earlier bytes in tail mode, or later bytes
     /// in offset mode).
     pub truncated: bool,
+    /// `true` when earlier output was discarded because the log rotated past its size cap.
+    pub output_dropped: bool,
+    /// Number of earliest bytes dropped due to log rotation, present when `output_dropped` is
+    /// `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped_bytes: Option<u64>,
 }
 
 /// Arguments of `job.wait`.
@@ -897,11 +904,10 @@ async fn read_logs(ctx: &Ctx, args: LogsArgs) -> Result<JobLogs, ToolError> {
 
     let derived = derive_status_async(&dir, &record, boot.as_deref(), jiff::Timestamp::now()).await;
     let actively_writing = derived.supervised == Some(true);
-    let log_path = dir.join(store::LOG_FILE);
 
     let slice = blocking("job.logs", move || match offset {
-        Some(off) => logs::read_offset(&log_path, off, limit_usize, actively_writing),
-        None => logs::read_tail(&log_path, tail_usize, limit_usize, actively_writing),
+        Some(off) => logs::read_offset(&dir, off, limit_usize, actively_writing),
+        None => logs::read_tail(&dir, tail_usize, limit_usize, actively_writing),
     })
     .await?;
 
@@ -913,6 +919,8 @@ async fn read_logs(ctx: &Ctx, args: LogsArgs) -> Result<JobLogs, ToolError> {
         next_offset: slice.next_offset,
         eof: slice.eof,
         truncated: slice.truncated,
+        output_dropped: slice.output_dropped,
+        dropped_bytes: slice.dropped_bytes,
     })
 }
 
