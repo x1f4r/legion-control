@@ -125,6 +125,17 @@ legion: denied: agent:wide may not read ~/.ssh/id_ed25519: ~/.ssh is on Legion's
   Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name ~/.ssh (or a path inside it) explicitly in the role's `paths` in policy.toml.
 ```
 
+The list also covers package-registry credentials (`~/.cargo/credentials.toml`, `~/.pypirc`),
+`~/.config/rclone`, `~/.config/op`, `~/.vault-token`, Terraform's credentials file, mail profiles
+and, on Windows, the operating system's credential stores. `.npmrc` and shell history files are
+deliberately left out because they cause too many false positives. An owner can protect them, or
+any other path, with a top-level `secrets = ["~/extra/path"]` in `policy.toml`; such a path is
+treated exactly like the built-in list.
+
+Two limits remain. A hard link to a secret file made outside Legion cannot be detected by any path
+check. And a role without the admin effect cannot create a secret location that does not exist
+yet, or a link in its place: planting `~/.ssh/authorized_keys` would be as bad as reading a key.
+
 ## The three ready-made roles
 
 `legion init` writes a starter `policy.toml` with `default = "owner"` and three roles:

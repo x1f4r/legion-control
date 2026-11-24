@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
+use legion_core::{Access, CancellationToken, CreateKind, Ctx, Grant, Registry, ToolError};
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, replace_file, write_atomic_from_reader};
 use schemars::JsonSchema;
@@ -66,6 +66,7 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
     let to = check_fs_path(ctx.grant(), &args.to, Access::Write)?;
     check_not_protected_tree(ctx.grant(), &from)?;
     check_not_protected_tree(ctx.grant(), &to)?;
+    let grant = ctx.grant().clone();
     let own_dirs = OwnDirFilter::for_ctx(ctx);
     let allows_destroy = ctx.grant().allows_effect(Effect::Destroy);
     let principal = ctx.principal().to_owned();
@@ -77,6 +78,7 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
         }
         let from_meta = fs::symlink_metadata(&from)
             .map_err(|error| map_io_error("move", &from, error))?;
+        grant.check_create(&to, create_kind_for(&from_meta), false)?;
         if from.as_os_str() == to.as_os_str() {
             return Ok(MoveResult {
                 from: path_to_string(&from),
@@ -167,6 +169,7 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
                     overwrite,
                     allows_destroy,
                     &principal,
+                    &grant,
                     &own_dirs,
                     &same_dev,
                     &cancel,
@@ -192,6 +195,7 @@ fn move_across_devices(
     overwrite: bool,
     allows_destroy: bool,
     principal: &str,
+    grant: &Grant,
     own_dirs: &OwnDirFilter,
     same_device: &dyn Fn(&Path, &Metadata) -> bool,
     cancel: &CancellationToken,
@@ -204,6 +208,7 @@ fn move_across_devices(
         overwrite,
         allows_destroy,
         principal,
+        grant,
         own_dirs,
         same_device,
         cancel,
@@ -220,6 +225,7 @@ fn move_across_devices_with_hook(
     overwrite: bool,
     allows_destroy: bool,
     principal: &str,
+    grant: &Grant,
     own_dirs: &OwnDirFilter,
     same_device: &dyn Fn(&Path, &Metadata) -> bool,
     cancel: &CancellationToken,
@@ -233,6 +239,7 @@ fn move_across_devices_with_hook(
         allows_destroy,
         principal,
         tool: "fs.move",
+        grant: Some(grant),
         own_dirs,
         same_device,
     };
@@ -416,6 +423,7 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
     let from = check_fs_path(ctx.grant(), &args.from, Access::Read)?;
     let to = check_fs_path(ctx.grant(), &args.to, Access::Write)?;
     check_not_protected_tree(ctx.grant(), &to)?;
+    let grant = ctx.grant().clone();
     let own_dirs = OwnDirFilter::for_ctx(ctx);
     let allows_destroy = ctx.grant().allows_effect(Effect::Destroy);
     let principal = ctx.principal().to_owned();
@@ -446,6 +454,7 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
             allows_destroy,
             principal: &principal,
             tool: "fs.copy",
+            grant: Some(&grant),
             own_dirs: &own_dirs,
             same_device: &same_dev,
         };
@@ -491,8 +500,19 @@ struct CopyOptions<'a> {
     allows_destroy: bool,
     principal: &'a str,
     tool: &'a str,
+    grant: Option<&'a Grant>,
     own_dirs: &'a OwnDirFilter,
     same_device: &'a dyn Fn(&Path, &Metadata) -> bool,
+}
+
+fn create_kind_for(meta: &Metadata) -> CreateKind {
+    if meta.file_type().is_symlink() {
+        CreateKind::Symlink
+    } else if meta.is_dir() {
+        CreateKind::Dir
+    } else {
+        CreateKind::File
+    }
 }
 
 fn deny_replace_directory(principal: &str, path: &Path) -> ErrorBody {
@@ -562,6 +582,9 @@ fn copy_path(
                 from.display()
             ),
         ));
+    }
+    if let Some(grant) = opts.grant {
+        grant.check_create(to, create_kind_for(from_meta), false)?;
     }
 
     if from_meta.file_type().is_symlink() {
@@ -1183,6 +1206,7 @@ mod tests {
             allows_destroy: true,
             principal: "owner",
             tool: "fs.copy",
+            grant: None,
             own_dirs: &own_dirs,
             same_device: &same_dev,
         };
@@ -1244,6 +1268,7 @@ mod tests {
     #[test]
     fn cross_device_move_errors_report_copy_completion_and_what_remains_where() {
         let dir = tempfile::tempdir().unwrap();
+        let grant = Grant::owner(&legion_core::Paths::under(dir.path()));
         let own_dirs = OwnDirFilter::allow_all_for_test();
         let all_same = |_p: &Path, _m: &Metadata| true;
 
@@ -1263,6 +1288,7 @@ mod tests {
             false,
             true,
             "owner",
+            &grant,
             &own_dirs,
             &all_same,
             &cancel1,
@@ -1295,6 +1321,7 @@ mod tests {
             true,
             true,
             "owner",
+            &grant,
             &own_dirs,
             &all_same,
             &cancel2,
@@ -1328,6 +1355,7 @@ mod tests {
             false,
             true,
             "owner",
+            &grant,
             &own_dirs,
             &all_same,
             &cancel3,
@@ -1363,6 +1391,7 @@ mod tests {
             false,
             true,
             "owner",
+            &grant,
             &own_dirs,
             &all_same,
             &cancel4,

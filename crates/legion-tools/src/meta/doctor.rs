@@ -24,6 +24,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-machine timeout when `meta.doctor` checks fleet reachability.
 const FLEET_PING_TIMEOUT_S: f64 = 5.0;
 
+/// Maximum number of matching `exec` tool names shown per role in `meta.doctor`.
+const MAX_NAMED_EXEC_TOOLS: usize = 5;
+
 /// Unique sentinel wrapping `$PATH` in login-shell probe output so profile banners are ignored.
 const PATH_MARKER: &str = "__LEGION_LOGIN_PATH__";
 
@@ -75,7 +78,8 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     checks.push(check_ssh_on_path(ssh_path.as_deref()));
 
     if let Ok(policy) = ctx.config().get::<Policy>() {
-        checks.push(check_policy_exec_roles(&policy));
+        let specs = ctx.tools();
+        checks.push(check_policy_exec_roles(&policy, &specs));
     }
 
     if !quick
@@ -357,21 +361,42 @@ pub fn check_ssh_on_path(found: Option<&Path>) -> Check {
     }
 }
 
-/// Checks whether any role other than `owner` in `policy.toml` allows the `exec` effect.
-pub fn check_policy_exec_roles(policy: &Policy) -> Check {
-    let flagged: Vec<&str> = policy
-        .roles
+/// Checks whether any role other than `owner` in `policy.toml` allows any live `Effect::Exec` tool
+/// (built-in or extension) from `specs`, naming the matching tools (bounded per role).
+pub fn check_policy_exec_roles(policy: &Policy, specs: &[ToolSpec]) -> Check {
+    let mut exec_specs: Vec<&ToolSpec> = specs
         .iter()
-        .filter(|(name, role)| name.as_str() != OWNER && role_allows_exec(role))
-        .map(|(name, _)| name.as_str())
+        .filter(|spec| spec.effect == Effect::Exec)
         .collect();
+    exec_specs.sort_by(|a, b| a.name.cmp(&b.name));
+    exec_specs.dedup_by(|a, b| a.name == b.name);
+
+    let mut flagged: Vec<String> = Vec::new();
+    for (name, role) in &policy.roles {
+        if name.as_str() == OWNER {
+            continue;
+        }
+        let matched: Vec<&str> = exec_specs
+            .iter()
+            .filter(|spec| {
+                !role.deny.iter().any(|rule| rule.matches(spec))
+                    && role.allow.iter().any(|rule| rule.matches(spec))
+            })
+            .map(|spec| spec.name.as_str())
+            .collect();
+        if !matched.is_empty() {
+            flagged.push(format!("{name} ({})", format_bounded_tools(&matched)));
+        } else if exec_specs.is_empty() && role_allows_exec_effect_broadly(role) {
+            flagged.push(format!("{name} (effect:exec)"));
+        }
+    }
 
     if flagged.is_empty() {
         Check {
             name: "policy exec roles".to_owned(),
             ok: true,
             warning: false,
-            detail: "No non-owner role allows the `exec` effect.".to_owned(),
+            detail: "No non-owner role allows any `exec` tool.".to_owned(),
             hint: None,
         }
     } else {
@@ -380,8 +405,8 @@ pub fn check_policy_exec_roles(policy: &Policy) -> Check {
             ok: true,
             warning: true,
             detail: format!(
-                "Role(s) {} allow the `exec` effect. Any role with `exec` is as strong as the account, admin included: a command can read, write, and start anything the operating system lets the user do, and neither `paths` nor denying `effect:admin` contains it.",
-                flagged.join(", ")
+                "Role(s) {} allow `exec` tools. Any role with `exec` is as strong as the account, admin included: a command can read, write, and start anything the operating system lets the user do, and neither `paths` nor denying `effect:admin` contains it.",
+                flagged.join("; ")
             ),
             hint: Some(
                 "Only assign roles with `exec` to principals you trust with the whole account. A role that needs a real boundary must omit `exec` (for example, `observer` or `editor`)."
@@ -391,37 +416,25 @@ pub fn check_policy_exec_roles(policy: &Policy) -> Check {
     }
 }
 
-fn role_allows_exec(role: &Role) -> bool {
-    let probes = [
-        ToolSpec {
-            name: "exec.run".to_owned(),
-            description: String::new(),
-            effect: Effect::Exec,
-            input_schema: json!({"type": "object"}),
-        },
-        ToolSpec {
-            name: "job.start".to_owned(),
-            description: String::new(),
-            effect: Effect::Exec,
-            input_schema: json!({"type": "object"}),
-        },
-        ToolSpec {
-            name: "proj.run".to_owned(),
-            description: String::new(),
-            effect: Effect::Exec,
-            input_schema: json!({"type": "object"}),
-        },
-        ToolSpec {
-            name: "ext.exec".to_owned(),
-            description: String::new(),
-            effect: Effect::Exec,
-            input_schema: json!({"type": "object"}),
-        },
-    ];
-    probes.iter().any(|spec| {
-        !role.deny.iter().any(|rule| rule.matches(spec))
-            && role.allow.iter().any(|rule| rule.matches(spec))
-    })
+fn format_bounded_tools(tools: &[&str]) -> String {
+    if tools.len() <= MAX_NAMED_EXEC_TOOLS {
+        tools.join(", ")
+    } else {
+        let shown = tools[..MAX_NAMED_EXEC_TOOLS].join(", ");
+        let extra = tools.len() - MAX_NAMED_EXEC_TOOLS;
+        format!("{shown}, and {extra} more")
+    }
+}
+
+fn role_allows_exec_effect_broadly(role: &Role) -> bool {
+    let probe = ToolSpec {
+        name: "exec.run".to_owned(),
+        description: String::new(),
+        effect: Effect::Exec,
+        input_schema: json!({"type": "object"}),
+    };
+    !role.deny.iter().any(|rule| rule.matches(&probe))
+        && role.allow.iter().any(|rule| rule.matches(&probe))
 }
 
 /// Converts `fleet.ping` outcomes into one `meta.doctor` check per machine.
@@ -558,45 +571,77 @@ mod tests {
     }
 
     #[test]
-    fn policy_exec_roles_warns_for_every_non_owner_role_allowing_exec() {
+    fn policy_exec_roles_warns_against_every_live_exec_spec_with_bounded_tool_list() {
+        let make_spec = |name: &str, effect: Effect| ToolSpec {
+            name: name.to_owned(),
+            description: String::new(),
+            effect,
+            input_schema: json!({"type": "object"}),
+        };
+        let live_specs = vec![
+            make_spec("fs.read", Effect::Read),
+            make_spec("exec.run", Effect::Exec),
+            make_spec("job.start", Effect::Exec),
+            make_spec("job.cancel", Effect::Exec),
+            make_spec("proj.pull", Effect::Exec),
+            make_spec("proj.run", Effect::Exec),
+            make_spec("svc.restart", Effect::Exec),
+            make_spec("ops.deploy", Effect::Exec),
+            make_spec("ops.info", Effect::Read),
+        ];
+
         let safe = parse::<Policy>(
             Path::new("policy.toml"),
-            b"[roles.writer]\nallow = [\"effect:read\", \"effect:write\"]\npaths = [\"~/projects/**\"]\n",
+            b"[roles.writer]\nallow = [\"effect:read\", \"effect:write\", \"ops.info\"]\npaths = [\"~/projects/**\"]\n",
         )
         .unwrap();
-        let safe_check = check_policy_exec_roles(&safe);
+        let safe_check = check_policy_exec_roles(&safe, &live_specs);
         assert!(safe_check.ok && !safe_check.warning && safe_check.hint.is_none());
 
         // Built-in owner alone never triggers a warning.
         let owner_only = Policy::default();
-        let owner_check = check_policy_exec_roles(&owner_only);
+        let owner_check = check_policy_exec_roles(&owner_only, &live_specs);
         assert!(owner_check.ok && !owner_check.warning && owner_check.hint.is_none());
 
-        // An exec role WITHOUT `paths` and denying `effect:admin` still triggers a warning.
-        let unconfined_exec = parse::<Policy>(
+        // Role allowing `proj.pull` by exact name and role matching an exec extension by glob
+        // (`ops.*`) are both caught and name the matching tools; broad roles bound the tool list.
+        let policy = parse::<Policy>(
             Path::new("policy.toml"),
-            b"[roles.operator]\nallow = [\"effect:read\", \"effect:write\", \"effect:exec\", \"effect:destroy\"]\ndeny = [\"effect:power\", \"effect:admin\"]\n",
+            b"\
+[roles.puller]
+allow = [\"proj.pull\"]
+
+[roles.deployer]
+allow = [\"ops.*\"]
+
+[roles.operator]
+allow = [\"effect:read\", \"effect:write\", \"effect:exec\", \"effect:destroy\"]
+deny = [\"effect:power\", \"effect:admin\"]
+",
         )
         .unwrap();
-        let warn = check_policy_exec_roles(&unconfined_exec);
+        let warn = check_policy_exec_roles(&policy, &live_specs);
         assert!(warn.ok && warn.warning);
-        assert!(warn.detail.contains("operator"));
+        assert!(
+            warn.detail.contains("puller (proj.pull)"),
+            "{}",
+            warn.detail
+        );
+        assert!(
+            warn.detail.contains("deployer (ops.deploy)"),
+            "{}",
+            warn.detail
+        );
+        assert!(
+            warn.detail.contains("operator (") && warn.detail.contains("and 2 more)"),
+            "{}",
+            warn.detail
+        );
         assert!(
             warn.detail
                 .contains("as strong as the account, admin included")
         );
         assert!(warn.hint.is_some());
-
-        // A role combining `paths` with `exec` is also named alongside any unconfined exec role.
-        let both = parse::<Policy>(
-            Path::new("policy.toml"),
-            b"[roles.operator]\nallow = [\"effect:exec\"]\n[roles.runner]\nallow = [\"exec.run\"]\npaths = [\"~/projects/**\"]\n",
-        )
-        .unwrap();
-        let both_warn = check_policy_exec_roles(&both);
-        assert!(both_warn.ok && both_warn.warning);
-        assert!(both_warn.detail.contains("operator"));
-        assert!(both_warn.detail.contains("runner"));
     }
 
     #[test]

@@ -242,20 +242,25 @@ pub fn render_policy_toml() -> &'static str {
 # Keeping default = \"owner\" preserves local shell behaviour until you assign narrower principals.
 default = \"owner\"
 
-# Observer: may look without changing anything (system facts, job and service status, project
-# status, and files under `paths`; never Legion's audit log). This is a real boundary when the
-# caller arrives through a door that pins its principal (an ssh key forced to `legion gate`, or
-# an HTTP token).
+# Observer: may look without changing anything. Besides system, service, job, and project status
+# and files under `paths` (never Legion's audit log), it can see every process's command line
+# (with secret-looking values replaced), service logs, every principal's job commands and output,
+# the fleet's layout, and the definitions of extension tools, and it can run any extension tool
+# declared `read`. This is a real boundary when the caller arrives through a door that pins its
+# principal (an ssh key forced to `legion gate`, or an HTTP token).
 [roles.observer]
 allow = [\"effect:read\"]
 deny = [\"audit.*\"]
 paths = [\"~/projects/**\"]
 
-# Editor: may read and change files inside `paths`, and nothing else that changes the machine.
+# Editor: may read everything `observer` sees and change files inside `paths` (plus run any
+# extension tool declared `read` or `write`), without altering project registrations (`proj.add`,
+# `proj.remove`), sending files across machines (`fs.transfer`), or reading Legion's audit log.
 # This is a real boundary through the same pinned doors (`legion gate` or an HTTP token); because
 # it has no `exec`, it cannot run commands, project tasks, or tests.
 [roles.editor]
 allow = [\"effect:read\", \"effect:write\"]
+deny = [\"audit.*\", \"proj.add\", \"proj.remove\", \"fs.transfer\"]
 paths = [\"~/projects/**\"]
 
 # Operator: may do everything except power and administration.
@@ -323,6 +328,19 @@ mod tests {
             policy_text.contains("as strong as your account") && policy_text.contains("not a wall"),
             "operator comment must state plainly that exec is as strong as the account"
         );
+        for required_observer_fact in [
+            "every process's command line",
+            "service logs",
+            "every principal's job commands and output",
+            "the fleet's layout",
+            "definitions of extension tools",
+            "declared `read`",
+        ] {
+            assert!(
+                policy_text.contains(required_observer_fact),
+                "observer comment missing {required_observer_fact:?}"
+            );
+        }
 
         policy_text.push_str(
             "\n[principals.viewer]\nrole = \"observer\"\n\
@@ -378,6 +396,10 @@ mod tests {
                 .is_err()
         );
         for (name, effect) in [
+            ("audit.tail", Effect::Read),
+            ("proj.add", Effect::Write),
+            ("proj.remove", Effect::Write),
+            ("fs.transfer", Effect::Write),
             ("exec.run", Effect::Exec),
             ("fs.remove", Effect::Destroy),
             ("power.reboot", Effect::Power),
