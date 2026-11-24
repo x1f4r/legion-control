@@ -1830,3 +1830,153 @@ fn real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels(
         serde_json::from_str(String::from_utf8_lossy(&bystander_after.stdout).trim()).unwrap();
     assert_eq!(bystander_reply["result"]["principal"], json!("phone"));
 }
+
+#[test]
+fn device_remove_leaves_running_jobs_alive_and_reports_them() {
+    let home = Home::new();
+    let auth_keys = home.home().join("jobs_authorized_keys");
+    let home_root = home.state().parent().unwrap().to_path_buf();
+    let pinned_home = legion_tools::device::authkeys::PinnedHome::Root(home_root.clone());
+    let exe = Path::new(env!("CARGO_BIN_EXE_legion"));
+    let shell = if cfg!(windows) {
+        legion_tools::device::authkeys::ForcedCommandShell::WindowsCmd
+    } else {
+        legion_tools::device::authkeys::ForcedCommandShell::Posix
+    };
+
+    let key_a = ed25519_public_key_from_seed(&[31_u8; 32]);
+    let key_b = ed25519_public_key_from_seed(&[32_u8; 32]);
+    let line_a = legion_tools::device::authkeys::format_device_line(
+        exe,
+        "phone",
+        &key_a,
+        "job-phone",
+        &pinned_home,
+        None,
+        shell,
+    )
+    .unwrap();
+    let line_b = legion_tools::device::authkeys::format_device_line(
+        exe,
+        "phone",
+        &key_b,
+        "other-phone",
+        &pinned_home,
+        None,
+        shell,
+    )
+    .unwrap();
+    std::fs::write(&auth_keys, format!("{line_a}\n{line_b}\n")).unwrap();
+
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_keys),
+        ),
+    );
+    home.write_config(
+        "policy.toml",
+        "default = \"owner\"\n\n\
+         [roles.operator]\n\
+         allow = [\"effect:read\", \"effect:exec\"]\n\n\
+         [principals.phone]\n\
+         role = \"operator\"\n",
+    );
+
+    let sleep_cmd = if cfg!(windows) {
+        "Start-Sleep -Seconds 30"
+    } else {
+        "sleep 30"
+    };
+
+    let start_job_via_gate = |device: &str| -> String {
+        let mut child = home
+            .command(&[
+                "gate",
+                "--as",
+                "phone",
+                "--device",
+                device,
+                "--home",
+                &home_root.to_string_lossy(),
+            ])
+            .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                rpc_request(
+                    json!(1),
+                    "call",
+                    json!({"tool": "job.start", "args": {"cmd": sleep_cmd}})
+                )
+            )
+            .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "gate job.start for {device} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        reply["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing job id in {reply}"))
+            .to_owned()
+    };
+
+    let job_a = start_job_via_gate("job-phone");
+    let job_b = start_job_via_gate("other-phone");
+    let owner_job_run = home.run(&["job.start", &format!("cmd={sleep_cmd}")]);
+    assert_eq!(
+        owner_job_run.code, 0,
+        "owner job.start failed: {}",
+        owner_job_run.stderr
+    );
+    let job_owner = owner_job_run.json()["id"].as_str().unwrap().to_owned();
+
+    // Ensure all three background jobs are cancelled even if an assertion fails below.
+    struct CancelJobs<'a> {
+        home: &'a Home,
+        ids: Vec<String>,
+    }
+    impl Drop for CancelJobs<'_> {
+        fn drop(&mut self) {
+            for id in &self.ids {
+                let _ = self
+                    .home
+                    .run(&["job.cancel", &format!("id={id}"), "force=true"]);
+            }
+        }
+    }
+    let _cleanup = CancelJobs {
+        home: &home,
+        ids: vec![job_a.clone(), job_b.clone(), job_owner.clone()],
+    };
+
+    // Remove `job-phone`: must report ONLY `job_a` in `jobs_left_running` and leave it running.
+    let removed = home.run(&["device.remove", "name=job-phone"]);
+    assert_eq!(removed.code, 0, "device.remove failed: {}", removed.stderr);
+    let removed_json = removed.json();
+    assert_eq!(removed_json["removed"], json!(true));
+    assert_eq!(
+        removed_json["jobs_left_running"],
+        json!([job_a]),
+        "expected only job-phone's running job in jobs_left_running: {removed_json}"
+    );
+
+    // Confirm `job_a` is still running (device.remove must NOT kill it).
+    let status_a = home.run(&["job.status", &format!("id={job_a}")]);
+    assert_eq!(status_a.code, 0, "job.status failed: {}", status_a.stderr);
+    assert_eq!(status_a.json()["state"], json!("running"));
+}

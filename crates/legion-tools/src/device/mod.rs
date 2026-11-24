@@ -68,7 +68,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.remove",
         Effect::Admin,
-        "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions for a removed device. Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home.",
+        "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions and same-account SSH connections for a removed device. Detached background jobs the device started keep running and are listed in `jobs_left_running` (stop them separately with `job.cancel` if needed). Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home.",
         remove,
     );
 }
@@ -559,6 +559,7 @@ struct Removed {
     removed: bool,
     lines_removed: usize,
     sessions_ended: usize,
+    jobs_left_running: Vec<String>,
 }
 
 async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
@@ -763,6 +764,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         removed: true,
                                         lines_removed: matched_lines,
                                         sessions_ended: 0,
+                                        jobs_left_running: Vec::new(),
                                     },
                                     terminate,
                                 )),
@@ -901,6 +903,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         removed: true,
                                         lines_removed: matched_lines,
                                         sessions_ended: 0,
+                                        jobs_left_running: Vec::new(),
                                     },
                                     None,
                                 )),
@@ -938,6 +941,17 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
             sessions::DEFAULT_TERMINATE_GRACE,
         )
         .await;
+        let paths_for_jobs = paths_for_sessions.clone();
+        let principal_for_jobs = removed.principal.clone();
+        removed.jobs_left_running = blocking(move || {
+            Ok(crate::job::running_job_ids_for_device(
+                &paths_for_jobs,
+                &device_name,
+                &principal_for_jobs,
+            ))
+        })
+        .await
+        .unwrap_or_default();
     }
 
     Ok(removed)

@@ -723,7 +723,9 @@ What happens during pairing:
    `tool: "device.enrol"`). The temporary key immediately stops working.
 
 Inspect paired devices and pending invites, or revoke one at once (removing a paired device also
-terminates any active sessions for that device immediately and reports `sessions_ended`):
+terminates any active sessions and same-account SSH connections for that device immediately and
+reports `sessions_ended`; detached background jobs the device started keep running and their IDs are
+reported in `jobs_left_running`, so cancel them separately with `job.cancel` if needed):
 
 ```sh
 legion device.list
