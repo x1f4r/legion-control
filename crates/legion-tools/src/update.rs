@@ -25,6 +25,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::trust::{RELEASE_PUBLIC_KEY, SIGNATURE_FILENAME, verify_signature_with_key};
+
 /// The single repository URL constant from which release metadata and binaries are fetched.
 pub const RELEASE_REPO_URL: &str = "https://github.com/x1f4r/legion-control";
 
@@ -56,7 +58,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.update",
         Effect::Admin,
-        "Replace this node's legion binary with a verified GitHub release artifact (downloading and checking SHA256SUMS, then replacing atomically). On Windows, renames the running executable aside first so it can be cleaned up on the next start.",
+        "Replace this node's legion binary with an offline-signed GitHub release artifact. Requires a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it; to install an unsigned local build use fleet.install with from=<local file> or install scripts with --from), verifies SHA-256, and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.",
         meta_update,
     );
 }
@@ -171,6 +173,12 @@ pub fn artifact_url(version: &str, target: &str) -> String {
 pub fn checksums_url(version: &str) -> String {
     let tag = release_tag(version);
     format!("{RELEASE_REPO_URL}/releases/download/{tag}/{CHECKSUMS_FILENAME}")
+}
+
+/// Download URL for a release's detached Ed25519 signature over `SHA256SUMS`.
+pub fn checksums_sig_url(version: &str) -> String {
+    let tag = release_tag(version);
+    format!("{RELEASE_REPO_URL}/releases/download/{tag}/{SIGNATURE_FILENAME}")
 }
 
 /// Validates and normalizes a release version, stripping an optional `legion-v` or `v` prefix.
@@ -369,8 +377,9 @@ pub fn dist_cache_binary(paths: &Paths, version: &str, target: &str) -> PathBuf 
 }
 
 /// Returns a verified local path to the release binary for `(version, target)`, using the cache
-/// under `<state_dir>/dist/<version>/<target>/` when already present or downloading and verifying
-/// against `SHA256SUMS` through `fetcher`.
+/// under `<state_dir>/dist/<version>/<target>/` only when a valid signed `SHA256SUMS` +
+/// `SHA256SUMS.sig` sits beside it, or downloading and verifying both the Ed25519 signature and
+/// SHA-256 checksum through `fetcher`.
 pub async fn resolve_release_binary(
     paths: &Paths,
     fetcher: &dyn ReleaseFetcher,
@@ -378,35 +387,50 @@ pub async fn resolve_release_binary(
     target: &str,
     cancel: CancellationToken,
 ) -> Result<PathBuf, ErrorBody> {
+    resolve_release_binary_with_key(paths, fetcher, version, target, &RELEASE_PUBLIC_KEY, cancel)
+        .await
+}
+
+/// Like [`resolve_release_binary`], parameterized on the Ed25519 public key for cross-crate tests.
+#[doc(hidden)]
+pub async fn resolve_release_binary_with_key(
+    paths: &Paths,
+    fetcher: &dyn ReleaseFetcher,
+    version: &str,
+    target: &str,
+    public_key: &[u8; 32],
+    cancel: CancellationToken,
+) -> Result<PathBuf, ErrorBody> {
     let version = normalize_version(version)?;
     let asset = artifact_filename(&version, target);
     let cache_dir = dist_cache_dir(paths, &version, target);
     let cached_bin = cache_dir.join(&asset);
     let cached_sums = cache_dir.join(CHECKSUMS_FILENAME);
+    let cached_sig = cache_dir.join(SIGNATURE_FILENAME);
 
+    // A cached binary is ONLY trusted when its signed SHA256SUMS and SHA256SUMS.sig sit beside it
+    // and both the Ed25519 signature and the binary's SHA-256 verify cleanly.
     if let Ok(meta) = fs::metadata(&cached_bin)
         && meta.is_file()
         && meta.len() > 0
+        && let Ok(sums_bytes) = fs::read(&cached_sums)
+        && let Ok(sig_text) = fs::read_to_string(&cached_sig)
+        && verify_signature_with_key(&sums_bytes, &sig_text, public_key).is_ok()
+        && let Ok(sums_text) = String::from_utf8(sums_bytes)
     {
-        if let Ok(sums_text) = fs::read_to_string(&cached_sums) {
-            let bin_check = cached_bin.clone();
-            let asset_check = asset.clone();
-            let verified = tokio::task::spawn_blocking(move || {
-                verify_file_checksum(&bin_check, &sums_text, &asset_check)
-            })
-            .await
-            .map_err(|err| {
-                ErrorBody::new(
-                    ErrorCode::Internal,
-                    format!("Checksum verification stopped unexpectedly: {err}."),
-                )
-            })?;
-            if verified.is_ok() {
-                return Ok(cached_bin);
-            }
-        } else {
-            // An operator may pre-populate dist/<version>/<target>/ on an air-gapped node without
-            // SHA256SUMS; accept a non-empty cached binary when no manifest sits beside it.
+        let bin_check = cached_bin.clone();
+        let asset_check = asset.clone();
+        let verified = tokio::task::spawn_blocking(move || {
+            verify_file_checksum(&bin_check, &sums_text, &asset_check)
+        })
+        .await
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Checksum verification stopped unexpectedly: {err}."),
+            )
+        })?;
+        if verified.is_ok() {
             return Ok(cached_bin);
         }
     }
@@ -424,23 +448,67 @@ pub async fn resolve_release_binary(
 
     let token = random_hex(8)?;
     let tmp_sums = cache_dir.join(format!(".{CHECKSUMS_FILENAME}.tmp.{token}"));
+    let tmp_sig = cache_dir.join(format!(".{SIGNATURE_FILENAME}.tmp.{token}"));
     let tmp_bin = cache_dir.join(format!(".{asset}.tmp.{token}"));
     let mut sums_guard = TempCleanup::new(tmp_sums.clone());
+    let mut sig_guard = TempCleanup::new(tmp_sig.clone());
     let mut bin_guard = TempCleanup::new(tmp_bin.clone());
 
     let sums_url = checksums_url(&version);
     fetcher
         .download_to_file(&sums_url, &tmp_sums, cancel.clone())
         .await?;
-    let bin_url = artifact_url(&version, target);
-    fetcher.download_to_file(&bin_url, &tmp_bin, cancel).await?;
 
-    let sums_text = fs::read_to_string(&tmp_sums).map_err(|err| {
+    let sig_url = checksums_sig_url(&version);
+    if let Err(err) = fetcher
+        .download_to_file(&sig_url, &tmp_sig, cancel.clone())
+        .await
+    {
+        if err.code == ErrorCode::Cancelled || err.code == ErrorCode::Timeout {
+            return Err(err);
+        }
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Refusing unsigned release {version}: {SIGNATURE_FILENAME} could not be fetched from {sig_url} ({}).",
+                err.message
+            ),
+        )
+        .with_hint(
+            "Sign the release offline with scripts/sign-legion-release.mjs to upload SHA256SUMS.sig, or pass `from=<local path>` to install a local binary you vouch for.",
+        ));
+    }
+
+    // Verify the detached Ed25519 signature over the exact bytes of SHA256SUMS before downloading
+    // or trusting any release binary.
+    let sums_bytes = fs::read(&tmp_sums).map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!("Could not read downloaded {CHECKSUMS_FILENAME}: {err}."),
         )
     })?;
+    let sig_text = fs::read_to_string(&tmp_sig).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Refusing release {version}: {SIGNATURE_FILENAME} is not readable UTF-8 ({err})."
+            ),
+        )
+        .with_hint(
+            "Upload a valid base64 Ed25519 SHA256SUMS.sig from scripts/sign-legion-release.mjs.",
+        )
+    })?;
+    verify_signature_with_key(&sums_bytes, &sig_text, public_key)?;
+
+    let sums_text = String::from_utf8(sums_bytes).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Signed {CHECKSUMS_FILENAME} is not valid UTF-8: {err}."),
+        )
+    })?;
+
+    let bin_url = artifact_url(&version, target);
+    fetcher.download_to_file(&bin_url, &tmp_bin, cancel).await?;
 
     let bin_verify = tmp_bin.clone();
     let asset_verify = asset.clone();
@@ -456,8 +524,8 @@ pub async fn resolve_release_binary(
         )
     })??;
 
-    // Commit both files atomically only after the digest matches so the cache never exposes
-    // an unverified or partially downloaded binary.
+    // Commit manifest, signature, and binary only after both signature and SHA-256 pass so the
+    // dist cache never holds an unverified artifact.
     replace_file(&tmp_sums, &cached_sums).map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
@@ -468,6 +536,17 @@ pub async fn resolve_release_binary(
         )
     })?;
     sums_guard.disarm();
+
+    replace_file(&tmp_sig, &cached_sig).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Could not commit {} into cache: {err}.",
+                cached_sig.display()
+            ),
+        )
+    })?;
+    sig_guard.disarm();
 
     replace_file(&tmp_bin, &cached_bin).map_err(|err| {
         ErrorBody::new(
@@ -698,7 +777,7 @@ async fn meta_update(ctx: &Ctx, args: UpdateArgs) -> Result<UpdateResult, ToolEr
 
 /// Core implementation of `meta.update`, parameterized over fetcher, platform, executable path, and
 /// replacement mode so tests exercise self-replacement on a temp copy without touching the network
-/// or the test runner binary.
+/// or the test runner binary. Always verifies against the compiled-in [`RELEASE_PUBLIC_KEY`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_meta_update(
     paths: &Paths,
@@ -708,6 +787,34 @@ pub async fn run_meta_update(
     current_version: &str,
     current_exe: &Path,
     rename_old_first: bool,
+    args: UpdateArgs,
+    cancel: CancellationToken,
+) -> Result<UpdateResult, ErrorBody> {
+    run_meta_update_with_key(
+        paths,
+        fetcher,
+        os,
+        arch,
+        current_version,
+        current_exe,
+        rename_old_first,
+        &RELEASE_PUBLIC_KEY,
+        args,
+        cancel,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_meta_update_with_key(
+    paths: &Paths,
+    fetcher: &dyn ReleaseFetcher,
+    os: &str,
+    arch: &str,
+    current_version: &str,
+    current_exe: &Path,
+    rename_old_first: bool,
+    public_key: &[u8; 32],
     args: UpdateArgs,
     cancel: CancellationToken,
 ) -> Result<UpdateResult, ErrorBody> {
@@ -740,8 +847,15 @@ pub async fn run_meta_update(
         });
     }
 
-    let cached_bin =
-        resolve_release_binary(paths, fetcher, &desired_version, target, cancel).await?;
+    let cached_bin = resolve_release_binary_with_key(
+        paths,
+        fetcher,
+        &desired_version,
+        target,
+        public_key,
+        cancel,
+    )
+    .await?;
     let target_exe = current_exe.to_path_buf();
     tokio::task::spawn_blocking(move || {
         replace_executable(&target_exe, &cached_bin, rename_old_first)
@@ -1097,6 +1211,8 @@ mod tests {
 
     #[tokio::test]
     async fn meta_update_replaces_temp_binary_copy_and_uses_cache() {
+        use ed25519_dalek::{Signer, SigningKey};
+
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path().join("home"));
         let install_dir = dir.path().join("install");
@@ -1111,17 +1227,22 @@ mod tests {
         let test_bin = std::env::current_exe().unwrap();
         fs::copy(&test_bin, &current_copy).unwrap();
 
+        let signing = SigningKey::from_bytes(&[0x42; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+
         let new_bytes = b"new-legion-0.2.0-binary-content".to_vec();
         let target = "x86_64-unknown-linux-musl";
         let asset = artifact_filename("0.2.0", target);
         let sums = format!("{}  {asset}\n", sha256_bytes(&new_bytes));
+        let sig = crate::trust::encode_signature_bytes(&signing.sign(sums.as_bytes()).to_bytes());
         let mut files = HashMap::new();
         files.insert(checksums_url("0.2.0"), sums.into_bytes());
+        files.insert(checksums_sig_url("0.2.0"), sig.into_bytes());
         files.insert(artifact_url("0.2.0", target), new_bytes.clone());
         let fetcher = FakeFetcher::new("0.2.0", files);
 
         // Dry run touches neither the network downloads nor the binary on disk.
-        let dry = run_meta_update(
+        let dry = run_meta_update_with_key(
             &paths,
             &fetcher,
             "linux",
@@ -1129,6 +1250,7 @@ mod tests {
             "0.1.0",
             &current_copy,
             false,
+            &pubkey,
             UpdateArgs {
                 version: None,
                 dry_run: true,
@@ -1144,8 +1266,8 @@ mod tests {
         assert_eq!(fetcher.download_count(), 0);
         assert_ne!(fs::read(&current_copy).unwrap(), new_bytes);
 
-        // Real update downloads, verifies, caches, and atomically replaces the copy.
-        let updated = run_meta_update(
+        // Real update downloads SHA256SUMS + SHA256SUMS.sig + binary, verifies, caches, and replaces.
+        let updated = run_meta_update_with_key(
             &paths,
             &fetcher,
             "linux",
@@ -1153,6 +1275,7 @@ mod tests {
             "0.1.0",
             &current_copy,
             false,
+            &pubkey,
             UpdateArgs {
                 version: None,
                 dry_run: false,
@@ -1165,11 +1288,11 @@ mod tests {
         assert!(updated.updated);
         assert_eq!(updated.previous_version, "0.1.0");
         assert_eq!(updated.installed_version, "0.2.0");
-        assert_eq!(fetcher.download_count(), 2);
+        assert_eq!(fetcher.download_count(), 3);
         assert_eq!(fs::read(&current_copy).unwrap(), new_bytes);
 
-        // A second explicit call reuses the verified dist cache without re-downloading.
-        let cached = run_meta_update(
+        // A second explicit call reuses the verified signed dist cache without re-downloading.
+        let cached = run_meta_update_with_key(
             &paths,
             &fetcher,
             "linux",
@@ -1177,6 +1300,7 @@ mod tests {
             "0.1.0",
             &current_copy,
             false,
+            &pubkey,
             UpdateArgs {
                 version: Some("0.2.0".to_owned()),
                 dry_run: false,
@@ -1186,7 +1310,7 @@ mod tests {
         .await
         .unwrap();
         assert!(cached.updated);
-        assert_eq!(fetcher.download_count(), 2);
+        assert_eq!(fetcher.download_count(), 3);
     }
 
     #[test]
@@ -1215,6 +1339,50 @@ mod tests {
 
     #[tokio::test]
     async fn bad_checksum_leaves_existing_binary_untouched() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("home"));
+        let exe = dir.path().join("legion");
+        fs::write(&exe, b"original-good-binary").unwrap();
+
+        let signing = SigningKey::from_bytes(&[0x55; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+
+        let target = "x86_64-unknown-linux-musl";
+        let asset = artifact_filename("0.2.0", target);
+        let sums = format!("{}  {asset}\n", "0".repeat(64));
+        let sig = crate::trust::encode_signature_bytes(&signing.sign(sums.as_bytes()).to_bytes());
+        let mut files = HashMap::new();
+        files.insert(checksums_url("0.2.0"), sums.into_bytes());
+        files.insert(checksums_sig_url("0.2.0"), sig.into_bytes());
+        files.insert(artifact_url("0.2.0", target), b"corrupted".to_vec());
+        let fetcher = FakeFetcher::new("0.2.0", files);
+
+        let err = run_meta_update_with_key(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.1.0",
+            &exe,
+            false,
+            &pubkey,
+            UpdateArgs {
+                version: Some("0.2.0".to_owned()),
+                dry_run: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert_eq!(fs::read(&exe).unwrap(), b"original-good-binary");
+        assert!(!dist_cache_binary(&paths, "0.2.0", target).exists());
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_signature_and_unsigned_cache_are_denied() {
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path().join("home"));
         let exe = dir.path().join("legion");
@@ -1222,13 +1390,20 @@ mod tests {
 
         let target = "x86_64-unknown-linux-musl";
         let asset = artifact_filename("0.2.0", target);
+        let payload = b"unsigned-release-binary";
+        let sums = format!("{}  {asset}\n", sha256_bytes(payload));
+
+        // Pre-populate an unsigned binary in the dist cache (no SHA256SUMS.sig).
+        let cache_dir = dist_cache_dir(&paths, "0.2.0", target);
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join(&asset), payload).unwrap();
+        fs::write(cache_dir.join(CHECKSUMS_FILENAME), &sums).unwrap();
+
+        // Missing SHA256SUMS.sig on the server must also be denied (never trusts unsigned cache).
         let mut files = HashMap::new();
-        files.insert(
-            checksums_url("0.2.0"),
-            format!("{}  {asset}\n", "0".repeat(64)).into_bytes(),
-        );
-        files.insert(artifact_url("0.2.0", target), b"corrupted".to_vec());
-        let fetcher = FakeFetcher::new("0.2.0", files);
+        files.insert(checksums_url("0.2.0"), sums.as_bytes().to_vec());
+        files.insert(artifact_url("0.2.0", target), payload.to_vec());
+        let fetcher = FakeFetcher::new("0.2.0", files.clone());
 
         let err = run_meta_update(
             &paths,
@@ -1246,8 +1421,35 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(err.code, ErrorCode::Failed);
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(err.message.contains(SIGNATURE_FILENAME), "{}", err.message);
         assert_eq!(fs::read(&exe).unwrap(), b"original-good-binary");
-        assert!(!dist_cache_binary(&paths, "0.2.0", target).exists());
+
+        // Wrong-key signature is also denied before downloading the binary.
+        use ed25519_dalek::{Signer, SigningKey};
+        let wrong_signing = SigningKey::from_bytes(&[0x99; 32]);
+        let bad_sig =
+            crate::trust::encode_signature_bytes(&wrong_signing.sign(sums.as_bytes()).to_bytes());
+        files.insert(checksums_sig_url("0.2.0"), bad_sig.into_bytes());
+        let bad_fetcher = FakeFetcher::new("0.2.0", files);
+        let err = run_meta_update(
+            &paths,
+            &bad_fetcher,
+            "linux",
+            "x86_64",
+            "0.1.0",
+            &exe,
+            false,
+            UpdateArgs {
+                version: Some("0.2.0".to_owned()),
+                dry_run: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(bad_fetcher.download_count(), 2);
+        assert_eq!(fs::read(&exe).unwrap(), b"original-good-binary");
     }
 }

@@ -12,6 +12,11 @@ set -eu
 REPO_URL='https://github.com/x1f4r/legion-control'
 REPO_SLUG="${REPO_URL#https://github.com/}"
 
+# Pinned Ed25519 public key from contract/release-public-key.pem (same key pinned in legion).
+RELEASE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAB8q1DNamFF0ShMi6Wzps/0UIGEkLmHDDvQqOvuv98zg=
+-----END PUBLIC KEY-----'
+
 TMP_DIR=''
 STAGED_FILE=''
 
@@ -33,14 +38,15 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: install/legion.sh [--version <version>] [--from <file>]
+Usage: install/legion.sh [--version <version>] [--from <file>] [--insecure-skip-verify]
 
 Install the legion binary to ~/.local/bin/legion.
 
 Options:
-  --version <ver>   Install a specific release version (for example 0.1.0 or legion-v0.1.0).
-  --from <file>     Install a legion binary already on disk instead of downloading.
-  -h, --help        Show this help message.
+  --version <ver>         Install a specific release version (for example 0.1.0 or legion-v0.1.0).
+  --from <file>           Install a legion binary already on disk instead of downloading.
+  --insecure-skip-verify  Skip release provenance/signature verification (SHA-256 is still checked).
+  -h, --help              Show this help message.
 EOF
 }
 
@@ -215,8 +221,90 @@ verify_checksum() {
   fi
 }
 
+openssl_supports_ed25519_rawin() {
+  pub_pem="$1"
+  command -v openssl >/dev/null 2>&1 || return 1
+  case "$(openssl version 2>/dev/null || true)" in
+    OpenSSL*) ;;
+    *) return 1 ;;
+  esac
+  openssl pkey -pubin -in "$pub_pem" -noout >/dev/null 2>&1 || return 1
+  openssl pkeyutl -help 2>&1 | grep -q -- '-rawin' || return 1
+}
+
+decode_base64_file() {
+  in_path="$1"
+  out_path="$2"
+  if command -v base64 >/dev/null 2>&1; then
+    if base64 -d "$in_path" >"$out_path" 2>/dev/null; then
+      return 0
+    fi
+    base64 -D -i "$in_path" -o "$out_path" 2>/dev/null && return 0
+  fi
+  openssl base64 -d -A -in "$in_path" -out "$out_path" 2>/dev/null
+}
+
+verify_release_trust() {
+  bin_path="$1"
+  sums_path="$2"
+  base_url="$3"
+  tag="$4"
+
+  if [ "$INSECURE_SKIP_VERIFY" -eq 1 ]; then
+    printf 'Warning: skipping release provenance/signature verification (--insecure-skip-verify); SHA-256 was still verified.\n' >&2
+    return 0
+  fi
+
+  if command -v gh >/dev/null 2>&1; then
+    gh attestation verify "$bin_path" \
+      --repo "$REPO_SLUG" \
+      --signer-workflow "${REPO_SLUG}/.github/workflows/legion-release.yml" \
+      --source-ref "refs/tags/${tag}" >/dev/null \
+      || die "GitHub build provenance verification failed for ${tag}; refusing to install."
+    return 0
+  fi
+
+  pub_pem="${TMP_DIR}/release-public-key.pem"
+  printf '%s\n' "$RELEASE_PUBLIC_KEY_PEM" >"$pub_pem"
+
+  if openssl_supports_ed25519_rawin "$pub_pem"; then
+    sig_b64="${TMP_DIR}/SHA256SUMS.sig"
+    sig_clean="${TMP_DIR}/SHA256SUMS.sig.clean"
+    sig_raw="${TMP_DIR}/SHA256SUMS.sig.bin"
+    fetch_to_file "${base_url}/SHA256SUMS.sig" "$sig_b64" \
+      || die "Failed to download ${base_url}/SHA256SUMS.sig; refusing unsigned release."
+    tr -d ' \t\r\n' <"$sig_b64" >"$sig_clean"
+    decode_base64_file "$sig_clean" "$sig_raw" \
+      || die "SHA256SUMS.sig is not valid base64; refusing to install."
+    raw_len="$(wc -c <"$sig_raw" | tr -d '[:space:]')"
+    if [ "$raw_len" -ne 64 ]; then
+      die "SHA256SUMS.sig did not decode to a 64-byte Ed25519 signature."
+    fi
+    openssl pkeyutl -verify -pubin -inkey "$pub_pem" -rawin \
+      -in "$sums_path" -sigfile "$sig_raw" >/dev/null 2>&1 \
+      || die "Ed25519 signature verification failed for ${tag}; refusing to install."
+    return 0
+  fi
+
+  cat >&2 <<EOF
+install/legion.sh: cannot verify who published ${tag}: neither 'gh' (for attestation verification)
+nor OpenSSL with Ed25519 -rawin support is installed (macOS ships LibreSSL).
+
+Verify manually before installing:
+  1. Install GitHub CLI (gh) and re-run this script, or verify the binary with:
+       gh attestation verify <file> --repo ${REPO_SLUG} \\
+         --signer-workflow ${REPO_SLUG}/.github/workflows/legion-release.yml \\
+         --source-ref refs/tags/${tag}
+  2. Or install OpenSSL 3 (e.g. 'brew install openssl') to verify SHA256SUMS.sig offline
+     against the pinned Ed25519 public key in contract/release-public-key.pem.
+  3. Or re-run with --insecure-skip-verify to install with SHA-256 verification only.
+EOF
+  exit 1
+}
+
 VERSION=''
 FROM_FILE=''
+INSECURE_SKIP_VERIFY=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -236,6 +324,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --from=*)
       FROM_FILE="${1#--from=}"
+      shift
+      ;;
+    --insecure-skip-verify)
+      INSECURE_SKIP_VERIFY=1
       shift
       ;;
     -h|--help)
@@ -288,6 +380,7 @@ else
     || die "Failed to download ${BASE_URL}/${ASSET}."
 
   verify_checksum "$DOWNLOADED_BIN" "$SUMS_FILE" "$ASSET"
+  verify_release_trust "$DOWNLOADED_BIN" "$SUMS_FILE" "$BASE_URL" "$TAG"
   SOURCE_BIN="$DOWNLOADED_BIN"
 fi
 

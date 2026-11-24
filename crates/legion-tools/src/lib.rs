@@ -19,6 +19,7 @@ pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod token;
+pub mod trust;
 pub mod update;
 pub mod xfer;
 

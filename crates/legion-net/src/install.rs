@@ -21,9 +21,10 @@ use legion_os::OsError;
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_tools::trust::RELEASE_PUBLIC_KEY;
 use legion_tools::update::{
     ReleaseFetcher, SystemFetcher, artifact_url, dist_cache_binary, normalize_version, random_hex,
-    resolve_release_binary, target_triple_for,
+    resolve_release_binary_with_key, target_triple_for,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -66,7 +67,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(InstallTool {
         spec: ToolSpec {
             name: "fleet.install".to_owned(),
-            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, fetches and verifies the matching release artifact against SHA256SUMS (or uses a cached copy or a local file passed via `from`), copies it atomically into place, and opens a normal session to verify the installed version.".to_owned(),
+            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.".to_owned(),
             effect: Effect::Admin,
             input_schema: input_schema::<InstallArgs>(),
         },
@@ -711,12 +712,34 @@ pub fn parse_version_output(output: &str) -> Option<String> {
 }
 
 /// Core implementation of `fleet.install`, parameterized over [`InstallBackend`] so tests run
-/// completely offline against a fake.
+/// completely offline against a fake. Always verifies release manifests against the compiled-in
+/// [`RELEASE_PUBLIC_KEY`].
 pub async fn run_fleet_install(
     paths: &Paths,
     fleet_file: &FleetFile,
     here: &str,
     backend: &dyn InstallBackend,
+    args: InstallArgs,
+    cancel: CancellationToken,
+) -> Result<InstallResult, ErrorBody> {
+    run_fleet_install_with_key(
+        paths,
+        fleet_file,
+        here,
+        backend,
+        &RELEASE_PUBLIC_KEY,
+        args,
+        cancel,
+    )
+    .await
+}
+
+async fn run_fleet_install_with_key(
+    paths: &Paths,
+    fleet_file: &FleetFile,
+    here: &str,
+    backend: &dyn InstallBackend,
+    public_key: &[u8; 32],
     args: InstallArgs,
     cancel: CancellationToken,
 ) -> Result<InstallResult, ErrorBody> {
@@ -840,8 +863,15 @@ pub async fn run_fleet_install(
                 None => backend.latest_version(cancel.clone()).await?,
             };
             let fetcher = BackendFetcher(backend);
-            resolve_release_binary(paths, &fetcher, &version, platform.target, cancel.clone())
-                .await?
+            resolve_release_binary_with_key(
+                paths,
+                &fetcher,
+                &version,
+                platform.target,
+                public_key,
+                cancel.clone(),
+            )
+            .await?
         }
     };
 
@@ -1139,8 +1169,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    use ed25519_dalek::{Signer, SigningKey};
     use legion_core::config::parse;
-    use legion_tools::update::{artifact_filename, checksums_url, sha256_file};
+    use legion_tools::update::{artifact_filename, checksums_sig_url, checksums_url, sha256_file};
     use tempfile::tempdir;
 
     use super::*;
@@ -1355,13 +1386,25 @@ mod tests {
             }
         }
 
-        fn with_release(mut self, version: &str, target: &str, payload: &[u8]) -> Self {
+        fn with_release(
+            mut self,
+            version: &str,
+            target: &str,
+            payload: &[u8],
+            signing_key: Option<&SigningKey>,
+        ) -> Self {
             let dir = tempdir().unwrap();
             let tmp = dir.path().join("bin");
             fs::write(&tmp, payload).unwrap();
             let hash = sha256_file(&tmp).unwrap();
             let asset = artifact_filename(version, target);
             let sums = format!("{hash}  {asset}\n");
+            if let Some(key) = signing_key {
+                let sig = key.sign(sums.as_bytes());
+                let sig_text = format!("{}\n", BASE64.encode(sig.to_bytes()));
+                self.files
+                    .insert(checksums_sig_url(version), sig_text.into_bytes());
+            }
             self.files.insert(checksums_url(version), sums.into_bytes());
             self.files
                 .insert(artifact_url(version, target), payload.to_vec());
@@ -1510,17 +1553,21 @@ via = "tower"
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x31; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
         let backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
             "0.2.0",
             "x86_64-unknown-linux-musl",
             b"fake-elf-binary",
+            Some(&signing),
         );
 
-        let res = run_fleet_install(
+        let res = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: None,
@@ -1540,7 +1587,7 @@ via = "tower"
         assert_eq!(res.previous_version, None);
         assert_eq!(res.path, "~/.local/bin/legion");
         assert!(!res.dry_run);
-        assert_eq!(backend.download_log.lock().unwrap().len(), 2);
+        assert_eq!(backend.download_log.lock().unwrap().len(), 3);
         assert_eq!(backend.scp_log.lock().unwrap().len(), 1);
         assert_eq!(
             backend.session_checks.lock().unwrap().as_slice(),
@@ -1559,14 +1606,22 @@ via = "tower"
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x32; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
         let backend = FakeInstallBackend::linux_x86_64("0.3.0", Some("0.1.0"), "0.3.0")
-            .with_release("0.3.0", "x86_64-unknown-linux-musl", b"legion-0.3.0");
+            .with_release(
+                "0.3.0",
+                "x86_64-unknown-linux-musl",
+                b"legion-0.3.0",
+                Some(&signing),
+            );
 
-        let first = run_fleet_install(
+        let first = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: Some("legion-v0.3.0".to_owned()),
@@ -1579,14 +1634,15 @@ via = "tower"
         .unwrap();
         assert_eq!(first.previous_version.as_deref(), Some("0.1.0"));
         assert_eq!(first.installed_version, "0.3.0");
-        assert_eq!(backend.download_log.lock().unwrap().len(), 2);
+        assert_eq!(backend.download_log.lock().unwrap().len(), 3);
 
         // Second run hits `<state>/dist/0.3.0/x86_64-unknown-linux-musl/` with zero downloads.
-        let second = run_fleet_install(
+        let second = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: Some("0.3.0".to_owned()),
@@ -1598,7 +1654,38 @@ via = "tower"
         .await
         .unwrap();
         assert_eq!(second.installed_version, "0.3.0");
-        assert_eq!(backend.download_log.lock().unwrap().len(), 2);
+        assert_eq!(backend.download_log.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn unsigned_release_is_denied_without_copying_anything() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
+            "0.2.0",
+            "x86_64-unknown-linux-musl",
+            b"unsigned-elf",
+            None,
+        );
+
+        let err = run_fleet_install(
+            &paths,
+            &fleet,
+            "laptop",
+            &backend,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: None,
+                from: None,
+                dry_run: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(backend.scp_log.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1724,18 +1811,22 @@ via = "tower"
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x33; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
         let mut backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
             "0.2.0",
             "x86_64-unknown-linux-musl",
             b"fake-elf",
+            Some(&signing),
         );
         backend.fail_finalize = true;
 
-        let err = run_fleet_install(
+        let err = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: None,

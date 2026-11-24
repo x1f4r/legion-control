@@ -14,7 +14,8 @@
 [CmdletBinding()]
 param(
     [string] $Version = '',
-    [string] $From = ''
+    [string] $From = '',
+    [switch] $InsecureSkipVerify
 )
 
 $ErrorActionPreference = 'Stop'
@@ -26,6 +27,13 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 
 $RepoUrl = 'https://github.com/x1f4r/legion-control'
 $RepoSlug = $RepoUrl -replace '^https://github\.com/', ''
+
+# Pinned Ed25519 public key from contract/release-public-key.pem (same key pinned in legion).
+$ReleasePublicKeyPem = @"
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAB8q1DNamFF0ShMi6Wzps/0UIGEkLmHDDvQqOvuv98zg=
+-----END PUBLIC KEY-----
+"@
 
 function Get-TargetTriple {
     $arch = ''
@@ -151,6 +159,57 @@ try {
         $actualHash = (Get-FileHash -LiteralPath $downloadedBin -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($actualHash -ne $expectedHash) {
             throw "Checksum mismatch for $asset (expected $expectedHash, got $actualHash)."
+        }
+
+        if ($InsecureSkipVerify) {
+            Write-Warning 'Skipping release provenance/signature verification (-InsecureSkipVerify); SHA-256 was still verified.'
+        } elseif ($null -ne (Get-Command -Name 'gh' -ErrorAction SilentlyContinue)) {
+            & gh attestation verify $downloadedBin `
+                --repo $RepoSlug `
+                --signer-workflow "$RepoSlug/.github/workflows/legion-release.yml" `
+                --source-ref "refs/tags/$tag" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "GitHub build provenance verification failed for $tag; refusing to install."
+            }
+        } else {
+            $opensslCmd = Get-Command -Name 'openssl' -ErrorAction SilentlyContinue
+            $verifiedWithOpenSsl = $false
+            if ($null -ne $opensslCmd) {
+                $pubPemPath = Join-Path -Path $tempDir -ChildPath 'release-public-key.pem'
+                [System.IO.File]::WriteAllText($pubPemPath, ($ReleasePublicKeyPem + "`n"), [System.Text.Encoding]::ASCII)
+                $verLine = (& $opensslCmd.Source version 2>$null | Out-String).Trim()
+                $pkeyCheck = & $opensslCmd.Source pkey -pubin -in $pubPemPath -noout 2>$null
+                $pkeyOk = ($LASTEXITCODE -eq 0)
+                $null = $pkeyCheck
+                $helpText = (& $opensslCmd.Source pkeyutl -help 2>&1 | Out-String)
+                if ($verLine.StartsWith('OpenSSL') -and $pkeyOk -and $helpText.Contains('-rawin')) {
+                    $sigB64Path = Join-Path -Path $tempDir -ChildPath 'SHA256SUMS.sig'
+                    Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS.sig" -OutFile $sigB64Path -Headers $headers -UseBasicParsing
+                    $sigText = ([System.IO.File]::ReadAllText($sigB64Path)).Trim()
+                    $sigBytes = [System.Convert]::FromBase64String($sigText)
+                    if ($sigBytes.Length -ne 64) {
+                        throw 'SHA256SUMS.sig did not decode to a 64-byte Ed25519 signature.'
+                    }
+                    $sigRawPath = Join-Path -Path $tempDir -ChildPath 'SHA256SUMS.sig.bin'
+                    [System.IO.File]::WriteAllBytes($sigRawPath, $sigBytes)
+                    & $opensslCmd.Source pkeyutl -verify -pubin -inkey $pubPemPath -rawin -in $sumsPath -sigfile $sigRawPath 2>$null | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Ed25519 signature verification failed for $tag; refusing to install."
+                    }
+                    $verifiedWithOpenSsl = $true
+                }
+            }
+            if (-not $verifiedWithOpenSsl) {
+                throw @"
+Cannot verify who published $tag: neither 'gh' (for attestation verification) nor OpenSSL with Ed25519 -rawin support is installed.
+
+Verify manually before installing:
+  1. Install GitHub CLI (gh) and re-run this script, or run:
+       gh attestation verify <file> --repo $RepoSlug --signer-workflow $RepoSlug/.github/workflows/legion-release.yml --source-ref refs/tags/$tag
+  2. Or ensure OpenSSL 3 (for example from Git for Windows) is on PATH to verify SHA256SUMS.sig against contract/release-public-key.pem.
+  3. Or re-run with -InsecureSkipVerify to install with SHA-256 verification only.
+"@
+            }
         }
         $sourceBin = $downloadedBin
     }

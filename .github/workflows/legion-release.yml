@@ -1,3 +1,9 @@
+# Legion release build workflow.
+#
+# Trust model: the offline Ed25519 signature (`SHA256SUMS.sig`, verified against the public key
+# compiled into `legion` from `contract/release-public-key.pem`) is the trust anchor. This workflow
+# never holds the signing key and never signs releases; the GitHub build provenance attestation is
+# defence in depth for installers and operators verifying CI provenance.
 name: Legion release
 on:
   push:
