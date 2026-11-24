@@ -537,8 +537,10 @@ impl ForcedCommandShell {
     }
 }
 
-/// Characters `cmd.exe` interprets even inside or around double quotes (or that break quoting).
-const CMD_UNSAFE_CHARS: &[char] = &['%', '&', '(', ')', '^', '!', '"'];
+/// Characters `cmd.exe` interprets even inside or around double quotes (or that break quoting),
+/// plus POSIX command-substitution metacharacters (`$`, `` ` ``) refused as a defense-in-depth
+/// backstop.
+const CMD_UNSAFE_CHARS: &[char] = &['%', '&', '(', ')', '^', '!', '"', '$', '`'];
 
 /// Unicode single-quote variants that PowerShell's lexer treats as single-quoted string delimiters.
 const PS_UNSAFE_SINGLE_QUOTES: &[char] = &['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
@@ -548,8 +550,8 @@ const PS_UNSAFE_SINGLE_QUOTES: &[char] = &['\u{2018}', '\u{2019}', '\u{201A}', '
 /// The executable path must be absolute, valid UTF-8, and free of control characters.
 /// Quoting follows `shell`:
 /// - [`ForcedCommandShell::Posix`]: bare ASCII tokens or `'...'` with `'\''`.
-/// - [`ForcedCommandShell::WindowsCmd`]: refuses `%`, `&`, `(`, `)`, `^`, `!`, and `"` in paths
-///   and arguments, and double-quotes tokens with spaces or non-ASCII characters.
+/// - [`ForcedCommandShell::WindowsCmd`]: refuses `%`, `&`, `(`, `)`, `^`, `!`, `"`, `$`, and `` ` ``
+///   in paths and arguments, and double-quotes tokens with spaces or non-ASCII characters.
 /// - [`ForcedCommandShell::WindowsPowerShell`]: emits `& '<exe>' ...` with `'` doubled (`''`),
 ///   refuses Unicode single-quote delimiters (`U+2018`..=`U+201B`), and single-quotes any argument
 ///   that could trigger PowerShell parsing or splatting (including leading `@`, spaces, quotes,
@@ -634,7 +636,7 @@ pub fn format_forced_command(
                         ),
                     )
                     .with_hint(
-                        "Move legion.exe / LEGION_HOME to a path without `% & ( ) ^ ! \"`, or set HKLM\\SOFTWARE\\OpenSSH\\DefaultShell to PowerShell.",
+                        "Move legion.exe / LEGION_HOME to a path without % & ( ) ^ ! \" $ or backtick, or set HKLM\\SOFTWARE\\OpenSSH\\DefaultShell to PowerShell.",
                     ));
                 }
                 Ok(())
@@ -1090,26 +1092,68 @@ pub struct AuthKeyLine {
 }
 
 /// Parsed representation of an `authorized_keys` file that preserves foreign lines byte for byte.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct AuthKeysFile {
     /// Lines in file order.
     pub lines: Vec<AuthKeyLine>,
+    shell: Option<ForcedCommandShell>,
+    is_windows_host: bool,
+}
+
+impl Default for AuthKeysFile {
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            shell: ForcedCommandShell::host().ok(),
+            is_windows_host: cfg!(windows),
+        }
+    }
 }
 
 impl AuthKeysFile {
-    /// Parses `bytes` into lines without altering any byte sequence.
+    /// Parses `bytes` into lines without altering any byte sequence, classifying only lines whose
+    /// forced-command shape matches this host's configured sshd shell (`ForcedCommandShell::host()`).
     pub fn parse(bytes: &[u8]) -> AuthKeysFile {
+        Self::parse_with_host(bytes, ForcedCommandShell::host().ok(), cfg!(windows))
+    }
+
+    /// Parses `bytes` as if running on a host with the given `shell` and OS family.
+    #[cfg(test)]
+    pub(crate) fn parse_for_host(
+        bytes: &[u8],
+        shell: ForcedCommandShell,
+        is_windows_host: bool,
+    ) -> AuthKeysFile {
+        Self::parse_with_host(bytes, Some(shell), is_windows_host)
+    }
+
+    fn parse_with_host(
+        bytes: &[u8],
+        shell: Option<ForcedCommandShell>,
+        is_windows_host: bool,
+    ) -> AuthKeysFile {
         if bytes.is_empty() {
-            return AuthKeysFile { lines: Vec::new() };
+            return AuthKeysFile {
+                lines: Vec::new(),
+                shell,
+                is_windows_host,
+            };
         }
         let lines = bytes
             .split_inclusive(|&b| b == b'\n')
             .map(|slice| AuthKeyLine {
                 raw: slice.to_vec(),
-                kind: classify_line(slice),
+                kind: match shell {
+                    Some(s) => classify_line(slice, s, is_windows_host),
+                    None => LineKind::Foreign,
+                },
             })
             .collect();
-        AuthKeysFile { lines }
+        AuthKeysFile {
+            lines,
+            shell,
+            is_windows_host,
+        }
     }
 
     /// Keeps only lines for which `keep` returns `true`, returning whether anything was removed.
@@ -1138,7 +1182,10 @@ impl AuthKeysFile {
         }
         let mut raw = line.as_bytes().to_vec();
         raw.extend_from_slice(eol);
-        let kind = classify_line(&raw);
+        let kind = match self.shell {
+            Some(s) => classify_line(&raw, s, self.is_windows_host),
+            None => LineKind::Foreign,
+        };
         self.lines.push(AuthKeyLine { raw, kind });
     }
 
@@ -1518,7 +1565,7 @@ pub(crate) fn ensure_parent_dir(dir: &Path, is_default_ssh_dir: bool) -> Result<
     }
 }
 
-fn classify_line(raw: &[u8]) -> LineKind {
+fn classify_line(raw: &[u8], host_shell: ForcedCommandShell, is_windows_host: bool) -> LineKind {
     let trimmed = trim_leading_ws_bytes(strip_eol(raw));
     if trimmed.is_empty() || trimmed.starts_with(b"#") {
         return LineKind::Foreign;
@@ -1591,9 +1638,13 @@ fn classify_line(raw: &[u8]) -> LineKind {
                 return LineKind::Foreign;
             }
             let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-            if !matches_exact_forced_command(&parsed_cmd.exe, &arg_refs, command, |expected_cmd| {
-                options_str == format!("restrict,command=\"{expected_cmd}\"")
-            }) {
+            if !matches_exact_forced_command(
+                &parsed_cmd.exe,
+                &arg_refs,
+                host_shell,
+                is_windows_host,
+                |expected_cmd| options_str == format!("restrict,command=\"{expected_cmd}\""),
+            ) {
                 return LineKind::Foreign;
             }
             LineKind::Device {
@@ -1635,10 +1686,16 @@ fn classify_line(raw: &[u8]) -> LineKind {
                 return LineKind::Foreign;
             }
             let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-            if !matches_exact_forced_command(&parsed_cmd.exe, &arg_refs, command, |expected_cmd| {
-                options_str
-                    == format!("restrict,expiry-time=\"{expiry}\",command=\"{expected_cmd}\"")
-            }) {
+            if !matches_exact_forced_command(
+                &parsed_cmd.exe,
+                &arg_refs,
+                host_shell,
+                is_windows_host,
+                |expected_cmd| {
+                    options_str
+                        == format!("restrict,expiry-time=\"{expiry}\",command=\"{expected_cmd}\"")
+                },
+            ) {
                 return LineKind::Foreign;
             }
             LineKind::Invite {
@@ -1656,25 +1713,28 @@ fn classify_line(raw: &[u8]) -> LineKind {
 fn matches_exact_forced_command(
     exe: &str,
     args: &[&str],
-    raw_command: &str,
+    host_shell: ForcedCommandShell,
+    is_windows_host: bool,
     check_options: impl Fn(&str) -> bool,
 ) -> bool {
     let exe_path = Path::new(exe);
-    let shells: &[ForcedCommandShell] = if looks_windows_absolute(exe_path) {
-        if raw_command.starts_with("& '") {
-            &[ForcedCommandShell::WindowsPowerShell]
-        } else {
-            &[ForcedCommandShell::WindowsCmd, ForcedCommandShell::Posix]
+    let path_matches_host = match host_shell {
+        ForcedCommandShell::Posix => {
+            if is_windows_host {
+                looks_windows_absolute(exe_path) || looks_posix_absolute(exe_path)
+            } else {
+                looks_posix_absolute(exe_path)
+            }
         }
-    } else if looks_posix_absolute(exe_path) {
-        &[ForcedCommandShell::Posix]
-    } else {
-        return false;
+        ForcedCommandShell::WindowsCmd | ForcedCommandShell::WindowsPowerShell => {
+            is_windows_host && looks_windows_absolute(exe_path)
+        }
     };
-    shells.iter().any(|&shell| {
-        format_forced_command(exe_path, args, shell)
-            .is_ok_and(|expected_cmd| check_options(&expected_cmd))
-    })
+    if !path_matches_host {
+        return false;
+    }
+    format_forced_command(exe_path, args, host_shell)
+        .is_ok_and(|expected_cmd| check_options(&expected_cmd))
 }
 
 fn trim_leading_ws_bytes(mut bytes: &[u8]) -> &[u8] {
@@ -2227,6 +2287,8 @@ mod tests {
             r"C:\Users\me\a^b\legion.exe",
             r"C:\Users\me\bang!\legion.exe",
             r#"C:\Users\me\"quote"\legion.exe"#,
+            r"C:\Users\me\$HOME\legion.exe",
+            r"C:\Users\me\a`b\legion.exe",
         ] {
             assert!(
                 format_forced_command(
@@ -2294,7 +2356,11 @@ mod tests {
             ForcedCommandShell::WindowsPowerShell,
         )
         .unwrap();
-        let parsed_ps = AuthKeysFile::parse(format!("{ps_line}\n").as_bytes());
+        let parsed_ps = AuthKeysFile::parse_for_host(
+            format!("{ps_line}\n").as_bytes(),
+            ForcedCommandShell::WindowsPowerShell,
+            true,
+        );
         assert!(matches!(
             &parsed_ps.lines[0].kind,
             LineKind::Device {
@@ -2346,7 +2412,11 @@ mod tests {
             win_posix_line.contains(r#"command="'C:\Users\me\O'\''Neil\legion.exe'"#),
             "{win_posix_line}"
         );
-        let parsed_win_posix = AuthKeysFile::parse(format!("{win_posix_line}\n").as_bytes());
+        let parsed_win_posix = AuthKeysFile::parse_for_host(
+            format!("{win_posix_line}\n").as_bytes(),
+            ForcedCommandShell::Posix,
+            true,
+        );
         assert!(matches!(
             &parsed_win_posix.lines[0].kind,
             LineKind::Device {
@@ -2384,7 +2454,11 @@ mod tests {
             ),
             "{split_line}"
         );
-        let parsed_split = AuthKeysFile::parse(format!("{split_line}\n").as_bytes());
+        let parsed_split = AuthKeysFile::parse_for_host(
+            format!("{split_line}\n").as_bytes(),
+            ForcedCommandShell::Posix,
+            false,
+        );
         assert!(matches!(
             &parsed_split.lines[0].kind,
             LineKind::Device {
@@ -2422,7 +2496,7 @@ mod tests {
     #[test]
     fn foreign_lines_comments_and_missing_trailing_newline_are_preserved_byte_for_byte() {
         let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:pixel\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
-        let mut parsed = AuthKeysFile::parse(initial);
+        let mut parsed = AuthKeysFile::parse_for_host(initial, ForcedCommandShell::Posix, false);
         assert_eq!(parsed.lines.len(), 5);
         assert_eq!(parsed.lines[0].kind, LineKind::Foreign);
         assert_eq!(parsed.lines[1].kind, LineKind::Foreign);
@@ -2449,7 +2523,7 @@ mod tests {
     #[test]
     fn appending_to_file_without_trailing_newline_inserts_separator() {
         let initial = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 foreign";
-        let mut parsed = AuthKeysFile::parse(initial);
+        let mut parsed = AuthKeysFile::parse_for_host(initial, ForcedCommandShell::Posix, false);
         parsed.append_line("restrict,command=\"/home/me/legion gate --as phone --device tablet --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:tablet");
         let bytes = parsed.to_bytes();
         let text = std::str::from_utf8(&bytes).unwrap();
@@ -2684,7 +2758,11 @@ Match Group users
         let with_secs: Timestamp = "2026-11-24T12:15:01Z".parse().unwrap();
         assert_eq!(format_sshd_expiry(with_secs), "202611250216");
 
-        let parsed = AuthKeysFile::parse(format!("{line}\n").as_bytes());
+        let parsed = AuthKeysFile::parse_for_host(
+            format!("{line}\n").as_bytes(),
+            ForcedCommandShell::Posix,
+            false,
+        );
         assert_eq!(parsed.lines.len(), 1);
         match &parsed.lines[0].kind {
             LineKind::Invite {
@@ -2970,7 +3048,11 @@ Match Group users
             ForcedCommandShell::Posix,
         )
         .unwrap();
-        let parsed_dev = AuthKeysFile::parse(format!("{valid_device}\n").as_bytes());
+        let parsed_dev = AuthKeysFile::parse_for_host(
+            format!("{valid_device}\n").as_bytes(),
+            ForcedCommandShell::Posix,
+            false,
+        );
         assert!(matches!(
             &parsed_dev.lines[0].kind,
             LineKind::Device { name, pairing_id, .. }
@@ -3049,12 +3131,20 @@ Match Group users
             format!(
                 "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid} --home /home/me/a\\\\b\" {key} legion-device:pixel\n"
             ),
-            // Windows cmd.exe env var expansion inside double quotes.
+            // Windows cmd.exe env var expansion or POSIX shell substitution inside double quotes.
             format!(
                 "restrict,command=\"\\\"C:\\Users\\%USERNAME%\\legion.exe\\\" gate --as phone --device pixel --pairing {pid} --home C:\\Users\\me\\legion\" {key} legion-device:pixel\n"
             ),
             format!(
                 "restrict,command=\"C:\\Users\\me\\legion.exe gate --as phone --device pixel --pairing {pid} --home \\\"C:\\Users\\%USERNAME%\\legion\\\"\" {key} legion-device:pixel\n"
+            ),
+            // Reproduced on Linux: Windows cmd-shaped path carrying backticks or `$` would be
+            // executed by bash if treated as a managed device line on a Unix host.
+            format!(
+                "restrict,command=\"\\\"C:\\x`touch /tmp/pwned`\\legion.exe\\\" gate --as phone --device dd --pairing {pid} --home /home/me/legion\" {key} legion-device:dd\n"
+            ),
+            format!(
+                "restrict,command=\"\\\"C:\\x$HOME\\legion.exe\\\" gate --as phone --device dd --pairing {pid} --home /home/me/legion\" {key} legion-device:dd\n"
             ),
             // Non-canonical command shapes: `--flag=value`, extra spaces, reordered flags, missing home.
             format!(
@@ -3075,12 +3165,141 @@ Match Group users
         ];
 
         for raw in attacks {
-            let parsed = AuthKeysFile::parse(raw.as_bytes());
+            let parsed =
+                AuthKeysFile::parse_for_host(raw.as_bytes(), ForcedCommandShell::Posix, false);
             assert_eq!(parsed.lines.len(), 1);
             assert_eq!(
                 parsed.lines[0].kind,
                 LineKind::Foreign,
-                "crafted line must stay Foreign: {raw}"
+                "crafted line must stay Foreign on Unix: {raw}"
+            );
+            let parsed_host = AuthKeysFile::parse(raw.as_bytes());
+            assert_eq!(parsed_host.lines.len(), 1);
+            assert_eq!(
+                parsed_host.lines[0].kind,
+                LineKind::Foreign,
+                "crafted line must stay Foreign on current host: {raw}"
+            );
+        }
+
+        // Host-shell shape enforcement: a line formatted for another OS or shell stays Foreign.
+        let unix_posix = format_device_line(
+            Path::new("/home/me/legion"),
+            "phone",
+            key,
+            "pixel",
+            pid,
+            &PinnedHome::Root(PathBuf::from("/home/me/legion-home")),
+            None,
+            ForcedCommandShell::Posix,
+        )
+        .unwrap();
+        let win_posix = format_device_line(
+            Path::new(r"C:\Users\me\legion.exe"),
+            "phone",
+            key,
+            "pixel",
+            pid,
+            &PinnedHome::Root(PathBuf::from(r"C:\Users\me\legion-home")),
+            None,
+            ForcedCommandShell::Posix,
+        )
+        .unwrap();
+        let win_cmd = format_device_line(
+            Path::new(r"C:\Users\me\My Legion\legion.exe"),
+            "phone",
+            key,
+            "pixel",
+            pid,
+            &PinnedHome::Root(PathBuf::from(r"C:\Users\me\Legion Home")),
+            None,
+            ForcedCommandShell::WindowsCmd,
+        )
+        .unwrap();
+        let win_ps = format_device_line(
+            Path::new(r"C:\Users\me\My Legion\legion.exe"),
+            "phone",
+            key,
+            "pixel",
+            pid,
+            &PinnedHome::Root(PathBuf::from(r"C:\Users\me\Legion Home")),
+            None,
+            ForcedCommandShell::WindowsPowerShell,
+        )
+        .unwrap();
+
+        // Unix host accepts only Unix Posix lines.
+        assert!(matches!(
+            AuthKeysFile::parse_for_host(
+                format!("{unix_posix}\n").as_bytes(),
+                ForcedCommandShell::Posix,
+                false,
+            )
+            .lines[0]
+                .kind,
+            LineKind::Device { .. }
+        ));
+        for other in [&win_posix, &win_cmd, &win_ps] {
+            assert_eq!(
+                AuthKeysFile::parse_for_host(
+                    format!("{other}\n").as_bytes(),
+                    ForcedCommandShell::Posix,
+                    false,
+                )
+                .lines[0]
+                    .kind,
+                LineKind::Foreign,
+                "Unix host must reject non-Unix line: {other}"
+            );
+        }
+
+        // Windows cmd host accepts only cmd lines; Posix and PowerShell shapes stay Foreign.
+        assert!(matches!(
+            AuthKeysFile::parse_for_host(
+                format!("{win_cmd}\n").as_bytes(),
+                ForcedCommandShell::WindowsCmd,
+                true,
+            )
+            .lines[0]
+                .kind,
+            LineKind::Device { .. }
+        ));
+        for other in [&unix_posix, &win_posix, &win_ps] {
+            assert_eq!(
+                AuthKeysFile::parse_for_host(
+                    format!("{other}\n").as_bytes(),
+                    ForcedCommandShell::WindowsCmd,
+                    true,
+                )
+                .lines[0]
+                    .kind,
+                LineKind::Foreign,
+                "Windows cmd host must reject non-cmd line: {other}"
+            );
+        }
+
+        // Windows PowerShell host accepts only PowerShell lines; cmd and Posix shapes stay Foreign.
+        assert!(matches!(
+            AuthKeysFile::parse_for_host(
+                format!("{win_ps}\n").as_bytes(),
+                ForcedCommandShell::WindowsPowerShell,
+                true,
+            )
+            .lines[0]
+                .kind,
+            LineKind::Device { .. }
+        ));
+        for other in [&unix_posix, &win_posix, &win_cmd] {
+            assert_eq!(
+                AuthKeysFile::parse_for_host(
+                    format!("{other}\n").as_bytes(),
+                    ForcedCommandShell::WindowsPowerShell,
+                    true,
+                )
+                .lines[0]
+                    .kind,
+                LineKind::Foreign,
+                "Windows PowerShell host must reject non-PowerShell line: {other}"
             );
         }
     }
@@ -3098,11 +3317,7 @@ Match Group users
         } else {
             dir.path().join("legion")
         };
-        let shell = if cfg!(windows) {
-            ForcedCommandShell::WindowsCmd
-        } else {
-            ForcedCommandShell::Posix
-        };
+        let shell = ForcedCommandShell::host().unwrap();
 
         let mut node_file = NodeFile::default();
         node_file.devices.authorized_keys = Some(auth_path.display().to_string());

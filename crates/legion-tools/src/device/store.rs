@@ -402,7 +402,8 @@ mod tests {
         .unwrap();
 
         let initial = format!("# keep me\n{expired_line}\n{other_home_line}\n{valid_line}\n");
-        let mut auth = AuthKeysFile::parse(initial.as_bytes());
+        let mut auth =
+            AuthKeysFile::parse_for_host(initial.as_bytes(), ForcedCommandShell::Posix, false);
         let mut state = DevicesState {
             version: 1,
             invites: BTreeMap::from([

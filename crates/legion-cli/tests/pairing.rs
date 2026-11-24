@@ -831,11 +831,7 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
     let my_pub = ed25519_public_key_from_seed(&[21_u8; 32]);
     let other_pub = ed25519_public_key_from_seed(&[22_u8; 32]);
     let exe = Path::new(env!("CARGO_BIN_EXE_legion"));
-    let shell = if cfg!(windows) {
-        legion_tools::device::authkeys::ForcedCommandShell::WindowsCmd
-    } else {
-        legion_tools::device::authkeys::ForcedCommandShell::Posix
-    };
+    let shell = legion_tools::device::authkeys::ForcedCommandShell::host().unwrap();
     let pinned_home = legion_tools::device::authkeys::PinnedHome::Root(
         home.state().parent().unwrap().to_path_buf(),
     );
@@ -1909,11 +1905,7 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
     let home_root = home.state().parent().unwrap().to_path_buf();
     let pinned_home = legion_tools::device::authkeys::PinnedHome::Root(home_root.clone());
     let exe = Path::new(env!("CARGO_BIN_EXE_legion"));
-    let shell = if cfg!(windows) {
-        legion_tools::device::authkeys::ForcedCommandShell::WindowsCmd
-    } else {
-        legion_tools::device::authkeys::ForcedCommandShell::Posix
-    };
+    let shell = legion_tools::device::authkeys::ForcedCommandShell::host().unwrap();
 
     let key_a = ed25519_public_key_from_seed(&[31_u8; 32]);
     let key_b = ed25519_public_key_from_seed(&[32_u8; 32]);

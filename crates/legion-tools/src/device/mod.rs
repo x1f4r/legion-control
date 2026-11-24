@@ -2018,11 +2018,7 @@ role = "owner"
             } else {
                 dir.path().join("legion")
             };
-            let shell = if cfg!(windows) {
-                ForcedCommandShell::WindowsCmd
-            } else {
-                ForcedCommandShell::Posix
-            };
+            let shell = ForcedCommandShell::host().unwrap();
             let invite_line = format_invite_line(
                 &fake_exe,
                 &id,
