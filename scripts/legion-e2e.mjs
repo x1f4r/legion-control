@@ -565,6 +565,14 @@ step('e4 job.cancel --on far leaves no process of the job behind', async () => {
   check(status.state === 'cancelled', `job.status says ${status.state} after job.cancel`, status);
 });
 
+step('e5 job.start --on far with a shell command string keeps an environment value byte for byte', () => {
+  const job = ok('job.start', { cmd: printEnvCommand('E2E_JOB_TEXT'), env: { E2E_JOB_TEXT: TRICKY_TEXT }, name: 'e2e-shell' }, { on: 'far' });
+  const waited = ok('job.wait', { id: job.id, timeout_s: 120 }, { on: 'far', timeout: 180_000 });
+  check(waited.state === 'succeeded' && waited.exit_code === 0, 'the shell job did not succeed', waited);
+  const logs = ok('job.logs', { id: job.id }, { on: 'far' });
+  check(logs.content === TRICKY_TEXT, 'the shell job printed something else', { sent: TRICKY_TEXT, received: logs.content });
+});
+
 // --- f. permissions across the hop ---------------------------------------------------------------
 
 const policy = `# Written by scripts/legion-e2e.mjs.
@@ -715,6 +723,17 @@ step('i2 power.restart --on far dry_run=true returns the platform\'s command and
   const flat = plan.commands.map(argv => argv.join(' '));
   const expected = { linux: /systemctl( -i)? reboot/, macos: /shutdown -r/, windows: /shutdown \/r/ }[expectedOs];
   check(flat.some(command => expected.test(command)), `power.restart did not plan ${expected}`, plan);
+  return flat.join('; ');
+});
+
+step('i3 power.shutdown --on far dry_run=true returns the platform\'s command and does nothing', () => {
+  const plan = ok('power.shutdown', { dry_run: true, force: true }, { on: 'far' });
+  check(plan.dry_run === true && plan.scheduled === false, 'power.shutdown did not stay a dry run', plan);
+  const flat = plan.commands.map(argv => argv.join(' '));
+  const expected = { linux: /systemctl( -i)? poweroff/, macos: /shutdown -h/, windows: /shutdown \/s/ }[expectedOs];
+  check(flat.some(command => expected.test(command)), `power.shutdown did not plan ${expected}`, plan);
+  const status = ok('power.status', {}, { on: 'far' });
+  check(status.boot_id === plan.boot_id, 'the far node restarted', { plan, status });
   return flat.join('; ');
 });
 
