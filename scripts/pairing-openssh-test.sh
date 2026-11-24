@@ -648,7 +648,7 @@ link_revoked_out="$(legion-link-cli call --config "$work/link_config.json" meta.
 link_revoked_rc=$?
 set -e
 [[ "$link_revoked_rc" -eq 1 ]] || { echo "expected revoked legion-link call to exit 1, got $link_revoked_rc: $link_revoked_out" >&2; exit 1; }
-python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["code"]=="denied" and e["details"]["reason"]=="auth_failed", e' "$link_revoked_out"
+python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["code"]=="denied" and e["details"]["reason"]=="device_removed_or_unknown", e' "$link_revoked_out"
 echo "    legion-link revocation verified"
 USER_EOF
 
