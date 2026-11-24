@@ -51,8 +51,8 @@ fn main() -> ExitCode {
             an_interrupted_file_resumes_where_it_stopped,
         ),
         (
-            "a_cancelled_transfer_leaves_nothing_under_a_final_name",
-            a_cancelled_transfer_leaves_nothing_under_a_final_name,
+            "a_cancelled_transfer_leaves_nothing_half_written_under_a_final_name",
+            a_cancelled_transfer_leaves_nothing_half_written_under_a_final_name,
         ),
         (
             "each_end_applies_its_own_policy_and_says_which_machine_refused",
@@ -85,6 +85,10 @@ fn main() -> ExitCode {
         (
             "what_arrives_is_checked_and_a_file_keeps_its_time",
             what_arrives_is_checked_and_a_file_keeps_its_time,
+        ),
+        (
+            "an_end_that_is_stopped_is_given_time_to_clean_up",
+            an_end_that_is_stopped_is_given_time_to_clean_up,
         ),
         (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
@@ -210,6 +214,20 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
         ("oversized", "pack") => header["names"] = json!(["readme.txt", "big.bin"]),
         // Its file is edited in place after it was listed and before it is packed.
         ("mutate", "pack") => fs::write(home.join("export/readme.txt"), b"READ ME").unwrap(),
+        // An unpack that, like a real one, has a temporary file to remove once its input ends,
+        // and takes a moment to do it: killed at once, it leaves the file behind.
+        ("slow-cleanup", "unpack") => {
+            let root = home.join(header["root"].as_str().unwrap().trim_start_matches("~/"));
+            fs::create_dir_all(&root).unwrap();
+            let temporary = root.join(".legion-unpack-1-0.tmp");
+            fs::write(&temporary, b"half").unwrap();
+            println!("{}", json!({"ready": true}));
+            std::io::stdout().flush().unwrap();
+            let _ = std::io::copy(&mut input, &mut std::io::sink());
+            std::thread::sleep(Duration::from_millis(300));
+            fs::remove_file(&temporary).unwrap();
+            return ExitCode::from(1);
+        }
         // Fails as soon as it is asked for an archive.
         ("fail-pack", "pack") => {
             let error =
@@ -263,6 +281,19 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
             }
             writeln!(out, "{reply}").unwrap();
             std::io::copy(&mut replies, &mut out).unwrap();
+        }
+        // Stops half way through its archive and fails.
+        ("truncate", "pack") => {
+            let mut taken = Vec::new();
+            replies.read_until(b'\n', &mut taken).unwrap();
+            out.write_all(&taken).unwrap();
+            let mut archive = vec![0u8; 300 * 1024];
+            replies.read_exact(&mut archive).unwrap();
+            out.write_all(&archive).unwrap();
+            out.flush().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            return ExitCode::from(1);
         }
         // Sends more than the size it announced.
         ("extra-bytes", "get") => {
@@ -807,7 +838,7 @@ fn an_interrupted_file_resumes_where_it_stopped() {
     );
 }
 
-fn a_cancelled_transfer_leaves_nothing_under_a_final_name() {
+fn a_cancelled_transfer_leaves_nothing_half_written_under_a_final_name() {
     let laptop = node("laptop");
     let pi = node("pi");
     fleet(&laptop, &[("pi", &pi, "slow", vec![])]);
@@ -856,32 +887,44 @@ fn a_cancelled_transfer_leaves_nothing_under_a_final_name() {
             error["details"]["bytes_sent"].as_u64().unwrap() > 0,
             "{reply}"
         );
+        assert_eq!(error["details"]["deleted"], 0, "{reply}");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("not what the destination confirmed"),
+            "{reply}"
+        );
         assert_eq!(rpc.finish(), 0);
     }
-    // Give the destination's stream a moment to notice its input ended and clean up.
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        let names: Vec<String> = fs::read_dir(pi.home())
-            .unwrap()
-            .chain(fs::read_dir(pi.home().join("tree")).into_iter().flatten())
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        let finals: Vec<&String> = names
-            .iter()
-            .filter(|name| {
-                *name == "huge.bin" || (name.starts_with("part") && name.ends_with(".bin"))
-            })
-            .collect();
-        let temporaries = names.iter().any(|name| name.ends_with(".tmp"));
-        if finals.is_empty() && !temporaries {
-            break;
+    // Both ends were waited for before the reply. Whatever has its final name by then (a part
+    // that finished before the cancel came) is whole and right; nothing is half written under one.
+    let names: Vec<(PathBuf, String)> = fs::read_dir(pi.home())
+        .unwrap()
+        .chain(fs::read_dir(pi.home().join("tree")).into_iter().flatten())
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.path(),
+                entry.file_name().to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    for (path, name) in &names {
+        if name == "huge.bin" {
+            assert_eq!(fs::read(path).unwrap(), data(24 * 1024 * 1024, 5), "{name}");
         }
-        assert!(
-            finals.is_empty(),
-            "a half-written file has its final name: {finals:?}"
-        );
-        assert!(Instant::now() < deadline, "{names:?}");
-        std::thread::sleep(Duration::from_millis(50));
+        if let Some(at) = name
+            .strip_prefix("part")
+            .and_then(|rest| rest.strip_suffix(".bin"))
+        {
+            let seed: u64 = at.parse().unwrap();
+            assert_eq!(
+                fs::read(path).unwrap(),
+                data(6 * 1024 * 1024, seed),
+                "{name}"
+            );
+        }
     }
     let audit = laptop.audit();
     assert!(
@@ -1585,4 +1628,33 @@ fn what_arrives_is_checked_and_a_file_keeps_its_time() {
     ));
     assert_eq!(tree["files_sent"], 1, "{tree}");
     assert_eq!(tree["files_unchanged"], 1, "{tree}");
+}
+
+fn an_end_that_is_stopped_is_given_time_to_clean_up() {
+    let laptop = node("laptop");
+    let broken = node("broken");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("broken", &broken, "evil", vec!["truncate".to_owned()]),
+            ("pi", &pi, "evil", vec!["slow-cleanup".to_owned()]),
+        ],
+    );
+    fs::create_dir_all(broken.home().join("export")).unwrap();
+    fs::write(broken.home().join("export/big.bin"), data(1024 * 1024, 31)).unwrap();
+
+    // The source fails half way through a file; the destination, stopped, still removes what
+    // it was writing before it goes.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "broken:~/export", "to": "pi:~/copy"}),
+        &[],
+    ));
+    assert_eq!(error["machine"], "broken", "{error}");
+    let left: Vec<String> = fs::read_dir(pi.home().join("copy"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }

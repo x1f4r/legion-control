@@ -12,8 +12,8 @@
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
@@ -29,8 +29,7 @@ use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::io::SyncIoBridge;
 
 use crate::config::{FleetFile, validate_machine_name};
@@ -71,6 +70,10 @@ const FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// or without a line while a reply is awaited. A node that is busy says so every
 /// [`stream::HEARTBEAT`], well inside this, so only a stall runs it out.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long an end whose input was cut off is given to clean up (an unpack removes the temporary
+/// file it was writing) and exit before it is killed.
+const ABORT_GRACE: Duration = Duration::from_secs(2);
 
 /// How long an ended stream is given to exit and say why on stderr.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
@@ -325,26 +328,79 @@ fn resolve(ctx: &Ctx, text: &str) -> Result<End, ErrorBody> {
 }
 
 /// What has been sent so far, kept outside the transfer so a cancelled one can still say, and
-/// the ends served here, so a cancelled one can wait for them to stop.
+/// the ends whose pipes were dropped before they were closed, so the transfer can still wait for
+/// them.
 #[derive(Default)]
 struct Sent {
     files: AtomicU64,
     bytes: AtomicU64,
-    served_here: Mutex<Vec<oneshot::Receiver<()>>>,
+    deleted: AtomicU64,
+    ends: Ends,
 }
 
 impl Sent {
-    /// Waits, within reason, for every end served here to have stopped: one writing a file has
-    /// then dropped or kept its partial file, never renamed it into place.
-    async fn settle(&self) {
-        let waiting: Vec<_> = self
-            .served_here
+    /// Gives every end left behind time to clean up and stop, together, and waits for them: a
+    /// remote end has its input closed and is killed only if it is still there after
+    /// [`ABORT_GRACE`]. Says whether all of them stopped; an end on this node runs on a thread,
+    /// which cannot be killed.
+    async fn settle(&self) -> bool {
+        let mut stopping = JoinSet::new();
+        for process in self.ends.take() {
+            stopping.spawn(async move {
+                match process {
+                    Process::Remote(handle) => {
+                        handle.close(ABORT_GRACE).await;
+                        true
+                    }
+                    Process::Local(Some(task)) => {
+                        tokio::time::timeout(EXIT_WAIT, task).await.is_ok()
+                    }
+                    Process::Local(None) => true,
+                }
+            });
+        }
+        let mut stopped = true;
+        while let Some(joined) = stopping.join_next().await {
+            stopped &= joined.unwrap_or(false);
+        }
+        stopped
+    }
+}
+
+/// The processes of ends whose pipes were dropped before they were closed.
+#[derive(Clone, Default)]
+struct Ends(Arc<Mutex<Vec<Process>>>);
+
+impl Ends {
+    fn push(&self, process: Process) {
+        self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-            .collect();
-        for stopped in waiting {
-            let _ = tokio::time::timeout(EXIT_WAIT, stopped).await;
+            .push(process);
+    }
+
+    fn take(&self) -> Vec<Process> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+/// The process behind one pipe. Dropped with its pipe before the pipe was closed, as when a
+/// transfer fails or is cancelled half way, it is handed to the transfer's [`Ends`] rather than
+/// killed on the spot, so it can still clean up.
+struct Owned {
+    process: Option<Process>,
+    ends: Ends,
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            self.ends.push(process);
         }
     }
 }
@@ -364,23 +420,35 @@ async fn transfer(
         sent: &sent,
     };
     let work = job.run(&from, &to, &args);
-    // Dropping the work closes every pipe it holds: a remote end sees its input end and its
-    // process is killed, an end served here sees its pipe close, and neither renames anything
-    // into place that was not complete.
-    let mut report = tokio::select! {
-        report = work => report?,
-        () = ctx.cancelled() => {
-            sent.settle().await;
-            let files = sent.files.load(Ordering::Relaxed);
-            let bytes = sent.bytes.load(Ordering::Relaxed);
-            return Err(ErrorBody::new(
-                ErrorCode::Cancelled,
-                format!("The transfer from {} to {} was cancelled after {bytes} bytes and {files} files.", from.named(), to.named()),
-            )
-            .with_hint("Run it again to continue: a file resumes where it stopped and a tree sends only what is still missing.")
-            .with_details(json!({"files_sent": files, "bytes_sent": bytes})));
-        }
+    // A cancel drops the work, and with it every pipe it holds: each end sees its input end
+    // without the rest of what it expected, so none renames anything into place that was not
+    // complete, and each is then given time to clean up and stop before the transfer replies.
+    let finished = tokio::select! {
+        report = work => Some(report),
+        () = ctx.cancelled() => None,
     };
+    let stopped = sent.settle().await;
+    let Some(report) = finished else {
+        let files = sent.files.load(Ordering::Relaxed);
+        let bytes = sent.bytes.load(Ordering::Relaxed);
+        let deleted = sent.deleted.load(Ordering::Relaxed);
+        let ends = if stopped {
+            "Both ends have stopped."
+        } else {
+            "The end on this node is still finishing."
+        };
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!(
+                "The transfer from {} to {} was cancelled after sending {bytes} bytes of {files} files and deleting {deleted} entries; those are what was sent, not what the destination confirmed it wrote. {ends}",
+                from.named(),
+                to.named()
+            ),
+        )
+        .with_hint("Run it again to continue: a file resumes where it stopped and a tree sends only what is still missing.")
+        .with_details(json!({"files_sent": files, "bytes_sent": bytes, "deleted": deleted, "stopped": stopped})));
+    };
+    let mut report = report?;
     report.dry_run = args.dry_run;
     report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(report)
@@ -744,6 +812,7 @@ impl Transfer<'_> {
                 .request(to, json!({"op": "delete", "root": to.path, "names": names}))
                 .await?;
             removed += done.removed;
+            self.sent.deleted.fetch_add(done.removed, Ordering::Relaxed);
             skipped.extend(on(&to.machine, done.skipped));
         }
         Ok(removed)
@@ -1068,7 +1137,7 @@ struct Conn {
     machine: String,
     reader: BufReader<BoxRead>,
     writer: Option<BoxWrite>,
-    process: Process,
+    process: Owned,
     /// Whether a reply has been read, which tells a server that never started from one that
     /// failed on the way.
     answered: bool,
@@ -1121,15 +1190,8 @@ impl Conn {
             let principal = ctx.principal().to_owned();
             let input = SyncIoBridge::new(server_in);
             let output = SyncIoBridge::new(server_out);
-            let (stopped, waiting) = oneshot::channel();
-            sent.served_here
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(waiting);
             let task = tokio::task::spawn_blocking(move || {
-                let served = stream::serve(&host, Some(&principal), input, output);
-                let _ = stopped.send(());
-                served
+                stream::serve(&host, Some(&principal), input, output)
             });
             (
                 Box::new(client_in),
@@ -1141,7 +1203,10 @@ impl Conn {
             machine: end.machine.clone(),
             reader: BufReader::with_capacity(CHUNK, reader),
             writer: Some(writer),
-            process,
+            process: Owned {
+                process: Some(process),
+                ends: sent.ends.clone(),
+            },
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
@@ -1362,8 +1427,8 @@ impl Conn {
     /// stderr when it ran on another machine.
     async fn ended(&mut self, when: &str) -> ErrorBody {
         let machine = self.machine.clone();
-        match &mut self.process {
-            Process::Local(task) => {
+        match self.process.process.as_mut() {
+            Some(Process::Local(task)) => {
                 if let Some(task) = task.take()
                     && let Ok(Ok(Err(error))) = tokio::time::timeout(EXIT_WAIT, task).await
                 {
@@ -1375,7 +1440,12 @@ impl Conn {
                 )
                 .with_machine(machine)
             }
-            Process::Remote(handle) => {
+            None => ErrorBody::new(
+                ErrorCode::Failed,
+                format!("The stream on {machine} ended {when}."),
+            )
+            .with_machine(machine),
+            Some(Process::Remote(handle)) => {
                 let (code, stderr) = handle.collect_exit_info(EXIT_WAIT).await;
                 let status = code
                     .map(|code| format!(" (exit status {code})"))
@@ -1406,8 +1476,9 @@ impl Conn {
     async fn finish(mut self) -> Result<(), ErrorBody> {
         self.writer.take();
         let machine = self.machine.clone();
-        let result = match &mut self.process {
-            Process::Local(task) => match task.take() {
+        let result = match self.process.process.as_mut() {
+            None => Ok(()),
+            Some(Process::Local(task)) => match task.take() {
                 Some(task) => match tokio::time::timeout(EXIT_WAIT, task).await {
                     Ok(Ok(Ok(()))) => Ok(()),
                     Ok(Ok(Err(error))) => Err(with_machine(error, &machine)),
@@ -1419,7 +1490,7 @@ impl Conn {
                 },
                 None => Ok(()),
             },
-            Process::Remote(handle) => match handle.collect_exit_info(FINISH_WAIT).await {
+            Some(Process::Remote(handle)) => match handle.collect_exit_info(FINISH_WAIT).await {
                 (Some(0), _) => Ok(()),
                 _ => Err(self.ended("before it finished").await),
             },
@@ -1438,27 +1509,29 @@ impl Conn {
     /// Lets the server finish on its own: its input ends and it is given a moment to exit.
     async fn close(mut self) {
         self.end_input().await;
-        match self.process {
-            Process::Remote(handle) => handle.close(EXIT_WAIT).await,
-            Process::Local(Some(task)) => {
+        match self.process.process.take() {
+            Some(Process::Remote(handle)) => handle.close(EXIT_WAIT).await,
+            Some(Process::Local(Some(task))) => {
                 drop(self.reader);
                 let _ = tokio::time::timeout(EXIT_WAIT, task).await;
             }
-            Process::Local(None) => {}
+            Some(Process::Local(None)) | None => {}
         }
     }
 
-    /// Stops the server now. Its input ends without the rest of what it expected, so nothing it
-    /// was writing is renamed into place.
-    async fn abort(self) {
+    /// Stops the server. Its input ends without the rest of what it expected, so nothing it was
+    /// writing is renamed into place, and it is given [`ABORT_GRACE`] to remove what it was
+    /// writing and exit before it is killed.
+    async fn abort(mut self) {
+        let process = self.process.process.take();
         drop(self.writer);
         drop(self.reader);
-        match self.process {
-            Process::Remote(handle) => handle.close(Duration::ZERO).await,
-            Process::Local(Some(task)) => {
+        match process {
+            Some(Process::Remote(handle)) => handle.close(ABORT_GRACE).await,
+            Some(Process::Local(Some(task))) => {
                 let _ = tokio::time::timeout(EXIT_WAIT, task).await;
             }
-            Process::Local(None) => {}
+            Some(Process::Local(None)) | None => {}
         }
     }
 }
@@ -1909,7 +1982,10 @@ mod tests {
             machine: machine.to_owned(),
             reader: BufReader::with_capacity(CHUNK, Box::new(reader)),
             writer: Some(Box::new(writer)),
-            process: Process::Local(None),
+            process: Owned {
+                process: Some(Process::Local(None)),
+                ends: Ends::default(),
+            },
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
