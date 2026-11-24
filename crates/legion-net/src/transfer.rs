@@ -11,6 +11,7 @@
 //! tree is listed at both ends, [`legion_xfer::plan::plan`] decides what differs, and only that is
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::io::SyncIoBridge;
 
@@ -298,11 +300,29 @@ fn resolve(ctx: &Ctx, text: &str) -> Result<End, ErrorBody> {
     }
 }
 
-/// What has been sent so far, kept outside the transfer so a cancelled one can still say.
+/// What has been sent so far, kept outside the transfer so a cancelled one can still say, and
+/// the ends served here, so a cancelled one can wait for them to stop.
 #[derive(Default)]
 struct Sent {
     files: AtomicU64,
     bytes: AtomicU64,
+    served_here: Mutex<Vec<oneshot::Receiver<()>>>,
+}
+
+impl Sent {
+    /// Waits, within reason, for every end served here to have stopped: one writing a file has
+    /// then dropped or kept its partial file, never renamed it into place.
+    async fn settle(&self) {
+        let waiting: Vec<_> = self
+            .served_here
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect();
+        for stopped in waiting {
+            let _ = tokio::time::timeout(EXIT_WAIT, stopped).await;
+        }
+    }
 }
 
 async fn transfer(
@@ -326,6 +346,7 @@ async fn transfer(
     let mut report = tokio::select! {
         report = work => report?,
         () = ctx.cancelled() => {
+            sent.settle().await;
             let files = sent.files.load(Ordering::Relaxed);
             let bytes = sent.bytes.load(Ordering::Relaxed);
             return Err(ErrorBody::new(
@@ -726,7 +747,7 @@ impl Transfer<'_> {
     }
 
     async fn open(&self, end: &End, header: Value) -> Result<Conn, ErrorBody> {
-        Conn::open(self.fleet, self.ctx, end, header).await
+        Conn::open(self.fleet, self.ctx, self.sent, end, header).await
     }
 }
 
@@ -828,6 +849,7 @@ impl Conn {
     async fn open(
         fleet: &Fleet,
         ctx: &Ctx,
+        sent: &Sent,
         end: &End,
         mut header: Value,
     ) -> Result<Conn, ErrorBody> {
@@ -847,8 +869,15 @@ impl Conn {
             let principal = ctx.principal().to_owned();
             let input = SyncIoBridge::new(server_in);
             let output = SyncIoBridge::new(server_out);
+            let (stopped, waiting) = oneshot::channel();
+            sent.served_here
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(waiting);
             let task = tokio::task::spawn_blocking(move || {
-                stream::serve(&host, Some(&principal), input, output)
+                let served = stream::serve(&host, Some(&principal), input, output);
+                let _ = stopped.send(());
+                served
             });
             (
                 Box::new(client_in),
