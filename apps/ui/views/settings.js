@@ -18,6 +18,10 @@ import {
   buildDeviceRemoveArgs,
   describeAppearance,
   describeRefreshing,
+  findIncomingDevice,
+  formatDeviceRemovedNotice,
+  isInviteOwnerStrength,
+  parsePolicyForInvite,
 } from '../lib/settings.js';
 
 export const UI_VERSION = '0.1.0';
@@ -224,7 +228,7 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
   `;
 }
 
-function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
+function InviteDeviceSubpage({ link, tools, allowedSet, nodeInfo, incomingDevices, technical }) {
   const inviteSpec = useMemo(() => (tools || []).find((t) => t.name === 'device.invite'), [tools]);
   const inviteProps = inviteSpec?.input_schema?.properties || {};
   const roleProp = inviteProps.role || null;
@@ -232,17 +236,59 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
   const hasAllowOwner = Boolean(inviteProps.allow_owner);
   const roleChoices = Array.isArray(roleProp?.enum) ? roleProp.enum : null;
   const defaultIdentity = nodeInfo?.whoami?.principal || 'phone';
+  const canReadPolicy =
+    Boolean((tools || []).find((t) => t.name === 'config.read')) &&
+    (!allowedSet || allowedSet.has('config.read'));
 
   const [principal, setPrincipal] = useState(defaultIdentity);
   const [validMinutes, setValidMinutes] = useState(15);
   const [role, setRole] = useState(roleProp?.default || (roleChoices ? roleChoices[0] : ''));
   const [allowOwner, setAllowOwner] = useState(false);
+  const [policy, setPolicy] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [inviteRes, setInviteRes] = useState(null);
 
+  useEffect(() => {
+    if (!hasAllowOwner || !canReadPolicy) {
+      setPolicy(null);
+      return;
+    }
+    let alive = true;
+    link
+      .call('config.read', { document: 'policy.toml' })
+      .then((res) => {
+        if (!alive) return;
+        setPolicy(
+          res?.exists && typeof res.content === 'string'
+            ? parsePolicyForInvite(res.content)
+            : null,
+        );
+      })
+      .catch(() => {
+        if (alive) setPolicy(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [link, nodeInfo?.node, hasAllowOwner, canReadPolicy]);
+
   const usesRoleName = Boolean(hasNameProp && roleProp && role.trim());
-  const wantsOwner = Boolean(hasAllowOwner && role.trim() === 'owner');
+  const wantsOwner = Boolean(
+    hasAllowOwner &&
+      isInviteOwnerStrength({
+        label: principal,
+        role,
+        usesRoleName,
+        policy,
+        whoami: nodeInfo?.whoami,
+        incomingDevices,
+      }),
+  );
+
+  useEffect(() => {
+    if (!wantsOwner) setAllowOwner(false);
+  }, [wantsOwner]);
 
   async function onCreate(e) {
     e.preventDefault();
@@ -287,7 +333,10 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
           <input
             type="text"
             value=${principal}
-            onInput=${(e) => setPrincipal(e.target.value)}
+            onInput=${(e) => {
+              setPrincipal(e.target.value);
+              setAllowOwner(false);
+            }}
             placeholder=${defaultIdentity}
             required
           />
@@ -311,9 +360,8 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
                       <select
                         value=${role}
                         onChange=${(e) => {
-                          const next = e.target.value;
-                          setRole(next);
-                          if (next.trim() !== 'owner') setAllowOwner(false);
+                          setRole(e.target.value);
+                          setAllowOwner(false);
                         }}
                       >
                         ${roleChoices.map(
@@ -326,9 +374,8 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
                         type="text"
                         value=${role}
                         onInput=${(e) => {
-                          const next = e.target.value;
-                          setRole(next);
-                          if (next.trim() !== 'owner') setAllowOwner(false);
+                          setRole(e.target.value);
+                          setAllowOwner(false);
                         }}
                         placeholder="observer"
                       />
@@ -354,8 +401,8 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
                     <span class="title">Allow full owner access</span>
                     <span class="sub">
                       ${technical
-                        ? 'Passes allow_owner=true, required to invite a device with the owner role.'
-                        : 'Lets this device change permissions and manage other devices.'}
+                        ? 'This device will be able to do everything, including changing who may do what (passes allow_owner=true).'
+                        : 'This device will be able to do everything, including changing who may do what.'}
                     </span>
                   </span>
                   <input
@@ -517,15 +564,17 @@ function IncomingDeviceSubpage({
   function askRemove() {
     onRequestConfirm({
       title: `Remove ${device.name}?`,
-      summary: `${device.name} will lose access to this machine right away.`,
+      summary: device.local_only
+        ? `${device.name} is only paired with this machine and will lose access here right away.`
+        : `${device.name} will lose access to this machine right away.`,
       confirmLabel: 'Remove access',
       danger: true,
       async onConfirm() {
         setBusy(true);
         setError(null);
         try {
-          await link.call('device.remove', buildDeviceRemoveArgs(device));
-          onRemoved();
+          const res = await link.call('device.remove', buildDeviceRemoveArgs(device));
+          onRemoved(formatDeviceRemovedNotice(device, res));
         } catch (err) {
           setError(err);
         } finally {
@@ -705,7 +754,9 @@ function ConnectionsPage({
       <${InviteDeviceSubpage}
         link=${link}
         tools=${tools}
+        allowedSet=${allowedSet}
         nodeInfo=${nodeInfo}
+        incomingDevices=${incoming?.devices || []}
         technical=${technical}
       />
     `;
@@ -745,9 +796,7 @@ function ConnectionsPage({
   }
 
   if (route.sub === 'incoming' && route.item) {
-    const dev =
-      (incoming?.devices || []).find((d) => (d.id || d.name) === route.item || d.name === route.item) ||
-      null;
+    const dev = findIncomingDevice(incoming?.devices, route.item);
     return html`
       <${IncomingDeviceSubpage}
         device=${dev}
@@ -756,7 +805,8 @@ function ConnectionsPage({
         technical=${technical}
         link=${link}
         onRequestConfirm=${onRequestConfirm}
-        onRemoved=${() => {
+        onRemoved=${(removedNotice) => {
+          setNotice(removedNotice || null);
           loadIncoming();
           window.location.hash = '#/settings/connections';
         }}
