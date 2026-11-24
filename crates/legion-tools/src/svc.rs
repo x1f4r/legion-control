@@ -185,6 +185,33 @@ impl StateFilter {
     }
 }
 
+/// Whether a validated service name is used for a read-only query or a control action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NamePurpose {
+    /// `svc.status` and `svc.logs`.
+    Read,
+    /// `svc.start`, `svc.stop` and `svc.restart`.
+    Control,
+}
+
+/// Systemd unit suffixes known to `systemctl`.
+const SYSTEMD_UNIT_SUFFIXES: [&str; 11] = [
+    ".service",
+    ".socket",
+    ".device",
+    ".mount",
+    ".automount",
+    ".swap",
+    ".target",
+    ".path",
+    ".timer",
+    ".slice",
+    ".scope",
+];
+
+/// Read-only systemd unit suffixes allowed by `svc.status` and `svc.logs`.
+const SYSTEMD_READONLY_SUFFIXES: [&str; 3] = [".timer", ".socket", ".path"];
+
 /// Control verb issued by `svc.start`, `svc.stop` and `svc.restart`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -442,8 +469,8 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
 
 async fn status(ctx: &Ctx, args: StatusArgs) -> Result<StatusResult, ToolError> {
     let backend = backend_for_os(ctx.os())?;
-    validate_name(&args.name, backend.kind())?;
-    let found = resolve_scope(backend, ctx, &args.name, args.scope).await?;
+    let name = prepare_name(&args.name, backend.kind(), NamePurpose::Read)?;
+    let found = resolve_scope(backend, ctx, &name, args.scope).await?;
     Ok(StatusResult {
         name: found.name,
         scope: found.scope,
@@ -476,12 +503,12 @@ async fn run_action(
     action: Action,
 ) -> Result<ActionResult, ToolError> {
     let backend = backend_for_os(ctx.os())?;
-    validate_name(&args.name, backend.kind())?;
+    let name = prepare_name(&args.name, backend.kind(), NamePurpose::Control)?;
     let node_cfg = ctx.config().get::<NodeFile>()?;
     execute_action(
         backend,
         ctx,
-        &args.name,
+        &name,
         args.scope,
         action,
         node_cfg.svc.sudo,
@@ -639,12 +666,12 @@ async fn logs(ctx: &Ctx, args: LogsArgs) -> Result<LogsResult, ToolError> {
         .with_hint("Use `since` to narrow the time window instead of asking for more lines."));
     }
     let backend = backend_for_os(ctx.os())?;
-    validate_name(&args.name, backend.kind())?;
+    let name = prepare_name(&args.name, backend.kind(), NamePurpose::Read)?;
     let since = args
         .since
         .map(|raw| parse_since(raw, Timestamp::now()))
         .transpose()?;
-    let found = resolve_scope(backend, ctx, &args.name, args.scope).await?;
+    let found = resolve_scope(backend, ctx, &name, args.scope).await?;
     let limit = usize::try_from(args.lines).unwrap_or(usize::MAX);
     let raw = backend
         .logs(ctx, &found.name, found.scope, limit, since)
@@ -709,18 +736,27 @@ async fn resolve_scope(
     }
 }
 
-/// Validates a service name before it is passed to any system command.
+/// Validates and normalises a service name before it is passed to any system command.
 ///
 /// Rejects empty or whitespace-only names, names longer than 256 bytes, leading `-`, control
-/// characters, and path separators (`/` everywhere; `\` everywhere except valid systemd `\xHH`
-/// unit-name hex escapes on Linux).
-pub(crate) fn validate_name(name: &str, backend: BackendKind) -> Result<(), ErrorBody> {
+/// characters, wildcard characters (`*`, `?`, `[`, `]`), and path separators (`/` everywhere; `\`
+/// everywhere except valid systemd `\xHH` unit-name hex escapes on Linux).
+///
+/// On systemd, bare names without a known unit suffix get `.service`; control operations allow
+/// only `.service` units, while read-only operations (`svc.status`, `svc.logs`) also allow
+/// `.timer`, `.socket` and `.path` units. Targets, slices, scopes, mounts and other unit types
+/// are always refused so a service call cannot trigger `exit.target` or `reboot.target`.
+pub(crate) fn prepare_name(
+    name: &str,
+    backend: BackendKind,
+    purpose: NamePurpose,
+) -> Result<String, ErrorBody> {
     let invalid = |reason: &str| {
         ErrorBody::new(
             ErrorCode::InvalidArgs,
             format!("Invalid service name {name:?}: {reason}."),
         )
-        .with_hint("Give the plain service name as shown by `svc.list`, with no leading `-`, path separators or control characters.")
+        .with_hint("Give the exact service name as shown by `svc.list`, with no wildcards, leading `-`, path separators or control characters.")
     };
 
     if name.is_empty() || name.trim().is_empty() {
@@ -737,6 +773,11 @@ pub(crate) fn validate_name(name: &str, backend: BackendKind) -> Result<(), Erro
     if name.chars().any(char::is_control) {
         return Err(invalid("service name must not contain control characters"));
     }
+    if name.contains(['*', '?', '[', ']']) {
+        return Err(invalid(
+            "service name must not contain wildcard characters (`*`, `?`, `[`, `]`)",
+        ));
+    }
     if name.contains('/') {
         return Err(invalid("service name must not contain path separators"));
     }
@@ -747,7 +788,48 @@ pub(crate) fn validate_name(name: &str, backend: BackendKind) -> Result<(), Erro
             return Err(invalid("service name must not contain path separators"));
         }
     }
-    Ok(())
+
+    if backend == BackendKind::Systemd {
+        let matched_suffix = SYSTEMD_UNIT_SUFFIXES
+            .iter()
+            .copied()
+            .find(|suffix| name.ends_with(suffix));
+        return match matched_suffix {
+            Some(".service") => Ok(name.to_owned()),
+            Some(suffix) if SYSTEMD_READONLY_SUFFIXES.contains(&suffix) => match purpose {
+                NamePurpose::Read => Ok(name.to_owned()),
+                NamePurpose::Control => Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!(
+                        "This tool controls services (`.service` units), not `{suffix}` unit {name:?}."
+                    ),
+                )
+                .with_hint(
+                    "Pass a `.service` unit name; `.timer`, `.socket` and `.path` units are only accepted by `svc.status` and `svc.logs`.",
+                )),
+            },
+            Some(suffix) => Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "This tool only handles services (`.service` units), not `{suffix}` unit {name:?}."
+                ),
+            )
+            .with_hint(
+                "Pass a `.service` unit name (or `.timer`, `.socket`, `.path` for read-only `svc.status` and `svc.logs`).",
+            )),
+            None => {
+                let normalized = format!("{name}.service");
+                if normalized.len() > MAX_NAME_LEN {
+                    return Err(invalid(&format!(
+                        "service name must be at most {MAX_NAME_LEN} bytes including `.service`"
+                    )));
+                }
+                Ok(normalized)
+            }
+        };
+    }
+
+    Ok(name.to_owned())
 }
 
 /// Returns `true` if `name` contains a `\` that is not a systemd `\xHH` two-digit hex escape.
@@ -865,29 +947,72 @@ mod tests {
                 BackendKind::Launchd,
                 BackendKind::Windows,
             ] {
-                assert!(validate_name(good, kind).is_ok(), "{good} on {kind:?}");
+                assert!(
+                    prepare_name(good, kind, NamePurpose::Control).is_ok(),
+                    "{good} on {kind:?}"
+                );
+            }
+        }
+
+        // Systemd appends `.service` when no unit suffix is present.
+        assert_eq!(
+            prepare_name("nginx", BackendKind::Systemd, NamePurpose::Control).unwrap(),
+            "nginx.service"
+        );
+        assert_eq!(
+            prepare_name(
+                "org.example.worker",
+                BackendKind::Systemd,
+                NamePurpose::Read
+            )
+            .unwrap(),
+            "org.example.worker.service"
+        );
+        // Read-only suffixes are accepted for Read and refused for Control.
+        for ro in ["backup.timer", "dbus.socket", "watch.path"] {
+            assert_eq!(
+                prepare_name(ro, BackendKind::Systemd, NamePurpose::Read).unwrap(),
+                ro
+            );
+            let err = prepare_name(ro, BackendKind::Systemd, NamePurpose::Control).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{ro}");
+        }
+        // Dangerous unit types like targets, slices, scopes and mounts are always refused.
+        for non_svc in [
+            "exit.target",
+            "reboot.target",
+            "user.slice",
+            "init.scope",
+            "home.mount",
+        ] {
+            for purpose in [NamePurpose::Read, NamePurpose::Control] {
+                let err = prepare_name(non_svc, BackendKind::Systemd, purpose).unwrap_err();
+                assert_eq!(err.code, ErrorCode::InvalidArgs, "{non_svc} {purpose:?}");
             }
         }
 
         // Systemd hex escapes are accepted on systemd and rejected on launchd/windows.
         assert!(
-            validate_name(
+            prepare_name(
                 "app-gnome\\x2dkeyring@autostart.service",
-                BackendKind::Systemd
+                BackendKind::Systemd,
+                NamePurpose::Control
             )
             .is_ok()
         );
         assert!(
-            validate_name(
+            prepare_name(
                 "app-gnome\\x2dkeyring@autostart.service",
-                BackendKind::Windows
+                BackendKind::Windows,
+                NamePurpose::Control
             )
             .is_err()
         );
         assert!(
-            validate_name(
+            prepare_name(
                 "app-gnome\\x2dkeyring@autostart.service",
-                BackendKind::Launchd
+                BackendKind::Launchd,
+                NamePurpose::Control
             )
             .is_err()
         );
@@ -898,6 +1023,9 @@ mod tests {
             "   ",
             "-user",
             "--all",
+            "legion-review-*",
+            "worker-?.service",
+            "worker-[0-9].service",
             "foo/bar",
             "../etc/passwd",
             "foo\\bar",
@@ -914,7 +1042,7 @@ mod tests {
                 BackendKind::Launchd,
                 BackendKind::Windows,
             ] {
-                let err = validate_name(bad, kind).unwrap_err();
+                let err = prepare_name(bad, kind, NamePurpose::Control).unwrap_err();
                 assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad:?} on {kind:?}");
             }
         }

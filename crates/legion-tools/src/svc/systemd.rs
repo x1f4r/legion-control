@@ -329,18 +329,53 @@ pub(crate) fn merge_list(
 }
 
 /// Parses `systemctl show` key=value output into a [`BackendStatus`].
+///
+/// Fails with `conflict` if `systemctl show` emitted more than one unit block (which would happen
+/// if a pattern ever slipped past validation).
 pub(crate) fn parse_show(
     text: &str,
     requested_name: &str,
     scope: Scope,
 ) -> Result<BackendStatus, ErrorBody> {
-    let mut props: BTreeMap<String, String> = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
+    let mut blocks: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut current: BTreeMap<String, String> = BTreeMap::new();
+    for raw in text.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() {
+            if !current.is_empty() {
+                blocks.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
         if let Some((k, v)) = line.split_once('=') {
-            props.insert(k.to_owned(), v.to_owned());
+            // A repeated `Id=` without an intervening blank line also marks a second unit.
+            if k == "Id" && current.contains_key("Id") {
+                blocks.push(std::mem::take(&mut current));
+            }
+            current.insert(k.to_owned(), v.to_owned());
         }
     }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    if blocks.len() > 1 {
+        let matched: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| block.get("Id").map(String::as_str))
+            .collect();
+        return Err(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "Multiple systemd units matched {requested_name:?} ({}).",
+                matched.join(", ")
+            ),
+        )
+        .with_hint("Give a single exact unit name without wildcards.")
+        .with_details(json!({"matches": matched})));
+    }
+
+    let props = blocks.into_iter().next().unwrap_or_default();
 
     let load_state = props.get("LoadState").map(String::as_str).unwrap_or("");
     let active_state = props.get("ActiveState").map(String::as_str).unwrap_or("");
@@ -797,6 +832,22 @@ MainPID=0
 ";
         let err = parse_show(not_found, "ghost.service", Scope::User).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
+
+        let multi = "\
+Id=legion-a.service
+LoadState=loaded
+ActiveState=active
+SubState=running
+
+Id=legion-b.service
+LoadState=loaded
+ActiveState=active
+SubState=running
+";
+        let err = parse_show(multi, "legion-*.service", Scope::User).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(err.message.contains("legion-a.service"), "{}", err.message);
+        assert!(err.message.contains("legion-b.service"), "{}", err.message);
     }
 
     #[test]

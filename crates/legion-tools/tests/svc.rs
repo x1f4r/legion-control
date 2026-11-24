@@ -93,6 +93,9 @@ async fn svc_tools_validate_arguments_and_service_names() {
         "",
         "   ",
         "-bad",
+        "legion-review-*",
+        "worker-?.service",
+        "worker-[0].service",
         "foo/bar",
         "foo\\bar",
         "bad\nname",
@@ -310,4 +313,61 @@ async fn linux_user_systemd_transient_unit_list_status_logs_and_stop() {
         .await
         .unwrap_err();
     assert_eq!(missing.code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn linux_rejects_wildcards_and_non_service_units() {
+    if !linux_user_systemd_available() {
+        return;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let prefix = format!("legion-svc-glob-{}-{nanos}", std::process::id());
+    let unit_a = format!("{prefix}-a.service");
+    let unit_b = format!("{prefix}-b.service");
+    let _guard_a = TransientUnitGuard {
+        unit: unit_a.clone(),
+    };
+    let _guard_b = TransientUnitGuard {
+        unit: unit_b.clone(),
+    };
+
+    for unit in [&unit_a, &unit_b] {
+        let out = Command::new("systemd-run")
+            .args(["--user", &format!("--unit={unit}"), "/bin/sleep", "60"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let fixture = Fixture::new();
+    let glob = format!("{prefix}-*");
+    for tool in ["svc.status", "svc.stop"] {
+        let err = fixture.call(tool, json!({"name": glob})).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{tool}");
+    }
+    // Neither unit was affected by the rejected wildcard stop.
+    for unit in [&unit_a, &unit_b] {
+        let st = fixture
+            .call("svc.status", json!({"name": unit}))
+            .await
+            .unwrap();
+        assert_eq!(st["state"], json!("running"));
+    }
+
+    // Non-service control targets like exit.target and reboot.target are refused.
+    for target in ["exit.target", "reboot.target", "backup.timer"] {
+        let err = fixture
+            .call("svc.start", json!({"name": target}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{target}");
+    }
 }

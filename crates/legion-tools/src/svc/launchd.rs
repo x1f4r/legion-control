@@ -377,7 +377,8 @@ pub(crate) fn parse_print(
     let mut keep_alive = false;
 
     // Only parse top-level key = value lines inside the service block (depth == 1) so nested
-    // blocks like `environment = { ... }` cannot shadow top-level fields.
+    // blocks like `environment = { ... }` cannot shadow top-level fields. Also verify the header
+    // line names the exact requested label.
     let mut depth: usize = 0;
     for raw in text.lines() {
         let line = raw.trim();
@@ -385,6 +386,19 @@ pub(crate) fn parse_print(
             continue;
         }
         if line.ends_with('{') {
+            if depth == 0
+                && let Some((header, _)) = line.split_once('=')
+            {
+                let expected_header = format!("{domain}/{label}");
+                let actual = header.trim();
+                if actual != expected_header && actual != label {
+                    return Err(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        format!("launchd returned {actual:?} instead of exact label {label:?}."),
+                    )
+                    .with_hint("Give the exact launchd service label as shown by `svc.list`."));
+                }
+            }
             if depth == 1 && line.starts_with("keepalive") {
                 keep_alive = true;
             }
@@ -784,6 +798,10 @@ system/com.example.broken = {
             Scope::User,
         );
         assert_eq!(err.code, ErrorCode::NotFound);
+
+        let mismatched =
+            parse_print(running, "com.example.other", Scope::User, "gui/501").unwrap_err();
+        assert_eq!(mismatched.code, ErrorCode::NotFound);
     }
 
     #[test]

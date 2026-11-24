@@ -157,13 +157,20 @@ Get-Service | ForEach-Object { \
 }
 
 /// Builds the PowerShell command for `svc.status` using `Get-Service` and `Get-CimInstance Win32_Service`.
+///
+/// Filters to an exact (case-insensitive) service name match so wildcard expansion never picks an
+/// arbitrary service, and uses the resolved `$s.Name` for the WMI lookup.
 pub(crate) fn status_cmd(name: &str) -> CmdSpec {
     const SCRIPT: &str = "\
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); \
 $ErrorActionPreference = 'Stop'; \
 $n = $env:LEGION_SVC_NAME; \
-$s = Get-Service -Name $n -ErrorAction Stop; \
-$escaped = $n.Replace(\"'\", \"''\").Replace('\\', '\\\\'); \
+$matches = @(Get-Service -Name $n -ErrorAction Stop | Where-Object { $_.Name -ieq $n }); \
+if ($matches.Count -eq 0) { throw \"Cannot find any service with service name '$n'.\" }; \
+if ($matches.Count -gt 1) { throw \"Multiple services matched '$n'.\" }; \
+$s = $matches[0]; \
+$resolved = $s.Name; \
+$escaped = $resolved.Replace(\"'\", \"''\").Replace('\\', '\\\\'); \
 $c = $null; \
 try { $c = Get-CimInstance -ClassName Win32_Service -Filter \"Name='$escaped'\" -ErrorAction SilentlyContinue } catch {}; \
 [PSCustomObject]@{ \
@@ -190,7 +197,11 @@ pub(crate) fn control_cmd(name: &str, action: Action) -> CmdSpec {
     let script = format!(
         "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); \
          $ErrorActionPreference = 'Stop'; \
-         {cmdlet} -Name $env:LEGION_SVC_NAME -ErrorAction Stop"
+         $n = $env:LEGION_SVC_NAME; \
+         $matches = @(Get-Service -Name $n -ErrorAction Stop | Where-Object {{ $_.Name -ieq $n }}); \
+         if ($matches.Count -eq 0) {{ throw \"Cannot find any service with service name '$n'.\" }}; \
+         if ($matches.Count -gt 1) {{ throw \"Multiple services matched '$n'.\" }}; \
+         {cmdlet} -Name $matches[0].Name -ErrorAction Stop"
     );
     ps_cmd(&script).with_env("LEGION_SVC_NAME", name)
 }
@@ -558,6 +569,16 @@ pub(crate) fn classify_error(
             .with_details(json!({"stderr": trimmed}));
     }
 
+    if lower.contains("multiple services matched")
+        && let Some((_, name)) = target
+    {
+        return ErrorBody::new(
+            ErrorCode::Conflict,
+            format!("Multiple Windows services matched {name:?}."),
+        )
+        .with_hint("Give the exact service name without wildcards.");
+    }
+
     if (lower.contains("cannot find any service")
         || lower.contains("no service")
         || lower.contains("objectnotfound"))
@@ -600,6 +621,8 @@ mod tests {
         let status = status_cmd("Spooler");
         assert!(status.args[3].contains("Get-Service"));
         assert!(status.args[3].contains("Get-CimInstance"));
+        assert!(status.args[3].contains("$resolved = $s.Name"));
+        assert!(status.args[3].contains("$_.Name -ieq $n"));
         assert!(!status.args[3].contains("Spooler"));
         assert!(
             status
