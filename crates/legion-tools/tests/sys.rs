@@ -31,6 +31,9 @@ fn main() -> ExitCode {
         ("the_runtime_stays_free_while_the_system_is_read", || {
             Box::pin(the_runtime_stays_free_while_the_system_is_read())
         }),
+        ("procs_hides_secrets_in_command_lines", || {
+            Box::pin(procs_hides_secrets_in_command_lines())
+        }),
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
@@ -326,4 +329,42 @@ async fn the_runtime_stays_free_while_the_system_is_read() {
         worst < Duration::from_millis(250),
         "the runtime was held for {worst:?}"
     );
+}
+
+async fn procs_hides_secrets_in_command_lines() {
+    let fixture = Fixture::new();
+    let mut child = spawn_helper(
+        "sleep",
+        &["60", "--password", "hunter2-7d1c", "--token=s3cr3t-7d1c"],
+    );
+    let pid = child.id();
+    wait_for(Duration::from_secs(10), || alive(pid).then_some(()))
+        .await
+        .unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let name = exe.file_stem().unwrap().to_string_lossy().into_owned();
+    let listed = fixture
+        .call("sys.procs", json!({"filter": name, "limit": 500}))
+        .await
+        .unwrap();
+    let proc = listed["procs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|proc| proc["pid"] == json!(pid))
+        .cloned()
+        .unwrap_or_else(|| panic!("process {pid} is not among {listed:#}"));
+    let cmd = proc["cmd"].as_str().unwrap();
+    assert!(
+        cmd.ends_with("60 --password [redacted] --token=[redacted]"),
+        "{cmd}"
+    );
+    // A filter cannot find a process by its secret either.
+    let probed = fixture
+        .call("sys.procs", json!({"filter": "hunter2-7d1c"}))
+        .await
+        .unwrap();
+    assert_eq!(probed["total"], json!(0), "{probed:#}");
+    child.kill().unwrap();
+    child.wait().unwrap();
 }

@@ -31,7 +31,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "exec.run",
         Effect::Exec,
-        "Run a command that finishes and return its exit code and output. Give `argv` to run a program with exactly these arguments, or `cmd` to hand one line to the platform shell (sh on Linux and macOS, PowerShell on Windows). The command is stopped, with everything it started, when `timeout_s` passes or the call is cancelled; a non-zero exit or a timeout is reported in the result, not as an error. Output is streamed as stdout and stderr events while it runs and capped at `max_output` bytes per stream, keeping the start and the end. Not for anything meant to keep running, such as a server or a watcher: that belongs to job.start. A command can do anything the account can, so a role's `paths` decide only the directory it starts in (the first of them when `cwd` is absent), and a role that must stay confined should not be given exec.",
+        "Run a command that finishes and return its exit code and output. Give `argv` to run a program with exactly these arguments, or `cmd` to hand one line to the platform shell (sh on Linux and macOS, PowerShell on Windows). The command is stopped, with everything it started, when `timeout_s` passes or the call is cancelled; a non-zero exit or a timeout is reported in the result, not as an error. Output is streamed as stdout and stderr events while it runs and capped at `max_output` bytes per stream, keeping the start and the end. The command gets legion's environment (except legion's own LEGION_* settings) plus `env`, as a command typed by the account would. Not for anything meant to keep running, such as a server or a watcher: that belongs to job.start. A command can do anything the account can, so a role's `paths` decide only the directory it starts in (the first of them when `cwd` is absent), and a role that must stay confined should not be given exec.",
         run_command,
     );
 }
@@ -105,7 +105,10 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
     let (command, program) = command_of(args.cmd, args.argv)?;
     let timeout = timeout_of(args.timeout_s)?;
     let limit = max_output_of(args.max_output)?;
-    let env = env_of(args.env.unwrap_or_default())?;
+    let env = env_of(
+        args.env.unwrap_or_default(),
+        std::env::vars_os().map(|(name, _)| name),
+    )?;
     let cwd = start_dir(ctx, args.cwd).await?;
 
     // Each stream is forwarded as events until `limit` bytes have gone out, so a flood of output
@@ -313,8 +316,16 @@ fn max_output_of(bytes: Option<u64>) -> Result<usize, ErrorBody> {
     Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
 }
 
-fn env_of(env: BTreeMap<String, String>) -> Result<Vec<(OsString, OsString)>, ErrorBody> {
-    env.into_iter()
+/// The variables the command gets on top of legion's own: the caller's, and an empty value for each
+/// of legion's own `LEGION_*` settings the caller did not set, which are about this node and not
+/// for a command it runs (legion reads an empty one as unset). `inherited` names the variables
+/// legion has.
+fn env_of(
+    env: BTreeMap<String, String>,
+    inherited: impl IntoIterator<Item = OsString>,
+) -> Result<Vec<(OsString, OsString)>, ErrorBody> {
+    let mut vars = env
+        .into_iter()
         .map(|(name, value)| {
             if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
                 Err(ErrorBody::new(
@@ -326,7 +337,14 @@ fn env_of(env: BTreeMap<String, String>) -> Result<Vec<(OsString, OsString)>, Er
                 Ok((OsString::from(name), OsString::from(value)))
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, ErrorBody>>()?;
+    let own: Vec<OsString> = inherited
+        .into_iter()
+        .filter(|name| name.to_string_lossy().starts_with("LEGION_"))
+        .filter(|name| vars.iter().all(|(set, _)| set != name))
+        .collect();
+    vars.extend(own.into_iter().map(|name| (name, OsString::new())));
+    Ok(vars)
 }
 
 /// Why a command did not start, in the closed codes.
@@ -408,14 +426,29 @@ mod tests {
         assert_eq!(max_output_of(None).unwrap(), 65536);
         assert_eq!(max_output_of(Some(0)).unwrap(), 0);
         assert!(max_output_of(Some(1024 * 1024 + 1)).is_err());
-        assert!(env_of(BTreeMap::from([("A=B".into(), "x".into())])).is_err());
-        assert!(env_of(BTreeMap::from([(String::new(), "x".into())])).is_err());
+        let none = || std::iter::empty::<OsString>();
+        assert!(env_of(BTreeMap::from([("A=B".into(), "x".into())]), none()).is_err());
+        assert!(env_of(BTreeMap::from([(String::new(), "x".into())]), none()).is_err());
         assert_eq!(
-            env_of(BTreeMap::from([("A".into(), "x=y".into())]))
+            env_of(BTreeMap::from([("A".into(), "x=y".into())]), none())
                 .unwrap()
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn legion_own_settings_are_emptied_unless_the_caller_sets_them() {
+        let inherited = ["PATH", "LEGION_HOME", "LEGION_TOKEN"].map(OsString::from);
+        let vars = env_of(
+            BTreeMap::from([("LEGION_HOME".into(), "/home/me/other".into())]),
+            inherited,
+        )
+        .unwrap();
+        let vars: BTreeMap<OsString, OsString> = vars.into_iter().collect();
+        assert_eq!(vars.len(), 2, "{vars:?}");
+        assert_eq!(vars[&OsString::from("LEGION_HOME")], "/home/me/other");
+        assert_eq!(vars[&OsString::from("LEGION_TOKEN")], "");
     }
 
     #[test]

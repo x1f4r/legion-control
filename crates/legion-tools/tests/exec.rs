@@ -36,6 +36,10 @@ fn main() -> ExitCode {
         ("cancelling_the_call_stops_the_whole_tree", || {
             Box::pin(cancelling_the_call_stops_the_whole_tree())
         }),
+        (
+            "the_command_gets_the_environment_but_not_legions_own",
+            || Box::pin(the_command_gets_the_environment_but_not_legions_own()),
+        ),
         ("what_cannot_run_fails_with_a_closed_code", || {
             Box::pin(what_cannot_run_fails_with_a_closed_code())
         }),
@@ -303,6 +307,17 @@ async fn cancelling_the_call_stops_the_whole_tree() {
     for pid in family {
         assert!(!alive(pid), "process {pid} outlived the cancelled call");
     }
+}
+
+async fn the_command_gets_the_environment_but_not_legions_own() {
+    let output = std::process::Command::new(this_binary())
+        .env(HELPER, "exec-env")
+        .env("LEGION_TEST_INHERITED", "leaked")
+        .env("TEST_INHERITED", "passed")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "|passed");
 }
 
 async fn what_cannot_run_fails_with_a_closed_code() {

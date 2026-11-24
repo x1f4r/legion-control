@@ -115,6 +115,34 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
             let value = env::var(&args[0]).unwrap_or_default();
             let _ = write!(stdout, "{value}");
         }
+        // Runs a node in this process, whose environment the test set, and prints what a command
+        // exec.run starts sees of two variables: `<LEGION_TEST_INHERITED>|<TEST_INHERITED>`.
+        "exec-env" => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let seen = runtime.block_on(async {
+                let fixture = Fixture::new();
+                let ran = fixture
+                    .call(
+                        "exec.run",
+                        serde_json::json!({
+                            "argv": [this_binary(), "LEGION_TEST_INHERITED", "TEST_INHERITED"],
+                            "env": {HELPER: "env-pair"},
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                ran["stdout"].as_str().unwrap_or_default().to_owned()
+            });
+            let _ = write!(stdout, "{seen}");
+        }
+        // Prints the values of two variables, `|` between them.
+        "env-pair" => {
+            let value = |name: &str| env::var(name).unwrap_or_default();
+            let _ = write!(stdout, "{}|{}", value(&args[0]), value(&args[1]));
+        }
         // Writes `ok` and the first byte of a two-byte character it never finishes.
         "cut-short" => {
             let _ = stdout.write_all(b"ok\xc3");

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Ctx, NoArgs, Registry, ToolError};
+use legion_core::{Ctx, NoArgs, Registry, ToolError, audit};
 use legion_os::procid::{self, ProcessId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "sys.procs",
         Effect::Read,
-        "List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory in bytes and start time. `filter` keeps those whose name or command line contains it.",
+        "List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory in bytes and start time. `filter` keeps those whose name or command line contains it. Command lines are shown with secret-looking values (passwords, tokens, credentials in URLs) replaced by [redacted].",
         procs,
     );
     registry.add_fn(
@@ -245,7 +245,8 @@ pub struct Proc {
     pub ppid: Option<u32>,
     /// The program's name.
     pub name: String,
-    /// The command line, cut at 300 characters; empty where the system does not say.
+    /// The command line with secret-looking values replaced by `[redacted]`, cut at 300
+    /// characters; empty where the system does not say.
     pub cmd: String,
     /// The account it runs as, when that can be read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,12 +305,13 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
             .values()
             .filter(|process| process.thread_kind() != Some(ThreadKind::Userland))
             .map(|process| {
-                let cmd = process
+                // Redacted before the filter sees it, so a filter cannot probe for a secret.
+                let words: Vec<String> = process
                     .cmd()
                     .iter()
-                    .map(|part| part.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .collect();
+                let cmd = audit::redact_command(&words).join(" ");
                 Proc {
                     pid: process.pid().as_u32(),
                     ppid: process.parent().map(Pid::as_u32),
