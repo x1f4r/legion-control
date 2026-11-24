@@ -325,20 +325,14 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
         return;
     };
 
-    // Prefer leaving `host_keys` unset when ssh-keyscan is available so the default auto-keyscan
-    // discovery path is proven end-to-end with `legion_link::Invite::parse` and `russh` pinning.
-    let node_toml = if find_tool("ssh-keyscan").is_some() {
-        format!(
-            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\n",
-            toml_literal(&auth_keys),
-        )
-    } else {
-        format!(
-            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
-            toml_literal(&auth_keys),
-            toml_literal(&sshd.host_key_pub),
-        )
-    };
+    // Pin the throwaway sshd's ephemeral host key explicitly under `[devices] host_keys` (an
+    // unconfigured invite against a high-port throwaway sshd would rightly be refused on hosts
+    // where `/etc/ssh/ssh_host_*_key.pub` exists and does not contain the throwaway key).
+    let node_toml = format!(
+        "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+        toml_literal(&auth_keys),
+        toml_literal(&sshd.host_key_pub),
+    );
     fs::write(config_dir.join("node.toml"), node_toml).unwrap();
     fs::write(
         config_dir.join("policy.toml"),
@@ -367,13 +361,7 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
         ],
     );
     let invite_text = invite_res["invite"].as_str().unwrap();
-    if find_tool("ssh-keyscan").is_some() {
-        let source = invite_res["host_keys_source"].as_str().unwrap_or("");
-        assert!(
-            source.starts_with("ssh-keyscan"),
-            "expected ssh-keyscan source, got {source:?}"
-        );
-    }
+    assert_eq!(invite_res["host_keys_source"], json!("configured"));
 
     // 2. Parse the invite with `legion-link` and enrol a fresh DeviceKey over real SSH.
     let invite = Invite::parse(invite_text).expect("legion-link failed to parse node invite");

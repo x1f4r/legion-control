@@ -906,10 +906,10 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
 }
 
 #[test]
-fn device_invite_scans_live_sshd_host_keys_without_configured_host_keys() {
+fn device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent() {
     if !TestSshd::available() {
         eprintln!(
-            "skipping device_invite_scans_live_sshd_host_keys_without_configured_host_keys: sshd unavailable"
+            "skipping device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent: sshd unavailable"
         );
         return;
     }
@@ -922,7 +922,7 @@ fn device_invite_scans_live_sshd_host_keys_without_configured_host_keys() {
         .is_ok();
     if !has_keyscan {
         eprintln!(
-            "skipping device_invite_scans_live_sshd_host_keys_without_configured_host_keys: ssh-keyscan unavailable"
+            "skipping device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_back_when_absent: ssh-keyscan unavailable"
         );
         return;
     }
@@ -936,8 +936,7 @@ fn device_invite_scans_live_sshd_host_keys_without_configured_host_keys() {
         return;
     };
 
-    // Configure ONLY [devices] authorized_keys — intentionally omit [devices] host_keys so
-    // device.invite must discover the throwaway sshd's ephemeral host key via ssh-keyscan.
+    // Configure ONLY [devices] authorized_keys — intentionally omit [devices] host_keys.
     home.write_config(
         "node.toml",
         &format!(
@@ -950,6 +949,10 @@ fn device_invite_scans_live_sshd_host_keys_without_configured_host_keys() {
         "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.phone]\nrole = \"observer\"\n",
     );
 
+    let default_files_readable = legion_tools::device::keys::read_host_keys(&[], None)
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+
     let invite_run = home.run(&[
         "device.invite",
         "principal=phone",
@@ -957,22 +960,62 @@ fn device_invite_scans_live_sshd_host_keys_without_configured_host_keys() {
         &format!("port={}", sshd.port()),
         &format!("user={}", sshd.user()),
     ]);
-    assert_eq!(
-        invite_run.code, 0,
-        "device.invite failed: stdout={} stderr={}",
-        invite_run.stdout, invite_run.stderr
-    );
-    let invite_json = invite_run.json();
-    let source = invite_json["host_keys_source"].as_str().unwrap();
-    assert!(
-        source.starts_with("ssh-keyscan"),
-        "expected ssh-keyscan host_keys_source, got {source:?}"
-    );
-    assert_eq!(
-        invite_json["host_keys"],
-        json!([sshd.host_key_line()]),
-        "scanned host key should match throwaway sshd's ephemeral host key"
-    );
+
+    let invite_json = if default_files_readable {
+        // When default /etc/ssh/ssh_host_*_key.pub files exist on the machine, a throwaway high-port
+        // sshd presenting an unrelated ephemeral host key MUST be refused with a hint to configure
+        // `[devices] host_keys`, rather than letting ssh-keyscan override host-key files.
+        assert_eq!(
+            invite_run.code, 1,
+            "expected disjoint keyscan vs default host key files to be refused: stdout={} stderr={}",
+            invite_run.stdout, invite_run.stderr
+        );
+        let err = invite_run.json();
+        assert_eq!(err["code"], json!("denied"), "{err}");
+        assert!(
+            err["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("[devices] host_keys")),
+            "expected [devices] host_keys hint, got {err}"
+        );
+
+        // Explicitly configuring [devices] host_keys succeeds and pins the throwaway sshd's key.
+        home.write_config(
+            "node.toml",
+            &format!(
+                "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+                toml_literal(&auth_keys),
+                toml_literal(sshd.host_key_path()),
+            ),
+        );
+        let configured_run = home.run(&[
+            "device.invite",
+            "principal=phone",
+            "host=127.0.0.1",
+            &format!("port={}", sshd.port()),
+            &format!("user={}", sshd.user()),
+        ]);
+        assert_eq!(
+            configured_run.code, 0,
+            "configured device.invite failed: stdout={} stderr={}",
+            configured_run.stdout, configured_run.stderr
+        );
+        let json = configured_run.json();
+        assert_eq!(json["host_keys_source"], json!("configured"));
+        assert_eq!(json["host_keys"], json!([sshd.host_key_line()]));
+        json
+    } else {
+        // When no default host-key files are readable, ssh-keyscan alone is used.
+        assert_eq!(
+            invite_run.code, 0,
+            "device.invite failed without readable default host-key files: stdout={} stderr={}",
+            invite_run.stdout, invite_run.stderr
+        );
+        let json = invite_run.json();
+        assert_eq!(json["host_keys_source"], json!("ssh-keyscan"));
+        assert_eq!(json["host_keys"], json!([sshd.host_key_line()]));
+        json
+    };
 
     // Confirm the scanned host key works for real StrictHostKeyChecking=yes enrolment.
     let payload = InvitePayload::decode(invite_json["invite"].as_str().unwrap()).unwrap();
