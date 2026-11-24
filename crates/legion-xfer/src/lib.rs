@@ -19,7 +19,7 @@ pub mod path;
 pub mod plan;
 mod platform;
 
-pub use archive::{PackReport, UnpackReport, pack, unpack};
+pub use archive::{PackReport, UnpackReport, pack, unpack, unpack_filtered};
 pub use error::{Error, Result};
 pub use file::{GetStream, PART_SUFFIX, PutReport, get, open_get, part_path, put, resume_offset};
 pub use hash::{Hash, HashingReader, HashingWriter};

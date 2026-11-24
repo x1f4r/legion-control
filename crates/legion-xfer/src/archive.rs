@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tar::{Archive, Builder, EntryType, Header};
 
 use crate::error::{Error, Result, classify_io};
-use crate::manifest::{CaseCollision, SkippedEntry, Timestamp};
+use crate::manifest::{CaseCollision, EntryKind, SkippedEntry, Timestamp};
 use crate::path::parse_relative_path_bytes;
 use crate::platform;
 
@@ -137,13 +137,27 @@ where
     Ok(report)
 }
 
-/// Safely extracts a tar stream from `reader` into `root`.
+/// Safely extracts all entries from a tar stream in `reader` into `root`.
 ///
-/// Refuses absolute paths, `..` traversal, backslashes, drive prefixes, unsupported special file
-/// types, and any entry whose ancestor symlink would escape `root`. Regular files are streamed to
-/// sibling temporary files and renamed into place so an interrupted unpack never leaves a partial
-/// file at its destination path.
+/// Convenience wrapper over [`unpack_filtered`] that accepts every valid entry.
 pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
+    unpack_filtered(root, reader, |_, _| true)
+}
+
+/// Safely extracts a tar stream from `reader` into `root`, consulting `filter` before writing each
+/// entry.
+///
+/// Refuses absolute paths, `..` traversal, backslashes, colons, Windows reserved names, hard links,
+/// unsupported special file types, and any entry whose ancestor symlink would escape `root`. When
+/// `filter` returns `false`, the entry's bytes are drained to keep the stream aligned, nothing is
+/// written for it, and it is recorded in [`UnpackReport::skipped`]. Regular files are streamed to
+/// sibling temporary files, synced, and renamed into place so an interrupted unpack never leaves a
+/// partial file at its destination path.
+pub fn unpack_filtered<R, F>(root: &Path, reader: R, mut filter: F) -> Result<UnpackReport>
+where
+    R: Read,
+    F: FnMut(&str, EntryKind) -> bool,
+{
     fs::create_dir_all(root).map_err(|e| classify_io(root, e))?;
     let canonical_root = fs::canonicalize(root).map_err(|e| classify_io(root, e))?;
     let case_insensitive = is_case_insensitive_dir(&canonical_root)?;
@@ -181,6 +195,45 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
             });
         };
 
+        let kind = match entry_type {
+            EntryType::Regular | EntryType::Continuous => EntryKind::File,
+            EntryType::Directory => EntryKind::Dir,
+            EntryType::Symlink => EntryKind::Symlink,
+            EntryType::Link => {
+                return Err(Error::UnsafeArchiveEntry {
+                    entry: rel,
+                    reason: "hard link entries are not allowed".to_string(),
+                });
+            }
+            other => {
+                return Err(Error::UnsafeArchiveEntry {
+                    entry: rel,
+                    reason: format!("unsupported archive entry type {other:?}"),
+                });
+            }
+        };
+
+        if !filter(&rel, kind) {
+            let expected_size = entry.size();
+            let drained = io::copy(&mut entry, &mut io::sink())?;
+            if kind == EntryKind::File && drained != expected_size {
+                return Err(Error::Io {
+                    path: None,
+                    source: io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "truncated archive entry {rel:?}: expected {expected_size} bytes, got {drained}"
+                        ),
+                    ),
+                });
+            }
+            report.skipped.push(SkippedEntry {
+                path: rel,
+                reason: "skipped by entry filter".to_string(),
+            });
+            continue;
+        }
+
         // Detect case-only collisions against entries already seen in this archive.
         let lower_key = rel.to_lowercase();
         let collides_existing = seen_lower
@@ -209,8 +262,8 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
         // Strip setuid/setgid/sticky bits from untrusted archive headers.
         let safe_mode = entry.header().mode().ok().map(|m| m & 0o777);
 
-        match entry_type {
-            EntryType::Directory => {
+        match kind {
+            EntryKind::Dir => {
                 match fs::symlink_metadata(&dest) {
                     Ok(meta) if meta.file_type().is_dir() => {}
                     Ok(meta) if meta.file_type().is_symlink() => {
@@ -239,7 +292,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                 record_written(&mut written_exact, &mut written_ancestors, &rel);
                 report.dirs.push(rel);
             }
-            EntryType::Regular | EntryType::Continuous => {
+            EntryKind::File => {
                 if let Ok(meta) = fs::symlink_metadata(&dest)
                     && meta.file_type().is_dir()
                 {
@@ -285,7 +338,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                 report.files.push(rel);
                 report.bytes += written;
             }
-            EntryType::Symlink => {
+            EntryKind::Symlink => {
                 if written_exact.contains(&rel) || written_ancestors.contains(&rel) {
                     return Err(Error::UnsafeArchiveEntry {
                         entry: rel,
@@ -333,18 +386,6 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
                         reason: "symlinks are skipped on Windows".to_string(),
                     });
                 }
-            }
-            EntryType::Link => {
-                return Err(Error::UnsafeArchiveEntry {
-                    entry: rel,
-                    reason: "hard link entries are not allowed".to_string(),
-                });
-            }
-            other => {
-                return Err(Error::UnsafeArchiveEntry {
-                    entry: rel,
-                    reason: format!("unsupported archive entry type {other:?}"),
-                });
             }
         }
     }
@@ -1112,5 +1153,56 @@ mod tests {
         // Restore write permission so tempdir cleanup succeeds on Unix.
         #[cfg(unix)]
         platform::set_mode(&dst.path().join("ro"), 0o755).unwrap();
+    }
+
+    #[test]
+    fn unpack_filtered_skips_refused_entries_and_drains_bytes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(src.path().join("blocked")).unwrap();
+        fs::write(src.path().join("keep-first.txt"), b"first").unwrap();
+        fs::write(src.path().join("blocked/secret.bin"), vec![b'S'; 16 * 1024]).unwrap();
+        fs::write(src.path().join("keep-last.txt"), b"last").unwrap();
+
+        let mut tar_bytes = Vec::new();
+        pack(
+            src.path(),
+            &[
+                "keep-first.txt",
+                "blocked",
+                "blocked/secret.bin",
+                "keep-last.txt",
+            ],
+            &mut tar_bytes,
+        )
+        .unwrap();
+
+        let report = unpack_filtered(dst.path(), Cursor::new(&tar_bytes), |path, kind| {
+            !(path == "blocked" || path.starts_with("blocked/") || kind == EntryKind::Symlink)
+        })
+        .unwrap();
+
+        assert_eq!(report.files, vec!["keep-first.txt", "keep-last.txt"]);
+        assert!(report.dirs.is_empty());
+        assert_eq!(
+            report
+                .skipped
+                .iter()
+                .map(|s| s.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["blocked", "blocked/secret.bin"]
+        );
+        assert_eq!(
+            fs::read(dst.path().join("keep-first.txt")).unwrap(),
+            b"first"
+        );
+        assert_eq!(fs::read(dst.path().join("keep-last.txt")).unwrap(), b"last");
+        assert!(!dst.path().join("blocked").exists());
+
+        // Unsafe entries are still rejected even if the filter would refuse them.
+        let hostile = build_raw_tar(&[("../escape.txt", EntryType::Regular, b"nope", None)]);
+        let err = unpack_filtered(dst.path(), Cursor::new(hostile), |_, _| false).unwrap_err();
+        assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
     }
 }
