@@ -41,7 +41,17 @@ function normalizeError(err) {
   };
 }
 
+function randomCallPrefix() {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Math.random().toString(16).slice(2, 10) + Date.now().toString(16);
+}
+
 export function createAppLink() {
+  const callPrefix = randomCallPrefix();
   let nextCallId = 1;
   let readySent = false;
 
@@ -118,7 +128,7 @@ export function createAppLink() {
 
   async function call(tool, args = {}, options = {}) {
     const { on, onEvent, signal } = options || {};
-    const id = `c${nextCallId++}`;
+    const id = `${callPrefix}-${nextCallId++}`;
     const core = tauriCore();
 
     const channel = core && typeof core.Channel === 'function' ? new core.Channel() : null;
