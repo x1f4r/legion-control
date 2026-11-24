@@ -4,9 +4,11 @@ import { html, render, useCallback, useEffect, useMemo, useRef, useState } from 
 import { Icon, IconSprite } from './icons.js';
 import { findActionById } from './lib/actions.js';
 import {
+  describeDryRunSummary,
   formatMachineDetailSubtitle,
   formatMachinesHeaderSubtitle,
   friendlyJobName,
+  plainRefusalParts,
 } from './lib/activity.js';
 import { createCache } from './lib/cache.js';
 import {
@@ -70,9 +72,12 @@ function safeLocalStorage() {
   }
 }
 
+const WAKE_TTL_MS = 120_000;
+
 function ConfirmSheet({ request, technical, onClose }) {
   const [dryResult, setDryResult] = useState(null);
   const [dryError, setDryError] = useState(null);
+  const [realError, setRealError] = useState(null);
   const [busy, setBusy] = useState(false);
 
   async function runDry() {
@@ -91,9 +96,12 @@ function ConfirmSheet({ request, technical, onClose }) {
 
   async function runReal() {
     setBusy(true);
+    setRealError(null);
     try {
       await request.onConfirm();
       onClose();
+    } catch (err) {
+      setRealError(err);
     } finally {
       setBusy(false);
     }
@@ -104,6 +112,10 @@ function ConfirmSheet({ request, technical, onClose }) {
     : Array.isArray(dryResult?.would_send)
       ? dryResult.would_send.map((addr) => `WoL packet -> ${addr}`)
       : [];
+  const refusalParts = dryResult?.would_refuse ? plainRefusalParts(dryResult.would_refuse) : null;
+  const plainDrySummary = dryResult
+    ? describeDryRunSummary(request.tool, request.targetName || request.target, request.args)
+    : '';
 
   return html`
     <${Sheet} title=${request.title} onClose=${onClose}>
@@ -130,19 +142,57 @@ function ConfirmSheet({ request, technical, onClose }) {
         : null}
 
       ${dryError ? html`<${Notice} error=${dryError} />` : null}
+      ${realError ? html`<${Notice} error=${realError} />` : null}
 
       ${dryResult
         ? html`
             <div class="spaced">
               ${dryResult.would_refuse
-                ? html`<${Notice} error=${dryResult.would_refuse} />`
+                ? technical
+                  ? html`
+                      <div class="notice neutral">
+                        <strong>It would refuse right now</strong>
+                        <span>${dryResult.would_refuse.message || String(dryResult.would_refuse)}</span>
+                        ${dryResult.would_refuse.hint
+                          ? html`<span class="hint">${dryResult.would_refuse.hint}</span>`
+                          : null}
+                      </div>
+                    `
+                  : html`
+                      <div class="notice neutral">
+                        <strong>It would refuse right now: ${refusalParts.first}</strong>
+                        ${refusalParts.detailMessage || refusalParts.detailHint
+                          ? html`
+                              <details class="more">
+                                <summary>More</summary>
+                                ${refusalParts.detailMessage
+                                  ? html`<p>${refusalParts.detailMessage}</p>`
+                                  : null}
+                                ${refusalParts.detailHint
+                                  ? html`<p>${refusalParts.detailHint}</p>`
+                                  : null}
+                              </details>
+                            `
+                          : null}
+                      </div>
+                    `
+                : !technical
+                  ? html`
+                      <div class="notice neutral">
+                        <strong>${plainDrySummary}</strong>
+                      </div>
+                    `
+                  : null}
+              ${technical
+                ? commands.length > 0
+                  ? html`
+                      <p class="label">Dry run commands</p>
+                      <pre class="out wrap">${commands.join('\n')}</pre>
+                    `
+                  : !dryResult.would_refuse
+                    ? html`<pre class="out wrap">${JSON.stringify(dryResult, null, 2)}</pre>`
+                    : null
                 : null}
-              ${commands.length > 0
-                ? html`
-                    <p class="label">Dry run commands</p>
-                    <pre class="out wrap">${commands.join('\n')}</pre>
-                  `
-                : html`<pre class="out wrap">${JSON.stringify(dryResult, null, 2)}</pre>`}
             </div>
           `
         : null}
@@ -207,6 +257,7 @@ function App() {
     error: null,
   });
   const [pairingOpen, setPairingOpen] = useState(false);
+  const [wakeSentAt, setWakeSentAt] = useState({});
   const sheetHistoryRef = useRef(false);
 
   const nodeInfo = linkState?.nodes?.[0] || null;
@@ -509,12 +560,67 @@ function App() {
     [],
   );
 
+  const markWakeSent = useCallback((name) => {
+    if (!name) return;
+    setWakeSentAt((prev) => ({ ...prev, [name]: Date.now() }));
+  }, []);
+
+  useEffect(() => {
+    const entries = Object.entries(wakeSentAt);
+    if (entries.length === 0) return;
+    const now = Date.now();
+    const reachableNames = new Set(
+      (snapshot?.machines || []).filter((m) => m.reachable).map((m) => m.name),
+    );
+    let changed = false;
+    const next = {};
+    let soonestMs = Infinity;
+    for (const [name, ts] of entries) {
+      const remaining = WAKE_TTL_MS - (now - ts);
+      if (reachableNames.has(name) || remaining <= 0) {
+        changed = true;
+      } else {
+        next[name] = ts;
+        if (remaining < soonestMs) soonestMs = remaining;
+      }
+    }
+    if (changed) {
+      setWakeSentAt(next);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      const t = Date.now();
+      setWakeSentAt((prev) => {
+        let dirty = false;
+        const filtered = {};
+        for (const [name, ts] of Object.entries(prev)) {
+          if (t - ts >= WAKE_TTL_MS) dirty = true;
+          else filtered[name] = ts;
+        }
+        return dirty ? filtered : prev;
+      });
+    }, Math.max(250, soonestMs + 50));
+    return () => window.clearTimeout(timer);
+  }, [wakeSentAt, snapshot]);
+
+  const wakePendingSet = useMemo(() => {
+    const now = Date.now();
+    const out = new Set();
+    for (const [name, ts] of Object.entries(wakeSentAt)) {
+      if (now - ts < WAKE_TTL_MS) out.add(name);
+    }
+    return out;
+  }, [wakeSentAt]);
+
   const onWakeMachine = useCallback(
     (machine) => {
-      const copy = describePowerConfirm('power.wake', machine.name, { machine: machine.name });
+      const args = { machine: machine.name };
+      const copy = describePowerConfirm('power.wake', machine.name, args);
       openConfirm({
         title: copy.title,
         summary: copy.summary,
+        targetName: machine.name,
+        args,
         tool: 'power.wake',
         effect: 'power',
         confirmLabel: copy.confirmLabel,
@@ -524,11 +630,12 @@ function App() {
         },
         async onConfirm() {
           await link.call('power.wake', { machine: machine.name });
+          markWakeSent(machine.name);
           refreshFleet(nodeInfo, { forceOffline: true });
         },
       });
     },
-    [link, openConfirm, refreshFleet, nodeInfo],
+    [link, openConfirm, markWakeSent, refreshFleet, nodeInfo],
   );
 
   const machines = snapshot?.machines || [];
@@ -743,7 +850,13 @@ function App() {
           <span class=${dotClass} aria-hidden="true"></span>
           <h1>
             ${route.machine}
-            ${m ? html`<small>${formatMachineDetailSubtitle(m)}</small>` : null}
+            ${m
+              ? html`<small>
+                  ${formatMachineDetailSubtitle(m, Date.now(), {
+                    wakePending: wakePendingSet.has(m.name),
+                  })}
+                </small>`
+              : null}
           </h1>
         </header>
       `;
@@ -1031,7 +1144,9 @@ function App() {
                           tools=${tools}
                           allowedSet=${allowedSet}
                           settings=${settings}
+                          wakePendingSet=${wakePendingSet}
                           onWakeMachine=${onWakeMachine}
+                          onWakeSent=${markWakeSent}
                           onRequestConfirm=${openConfirm}
                           onRefresh=${() => refreshFleet(nodeInfo, { forceOffline: true })}
                           commandRuns=${{ byMachine: commandRunsByMachine, draft: commandDraft }}
@@ -1063,6 +1178,7 @@ function App() {
                               settings=${settings}
                               wide=${wide}
                               query=${actionsQuery}
+                              onWakeSent=${markWakeSent}
                               onRequestConfirm=${openConfirm}
                               onRefreshFleet=${() => refreshFleet(nodeInfo)}
                             />

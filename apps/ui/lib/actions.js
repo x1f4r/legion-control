@@ -187,7 +187,10 @@ export function buildActionGroups({ tools = [], allowedSet = null, whoami = null
   const out = [];
   for (const group of ACTION_GROUPS) {
     const items = byGroup.get(group) || [];
-    if (items.length > 0) out.push({ group, items });
+    // Hide groups where this device's role allows nothing at all.
+    if (items.length > 0 && items.some((item) => item.allowed)) {
+      out.push({ group, items });
+    }
   }
   return out;
 }

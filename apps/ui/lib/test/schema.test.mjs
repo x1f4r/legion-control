@@ -185,6 +185,7 @@ test('describePowerConfirm generates plain wording from tool, target, jobs, and 
 
   const wake = describePowerConfirm('power.wake', 'tower', { machine: 'laptop' }, [], []);
   assert.equal(wake.title, 'Wake laptop?');
+  assert.equal(wake.summary, 'Send a wake signal to laptop.');
   assert.equal(wake.confirmLabel, 'Wake');
 
   const sw = describePowerConfirm('power.switch', 'tower', { machine: 'tower', into: 'windows' }, [], []);

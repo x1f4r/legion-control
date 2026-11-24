@@ -203,6 +203,15 @@ async function dispatchSwipe(page, selector, { startX, startY, endX, endY }) {
   await page.waitForTimeout(120);
 }
 
+const CATALOG_TOOL_RE =
+  /\b(?:power|fs|exec|job|svc|proj|fleet|sys|meta|device|token|config|net|env)\.[a-z_]+\b/g;
+
+async function assertNoToolNames(page, label) {
+  const text = await page.locator('body').innerText();
+  const matches = [...new Set(text.match(CATALOG_TOOL_RE) || [])];
+  assert.deepEqual(matches, [], `Tool name(s) leaked in plain mode (${label}): ${matches.join(', ')}\n---\n${text}`);
+}
+
 async function maybeShot(page, name) {
   if (!SHOTS_DIR) return;
   fs.mkdirSync(SHOTS_DIR, { recursive: true });
@@ -291,14 +300,33 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await piCard.click();
     assert.equal(await page.locator('nav.nav.parts a').count(), 4);
     await page.getByText('agents: busy: 1239887 worker').waitFor({ timeout: 5_000 });
+    await assertNoToolNames(page, 'real phone pi overview');
     await page.locator('nav.nav.parts a', { hasText: 'Power' }).click();
     await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
     await page.getByText('agents: busy: 1239887 worker').waitFor({ timeout: 5_000 });
+    await assertNoToolNames(page, 'real phone pi power');
+
+    // Dry-run refusal on busy pi in plain mode: neutral notice, plain sentence, collapsed "More", no commands.
+    await page.getByRole('button', { name: 'Sleep', exact: true }).click();
+    const piDialog = page.getByRole('dialog');
+    await piDialog.waitFor();
+    await piDialog.getByRole('button', { name: 'Try it (dry run)' }).click();
+    await piDialog.locator('.notice.neutral', { hasText: 'It would refuse right now:' }).waitFor({ timeout: 10_000 });
+    assert.equal(await piDialog.locator('.notice.bad').count(), 0, 'Dry-run refusal must use neutral notice, not red error');
+    assert.equal(await piDialog.locator('pre.out').count(), 0, 'Plain dry-run refusal must not show raw commands');
+    const moreDetails = piDialog.locator('details.more');
+    await moreDetails.waitFor();
+    assert.equal(await moreDetails.getAttribute('open'), null, 'Dry-run refusal details should start collapsed');
+    await assertNoToolNames(page, 'real phone pi dry-run refusal sheet');
+    await maybeShot(page, 'real-phone-dark-power-refusal-plain');
+    await piDialog.getByRole('button', { name: 'Cancel' }).click();
+    await piDialog.waitFor({ state: 'hidden' });
 
     // Back to Machines and open tower.
     await page.locator('header.top button[aria-label="Back"]').click();
     await page.locator('a.machine', { hasText: 'tower' }).click();
     await page.getByText('Health').waitFor();
+    await assertNoToolNames(page, 'real phone tower overview');
     await maybeShot(page, 'real-phone-dark-machine-overview');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-machine-overview');
@@ -310,18 +338,36 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await page.locator('button.row', { hasText: 'docs/' }).click();
     await page.locator('button.row', { hasText: 'hello.txt' }).click();
     await page.locator('pre.out').getByText('Hello from Legion real server preview.').waitFor();
+    await assertNoToolNames(page, 'real phone tower files');
     await maybeShot(page, 'real-phone-dark-machine-files');
 
-    // Power part.
+    // Power part: plain dry run shows one plain sentence, no "Dry run commands" or raw commands.
     await page.locator('nav.nav.parts a', { hasText: 'Power' }).click();
     await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
     await page.getByRole('button', { name: 'Sleep', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Restart', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Shut down', exact: true }).waitFor();
+    await assertNoToolNames(page, 'real phone tower power');
     await maybeShot(page, 'real-phone-dark-machine-power');
+
+    await page.getByRole('button', { name: 'Sleep', exact: true }).click();
+    const towerPlainDialog = page.getByRole('dialog');
+    await towerPlainDialog.waitFor();
+    await towerPlainDialog.getByRole('button', { name: 'Try it (dry run)' }).click();
+    await towerPlainDialog
+      .locator('.notice.neutral', { hasText: /tower would go to sleep\.|It would refuse right now:/ })
+      .waitFor({ timeout: 10_000 });
+    assert.equal(await towerPlainDialog.locator('.notice.bad').count(), 0, 'Plain dry run must not use red error style');
+    assert.equal(await towerPlainDialog.locator('pre.out').count(), 0, 'Plain dry run must not show raw commands');
+    assert.ok(!(await towerPlainDialog.innerText()).includes('Dry run commands'));
+    await assertNoToolNames(page, 'real phone tower plain dry-run sheet');
+    await maybeShot(page, 'real-phone-dark-power-sheet-plain');
+    await towerPlainDialog.getByRole('button', { name: 'Cancel' }).click();
+    await towerPlainDialog.waitFor({ state: 'hidden' });
 
     // More -> Command (docked at bottom with "Keep running after I leave" + "Name it").
     await page.locator('nav.nav.parts a', { hasText: 'More' }).click();
+    await assertNoToolNames(page, 'real phone tower more');
     await page.locator('a.row', { hasText: 'Command' }).click();
     await page.locator('.dock input[aria-label="Command"]').waitFor();
     await page.locator('.dock input[aria-label="Command"]').fill('echo hello-stream-one; sleep 0.15; echo hello-stream-two');
@@ -366,6 +412,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     assert.ok(!plainActivityText.includes('secret-shell-cmd-token'), `Raw command leaked in plain Activity: ${plainActivityText}`);
     assert.ok(!plainActivityText.includes('job-live-line'), `Raw command leaked in plain Activity: ${plainActivityText}`);
     assert.ok(!/\bexit \d+\b/i.test(plainActivityText), `Exit code leaked in plain Activity: ${plainActivityText}`);
+    await assertNoToolNames(page, 'real phone plain activity');
     await maybeShot(page, 'real-phone-dark-activity-plain');
 
     // Actions screen: tiles + bottom-docked search, NO All tools while Technical details is off.
@@ -373,6 +420,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await page.locator('.dock input[aria-label="Find something to do"]').waitFor();
     await page.locator('.tile[href="#/actions/restart"]').waitFor();
     assert.equal(await page.locator('a.row', { hasText: 'All tools' }).count(), 0);
+    await assertNoToolNames(page, 'real phone plain actions');
     await maybeShot(page, 'real-phone-dark-actions');
 
     // Settings via top-right gear: turn Technical details on, inspect Appearance live, check This browser.
@@ -482,6 +530,8 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
 
     await wide.locator('nav.nav a.last', { hasText: 'Settings' }).click();
     await wide.getByText('Forget this browser').waitFor();
+    const paneWidth = await wide.locator('.settings-pane').evaluate((el) => el.getBoundingClientRect().width);
+    assert.ok(paneWidth <= 561, `Expected wide Settings reading column <= 560px, got ${paneWidth}`);
     await maybeShot(wide, 'real-wide-dark-settings');
 
     await wideCtx.close();
@@ -515,12 +565,47 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       await nasRow.getByText('Off').waitFor();
       assert.equal(await nasRow.getByRole('button', { name: 'Wake' }).count(), 0);
       await setTheme(p, 'dark');
+      await assertNoToolNames(p, `mock ${label} machines`);
       await maybeShot(p, `mock-${label}-dark-machines`);
       if (SHOTS_DIR) {
         await setTheme(p, 'light');
         await maybeShot(p, `mock-${label}-light-machines`);
         await setTheme(p, 'dark');
       }
+
+      // Offline Wake button opens plain confirm sheet; confirming shows pending-wake feedback.
+      await laptopRow.getByRole('button', { name: 'Wake' }).click();
+      const wakeDialog = p.getByRole('dialog');
+      await wakeDialog.waitFor();
+      await wakeDialog.getByRole('heading', { name: 'Wake laptop?' }).waitFor();
+      await wakeDialog.getByText('Send a wake signal to laptop.').waitFor();
+      await wakeDialog.getByRole('button', { name: 'Try it (dry run)' }).click();
+      await wakeDialog.locator('.notice.neutral', { hasText: 'A wake signal would be sent to laptop.' }).waitFor();
+      assert.equal(await wakeDialog.locator('pre.out').count(), 0, 'Plain Wake dry run must not show raw WoL details');
+      await assertNoToolNames(p, `mock ${label} wake confirm sheet`);
+      await wakeDialog.getByRole('button', { name: 'Wake', exact: true }).click();
+      await wakeDialog.waitFor({ state: 'hidden' });
+      await p.locator('.machine.off', { hasText: 'laptop' }).getByText('Wake sent · waiting for it to answer').waitFor();
+      assert.equal(
+        await p.locator('.machine.off', { hasText: 'laptop' }).getByRole('button', { name: 'Wake' }).count(),
+        0,
+        'Wake button should hide while waiting for machine to answer',
+      );
+      await maybeShot(p, `mock-${label}-dark-wake-sent`);
+
+      // Mock idle machine (pi) Power dry run in plain mode: one plain sentence, no commands.
+      await p.goto(`${server.url}/?mock#/machines/pi/power`, { waitUntil: 'domcontentloaded' });
+      await p.getByRole('button', { name: 'Sleep', exact: true }).click();
+      const piSleepDialog = p.getByRole('dialog');
+      await piSleepDialog.waitFor();
+      await piSleepDialog.getByRole('button', { name: 'Try it (dry run)' }).click();
+      await piSleepDialog.locator('.notice.neutral', { hasText: 'pi would go to sleep.' }).waitFor();
+      assert.equal(await piSleepDialog.locator('pre.out').count(), 0, 'Plain dry run must not show commands');
+      assert.ok(!(await piSleepDialog.innerText()).includes('Dry run commands'));
+      await assertNoToolNames(p, `mock ${label} pi plain dry-run sheet`);
+      await maybeShot(p, `mock-${label}-dark-power-sheet-plain`);
+      await piSleepDialog.getByRole('button', { name: 'Cancel' }).click();
+      await piSleepDialog.waitFor({ state: 'hidden' });
 
       // Activity plain vs technical + row swipe to reveal Stop on running item.
       await p.goto(`${server.url}/?mock#/activity`, { waitUntil: 'domcontentloaded' });
@@ -531,6 +616,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       assert.ok(!mockPlainAct.includes('rsync -av'), `Raw command leaked: ${mockPlainAct}`);
       assert.ok(!mockPlainAct.includes('npm test'), `Raw command leaked: ${mockPlainAct}`);
       assert.ok(!/\bexit \d+\b/i.test(mockPlainAct), `Exit code leaked: ${mockPlainAct}`);
+      await assertNoToolNames(p, `mock ${label} activity plain`);
       await maybeShot(p, `mock-${label}-dark-activity-plain`);
       if (SHOTS_DIR) {
         await setTheme(p, 'light');
@@ -547,6 +633,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       // Mock Actions + Which machine?
       await p.goto(`${server.url}/?mock#/actions`, { waitUntil: 'domcontentloaded' });
       await p.locator('.tile', { hasText: 'Sleep' }).waitFor();
+      await assertNoToolNames(p, `mock ${label} actions plain`);
       await maybeShot(p, `mock-${label}-dark-actions`);
       if (SHOTS_DIR) {
         await setTheme(p, 'light');
@@ -554,19 +641,38 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
         await setTheme(p, 'dark');
       }
 
-      // Mock Connections + Let another device in (in-page SVG QR code).
+      // Mock Connections (single machine): quiet second-machine hint above "Make a connection".
+      await p.goto(`${server.url}/?mock#/settings/connections`, { waitUntil: 'domcontentloaded' });
+      await p.getByText('Pair with a second machine so this device still works when tower is off.').waitFor();
+      await assertNoToolNames(p, `mock ${label} connections single`);
+      await maybeShot(p, `mock-${label}-dark-connections-single`);
+
+      // Mock Connections (multi) + Let another device in (plain wording + square SVG QR code).
       await p.goto(`${server.url}/?mock=multi#/settings/connections`, { waitUntil: 'domcontentloaded' });
       await p.getByText('Paired machines').waitFor();
       await p.getByText('Devices that may come in').waitFor();
       await p.getByText('Pixel 10').waitFor();
+      assert.equal(await p.getByText(/Pair with a second machine so this device still works/).count(), 0);
       await maybeShot(p, `mock-${label}-dark-connections`);
 
       await p.locator('a.row', { hasText: 'Let another device in' }).click();
+      await p.getByText('Use the identity').waitFor();
+      const inviteFormText = await p.locator('main.main').innerText();
+      assert.ok(!inviteFormText.includes('policy.toml'), `Jargon leaked in plain invite screen: ${inviteFormText}`);
       await p.getByRole('button', { name: 'Make invite' }).click();
       const qrSvg = p.locator('.qr-box svg path');
       await qrSvg.waitFor();
       const qrD = await qrSvg.getAttribute('d');
       assert.ok(qrD && qrD.length > 200, 'Expected non-trivial SVG QR path');
+      const qrBoxWidth = await p.locator('.qr-box').evaluate((el) => el.getBoundingClientRect().width);
+      assert.ok(qrBoxWidth <= 320, `Expected square QR box <= 320px wide, got ${qrBoxWidth}`);
+      await p
+        .getByText(
+          'Works once, for the next 15 minutes. The device will be able to: do everything except change permissions.',
+        )
+        .waitFor();
+      assert.ok(!(await p.locator('main.main').innerText()).includes('for phone (operator)'));
+      await assertNoToolNames(p, `mock ${label} invite qr`);
       await maybeShot(p, `mock-${label}-dark-invite-qr`);
       if (SHOTS_DIR) {
         await setTheme(p, 'light');
@@ -580,10 +686,27 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       await p.locator('.state', { hasText: 'exit 1' }).first().waitFor();
       await maybeShot(p, `mock-${label}-dark-activity-tech`);
 
-      // Mock limited role: unavailable tiles show plain reasons.
+      // Empty Activity state.
+      await p.goto(`${server.url}/?mock=empty#/activity`, { waitUntil: 'domcontentloaded' });
+      await p
+        .getByText('Nothing has run yet. Things you start here or on a machine appear in this list.')
+        .waitFor();
+      await assertNoToolNames(p, `mock ${label} activity empty`);
+      await maybeShot(p, `mock-${label}-dark-activity-empty`);
+
+      // Mock limited role: groups with zero allowed actions (Power, Run) are hidden; remaining groups show cleanly.
       await p.goto(`${server.url}/?mock=limited#/actions`, { waitUntil: 'domcontentloaded' });
-      await p.locator('.tile.na', { hasText: 'Power controls are not allowed on this device' }).first().waitFor();
+      await p.locator('.tile', { hasText: 'Browse' }).waitFor();
+      assert.equal(await p.locator('.label', { hasText: /^Power$/i }).count(), 0, 'Power group should be hidden when none allowed');
+      assert.equal(await p.locator('.label', { hasText: /^Run$/i }).count(), 0, 'Run group should be hidden when none allowed');
+      await assertNoToolNames(p, `mock ${label} actions limited`);
       await maybeShot(p, `mock-${label}-dark-actions-limited`);
+
+      // Mock role with zero actions allowed anywhere: one calm sentence.
+      await p.goto(`${server.url}/?mock=none#/actions`, { waitUntil: 'domcontentloaded' });
+      await p.getByText('This device is not allowed to run actions here.').waitFor();
+      await assertNoToolNames(p, `mock ${label} actions empty`);
+      await maybeShot(p, `mock-${label}-dark-actions-empty`);
 
       // Mock pairing start screen.
       await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });

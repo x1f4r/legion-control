@@ -16,6 +16,7 @@ function ActionDetail({
   allowedSet,
   technical,
   onRequestConfirm,
+  onWakeSent,
   onRefreshFleet,
 }) {
   const [pickedMachine, setPickedMachine] = useState(null);
@@ -99,6 +100,8 @@ function ActionDetail({
                           title: copy.title,
                           summary: copy.summary,
                           tool: 'power.wake',
+                          targetName: m.name,
+                          args: { machine: m.name },
                           effect: 'power',
                           confirmLabel: copy.confirmLabel,
                           canDryRun: true,
@@ -109,7 +112,8 @@ function ActionDetail({
                             setError(null);
                             try {
                               await link.call('power.wake', { machine: m.name });
-                              setResultMsg(`Sent wake signal to ${m.name}.`);
+                              if (onWakeSent) onWakeSent(m.name);
+                              setResultMsg(`Wake sent to ${m.name} — waiting for it to answer.`);
                               if (onRefreshFleet) onRefreshFleet();
                             } catch (err) {
                               setError(err);
@@ -169,6 +173,8 @@ function ActionDetail({
                             summary: copy.summary,
                             jobs: liveJobs,
                             tool: action.tool,
+                            targetName: m.name,
+                            args: {},
                             effect: 'power',
                             confirmLabel: copy.confirmLabel,
                             canDryRun: true,
@@ -260,6 +266,7 @@ export function ActionsView({
   wide,
   query,
   onRequestConfirm,
+  onWakeSent,
   onRefreshFleet,
 }) {
   const technical = Boolean(settings?.technical);
@@ -304,6 +311,7 @@ export function ActionsView({
         allowedSet=${allowedSet}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
+        onWakeSent=${onWakeSent}
         onRefreshFleet=${onRefreshFleet}
       />
     `;
@@ -312,7 +320,9 @@ export function ActionsView({
   return html`
     <div>
       ${groups.length === 0
-        ? html`<div class="empty">Nothing matches "${query}".</div>`
+        ? query && query.trim()
+          ? html`<div class="empty">Nothing matches "${query.trim()}".</div>`
+          : html`<div class="empty">This device is not allowed to run actions here.</div>`
         : groups.map(
             (group) => html`
               <div key=${group.group}>

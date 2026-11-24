@@ -42,7 +42,7 @@ function OnlineMachineCard({ machine, selected, showMetrics }) {
   `;
 }
 
-function OfflineMachineRow({ machine, selected, canWake, onWake }) {
+function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake }) {
   const isAsking = machine.status === 'asking' || machine.asking;
   const cls = [
     'machine',
@@ -52,14 +52,14 @@ function OfflineMachineRow({ machine, selected, canWake, onWake }) {
     .filter(Boolean)
     .join(' ');
   const href = routeHref({ section: 'machines', machine: machine.name, tab: 'overview' });
-  const showWake = !isAsking && machine.canWake && canWake;
+  const showWake = !isAsking && !wakePending && machine.canWake && canWake;
 
   return html`
     <div class=${cls}>
       <a class="machine-link" href=${href} aria-current=${selected ? 'true' : undefined}>
         <span class=${isAsking ? 'dot asking' : 'dot off'} aria-hidden="true"></span>
         <strong>${machine.name}</strong>
-        <span>${formatMachineStatusPhrase(machine)}</span>
+        <span>${formatMachineStatusPhrase(machine, Date.now(), { wakePending })}</span>
       </a>
       ${showWake
         ? html`
@@ -91,7 +91,9 @@ export function MachinesView({
   tools,
   allowedSet,
   settings,
+  wakePendingSet,
   onWakeMachine,
+  onWakeSent,
   onRequestConfirm,
   onRefresh,
   commandRuns,
@@ -167,6 +169,7 @@ export function MachinesView({
                           machine=${m}
                           selected=${wide && m.name === selectedName}
                           canWake=${canWake}
+                          wakePending=${Boolean(wakePendingSet?.has(m.name))}
                           onWake=${onWakeMachine}
                         />
                       `,
@@ -195,7 +198,9 @@ export function MachinesView({
                   tools=${tools}
                   allowedSet=${allowedSet}
                   settings=${settings}
+                  wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
                   onWakeMachine=${onWakeMachine}
+                  onWakeSent=${onWakeSent}
                   onRequestConfirm=${onRequestConfirm}
                   onRefreshFleet=${onRefresh}
                   commandRuns=${commandRuns}
@@ -220,7 +225,9 @@ export function MachinesView({
         tools=${tools}
         allowedSet=${allowedSet}
         settings=${settings}
+        wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
         onWakeMachine=${onWakeMachine}
+        onWakeSent=${onWakeSent}
         onRequestConfirm=${onRequestConfirm}
         onRefreshFleet=${onRefresh}
         commandRuns=${commandRuns}

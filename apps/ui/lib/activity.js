@@ -1,6 +1,6 @@
 // Plain-language formatting for activity rows, machine status phrases, and role summaries.
 
-import { busyReasonLabel, formatDuration, formatDurationMs, formatRelativeTime } from './format.js';
+import { busyReasonLabel, formatDuration, formatDurationMs, formatRelativeTime, splitFirstSentence } from './format.js';
 
 const SHELL_NAMES = new Set([
   'sh',
@@ -276,12 +276,13 @@ export function groupActivity(items, nowMs = Date.now()) {
 /**
  * Plain-word status phrase for a machine card header ("Idle", "Busy · 2 things running", "Busy · agents").
  */
-export function formatMachineStatusPhrase(machine, nowMs = Date.now()) {
+export function formatMachineStatusPhrase(machine, nowMs = Date.now(), { wakePending = false } = {}) {
   if (!machine) return '';
   if (machine.status === 'asking' || machine.asking) {
     return 'Checking…';
   }
   if (!machine.reachable) {
+    if (wakePending) return 'Wake sent · waiting for it to answer';
     if (machine.lastSeenAt) {
       const seen = formatRelativeTime(machine.lastSeenAt, nowMs);
       if (seen) return `Last on ${seen}`;
@@ -303,10 +304,11 @@ export function formatMachineStatusPhrase(machine, nowMs = Date.now()) {
 /**
  * Plain-word subtitle for a machine's own detail header ("Busy · on for 11 hours", "Idle · on for 41 days").
  */
-export function formatMachineDetailSubtitle(machine, nowMs = Date.now()) {
+export function formatMachineDetailSubtitle(machine, nowMs = Date.now(), { wakePending = false } = {}) {
   if (!machine) return '';
   if (machine.status === 'asking' || machine.asking) return 'Checking…';
   if (!machine.reachable) {
+    if (wakePending) return 'Wake sent · waiting for it to answer';
     if (machine.lastSeenAt) {
       const seen = formatRelativeTime(machine.lastSeenAt, nowMs);
       if (seen) return `Off · last on ${seen}`;
@@ -415,4 +417,75 @@ export function formatCommandMeta(entry, technical = false) {
             ? 'Stopped'
             : 'Finished';
   return [word, dur].filter(Boolean).join(' · ');
+}
+
+/**
+ * One plain-English sentence describing what a dry-run power or destructive action would do.
+ */
+export function describeDryRunSummary(tool, target, args = {}) {
+  const name = args?.machine || target || 'this machine';
+  const into = args?.into ? capitalize(args.into) : '';
+  switch (tool) {
+    case 'power.sleep':
+      return `${name} would go to sleep.`;
+    case 'power.restart':
+      return into ? `${name} would restart into ${into}.` : `${name} would restart.`;
+    case 'power.shutdown':
+      return `${name} would switch off.`;
+    case 'power.wake':
+      return `A wake signal would be sent to ${name}.`;
+    case 'power.switch':
+      return into ? `${name} would switch to ${into}.` : `${name} would switch systems.`;
+    case 'power.cancel':
+      return `Any pending power action on ${name} would be cancelled.`;
+    default:
+      return `Ready to run on ${name}.`;
+  }
+}
+
+/**
+ * Splits a refusal (such as `dryResult.would_refuse`) into a plain first sentence and full details
+ * suitable for a collapsed "More" disclosure.
+ */
+export function plainRefusalParts(refusal) {
+  if (!refusal) return { first: '', detailMessage: '', detailHint: '' };
+  const rawMessage = typeof refusal === 'string' ? refusal : String(refusal.message || '');
+  const rawHint = typeof refusal === 'object' && refusal.hint ? String(refusal.hint) : '';
+  const { first, rest } = splitFirstSentence(rawMessage);
+
+  let plainFirst = first;
+  if (/node\.toml\s+does not say what keeps this machine busy/i.test(rawMessage)) {
+    plainFirst = 'this machine does not have a busy check set up yet.';
+  } else {
+    plainFirst = first.replace(/^Refused to [^:]+:\s*/i, '').trim() || first;
+  }
+
+  const hasExtra = Boolean(rest || rawHint || plainFirst !== rawMessage.trim());
+  return {
+    first: plainFirst,
+    detailMessage: hasExtra ? rawMessage.trim() : '',
+    detailHint: rawHint.trim(),
+  };
+}
+
+/**
+ * Plain-English description of what a named role is allowed to do (for invite confirmations).
+ */
+export function describeRolePlain(role) {
+  const lower = String(role || '').trim().toLowerCase();
+  if (lower === 'owner') return 'do everything on this machine';
+  if (lower === 'operator') return 'do everything except change permissions';
+  if (lower === 'editor') return 'look at machines and edit files';
+  if (lower === 'observer') return 'look only';
+  return 'use this machine with that identity';
+}
+
+export function formatInviteValidity(minutes) {
+  const m = Number(minutes);
+  if (!Number.isFinite(m) || m <= 0) return '15 minutes';
+  if (m === 60) return '1 hour';
+  if (m === 1440) return '1 day';
+  if (m % 1440 === 0) return `${m / 1440} days`;
+  if (m % 60 === 0) return `${m / 60} hours`;
+  return m === 1 ? '1 minute' : `${m} minutes`;
 }

@@ -343,7 +343,7 @@ export function describePowerConfirm(toolName, target, args = {}, runningJobs = 
         title: `Wake ${machine}?`,
         confirmLabel: 'Wake',
         buttonLabel: `Wake ${machine}`,
-        summary: `Send Wake-on-LAN packets for ${machine}.`,
+        summary: `Send a wake signal to ${machine}.`,
       };
     case 'power.switch':
       return {

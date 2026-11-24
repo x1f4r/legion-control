@@ -3,6 +3,7 @@
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { CopyButton, Meter, Notice } from './common.js';
 import { ActivityDetail, ActivityGroups, ActivityRow } from './activity.js';
+import { plainDenyReason } from '../lib/actions.js';
 import {
   formatCommandMeta,
   formatFriendlyUptime,
@@ -69,25 +70,28 @@ function splitCrumbs(fullPath) {
 
 // ── Overview tab ─────────────────────────────────────────────────────────────────────────────
 
-function OverviewTab({ machine, allowedSet, technical, onWake, onStopJob }) {
+function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onStopJob }) {
   if (machine.status === 'asking' || machine.asking) {
     return html`<div class="empty">Checking ${machine.name}…</div>`;
   }
 
   if (!machine.reachable) {
-    const sub = formatMachineDetailSubtitle(machine);
-    const canWake = machine.canWake && allowedSet?.has('power.wake');
+    const sub = formatMachineDetailSubtitle(machine, Date.now(), { wakePending });
+    const canWake = !wakePending && machine.canWake && allowedSet?.has('power.wake');
     return html`
       <div>
         <div class="notice">
-          <strong>${machine.name} is off.</strong>
+          <strong>${wakePending ? `${machine.name} is waking up.` : `${machine.name} is off.`}</strong>
           <span>
-            ${sub !== 'Off' ? `${sub}. ` : ''}
-            ${canWake
-              ? 'You can switch it on from here.'
-              : machine.canWake
-                ? 'This device is not allowed to wake machines.'
-                : 'Wake-on-LAN is not set up for this machine.'}
+            ${wakePending
+              ? sub
+              : `${sub !== 'Off' ? `${sub}. ` : ''}${
+                  canWake
+                    ? 'You can switch it on from here.'
+                    : machine.canWake
+                      ? 'This device is not allowed to wake machines.'
+                      : 'Wake-on-LAN is not set up for this machine.'
+                }`}
           </span>
         </div>
         ${canWake
@@ -441,7 +445,9 @@ function CommandStream({ machine, runs, technical, allowedSet, nodeInfo, onOpenJ
     return html`
       <${Notice}
         title="Running commands is not allowed."
-        hint=${unavailableReason({ name: 'exec.run', effect: 'exec' }, nodeInfo?.whoami)}
+        hint=${technical
+          ? unavailableReason({ name: 'exec.run', effect: 'exec' }, nodeInfo?.whoami)
+          : plainDenyReason('exec.run', nodeInfo?.whoami)}
       />
     `;
   }
@@ -1167,6 +1173,8 @@ function PowerTab({
   link,
   allowedSet,
   technical,
+  wakePending,
+  onWakeSent,
   onRequestConfirm,
   onRefreshFleet,
 }) {
@@ -1207,6 +1215,8 @@ function PowerTab({
       summary: copy.summary,
       jobs: tool === 'power.wake' ? [] : liveJobs,
       target: target || nodeInfo?.node,
+      targetName: machine.name,
+      args,
       tool,
       effect: 'power',
       confirmLabel: copy.confirmLabel,
@@ -1221,6 +1231,9 @@ function PowerTab({
         try {
           const out = await link.call(tool, { ...args, dry_run: false }, { on: target });
           setResult(out);
+          if (tool === 'power.wake' && onWakeSent) {
+            onWakeSent(args?.machine || machine.name);
+          }
           await load();
           if (onRefreshFleet) onRefreshFleet();
         } catch (err) {
@@ -1238,21 +1251,26 @@ function PowerTab({
 
   if (!machine.reachable) {
     const canWake = allowedSet?.has('power.wake');
-    const sub = formatMachineDetailSubtitle(machine);
+    const sub = formatMachineDetailSubtitle(machine, Date.now(), { wakePending });
     return html`
       <div>
         <div class="notice">
-          <strong>${machine.name} is off.</strong>
+          <strong>${wakePending ? `${machine.name} is waking up.` : `${machine.name} is off.`}</strong>
           <span>
-            ${sub !== 'Off' ? `${sub}. ` : ''}
-            ${machine.canWake
-              ? canWake
-                ? 'Send a Wake-on-LAN signal to turn it on.'
-                : unavailableReason({ name: 'power.wake', effect: 'power' }, nodeInfo?.whoami)
-              : 'Wake-on-LAN is not configured for this machine.'}
+            ${wakePending
+              ? sub
+              : `${sub !== 'Off' ? `${sub}. ` : ''}${
+                  machine.canWake
+                    ? canWake
+                      ? 'Send a wake signal to turn it on.'
+                      : technical
+                        ? unavailableReason({ name: 'power.wake', effect: 'power' }, nodeInfo?.whoami)
+                        : plainDenyReason('power.wake', nodeInfo?.whoami)
+                    : 'Wake-on-LAN is not configured for this machine.'
+                }`}
           </span>
         </div>
-        ${machine.canWake
+        ${machine.canWake && !wakePending
           ? html`
               <div class="list">
                 <div class=${canWake ? 'row' : 'row off'}>
@@ -1412,7 +1430,9 @@ function PowerTab({
                 <div class="sub wrap">
                   ${allowed
                     ? item.desc
-                    : unavailableReason({ name: item.tool, effect: 'power' }, nodeInfo?.whoami)}
+                    : technical
+                      ? unavailableReason({ name: item.tool, effect: 'power' }, nodeInfo?.whoami)
+                      : plainDenyReason(item.tool, nodeInfo?.whoami)}
                 </div>
               </div>
               <button
@@ -1444,7 +1464,9 @@ export function MachineDetail({
   nodeInfo,
   allowedSet,
   settings,
+  wakePending,
   onWakeMachine,
+  onWakeSent,
   onRequestConfirm,
   onRefreshFleet,
   commandRuns,
@@ -1529,6 +1551,7 @@ export function MachineDetail({
               machine=${machine}
               allowedSet=${allowedSet}
               technical=${technical}
+              wakePending=${wakePending}
               onWake=${onWakeMachine || (() => selectTab('power'))}
               onStopJob=${handleStopJob}
             />
@@ -1613,6 +1636,8 @@ export function MachineDetail({
                           link=${link}
                           allowedSet=${allowedSet}
                           technical=${technical}
+                          wakePending=${wakePending}
+                          onWakeSent=${onWakeSent}
                           onRequestConfirm=${onRequestConfirm}
                           onRefreshFleet=${onRefreshFleet}
                         />
