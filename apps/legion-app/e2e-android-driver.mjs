@@ -534,11 +534,19 @@ async function runPhoneSuite() {
     window.location.hash = '#/settings/connections';
   });
   await page.getByText('Paired machines').waitFor({ state: 'visible', timeout: 15000 });
-  await page.locator('a.row', { hasText: 'tower' }).getByText('directly').waitFor({ timeout: 20000 });
-  await page.locator('a.row', { hasText: 'pi' }).getByText('directly').waitFor({ timeout: 20000 });
+  await page.locator('a.row[href="#/settings/connections/node/tower"]').getByText('directly').waitFor({ timeout: 20000 });
+  await page.locator('a.row[href="#/settings/connections/node/pi"]').getByText('directly').waitFor({ timeout: 20000 });
   const connText = await page.locator('main.main').innerText();
   const connLeaks = connText.match(/\b(?:power|fs|exec|job|svc|proj|fleet|sys|meta|device|token|config)\.[a-z_]+\b/g) || [];
   assert.deepEqual(connLeaks, [], `Tool name(s) leaked in plain Connections: ${connLeaks.join(', ')}`);
+  assert.ok(
+    !connText.includes('Paired with tower and shared with pi.'),
+    `Pairing sync banner should stay on Machines and not repeat on Connections:\n${connText}`,
+  );
+  assert.ok(
+    !connText.includes('device:pixel-e2e'),
+    `Plain Connections leaked raw principal string device:pixel-e2e:\n${connText}`,
+  );
   await takeShot(page, '03-connections-direct.png');
 
   // 4. Run a command on B (pi) and confirm it connected DIRECTLY to pi's sshd using pixel-e2e's key.
@@ -593,7 +601,7 @@ async function runPhoneSuite() {
   await page.evaluate(() => {
     window.location.hash = '#/settings/connections/invite';
   });
-  const roleSelect = page.locator('label.field select');
+  const roleSelect = page.locator('label.field:has-text("Role") select');
   await roleSelect.waitFor({ state: 'visible', timeout: 15000 });
   await page.getByText('Name for this device').waitFor({ state: 'visible' });
   await page.locator('label.field input[type="text"]').fill('tablet-peer');
@@ -604,9 +612,9 @@ async function runPhoneSuite() {
   const makeInviteBtn = page.getByRole('button', { name: 'Make invite' });
   assert.equal(await makeInviteBtn.isDisabled(), true, 'Owner invite must stay disabled until confirmed');
 
-  // Choose observer role (plain description "Look only.") and create the invite.
+  // Choose observer role (plain description "Look only...") and create the invite.
   await roleSelect.selectOption('observer');
-  await page.getByText('Look only.').waitFor({ state: 'visible' });
+  await page.locator('small', { hasText: /Look only/i }).waitFor({ state: 'visible' });
   const plainInviteText = await page.locator('main.main').innerText();
   const inviteLeaks = plainInviteText.match(/\b(?:power|fs|exec|job|svc|proj|fleet|sys|meta|device|token|config)\.[a-z_]+\b/g) || [];
   assert.deepEqual(inviteLeaks, [], `Tool name(s) leaked in plain invite screen: ${inviteLeaks.join(', ')}`);
@@ -671,6 +679,15 @@ async function runPhoneSuite() {
   await piCmd.fill('echo after-revoke-on-b');
   await page.locator('.dock form.prompt button[type="submit"]').click();
   await page.getByRole('button', { name: 'Pair again' }).waitFor({ state: 'visible', timeout: 20000 });
+  const revokedBText = await page.locator('main.main').innerText();
+  assert.ok(
+    revokedBText.includes('pi no longer lets this phone in. It may have been removed there.'),
+    `Expected plain removed-device message for pi, got:\n${revokedBText}`,
+  );
+  assert.ok(
+    !revokedBText.includes('legion pair'),
+    `Plain removed-device notice must not include CLI command:\n${revokedBText}`,
+  );
   await takeShot(page, '12-revoked-on-b.png');
 
   log('Step 10: starting tower, syncing revocation from pi to tower, and verifying refusal by tower');
@@ -691,6 +708,15 @@ async function runPhoneSuite() {
     window.location.reload();
   });
   await page.getByRole('button', { name: 'Pair again' }).waitFor({ state: 'visible', timeout: 25000 });
+  const revokedAText = await page.locator('main.main').innerText();
+  assert.ok(
+    /no longer lets this phone in\. It may have been removed there\./.test(revokedAText),
+    `Expected plain removed-device message after sync, got:\n${revokedAText}`,
+  );
+  assert.ok(
+    !revokedAText.includes('legion pair'),
+    `Plain removed-device notice after sync must not include CLI command:\n${revokedAText}`,
+  );
   const afterSyncListA = JSON.parse(legionNode('tower', ['device.list', '--json']));
   assert.ok(
     !(afterSyncListA.devices || []).some((d) => d.name === 'pixel-e2e'),

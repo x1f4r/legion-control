@@ -496,6 +496,9 @@ run_on_avd() {
 	adb -s "$serial" uninstall "$APP_ID" >/dev/null 2>&1 || true
 	"$HERE/emulator.sh" --avd "$avd" install "$DEBUG_APK"
 	adb -s "$serial" shell pm clear "$APP_ID" >/dev/null
+	# Enable the debug-only loopback endpoint switch so the two-node loopback harness
+	# (127.0.0.1 + 10.0.2.2) can learn peer endpoints. Release builds ignore this marker.
+	adb -s "$serial" shell "run-as '$APP_ID' touch allow-loopback-endpoints"
 	# Android 17 (API 37) Local Network Protection gates 10.0.2.2 behind ACCESS_LOCAL_NETWORK.
 	adb -s "$serial" shell pm grant "$APP_ID" android.permission.ACCESS_LOCAL_NETWORK >/dev/null 2>&1 || true
 	"$HERE/emulator.sh" --avd "$avd" launch
