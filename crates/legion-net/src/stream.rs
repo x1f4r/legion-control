@@ -678,17 +678,20 @@ fn pack<W: Write>(
     };
     let mut keep = Vec::with_capacity(names.len());
     for name in names {
-        match checked(grant, &root, name, Access::Read) {
-            Ok(path) => match fs::symlink_metadata(&path) {
-                Ok(_) => keep.push(name.as_str()),
-                Err(error) => ready.skipped.push(SkippedEntry {
-                    path: name.clone(),
-                    reason: format!("it cannot be read since it was listed: {error}"),
-                }),
-            },
-            Err(error) => ready.skipped.push(SkippedEntry {
+        let found = named(grant, &root, name, Access::Read).and_then(|path| {
+            fs::symlink_metadata(&path)
+                .map(|_| ())
+                .map_err(|error| Named::Refused(error.to_string()))
+        });
+        match found {
+            Ok(()) => keep.push(name.as_str()),
+            Err(Named::Missing) => ready.skipped.push(SkippedEntry {
                 path: name.clone(),
-                reason: error.message,
+                reason: "it is no longer there since it was listed".to_owned(),
+            }),
+            Err(Named::Refused(reason)) => ready.skipped.push(SkippedEntry {
+                path: name.clone(),
+                reason,
             }),
         }
     }
@@ -821,7 +824,11 @@ fn delete<W: Write>(
 /// Removes one name under `root`, never following a symbolic link; says whether there was
 /// anything to remove, or why it was left.
 fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
-    let path = checked(grant, root, name, Access::Write).map_err(|error| error.message)?;
+    let path = match named(grant, root, name, Access::Write) {
+        Ok(path) => path,
+        Err(Named::Missing) => return Ok(false),
+        Err(Named::Refused(reason)) => return Err(reason),
+    };
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -846,6 +853,50 @@ fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
         fs::remove_file(&path).map_err(|error| error.to_string())
     };
     removed.map(|()| true)
+}
+
+/// Why a name a peer sent cannot be used.
+enum Named {
+    /// A part of it does not exist.
+    Missing,
+    /// It may not be used, for this reason.
+    Refused(String),
+}
+
+/// A relative name a peer sent for an entry under `root`, walked part by part without following
+/// a symbolic link: every part before the last must be a real directory, so a link inside the tree
+/// cannot lead a `pack` or `delete` somewhere else. The last part, when it is a link, is the link
+/// itself. The path is then checked for `access` like any other.
+fn named(grant: &Grant, root: &Path, name: &str, access: Access) -> Result<PathBuf, Named> {
+    let name = legion_xfer::validate_relative_path(name)
+        .map_err(|error| Named::Refused(xfer_error(error).message))?;
+    let parts: Vec<&str> = name.split('/').collect();
+    let mut path = root.to_path_buf();
+    for (at, part) in parts.iter().enumerate() {
+        path.push(part);
+        if at + 1 == parts.len() {
+            break;
+        }
+        let way = parts[..=at].join("/");
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Named::Refused(format!(
+                    "{way} on its way is a symbolic link, which is never followed"
+                )));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(Named::Refused(format!(
+                    "{way} on its way is not a directory"
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Named::Missing),
+            Err(error) => return Err(Named::Refused(error.to_string())),
+        }
+    }
+    grant
+        .check_path(&path, access)
+        .map_err(|error| Named::Refused(error.message))
 }
 
 /// A relative name under `root`, validated as a transfer path and checked for `access`.

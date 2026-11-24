@@ -511,6 +511,59 @@ fn delete_removes_children_before_parents_and_never_follows_links() {
     assert_eq!(node.last_audit()["tool"], "stream.delete");
 }
 
+#[cfg(unix)]
+#[test]
+fn pack_and_delete_never_go_through_a_link_inside_a_name() {
+    let node = Node::new();
+    let tree = node.home().join("projects/tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::create_dir_all(node.home().join("precious")).unwrap();
+    fs::write(node.home().join("precious/secret.txt"), b"secret").unwrap();
+    fs::write(tree.join("plain.txt"), b"plain").unwrap();
+    std::os::unix::fs::symlink(node.home().join("precious"), tree.join("link")).unwrap();
+
+    let ran = node.run(
+        None,
+        &json!({"op": "pack", "root": "~/projects/tree", "names": ["link/secret.txt", "plain.txt", "link"]}),
+        b"",
+    );
+    let (ready, archive) = ran.ok().first();
+    assert_eq!(ready["skipped"][0]["path"], "link/secret.txt", "{ready}");
+    assert!(
+        ready["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("symbolic link"),
+        "{ready}"
+    );
+    // The link itself is packed as a link; what it leads to is not read.
+    let unpacked = tempfile::tempdir().unwrap();
+    let report = legion_xfer::unpack(unpacked.path(), archive).unwrap();
+    assert_eq!(report.files, ["plain.txt"]);
+    assert_eq!(report.symlinks, ["link"]);
+    assert!(!String::from_utf8_lossy(archive).contains("secret"));
+
+    let ran = node.run(
+        None,
+        &json!({"op": "delete", "root": "~/projects/tree", "names": ["link/secret.txt"]}),
+        b"",
+    );
+    let (done, _) = ran.ok().first();
+    assert_eq!(done["removed"], 0, "{done}");
+    assert_eq!(done["skipped"][0]["path"], "link/secret.txt", "{done}");
+    assert!(node.home().join("precious/secret.txt").exists());
+
+    // The last part, when it is a link, is removed as a link.
+    let ran = node.run(
+        None,
+        &json!({"op": "delete", "root": "~/projects/tree", "names": ["link"]}),
+        b"",
+    );
+    assert_eq!(ran.ok().first().0["removed"], 1);
+    assert!(fs::symlink_metadata(tree.join("link")).is_err());
+    assert!(node.home().join("precious/secret.txt").exists());
+}
+
 #[test]
 fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     let node = Node::new();
