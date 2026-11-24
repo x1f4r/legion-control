@@ -104,6 +104,15 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check);
     }
 
+    if let Ok(node_file) = ctx.config().get::<NodeFile>() {
+        let conflicts =
+            crate::device::registry::inspect_device_key_conflicts(ctx.paths(), &node_file);
+        checks.extend(check_device_key_conflicts(
+            &conflicts.duplicate_groups,
+            &conflicts.foreign_conflicts,
+        ));
+    }
+
     if !quick
         && let Some(ping_tool) = ctx.node().registry().get("fleet.ping")
         && let Ok(value) = ping_tool
@@ -146,6 +155,60 @@ pub struct FleetDeviceSyncEntry {
 #[derive(Deserialize)]
 struct FleetDevicesSyncResponse {
     results: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
+}
+
+/// Builds `meta.doctor` warnings when two live devices in `devices.toml` share a public key or
+/// when a live device's public key sits on a foreign line of `authorized_keys`.
+pub fn check_device_key_conflicts(
+    duplicate_groups: &[Vec<(String, String)>],
+    foreign_conflicts: &[(String, String)],
+) -> Vec<Check> {
+    let mut out = Vec::new();
+    if !duplicate_groups.is_empty() {
+        let rendered: Vec<String> = duplicate_groups
+            .iter()
+            .map(|group| {
+                let members: Vec<String> = group
+                    .iter()
+                    .map(|(name, id)| format!("{name} ({id})"))
+                    .collect();
+                format!("[{}]", members.join(", "))
+            })
+            .collect();
+        out.push(Check {
+            name: "duplicate device keys".to_owned(),
+            ok: true,
+            warning: true,
+            detail: format!(
+                "Live entries in devices.toml share the same SSH public key; no authorized_keys line is active for any of them: {}.",
+                rendered.join("; ")
+            ),
+            hint: Some(
+                "Remove the conflicting entries with `legion device.remove id=<pairing_id>` and pair each device with its own Ed25519 key."
+                    .to_owned(),
+            ),
+        });
+    }
+    if !foreign_conflicts.is_empty() {
+        let rendered: Vec<String> = foreign_conflicts
+            .iter()
+            .map(|(name, id)| format!("{name} ({id})"))
+            .collect();
+        out.push(Check {
+            name: "foreign key collisions".to_owned(),
+            ok: true,
+            warning: true,
+            detail: format!(
+                "Paired device(s) are not active here because their key is already on another line of authorized_keys: {}.",
+                rendered.join(", ")
+            ),
+            hint: Some(
+                "Remove the conflicting line from authorized_keys or re-pair the device with a dedicated Ed25519 key."
+                    .to_owned(),
+            ),
+        });
+    }
+    out
 }
 
 /// Builds a `meta.doctor` warning when `policy.toml` defines any `device:*` principal without a

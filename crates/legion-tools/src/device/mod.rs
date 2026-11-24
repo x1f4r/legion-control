@@ -883,7 +883,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         let exe = legion_core::current_exe()?;
         let shell = ForcedCommandShell::host()?;
         edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
-            let (changed, _) = reconcile_authorized_keys_in_memory(
+            let report = reconcile_authorized_keys_in_memory(
                 &mut auth_keys,
                 &devices_file,
                 &paths,
@@ -892,7 +892,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                 &exe,
                 shell,
             )?;
-            Ok((changed.then_some(auth_keys), ()))
+            Ok((report.changed.then_some(auth_keys), ()))
         })?;
 
         // Keep local state/devices.json metadata in step on rename.
@@ -926,6 +926,8 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
 struct ListResult {
     devices: Vec<ListedDevice>,
     invites: Vec<ListedInvite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -946,6 +948,8 @@ struct ListedDevice {
     added: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     paired_on: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     home: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
@@ -980,7 +984,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
     let paths = ctx.paths().clone();
     let paths_for_sessions = paths.clone();
 
-    let (raw_devices, raw_invites, removed_stale) = blocking(move || {
+    let (raw_devices, raw_invites, removed_stale, warnings) = blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
         let caller_account = caller_account_for_target(&target)?;
@@ -997,7 +1001,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
         let exe = legion_core::current_exe()?;
         let shell = ForcedCommandShell::host()?;
 
-        let (auth_keys, state, state_changed, devices_file, adopted_new, removed_stale) =
+        let (auth_keys, state, state_changed, devices_file, adopted_new, report) =
             edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
                 let mut state = load_state(&paths)?;
                 let now = Timestamp::now();
@@ -1020,7 +1024,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     }
                 };
 
-                let (reconciled_auth, removed_stale) = reconcile_authorized_keys_in_memory(
+                let report = reconcile_authorized_keys_in_memory(
                     &mut auth_keys,
                     &devices_file,
                     &paths,
@@ -1029,7 +1033,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     &exe,
                     shell,
                 )?;
-                let write_auth = (swept_auth || reconciled_auth).then(|| auth_keys.clone());
+                let write_auth = (swept_auth || report.changed).then(|| auth_keys.clone());
                 Ok((
                     write_auth,
                     (
@@ -1038,7 +1042,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                         state_changed,
                         devices_file,
                         adopted_new,
-                        removed_stale,
+                        report,
                     ),
                 ))
             })?;
@@ -1055,6 +1059,16 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
             .iter()
             .map(|(id, entry)| {
                 let effective_role = policy.role_of(&entry.principal).0;
+                let status = if let Some(others) = report.duplicate_key_ids.get(id) {
+                    Some(format!(
+                        "not active here: public key collides with another live device ({})",
+                        others.join(", ")
+                    ))
+                } else if report.foreign_key_ids.contains(id) {
+                    Some(registry::FOREIGN_KEY_COLLISION_STATUS.to_owned())
+                } else {
+                    None
+                };
                 ListedDevice {
                     id: Some(id.clone()),
                     name: entry.name.clone(),
@@ -1063,6 +1077,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     fingerprint: DevicesFile::fingerprint_of(entry),
                     added: Some(entry.paired_at.clone()),
                     paired_on: Some(entry.paired_on.clone()),
+                    status,
                     home: None,
                     foreign: false,
                     missing_home: false,
@@ -1110,6 +1125,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                         fingerprint,
                         added: None,
                         paired_on: None,
+                        status: None,
                         home: home.as_ref().map(PinnedHome::display_label),
                         foreign: true,
                         missing_home,
@@ -1172,7 +1188,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                 LineKind::Foreign => {}
             }
         }
-        Ok((devices, invites, removed_stale))
+        Ok((devices, invites, report.removed_device_names, report.warnings))
     })
     .await?;
 
@@ -1185,7 +1201,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
         .await;
     }
 
-    let devices = raw_devices
+    let devices: Vec<ListedDevice> = raw_devices
         .into_iter()
         .filter(|d| d.foreign || caller.may_manage(&d.principal))
         .collect();
@@ -1195,7 +1211,22 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
         .filter(|i| i.foreign || caller.may_manage(&i.principal))
         .collect();
 
-    Ok(ListResult { devices, invites })
+    let warnings = if caller_is_owner {
+        warnings
+    } else {
+        let visible_ids: std::collections::HashSet<&str> =
+            devices.iter().filter_map(|d| d.id.as_deref()).collect();
+        warnings
+            .into_iter()
+            .filter(|w| visible_ids.iter().any(|id| w.contains(id)))
+            .collect()
+    };
+
+    Ok(ListResult {
+        devices,
+        invites,
+        warnings,
+    })
 }
 
 /// Arguments of `device.remove`.
@@ -1372,7 +1403,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                             )
                         })
                         .count();
-                    let (reconciled_auth, stale_names) = reconcile_authorized_keys_in_memory(
+                    let report = reconcile_authorized_keys_in_memory(
                         &mut auth_keys,
                         &devices_file,
                         &paths,
@@ -1382,7 +1413,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                         shell,
                     )?;
                     state.devices.remove(&entry.name);
-                    let write_auth = (swept_auth || reconciled_auth).then_some(auth_keys);
+                    let write_auth = (swept_auth || report.changed).then_some(auth_keys);
                     return Ok((
                         write_auth,
                         (
@@ -1405,7 +1436,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                             )),
                             Some(state),
                             Some(devices_file),
-                            stale_names,
+                            report.removed_device_names,
                         ),
                     ));
                 }
@@ -1483,18 +1514,17 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                     )
                                 })
                                 .count();
-                            let (reconciled_auth, stale_names) =
-                                reconcile_authorized_keys_in_memory(
-                                    &mut auth_keys,
-                                    &devices_file,
-                                    &paths,
-                                    &target,
-                                    caller_account.as_deref(),
-                                    &exe,
-                                    shell,
-                                )?;
+                            let report = reconcile_authorized_keys_in_memory(
+                                &mut auth_keys,
+                                &devices_file,
+                                &paths,
+                                &target,
+                                caller_account.as_deref(),
+                                &exe,
+                                shell,
+                            )?;
                             state.devices.remove(&entry.name);
-                            let write_auth = (swept_auth || reconciled_auth).then_some(auth_keys);
+                            let write_auth = (swept_auth || report.changed).then_some(auth_keys);
                             return Ok((
                                 write_auth,
                                 (
@@ -1517,7 +1547,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                     )),
                                     Some(state),
                                     Some(devices_file),
-                                    stale_names,
+                                    report.removed_device_names,
                                 ),
                             ));
                         }
@@ -3500,5 +3530,112 @@ allow = ["effect:read", "effect:write"]
             let err = h.node.call(call).await.unwrap_err();
             assert_eq!(err.code, ErrorCode::Denied, "{args}: {err:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn duplicate_live_keys_and_foreign_key_collision_write_no_line_and_warn_in_list_and_doctor()
+    {
+        use crate::device::keys::ed25519_public_key_from_seed;
+        use crate::device::registry::{DevicesFile, FleetDevice};
+
+        let h = Harness::new();
+        let shared_key = ed25519_public_key_from_seed(&[77u8; 32]);
+        let foreign_key = ed25519_public_key_from_seed(&[88u8; 32]);
+        let good_key = ed25519_public_key_from_seed(&[99u8; 32]);
+
+        // Put `foreign_key` on an unrelated hand-written authorized_keys line.
+        std::fs::write(&h.auth_keys, format!("{foreign_key} hand-written@laptop\n")).unwrap();
+
+        let id1 = "11".repeat(16);
+        let id2 = "22".repeat(16);
+        let id_foreign = "33".repeat(16);
+        let id_good = "44".repeat(16);
+
+        let mut file = DevicesFile::default();
+        for (id, name, key) in [
+            (&id1, "dup-a", &shared_key),
+            (&id2, "dup-b", &shared_key),
+            (&id_foreign, "foreign-dev", &foreign_key),
+            (&id_good, "healthy-dev", &good_key),
+        ] {
+            file.devices.insert(
+                id.clone(),
+                FleetDevice {
+                    name: name.to_owned(),
+                    public_key: key.clone(),
+                    principal: "owner".to_owned(),
+                    role: None,
+                    paired_at: "2026-11-24T10:00:00Z".to_owned(),
+                    paired_on: "tower".to_owned(),
+                    updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                    updated_on: "tower".to_owned(),
+                },
+            );
+        }
+        std::fs::write(
+            h.node.paths().config_file("devices.toml"),
+            file.to_toml_string(),
+        )
+        .unwrap();
+
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
+        // Neither dup-a nor dup-b may have a line written; foreign-dev gets no Legion line (its
+        // hand-written line stays intact); healthy-dev gets its line.
+        assert!(!auth_text.contains("legion-device:dup-a"), "{auth_text}");
+        assert!(!auth_text.contains("legion-device:dup-b"), "{auth_text}");
+        assert!(
+            !auth_text.contains("legion-device:foreign-dev"),
+            "{auth_text}"
+        );
+        assert!(auth_text.contains("hand-written@laptop"), "{auth_text}");
+        assert!(
+            auth_text.contains("legion-device:healthy-dev"),
+            "{auth_text}"
+        );
+
+        let devices = listed["devices"].as_array().unwrap();
+        let foreign_entry = devices
+            .iter()
+            .find(|d| d["name"] == json!("foreign-dev"))
+            .unwrap();
+        assert_eq!(
+            foreign_entry["status"],
+            json!("not active here: this key is already on another line of authorized_keys")
+        );
+        let dup_a = devices.iter().find(|d| d["name"] == json!("dup-a")).unwrap();
+        let dup_b = devices.iter().find(|d| d["name"] == json!("dup-b")).unwrap();
+        assert!(
+            dup_a["status"]
+                .as_str()
+                .is_some_and(|s| s.contains("not active here")),
+            "{dup_a}"
+        );
+        assert!(
+            dup_b["status"]
+                .as_str()
+                .is_some_and(|s| s.contains("not active here")),
+            "{dup_b}"
+        );
+        let warnings = listed["warnings"].as_array().unwrap();
+        assert!(!warnings.is_empty(), "expected warnings in device.list: {listed}");
+
+        let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        let checks = doctor["checks"].as_array().unwrap();
+        assert!(
+            checks.iter().any(|c| c["warning"] == json!(true)
+                && c["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("dup-a") && d.contains("dup-b"))),
+            "expected duplicate-key warning in meta.doctor: {doctor}"
+        );
+        assert!(
+            checks.iter().any(|c| c["warning"] == json!(true)
+                && c["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("foreign-dev")
+                        && d.contains("already on another line of authorized_keys"))),
+            "expected foreign-key warning in meta.doctor: {doctor}"
+        );
     }
 }

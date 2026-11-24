@@ -922,7 +922,19 @@ async fn apply_local_write(
                     return Ok(());
                 }
                 match change {
-                    MergeChange::Live { entry, .. } => {
+                    MergeChange::Live { entry, previous } => {
+                        if let Some(prev) = previous
+                            && prev.principal != caller_principal
+                        {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                format!(
+                                    "As {caller_principal}, you may not modify a paired device owned by {}.",
+                                    prev.principal
+                                ),
+                            )
+                            .with_hint("Modify other principals' devices as the owner of this machine."));
+                        }
                         if entry.principal != caller_principal {
                             return Err(ErrorBody::new(
                                 ErrorCode::Denied,
@@ -945,18 +957,22 @@ async fn apply_local_write(
                             .with_hint("Only a caller with the owner role may assign or change device roles."));
                         }
                     }
-                    MergeChange::Removed {
-                        tombstone,
-                        previous_live,
-                    } => {
-                        let target_principal = previous_live
-                            .map(|prev| prev.principal.as_str())
-                            .unwrap_or(tombstone.principal.as_str());
-                        if target_principal != caller_principal {
+                    MergeChange::Removed { previous_live, .. } => {
+                        let Some(prev) = previous_live else {
                             return Err(ErrorBody::new(
                                 ErrorCode::Denied,
                                 format!(
-                                    "As {caller_principal}, you may only revoke paired devices pinned to {caller_principal}, not {target_principal}."
+                                    "As {caller_principal}, you may only revoke paired devices that are live on this machine and pinned to {caller_principal}."
+                                ),
+                            )
+                            .with_hint("Only the owner may record tombstones for devices that are not live on this node."));
+                        };
+                        if prev.principal != caller_principal {
+                            return Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                format!(
+                                    "As {caller_principal}, you may only revoke paired devices pinned to {caller_principal}, not {}.",
+                                    prev.principal
                                 ),
                             )
                             .with_hint("Revoke other principals' devices as the owner of this machine."));
@@ -3073,5 +3089,142 @@ device = \"11111111111111111111111111111111\"
         .unwrap();
         assert!(saved.devices.is_empty());
         assert!(saved.removed.contains_key(&id_existing));
+    }
+
+    #[tokio::test]
+    async fn non_owner_merge_cannot_steal_owner_id_tombstone_absent_id_or_collide_keys() {
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, FleetDevice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.phone_admin]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"phone_admin\"
+",
+        )
+        .unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let id_owner = "aa".repeat(16);
+        let owner_key = ed25519_public_key_from_seed(&[51u8; 32]);
+        let mut local = DevicesFile::default();
+        local.devices.insert(
+            id_owner.clone(),
+            FleetDevice {
+                name: "owners-laptop".to_owned(),
+                public_key: owner_key.clone(),
+                principal: "owner".to_owned(),
+                role: Some("owner".to_owned()),
+                paired_at: "2026-11-24T10:00:00Z".to_owned(),
+                paired_on: "box-a".to_owned(),
+                updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        std::fs::write(paths.config_file("devices.toml"), local.to_toml_string()).unwrap();
+
+        // 1. Non-owner admin (`tablet`) cannot overwrite an `owner` pairing id by changing its
+        //    principal to `tablet` with a newer timestamp.
+        let mut hijack = DevicesFile::default();
+        hijack.devices.insert(
+            id_owner.clone(),
+            FleetDevice {
+                name: "hijacked".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[52u8; 32]),
+                principal: "tablet".to_owned(),
+                role: None,
+                paired_at: "2026-11-24T10:00:00Z".to_owned(),
+                paired_on: "box-a".to_owned(),
+                updated_at: "2026-11-24T10:05:00Z".to_owned(),
+                updated_on: "box-b".to_owned(),
+            },
+        );
+        let mut hijack_call = Call::new(
+            Door::Cli,
+            "config.write",
+            json!({"document": "devices.toml", "content": hijack.to_toml_string()}),
+        );
+        hijack_call.pinned = Some("tablet".to_owned());
+        let err = node.call(hijack_call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "hijack must be denied: {err:?}");
+
+        // 2. Non-owner admin (`tablet`) cannot plant a tombstone for an id that is not live locally.
+        let mut phantom_tomb = DevicesFile::default();
+        phantom_tomb.removed.insert(
+            "bb".repeat(16),
+            DeviceTombstone {
+                name: "phantom".to_owned(),
+                principal: "tablet".to_owned(),
+                paired_at: None,
+                paired_on: None,
+                removed_at: "2026-11-24T10:06:00Z".to_owned(),
+                removed_on: "box-b".to_owned(),
+            },
+        );
+        let mut tomb_call = Call::new(
+            Door::Cli,
+            "config.write",
+            json!({"document": "devices.toml", "content": phantom_tomb.to_toml_string()}),
+        );
+        tomb_call.pinned = Some("tablet".to_owned());
+        let err2 = node.call(tomb_call).await.unwrap_err();
+        assert_eq!(
+            err2.code,
+            ErrorCode::Denied,
+            "tombstone for absent id must be denied for non-owner: {err2:?}"
+        );
+
+        // 3. Merging a live entry whose public key is already used by another live entry is refused
+        //    with Conflict (even by owner).
+        let mut dup_key = DevicesFile::default();
+        dup_key.devices.insert(
+            "cc".repeat(16),
+            FleetDevice {
+                name: "duplicate-key-device".to_owned(),
+                public_key: owner_key,
+                principal: "tablet".to_owned(),
+                role: None,
+                paired_at: "2026-11-24T10:07:00Z".to_owned(),
+                paired_on: "box-b".to_owned(),
+                updated_at: "2026-11-24T10:07:00Z".to_owned(),
+                updated_on: "box-b".to_owned(),
+            },
+        );
+        let err3 = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": dup_key.to_toml_string()}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err3.code,
+            ErrorCode::Conflict,
+            "duplicate live public key in merge must fail with Conflict: {err3:?}"
+        );
     }
 }

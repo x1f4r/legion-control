@@ -525,10 +525,11 @@ fn process_enrol_blocking(
                 state,
             );
         }
-        let key_in_registry = devices
-            .devices
-            .values()
-            .any(|dev| dev.public_key == validated_key.canonical);
+        let key_in_registry = devices.devices.values().any(|dev| {
+            dev.public_key == validated_key.canonical
+                || validate_ed25519_public_key(&dev.public_key)
+                    .is_ok_and(|existing| existing.wire_blob == validated_key.wire_blob)
+        });
         if key_in_registry || auth_keys.contains_key_blob(&validated_key.wire_blob) {
             return fail_with_sweep(
                 Some(principal),

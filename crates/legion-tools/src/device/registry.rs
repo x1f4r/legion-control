@@ -1120,10 +1120,121 @@ pub fn adopt_legacy_devices_from_auth_keys(
     file
 }
 
+/// Status message shown when a live device's public key already sits on a foreign line of
+/// `authorized_keys`.
+pub const FOREIGN_KEY_COLLISION_STATUS: &str =
+    "not active here: this key is already on another line of authorized_keys";
+
+/// Outcome of reconciling this home's device lines in `authorized_keys` against `devices.toml`.
+#[derive(Clone, Debug, Default)]
+pub struct AuthKeysReconcileReport {
+    /// Whether `authorized_keys` was modified in memory and needs to be saved.
+    pub changed: bool,
+    /// Device names whose `authorized_keys` lines were removed during reconciliation.
+    pub removed_device_names: Vec<String>,
+    /// Live pairing ids skipped because two or more live devices share the same public key, mapped
+    /// to the other colliding pairing ids.
+    pub duplicate_key_ids: BTreeMap<String, Vec<String>>,
+    /// Live pairing ids skipped because their public key already sits on a foreign line of
+    /// `authorized_keys`.
+    pub foreign_key_ids: BTreeSet<String>,
+    /// Warnings generated for colliding or inactive entries.
+    pub warnings: Vec<String>,
+}
+
+/// Groups live pairing ids in `devices` by their decoded Ed25519 public-key wire blob, returning
+/// only wire blobs shared by two or more live entries.
+pub fn duplicate_live_public_keys(
+    devices: &DevicesFile,
+) -> Result<BTreeMap<Vec<u8>, Vec<String>>, ErrorBody> {
+    let mut by_blob: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
+    for (id, entry) in &devices.devices {
+        let validated = validate_ed25519_public_key(&entry.public_key)?;
+        by_blob
+            .entry(validated.wire_blob.to_vec())
+            .or_default()
+            .push(id.clone());
+    }
+    by_blob.retain(|_, ids| ids.len() > 1);
+    Ok(by_blob)
+}
+
+/// Result of read-only key conflict inspection for `meta.doctor`.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceKeyConflicts {
+    /// Groups of live devices sharing the same SSH public key (`(name, pairing_id)`).
+    pub duplicate_groups: Vec<Vec<(String, String)>>,
+    /// Live devices `(name, pairing_id)` whose key already sits on a foreign line of
+    /// `authorized_keys`.
+    pub foreign_conflicts: Vec<(String, String)>,
+}
+
+/// Read-only inspection of `devices.toml` and `authorized_keys` for `meta.doctor`.
+pub fn inspect_device_key_conflicts(paths: &Paths, node_file: &NodeFile) -> DeviceKeyConflicts {
+    let Ok(Some(devices)) = load_devices_raw(paths) else {
+        return DeviceKeyConflicts::default();
+    };
+    let mut by_blob: BTreeMap<Vec<u8>, Vec<(String, String)>> = BTreeMap::new();
+    let mut validated_by_id: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (id, entry) in &devices.devices {
+        if let Ok(validated) = validate_ed25519_public_key(&entry.public_key) {
+            let blob = validated.wire_blob.to_vec();
+            by_blob
+                .entry(blob.clone())
+                .or_default()
+                .push((entry.name.clone(), id.clone()));
+            validated_by_id.insert(id.clone(), blob);
+        }
+    }
+    let mut duplicate_groups: Vec<Vec<(String, String)>> = Vec::new();
+    let mut dup_ids: BTreeSet<String> = BTreeSet::new();
+    for group in by_blob.into_values() {
+        if group.len() > 1 {
+            for (_, id) in &group {
+                dup_ids.insert(id.clone());
+            }
+            duplicate_groups.push(group);
+        }
+    }
+
+    let mut foreign_conflicts: Vec<(String, String)> = Vec::new();
+    if let Ok(target) = resolve_target(paths, node_file)
+        && let Ok(write_path) = resolve_safe_write_path(&target, paths.home())
+        && write_path.is_file()
+        && let Ok(auth_keys) = read_auth_keys(&write_path)
+    {
+        let caller_account = caller_account_for_target(&target).ok().flatten();
+        for (id, entry) in &devices.devices {
+            if dup_ids.contains(id) {
+                continue;
+            }
+            if let Some(blob) = validated_by_id.get(id)
+                && contains_non_owned_key_blob(
+                    &auth_keys,
+                    blob,
+                    paths,
+                    caller_account.as_deref(),
+                    &target,
+                )
+            {
+                foreign_conflicts.push((entry.name.clone(), id.clone()));
+            }
+        }
+    }
+
+    DeviceKeyConflicts {
+        duplicate_groups,
+        foreign_conflicts,
+    }
+}
+
 /// Reconciles this home's device lines in `auth_keys` to match `devices`.
 ///
 /// Foreign lines, pending invites, and device lines belonging to another Legion home or another OS
-/// account are preserved byte for byte. Returns `(auth_keys_changed, removed_device_names)`.
+/// account are preserved byte for byte. If two or more live entries in `devices` share the same
+/// public key, NO `authorized_keys` line is written for ANY of them (and any existing lines for
+/// them are removed) with a loud warning. Live entries whose public key already sits on a foreign
+/// line of `authorized_keys` are similarly skipped with a warning.
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_authorized_keys_in_memory(
     auth_keys: &mut AuthKeysFile,
@@ -1133,7 +1244,7 @@ pub fn reconcile_authorized_keys_in_memory(
     caller_account: Option<&str>,
     exe: &Path,
     shell: ForcedCommandShell,
-) -> Result<(bool, Vec<String>), ErrorBody> {
+) -> Result<AuthKeysReconcileReport, ErrorBody> {
     let pinned_home = PinnedHome::from_paths(paths);
     let pinned_account = if target.windows_admin_acl {
         let Some(acct) = caller_account else {
@@ -1147,35 +1258,74 @@ pub fn reconcile_authorized_keys_in_memory(
         None
     };
 
-    // Build expected canonical line per live pairing id so we can detect exact matches without
-    // unnecessary rewrites.
-    let mut expected_lines: BTreeMap<&str, (String, Vec<u8>)> = BTreeMap::new();
-    let mut seen_wire_blobs: HashSet<Vec<u8>> = HashSet::new();
+    // Pass 1: validate every live key and detect duplicate public keys across live entries so NO
+    // line is written for ANY entry in a colliding group.
+    let mut validated_keys: BTreeMap<&str, (String, Vec<u8>)> = BTreeMap::new();
+    let mut ids_by_blob: BTreeMap<Vec<u8>, Vec<&str>> = BTreeMap::new();
     for (id, entry) in &devices.devices {
         let validated = validate_ed25519_public_key(&entry.public_key)?;
-        if contains_non_owned_key_blob(
-            auth_keys,
-            &validated.wire_blob,
-            paths,
-            caller_account,
-            target,
-        ) {
+        let blob = validated.wire_blob.to_vec();
+        ids_by_blob.entry(blob.clone()).or_default().push(id.as_str());
+        validated_keys.insert(id.as_str(), (validated.canonical, blob));
+    }
+
+    let mut duplicate_key_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for ids in ids_by_blob.values() {
+        if ids.len() > 1 {
+            let labels: Vec<String> = ids
+                .iter()
+                .filter_map(|id| {
+                    devices
+                        .devices
+                        .get(*id)
+                        .map(|d| format!("{} ({id})", d.name))
+                })
+                .collect();
+            warnings.push(format!(
+                "Public key collision in devices.toml: live devices {} share the same SSH public key; no authorized_keys line was written for any of them.",
+                labels.join(", ")
+            ));
+            for id in ids {
+                let others: Vec<String> = ids
+                    .iter()
+                    .filter(|other| *other != id)
+                    .map(|other| (*other).to_owned())
+                    .collect();
+                duplicate_key_ids.insert((*id).to_owned(), others);
+            }
+        }
+    }
+
+    // Pass 2: build expected canonical line per non-colliding live pairing id.
+    let mut expected_lines: BTreeMap<&str, (String, Vec<u8>)> = BTreeMap::new();
+    let mut foreign_key_ids: BTreeSet<String> = BTreeSet::new();
+    for (id, entry) in &devices.devices {
+        if duplicate_key_ids.contains_key(id) {
             continue;
         }
-        if !seen_wire_blobs.insert(validated.wire_blob.to_vec()) {
+        let Some((canonical, wire_blob)) = validated_keys.get(id.as_str()) else {
+            continue;
+        };
+        if contains_non_owned_key_blob(auth_keys, wire_blob, paths, caller_account, target) {
+            foreign_key_ids.insert(id.clone());
+            warnings.push(format!(
+                "Device {} ({id}) is {FOREIGN_KEY_COLLISION_STATUS}.",
+                entry.name
+            ));
             continue;
         }
         let line = format_device_line(
             exe,
             &entry.principal,
-            &validated.canonical,
+            canonical,
             &entry.name,
             id,
             &pinned_home,
             pinned_account,
             shell,
         )?;
-        expected_lines.insert(id.as_str(), (line, validated.wire_blob.to_vec()));
+        expected_lines.insert(id.as_str(), (line, wire_blob.clone()));
     }
 
     let mut kept_ids: HashSet<String> = HashSet::new();
@@ -1237,7 +1387,13 @@ pub fn reconcile_authorized_keys_in_memory(
         changed = true;
     }
 
-    Ok((changed, removed_device_names.into_iter().collect()))
+    Ok(AuthKeysReconcileReport {
+        changed,
+        removed_device_names: removed_device_names.into_iter().collect(),
+        duplicate_key_ids,
+        foreign_key_ids,
+        warnings,
+    })
 }
 
 /// Outcome of loading (with first-run adoption) and reconciling `devices.toml` and
@@ -1253,6 +1409,9 @@ pub struct ReconcileOutcome {
     /// Device names whose `authorized_keys` lines were removed during reconciliation (callers
     /// should terminate active sessions for these names).
     pub removed_device_names: Vec<String>,
+    /// Warnings generated during `authorized_keys` reconciliation (duplicate keys or foreign-line
+    /// collisions).
+    pub warnings: Vec<String>,
 }
 
 /// Loads `devices.toml` (adopting legacy `--pairing` lines from `authorized_keys` if `devices.toml`
@@ -1319,25 +1478,25 @@ pub fn reconcile_devices_and_auth_keys_with_config_lock(
 
     let exe = legion_core::current_exe()?;
     let shell = ForcedCommandShell::host()?;
-    let (auth_keys_changed, removed_device_names) =
-        edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
-            let (changed, removed) = reconcile_authorized_keys_in_memory(
-                &mut auth_keys,
-                &devices,
-                paths,
-                &target,
-                caller_account.as_deref(),
-                &exe,
-                shell,
-            )?;
-            Ok((changed.then_some(auth_keys), (changed, removed)))
-        })?;
+    let report = edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+        let report = reconcile_authorized_keys_in_memory(
+            &mut auth_keys,
+            &devices,
+            paths,
+            &target,
+            caller_account.as_deref(),
+            &exe,
+            shell,
+        )?;
+        Ok((report.changed.then_some(auth_keys), report))
+    })?;
 
     Ok(ReconcileOutcome {
         devices,
         devices_adopted,
-        auth_keys_changed,
-        removed_device_names,
+        auth_keys_changed: report.changed,
+        removed_device_names: report.removed_device_names,
+        warnings: report.warnings,
     })
 }
 
@@ -1422,7 +1581,7 @@ pub fn verify_gate_device(
     let exe = legion_core::current_exe()?;
     let shell = ForcedCommandShell::host()?;
     let mut probe = auth_keys;
-    let (needs_write, _) = reconcile_authorized_keys_in_memory(
+    let probe_report = reconcile_authorized_keys_in_memory(
         &mut probe,
         &devices,
         paths,
@@ -1431,7 +1590,7 @@ pub fn verify_gate_device(
         &exe,
         shell,
     )?;
-    if needs_write {
+    if probe_report.changed {
         let outcome = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false)?;
         return Ok(outcome.removed_device_names);
     }
@@ -1620,6 +1779,43 @@ pub fn apply_devices_merge_blocking(
 
     let merged = merge_devices(&local, incoming);
 
+    // Refuse any merge that adds or changes a live entry whose public key collides with another
+    // live entry in the merged view.
+    let duplicate_keys = duplicate_live_public_keys(&merged)?;
+    for ids in duplicate_keys.values() {
+        if let Some(changed_id) = ids
+            .iter()
+            .find(|id| local.devices.get(*id) != merged.devices.get(*id))
+        {
+            let name = merged
+                .devices
+                .get(changed_id)
+                .map(|d| d.name.as_str())
+                .unwrap_or("device");
+            let others: Vec<String> = ids
+                .iter()
+                .filter(|id| *id != changed_id)
+                .map(|id| {
+                    merged
+                        .devices
+                        .get(id)
+                        .map(|d| format!("{} ({id})", d.name))
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect();
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "Paired device {name} ({changed_id}) uses a public key already assigned to another live paired device: {}.",
+                    others.join(", ")
+                ),
+            )
+            .with_hint(
+                "Remove the conflicting device or pair with a dedicated Ed25519 key pair.",
+            ));
+        }
+    }
+
     // Authorize every live entry and tombstone that the merge adds or modifies before writing.
     for (id, entry) in &merged.devices {
         let previous = local.devices.get(id);
@@ -1638,7 +1834,7 @@ pub fn apply_devices_merge_blocking(
         }
     }
 
-    let warnings = reconcile_device_principals_locked(paths, &merged)?;
+    let mut warnings = reconcile_device_principals_locked(paths, &merged)?;
     let canonical = save_devices_locked(paths, &merged)?;
     let backup = had_existing_file.then(|| {
         paths
@@ -1652,19 +1848,20 @@ pub fn apply_devices_merge_blocking(
 
     let exe = legion_core::current_exe()?;
     let shell = ForcedCommandShell::host()?;
-    let mut removed_device_names =
-        edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
-            let (changed, removed) = reconcile_authorized_keys_in_memory(
-                &mut auth_keys,
-                &merged,
-                paths,
-                &target,
-                caller_account.as_deref(),
-                &exe,
-                shell,
-            )?;
-            Ok((changed.then_some(auth_keys), removed))
-        })?;
+    let auth_report = edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+        let report = reconcile_authorized_keys_in_memory(
+            &mut auth_keys,
+            &merged,
+            paths,
+            &target,
+            caller_account.as_deref(),
+            &exe,
+            shell,
+        )?;
+        Ok((report.changed.then_some(auth_keys), report))
+    })?;
+    warnings.extend(auth_report.warnings);
+    let mut removed_device_names = auth_report.removed_device_names;
 
     // Also include names of any previously live devices that just became tombstoned so live
     // sessions are terminated even if their authorized_keys line was already gone.
