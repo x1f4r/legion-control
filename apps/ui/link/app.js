@@ -16,6 +16,7 @@ function invoke(command, payload) {
       message: 'The native Legion shell is not available in this window.',
       hint: null,
       machine: null,
+      details: null,
     });
   }
   return core.invoke(command, payload);
@@ -28,6 +29,7 @@ function normalizeError(err) {
       message: err.message,
       hint: err.hint || null,
       machine: err.machine || null,
+      details: err.details || null,
     };
   }
   return {
@@ -35,13 +37,14 @@ function normalizeError(err) {
     message: typeof err === 'string' ? err : 'The native command failed.',
     hint: null,
     machine: null,
+    details: null,
   };
 }
 
 export function createAppLink() {
   let nextCallId = 1;
 
-  async function state() {
+  async function rawState() {
     try {
       return await invoke('state');
     } catch (err) {
@@ -62,9 +65,8 @@ export function createAppLink() {
     const id = `c${nextCallId++}`;
     const core = tauriCore();
 
-    let channel = null;
-    if (typeof onEvent === 'function' && core && typeof core.Channel === 'function') {
-      channel = new core.Channel();
+    const channel = core && typeof core.Channel === 'function' ? new core.Channel() : null;
+    if (channel && typeof onEvent === 'function') {
       channel.onmessage = (evt) => {
         try {
           onEvent(evt);
@@ -84,6 +86,7 @@ export function createAppLink() {
           message: 'The call was cancelled.',
           hint: null,
           machine: null,
+          details: null,
         };
       }
       signal.addEventListener('abort', onAbort, { once: true });
@@ -107,6 +110,43 @@ export function createAppLink() {
     }
   }
 
+  async function state() {
+    const base = await rawState();
+    if (!base?.ready || !Array.isArray(base.nodes) || base.nodes.length === 0) {
+      return base;
+    }
+
+    try {
+      const [whoami, version] = await Promise.all([
+        call('meta.whoami', {}),
+        call('meta.version', {}).catch(() => null),
+      ]);
+      // Re-read backend state in case failover switched the active node during the probe.
+      const latest = await rawState().catch(() => base);
+      const nodes = Array.isArray(latest?.nodes) && latest.nodes.length > 0 ? latest.nodes : base.nodes;
+      const primary = nodes[0];
+      const enriched = {
+        ...primary,
+        node: whoami.node || primary.node,
+        principal: whoami.principal || primary.principal,
+        role: whoami.role || primary.role,
+        version: version?.version || '',
+        build: version?.build || null,
+        protocol: version?.protocol ?? 1,
+        whoami,
+      };
+      return {
+        ...latest,
+        nodes: [enriched, ...nodes.slice(1)],
+      };
+    } catch (err) {
+      return {
+        ...base,
+        error: normalizeError(err),
+      };
+    }
+  }
+
   async function deviceName() {
     try {
       const name = await invoke('device_name');
@@ -118,7 +158,7 @@ export function createAppLink() {
 
   async function pair(inviteText, name) {
     try {
-      await invoke('pair', { inviteText, deviceName: name });
+      await invoke('pair', { invite: inviteText, name: name || null });
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -128,6 +168,15 @@ export function createAppLink() {
   async function unpair(node) {
     try {
       return await invoke('unpair', { node });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function selectNode(node) {
+    try {
+      await invoke('select_node', { node });
+      return await state();
     } catch (err) {
       throw normalizeError(err);
     }
@@ -159,6 +208,7 @@ export function createAppLink() {
     deviceName,
     pair,
     unpair,
+    selectNode,
     scanInvite,
   };
 }

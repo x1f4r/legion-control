@@ -50,12 +50,24 @@ function createBrowserCache() {
   }
 }
 
+function isPairingError(err) {
+  const reason = err?.details?.reason;
+  return err?.code === 'denied' && (reason === 'auth_failed' || reason === 'host_key_mismatch');
+}
+
 async function fetchFleetSnapshot(link, localNode) {
+  let fatalError = null;
+  const capture = (fallback) => (err) => {
+    if (isPairingError(err) && !fatalError) fatalError = err;
+    return fallback;
+  };
+
   const [fleetList, fleetPing, localVersion] = await Promise.all([
-    link.call('fleet.list', {}).catch(() => ({ node: localNode, machines: [] })),
-    link.call('fleet.ping', {}).catch(() => ({ results: [] })),
-    link.call('meta.version', {}).catch(() => null),
+    link.call('fleet.list', {}).catch(capture({ node: localNode, machines: [] })),
+    link.call('fleet.ping', {}).catch(capture({ results: [] })),
+    link.call('meta.version', {}).catch(capture(null)),
   ]);
+  if (fatalError) throw fatalError;
 
   const here = fleetList?.node || localNode;
   const listedMap = new Map();
@@ -295,6 +307,7 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [confirmRequest, setConfirmRequest] = useState(null);
   const [runHistory, setRunHistory] = useState([]);
+  const [pairingOpen, setPairingOpen] = useState(false);
   const sheetHistoryRef = useRef(false);
 
   const nodeInfo = linkState?.nodes?.[0] || null;
@@ -356,6 +369,14 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const onOpenPairing = () => {
+      if (link.kind === 'app') setPairingOpen(true);
+    };
+    window.addEventListener('legion:open-pairing', onOpenPairing);
+    return () => window.removeEventListener('legion:open-pairing', onOpenPairing);
+  }, [link]);
+
   const refreshFleet = useCallback(
     async (activeNodeInfo) => {
       const targetNode = activeNodeInfo || nodeInfoRef.current;
@@ -379,6 +400,11 @@ function App() {
     async (nextState) => {
       setLinkState(nextState);
       if (!nextState?.ready) {
+        setBooting(false);
+        return;
+      }
+      if (nextState.error) {
+        setFleetError(nextState.error);
         setBooting(false);
         return;
       }
@@ -570,12 +596,17 @@ function App() {
               <main class="main"><div class="empty">Connecting…</div></main>
             </div>
           `
-        : !linkState?.ready
+        : !linkState?.ready || pairingOpen
           ? html`
               <${StartView}
                 link=${link}
                 linkState=${linkState}
-                onConnected=${(next) => hydrate(next)}
+                onCancel=${linkState?.ready ? () => setPairingOpen(false) : null}
+                onConnected=${(next) => {
+                  setPairingOpen(false);
+                  setFleetError(null);
+                  hydrate(next);
+                }}
               />
             `
           : html`
@@ -635,12 +666,24 @@ function App() {
                               theme=${theme}
                               onChangeTheme=${setTheme}
                               onRequestConfirm=${openConfirm}
+                              onOpenPairing=${link.kind === 'app' ? () => setPairingOpen(true) : null}
+                              onSelectNode=${
+                                link.kind === 'app' && typeof link.selectNode === 'function'
+                                  ? async (node) => {
+                                      cache.clear();
+                                      setSnapshot(null);
+                                      setTools([]);
+                                      const next = await link.selectNode(node);
+                                      await hydrate(next);
+                                    }
+                                  : null
+                              }
                               onDisconnected=${async () => {
                                 cache.clear();
                                 setSnapshot(null);
                                 setTools([]);
                                 const st = await link.state();
-                                setLinkState(st);
+                                await hydrate(st);
                               }}
                             />
                           `}

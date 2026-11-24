@@ -1,15 +1,24 @@
 // First-start screen: bearer token entry for HTTP, or device pairing for the native app.
 
-import { html, useEffect, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
+import { Icon } from '../icons.js';
 import { CopyButton, Notice } from './common.js';
 
-export function StartView({ link, linkState, onConnected }) {
+export function StartView({ link, linkState, onConnected, onCancel }) {
   const [token, setToken] = useState('');
   const [invite, setInvite] = useState('');
   const [deviceName, setDeviceName] = useState('');
   const [pasteOpen, setPasteOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(linkState?.error || null);
+  const inviteInputRef = useRef(null);
+
+  useEffect(() => {
+    if (pasteOpen && inviteInputRef.current) {
+      inviteInputRef.current.focus();
+      inviteInputRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [pasteOpen]);
 
   const nodeName = linkState?.health?.node || 'this machine';
   const needsPairing = linkState?.needs === 'pairing' || link.kind === 'app';
@@ -83,6 +92,13 @@ export function StartView({ link, linkState, onConnected }) {
     return html`
       <div class="app">
         <header class="bar">
+          ${onCancel
+            ? html`
+                <button type="button" class="btn icon back" aria-label="Back" onClick=${onCancel}>
+                  <${Icon} name="back" />
+                </button>
+              `
+            : null}
           <h1 class="wordmark"><b>▍</b>Legion</h1>
         </header>
         <main class="main">
@@ -122,6 +138,7 @@ export function StartView({ link, linkState, onConnected }) {
                   <label class="field">
                     <span>Invite</span>
                     <textarea
+                      ref=${inviteInputRef}
                       value=${invite}
                       onInput=${(e) => setInvite(e.target.value)}
                       placeholder="Paste the invite line from legion pair"
