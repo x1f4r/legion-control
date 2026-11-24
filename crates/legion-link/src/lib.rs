@@ -10,8 +10,9 @@
 //! `legion-core`). The `legion` node binary depends on `legion-link` with default features only so
 //! `russh` is never compiled into the node binary.
 //!
-//! - **`ssh`**: adds [`DeviceKey`], [`ssh::open`], [`ssh::open_raw`], and [`enrol`] using `russh`.
-//! - **`local`**: adds [`local::open_local_session`] for desktop apps that spawn a local `legion
+//! - **`ssh`**: adds `DeviceKey`, `ssh::open`, `ssh::open_raw`, `enrol`, and `Link::pair` using
+//!   `russh`.
+//! - **`local`**: adds `local::open_local_session` for desktop apps that spawn a local `legion
 //!   rpc` child process.
 //! - **`schemars`**: derives `JsonSchema` on [`RemoteOs`] for `legion-net`.
 //!
@@ -36,10 +37,46 @@
 //! - **`call` (fan-out via `on`)**: `{"results": {"<machine>": {"ok": {...}} | {"error": ErrorBody}}}`.
 //! - **`events` callback**: `{"kind": "stdout"|"stderr"|"progress"|"log", "data": ..., "machine"?: "..."}`.
 //! - **Errors**: [`legion_proto::ErrorBody`] (`{"code", "message", "hint"?, "machine"?, "details"?}`).
-//!   Because [`legion_proto::ErrorCode`] is a closed 13-code wire set, SSH-specific rejections use
-//!   `code: "denied"` with `details.reason` set to `"host_key_mismatch"` (plus `details.offered`)
-//!   or `"auth_failed"`, while connect timeouts and unreachable hosts reuse `code: "timeout"` and
-//!   `code: "unreachable"`.
+//!
+//! # Stable error reasons
+//!
+//! Because [`legion_proto::ErrorCode`] is a closed 13-code wire set, callers and GUIs can branch
+//! on `error.details.reason` without parsing human-readable `message` text. The stable reason
+//! strings exported as crate-root constants are:
+//!
+//! - **`"device_removed_or_unknown"`** ([`REASON_DEVICE_REMOVED_OR_UNKNOWN`], `code: "denied"`):
+//!   emitted by [`Link`] when SSH public-key authentication to a paired node is rejected — for
+//!   example because the device was removed on the node (`legion device.remove`) or is unknown to
+//!   it. Preserves `details.host`, `details.port`, and `details.user` when available, and includes
+//!   a `hint` instructing the user to pair the device again.
+//! - **`"auth_failed"`** ([`REASON_AUTH_FAILED`], `code: "denied"`): emitted by low-level
+//!   `ssh::open` / `ssh::open_raw` and by `enrol` / `Link::pair` when SSH public-key
+//!   authentication is rejected (during pairing, usually because the single-use invite expired or
+//!   was already consumed).
+//! - **`"host_key_mismatch"`** ([`REASON_HOST_KEY_MISMATCH`], `code: "denied"`): the server
+//!   offered a host key that did not match any pinned key in `host_keys`. Includes `details.host`,
+//!   `details.port`, and either `details.offered` / `details.expected` SHA-256 fingerprints or
+//!   `details.offered_algorithms` / `details.pinned_algorithms`.
+//! - **`"timeout"`** ([`REASON_TIMEOUT`], `code: "timeout"`): DNS lookup, TCP connect, or SSH
+//!   handshake timed out. Includes `details.host` and `details.port` when a single host failed.
+//! - **`"unreachable"`** ([`REASON_UNREACHABLE`], `code: "unreachable"`): DNS lookup failed, TCP
+//!   connection was refused or errored, or the SSH transport or channel failed. Includes
+//!   `details.host` and `details.port` when a single host failed.
+//! - **`"non_protocol_output"`** ([`REASON_NON_PROTOCOL_OUTPUT`], `code: "unreachable"`): the
+//!   remote command emitted too much non-JSON-RPC output before answering `hello` (for example a
+//!   noisy login shell profile or an unexpected forced command).
+//!
+//! # Troubleshooting
+//!
+//! ## Android 17 local-network permission
+//!
+//! Android 17 blocks an app's outbound sockets to local/LAN addresses and the CGNAT range
+//! (`100.64.0.0/10`, used by overlay networks such as Tailscale) until the app holds the
+//! local-network permission. From `legion-link`'s side, blocked connections do not report a
+//! distinct OS permission error — they surface as connect timeouts (`code: "timeout"`,
+//! `details.reason: "timeout"`). Android apps embedding `legion-link` should request the
+//! local-network permission before connecting, or prompt the user to grant it when local or CGNAT
+//! nodes time out.
 
 pub mod command;
 pub mod invite;
