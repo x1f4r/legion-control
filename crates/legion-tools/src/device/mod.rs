@@ -747,6 +747,33 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         let pairing_id = match &selector {
             SelectBy::Id(id) => {
                 let Some(entry) = devices_file.devices.get(id) else {
+                    let auth_keys = authkeys::read_auth_keys(&write_path)?;
+                    let is_local_only = auth_keys.lines.iter().any(|line| {
+                        matches!(
+                            &line.kind,
+                            LineKind::Device { pairing_id: pid, principal, home, account, .. }
+                                if pid == id
+                                    && caller.may_manage(principal)
+                                    && line_matches_home(home.as_ref(), &paths)
+                                    && line_matches_account(
+                                        account.as_deref(),
+                                        caller_account.as_deref(),
+                                        target.windows_admin_acl,
+                                        cfg!(windows),
+                                    )
+                        )
+                    });
+                    if is_local_only {
+                        return Err(ErrorBody::new(
+                            ErrorCode::InvalidArgs,
+                            format!(
+                                "Device with id {id} is local-only (present in authorized_keys but not in devices.toml) and cannot be modified with device.set."
+                            ),
+                        )
+                        .with_hint(
+                            "Pair this device again with `legion pair` to manage it across the fleet, or remove it with `legion device.remove`.",
+                        ));
+                    }
                     return Err(ErrorBody::new(
                         ErrorCode::NotFound,
                         format!("There is no paired device with id {id}."),
@@ -770,6 +797,33 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                     .collect();
                 match matches.len() {
                     0 => {
+                        let auth_keys = authkeys::read_auth_keys(&write_path)?;
+                        let is_local_only = auth_keys.lines.iter().any(|line| {
+                            matches!(
+                                &line.kind,
+                                LineKind::Device { name: line_name, principal, home, account, .. }
+                                    if line_name == name
+                                        && caller.may_manage(principal)
+                                        && line_matches_home(home.as_ref(), &paths)
+                                        && line_matches_account(
+                                            account.as_deref(),
+                                            caller_account.as_deref(),
+                                            target.windows_admin_acl,
+                                            cfg!(windows),
+                                        )
+                            )
+                        });
+                        if is_local_only {
+                            return Err(ErrorBody::new(
+                                ErrorCode::InvalidArgs,
+                                format!(
+                                    "Device {name} is local-only (present in authorized_keys but not in devices.toml) and cannot be modified with device.set."
+                                ),
+                            )
+                            .with_hint(
+                                "Pair this device again with `legion pair` to manage it across the fleet, or remove it with `legion device.remove`.",
+                            ));
+                        }
                         return Err(ErrorBody::new(
                             ErrorCode::NotFound,
                             format!("There is no paired device called {name}."),
@@ -955,6 +1009,8 @@ struct ListedDevice {
     #[serde(skip_serializing_if = "is_false")]
     foreign: bool,
     #[serde(skip_serializing_if = "is_false")]
+    local_only: bool,
+    #[serde(skip_serializing_if = "is_false")]
     missing_home: bool,
 }
 
@@ -1080,6 +1136,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     status,
                     home: None,
                     foreign: false,
+                    local_only: false,
                     missing_home: false,
                 }
             })
@@ -1109,6 +1166,29 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     let is_this_home = line_matches_home(home.as_ref(), &paths)
                         || (home.is_none() && state.devices.contains_key(name));
                     if is_this_home {
+                        if devices_file.devices.contains_key(pairing_id) {
+                            continue;
+                        }
+                        let fingerprint =
+                            fingerprint_key_b64(key_b64).unwrap_or_else(|| "unknown".to_owned());
+                        let effective_role = policy.role_of(principal).0;
+                        devices.push(ListedDevice {
+                            id: Some(pairing_id.clone()),
+                            name: name.clone(),
+                            principal: principal.clone(),
+                            role: Some(effective_role),
+                            fingerprint,
+                            added: None,
+                            paired_on: None,
+                            status: Some(
+                                "local-only: present in authorized_keys but not in devices.toml and never synced to peers; pair again with `legion pair` or remove with `legion device.remove`"
+                                    .to_owned(),
+                            ),
+                            home: None,
+                            foreign: false,
+                            local_only: true,
+                            missing_home: false,
+                        });
                         continue;
                     }
                     if !caller_is_owner {
@@ -1128,6 +1208,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                         status: None,
                         home: home.as_ref().map(PinnedHome::display_label),
                         foreign: true,
+                        local_only: false,
                         missing_home,
                     });
                 }
@@ -1558,6 +1639,113 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
 
                 match &target_item {
                     RemoveTarget::DeviceName(name) if !remove_foreign => {
+                        // First check local-only device lines belonging to THIS home/account (not in devices.toml).
+                        let mut local_only_matches: Vec<(String, String)> = Vec::new();
+                        for line in &auth_keys.lines {
+                            if let LineKind::Device {
+                                name: line_name,
+                                principal,
+                                pairing_id: pid,
+                                home,
+                                account,
+                                ..
+                            } = &line.kind
+                                && line_name == name
+                                && !devices_file.devices.contains_key(pid)
+                                && caller.may_manage(principal)
+                                && line_matches_home(home.as_ref(), &paths)
+                                && line_matches_account(
+                                    account.as_deref(),
+                                    caller_account.as_deref(),
+                                    target.windows_admin_acl,
+                                    cfg!(windows),
+                                )
+                                && !local_only_matches.iter().any(|(id, _)| id == pid)
+                            {
+                                local_only_matches.push((pid.clone(), principal.clone()));
+                            }
+                        }
+                        if local_only_matches.len() > 1 {
+                            let ids: Vec<&str> = local_only_matches
+                                .iter()
+                                .map(|(id, _)| id.as_str())
+                                .collect();
+                            let err = ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "Multiple local-only devices are named {name} (pairing ids: {}).",
+                                    ids.join(", ")
+                                ),
+                            )
+                            .with_hint(
+                                "Pass `id=<pairing_id>` from `device.list` to choose which one to remove.",
+                            );
+                            return Ok((
+                                swept_auth.then_some(auth_keys),
+                                (
+                                    Err(err),
+                                    swept_state.then_some(state),
+                                    adopted_new.then_some(devices_file),
+                                    Vec::new(),
+                                ),
+                            ));
+                        }
+                        if let Some((pid, principal)) = local_only_matches.into_iter().next() {
+                            let mut removed_count = 0usize;
+                            auth_keys.retain(|line| {
+                                let drop_it = matches!(
+                                    &line.kind,
+                                    LineKind::Device {
+                                        name: line_name,
+                                        pairing_id: line_pid,
+                                        home,
+                                        account,
+                                        ..
+                                    } if line_name == name
+                                        && line_pid == &pid
+                                        && line_matches_home(home.as_ref(), &paths)
+                                        && line_matches_account(
+                                            account.as_deref(),
+                                            caller_account.as_deref(),
+                                            target.windows_admin_acl,
+                                            cfg!(windows),
+                                        )
+                                );
+                                if drop_it {
+                                    removed_count += 1;
+                                }
+                                !drop_it
+                            });
+                            return Ok((
+                                Some(auth_keys),
+                                (
+                                    Ok((
+                                        Removed {
+                                            kind: "device",
+                                            name: Some(name.clone()),
+                                            id: Some(pid.clone()),
+                                            principal,
+                                            removed: true,
+                                            lines_removed: removed_count,
+                                            sessions_ended: 0,
+                                            sessions_not_ended: false,
+                                            jobs_left_running: Vec::new(),
+                                            fleet: BTreeMap::new(),
+                                            still_trusted_by: Vec::new(),
+                                            hint: None,
+                                        },
+                                        Some(sessions::SessionTarget::new(
+                                            name.clone(),
+                                            Some(pid),
+                                        )),
+                                    )),
+                                    swept_state.then_some(state),
+                                    adopted_new.then_some(devices_file),
+                                    Vec::new(),
+                                ),
+                            ));
+                        }
+
                         let visible_entries: Vec<(&String, &registry::FleetDevice)> = devices_file
                             .devices
                             .iter()
@@ -1732,6 +1920,88 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                         ))
                     }
                     RemoveTarget::Id(id) => {
+                        // First check local-only device lines belonging to THIS home/account by pairing id.
+                        if !remove_foreign {
+                            let local_only_match = auth_keys.lines.iter().find_map(|line| {
+                                match &line.kind {
+                                    LineKind::Device {
+                                        name: line_name,
+                                        principal,
+                                        pairing_id: line_pid,
+                                        home,
+                                        account,
+                                        ..
+                                    } if line_pid == id
+                                        && !devices_file.devices.contains_key(line_pid)
+                                        && caller.may_manage(principal)
+                                        && line_matches_home(home.as_ref(), &paths)
+                                        && line_matches_account(
+                                            account.as_deref(),
+                                            caller_account.as_deref(),
+                                            target.windows_admin_acl,
+                                            cfg!(windows),
+                                        ) =>
+                                    {
+                                        Some((line_name.clone(), principal.clone()))
+                                    }
+                                    _ => None,
+                                }
+                            });
+                            if let Some((dev_name, principal)) = local_only_match {
+                                let mut removed_count = 0usize;
+                                auth_keys.retain(|line| {
+                                    let drop_it = matches!(
+                                        &line.kind,
+                                        LineKind::Device {
+                                            pairing_id: line_pid,
+                                            home,
+                                            account,
+                                            ..
+                                        } if line_pid == id
+                                            && line_matches_home(home.as_ref(), &paths)
+                                            && line_matches_account(
+                                                account.as_deref(),
+                                                caller_account.as_deref(),
+                                                target.windows_admin_acl,
+                                                cfg!(windows),
+                                            )
+                                    );
+                                    if drop_it {
+                                        removed_count += 1;
+                                    }
+                                    !drop_it
+                                });
+                                return Ok((
+                                    Some(auth_keys),
+                                    (
+                                        Ok((
+                                            Removed {
+                                                kind: "device",
+                                                name: Some(dev_name.clone()),
+                                                id: Some(id.clone()),
+                                                principal,
+                                                removed: true,
+                                                lines_removed: removed_count,
+                                                sessions_ended: 0,
+                                                sessions_not_ended: false,
+                                                jobs_left_running: Vec::new(),
+                                                fleet: BTreeMap::new(),
+                                                still_trusted_by: Vec::new(),
+                                                hint: None,
+                                            },
+                                            Some(sessions::SessionTarget::new(
+                                                dev_name,
+                                                Some(id.clone()),
+                                            )),
+                                        )),
+                                        swept_state.then_some(state),
+                                        adopted_new.then_some(devices_file),
+                                        Vec::new(),
+                                    ),
+                                ));
+                            }
+                        }
+
                         let mut visible_ids: Vec<String> = Vec::new();
                         let mut foreign_match_home: Option<String> = None;
                         let mut matched_principal: Option<String> = None;
@@ -3741,5 +4011,181 @@ allow = ["effect:read", "effect:write"]
             !marker_session.exists(),
             "session termination/sweep must run whenever devices.toml was saved, even if authorized_keys update fails"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_adoption_requires_matching_state_and_keeps_unmatched_lines_local_only() {
+        use crate::device::authkeys::{ForcedCommandShell, PinnedHome, format_device_line};
+        use crate::device::keys::{ed25519_public_key_from_seed, validate_ed25519_public_key};
+        use crate::device::registry::verify_gate_device;
+        use crate::device::store::{DeviceRecord, DevicesState, save_state};
+
+        let h = Harness::new();
+        let exe = legion_core::current_exe().unwrap();
+        let shell = ForcedCommandShell::host().unwrap();
+        let pinned_home = PinnedHome::from_paths(h.node.paths());
+
+        let adopted_id = "11".repeat(16);
+        let adopted_key = ed25519_public_key_from_seed(&[11u8; 32]);
+        let adopted_fp = validate_ed25519_public_key(&adopted_key).unwrap().fingerprint;
+
+        let local_only_id = "22".repeat(16);
+        let local_only_key = ed25519_public_key_from_seed(&[22u8; 32]);
+
+        let mismatch_id = "33".repeat(16);
+        let mismatch_key = ed25519_public_key_from_seed(&[33u8; 32]);
+        let wrong_fp = validate_ed25519_public_key(&ed25519_public_key_from_seed(&[44u8; 32]))
+            .unwrap()
+            .fingerprint;
+
+        let line_adopted = format_device_line(
+            &exe,
+            "phone",
+            &adopted_key,
+            "matched-phone",
+            &adopted_id,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        let line_local = format_device_line(
+            &exe,
+            "phone",
+            &local_only_key,
+            "untracked-phone",
+            &local_only_id,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        let line_mismatch = format_device_line(
+            &exe,
+            "phone",
+            &mismatch_key,
+            "mismatch-phone",
+            &mismatch_id,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        std::fs::write(
+            &h.auth_keys,
+            format!("{line_adopted}\n{line_local}\n{line_mismatch}\n"),
+        )
+        .unwrap();
+
+        // Populate state/devices.json with an exact match for `matched-phone` and a mismatched
+        // fingerprint for `mismatch-phone`, and nothing for `untracked-phone`.
+        let mut state = DevicesState::default();
+        state.devices.insert(
+            "matched-phone".to_owned(),
+            DeviceRecord {
+                name: "matched-phone".to_owned(),
+                principal: "phone".to_owned(),
+                added: "2026-11-24T10:00:00Z".to_owned(),
+                fingerprint: adopted_fp,
+                pairing_id: Some(adopted_id.clone()),
+            },
+        );
+        state.devices.insert(
+            "mismatch-phone".to_owned(),
+            DeviceRecord {
+                name: "mismatch-phone".to_owned(),
+                principal: "phone".to_owned(),
+                added: "2026-11-24T10:00:00Z".to_owned(),
+                fingerprint: wrong_fp,
+                pairing_id: Some(mismatch_id.clone()),
+            },
+        );
+        save_state(h.node.paths(), &state).unwrap();
+
+        let listed = h.call("device.list", json!({})).await.unwrap();
+
+        // Only `matched-phone` may be adopted into devices.toml.
+        let saved: DevicesFile = legion_core::config::parse(
+            &h.node.paths().config_file("devices.toml"),
+            &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.devices.contains_key(&adopted_id));
+        assert!(
+            !saved.devices.contains_key(&local_only_id),
+            "untracked line must NOT be adopted into devices.toml"
+        );
+        assert!(
+            !saved.devices.contains_key(&mismatch_id),
+            "mismatched-fingerprint line must NOT be adopted into devices.toml"
+        );
+
+        // Both unmatched lines stay intact in authorized_keys and keep working locally.
+        let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(auth_text.contains("legion-device:untracked-phone"), "{auth_text}");
+        assert!(auth_text.contains("legion-device:mismatch-phone"), "{auth_text}");
+
+        let node_file = h.node.config().get::<NodeFile>().unwrap();
+        verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            "untracked-phone",
+            &local_only_id,
+            "phone",
+            None,
+        )
+        .expect("local-only line must continue working locally via legion gate");
+
+        // `device.list` shows unmatched lines as local_only with a hint to pair again or remove.
+        let devices = listed["devices"].as_array().unwrap();
+        let untracked = devices
+            .iter()
+            .find(|d| d["name"] == json!("untracked-phone"))
+            .expect("untracked-phone must appear in device.list");
+        assert_eq!(untracked["local_only"], json!(true), "{untracked}");
+        assert!(
+            untracked["status"]
+                .as_str()
+                .is_some_and(|s| s.contains("local-only") && s.contains("remove")),
+            "{untracked}"
+        );
+
+        // `device.set` refuses local-only lines cleanly.
+        let set_err = h
+            .call(
+                "device.set",
+                json!({"name": "untracked-phone", "rename": "renamed"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            set_err.message.contains("local-only")
+                || set_err
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("legion pair")),
+            "{set_err:?}"
+        );
+
+        // `device.remove` removes a local-only line cleanly and gate immediately denies it.
+        let rem = h
+            .call("device.remove", json!({"name": "untracked-phone"}))
+            .await
+            .unwrap();
+        assert_eq!(rem["removed"], json!(true));
+        let auth_after = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(!auth_after.contains("legion-device:untracked-phone"));
+        let gate_err = verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            "untracked-phone",
+            &local_only_id,
+            "phone",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(gate_err.code, ErrorCode::Denied);
     }
 }

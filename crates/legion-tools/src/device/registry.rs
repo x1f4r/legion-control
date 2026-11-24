@@ -995,6 +995,7 @@ pub fn reconcile_device_principals_locked(
 /// device line), so reconciling a synced device never collides with an existing non-managed key.
 fn contains_non_owned_key_blob(
     auth_keys: &AuthKeysFile,
+    devices: &DevicesFile,
     wire_blob: &[u8],
     paths: &Paths,
     caller_account: Option<&str>,
@@ -1004,10 +1005,12 @@ fn contains_non_owned_key_blob(
     use base64::engine::general_purpose::STANDARD;
 
     for line in &auth_keys.lines {
-        let is_this_homes_device = matches!(
+        let is_registry_managed_line = matches!(
             &line.kind,
-            LineKind::Device { home, account, .. }
-                if line_matches_home(home.as_ref(), paths)
+            LineKind::Device { pairing_id, home, account, .. }
+                if (devices.devices.contains_key(pairing_id.as_str())
+                    || devices.removed.contains_key(pairing_id.as_str()))
+                    && line_matches_home(home.as_ref(), paths)
                     && line_matches_account(
                         account.as_deref(),
                         caller_account,
@@ -1015,7 +1018,7 @@ fn contains_non_owned_key_blob(
                         cfg!(windows),
                     )
         );
-        if is_this_homes_device {
+        if is_registry_managed_line {
             continue;
         }
         let key_matches = match &line.kind {
@@ -1036,6 +1039,10 @@ fn contains_non_owned_key_blob(
 
 /// Adopts legacy `--pairing <id>` device lines belonging to THIS home from `authorized_keys` into
 /// a [`DevicesFile`] during first-run migration (when `devices.toml` does not exist yet).
+///
+/// Only lines matching a record in this node's own `state/devices.json` (with equal `principal`,
+/// key `fingerprint`, and `pairing_id`) are adopted. Any other Legion-shaped line is left
+/// untouched as local-only and never becomes a fleet entry on its own.
 pub fn adopt_legacy_devices_from_auth_keys(
     paths: &Paths,
     node_name: &str,
@@ -1086,15 +1093,19 @@ pub fn adopt_legacy_devices_from_auth_keys(
         let Ok(validated_key) = validate_ed25519_public_key(&raw_key) else {
             continue;
         };
-        let paired_at = state
-            .devices
-            .get(name)
-            .and_then(|meta| {
-                meta.added
-                    .parse::<Timestamp>()
-                    .ok()
-                    .map(|_| meta.added.clone())
-            })
+        let Some(matched_state) = state.devices.values().find(|meta| {
+            meta.principal == *principal
+                && meta.fingerprint == validated_key.fingerprint
+                && meta.pairing_id.as_deref() == Some(pairing_id.as_str())
+        }) else {
+            // Unmatched Legion-shaped line stays local-only and is never adopted into devices.toml.
+            continue;
+        };
+        let paired_at = matched_state
+            .added
+            .parse::<Timestamp>()
+            .ok()
+            .map(|_| matched_state.added.clone())
             .unwrap_or_else(|| now_str.clone());
         let role = if principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
             && policy.principals.keys().any(|p| p.as_str() == principal)
@@ -1212,6 +1223,7 @@ pub fn inspect_device_key_conflicts(paths: &Paths, node_file: &NodeFile) -> Devi
             if let Some(blob) = validated_by_id.get(id)
                 && contains_non_owned_key_blob(
                     &auth_keys,
+                    &devices,
                     blob,
                     paths,
                     caller_account.as_deref(),
@@ -1308,7 +1320,8 @@ pub fn reconcile_authorized_keys_in_memory(
         let Some((canonical, wire_blob)) = validated_keys.get(id.as_str()) else {
             continue;
         };
-        if contains_non_owned_key_blob(auth_keys, wire_blob, paths, caller_account, target) {
+        if contains_non_owned_key_blob(auth_keys, devices, wire_blob, paths, caller_account, target)
+        {
             foreign_key_ids.insert(id.clone());
             warnings.push(format!(
                 "Device {} ({id}) is {FOREIGN_KEY_COLLISION_STATUS}.",
@@ -1353,6 +1366,13 @@ pub fn reconcile_authorized_keys_in_memory(
             return true;
         }
         if !line_matches_home(home.as_ref(), paths) {
+            return true;
+        }
+        if !devices.devices.contains_key(pairing_id.as_str())
+            && !devices.removed.contains_key(pairing_id.as_str())
+        {
+            // Local-only Legion-shaped line (never adopted into devices.toml and not tombstoned):
+            // keep it working locally byte-for-byte without promoting it to a fleet entry.
             return true;
         }
 
@@ -1561,6 +1581,35 @@ pub fn verify_gate_device(
     }
 
     let Some(entry) = devices.devices.get(pairing_id) else {
+        // If this pairing id is neither live nor tombstoned in `devices.toml`, check whether a
+        // matching local-only Legion-shaped line still exists on disk in `authorized_keys`.
+        let caller_account = caller_account_for_target(&target)?;
+        let auth_keys = read_auth_keys(&write_path)?;
+        let local_only_present = auth_keys.lines.iter().any(|line| {
+            matches!(
+                &line.kind,
+                LineKind::Device {
+                    name: line_name,
+                    principal: line_principal,
+                    pairing_id: line_pid,
+                    home,
+                    account: line_account,
+                    ..
+                } if line_pid == pairing_id
+                    && line_name == device_name
+                    && line_principal == principal
+                    && line_matches_home(home.as_ref(), paths)
+                    && line_matches_account(
+                        line_account.as_deref(),
+                        caller_account.as_deref(),
+                        target.windows_admin_acl,
+                        cfg!(windows),
+                    )
+            )
+        });
+        if local_only_present {
+            return Ok(Vec::new());
+        }
         let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
         return Err(ErrorBody::new(
             ErrorCode::Denied,
@@ -2435,10 +2484,12 @@ role = "editor"
 
         let foreign_line = format!("{} me@laptop", sample_key(99));
         let legacy_id = sample_id(7);
+        let legacy_key = sample_key(7);
+        let legacy_fp = validate_ed25519_public_key(&legacy_key).unwrap().fingerprint;
         let legacy_line = format_device_line(
             &exe,
             "phone",
-            &sample_key(7),
+            &legacy_key,
             "legacy-phone",
             &legacy_id,
             &PinnedHome::from_paths(&paths),
@@ -2447,6 +2498,18 @@ role = "editor"
         )
         .unwrap();
         std::fs::write(&auth_path, format!("{foreign_line}\n{legacy_line}\n")).unwrap();
+        let mut legacy_state = DevicesState::default();
+        legacy_state.devices.insert(
+            "legacy-phone".to_owned(),
+            crate::device::store::DeviceRecord {
+                name: "legacy-phone".to_owned(),
+                principal: "phone".to_owned(),
+                added: "2026-11-24T10:00:00Z".to_owned(),
+                fingerprint: legacy_fp,
+                pairing_id: Some(legacy_id.clone()),
+            },
+        );
+        crate::device::store::save_state(&paths, &legacy_state).unwrap();
 
         let mut node_file = NodeFile::default();
         node_file.devices.authorized_keys = Some(auth_path.display().to_string());

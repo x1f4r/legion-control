@@ -2926,14 +2926,26 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
     )
     .unwrap();
 
-    // Write a pre-existing legacy `--pairing` line on C with NO `devices.toml` on disk.
+    // Write two pre-existing legacy `--pairing` lines on C with NO `devices.toml` on disk:
+    // 1. `legacy-phone` WITH a matching `state/devices.json` record (must be adopted).
+    // 2. `untracked-local` WITHOUT a `state/devices.json` record (must stay local-only).
     let legacy_key = client_dir.path().join("legacy_c_key");
     let legacy_pub_raw =
         generate_ed25519_keypair(sshd_c.ssh_keygen_bin(), &legacy_key, "legacy@c").unwrap();
-    let legacy_pub = legion_tools::device::keys::validate_ed25519_public_key(&legacy_pub_raw)
-        .unwrap()
-        .canonical;
+    let legacy_validated =
+        legion_tools::device::keys::validate_ed25519_public_key(&legacy_pub_raw).unwrap();
+    let legacy_pub = legacy_validated.canonical;
     let legacy_pairing_id = "cccccccccccccccccccccccccccccccc";
+
+    let local_only_key = client_dir.path().join("local_only_c_key");
+    let local_only_pub_raw =
+        generate_ed25519_keypair(sshd_c.ssh_keygen_bin(), &local_only_key, "local@c").unwrap();
+    let local_only_pub =
+        legion_tools::device::keys::validate_ed25519_public_key(&local_only_pub_raw)
+            .unwrap()
+            .canonical;
+    let local_only_id = "dddddddddddddddddddddddddddddddd";
+
     let pinned_c = legion_tools::device::authkeys::PinnedHome::Root(home_c_root.clone());
     let shell = legion_tools::device::authkeys::ForcedCommandShell::host().unwrap();
     let legacy_line = legion_tools::device::authkeys::format_device_line(
@@ -2947,11 +2959,38 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
         shell,
     )
     .unwrap();
-    std::fs::write(
-        &auth_c,
-        format!("{}{legacy_line}\n", fleet_line(&home_c_root)),
+    let local_only_line = legion_tools::device::authkeys::format_device_line(
+        legion_bin,
+        "legacy_phone",
+        &local_only_pub,
+        "untracked-local",
+        local_only_id,
+        &pinned_c,
+        None,
+        shell,
     )
     .unwrap();
+    std::fs::write(
+        &auth_c,
+        format!(
+            "{}{legacy_line}\n{local_only_line}\n",
+            fleet_line(&home_c_root)
+        ),
+    )
+    .unwrap();
+    let mut c_state = legion_tools::device::store::DevicesState::default();
+    c_state.devices.insert(
+        "legacy-phone".to_owned(),
+        legion_tools::device::store::DeviceRecord {
+            name: "legacy-phone".to_owned(),
+            principal: "legacy_phone".to_owned(),
+            added: "2026-11-24T10:00:00Z".to_owned(),
+            fingerprint: legacy_validated.fingerprint,
+            pairing_id: Some(legacy_pairing_id.to_owned()),
+        },
+    );
+    let paths_c = legion_core::Paths::under(home_c_root.clone());
+    legion_tools::device::store::save_state(&paths_c, &c_state).unwrap();
     assert!(!home_c_root.join("config").join("devices.toml").exists());
 
     // Wire `c` into A's `fleet.toml` and pull `devices.toml` from C -> bidirectional merge adopts
@@ -3005,6 +3044,36 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
         json!("device:phone-offline")
     );
     assert_eq!(field_on_c["result"]["role"], json!("editor"));
-    // And C's devices.toml now exists on disk (adopted + merged).
+    // And C's devices.toml now exists on disk (adopted + merged), while untracked-local stayed
+    // local-only on C (working on C, refused on A, marked local_only in C's device.list).
     assert!(home_c_root.join("config").join("devices.toml").is_file());
+    let local_on_c = rpc_call_direct(
+        &local_only_key,
+        &fleet_kh_c,
+        sshd_c.port(),
+        sshd_c.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(local_on_c["result"]["node"], json!("c"), "{local_on_c}");
+    let local_refused_on_a = sshd_a
+        .ssh_command(&local_only_key, &fleet_kh_a)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !local_refused_on_a.status.success(),
+        "local-only line from C must never be adopted onto A"
+    );
+    let list_c = node_c.run(&["device.list"]).json();
+    assert!(
+        list_c["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == json!("untracked-local") && d["local_only"] == json!(true)),
+        "expected untracked-local marked local_only in C's device.list: {list_c}"
+    );
 }
