@@ -31,9 +31,9 @@ projects, services, power, and the fleet itself.
 - **Not a container or OS sandbox.** A role with the `exec` effect can run commands as the OS
   account `legion` runs under; real filesystem boundaries require a role without `exec` behind a
   door that pins the principal (a restricted SSH key or an HTTP bearer token).
-- **Not the older Node.js agent or GUI apps in this repository.** Those live beside the Rust
-  workspace and keep their own files under `~/.legion-control` and `~/.config/legion-control`.
-  Neither touches the other's configuration or state.
+- **Not the earlier Legion Control agent or apps.** Earlier releases remain under the repository's
+  tags; if an older installation is still on disk under `~/.legion-control` or
+  `~/.config/legion-control`, Legion does not read or touch its files.
 
 ## Two-minute tour
 

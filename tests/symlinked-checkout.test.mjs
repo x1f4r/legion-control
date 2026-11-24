@@ -5,7 +5,6 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { createSigningKey, signManifest } from '../scripts/release-integrity.mjs';
-import { edit, versionTree } from './fixtures/version-tree.mjs';
 
 const repository = path.resolve(import.meta.dirname, '..');
 
@@ -15,8 +14,9 @@ const repository = path.resolve(import.meta.dirname, '..');
 function linkedCheckout(t) {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-linked-'));
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
-  const root = versionTree(path.join(scratch, 'checkout'));
-  for (const script of ['check-versions.mjs', 'package-agent.mjs', 'release-integrity.mjs']) {
+  const root = path.join(scratch, 'checkout');
+  fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
+  for (const script of ['checkout-files.mjs', 'check-syntax.mjs', 'release-integrity.mjs']) {
     fs.copyFileSync(path.join(repository, 'scripts', script), path.join(root, 'scripts', script));
   }
   const link = path.join(scratch, 'link');
@@ -24,17 +24,6 @@ function linkedCheckout(t) {
   return { scratch, root, scripts: path.join(link, 'scripts') };
 }
 const run = (script, args = [], env = {}) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', env: { ...process.env, ...env } });
-
-test('check-versions run through a symlink checks its checkout and fails on a stale copy', (t) => {
-  const { root, scripts } = linkedCheckout(t);
-  const agreeing = run(path.join(scripts, 'check-versions.mjs'));
-  assert.equal(agreeing.status, 0, agreeing.stderr);
-  assert.equal(agreeing.stdout, 'Versions agree: agent 3.1.0 (floor 3.1.0), app 1.3.4 (build 14).\n');
-  edit(root, 'mac/Sources/LegionControlCore/AgentContract.swift', '"3.1.0"', '"3.0.1"');
-  const stale = run(path.join(scripts, 'check-versions.mjs'));
-  assert.equal(stale.status, 1);
-  assert.match(stale.stderr, /bundledAgentVersion = "3\.0\.1", but agent\/package\.json says 3\.1\.0/);
-});
 
 test('release-integrity run through a symlink verifies, and refuses another signer', (t) => {
   const { scratch, scripts } = linkedCheckout(t);
@@ -51,13 +40,14 @@ test('release-integrity run through a symlink verifies, and refuses another sign
   assert.match(other.stderr, /does not match the trusted key/);
 });
 
-test('package-agent run through a symlink packages, or says why it cannot', (t) => {
-  const { scratch, root, scripts } = linkedCheckout(t);
-  // No signing key in this home, so it stops there, before anything is written to dist/.
-  const home = path.join(scratch, 'home');
-  fs.mkdirSync(home);
-  const result = run(path.join(scripts, 'package-agent.mjs'), [], { HOME: home, USERPROFILE: home });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /Release signing key missing/);
-  assert.equal(fs.existsSync(path.join(root, 'dist')), false);
+test('check-syntax run through a symlink checks the checkout and fails on invalid syntax', (t) => {
+  const { root, scripts } = linkedCheckout(t);
+  assert.equal(spawnSync('git', ['init', '-q', root]).status, 0);
+  const ok = run(path.join(scripts, 'check-syntax.mjs'));
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /^Syntax checked 3 JavaScript files\.\n$/);
+  fs.writeFileSync(path.join(root, 'scripts', 'broken.mjs'), 'export const x = (;\n');
+  const bad = run(path.join(scripts, 'check-syntax.mjs'));
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /scripts\/broken\.mjs does not parse:/);
 });

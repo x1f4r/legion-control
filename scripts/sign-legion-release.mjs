@@ -5,7 +5,7 @@
 //
 //   node scripts/sign-legion-release.mjs <legion-vX.Y.Z> [--key PATH] [--public-key PATH] [--repo OWNER/REPO]
 //
-// Uses the same key locations as scripts/sign-release.mjs:
+// Key locations:
 //   private key: ~/.legion-control/release-signing.key
 //   public key:  contract/release-public-key.pem
 import { execFileSync } from 'node:child_process';
