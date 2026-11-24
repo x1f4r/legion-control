@@ -277,7 +277,8 @@ pub fn validate_machine_name(name: &str) -> Result<(), String> {
     NodeName::try_from(name.to_owned()).map(|_| ())
 }
 
-/// Checks that an SSH destination string cannot be mistaken for an option or carry control bytes.
+/// Checks that an SSH destination string cannot be mistaken for an option and contains only
+/// `[A-Za-z0-9._@:\[\]-]` as defence in depth against token expansion in a user's ssh config.
 pub fn validate_ssh_target(target: &str) -> Result<(), String> {
     if target.is_empty() {
         return Err("ssh target cannot be empty".to_owned());
@@ -287,12 +288,16 @@ pub fn validate_ssh_target(target: &str) -> Result<(), String> {
             "ssh target {target:?} cannot begin with `-`, which ssh would read as an option"
         ));
     }
-    if target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if let Some(bad) = target.chars().find(|&c| !is_safe_ssh_target_char(c)) {
         return Err(format!(
-            "ssh target {target:?} cannot contain spaces or control characters"
+            "ssh target {target:?} contains {bad:?}; only A-Z, a-z, 0-9, `.`, `_`, `@`, `:`, `[`, `]`, and `-` are allowed"
         ));
     }
     Ok(())
+}
+
+fn is_safe_ssh_target_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | ':' | '[' | ']' | '-')
 }
 
 /// Checks that a configured remote `program` needs no shell quoting on any supported shell.
@@ -959,10 +964,35 @@ command = ["docker", "exec", "-i", "box", "legion", "rpc"]
             assert!(validate_program(bad).is_err(), "{bad:?} was accepted");
         }
 
-        for ok in ["pi", "me@tower.example", "tower-win", "192.0.2.10"] {
+        for ok in [
+            "pi",
+            "me@tower.example",
+            "tower_1-win",
+            "192.0.2.10",
+            "[2001:db8::1]",
+            "me@[2001:db8::1]:2222",
+        ] {
             assert!(validate_ssh_target(ok).is_ok(), "{ok} was rejected");
         }
-        for bad in ["", "-", "-oProxyCommand=x", "host name", "a\nb", "a\tb"] {
+        for bad in [
+            "",
+            "-",
+            "-oProxyCommand=x",
+            "host name",
+            "a\nb",
+            "a\tb",
+            "host%h",
+            "me@%r.example",
+            "host$USER",
+            "host;id",
+            "host/path",
+            "host~1",
+            "host'q",
+            "host\"q",
+            "host*glob",
+            "host?x",
+            "höst.example",
+        ] {
             assert!(validate_ssh_target(bad).is_err(), "{bad:?} was accepted");
         }
 

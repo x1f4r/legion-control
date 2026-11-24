@@ -90,6 +90,10 @@ fn main() -> ExitCode {
             "fleet_tools_list_ping_add_remove_and_discover_permissions",
             fleet_tools_list_ping_add_remove_and_discover_permissions,
         ),
+        (
+            "pipe_handle_drop_is_non_blocking_and_kills_lingering_child",
+            pipe_handle_drop_is_non_blocking_and_kills_lingering_child,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -1910,3 +1914,49 @@ fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {
 
 #[cfg(not(unix))]
 fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {}
+
+fn pipe_handle_drop_is_non_blocking_and_kills_lingering_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pipe-drop.pid");
+    let hold_argv = helper_argv("hold", &[pid_file.to_string_lossy().into_owned()]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let elapsed = rt.block_on(async {
+        let pipe = legion_net::Pipe::spawn_command(&hold_argv, legion_net::Subcommand::Rpc)
+            .expect("spawn hold helper");
+        let deadline = Instant::now() + PATIENCE;
+        while !pid_file.exists() {
+            assert!(Instant::now() < deadline, "hold helper never wrote pid");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        drop(pipe);
+        let elapsed = started.elapsed();
+        #[cfg(unix)]
+        {
+            // Keep the runtime ticking briefly so Tokio's async child reaper reaps the killed
+            // child (an unreaped zombie still answers `kill -0`).
+            let pid: u32 = fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let reap_deadline = Instant::now() + Duration::from_secs(5);
+            while pid_alive(pid) {
+                assert!(
+                    Instant::now() < reap_deadline,
+                    "hold child {pid} survived PipeHandle::drop"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        elapsed
+    });
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "PipeHandle::drop blocked for {elapsed:?}"
+    );
+}
