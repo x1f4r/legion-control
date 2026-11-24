@@ -975,16 +975,30 @@ async fn hot_added_and_edited_files_are_picked_up_without_restart() {
         json!({"v": 1})
     );
 
-    // Edit in place (same length!) -> picked up on next call.
+    // Two writes within the same second of different sizes -> picked up on next call.
     let toml_v2 = format!(
-        "name = \"live.echo\"\ndescription = \"V2.\"\neffect = \"read\"\nrun = {}\n",
-        serde_json::to_string(&helper_argv("print", &["{\"v\":2}"])).unwrap()
+        "name = \"live.echo\"\ndescription = \"V2 updated.\"\neffect = \"read\"\nrun = {}\n",
+        serde_json::to_string(&helper_argv("print", &["{\"v\":22}"])).unwrap()
     );
     std::fs::write(&file, toml_v2).unwrap();
-    assert_eq!(fixture.node.spec("live.echo").unwrap().description, "V2.");
+    assert_eq!(
+        fixture.node.spec("live.echo").unwrap().description,
+        "V2 updated."
+    );
     assert_eq!(
         fixture.call("live.echo", json!({})).await.unwrap(),
-        json!({"v": 2})
+        json!({"v": 22})
+    );
+
+    let toml_v3 = format!(
+        "name = \"live.echo\"\ndescription = \"V3.\"\neffect = \"read\"\nrun = {}\n",
+        serde_json::to_string(&helper_argv("print", &["{\"v\":3}"])).unwrap()
+    );
+    std::fs::write(&file, toml_v3).unwrap();
+    assert_eq!(fixture.node.spec("live.echo").unwrap().description, "V3.");
+    assert_eq!(
+        fixture.call("live.echo", json!({})).await.unwrap(),
+        json!({"v": 3})
     );
 
     // Delete -> immediately gone.
