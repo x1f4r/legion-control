@@ -3,8 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use legion_proto::{ErrorBody, ErrorCode, FanOut, MachineOutcome, Target};
+use legion_proto::{Effect, ErrorBody, ErrorCode, FanOut, MachineOutcome, Target};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::node::{Call, Node};
 use crate::tool::BoxFuture;
@@ -64,6 +65,10 @@ impl RouteOutcome {
     }
 }
 
+/// Each machine a call would run on, with the effect its tool has there, or `None` where that
+/// cannot be established.
+pub type MachineEffects = Vec<(String, Option<Effect>)>;
+
 /// Runs a call on the machine or machines its `on` names.
 pub trait Router: Send + Sync + 'static {
     /// Runs `call` where `on` says: this node when `on` is absent.
@@ -73,6 +78,33 @@ pub trait Router: Send + Sync + 'static {
         call: Call,
         on: Option<Target>,
     ) -> BoxFuture<'a, RouteOutcome>;
+
+    /// The effect `tool` has on each machine a call sent where `on` says would run on, learned
+    /// the way this router learns it to authorise the call: from this node's spec when the call
+    /// runs here or the tool is built in, and otherwise from what the target reports. An effect
+    /// is `None` where it cannot be established, such as for a tool that exists only on a
+    /// machine this router cannot reach or asks through a relay. Nothing runs.
+    ///
+    /// Fails with the error the call itself would get when the tool is not on this node and the
+    /// call runs here, or when a target cannot be resolved or reached.
+    fn effects<'a>(
+        &'a self,
+        node: &'a Node,
+        tool: &'a str,
+        on: Option<&'a Target>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<MachineEffects, ErrorBody>> {
+        Box::pin(async move {
+            let here = node.name();
+            match on {
+                Some(target) if target.single() != Some(here.as_str()) => Ok(vec![(
+                    target.to_string(),
+                    node.registry().get(tool).map(|tool| tool.spec().effect),
+                )]),
+                _ => Ok(vec![(here, Some(node.spec(tool)?.effect))]),
+            }
+        })
+    }
 
     /// Closes any open remote sessions cleanly (EOF, short wait, then kill) before the process
     /// exits.

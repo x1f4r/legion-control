@@ -367,10 +367,12 @@ replaced by their size.
   (`fs_read`), every tool gains the optional `on` argument, and effects become the standard
   annotations (`readOnlyHint` for `read`, `destructiveHint` for every other effect). A failed
   call is a result with `isError` and the same error object as text, so the agent can read the
-  code and the hint. `--compact` serves three tools instead (`legion_tools`, `legion_describe`,
-  `legion_call`) for agents that should not carry dozens of schemas in their context. Two revisions
-  of the protocol are in use, one with an `initialize` handshake and one without; the official
-  SDK (`rmcp`) speaks both, so the door is built on it rather than written by hand.
+  code and the hint. `--compact` serves four tools instead (`legion_tools`, `legion_describe`,
+  `legion_read` and `legion_call`) for agents that should not carry dozens of schemas in their
+  context; `legion_read` runs only tools whose effect is `read` and is annotated read-only, so a
+  client that approves read-only tools by itself can use it, while `legion_call` runs any. Two
+  revisions of the protocol are in use, one with an `initialize` handshake and one without; the
+  official SDK (`rmcp`) speaks both, so the door is built on it rather than written by hand.
 - **HTTP.** `legion serve` listens on a loopback address only (`127.0.0.1:7117` by default) and
   refuses any other: `GET /v1/health` (without a token), `GET /v1/tools`, `POST /v1/call` (with
   optional `Accept: text/event-stream` for live events), and streamable-HTTP MCP at `/mcp`

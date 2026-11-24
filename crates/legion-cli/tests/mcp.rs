@@ -471,7 +471,7 @@ deny = ["meta.doctor"]
 }
 
 #[test]
-fn compact_mode_serves_three_tools_that_reach_every_other() {
+fn compact_mode_serves_four_tools_that_reach_every_other() {
     let home = Home::new();
     for inline in [false, true] {
         let mut mcp = if inline {
@@ -481,7 +481,36 @@ fn compact_mode_serves_three_tools_that_reach_every_other() {
         };
         assert_eq!(
             mcp.tool_names(),
-            ["legion_tools", "legion_describe", "legion_call"]
+            [
+                "legion_tools",
+                "legion_describe",
+                "legion_read",
+                "legion_call"
+            ]
+        );
+        // Only legion_call may change anything; legion_read promises it does not.
+        let listed = mcp.request("tools/list", json!({}));
+        let hints: Vec<_> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                let a = &tool["annotations"];
+                (
+                    a["readOnlyHint"].clone(),
+                    a["destructiveHint"].clone(),
+                    a["idempotentHint"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                (json!(true), Value::Null, Value::Null),
+                (json!(true), Value::Null, Value::Null),
+                (json!(true), json!(false), json!(true)),
+                (json!(false), json!(true), Value::Null),
+            ]
         );
 
         let all = ok(&mcp.call("legion_tools", json!({})));
@@ -534,6 +563,11 @@ fn compact_mode_serves_three_tools_that_reach_every_other() {
         let direct = failed(&mcp.call("meta_version", json!({})));
         assert_eq!(direct["code"], json!("unknown_tool"));
         assert!(
+            direct["hint"].as_str().unwrap().contains("legion_read"),
+            "{direct}"
+        );
+        let direct = failed(&mcp.call("exec_run", json!({})));
+        assert!(
             direct["hint"].as_str().unwrap().contains("legion_call"),
             "{direct}"
         );
@@ -541,6 +575,151 @@ fn compact_mode_serves_three_tools_that_reach_every_other() {
         let (code, rest) = mcp.finish();
         assert_eq!(code, 0);
         assert_eq!(rest, Vec::<String>::new());
+    }
+}
+
+#[test]
+fn legion_read_runs_read_tools_and_refuses_the_others_without_running_them() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"tower\"\n");
+    let written = home.home().join("projects").join("app").join("note.txt");
+    for inline in [false, true] {
+        let mut mcp = if inline {
+            Mcp::inline(&home, &["--compact"])
+        } else {
+            Mcp::initialized(&home, &["--compact"]).0
+        };
+        let whoami = ok(&mcp.call("legion_read", json!({"tool": "meta.whoami"})));
+        assert_eq!(whoami["door"], json!("mcp"));
+        assert_eq!(
+            ok(&mcp.call(
+                "legion_read",
+                json!({"tool": "test.echo", "args": {"x": 1}})
+            )),
+            json!({"x": 1})
+        );
+        // `on` is passed through: this node by name, and a machine it does not know.
+        assert_eq!(
+            ok(&mcp.call(
+                "legion_read",
+                json!({"tool": "meta.version", "on": "tower"})
+            ))["node"],
+            json!("tower")
+        );
+        let elsewhere = failed(&mcp.call(
+            "legion_read",
+            json!({"tool": "meta.version", "on": "elsewhere"}),
+        ));
+        assert_eq!(elsewhere["code"], json!("not_found"));
+
+        for (tool, args, effect) in [
+            (
+                "fs.write",
+                json!({"path": written.to_string_lossy(), "content": "x"}),
+                "write",
+            ),
+            ("test.write_path", json!({"path": "~/projects/x"}), "write"),
+            ("exec.run", json!({"argv": ["true"]}), "exec"),
+            ("fs.remove", json!({"path": "~/projects/app"}), "destroy"),
+            ("power.sleep", json!({}), "power"),
+            ("config.write", json!({}), "admin"),
+        ] {
+            let refused = failed(&mcp.call("legion_read", json!({"tool": tool, "args": args})));
+            assert_eq!(refused["code"], json!("denied"), "{tool}: {refused}");
+            assert_eq!(refused["machine"], json!("tower"), "{tool}");
+            assert_eq!(refused["details"]["effect"], json!(effect), "{tool}");
+            let hint = refused["hint"].as_str().unwrap();
+            assert!(
+                hint.contains("legion_call") && hint.contains(tool),
+                "{hint}"
+            );
+        }
+        let unknown = failed(&mcp.call("legion_read", json!({"tool": "fs.nothing"})));
+        assert_eq!(unknown["code"], json!("unknown_tool"));
+        assert_eq!(
+            unknown["hint"],
+            json!("legion_tools lists the tools you may use here.")
+        );
+        assert_eq!(mcp.finish().0, 0);
+    }
+    assert!(!written.exists());
+    assert!(home.home().join("projects").join("app").exists());
+    // A refusal is the door's, before anything reaches the node, so the node records nothing.
+    let audit = home.audit();
+    for refused in [
+        "fs.write",
+        "test.write_path",
+        "exec.run",
+        "fs.remove",
+        "power.sleep",
+        "config.write",
+    ] {
+        assert!(
+            !audit.iter().any(|line| line["tool"] == json!(refused)),
+            "{refused} reached the audit log"
+        );
+    }
+    assert!(
+        audit
+            .iter()
+            .any(|line| line["tool"] == json!("meta.whoami") && line["outcome"] == json!("ok"))
+    );
+}
+
+#[test]
+fn legion_read_is_held_to_the_policy_like_any_call() {
+    let home = Home::new();
+    home.write_config(
+        "policy.toml",
+        r#"
+[principals."agent:obs"]
+role = "observer"
+
+[principals."agent:writer"]
+role = "writer"
+
+[roles.observer]
+allow = ["effect:read"]
+deny = ["meta.doctor"]
+
+[roles.writer]
+allow = ["fs.write"]
+"#,
+    );
+    let (mut obs, _) = Mcp::initialized(&home, &["--compact", "--as", "agent:obs"]);
+    assert_eq!(
+        ok(&obs.call("legion_read", json!({"tool": "meta.whoami"})))["principal"],
+        json!("agent:obs")
+    );
+    let denied = failed(&obs.call("legion_read", json!({"tool": "meta.doctor"})));
+    assert_eq!(denied["code"], json!("denied"));
+    assert!(
+        denied["message"].as_str().unwrap().contains("agent:obs"),
+        "{denied}"
+    );
+    assert_eq!(obs.finish().0, 0);
+
+    // A read tool beyond the role is refused by the node, not run because it only reads.
+    let (mut writer, _) = Mcp::initialized(&home, &["--compact", "--as", "agent:writer"]);
+    let denied = failed(&writer.call("legion_read", json!({"tool": "meta.whoami"})));
+    assert_eq!(denied["code"], json!("denied"));
+    assert!(
+        denied["message"].as_str().unwrap().contains("agent:writer"),
+        "{denied}"
+    );
+    assert_eq!(writer.finish().0, 0);
+
+    let audit = home.audit();
+    for (principal, tool) in [
+        ("agent:obs", "meta.doctor"),
+        ("agent:writer", "meta.whoami"),
+    ] {
+        let line = audit
+            .iter()
+            .find(|line| line["principal"] == json!(principal) && line["tool"] == json!(tool))
+            .unwrap_or_else(|| panic!("{principal} {tool} is not in the audit log"));
+        assert_eq!(line["outcome"], json!("denied"));
+        assert_eq!(line["door"], json!("mcp"));
     }
 }
 
@@ -814,6 +993,7 @@ fn a_policy_that_does_not_parse_shows_nothing_and_every_call_says_why() {
     for (tool, args) in [
         ("legion_tools", json!({})),
         ("legion_describe", json!({"tool": "meta.version"})),
+        ("legion_read", json!({"tool": "meta.version"})),
         ("legion_call", json!({"tool": "meta.version"})),
     ] {
         let failure = failed(&compact.call(tool, args));

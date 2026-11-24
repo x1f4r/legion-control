@@ -34,7 +34,7 @@ pub enum Command {
     Mcp {
         /// The principal every call in the session acts as.
         pinned: Option<String>,
-        /// Serve three tools that list, describe and call the others.
+        /// Serve four tools that list, describe and run the others.
         compact: bool,
     },
     /// `legion stream`: serve one bulk-data operation on stdin and stdout.
@@ -165,7 +165,7 @@ agent's own CLI command, never by editing their configuration files directly.
 
 In `legion agents add`, `--as PRINCIPAL` names the principal the agent will act as (and must exist
 in policy.toml, or be `owner` with `--allow-owner`). Compact mode is enabled by default so the
-agent carries three meta-tools instead of every tool schema in every conversation; pass `--full`
+agent carries four meta-tools instead of every tool schema in every conversation; pass `--full`
 (or `--no-compact`) to expose every tool individually.";
 
 /// `legion help cp`.

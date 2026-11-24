@@ -517,3 +517,129 @@ async fn compact_mode_does_not_advertise_list_changed_or_notify() {
     client_out.shutdown().await.unwrap();
     serving.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn legion_read_hands_on_only_tools_whose_effect_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::new(Paths::under(dir.path()), legion_tools::registry());
+    let tools_d = node.paths().tools_dir();
+    std::fs::create_dir_all(&tools_d).unwrap();
+    for (name, effect) in [("lab.check", "read"), ("lab.flash", "exec")] {
+        std::fs::write(
+            tools_d.join(format!("{name}.toml")),
+            format!("name = \"{name}\"\ndescription = \"Lab.\"\neffect = \"{effect}\"\ncmd = \"echo ok\"\n"),
+        )
+        .unwrap();
+    }
+    let recorder = Arc::new(Recorder::default());
+    let door = McpDoor::new(
+        node,
+        recorder.clone(),
+        Options {
+            pinned: None,
+            compact: true,
+        },
+    )
+    .unwrap();
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (server_in, server_out) = tokio::io::split(server);
+    let serving = tokio::spawn(door.serve(server_in, server_out));
+    let (client_in, mut client_out) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_in).lines();
+    let init = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"}
+    }});
+    client_out
+        .write_all(
+            format!(
+                "{init}\n{}\n",
+                json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    read_response(&mut lines, json!(0)).await;
+
+    let calls = [
+        // Read: handed on, with `on` beside the arguments.
+        (
+            json!({"tool": "test.echo", "args": {"x": 1}, "on": "tower,pi"}),
+            None,
+        ),
+        (json!({"tool": "meta_whoami"}), None),
+        (json!({"tool": "lab.check"}), None),
+        // Anything else: refused here.
+        (
+            json!({"tool": "fs.write", "args": {"path": "~/x", "content": "x"}}),
+            Some("write"),
+        ),
+        (
+            json!({"tool": "exec.run", "args": {"argv": ["true"]}}),
+            Some("exec"),
+        ),
+        (json!({"tool": "fs.remove", "on": "pi"}), Some("destroy")),
+        (json!({"tool": "power.sleep"}), Some("power")),
+        (json!({"tool": "ext.remove"}), Some("admin")),
+        (json!({"tool": "lab.flash"}), Some("exec")),
+        // An extension elsewhere whose effect this router cannot learn.
+        (json!({"tool": "gpu.probe", "on": "pi"}), Some("")),
+    ];
+    for (id, (arguments, refused)) in calls.iter().enumerate() {
+        let id = json!(id + 1);
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "legion_read", "arguments": arguments}});
+        client_out
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let (reply, _) = read_response(&mut lines, id).await;
+        let result = &reply["result"];
+        let text: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        match refused {
+            None => {
+                assert_eq!(result["isError"], json!(false), "{arguments}: {reply}");
+                assert_eq!(text, json!({"routed": true}));
+            }
+            Some(effect) => {
+                assert_eq!(result["isError"], json!(true), "{arguments}: {reply}");
+                assert_eq!(text["code"], json!("denied"), "{text}");
+                assert!(
+                    text["hint"].as_str().unwrap().contains("legion_call"),
+                    "{text}"
+                );
+                let reported = if effect.is_empty() {
+                    Value::Null
+                } else {
+                    json!(effect)
+                };
+                assert_eq!(text["details"]["effect"], reported, "{text}");
+                assert_eq!(text["details"]["tool"], arguments["tool"], "{text}");
+            }
+        }
+    }
+    client_out.shutdown().await.unwrap();
+    serving.await.unwrap().unwrap();
+
+    let routed: Vec<(String, Option<Target>)> = recorder
+        .routed
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|routed| (routed.tool.clone(), routed.on.clone()))
+        .collect();
+    assert_eq!(
+        routed,
+        [
+            (
+                "test.echo".to_owned(),
+                Some(Target::Many(vec!["tower".to_owned(), "pi".to_owned()]))
+            ),
+            ("meta.whoami".to_owned(), None),
+            ("lab.check".to_owned(), None),
+        ]
+    );
+}
