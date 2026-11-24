@@ -33,8 +33,8 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -244,6 +244,16 @@ pub enum ScopeProbeOverride {
 /// to the configured files (or connected to null when omitted). Returns a serializable
 /// [`DetachHandle`] carrying the target's [`ProcessId`], its Linux systemd scope unit name when
 /// a scope was used, and any non-fatal launch warnings.
+///
+/// # Late starts after timeout or ambiguous errors
+///
+/// When launching through an out-of-process helper (such as Windows WMI `Win32_Process.Create`
+/// under a breakaway-forbidding Job Object), a process may still finish starting *after*
+/// `spawn_detached` returns a timeout or ambiguous error (for example if the WMI provider host
+/// created the process before hanging or dropping the RPC reply). Callers that record state on
+/// disk before calling `spawn_detached` (such as background job supervisors and delayed power
+/// runners) must mark the record failed/abandoned on error and have the detached process refuse
+/// to act if it starts late.
 pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
     spawn_detached_for_test(options, ScopeProbeOverride::Auto).await
 }
@@ -467,6 +477,100 @@ pub(crate) const LINGER_DISABLED_WARNING: &str = "systemd user lingering is disa
 /// without breaking away.
 #[allow(dead_code)]
 pub(crate) const WMI_FALLBACK_WARNING: &str = "Windows Job Object breakaway was refused and WMI Win32_Process.Create was unavailable, so the process started inside the caller's Job Object and may stop if the parent session ends; ensure the Windows Management Instrumentation (Winmgmt) service is running";
+
+/// Single overall deadline for a Windows WMI detached launch across all COM attempts, retry
+/// backoffs, PowerShell CIM fallback, and hand-off wait.
+#[allow(dead_code)]
+pub const WINDOWS_WMI_LAUNCH_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Maximum share of [`WINDOWS_WMI_LAUNCH_DEADLINE`] granted to a single WMI call so a hung DCOM
+/// or PowerShell call still leaves budget inside the 60 s overall deadline to wait for hand-off.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_WMI_SINGLE_CALL_CAP: Duration = Duration::from_secs(30);
+
+/// Single overall launch deadline budget shared across every step of a detached WMI launch.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) struct LaunchBudget {
+    deadline: Instant,
+}
+
+#[allow(dead_code)]
+impl LaunchBudget {
+    pub(crate) fn from_now(total: Duration) -> Self {
+        Self::starting_at(Instant::now(), total)
+    }
+
+    pub(crate) fn starting_at(start: Instant, total: Duration) -> Self {
+        Self {
+            deadline: start + total,
+        }
+    }
+
+    /// Remaining time before the overall launch deadline, or `None` once expired.
+    pub(crate) fn remaining_at(self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .checked_duration_since(now)
+            .filter(|d| !d.is_zero())
+    }
+
+    pub(crate) fn remaining(self) -> Option<Duration> {
+        self.remaining_at(Instant::now())
+    }
+
+    /// Time budget for one WMI RPC/CIM invocation: capped at `cap` and bounded by remaining time.
+    pub(crate) fn call_budget_at(self, now: Instant, cap: Duration) -> Option<Duration> {
+        self.remaining_at(now).map(|rem| rem.min(cap))
+    }
+
+    pub(crate) fn call_budget(self, cap: Duration) -> Option<Duration> {
+        self.call_budget_at(Instant::now(), cap)
+    }
+
+    /// Sleep duration for a retry backoff, or `None` if sleeping would exhaust the overall budget.
+    pub(crate) fn backoff_at(self, now: Instant, desired: Duration) -> Option<Duration> {
+        let rem = self.remaining_at(now)?;
+        (rem > desired).then_some(desired)
+    }
+
+    pub(crate) fn backoff(self, desired: Duration) -> Option<Duration> {
+        self.backoff_at(Instant::now(), desired)
+    }
+}
+
+/// Process-wide guard preventing piled-up blocked DCOM worker threads when WMI stops answering.
+///
+/// The guard is moved into the worker thread and released only when the WMI call actually returns,
+/// even if the caller already timed out. While held, subsequent callers fail fast instead of
+/// spawning additional blocked threads.
+#[allow(dead_code)]
+pub(crate) struct InFlightGuard {
+    flag: &'static AtomicBool,
+}
+
+#[allow(dead_code)]
+impl InFlightGuard {
+    pub(crate) fn try_acquire(flag: &'static AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { flag })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+/// Build the error returned when a previous WMI worker thread is still blocked waiting for
+/// Windows to answer an earlier detached launch request.
+#[allow(dead_code)]
+pub(crate) fn wmi_in_flight_error() -> OsError {
+    OsError::TimedOut {
+        detail: "still waiting for Windows to answer an earlier detached launch request; check system load and the Windows Management Instrumentation service (Winmgmt) with `Get-Service Winmgmt`, and inspect `job.status` before retrying".into(),
+    }
+}
 
 /// Build the error returned when Windows Job Object breakaway is refused, WMI is provably
 /// unavailable, and [`DetachOptions::allow_in_job_fallback`] is `false` (the default).
@@ -2045,5 +2149,57 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, OsError::NotFound { .. }));
+    }
+
+    #[test]
+    fn launch_budget_draws_down_single_overall_deadline() {
+        let start = Instant::now();
+        let budget = LaunchBudget::starting_at(start, WINDOWS_WMI_LAUNCH_DEADLINE);
+
+        assert_eq!(budget.remaining_at(start), Some(Duration::from_secs(60)));
+        assert_eq!(
+            budget.call_budget_at(start, WINDOWS_WMI_SINGLE_CALL_CAP),
+            Some(Duration::from_secs(30))
+        );
+        // After 40 s, only 20 s remain across both calls and hand-off wait.
+        let at_40 = start + Duration::from_secs(40);
+        assert_eq!(budget.remaining_at(at_40), Some(Duration::from_secs(20)));
+        assert_eq!(
+            budget.call_budget_at(at_40, WINDOWS_WMI_SINGLE_CALL_CAP),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            budget.backoff_at(at_40, Duration::from_millis(750)),
+            Some(Duration::from_millis(750))
+        );
+        // If sleeping would consume the remaining budget, backoff returns None so we do not sleep
+        // past the deadline.
+        let at_59_5 = start + Duration::from_millis(59_500);
+        assert_eq!(budget.backoff_at(at_59_5, Duration::from_millis(750)), None);
+        // At or after the deadline, all remaining/call/backoff queries return None.
+        let at_60 = start + Duration::from_secs(60);
+        assert_eq!(budget.remaining_at(at_60), None);
+        assert_eq!(
+            budget.call_budget_at(at_60, WINDOWS_WMI_SINGLE_CALL_CAP),
+            None
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_rejects_concurrent_acquire_and_releases_on_drop() {
+        static TEST_FLAG: AtomicBool = AtomicBool::new(false);
+        let guard = InFlightGuard::try_acquire(&TEST_FLAG).expect("first acquire should succeed");
+        assert!(
+            InFlightGuard::try_acquire(&TEST_FLAG).is_none(),
+            "second concurrent acquire must fail fast while guard is held"
+        );
+        let err = wmi_in_flight_error();
+        assert!(matches!(err, OsError::TimedOut { .. }));
+        assert!(err.to_string().contains("earlier"));
+        assert!(err.to_string().contains("Winmgmt"));
+        drop(guard);
+        let second =
+            InFlightGuard::try_acquire(&TEST_FLAG).expect("acquire after drop should succeed");
+        drop(second);
     }
 }

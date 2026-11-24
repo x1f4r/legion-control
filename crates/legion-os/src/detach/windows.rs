@@ -24,7 +24,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
@@ -36,16 +36,16 @@ use crate::win_proc::{self, DirectSpawnError, WmiCreateError};
 use crate::{OsError, Result};
 
 use super::{
-    DETACH_MARKER_ENV, DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE, WMI_FALLBACK_WARNING,
-    WmiCimResult, build_windows_direct_launch, build_wmi_create_script_for_cmdline,
-    build_wmi_launcher_script, generate_detach_marker, merge_recheck_survivors, merge_windows_env,
-    parse_wmi_cim_output, parse_wmi_handoff, reconcile_wmi_identity, resolve_windows_job_name,
-    resolve_windows_powershell_exe, resolve_wmi_program, validate_wmi_batch_target,
-    wmi_breakaway_return_value_rejected, wmi_unavailable_error,
+    DETACH_MARKER_ENV, DetachHandle, DetachOptions, InFlightGuard, LaunchBudget,
+    WINDOWS_WMI_LAUNCH_DEADLINE, WINDOWS_WMI_MAX_CMDLINE, WINDOWS_WMI_SINGLE_CALL_CAP,
+    WMI_FALLBACK_WARNING, WmiCimResult, build_windows_direct_launch,
+    build_wmi_create_script_for_cmdline, build_wmi_launcher_script, generate_detach_marker,
+    merge_recheck_survivors, merge_windows_env, parse_wmi_cim_output, parse_wmi_handoff,
+    reconcile_wmi_identity, resolve_windows_job_name, resolve_windows_powershell_exe,
+    resolve_wmi_program, validate_wmi_batch_target, wmi_breakaway_return_value_rejected,
+    wmi_in_flight_error, wmi_unavailable_error,
 };
 
-const WMI_CREATE_TIMEOUT: Duration = Duration::from_secs(45);
-const WMI_HANDOFF_TIMEOUT: Duration = Duration::from_secs(45);
 const WMI_MAX_ATTEMPTS: usize = 3;
 const WMI_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(750)];
 const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -53,6 +53,7 @@ const JOB_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const JOB_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 static WMI_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+static WMI_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Removes temporary handoff and fallback launcher files whenever `spawn_via_wmi` exits (on
 /// every error path as well as after handoff completes).
@@ -454,26 +455,45 @@ async fn spawn_via_wmi(
         )
     };
 
+    let budget = LaunchBudget::from_now(WINDOWS_WMI_LAUNCH_DEADLINE);
+
     let reported = match create_wmi_wrapper_with_retry(
         &command_line,
         &cwd_str,
         &handoff_path,
         &powershell_exe,
+        budget,
     )
     .await?
     {
         WmiCreateOutcome::Started(wrapper_pid) => {
-            wait_for_handoff(&handoff_path, Some(wrapper_pid), WMI_HANDOFF_TIMEOUT).await?
+            let handoff_timeout = budget.remaining().ok_or_else(|| OsError::TimedOut {
+                detail: format!(
+                    "WMI detached launch exceeded its {}s overall deadline before the launcher reported target PID; check system load and inspect `job.status` before retrying",
+                    WINDOWS_WMI_LAUNCH_DEADLINE.as_secs()
+                ),
+            })?;
+            wait_for_handoff(&handoff_path, Some(wrapper_pid), handoff_timeout).await?
         }
         WmiCreateOutcome::HandoffReady => {
-            wait_for_handoff(&handoff_path, None, Duration::from_secs(5)).await?
+            let handoff_timeout = budget.remaining().unwrap_or(Duration::from_secs(1));
+            wait_for_handoff(&handoff_path, None, handoff_timeout).await?
         }
         WmiCreateOutcome::MaybeStarted(cause) => {
             // The WMI provider host may have created the process before failing or timing out.
-            // Wait for the full hand-off timeout before concluding failure, and never retry.
-            match wait_for_handoff(&handoff_path, None, WMI_HANDOFF_TIMEOUT).await {
-                Ok(id) => id,
-                Err(_) => return Err(cause),
+            // Wait for the remaining overall hand-off budget before concluding failure, and never
+            // retry or fall back.
+            if let Ok(contents) = fs::read_to_string(&handoff_path)
+                && !contents.trim().is_empty()
+            {
+                parse_wmi_handoff(&contents)?
+            } else if let Some(handoff_timeout) = budget.remaining() {
+                match wait_for_handoff(&handoff_path, None, handoff_timeout).await {
+                    Ok(id) => id,
+                    Err(_) => return Err(cause),
+                }
+            } else {
+                return Err(cause);
             }
         }
         WmiCreateOutcome::Unavailable(wmi_reason) => {
@@ -536,30 +556,61 @@ fn handoff_file_ready(path: &Path) -> bool {
     fs::read_to_string(path).is_ok_and(|contents| !contents.trim().is_empty())
 }
 
+enum NativeWmiCallError {
+    /// Failed before invoking `Win32_Process.Create` (budget already expired, earlier WMI call
+    /// still blocked in-flight, or worker thread could not be spawned).
+    NotDispatched(OsError),
+    /// Timed out waiting for an invoked COM WMI call to return; the process may still start late.
+    TimedOut(OsError),
+}
+
 async fn run_native_wmi_create_once(
     command_line: String,
     cwd: String,
-) -> std::result::Result<std::result::Result<u32, WmiCreateError>, OsError> {
+    budget: LaunchBudget,
+) -> std::result::Result<std::result::Result<u32, WmiCreateError>, NativeWmiCallError> {
+    let Some(call_timeout) = budget.call_budget(WINDOWS_WMI_SINGLE_CALL_CAP) else {
+        return Err(NativeWmiCallError::NotDispatched(OsError::TimedOut {
+            detail: format!(
+                "WMI Win32_Process.Create exceeded the {}s overall launch deadline; check system load and the Windows Management Instrumentation (Winmgmt) service, and inspect `job.status` before retrying",
+                WINDOWS_WMI_LAUNCH_DEADLINE.as_secs()
+            ),
+        }));
+    };
+
+    // Fail fast if a previous WMI worker thread is still stuck in DCOM rather than piling up
+    // blocked OS threads. The guard lives inside the worker thread until `wmi_create_process`
+    // actually returns, even if this caller times out first.
+    let Some(in_flight) = InFlightGuard::try_acquire(&WMI_IN_FLIGHT) else {
+        return Err(NativeWmiCallError::NotDispatched(wmi_in_flight_error()));
+    };
+
     let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
+    if let Err(err) = std::thread::Builder::new()
         .name("legion-wmi-create".to_owned())
         .spawn(move || {
+            let _guard = in_flight;
             let res = win_proc::wmi_create_process(&command_line, Some(&cwd));
             let _ = tx.send(res);
         })
-        .map_err(|err| OsError::from_io("cannot spawn WMI worker thread", err))?;
+    {
+        return Err(NativeWmiCallError::NotDispatched(OsError::from_io(
+            "cannot spawn WMI worker thread",
+            err,
+        )));
+    }
 
-    match tokio::time::timeout(WMI_CREATE_TIMEOUT, rx).await {
+    match tokio::time::timeout(call_timeout, rx).await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(_)) => Ok(Err(WmiCreateError::MaybeStarted {
             detail: "WMI worker thread exited before returning a result".into(),
         })),
-        Err(_) => Err(OsError::TimedOut {
+        Err(_) => Err(NativeWmiCallError::TimedOut(OsError::TimedOut {
             detail: format!(
                 "WMI Win32_Process.Create did not respond within {}s; check system load and the Windows Management Instrumentation (Winmgmt) service, and inspect `job.status` before retrying",
-                WMI_CREATE_TIMEOUT.as_secs()
+                call_timeout.as_secs()
             ),
-        }),
+        })),
     }
 }
 
@@ -568,6 +619,7 @@ async fn create_wmi_wrapper_with_retry(
     cwd: &str,
     handoff_path: &Path,
     powershell_exe: &str,
+    budget: LaunchBudget,
 ) -> Result<WmiCreateOutcome> {
     let mut last_com_err = String::new();
     for attempt in 0..WMI_MAX_ATTEMPTS {
@@ -575,15 +627,18 @@ async fn create_wmi_wrapper_with_retry(
             return Ok(WmiCreateOutcome::HandoffReady);
         }
 
-        match run_native_wmi_create_once(command_line.to_owned(), cwd.to_owned()).await {
+        match run_native_wmi_create_once(command_line.to_owned(), cwd.to_owned(), budget).await {
             Ok(Ok(wrapper_pid)) => return Ok(WmiCreateOutcome::Started(wrapper_pid)),
             Ok(Err(WmiCreateError::NotStarted { transient, detail })) => {
                 last_com_err = detail;
                 if transient && attempt + 1 < WMI_MAX_ATTEMPTS {
-                    let backoff = WMI_RETRY_BACKOFFS
+                    let desired = WMI_RETRY_BACKOFFS
                         .get(attempt)
                         .copied()
                         .unwrap_or(Duration::from_millis(750));
+                    let Some(backoff) = budget.backoff(desired) else {
+                        break;
+                    };
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
@@ -596,20 +651,32 @@ async fn create_wmi_wrapper_with_retry(
                     ),
                 }));
             }
-            Err(timeout_err) => {
+            Err(NativeWmiCallError::NotDispatched(err)) => {
+                return Err(err);
+            }
+            Err(NativeWmiCallError::TimedOut(timeout_err)) => {
                 return Ok(WmiCreateOutcome::MaybeStarted(timeout_err));
             }
         }
     }
 
     // Native COM WMI provably did not start a process. Try `Invoke-CimMethod` once in case COM
-    // process security was initialized incompatibly by the host process, unless the handoff file
-    // already appeared.
+    // security in this process prevented local WMI access, unless the handoff file already
+    // appeared or the overall launch budget is exhausted.
     if handoff_file_ready(handoff_path) {
         return Ok(WmiCreateOutcome::HandoffReady);
     }
 
     for breakaway in [true, false] {
+        let Some(call_timeout) = budget.call_budget(WINDOWS_WMI_SINGLE_CALL_CAP) else {
+            return Err(OsError::TimedOut {
+                detail: format!(
+                    "WMI detached launch exceeded its {}s overall deadline (after COM WMI error: {last_com_err}); check system load and the Windows Management Instrumentation (Winmgmt) service",
+                    WINDOWS_WMI_LAUNCH_DEADLINE.as_secs()
+                ),
+            });
+        };
+
         let cim_script = build_wmi_create_script_for_cmdline(command_line, Some(cwd), breakaway)?;
         let mut cim = tokio::process::Command::new(powershell_exe);
         cim.args(["-NoProfile", "-NonInteractive", "-Command", &cim_script])
@@ -620,7 +687,7 @@ async fn create_wmi_wrapper_with_retry(
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let output = match tokio::time::timeout(WMI_CREATE_TIMEOUT, cim.output()).await {
+        let output = match tokio::time::timeout(call_timeout, cim.output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(err)) => {
                 // `powershell.exe` itself could not be spawned, so `Invoke-CimMethod` never ran.
@@ -632,7 +699,7 @@ async fn create_wmi_wrapper_with_retry(
                 return Ok(WmiCreateOutcome::MaybeStarted(OsError::TimedOut {
                     detail: format!(
                         "WMI Win32_Process.Create via PowerShell did not respond within {}s (after COM WMI error: {last_com_err}); check system load and the Windows Management Instrumentation (Winmgmt) service, and inspect `job.status` before retrying",
-                        WMI_CREATE_TIMEOUT.as_secs()
+                        call_timeout.as_secs()
                     ),
                 }));
             }
