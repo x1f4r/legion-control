@@ -243,6 +243,7 @@ export async function refreshFleetProgressive({
   signal,
   onUpdate,
   onSettled,
+  onActiveNodeChanged,
   now = () => Date.now(),
   pingTimeoutS = PING_TIMEOUT_S,
   pingClientTimeoutMs = PING_CLIENT_TIMEOUT_MS,
@@ -257,6 +258,7 @@ export async function refreshFleetProgressive({
     if (m && m.name) map.set(m.name, { ...m });
   }
 
+  const initialLocalNode = localNode;
   let here = localNode;
   let activeCachedAt = cachedAt;
 
@@ -294,7 +296,7 @@ export async function refreshFleetProgressive({
   };
 
   async function fetchMachineDetails(name, isLocal) {
-    const on = isLocal ? undefined : name;
+    const on = name || undefined;
     const onErr = isLocal ? capturePairingError(undefined) : () => {};
     const tasks = [
       callWithTimeout(link, 'sys.info', {}, { on, signal }, detailTimeoutMs)
@@ -346,7 +348,7 @@ export async function refreshFleetProgressive({
 
     if (isLocal) {
       tasks.push(
-        callWithTimeout(link, 'meta.version', {}, { signal }, detailTimeoutMs)
+        callWithTimeout(link, 'meta.version', {}, { on, signal }, detailTimeoutMs)
           .then((ver) => {
             if (signal?.aborted || !ver) return;
             updateMachine(name, (prev) => ({
@@ -378,7 +380,12 @@ export async function refreshFleetProgressive({
   if (signal?.aborted) return null;
   if (fatalError) throw fatalError;
 
+  const prevHere = here;
   here = fleetList?.node || here;
+  const switchedActive = Boolean(here && prevHere && here !== prevHere);
+  if (switchedActive && typeof onActiveNodeChanged === 'function') {
+    onActiveNodeChanged(here);
+  }
   const listedMap = new Map();
   for (const m of fleetList?.machines || []) {
     if (m && m.name) listedMap.set(m.name, m);
@@ -403,11 +410,20 @@ export async function refreshFleetProgressive({
         canWake: Boolean(listed.mac || (listed.wake_via && listed.wake_via.length > 0)),
       });
     } else {
-      map.set(name, makeEntry(name, false, listed, prev));
+      const nextEntry = makeEntry(name, false, listed, prev);
+      if (switchedActive && name === initialLocalNode) {
+        nextEntry.thisNode = false;
+      }
+      map.set(name, nextEntry);
       remoteNames.push(name);
     }
   }
   emit(false);
+
+  // If failover switched the answering node (e.g. originally paired node A is off and B answered),
+  // fetch live details for the new answering node too.
+  const failoverLocalPromise =
+    switchedActive && here ? fetchMachineDetails(here, true) : Promise.resolve();
 
   // Probe each remote machine once; machines known to be off are checked quietly at most every
   // `offlineRecheckMs` (or when `forceOffline` is set) without flipping back to `asking`.
@@ -486,7 +502,7 @@ export async function refreshFleetProgressive({
     await fetchMachineDetails(name, false);
   });
 
-  await Promise.all([localPromise, remotesPromise]);
+  await Promise.all([localPromise, failoverLocalPromise, remotesPromise]);
   if (signal?.aborted) return null;
   if (fatalError) throw fatalError;
 

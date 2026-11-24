@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end Android emulator test for Legion over real SSH + legion-link.
+# End-to-end two-node Android emulator test for Legion over real SSH + legion-link.
 #
 #   ./apps/legion-app/e2e-android.sh
 #   ./apps/legion-app/e2e-android.sh --node-ref HEAD
@@ -8,11 +8,11 @@
 #   ./apps/legion-app/e2e-android.sh --skip-tablet
 #   ./apps/legion-app/e2e-android.sh --keep-running
 #
-# Builds a release `legion` binary from `--node-ref` (default `HEAD`) in a cache
-# checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, brings up a throwaway `LEGION_HOME`
-# node named `tower` and a loopback-only `sshd` on 127.0.0.1, installs a WebView-debuggable x86_64
-# build on `legion-test`, and drives the real UI over `adb forward` + Chrome DevTools Protocol.
-# Never touches ~/.ssh, the system sshd, ~/.config/legion, or /tmp.
+# Builds a release `legion` binary and `legion-link` example CLI from `--node-ref` (default
+# `HEAD`) in a cache checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, brings up two
+# throwaway loopback nodes (`tower` and `pi`) connected in a mutual SSH fleet, installs a
+# WebView-debuggable x86_64 build on `legion-test`, and drives the real UI over `adb forward` +
+# Chrome DevTools Protocol. Never touches ~/.ssh, the system sshd, ~/.config/legion, or /tmp.
 #
 set -euo pipefail
 
@@ -79,6 +79,7 @@ command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH."
 command -v git >/dev/null 2>&1 || die "git is not on PATH."
 command -v node >/dev/null 2>&1 || die "node is not on PATH."
 command -v npm >/dev/null 2>&1 || die "npm is not on PATH."
+command -v ssh >/dev/null 2>&1 || die "ssh is not on PATH."
 command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is not on PATH."
 cargo tauri --version >/dev/null 2>&1 || die "cargo-tauri is not installed or not on PATH."
 
@@ -134,17 +135,29 @@ unset _dir _cand
 # ---------------------------------------------------------------------------
 
 RUN_DIR=""
-SSHD_PID=""
+SSHD_A_PIDFILE=""
+SSHD_B_PIDFILE=""
 STARTED_PHONE=0
 STARTED_TABLET=0
 
+stop_pidfile() {
+	local pidfile="$1"
+	if [ -n "$pidfile" ] && [ -f "$pidfile" ]; then
+		local pid
+		pid="$(tr -d '[:space:]' < "$pidfile" || true)"
+		if [ -n "$pid" ]; then
+			pkill -KILL -P "$pid" 2>/dev/null || true
+			kill -TERM "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+		fi
+		rm -f "$pidfile"
+	fi
+}
+
 cleanup() {
 	local rc=$?
-	if [ -n "$SSHD_PID" ]; then
-		pkill -KILL -P "$SSHD_PID" 2>/dev/null || true
-		kill -TERM "$SSHD_PID" 2>/dev/null || true
-		wait "$SSHD_PID" 2>/dev/null || true
-	fi
+	stop_pidfile "$SSHD_A_PIDFILE"
+	stop_pidfile "$SSHD_B_PIDFILE"
 	if [ "$KEEP_RUNNING" -eq 0 ]; then
 		if [ "$STARTED_TABLET" -eq 1 ]; then
 			"$HERE/emulator.sh" --avd "$TABLET_AVD" stop >/dev/null 2>&1 || true
@@ -161,14 +174,14 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------------------
-# Build release legion binary from NODE_REF inside ~/.cache
+# Build release legion binary and legion-link example from NODE_REF in ~/.cache
 # ---------------------------------------------------------------------------
 
 mkdir -p "$CACHE_DIR" "$SHOTS_DIR"
 NODE_SRC="$CACHE_DIR/e2e-node-src"
 NODE_TARGET="$CACHE_DIR/e2e-node-target"
 
-say "Preparing legion node binary from $NODE_REF"
+say "Preparing legion node binary and link helper from $NODE_REF"
 if [ ! -d "$NODE_SRC/.git" ]; then
 	git clone --no-checkout "$REPO_ROOT" "$NODE_SRC" >/dev/null
 fi
@@ -180,8 +193,18 @@ CARGO_TARGET_DIR="$NODE_TARGET" cargo build \
 	--release \
 	-p legion-cli \
 	--locked
+CARGO_TARGET_DIR="$NODE_TARGET" cargo build \
+	--manifest-path "$NODE_SRC/Cargo.toml" \
+	--release \
+	-p legion-link \
+	--all-features \
+	--example link \
+	--locked
+
 LEGION_BIN="$NODE_TARGET/release/legion"
+LINK_BIN="$NODE_TARGET/release/examples/link"
 [ -x "$LEGION_BIN" ] || die "expected built legion binary at $LEGION_BIN"
+[ -x "$LINK_BIN" ] || die "expected built link helper at $LINK_BIN"
 
 # ---------------------------------------------------------------------------
 # Ensure playwright-core is installed in apps/ui/test
@@ -207,66 +230,171 @@ fi
 [ -n "$DEBUG_APK" ] && [ -f "$DEBUG_APK" ] || die "no debug APK found after cargo tauri android build --debug"
 
 # ---------------------------------------------------------------------------
-# Throwaway LEGION_HOME + loopback sshd
+# Two throwaway nodes (tower + pi) with mutual SSH fleet on 127.0.0.1
 # ---------------------------------------------------------------------------
 
 RUN_DIR="$(mktemp -d "$CACHE_DIR/e2e-run-XXXXXX")"
 chmod 700 "$RUN_DIR"
 
-NODE_HOME="$RUN_DIR/legion-home"
-FILES_DIR="$RUN_DIR/files"
-AUTH_KEYS="$RUN_DIR/authorized_keys"
-HOST_KEY="$RUN_DIR/host_ed25519"
-SSHD_CFG="$RUN_DIR/sshd_config"
-SSHD_LOG="$RUN_DIR/sshd.log"
+NODE_A_HOME="$RUN_DIR/node-a"
+NODE_B_HOME="$RUN_DIR/node-b"
+FILES_A_DIR="$RUN_DIR/files-a"
+FILES_B_DIR="$RUN_DIR/files-b"
+AUTH_KEYS_A="$RUN_DIR/authorized_keys_a"
+AUTH_KEYS_B="$RUN_DIR/authorized_keys_b"
+FLEET_AUTH_KEYS_A="$RUN_DIR/fleet_authorized_keys_a"
+FLEET_AUTH_KEYS_B="$RUN_DIR/fleet_authorized_keys_b"
+HOST_KEY_A="$RUN_DIR/host_a_ed25519"
+HOST_KEY_B="$RUN_DIR/host_b_ed25519"
+FLEET_KEY="$RUN_DIR/fleet_ed25519"
+FLEET_KNOWN_HOSTS="$RUN_DIR/fleet_known_hosts"
+FLEET_SSH_CFG="$RUN_DIR/fleet_ssh_config"
+SSHD_A_CFG="$RUN_DIR/sshd_a_config"
+SSHD_B_CFG="$RUN_DIR/sshd_b_config"
+SSHD_A_LOG="$RUN_DIR/sshd_a.log"
+SSHD_B_LOG="$RUN_DIR/sshd_b.log"
+SSHD_A_PIDFILE="$RUN_DIR/sshd_a.pid"
+SSHD_B_PIDFILE="$RUN_DIR/sshd_b.pid"
 
-mkdir -p "$NODE_HOME" "$FILES_DIR/subdir"
-printf 'hello from tower\n' > "$FILES_DIR/hello.txt"
-printf 'sample note\n' > "$FILES_DIR/notes.md"
-printf 'nested file\n' > "$FILES_DIR/subdir/item.txt"
+mkdir -p "$NODE_A_HOME" "$NODE_B_HOME" "$FILES_A_DIR/subdir" "$FILES_B_DIR/subdir"
+printf 'hello from tower\n' > "$FILES_A_DIR/hello.txt"
+printf 'sample note\n' > "$FILES_A_DIR/notes.md"
+printf 'nested file\n' > "$FILES_A_DIR/subdir/item.txt"
+printf 'hello from pi\n' > "$FILES_B_DIR/pi.txt"
+printf 'nested on pi\n' > "$FILES_B_DIR/subdir/item.txt"
 
-ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-host' -f "$HOST_KEY"
-: > "$AUTH_KEYS"
-chmod 600 "$AUTH_KEYS"
+ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-host-a' -f "$HOST_KEY_A"
+ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-host-b' -f "$HOST_KEY_B"
+ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-fleet' -f "$FLEET_KEY"
 
-LEGION_HOME="$NODE_HOME" "$LEGION_BIN" init --name tower >/dev/null
+: > "$AUTH_KEYS_A"
+: > "$AUTH_KEYS_B"
+chmod 600 "$AUTH_KEYS_A" "$AUTH_KEYS_B"
 
-cat > "$NODE_HOME/config/policy.toml" <<EOF
-[principals.phone]
-role = "operator"
+FLEET_PUB="$(cat "$FLEET_KEY.pub")"
+printf 'command="env LEGION_HOME=%s %s rpc",restrict %s\n' "$NODE_A_HOME" "$LEGION_BIN" "$FLEET_PUB" > "$FLEET_AUTH_KEYS_A"
+printf 'command="env LEGION_HOME=%s %s rpc",restrict %s\n' "$NODE_B_HOME" "$LEGION_BIN" "$FLEET_PUB" > "$FLEET_AUTH_KEYS_B"
+chmod 600 "$FLEET_AUTH_KEYS_A" "$FLEET_AUTH_KEYS_B"
 
-[roles.operator]
-allow = ["effect:read", "effect:write", "effect:exec", "effect:power"]
-paths = ["$FILES_DIR/**"]
-EOF
-
-cat >> "$NODE_HOME/config/node.toml" <<EOF
-
-[devices]
-authorized_keys = "$AUTH_KEYS"
-host_keys = ["$HOST_KEY.pub"]
-EOF
-
-SSHD_PORT="$(node -e '
+read -r PORT_A PORT_B <<< "$(node -e '
 const net = require("node:net");
-const s = net.createServer();
-s.listen(0, "127.0.0.1", () => {
-  console.log(s.address().port);
-  s.close();
+const s1 = net.createServer();
+const s2 = net.createServer();
+s1.listen(0, "127.0.0.1", () => {
+  s2.listen(0, "127.0.0.1", () => {
+    console.log(s1.address().port, s2.address().port);
+    s2.close(() => s1.close());
+  });
 });
 ')"
 
+CURRENT_USER="$(id -un)"
+
+{
+	printf '[127.0.0.1]:%s %s\n' "$PORT_A" "$(cat "$HOST_KEY_A.pub")"
+	printf '[127.0.0.1]:%s %s\n' "$PORT_B" "$(cat "$HOST_KEY_B.pub")"
+} > "$FLEET_KNOWN_HOSTS"
+chmod 600 "$FLEET_KNOWN_HOSTS"
+
+cat > "$FLEET_SSH_CFG" <<EOF
+Host tower
+  HostName 127.0.0.1
+  Port $PORT_A
+  User $CURRENT_USER
+  IdentityFile $FLEET_KEY
+  IdentitiesOnly yes
+  UserKnownHostsFile $FLEET_KNOWN_HOSTS
+  StrictHostKeyChecking yes
+  BatchMode yes
+  ConnectTimeout 3
+
+Host pi
+  HostName 127.0.0.1
+  Port $PORT_B
+  User $CURRENT_USER
+  IdentityFile $FLEET_KEY
+  IdentitiesOnly yes
+  UserKnownHostsFile $FLEET_KNOWN_HOSTS
+  StrictHostKeyChecking yes
+  BatchMode yes
+  ConnectTimeout 3
+EOF
+chmod 600 "$FLEET_SSH_CFG"
+
+LEGION_HOME="$NODE_A_HOME" "$LEGION_BIN" init --name tower >/dev/null
+LEGION_HOME="$NODE_B_HOME" "$LEGION_BIN" init --name pi >/dev/null
+
+write_policy() {
+	local home="$1"
+	local files_dir="$2"
+	cat > "$home/config/policy.toml" <<EOF
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.editor]
+allow = ["effect:read", "effect:write"]
+paths = ["$files_dir/**"]
+
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:power"]
+paths = ["$files_dir/**"]
+EOF
+}
+
+write_policy "$NODE_A_HOME" "$FILES_A_DIR"
+write_policy "$NODE_B_HOME" "$FILES_B_DIR"
+
+cat >> "$NODE_A_HOME/config/node.toml" <<EOF
+
+[devices]
+hosts = ["127.0.0.1", "10.0.2.2"]
+port = $PORT_A
+user = "$CURRENT_USER"
+authorized_keys = "$AUTH_KEYS_A"
+host_keys = ["$HOST_KEY_A.pub"]
+EOF
+
+cat >> "$NODE_B_HOME/config/node.toml" <<EOF
+
+[devices]
+hosts = ["127.0.0.1", "10.0.2.2"]
+port = $PORT_B
+user = "$CURRENT_USER"
+authorized_keys = "$AUTH_KEYS_B"
+host_keys = ["$HOST_KEY_B.pub"]
+EOF
+
+cat > "$NODE_A_HOME/config/fleet.toml" <<EOF
+[machines.pi]
+[[machines.pi.systems]]
+name = "linux"
+command = ["ssh", "-F", "$FLEET_SSH_CFG", "pi", "legion", "rpc"]
+EOF
+
+cat > "$NODE_B_HOME/config/fleet.toml" <<EOF
+[machines.tower]
+[[machines.tower.systems]]
+name = "linux"
+command = ["ssh", "-F", "$FLEET_SSH_CFG", "tower", "legion", "rpc"]
+EOF
+
 PENALTIES_LINE=""
-if "$SSHD_BIN" -T -o PerSourcePenalties=no -h "$HOST_KEY" >/dev/null 2>&1; then
+if "$SSHD_BIN" -T -o PerSourcePenalties=no -h "$HOST_KEY_A" >/dev/null 2>&1; then
 	PENALTIES_LINE="PerSourcePenalties no"
 fi
 
-CURRENT_USER="$(id -un)"
-cat > "$SSHD_CFG" <<EOF
+write_sshd_cfg() {
+	local cfg="$1"
+	local port="$2"
+	local host_key="$3"
+	local auth_keys="$4"
+	local fleet_auth_keys="$5"
+	local node_home="$6"
+	cat > "$cfg" <<EOF
 ListenAddress 127.0.0.1
-Port $SSHD_PORT
-HostKey "$HOST_KEY"
-AuthorizedKeysFile "$AUTH_KEYS"
+Port $port
+HostKey "$host_key"
+AuthorizedKeysFile $auth_keys $fleet_auth_keys
 PidFile none
 UsePAM no
 StrictModes no
@@ -275,28 +403,67 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 $PENALTIES_LINE
 AllowUsers "$CURRENT_USER"
-SetEnv "LEGION_HOME=$NODE_HOME"
+SetEnv "LEGION_HOME=$node_home"
 Subsystem sftp internal-sftp
 LogLevel VERBOSE
 EOF
+}
 
-say "Starting throwaway sshd on 127.0.0.1:$SSHD_PORT"
-"$SSHD_BIN" -D -e -f "$SSHD_CFG" -E "$SSHD_LOG" </dev/null >/dev/null 2>&1 &
-SSHD_PID=$!
+write_sshd_cfg "$SSHD_A_CFG" "$PORT_A" "$HOST_KEY_A" "$AUTH_KEYS_A" "$FLEET_AUTH_KEYS_A" "$NODE_A_HOME"
+write_sshd_cfg "$SSHD_B_CFG" "$PORT_B" "$HOST_KEY_B" "$AUTH_KEYS_B" "$FLEET_AUTH_KEYS_B" "$NODE_B_HOME"
 
-for _i in $(seq 1 50); do
-	kill -0 "$SSHD_PID" 2>/dev/null || { cat "$SSHD_LOG" >&2 || true; die "throwaway sshd exited early"; }
-	if node -e '
+start_sshd() {
+	local name="$1"
+	local cfg="$2"
+	local log="$3"
+	local port="$4"
+	local pidfile="$5"
+	say "Starting throwaway sshd for $name on 127.0.0.1:$port"
+	"$SSHD_BIN" -D -e -f "$cfg" -E "$log" </dev/null >/dev/null 2>&1 &
+	local pid=$!
+	printf '%s\n' "$pid" > "$pidfile"
+	for _i in $(seq 1 50); do
+		kill -0 "$pid" 2>/dev/null || { cat "$log" >&2 || true; die "throwaway sshd for $name exited early"; }
+		if node -e '
 const net = require("node:net");
 const s = net.connect(Number(process.argv[1]), "127.0.0.1");
 s.on("connect", () => { s.destroy(); process.exit(0); });
 s.on("error", () => process.exit(1));
-' "$SSHD_PORT" 2>/dev/null; then
-		break
+' "$port" 2>/dev/null; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	die "timed out waiting for throwaway sshd ($name) on 127.0.0.1:$port"
+}
+
+start_sshd tower "$SSHD_A_CFG" "$SSHD_A_LOG" "$PORT_A" "$SSHD_A_PIDFILE"
+start_sshd pi "$SSHD_B_CFG" "$SSHD_B_LOG" "$PORT_B" "$SSHD_B_PIDFILE"
+
+# Confirm mutual fleet connectivity before booting any emulator.
+verify_fleet_ping() {
+	local from_name="$1"
+	local from_home="$2"
+	local peer_name="$3"
+	local peer_log="$4"
+	local out
+	out="$(LEGION_HOME="$from_home" "$LEGION_BIN" fleet.ping --json 2>&1 || true)"
+	if ! printf '%s' "$out" | node -e '
+const fs = require("node:fs");
+const data = JSON.parse(fs.readFileSync(0, "utf8"));
+const ok = Array.isArray(data.results) && data.results.some((r) => r.machine === process.argv[1] && r.reachable === true);
+process.exit(ok ? 0 : 1);
+' "$peer_name" 2>/dev/null; then
+		printf 'fleet.ping from %s output:\n%s\n' "$from_name" "$out" >&2
+		printf '%s sshd.log:\n' "$peer_name" >&2
+		cat "$peer_log" >&2 || true
+		die "$from_name failed to ping $peer_name over mutual loopback SSH fleet"
 	fi
-	sleep 0.1
-done
-unset _i
+}
+
+verify_fleet_ping tower "$NODE_A_HOME" pi "$SSHD_B_LOG"
+verify_fleet_ping pi "$NODE_B_HOME" tower "$SSHD_A_LOG"
+say "Verified mutual loopback SSH fleet between tower ($PORT_A) and pi ($PORT_B)"
 
 # ---------------------------------------------------------------------------
 # Helper to find emulator serial for an AVD
@@ -329,23 +496,35 @@ run_on_avd() {
 	adb -s "$serial" uninstall "$APP_ID" >/dev/null 2>&1 || true
 	"$HERE/emulator.sh" --avd "$avd" install "$DEBUG_APK"
 	adb -s "$serial" shell pm clear "$APP_ID" >/dev/null
+	# Enable the debug-only loopback endpoint switch so the two-node loopback harness
+	# (127.0.0.1 + 10.0.2.2) can learn peer endpoints. Release builds ignore this marker.
+	adb -s "$serial" shell "run-as '$APP_ID' touch allow-loopback-endpoints"
 	# Android 17 (API 37) Local Network Protection gates 10.0.2.2 behind ACCESS_LOCAL_NETWORK.
 	adb -s "$serial" shell pm grant "$APP_ID" android.permission.ACCESS_LOCAL_NETWORK >/dev/null 2>&1 || true
 	"$HERE/emulator.sh" --avd "$avd" launch
 
 	E2E_ADB_SERIAL="$serial" \
 	E2E_SHOTS_DIR="$SHOTS_DIR" \
+	E2E_RUN_DIR="$RUN_DIR" \
 	E2E_LEGION_BIN="$LEGION_BIN" \
-	E2E_NODE_HOME="$NODE_HOME" \
-	E2E_SSHD_PORT="$SSHD_PORT" \
-	E2E_SSHD_PID="$SSHD_PID" \
-	E2E_SSHD_LOG="$SSHD_LOG" \
+	E2E_LINK_BIN="$LINK_BIN" \
+	E2E_SSHD_BIN="$SSHD_BIN" \
+	E2E_NODE_A_HOME="$NODE_A_HOME" \
+	E2E_PORT_A="$PORT_A" \
+	E2E_SSHD_A_CFG="$SSHD_A_CFG" \
+	E2E_SSHD_A_LOG="$SSHD_A_LOG" \
+	E2E_SSHD_A_PIDFILE="$SSHD_A_PIDFILE" \
+	E2E_NODE_B_HOME="$NODE_B_HOME" \
+	E2E_PORT_B="$PORT_B" \
+	E2E_SSHD_B_CFG="$SSHD_B_CFG" \
+	E2E_SSHD_B_LOG="$SSHD_B_LOG" \
+	E2E_SSHD_B_PIDFILE="$SSHD_B_PIDFILE" \
 	E2E_MODE="$mode" \
 	node "$HERE/e2e-android-driver.mjs"
 }
 
 # ---------------------------------------------------------------------------
-# Run phone suite, then tablet wide paired shot
+# Run phone two-node suite, then tablet wide paired shot
 # ---------------------------------------------------------------------------
 
 STARTED_PHONE=1
@@ -365,4 +544,4 @@ if [ "$SKIP_TABLET" -eq 0 ]; then
 fi
 
 say ""
-say "End-to-end Android suite passed. Screenshots saved in: $SHOTS_DIR"
+say "End-to-end two-node Android suite passed. Screenshots saved in: $SHOTS_DIR"

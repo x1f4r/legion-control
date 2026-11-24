@@ -86,3 +86,91 @@ test('createAppLink uses origin-scoped Android bridge for deviceModel and local 
     }
   }
 });
+
+test('createAppLink exposes learn, acceptIdentityChange, and preserves last_paired from pair', async () => {
+  const calls = [];
+  const prevWindow = globalThis.window;
+  const lastPaired = {
+    node: 'tower',
+    device: 'Pixel 10',
+    role: 'operator',
+    synced: ['pi'],
+    not_synced: [],
+  };
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'pair') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [{ node: 'tower', principal: 'device:pixel', role: 'operator', via: 'ssh' }],
+              last_paired: lastPaired,
+            });
+          }
+          if (command === 'state') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [{ node: 'tower', principal: 'device:pixel', role: 'operator', via: 'ssh' }],
+              routes: { tower: { kind: 'direct' } },
+            });
+          }
+          if (command === 'call' && payload.tool === 'meta.whoami') {
+            return Promise.resolve({ node: 'tower', principal: 'device:pixel', role: 'operator', tools: [] });
+          }
+          if (command === 'call' && payload.tool === 'meta.version') {
+            return Promise.resolve({ version: '0.1.0', protocol: 1 });
+          }
+          if (command === 'learn') {
+            return Promise.resolve({
+              report: { introducer: 'tower', added: ['pi'], updated: [], identity_changed: [], skipped: [] },
+              state: { ready: true, nodes: [{ node: 'tower' }, { node: 'pi' }] },
+            });
+          }
+          if (command === 'accept_identity_change') {
+            return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
+          }
+          if (command === 'dismiss_identity_change') {
+            return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
+          }
+          return Promise.resolve({});
+        },
+        Channel: class FakeChannel {
+          constructor() {
+            this.onmessage = null;
+          }
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const pairedState = await link.pair('legion-invite-1:abc', 'Pixel 10');
+    assert.deepEqual(pairedState.last_paired, lastPaired);
+
+    const learned = await link.learn();
+    assert.deepEqual(learned.report.added, ['pi']);
+
+    await link.acceptIdentityChange('mini', ['SHA256:abc']);
+    assert.ok(
+      calls.some(
+        (c) =>
+          c.command === 'accept_identity_change' &&
+          c.payload.node === 'mini' &&
+          Array.isArray(c.payload.fingerprints) &&
+          c.payload.fingerprints[0] === 'SHA256:abc',
+      ),
+    );
+
+    await link.dismissIdentityChange('mini');
+    assert.ok(calls.some((c) => c.command === 'dismiss_identity_change' && c.payload.node === 'mini'));
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});

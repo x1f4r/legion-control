@@ -16,7 +16,11 @@ use tempfile::NamedTempFile;
 use crate::backend::{AppError, ErrorCode};
 
 /// Current on-disk schema version.
-pub const STORE_VERSION: u32 = 1;
+///
+/// Version 2 records node provenance (`origin`, `learned_from`), conflict-aware pending identity
+/// changes, and explicitly forgotten machine names inside `link`. Version 1 files load cleanly
+/// and upgrade to version 2 on the next save; version 1 builds refuse version 2 files cleanly.
+pub const STORE_VERSION: u32 = 2;
 
 /// Filename inside the platform's private app data directory.
 pub const STORE_FILENAME: &str = "legion-app.json";
@@ -200,7 +204,7 @@ impl AppStore {
             }
         };
 
-        let data: AppStoreData = serde_json::from_slice(&bytes).map_err(|err| {
+        let mut data: AppStoreData = serde_json::from_slice(&bytes).map_err(|err| {
             AppError::new(
                 ErrorCode::Internal,
                 format!("Stored app state is not valid JSON: {err}"),
@@ -221,6 +225,8 @@ impl AppStore {
             ));
         }
 
+        // Upgrade earlier schemas (v1) in memory so the next atomic save writes STORE_VERSION.
+        data.version = STORE_VERSION;
         Ok(data)
     }
 
@@ -431,6 +437,46 @@ mod tests {
         let err = store.load().err().ok_or("expected parse error")?;
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(err.hint.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn schema_v1_loads_cleanly_and_upgrades_to_v2_on_save() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert_eq!(STORE_VERSION, 2);
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let v1_json = serde_json::json!({
+            "version": 1,
+            "link": {
+                "nodes": [
+                    {
+                        "node": "tower",
+                        "target": {
+                            "hosts": ["tower.example"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": ["ssh-ed25519 AAAA"]
+                        },
+                        "principal": "phone"
+                    }
+                ]
+            },
+            "current_node": "tower",
+            "node_meta": [{ "node": "tower", "role": "operator", "device": "pixel" }]
+        })
+        .to_string();
+        fs::write(store.path(), v1_json)?;
+
+        let loaded = store.load()?;
+        assert_eq!(loaded.version, STORE_VERSION);
+        assert_eq!(loaded.link.nodes.len(), 1);
+        assert_eq!(loaded.link.nodes[0].node, "tower");
+        assert!(loaded.link.forgotten_nodes.is_empty());
+
+        store.save(&loaded)?;
+        let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(store.path())?)?;
+        assert_eq!(raw["version"], 2);
         Ok(())
     }
 

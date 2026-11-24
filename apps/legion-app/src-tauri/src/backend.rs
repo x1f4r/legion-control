@@ -3,10 +3,12 @@
 //! [`Backend`] is implemented by [`crate::link_backend::LinkBackend`] over `legion-link`, and by
 //! [`Unpaired`] for lightweight tests.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+use legion_link::LearnReport;
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -173,10 +175,125 @@ pub struct RepairResult {
     pub state: AppState,
 }
 
+fn default_origin() -> String {
+    "paired".to_owned()
+}
+
+fn default_route() -> String {
+    "direct".to_owned()
+}
+
+/// One conflicting endpoint report received while another pending change was already recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictingIdentityInfo {
+    /// Directly paired node that reported this conflicting endpoint.
+    pub reported_by: String,
+    /// Candidate host names / addresses in the conflicting report.
+    pub hosts: Vec<String>,
+    /// SSH port in the conflicting report.
+    pub port: u16,
+    /// SSH user in the conflicting report.
+    pub user: String,
+    /// SHA-256 fingerprints of the conflicting report's host keys.
+    #[serde(default)]
+    pub fingerprints: Vec<String>,
+}
+
+/// Details of a pending host-key or endpoint change reported for an already known machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityChangedInfo {
+    /// Directly paired node that reported the pending change.
+    pub reported_by: String,
+    /// Candidate host names / addresses in the newly reported target.
+    pub hosts: Vec<String>,
+    /// SSH port in the newly reported target.
+    pub port: u16,
+    /// SSH user in the newly reported target.
+    #[serde(default)]
+    pub user: String,
+    /// Currently pinned host names / addresses before this change.
+    #[serde(default)]
+    pub old_hosts: Vec<String>,
+    /// Currently pinned SSH port before this change.
+    #[serde(default)]
+    pub old_port: u16,
+    /// Currently pinned SSH user before this change.
+    #[serde(default)]
+    pub old_user: String,
+    /// SHA-256 fingerprints of the currently pinned host keys.
+    #[serde(default)]
+    pub old_fingerprints: Vec<String>,
+    /// SHA-256 fingerprints of the newly reported host keys.
+    #[serde(default)]
+    pub new_fingerprints: Vec<String>,
+    /// Conflicting reports received while this change was pending; when non-empty, acceptance is
+    /// blocked until dismissed or paired directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ConflictingIdentityInfo>,
+    /// True when the entry is directly paired (informational warning only; cannot be accepted).
+    #[serde(default)]
+    pub is_paired: bool,
+}
+
+/// A fleet machine that did not receive this device fully during pairing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairPendingPeer {
+    /// Machine name.
+    pub node: String,
+    /// Delivery status reported by the node (`"partial"` or `"not_reached"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Optional reason the peer was not reached or refused live changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Summary of which fleet machines received this device during the most recent pairing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairSummary {
+    /// Node paired directly with.
+    pub node: String,
+    /// Device name enrolled on the node.
+    pub device: String,
+    /// Role assigned to this device.
+    pub role: String,
+    /// Other fleet machines that received this device immediately.
+    #[serde(default)]
+    pub synced: Vec<String>,
+    /// Other fleet machines that did not answer and will get this device at their next sync.
+    #[serde(default)]
+    pub not_synced: Vec<PairPendingPeer>,
+    /// Exact sync command reported by the node when `not_synced` is non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_command: Option<String>,
+}
+
+/// Observed reachability status for any machine (including relay-only fleet peers).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineRouteView {
+    /// `"direct"`, `"relay"`, `"not_synced"`, or `"identity_changed"`.
+    pub kind: String,
+    /// Relay node name (for `"relay"`) or introducer/relay (for `"not_synced"` / `"identity_changed"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Introducer node name for `"not_synced"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introducer: Option<String>,
+}
+
+/// Result returned by `learn`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnResult {
+    /// Summary of what `legion-link` learned from the answering introducer.
+    pub report: LearnReport,
+    /// Updated application state including any newly learned nodes or identity-change warnings.
+    pub state: AppState,
+}
+
 /// Summary of one node link known to the app.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeLink {
-    /// Name of the paired or local node.
+    /// Name of the paired, learned, or local node.
     pub node: String,
     /// Principal this controller acts as on that node.
     pub principal: String,
@@ -187,10 +304,21 @@ pub struct NodeLink {
     /// Canonical path to the local `legion` binary when `via == "local"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// True when this node is only acting as a temporary in-memory failover link (not persisted
-    /// as the user's chosen default node).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub temporary: bool,
+    /// `"paired"` (paired directly or local) or `"learned"` (learned via `device.endpoint`).
+    #[serde(default = "default_origin")]
+    pub origin: String,
+    /// Trusted node that introduced this learned entry, when `origin == "learned"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_from: Option<String>,
+    /// Current route kind: `"direct"`, `"relay"`, `"not_synced"`, or `"identity_changed"`.
+    #[serde(default = "default_route")]
+    pub route: String,
+    /// Relay node (or introducer for `"not_synced"`) when not direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_via: Option<String>,
+    /// Pending host-key change warning requiring explicit user acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_changed: Option<IdentityChangedInfo>,
 }
 
 /// Snapshot returned by the `state` command.
@@ -208,6 +336,12 @@ pub struct AppState {
     /// True when this platform has a built-in camera QR scanner (`android` and `ios`).
     #[serde(default)]
     pub can_scan: bool,
+    /// Observed route for every known or relayed machine.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routes: BTreeMap<String, MachineRouteView>,
+    /// Fleet delivery summary from the most recent pairing in this session, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_paired: Option<PairSummary>,
 }
 
 /// Identifier of an in-flight call for cancellation.
@@ -290,6 +424,20 @@ pub trait Backend: Send + Sync {
 
     /// Closes cached transport sessions so the next call opens a fresh connection.
     fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>>;
+
+    /// Learns direct SSH endpoints for every answering machine in the fleet and persists them.
+    fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>>;
+
+    /// Explicitly accepts a pending host-key or endpoint change for learned node `node`, verifying
+    /// `fingerprints` match the reviewed pending target and persisting before updating live state.
+    fn accept_identity_change(
+        &self,
+        node: String,
+        fingerprints: Vec<String>,
+    ) -> BoxFuture<'_, Result<AppState, AppError>>;
+
+    /// Dismisses a pending identity-change warning for `node` without changing its pinned target.
+    fn dismiss_identity_change(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>>;
 }
 
 /// Fallback backend returning honest unpaired responses.
@@ -305,6 +453,8 @@ impl Backend for Unpaired {
                 needs: Some(Needs::Pairing),
                 repair: None,
                 can_scan: cfg!(any(target_os = "android", target_os = "ios")),
+                routes: BTreeMap::new(),
+                last_paired: None,
             })
         })
     }
@@ -362,6 +512,22 @@ impl Backend for Unpaired {
     fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+        Box::pin(async { Err(AppError::not_paired()) })
+    }
+
+    fn accept_identity_change(
+        &self,
+        _node: String,
+        _fingerprints: Vec<String>,
+    ) -> BoxFuture<'_, Result<AppState, AppError>> {
+        Box::pin(async { Err(AppError::not_paired()) })
+    }
+
+    fn dismiss_identity_change(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+        Box::pin(async { Err(AppError::not_paired()) })
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +573,8 @@ mod tests {
             needs: Some(Needs::Pairing),
             repair: None,
             can_scan: true,
+            routes: BTreeMap::new(),
+            last_paired: None,
         };
         let json = serde_json::to_value(&unpaired)?;
         assert_eq!(json["ready"], false);
@@ -421,11 +589,17 @@ mod tests {
                 role: "operator".to_owned(),
                 via: "ssh".to_owned(),
                 path: None,
-                temporary: false,
+                origin: "paired".to_owned(),
+                learned_from: None,
+                route: "direct".to_owned(),
+                route_via: None,
+                identity_changed: None,
             }],
             needs: None,
             repair: None,
             can_scan: false,
+            routes: BTreeMap::new(),
+            last_paired: None,
         };
         let ready_json = serde_json::to_value(&ready)?;
         assert_eq!(ready_json["ready"], true);

@@ -7,17 +7,25 @@ import {
   applySettingsToRoot,
   buildDeviceInviteArgs,
   buildDeviceRemoveArgs,
+  buildRelayedConnections,
   describeAppearance,
+  describeConnectionRoute,
+  describePolicyRolePlain,
   describeRefreshing,
   detectDeviceNoun,
+  extractInviteRoles,
   findIncomingDevice,
   formatDeviceRemovedNotice,
+  formatInvitedDeviceSyncNotice,
+  formatPairSyncNotice,
   isInviteOwnerStrength,
   isPairingId,
   isRoleOwnerStrength,
+  normalizeNodeRoles,
   normalizeSettings,
   parsePolicyForInvite,
   readSettings,
+  summarizeInvitedDeviceFleet,
   writeSettings,
 } from '../settings.js';
 
@@ -332,4 +340,214 @@ test('formatDeviceRemovedNotice never lists fleet machines for a local-only devi
     { removed: true, still_trusted_by: ['pi'] },
   );
   assert.ok(notice && notice.includes('pi') && notice.includes('Pixel 10'));
+});
+
+test('formatPairSyncNotice describes synced and pending fleet machines without leaking tool names in plain mode', () => {
+  assert.equal(formatPairSyncNotice({ node: 'tower', synced: [], not_synced: [] }, false), null);
+
+  const allSynced = formatPairSyncNotice(
+    { node: 'tower', synced: ['pi', 'studio'], not_synced: [] },
+    false,
+  );
+  assert.equal(allSynced.kind, 'neutral');
+  assert.match(allSynced.title, /Paired with tower and shared with pi and studio/);
+  assert.ok(!allSynced.detail.includes('fleet.sync'));
+
+  const partialPlain = formatPairSyncNotice(
+    {
+      node: 'tower',
+      synced: ['pi'],
+      not_synced: [{ node: 'studio', reason: 'connection refused' }],
+      sync_command: 'legion fleet.sync direction=push documents=\'["devices.toml"]\'',
+    },
+    false,
+  );
+  assert.equal(partialPlain.kind, 'warn');
+  assert.match(partialPlain.title, /shared with pi/);
+  assert.match(partialPlain.detail, /studio did not answer and will get this device at the next sync/);
+  assert.ok(!partialPlain.detail.includes('fleet.sync'));
+  assert.ok(!partialPlain.detail.includes('devices.toml'));
+
+  const partialTech = formatPairSyncNotice(
+    {
+      node: 'tower',
+      synced: ['pi'],
+      not_synced: [{ node: 'studio', status: 'not_reached' }],
+      sync_command: 'legion fleet.sync direction=push documents=\'["devices.toml"]\'',
+    },
+    true,
+  );
+  assert.match(partialTech.detail, /legion fleet\.sync/);
+
+  // Partial peer (removals delivered, live device changes refused) is distinguished from not_reached.
+  const partialStatusPlain = formatPairSyncNotice(
+    {
+      node: 'tower',
+      synced: ['pi'],
+      not_synced: [
+        { node: 'studio', status: 'partial', reason: 'live device changes refused' },
+        { node: 'nas', status: 'not_reached' },
+      ],
+    },
+    false,
+  );
+  assert.equal(partialStatusPlain.kind, 'warn');
+  assert.match(partialStatusPlain.detail, /studio received removals, but not this device yet/);
+  assert.match(partialStatusPlain.detail, /nas did not answer/);
+  assert.ok(!partialStatusPlain.detail.includes('fleet.sync'));
+});
+
+test('describeConnectionRoute and buildRelayedConnections render direct, relay, unsynced, and identity-changed routes cleanly', () => {
+  assert.equal(describeConnectionRoute({ node: 'tower', route: 'direct' }, false).label, 'directly');
+  assert.equal(
+    describeConnectionRoute({ node: 'nas', route: 'relay', route_via: 'tower' }, false).label,
+    'through tower',
+  );
+
+  const unsyncedPlain = describeConnectionRoute(
+    { node: 'studio', route: 'not_synced', learned_from: 'tower', route_via: 'tower' },
+    false,
+  );
+  assert.equal(unsyncedPlain.label, 'not yet: tower has not passed this device on to it');
+  assert.equal(unsyncedPlain.hint, 'Ask the owner to sync the machines');
+  assert.ok(!unsyncedPlain.hint.includes('fleet.sync'));
+
+  const unsyncedTech = describeConnectionRoute(
+    { node: 'studio', route: 'not_synced', learned_from: 'tower', route_via: 'tower' },
+    true,
+  );
+  assert.match(unsyncedTech.hint, /legion fleet\.sync/);
+
+  const changed = describeConnectionRoute(
+    {
+      node: 'mini',
+      origin: 'learned',
+      route: 'identity_changed',
+      identity_changed: { reported_by: 'tower', old_fingerprints: ['a'], new_fingerprints: ['b'] },
+    },
+    false,
+  );
+  assert.equal(changed.isIdentityChanged, true);
+  assert.equal(changed.label, 'Identity changed');
+  assert.match(changed.hint, /tower reported a change for mini/);
+
+  const changedPaired = describeConnectionRoute(
+    {
+      node: 'tower',
+      origin: 'paired',
+      route: 'identity_changed',
+      identity_changed: {
+        reported_by: 'pi',
+        is_paired: true,
+        old_fingerprints: ['a'],
+        new_fingerprints: ['b'],
+      },
+    },
+    false,
+  );
+  assert.match(changedPaired.hint, /pair with tower again/);
+
+  const relayed = buildRelayedConnections(
+    {
+      nodes: [{ node: 'tower' }, { node: 'pi' }],
+      routes: {
+        tower: { kind: 'direct' },
+        pi: { kind: 'direct' },
+        nas: { kind: 'relay', via: 'tower' },
+      },
+    },
+    { machines: [{ name: 'tower' }, { name: 'pi' }, { name: 'nas' }, { name: 'laptop' }] },
+  );
+  assert.deepEqual(
+    relayed.map((r) => [r.node, r.route, r.route_via]),
+    [
+      ['laptop', 'relay', 'tower'],
+      ['nas', 'relay', 'tower'],
+    ],
+  );
+});
+
+test('extractInviteRoles, normalizeNodeRoles, and live policy analysis never hardcode descriptions by role name', () => {
+  // Primary path: device.roles preserves node-supplied descriptions verbatim.
+  const fromNode = normalizeNodeRoles([
+    {
+      name: 'observer',
+      description: 'node custom description for observer',
+      strongest_effect: 'read',
+      owner_strength: false,
+    },
+    {
+      name: 'owner',
+      description: 'everything, including changing who may do what',
+      strongest_effect: 'admin',
+      owner_strength: true,
+    },
+  ]);
+  assert.equal(fromNode.length, 2);
+  assert.equal(fromNode[0].description, 'node custom description for observer');
+  assert.equal(fromNode[0].ownerStrength, false);
+  assert.equal(fromNode[1].ownerStrength, true);
+
+  // Fallback path: descriptions are derived strictly from live policy rules, NOT role names.
+  // Even a role named "observer" that grants effect:admin is described as owner-strength!
+  const swappedPolicy = parsePolicyForInvite(`
+[roles.observer]
+allow = ["effect:admin"]
+
+[roles.operator]
+allow = ["effect:read"]
+
+[roles.helper]
+allow = ["effect:read", "effect:exec"]
+`);
+  const swappedDescObserver = describePolicyRolePlain('observer', swappedPolicy);
+  assert.match(swappedDescObserver, /as strong as owner/);
+  assert.equal(
+    describePolicyRolePlain('operator', swappedPolicy),
+    'look only (read status and files, change nothing)',
+  );
+
+  const policy = parsePolicyForInvite(`
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.editor]
+allow = ["effect:read", "effect:write"]
+
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:power"]
+
+[roles.helper]
+allow = ["effect:read", "effect:exec"]
+`);
+  const roles = extractInviteRoles(policy, { type: 'string' }, { allowOwner: true });
+  assert.deepEqual(
+    roles.map((r) => r.name),
+    ['observer', 'editor', 'operator', 'helper', 'owner'],
+  );
+  assert.equal(
+    describePolicyRolePlain('observer', policy),
+    'look only (read status and files, change nothing)',
+  );
+  assert.match(describePolicyRolePlain('helper', policy), /allows running commands/);
+  assert.equal(roles.find((r) => r.name === 'owner').ownerStrength, true);
+  assert.equal(roles.find((r) => r.name === 'observer').ownerStrength, false);
+
+  const summary = summarizeInvitedDeviceFleet(
+    {
+      results: {
+        tower: { ok: { devices: [{ id: 'abc', name: 'tablet' }] } },
+        pi: { ok: { devices: [{ id: 'abc', name: 'tablet' }] } },
+        studio: { ok: { devices: [] } },
+      },
+    },
+    { id: 'abc', name: 'tablet' },
+  );
+  assert.deepEqual(summary, { received: ['pi', 'tower'], pending: ['studio'] });
+
+  const plainNotice = formatInvitedDeviceSyncNotice('tablet', summary, false);
+  assert.equal(plainNotice.title, 'tablet is paired.');
+  assert.match(plainNotice.detail, /Received by pi and tower/);
+  assert.match(plainNotice.detail, /studio will get it at the next sync/);
+  assert.ok(!plainNotice.detail.includes('fleet.sync'));
 });

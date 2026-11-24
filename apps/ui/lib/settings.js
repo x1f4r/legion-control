@@ -106,6 +106,11 @@ export function applySettingsToRoot(root, settings) {
   } else {
     delete root.dataset.density;
   }
+  if (s.technical) {
+    root.dataset.technical = 'true';
+  } else {
+    delete root.dataset.technical;
+  }
 }
 
 export function detectDeviceNoun(linkKind, userAgent = '', width = 0) {
@@ -517,4 +522,514 @@ export function isInviteOwnerStrength({
     return isRoleOwnerStrength(matchedDevice.role, { policy, whoami });
   }
   return false;
+}
+
+function joinNamesPlain(names) {
+  const list = (names || []).filter(Boolean);
+  if (list.length === 0) return '';
+  if (list.length === 1) return list[0];
+  if (list.length === 2) return `${list[0]} and ${list[1]}`;
+  return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+}
+
+/**
+ * Plain-language summary of which fleet machines received this device right after pairing
+ * and which will receive it at their next sync (distinguishing `partial` from `not_reached`).
+ */
+export function formatPairSyncNotice(lastPaired, technical = false) {
+  if (!lastPaired || typeof lastPaired !== 'object') return null;
+  const node = String(lastPaired.node || '').trim();
+  const synced = Array.isArray(lastPaired.synced) ? lastPaired.synced.filter(Boolean) : [];
+  const rawPending = Array.isArray(lastPaired.not_synced) ? lastPaired.not_synced : [];
+  const partialPeers = [];
+  const unreachedPeers = [];
+  for (const item of rawPending) {
+    const peerNode = typeof item === 'string' ? item : item?.node;
+    if (!peerNode) continue;
+    const status = typeof item === 'object' ? String(item?.status || '') : '';
+    const reason = typeof item === 'object' && item?.reason ? String(item.reason) : '';
+    if (status === 'partial') {
+      partialPeers.push({ node: peerNode, reason });
+    } else {
+      unreachedPeers.push({ node: peerNode, reason });
+    }
+  }
+  if (synced.length === 0 && partialPeers.length === 0 && unreachedPeers.length === 0) return null;
+
+  const syncedNames = joinNamesPlain(synced);
+  const title =
+    synced.length > 0
+      ? `Paired with ${node || 'this machine'} and shared with ${syncedNames}.`
+      : `Paired with ${node || 'this machine'}.`;
+
+  if (partialPeers.length === 0 && unreachedPeers.length === 0) {
+    return {
+      kind: 'neutral',
+      title,
+      detail: 'This device can reach them directly.',
+    };
+  }
+
+  const parts = [];
+  if (partialPeers.length > 0) {
+    const names = joinNamesPlain(partialPeers.map((p) => p.node));
+    let part = `${names} received removals, but not this device yet — it will get this device at the next sync.`;
+    if (technical) {
+      const reasons = partialPeers
+        .filter((p) => p.reason)
+        .map((p) => `${p.node}: ${p.reason}`);
+      if (reasons.length > 0) {
+        part = `${part} (${reasons.join('; ')})`;
+      }
+    }
+    parts.push(part);
+  }
+  if (unreachedPeers.length > 0) {
+    const names = joinNamesPlain(unreachedPeers.map((p) => p.node));
+    parts.push(`${names} did not answer and will get this device at the next sync.`);
+  }
+
+  let detail = parts.join(' ');
+  if (technical) {
+    const cmd =
+      String(lastPaired.sync_command || '').trim() ||
+      'legion fleet.sync direction=push documents=\'["devices.toml"]\'';
+    detail = `${detail} Run \`${cmd}\` to sync now.`;
+  }
+  return {
+    kind: 'warn',
+    title,
+    detail,
+  };
+}
+
+/**
+ * Describes how this device reaches a machine for Settings -> Connections.
+ * Never exposes tool names when `technical` is false.
+ */
+export function describeConnectionRoute(entry, technical = false) {
+  const node = entry?.node || 'this machine';
+  const idChanged = entry?.identity_changed || null;
+  const route = idChanged ? 'identity_changed' : entry?.route || 'direct';
+
+  if (route === 'identity_changed') {
+    const reporter = idChanged?.reported_by || entry?.route_via || entry?.learned_from || 'another machine';
+    const isPaired = Boolean(idChanged?.is_paired || entry?.origin === 'paired');
+    const hasConflicts = Array.isArray(idChanged?.conflicts) && idChanged.conflicts.length > 0;
+    const hint = isPaired
+      ? `${reporter} reported a different host key for ${node}. Because this device paired with ${node} directly, its saved keys were not changed; pair with ${node} again if its identity really changed.`
+      : hasConflicts
+        ? `Machines disagree on the new identity for ${node}. Review the reports before deciding whether to dismiss or pair directly.`
+        : `${reporter} reported a change for ${node}. Review the details and accept only if ${node} was reinstalled or its keys or address changed.`;
+    return {
+      kind: 'identity_changed',
+      label: 'Identity changed',
+      hint,
+      isWarning: true,
+      isIdentityChanged: true,
+    };
+  }
+
+  if (route === 'not_synced') {
+    const introducer = entry?.learned_from || entry?.route_via || 'another machine';
+    return {
+      kind: 'not_synced',
+      label: `not yet: ${introducer} has not passed this device on to it`,
+      hint: technical
+        ? `Run \`legion fleet.sync\` on ${introducer}.`
+        : 'Ask the owner to sync the machines',
+      isWarning: false,
+      isIdentityChanged: false,
+    };
+  }
+
+  if (route === 'relay') {
+    const via = entry?.route_via || 'another machine';
+    return {
+      kind: 'relay',
+      label: `through ${via}`,
+      hint: null,
+      isWarning: false,
+      isIdentityChanged: false,
+    };
+  }
+
+  return {
+    kind: 'direct',
+    label: 'directly',
+    hint: null,
+    isWarning: false,
+    isIdentityChanged: false,
+  };
+}
+
+/**
+ * Lists relay-only machines known via `linkState.routes` or the live fleet snapshot that do not
+ * have their own direct node entry in `linkState.nodes`.
+ */
+export function buildRelayedConnections(linkState, snapshot) {
+  const directNodes = new Set((linkState?.nodes || []).map((n) => n?.node).filter(Boolean));
+  const fallbackVia = linkState?.nodes?.[0]?.node || null;
+  const routes = linkState?.routes && typeof linkState.routes === 'object' ? linkState.routes : {};
+  const byName = new Map();
+
+  for (const [name, info] of Object.entries(routes)) {
+    if (!name || directNodes.has(name)) continue;
+    byName.set(name, {
+      node: name,
+      route: info?.kind || 'relay',
+      route_via: info?.via || fallbackVia,
+      learned_from: info?.introducer || null,
+      identity_changed: null,
+      relayedOnly: true,
+    });
+  }
+
+  for (const m of snapshot?.machines || []) {
+    if (!m?.name || directNodes.has(m.name) || byName.has(m.name)) continue;
+    byName.set(m.name, {
+      node: m.name,
+      route: 'relay',
+      route_via: fallbackVia,
+      learned_from: null,
+      identity_changed: null,
+      relayedOnly: true,
+    });
+  }
+
+  return Array.from(byName.values()).sort((a, b) => (a.node < b.node ? -1 : a.node > b.node ? 1 : 0));
+}
+
+function ruleMatchesToolSpec(rule, spec) {
+  if (typeof rule !== 'string' || !rule) return false;
+  if (rule.startsWith('effect:')) {
+    return spec?.effect === rule.slice('effect:'.length);
+  }
+  return globMatches(rule, String(spec?.name || ''));
+}
+
+function analyzePolicyRole(roleName, policy, tools = []) {
+  const trimmed = String(roleName || '').trim();
+  if (trimmed === 'owner') {
+    return {
+      read: true,
+      write: true,
+      exec: true,
+      power: true,
+      destroy: true,
+      admin: true,
+      broadWrite: true,
+      broadExec: true,
+      broadAdmin: true,
+      canWritePolicy: true,
+      hasUnknownToolRule: false,
+      ownerStrength: true,
+      allow: ['*'],
+    };
+  }
+  const def = policy?.roles?.[trimmed];
+  if (!def || !Array.isArray(def.allow)) return null;
+  const allow = def.allow;
+  const deny = Array.isArray(def.deny) ? def.deny : [];
+  const toolList = Array.isArray(tools) ? tools : [];
+
+  const eff = {
+    read: false,
+    write: false,
+    exec: false,
+    power: false,
+    destroy: false,
+    admin: false,
+    broadWrite: false,
+    broadExec: false,
+    broadAdmin: false,
+    canWritePolicy: false,
+    hasUnknownToolRule: false,
+    ownerStrength: false,
+    allow,
+  };
+
+  if (allow.length === 0) return eff;
+
+  const isDeniedEffect = (effectName) =>
+    deny.some((r) => r === `effect:${effectName}` || ruleIsBroadAdmin(r));
+
+  for (const rule of allow) {
+    if (ruleIsBroadAdmin(rule)) {
+      if (!isDeniedEffect('read')) eff.read = true;
+      if (!isDeniedEffect('write')) {
+        eff.write = true;
+        eff.broadWrite = true;
+      }
+      if (!isDeniedEffect('exec')) {
+        eff.exec = true;
+        eff.broadExec = true;
+      }
+      if (!isDeniedEffect('power')) eff.power = true;
+      if (!isDeniedEffect('destroy')) eff.destroy = true;
+      if (!isDeniedEffect('admin')) {
+        eff.admin = true;
+        eff.broadAdmin = true;
+      }
+    } else if (rule === 'effect:read' && !isDeniedEffect('read')) {
+      eff.read = true;
+    } else if (rule === 'effect:write' && !isDeniedEffect('write')) {
+      eff.write = true;
+      eff.broadWrite = true;
+    } else if (rule === 'effect:exec' && !isDeniedEffect('exec')) {
+      eff.exec = true;
+      eff.broadExec = true;
+    } else if (rule === 'effect:power' && !isDeniedEffect('power')) {
+      eff.power = true;
+    } else if (rule === 'effect:destroy' && !isDeniedEffect('destroy')) {
+      eff.destroy = true;
+    } else if (rule === 'effect:admin' && !isDeniedEffect('admin')) {
+      eff.admin = true;
+      eff.broadAdmin = true;
+    }
+  }
+
+  if (allow.some(ruleMatchesConfigWrite) && !deny.some(ruleMatchesConfigWrite)) {
+    eff.canWritePolicy = true;
+    eff.admin = true;
+  }
+
+  if (toolList.length > 0) {
+    for (const spec of toolList) {
+      const allowed = allow.some((r) => ruleMatchesToolSpec(r, spec));
+      const denied = deny.some((r) => ruleMatchesToolSpec(r, spec));
+      if (allowed && !denied) {
+        if (spec.effect === 'read') eff.read = true;
+        else if (spec.effect === 'write') eff.write = true;
+        else if (spec.effect === 'exec') eff.exec = true;
+        else if (spec.effect === 'power') eff.power = true;
+        else if (spec.effect === 'destroy') eff.destroy = true;
+        else if (spec.effect === 'admin') eff.admin = true;
+        if (spec.name === 'config.write') eff.canWritePolicy = true;
+      }
+    }
+    for (const rule of allow) {
+      if (rule.startsWith('effect:') || ruleIsBroadAdmin(rule)) continue;
+      if (!toolList.some((spec) => globMatches(rule, String(spec?.name || '')))) {
+        eff.hasUnknownToolRule = true;
+      }
+    }
+  } else {
+    for (const rule of allow) {
+      if (rule.startsWith('effect:') || ruleIsBroadAdmin(rule)) continue;
+      if (ruleMatchesConfigWrite(rule)) continue;
+      eff.hasUnknownToolRule = true;
+    }
+  }
+
+  eff.ownerStrength = eff.broadAdmin || eff.canWritePolicy;
+  return eff;
+}
+
+/**
+ * Normalizes the reply from the node's `device.roles` tool (`[{name, description, strongest_effect, owner_strength}]`
+ * or `{ roles: [...] }`). Preserves the node-supplied `description` and `owner_strength` verbatim.
+ */
+export function normalizeNodeRoles(result) {
+  const list = Array.isArray(result)
+    ? result
+    : Array.isArray(result?.roles)
+      ? result.roles
+      : null;
+  if (!list) return null;
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    const name = String(item?.name || '').trim();
+    if (!name || name === 'nobody' || seen.has(name)) continue;
+    seen.add(name);
+    out.push({
+      name,
+      description: String(item?.description || '').trim(),
+      strongestEffect: item?.strongest_effect || null,
+      ownerStrength: Boolean(item?.owner_strength),
+      fromNode: true,
+    });
+  }
+  return out;
+}
+
+/**
+ * Derives a plain-English role description strictly from the node's live `policy.toml` rules and
+ * tool catalogue (matching `legion pair`'s rule analysis; never hardcoded by role name except
+ * built-in `owner`).
+ *
+ * When `technical` is false, custom rule summaries omit raw tool names so plain mode stays free
+ * of internal tool identifiers.
+ */
+export function describePolicyRolePlain(
+  roleName,
+  policy = null,
+  { tools = [], technical = false } = {},
+) {
+  const trimmed = String(roleName || '').trim();
+  if (!trimmed) return '';
+  if (trimmed === 'owner') {
+    return 'everything, including changing who may do what';
+  }
+  const eff = analyzePolicyRole(trimmed, policy, tools);
+  if (!eff) return '';
+  if (eff.allow.length === 0) return 'nothing (no actions allowed)';
+
+  const summary = eff.allow.join(', ');
+  const suffix = technical && summary ? `: ${summary}` : '';
+
+  if (eff.admin) {
+    if (eff.broadAdmin) {
+      return 'everything, including changing who may do what (as strong as owner)';
+    }
+    if (eff.canWritePolicy) {
+      return `everything, including changing who may do what (as strong as owner${suffix})`;
+    }
+    return `custom (allows admin${suffix})`;
+  }
+  if (eff.exec) {
+    if (eff.broadExec && eff.write && !eff.hasUnknownToolRule) {
+      return 'operate (read, change files, and run commands — as strong as this account)';
+    }
+    return `custom (allows running commands — as strong as this account${suffix})`;
+  }
+  if (eff.power) {
+    return `custom (allows power controls${suffix})`;
+  }
+  if (eff.destroy) {
+    return `custom (allows removing files or processes${suffix})`;
+  }
+  if (eff.hasUnknownToolRule) {
+    return `custom${suffix ? ` (${summary})` : ''}`;
+  }
+  if (eff.write) {
+    if (eff.broadWrite) {
+      return 'change files (read and edit files, no running commands)';
+    }
+    return `custom (allows changing files${suffix})`;
+  }
+  if (eff.read) {
+    return 'look only (read status and files, change nothing)';
+  }
+  return 'nothing (no actions allowed)';
+}
+
+const STANDARD_ROLE_ORDER = ['observer', 'editor', 'operator'];
+
+/**
+ * Builds the list of selectable roles for "Let another device in" from `policy.toml` + `owner`
+ * (fallback path when `device.roles` is not offered by the node).
+ */
+export function extractInviteRoles(
+  policy,
+  roleProp,
+  { allowOwner = true, tools = [], technical = false } = {},
+) {
+  const names = [];
+  const seen = new Set();
+  const push = (name) => {
+    const s = String(name || '').trim();
+    if (!s || s === 'nobody' || seen.has(s)) return;
+    seen.add(s);
+    names.push(s);
+  };
+
+  if (Array.isArray(roleProp?.enum) && roleProp.enum.length > 0) {
+    for (const opt of roleProp.enum) push(opt);
+  } else if (policy?.roles && typeof policy.roles === 'object') {
+    const policyNames = Object.keys(policy.roles);
+    for (const std of STANDARD_ROLE_ORDER) {
+      if (policyNames.includes(std)) push(std);
+    }
+    for (const custom of [...policyNames].sort()) {
+      if (custom !== 'owner') push(custom);
+    }
+    if (allowOwner || policyNames.includes('owner')) {
+      push('owner');
+    }
+  }
+
+  return names.map((name) => {
+    const eff = analyzePolicyRole(name, policy, tools);
+    return {
+      name,
+      description: describePolicyRolePlain(name, policy, { tools, technical }),
+      ownerStrength: eff ? eff.ownerStrength : isRoleOwnerStrength(name, { policy }),
+      fromNode: false,
+    };
+  });
+}
+
+/**
+ * Checks a fan-out `device.list` (`on: "all"`) result to see which fleet machines received
+ * `invitedDevice` and which have not yet.
+ */
+export function summarizeInvitedDeviceFleet(allResult, invitedDevice) {
+  const results = allResult?.results && typeof allResult.results === 'object' ? allResult.results : {};
+  const received = [];
+  const pending = [];
+  const targetId = invitedDevice?.id || null;
+  const targetFp = invitedDevice?.fingerprint || null;
+  const targetName = invitedDevice?.name || null;
+  const targetPrincipal = invitedDevice?.principal || null;
+
+  for (const machine of Object.keys(results).sort()) {
+    const entry = results[machine];
+    const devices = Array.isArray(entry?.ok?.devices) ? entry.ok.devices : null;
+    if (!devices) {
+      pending.push(machine);
+      continue;
+    }
+    const found = devices.some((d) => {
+      if (targetId && d?.id) return d.id === targetId;
+      if (targetFp && d?.fingerprint) return d.fingerprint === targetFp;
+      return Boolean(targetName && d?.name === targetName && (!targetPrincipal || d?.principal === targetPrincipal));
+    });
+    if (found) received.push(machine);
+    else pending.push(machine);
+  }
+
+  return { received, pending };
+}
+
+/**
+ * Plain-language notice for the invite screen once the other device has paired.
+ */
+export function formatInvitedDeviceSyncNotice(deviceName, summary, technical = false) {
+  const who = String(deviceName || '').trim() || 'The new device';
+  const received = Array.isArray(summary?.received) ? summary.received.filter(Boolean) : [];
+  const pending = Array.isArray(summary?.pending) ? summary.pending.filter(Boolean) : [];
+
+  const title = `${who} is paired.`;
+  if (received.length > 0 && pending.length === 0) {
+    return {
+      kind: 'neutral',
+      title,
+      detail: `Received by ${joinNamesPlain(received)}.`,
+    };
+  }
+  if (received.length > 0 && pending.length > 0) {
+    let detail = `Received by ${joinNamesPlain(received)}. ${joinNamesPlain(pending)} will get it at the next sync.`;
+    if (technical) {
+      detail = `${detail} Run \`legion fleet.sync direction=push documents='["devices.toml"]'\` to sync now.`;
+    }
+    return {
+      kind: 'warn',
+      title,
+      detail,
+    };
+  }
+  if (pending.length > 0) {
+    return {
+      kind: 'warn',
+      title,
+      detail: `${joinNamesPlain(pending)} will get it at the next sync.`,
+    };
+  }
+  return {
+    kind: 'neutral',
+    title,
+    detail: 'Ready to connect.',
+  };
 }

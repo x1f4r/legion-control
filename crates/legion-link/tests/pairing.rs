@@ -428,6 +428,7 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
     let config = LinkConfig {
         device_key: Some(device_key.to_openssh().unwrap()),
         nodes: vec![NodeLink::from(enrolled)],
+        ..LinkConfig::default()
     };
     let link = Link::new(config);
 

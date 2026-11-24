@@ -267,6 +267,7 @@ async fn real_sshd_session_and_security_checks() {
     let config = LinkConfig {
         device_key: Some(env.key.to_openssh().unwrap()),
         nodes: vec![NodeLink::ssh(&env.node, target, Some("phone".to_owned()))],
+        ..LinkConfig::default()
     };
     let link = Link::new(config);
     let hello = link.hello(&env.node).await.unwrap();

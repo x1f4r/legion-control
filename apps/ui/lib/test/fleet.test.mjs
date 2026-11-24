@@ -319,3 +319,78 @@ test('refreshFleetProgressive preserves busyState (busy object reasons and unmon
   assert.equal(pi.busyState, 'busy');
   assert.deepEqual(pi.busyReasons, [probeReason]);
 });
+
+test('refreshFleetProgressive in app mode routes machine details directly and handles active node failover when A is off', async () => {
+  const seenOn = [];
+  const activeChanges = [];
+  const link = {
+    kind: 'app',
+    async call(tool, args = {}, opts = {}) {
+      seenOn.push({ tool, on: opts.on ?? null });
+      if (tool === 'fleet.list') {
+        // Originally paired node tower is off; pi answered via failover.
+        return {
+          node: 'pi',
+          machines: [
+            { name: 'pi', this_node: true, systems: [], wake_via: [] },
+            { name: 'tower', this_node: false, systems: [], wake_via: [] },
+          ],
+        };
+      }
+      if (tool === 'fleet.ping') {
+        assert.deepEqual(args.machines, ['tower']);
+        return {
+          results: [
+            {
+              machine: 'tower',
+              reachable: false,
+              error: { code: 'unreachable', message: 'tower did not answer.', machine: 'tower' },
+            },
+          ],
+        };
+      }
+      if (opts.on === 'tower') {
+        throw { code: 'unreachable', message: 'tower did not answer.', machine: 'tower' };
+      }
+      if (tool === 'meta.version') {
+        return { version: '0.1.0', os: 'linux', arch: 'aarch64' };
+      }
+      if (tool === 'sys.info') {
+        return {
+          node: 'pi',
+          os: { family: 'linux', arch: 'aarch64' },
+          uptime_s: 300,
+          cpu: { usage_pct: 8 },
+          memory: { total: 8000, used: 1000 },
+          disks: [],
+          gpus: [],
+        };
+      }
+      if (tool === 'job.list') return { jobs: [] };
+      if (tool === 'power.status') return { system: 'linux', busy: { state: 'idle', reasons: [] } };
+      throw new Error(`unexpected ${tool} on=${opts.on}`);
+    },
+  };
+
+  const finalSnap = await refreshFleetProgressive({
+    link,
+    localNode: 'tower',
+    onActiveNodeChanged(next) {
+      activeChanges.push(next);
+    },
+    onUpdate() {},
+    now: () => 1700000300000,
+  });
+
+  assert.deepEqual(activeChanges, ['pi']);
+  const pi = finalSnap.machines.find((m) => m.name === 'pi');
+  const tower = finalSnap.machines.find((m) => m.name === 'tower');
+  assert.equal(pi.reachable, true);
+  assert.equal(pi.thisNode, true);
+  assert.equal(pi.sys.node, 'pi');
+  assert.equal(tower.reachable, false);
+  assert.equal(tower.status, 'offline');
+  assert.equal(tower.thisNode, false);
+  // In app mode, detail calls carry explicit `on: machine` so Link routes directly.
+  assert.ok(seenOn.some((c) => c.tool === 'sys.info' && c.on === 'pi'));
+});

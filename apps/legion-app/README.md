@@ -17,10 +17,11 @@ an internal `Backend` trait.
   displays the resolved path under This device while still allowing additional SSH nodes to be
   paired.
 - **Streaming, failover, and reconnect:** Tool calls stream live output over Tauri IPC channels
-  with caller-scoped cancellation. Failover to another configured node only runs when a request
-  never left this device (`details.sent == false`), preserves the originally intended target node,
-  and marks the failover switch as temporary in memory without persisting it. On mobile resume from
-  background, cached sessions are closed before refreshing.
+  with caller-scoped cancellation. Machine calls always name their target machine; only door-level
+  discovery reads may omit `on` and fall back to another directly paired node when a request never
+  left this device (`details.sent == false`), caching an expiring in-memory relay preference hint
+  without persisting or changing any machine target. On mobile resume from background, cached
+  sessions are closed before refreshing.
 - **State safety, revocation, and unpairing:** If `legion-app.json` is damaged or written by a
   newer schema version, the app enters repair mode, refuses writes, and offers an explicit repair
   action that moves the file aside to `legion-app.json.damaged-<timestamp>` without deleting it. If

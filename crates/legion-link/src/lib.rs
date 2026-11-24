@@ -38,6 +38,13 @@
 //! - **`events` callback**: `{"kind": "stdout"|"stderr"|"progress"|"log", "data": ..., "machine"?: "..."}`.
 //! - **Errors**: [`legion_proto::ErrorBody`] (`{"code", "message", "hint"?, "machine"?, "details"?}`).
 //!
+//! # Introducer trust
+//!
+//! Only directly paired machines may act as introducers or preferred relays; learned machines never
+//! introduce other machines. When only one paired node is reachable, you trust it to supply the
+//! host keys pinned for brand-new machines it reports, though it can never alter a paired machine's
+//! pins or silently replace an already known machine's keys or route.
+//!
 //! # Stable error reasons
 //!
 //! Because [`legion_proto::ErrorCode`] is a closed 13-code wire set, callers and GUIs can branch
@@ -57,6 +64,9 @@
 //!   offered a host key that did not match any pinned key in `host_keys`. Includes `details.host`,
 //!   `details.port`, and either `details.offered` / `details.expected` SHA-256 fingerprints or
 //!   `details.offered_algorithms` / `details.pinned_algorithms`.
+//! - **`"node_mismatch"`** ([`REASON_NODE_MISMATCH`], `code: "denied"`): the connected SSH server
+//!   reported a different `hello.node` name than the configured entry; the session is closed
+//!   without executing any tool or failing over. Includes `details.expected` and `details.actual`.
 //! - **`"timeout"`** ([`REASON_TIMEOUT`], `code: "timeout"`): DNS lookup, TCP connect, or SSH
 //!   handshake timed out. Includes `details.host` and `details.port` when a single host failed.
 //! - **`"unreachable"`** ([`REASON_UNREACHABLE`], `code: "unreachable"`): DNS lookup failed, TCP
@@ -92,6 +102,9 @@ pub mod stderr;
 
 /// Structured `details.reason` for a pinned host key mismatch (`code: "denied"`).
 pub const REASON_HOST_KEY_MISMATCH: &str = "host_key_mismatch";
+/// Structured `details.reason` when a connected SSH server's `hello` handshake reports a different
+/// node name than the configured entry (`code: "denied"`).
+pub const REASON_NODE_MISMATCH: &str = "node_mismatch";
 /// Structured `details.reason` for rejected SSH key authentication on a low-level SSH open or
 /// invite enrolment (`code: "denied"`).
 pub const REASON_AUTH_FAILED: &str = "auth_failed";
@@ -113,17 +126,33 @@ pub const REASON_NON_PROTOCOL_OUTPUT: &str = "non_protocol_output";
 /// already written to the wire or when an error came back from the node.
 pub const DETAIL_SENT: &str = "sent";
 
+/// Removes any caller-reserved [`DETAIL_SENT`] key from an error received over the wire so a
+/// remote node can never spoof `details.sent = false` to trigger failover or retries.
+pub(crate) fn strip_remote_sent(mut err: legion_proto::ErrorBody) -> legion_proto::ErrorBody {
+    if let Some(serde_json::Value::Object(ref mut obj)) = err.details {
+        obj.remove(DETAIL_SENT);
+        if obj.is_empty() {
+            err.details = None;
+        }
+    }
+    err
+}
+
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
 pub use invite::{
-    Enrolled, INVITE_PREFIX, INVITE_VERSION, Invite, MAX_INVITE_LEN, SshTarget, SshTimeouts,
+    Enrolled, FleetPushOutcome, INVITE_PREFIX, INVITE_VERSION, Invite, MAX_INVITE_LEN, SshTarget,
+    SshTimeouts,
 };
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    DEFAULT_IDLE_TIMEOUT, Link, LinkConfig, LinkOptions, NodeLink, SessionOpener,
-    parse_optional_target,
+    ConflictingIdentityReport, DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, LearnReport, Link,
+    LinkConfig, LinkOptions, MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN,
+    MAX_ENDPOINT_HOST_KEY_LEN, MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS, MachineRouteStatus,
+    NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue, SessionOpener,
+    parse_optional_target, public_key_fingerprint,
 };
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,

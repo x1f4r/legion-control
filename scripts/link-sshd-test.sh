@@ -184,7 +184,7 @@ cat > "$WORK/enrol-responder.sh" <<EOF
 set -euo pipefail
 exec "$NODE_BIN" -e '
 const fs = require("node:fs");
-const [authKeysPath, legionBin] = process.argv.slice(1);
+const [authKeysPath, legionBin, farHome] = process.argv.slice(1);
 let buf = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -197,7 +197,7 @@ process.stdin.on("data", (chunk) => {
     process.stdout.write(JSON.stringify({ ok: false, error: { code: "invalid_args", message: "Bad enrolment request." } }) + "\n");
     process.exit(0);
   }
-  const entry = \`command="\${legionBin} gate --as phone",restrict \${req.public_key}\n\`;
+  const entry = \`command="\${legionBin} gate --as phone --home \${farHome}",restrict \${req.public_key}\n\`;
   fs.appendFileSync(authKeysPath, entry, { mode: 0o600 });
   process.stdout.write(JSON.stringify({
     ok: true,
@@ -208,7 +208,7 @@ process.stdin.on("data", (chunk) => {
   }) + "\n");
   process.exit(0);
 });
-' "$WORK/authorized_keys" "$LEGION_BIN"
+' "$WORK/authorized_keys" "$LEGION_BIN" "$FAR_HOME"
 EOF
 chmod 700 "$WORK/enrol-responder.sh"
 

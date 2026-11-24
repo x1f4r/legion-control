@@ -257,8 +257,10 @@ function App() {
     error: null,
   });
   const [pairingOpen, setPairingOpen] = useState(false);
+  const [pairNotice, setPairNotice] = useState(null);
   const [wakeSentAt, setWakeSentAt] = useState({});
   const sheetHistoryRef = useRef(false);
+  const learnInFlightRef = useRef(false);
 
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
@@ -290,7 +292,10 @@ function App() {
 
   useEffect(() => {
     applySettingsToRoot(document.documentElement, settings);
-  }, [settings]);
+    if (document.documentElement?.dataset) {
+      document.documentElement.dataset.deviceNoun = deviceNoun;
+    }
+  }, [settings, deviceNoun]);
 
   useEffect(() => {
     if (mainRef.current) mainRef.current.scrollTop = 0;
@@ -347,6 +352,58 @@ function App() {
     return () => window.removeEventListener('legion:open-pairing', onOpenPairing);
   }, [link]);
 
+  const mergeBackendState = useCallback((updated) => {
+    if (!updated || !Array.isArray(updated.nodes)) return;
+    setLinkState((prev) => {
+      if (!prev) return updated;
+      const prevByNode = new Map((prev.nodes || []).map((n) => [n.node, n]));
+      const mergedNodes = updated.nodes.map((n) => {
+        const old = prevByNode.get(n.node);
+        if (!old) return n;
+        return {
+          ...n,
+          version: n.version || old.version,
+          build: n.build ?? old.build,
+          protocol: n.protocol ?? old.protocol,
+          whoami: n.whoami || old.whoami,
+        };
+      });
+      return {
+        ...prev,
+        ...updated,
+        nodes: mergedNodes,
+      };
+    });
+  }, []);
+
+  const triggerLearnInBackground = useCallback(() => {
+    if (typeof link.learn !== 'function' || learnInFlightRef.current) return;
+    learnInFlightRef.current = true;
+    link
+      .learn()
+      .then((res) => {
+        if (res?.state) mergeBackendState(res.state);
+      })
+      .catch(() => {})
+      .finally(() => {
+        learnInFlightRef.current = false;
+      });
+  }, [link, mergeBackendState]);
+
+  const handleActiveNodeChanged = useCallback(
+    (nextNode) => {
+      if (!nextNode) return;
+      setLinkState((prev) => {
+        if (!prev || !Array.isArray(prev.nodes)) return prev;
+        const idx = prev.nodes.findIndex((n) => n.node === nextNode);
+        if (idx <= 0) return prev;
+        const reordered = [prev.nodes[idx], ...prev.nodes.slice(0, idx), ...prev.nodes.slice(idx + 1)];
+        return { ...prev, nodes: reordered };
+      });
+    },
+    [],
+  );
+
   const refreshFleet = useCallback(
     async (activeNodeInfo, options = {}) => {
       const targetNode = activeNodeInfo || nodeInfoRef.current;
@@ -373,6 +430,7 @@ function App() {
           forceOffline: Boolean(options.forceOffline),
           checkOffline: settingsRef.current.checkOffline !== false,
           signal: ctrl.signal,
+          onActiveNodeChanged: handleActiveNodeChanged,
           onUpdate(next) {
             if (ctrl.signal.aborted) return;
             setSnapshot(next);
@@ -380,7 +438,8 @@ function App() {
           onSettled(finalSnap) {
             if (ctrl.signal.aborted) return;
             if (link.kind !== 'mock') {
-              persistentCache.set('fleet', serializeFleetCache(targetNode.node, finalSnap.machines));
+              const activeName = nodeInfoRef.current?.node || targetNode.node;
+              persistentCache.set('fleet', serializeFleetCache(activeName, finalSnap.machines));
             }
           },
         });
@@ -395,7 +454,26 @@ function App() {
         }
       }
     },
-    [link, persistentCache],
+    [link, persistentCache, handleActiveNodeChanged],
+  );
+
+  const handleAcceptIdentityChange = useCallback(
+    async (nodeName, fingerprints) => {
+      if (typeof link.acceptIdentityChange !== 'function') return;
+      const next = await link.acceptIdentityChange(nodeName, fingerprints);
+      if (next) mergeBackendState(next);
+      refreshFleet(nodeInfoRef.current, { background: true });
+    },
+    [link, mergeBackendState, refreshFleet],
+  );
+
+  const handleDismissIdentityChange = useCallback(
+    async (nodeName) => {
+      if (typeof link.dismissIdentityChange !== 'function') return;
+      const next = await link.dismissIdentityChange(nodeName);
+      if (next) mergeBackendState(next);
+    },
+    [link, mergeBackendState],
   );
 
   const hydrate = useCallback(
@@ -433,8 +511,9 @@ function App() {
         .catch(() => {});
 
       refreshFleet(primary, { initialSnapshot: cachedSnap });
+      triggerLearnInBackground();
     },
-    [link, sessionCache, persistentCache, refreshFleet],
+    [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground],
   );
 
   useEffect(() => {
@@ -616,6 +695,8 @@ function App() {
     (machine) => {
       const args = { machine: machine.name };
       const copy = describePowerConfirm('power.wake', machine.name, args);
+      const wakeRunner =
+        (snapshotRef.current?.machines || []).find((m) => m.reachable)?.name || nodeInfo?.node;
       openConfirm({
         title: copy.title,
         summary: copy.summary,
@@ -626,10 +707,10 @@ function App() {
         confirmLabel: copy.confirmLabel,
         canDryRun: true,
         async onDryRun() {
-          return link.call('power.wake', { machine: machine.name, dry_run: true });
+          return link.call('power.wake', { machine: machine.name, dry_run: true }, { on: wakeRunner });
         },
         async onConfirm() {
-          await link.call('power.wake', { machine: machine.name });
+          await link.call('power.wake', { machine: machine.name }, { on: wakeRunner });
           markWakeSent(machine.name);
           refreshFleet(nodeInfo, { forceOffline: true });
         },
@@ -745,6 +826,7 @@ function App() {
     if (canPull && classifyPullRefresh({ dx, dy, scrollTop: start.scrollTop })) {
       setPullState('refreshing');
       refreshFleet(nodeInfo, { forceOffline: true });
+      triggerLearnInBackground();
       return;
     }
     if (pullState === 'pull' || pullState === 'release') {
@@ -1105,6 +1187,9 @@ function App() {
                 onConnected=${(next) => {
                   setPairingOpen(false);
                   setFleetError(null);
+                  setPairNotice(
+                    next?.last_paired ? { summary: next.last_paired, screen: 'machines' } : null,
+                  );
                   hydrate(next);
                 }}
               />
@@ -1136,6 +1221,8 @@ function App() {
                         <${MachinesView}
                           snapshot=${snapshot}
                           error=${fleetError}
+                          pairNotice=${pairNotice?.screen === 'machines' ? pairNotice.summary : null}
+                          onDismissPairNotice=${() => setPairNotice(null)}
                           loading=${refreshing}
                           wide=${wide}
                           route=${route}
@@ -1148,7 +1235,10 @@ function App() {
                           onWakeMachine=${onWakeMachine}
                           onWakeSent=${markWakeSent}
                           onRequestConfirm=${openConfirm}
-                          onRefresh=${() => refreshFleet(nodeInfo, { forceOffline: true })}
+                          onRefresh=${() => {
+                            refreshFleet(nodeInfo, { forceOffline: true });
+                            triggerLearnInBackground();
+                          }}
                           commandRuns=${{ byMachine: commandRunsByMachine, draft: commandDraft }}
                           onCommandRunsChange=${commandRunsApi}
                         />
@@ -1195,10 +1285,19 @@ function App() {
                               allowedSet=${allowedSet}
                               snapshot=${snapshot}
                               settings=${settings}
+                              pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
+                              onDismissPairNotice=${() => setPairNotice(null)}
                               onUpdateSettings=${updateSettings}
                               onRequestConfirm=${openConfirm}
+                              onAcceptIdentityChange=${handleAcceptIdentityChange}
+                              onDismissIdentityChange=${handleDismissIdentityChange}
                               onConnected=${(next) => {
                                 setFleetError(null);
+                                setPairNotice(
+                                  next?.last_paired
+                                    ? { summary: next.last_paired, screen: 'connections' }
+                                    : null,
+                                );
                                 hydrate(next);
                               }}
                               onSelectNode=${
