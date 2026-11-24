@@ -636,17 +636,15 @@ pub async fn wait_for_runner(dir: &Path, id: &str, patience: Duration) -> bool {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
-            if let Some(mut record) = record
-                && record.id == id
+            let _fire = take_fire_lock(dir);
+            if let Some(mut latest) = read_pending(dir)
+                && latest.id == id
             {
-                record.abandoned = true;
-                let _ = write_pending(dir, &record);
-                // It may have taken over while this was written.
-                if read_pending(dir).is_some_and(|again| again.taken.is_some()) {
-                    record.abandoned = false;
-                    let _ = write_pending(dir, &record);
+                if latest.taken.is_some() || latest.fired.is_some() {
                     return true;
                 }
+                latest.abandoned = true;
+                let _ = write_pending(dir, &latest);
             }
             return false;
         }
@@ -914,6 +912,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let handle = DetachHandle {
             process: legion_os::procid::ProcessId::new(4242, 7),
+            root_start_key: None,
             systemd_unit: Some("legion-job-power.scope".to_owned()),
             windows_job: None,
             marker: Some("m".to_owned()),

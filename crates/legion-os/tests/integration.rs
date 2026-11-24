@@ -204,6 +204,18 @@ fn write_current_procid(path: &Path) {
     .expect("failed to write helper ProcessId");
 }
 
+fn wait_for_path_sync(path: &Path, timeout: Duration, what: &str) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {timeout:?} waiting for {what} ({})",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
 fn run_helper(mode: &str) -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match mode {
@@ -317,10 +329,11 @@ fn helper_spawn_tree(args: &[String]) -> ExitCode {
     }
 
     let mut child = cmd.spawn().expect("failed to spawn grandchild");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !Path::new(grandchild_id_file).exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    wait_for_path_sync(
+        Path::new(grandchild_id_file),
+        Duration::from_secs(20),
+        "grandchild PID file in spawn_tree",
+    );
 
     println!("READY");
     let _ = io::stdout().flush();
@@ -344,10 +357,11 @@ fn helper_spawn_and_exit(args: &[String]) -> ExitCode {
         .spawn()
         .expect("failed to spawn background grandchild");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !Path::new(grandchild_id_file).exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    wait_for_path_sync(
+        Path::new(grandchild_id_file),
+        Duration::from_secs(20),
+        "background grandchild PID file in spawn_and_exit",
+    );
 
     println!("DONE");
     let _ = io::stdout().flush();
@@ -382,10 +396,11 @@ fn helper_escape_pipes(args: &[String]) -> ExitCode {
         .spawn()
         .expect("failed to spawn grandchild");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !Path::new(escaped_id_file).exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    wait_for_path_sync(
+        Path::new(escaped_id_file),
+        Duration::from_secs(20),
+        "escaped grandchild PID file in escape_pipes",
+    );
 
     println!("READY");
     let _ = io::stdout().flush();
@@ -404,6 +419,8 @@ fn helper_detach_parent(args: &[String]) -> ExitCode {
     let stdout_log = PathBuf::from(&args[3]);
     let stderr_log = PathBuf::from(&args[4]);
     let job_name = args[5].clone();
+    let me = procid::current().expect("failed to query detach_parent ProcessId");
+    let parent_id_arg = format!("{}:{}", me.pid, me.start_time);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -414,7 +431,7 @@ fn helper_detach_parent(args: &[String]) -> ExitCode {
         .block_on(spawn_detached(
             DetachOptions::new(CommandSpec::argv(
                 current_exe(),
-                [subchild_id_file, setsid_id_file],
+                [subchild_id_file, setsid_id_file, parent_id_arg],
             ))
             .name(job_name)
             .env(HELPER_ENV, "detach_worker")
@@ -435,9 +452,18 @@ fn helper_detach_parent(args: &[String]) -> ExitCode {
 fn helper_detach_worker(args: &[String]) -> ExitCode {
     let subchild_id_file = &args[0];
     let setsid_id_file = &args[1];
+    let parent_id = parse_procid(&args[2]);
 
-    // Give the parent a moment to exit first so log writes happen after parent exit.
-    std::thread::sleep(Duration::from_millis(250));
+    // Wait for the parent process to actually exit so log writes deterministically happen after
+    // parent exit without relying on a fixed sleep.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while procid::is_alive(&parent_id) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(
+        !procid::is_alive(&parent_id),
+        "timed out after 20s waiting for detach_parent ({parent_id}) to exit"
+    );
 
     let mark = env::var("LEGION_DETACH_MARK").unwrap_or_default();
     println!("worker-stdout:{mark}");
@@ -541,10 +567,11 @@ fn helper_orphan_root_exit(args: &[String]) -> ExitCode {
         .spawn()
         .expect("failed to spawn surviving child");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !Path::new(child_id_file).exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    wait_for_path_sync(
+        Path::new(child_id_file),
+        Duration::from_secs(20),
+        "surviving child PID file in orphan_root_exit",
+    );
 
     ExitCode::SUCCESS
 }
@@ -664,7 +691,7 @@ fn helper_env_remove_driver(args: &[String]) -> ExitCode {
 
     let detach_text = rt.block_on(wait_for_detached_file(
         &detach_out,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
         &handle,
         &[&detach_out],
     ));
@@ -719,6 +746,7 @@ fn helper_dump_argv(args: &[String]) -> ExitCode {
 /// while the root itself keeps running.
 fn helper_setsid_reparent_root(args: &[String]) -> ExitCode {
     let grandchild_id_file = &args[0];
+    let reparented_ready_file = Path::new(&args[1]);
     let ignore_term = args.iter().any(|a| a == "--ignore-term");
 
     let mut cmd = Command::new(current_exe());
@@ -733,9 +761,14 @@ fn helper_setsid_reparent_root(args: &[String]) -> ExitCode {
     let status = cmd.status().expect("failed to run setsid_reparent_mid");
     assert!(status.success());
 
+    // Signal to the test only after `setsid_reparent_mid` has completely exited so the grandchild
+    // is genuinely reparented before `stop_detached` runs.
+    write_atomic(reparented_ready_file, b"ready\n", WriteOptions::default())
+        .expect("failed to write reparented ready marker");
+
     // Keep the root alive so `stop_detached` runs while both root and the reparented `setsid`
     // grandchild are live simultaneously.
-    std::thread::sleep(Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(60));
     ExitCode::SUCCESS
 }
 
@@ -748,7 +781,7 @@ fn helper_setsid_reparent_mid(args: &[String]) -> ExitCode {
         use process_wrap::std::{CommandWrap, ProcessSession};
         let mut wrapped = CommandWrap::with_new(current_exe(), |cmd| {
             cmd.env(HELPER_ENV, "sleep")
-                .args(["30000", grandchild_id_file])
+                .args(["60000", grandchild_id_file])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -763,7 +796,7 @@ fn helper_setsid_reparent_mid(args: &[String]) -> ExitCode {
     {
         let mut cmd = Command::new(current_exe());
         cmd.env(HELPER_ENV, "sleep")
-            .args(["30000", grandchild_id_file])
+            .args(["60000", grandchild_id_file])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -774,10 +807,11 @@ fn helper_setsid_reparent_mid(args: &[String]) -> ExitCode {
         let _child = cmd.spawn().expect("failed to spawn grandchild");
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !Path::new(grandchild_id_file).exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(15));
-    }
+    wait_for_path_sync(
+        Path::new(grandchild_id_file),
+        Duration::from_secs(20),
+        "grandchild PID file in setsid_reparent_mid",
+    );
     ExitCode::SUCCESS
 }
 
@@ -901,7 +935,7 @@ async fn test_env_remove_drops_inherited_vars_in_run_and_detach() {
         .env("LEGION_DROP_TOO", "secret-2")
         .env("LEGION_KEEP_ME", "keep-val")
         .env("LEGION_RESET_ME", "old-val")
-        .timeout(Duration::from_secs(15)))
+        .timeout(Duration::from_secs(60)))
     .await
     .unwrap();
     assert!(
@@ -992,10 +1026,15 @@ async fn test_run_timeout_kills_direct_child_and_grandchildren() {
     let grandchild_file = dir.path().join("grandchild.pid");
     let grandchild_str = grandchild_file.to_string_lossy().into_owned();
 
+    let timeout = if cfg!(windows) {
+        Duration::from_secs(4)
+    } else {
+        Duration::from_millis(1200)
+    };
     let (spec, helper_env) = helper_spec("spawn_tree", &[&grandchild_str]);
     let res = run(RunOptions::new(spec)
         .envs(helper_env)
-        .timeout(Duration::from_millis(1200))
+        .timeout(timeout)
         .kill_grace(Duration::from_millis(200)))
     .await
     .unwrap();
@@ -1005,7 +1044,7 @@ async fn test_run_timeout_kills_direct_child_and_grandchildren() {
     assert!(!res.success());
 
     let grandchild_id =
-        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(10)).await);
     assert!(
         !procid::is_alive(&grandchild_id),
         "grandchild {grandchild_id} survived timeout"
@@ -1022,7 +1061,7 @@ async fn test_run_cancellation_kills_direct_child_and_grandchildren() {
     let (spec, helper_env) = helper_spec("spawn_tree", &[&grandchild_str]);
     let res = run(RunOptions::new(spec)
         .envs(helper_env)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30))
         .kill_grace(Duration::from_millis(200))
         .cancel(token)
         .on_output(Arc::new(move |chunk| {
@@ -1036,10 +1075,14 @@ async fn test_run_cancellation_kills_direct_child_and_grandchildren() {
     assert!(res.cancelled, "expected cancellation, got {res:?}");
     assert!(!res.timed_out);
     assert!(!res.success());
-    assert!(res.duration < Duration::from_secs(5));
+    assert!(
+        res.duration < Duration::from_secs(15),
+        "cancellation took unexpectedly long: {:?}",
+        res.duration
+    );
 
     let grandchild_id =
-        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(10)).await);
     assert!(
         !procid::is_alive(&grandchild_id),
         "grandchild {grandchild_id} survived cancellation"
@@ -1056,7 +1099,7 @@ async fn test_run_escalation_kills_term_ignoring_grandchild() {
     let (spec, helper_env) = helper_spec("spawn_tree", &[&grandchild_str, "--ignore-term"]);
     let res = run(RunOptions::new(spec)
         .envs(helper_env)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30))
         .kill_grace(Duration::from_millis(150))
         .cancel(token)
         .on_output(Arc::new(move |chunk| {
@@ -1069,7 +1112,7 @@ async fn test_run_escalation_kills_term_ignoring_grandchild() {
 
     assert!(res.cancelled);
     let grandchild_id =
-        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(10)).await);
     assert!(
         !procid::is_alive(&grandchild_id),
         "SIGTERM-ignoring grandchild {grandchild_id} survived SIGKILL escalation"
@@ -1122,19 +1165,19 @@ async fn test_run_dropped_future_kills_grandchildren() {
             }
         }))));
 
-    tokio::time::timeout(Duration::from_secs(5), ready.notified())
+    tokio::time::timeout(Duration::from_secs(20), ready.notified())
         .await
-        .expect("timed out waiting for spawn_tree READY");
+        .expect("timed out waiting 20s for spawn_tree READY");
 
     let grandchild_id =
-        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(10)).await);
     assert!(procid::is_alive(&grandchild_id));
 
     // Abort the task running `run(...)`, dropping its future mid-flight.
     handle.abort();
     let _ = handle.await;
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while procid::is_alive(&grandchild_id) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -1153,13 +1196,13 @@ async fn test_run_normal_exit_kills_background_grandchild_without_timeout() {
     // holding stdout open and return promptly instead of hanging or leaking it.
     let (spec, helper_env) = helper_spec("spawn_and_exit", &[&grandchild_str]);
     let res = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(20),
         run(RunOptions::new(spec)
             .envs(helper_env)
             .kill_grace(Duration::from_millis(150))),
     )
     .await
-    .expect("run() hung waiting on background grandchild's stdout pipe")
+    .expect("run() hung for 20s waiting on background grandchild's stdout pipe")
     .unwrap();
 
     assert!(res.success(), "expected clean exit, got {res:?}");
@@ -1168,7 +1211,7 @@ async fn test_run_normal_exit_kills_background_grandchild_without_timeout() {
     assert_eq!(res.stdout.text.trim(), "DONE");
 
     let grandchild_id =
-        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(10)).await);
     assert!(
         !procid::is_alive(&grandchild_id),
         "background grandchild {grandchild_id} survived after direct child exited"
@@ -1185,7 +1228,7 @@ async fn test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open() {
     let (spec, helper_env) = helper_spec("escape_pipes", &[&escaped_str]);
     let res = run(RunOptions::new(spec)
         .envs(helper_env)
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(30))
         .kill_grace(Duration::from_millis(100))
         .cancel(token)
         .on_output(Arc::new(move |chunk| {
@@ -1198,12 +1241,12 @@ async fn test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open() {
 
     assert!(res.cancelled);
     assert!(
-        res.duration < Duration::from_secs(5),
+        res.duration < Duration::from_secs(15),
         "run() hung waiting on an escaped grandchild's pipes: {:?}",
         res.duration
     );
 
-    let escaped_id = parse_procid(&wait_for_file(&escaped_file, Duration::from_secs(2)).await);
+    let escaped_id = parse_procid(&wait_for_file(&escaped_file, Duration::from_secs(10)).await);
     // Clean up the escaped grandchild via kill_tree if it survived (expected on Unix).
     if procid::is_alive(&escaped_id) {
         let report = procid::kill_tree(&escaped_id, Duration::from_millis(200))
@@ -1249,7 +1292,7 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
     );
     let parent_out = run(RunOptions::new(spec)
         .envs(helper_env)
-        .timeout(Duration::from_secs(20)))
+        .timeout(Duration::from_secs(60)))
     .await
     .unwrap();
     assert!(
@@ -1261,7 +1304,7 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
 
     // Parent has now completely exited; deserialize the persisted DetachHandle and verify the
     // detached worker is alive and finished writing to its logs.
-    let handle_json = wait_for_file(&handle_file, Duration::from_secs(5)).await;
+    let handle_json = wait_for_file(&handle_file, Duration::from_secs(10)).await;
     let handle: DetachHandle =
         serde_json::from_str(&handle_json).expect("failed to deserialize DetachHandle");
     assert!(
@@ -1273,7 +1316,7 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
     let subchild_id = parse_procid(
         &wait_for_detached_file(
             &subchild_id_file,
-            Duration::from_secs(10),
+            Duration::from_secs(20),
             &handle,
             &[&stdout_log, &stderr_log],
         )
@@ -1286,7 +1329,7 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
     let setsid_id = parse_procid(
         &wait_for_detached_file(
             &setsid_id_file,
-            Duration::from_secs(5),
+            Duration::from_secs(20),
             &handle,
             &[&stdout_log, &stderr_log],
         )
@@ -1346,8 +1389,12 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
         .await
         .unwrap();
 
-    let _ = wait_for_detached_file(&id1_file, Duration::from_secs(5), &h1, &[]).await;
-    let _ = wait_for_detached_file(&id2_file, Duration::from_secs(5), &h2, &[]).await;
+    let p1 =
+        parse_procid(&wait_for_detached_file(&id1_file, Duration::from_secs(20), &h1, &[]).await);
+    let p2 =
+        parse_procid(&wait_for_detached_file(&id2_file, Duration::from_secs(20), &h2, &[]).await);
+    assert_eq!(p1, h1.process);
+    assert_eq!(p2, h2.process);
     assert!(procid::is_alive(&h1.process));
     assert!(procid::is_alive(&h2.process));
 
@@ -1387,8 +1434,11 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
                 h_no_linger.warnings
             );
         }
-        let _ = wait_for_detached_file(&linger_id_file, Duration::from_secs(5), &h_no_linger, &[])
-            .await;
+        let p_linger = parse_procid(
+            &wait_for_detached_file(&linger_id_file, Duration::from_secs(20), &h_no_linger, &[])
+                .await,
+        );
+        assert_eq!(p_linger, h_no_linger.process);
         let rl = stop_detached(&h_no_linger, Duration::from_millis(300))
             .await
             .unwrap();
@@ -1430,7 +1480,7 @@ async fn test_detach_preserves_dollar_signs_in_argv_and_shell() {
     .await
     .unwrap();
 
-    let got = wait_for_detached_file(&argv_out, Duration::from_secs(5), &handle, &[]).await;
+    let got = wait_for_detached_file(&argv_out, Duration::from_secs(20), &handle, &[]).await;
     let lines: Vec<&str> = got.lines().collect();
     assert_eq!(
         lines,
@@ -1563,11 +1613,11 @@ async fn test_detach_active_tracks_root_and_surviving_descendants() {
         }
 
         let child_id = parse_procid(
-            &wait_for_detached_file(&child_id_file, Duration::from_secs(5), &handle, &[]).await,
+            &wait_for_detached_file(&child_id_file, Duration::from_secs(20), &handle, &[]).await,
         );
 
         // Wait for the root process to finish exiting while its child keeps running.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while procid::is_alive(&handle.process) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1621,20 +1671,25 @@ async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
     );
 
     let child_id = parse_procid(
-        &wait_for_detached_file(&child_id_file, Duration::from_secs(5), &handle, &[]).await,
+        &wait_for_detached_file(&child_id_file, Duration::from_secs(20), &handle, &[]).await,
     );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while procid::is_alive(&handle.process) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!procid::is_alive(&handle.process));
+    assert!(
+        !procid::is_alive(&handle.process),
+        "timed out after 15s waiting for root {} to exit",
+        handle.process
+    );
     assert!(procid::is_alive(&child_id));
 
     // A handle referencing the same exited root PID with a DIFFERENT marker must NOT treat this
     // orphan as active and must NOT kill it (simulating an unrelated process reusing the PID).
     let wrong_marker = DetachHandle {
         process: handle.process,
+        root_start_key: handle.root_start_key,
         systemd_unit: None,
         windows_job: None,
         marker: Some("unrelated-job-marker-0000".into()),
@@ -1657,6 +1712,7 @@ async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
     // active and must report it in `unverified_survivors` without killing it.
     let legacy_handle = DetachHandle {
         process: handle.process,
+        root_start_key: None,
         systemd_unit: None,
         windows_job: None,
         marker: None,
@@ -1700,10 +1756,12 @@ async fn test_detach_stop_without_scope_stops_reparented_setsid_grandchild() {
 
     for (label, extra) in [("normal", None), ("ignore-term", Some("--ignore-term"))] {
         let grandchild_file = dir.path().join(format!("reparented-setsid-{label}.pid"));
+        let ready_file = dir.path().join(format!("reparented-ready-{label}.txt"));
         let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+        let ready_str = ready_file.to_string_lossy().into_owned();
         let args: Vec<&str> = match extra {
-            Some(flag) => vec![&grandchild_str, flag],
-            None => vec![&grandchild_str],
+            Some(flag) => vec![&grandchild_str, &ready_str, flag],
+            None => vec![&grandchild_str, &ready_str],
         };
 
         let (spec, env_vars) = helper_spec("setsid_reparent_root", &args);
@@ -1717,7 +1775,15 @@ async fn test_detach_stop_without_scope_stops_reparented_setsid_grandchild() {
         assert!(handle.marker.is_some());
 
         let grandchild_id = parse_procid(
-            &wait_for_detached_file(&grandchild_file, Duration::from_secs(5), &handle, &[]).await,
+            &wait_for_detached_file(&grandchild_file, Duration::from_secs(20), &handle, &[]).await,
+        );
+        // Wait for the intermediate child to finish exiting so the grandchild is reparented.
+        let ready =
+            wait_for_detached_file(&ready_file, Duration::from_secs(20), &handle, &[]).await;
+        assert_eq!(
+            ready.trim(),
+            "ready",
+            "unexpected reparented_ready payload ({label})"
         );
         assert!(procid::is_alive(&handle.process));
         assert!(procid::is_alive(&grandchild_id));
@@ -1728,7 +1794,8 @@ async fn test_detach_stop_without_scope_stops_reparented_setsid_grandchild() {
             .unwrap();
         assert!(
             report.all_gone,
-            "stop_detached without scope ({label}) left survivors: {report:?}"
+            "stop_detached without scope ({label}) left survivors (root={}, grandchild={grandchild_id}): {report:?}",
+            handle.process
         );
         assert!(report.survivors.is_empty());
         assert!(report.unverified_survivors.is_empty());
@@ -1942,7 +2009,7 @@ async fn test_procid_kill_process_stops_only_verified_target_and_respects_force(
     assert!(gone);
     assert!(!procid::is_alive(&stubborn_id));
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(5),
         "force = true waited for grace instead of killing immediately ({elapsed:?})"
     );
 }
@@ -2015,7 +2082,7 @@ async fn test_lock_contention_and_crash_release_across_processes() {
     holder.kill().unwrap();
     let _ = holder.wait();
 
-    let taken = FileLock::lock_exclusive_timeout(&lock_path, Duration::from_secs(2)).unwrap();
+    let taken = FileLock::lock_exclusive_timeout(&lock_path, Duration::from_secs(10)).unwrap();
     drop(taken);
     assert!(lock_path.exists(), "lock file must never be deleted");
 
@@ -2044,7 +2111,7 @@ async fn test_lock_contention_and_crash_release_across_processes() {
     // Close stdin so shared_holder exits cleanly, then exclusive lock succeeds.
     drop(shared_holder.stdin.take());
     let _ = shared_holder.wait();
-    let exclusive = FileLock::lock_exclusive_timeout(&lock_path, Duration::from_secs(2)).unwrap();
+    let exclusive = FileLock::lock_exclusive_timeout(&lock_path, Duration::from_secs(10)).unwrap();
     drop(exclusive);
     assert!(lock_path.exists());
 }

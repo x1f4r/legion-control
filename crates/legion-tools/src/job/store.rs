@@ -65,7 +65,7 @@ pub(super) const RETENTION_MAX_FINISHED: usize = 200;
 pub(super) const RETENTION_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// Window during which a brand-new record with no lock yet counts as `starting` rather than
 /// `interrupted`, covering the brief handoff while `job.start` spawns the supervisor.
-const STARTING_GRACE_MS: i64 = 15_000;
+const STARTING_GRACE_MS: i64 = 25_000;
 /// Maximum characters kept in `job.list`'s command summary.
 const COMMAND_SUMMARY_CHARS: usize = 200;
 /// Maximum characters for a derived default job name.
@@ -121,6 +121,18 @@ impl From<ExitOutcome> for JobState {
     }
 }
 
+/// Explicit launching state written into `job.json` while `job.start` is launching the detached
+/// supervisor and waiting for it to acquire `lock`.
+///
+/// While `now < deadline` on the same boot (with no `exit.json`), `job.status` reports `starting`
+/// instead of `interrupted` and `key_matches_job` returns this job so retries with the same `key`
+/// never start a second supervisor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LaunchingState {
+    /// RFC 3339 UTC deadline until which the launch is considered in progress.
+    pub deadline: String,
+}
+
 /// On-disk record stored in `<state dir>/jobs/<id>/job.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct JobRecord {
@@ -143,6 +155,8 @@ pub(super) struct JobRecord {
     pub boot_id: String,
     #[serde(default)]
     pub exclusive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launching: Option<LaunchingState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detach: Option<DetachHandle>,
 }
@@ -545,10 +559,17 @@ enum LocalInspect {
     NeedsTreeCheck {
         handle: DetachHandle,
         lock_exists: bool,
-        age_ms: i64,
+        still_launching: bool,
         created_ts: Option<jiff::Timestamp>,
         output_bytes: u64,
     },
+}
+
+fn is_launching_within_deadline(record: &JobRecord, age_ms: i64, now: jiff::Timestamp) -> bool {
+    if let Some(ref launching) = record.launching {
+        return parse_timestamp(&launching.deadline).is_some_and(|deadline| now < deadline);
+    }
+    age_ms < STARTING_GRACE_MS
 }
 
 /// Checks `legion_os::detach::detached_active` from synchronous code without panicking when
@@ -584,7 +605,7 @@ pub(super) async fn derive_status_async(
         LocalInspect::NeedsTreeCheck {
             handle,
             lock_exists,
-            age_ms,
+            still_launching,
             created_ts,
             output_bytes,
         } => {
@@ -594,7 +615,7 @@ pub(super) async fn derive_status_async(
                 record,
                 &handle,
                 lock_exists,
-                age_ms,
+                still_launching,
                 created_ts,
                 output_bytes,
                 active,
@@ -617,7 +638,7 @@ pub(super) fn derive_status(
         LocalInspect::NeedsTreeCheck {
             handle,
             lock_exists,
-            age_ms,
+            still_launching,
             created_ts,
             output_bytes,
         } => {
@@ -627,7 +648,7 @@ pub(super) fn derive_status(
                 record,
                 &handle,
                 lock_exists,
-                age_ms,
+                still_launching,
                 created_ts,
                 output_bytes,
                 active,
@@ -696,17 +717,19 @@ fn inspect_local(
         });
     }
 
+    let still_launching = is_launching_within_deadline(record, age_ms, now);
+
     if let Some(handle) = record.detach.clone() {
         return LocalInspect::NeedsTreeCheck {
             handle,
             lock_exists,
-            age_ms,
+            still_launching,
             created_ts,
             output_bytes,
         };
     }
 
-    if age_ms < STARTING_GRACE_MS {
+    if still_launching {
         let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
         return LocalInspect::Ready(DerivedStatus {
             state: JobState::Starting,
@@ -741,15 +764,15 @@ fn finish_same_boot_unlocked(
     record: &JobRecord,
     handle: &DetachHandle,
     lock_exists: bool,
-    age_ms: i64,
+    still_launching: bool,
     created_ts: Option<jiff::Timestamp>,
     output_bytes: u64,
     tree_active: bool,
     now: jiff::Timestamp,
 ) -> DerivedStatus {
-    // Before the supervisor has created `lock`, a live root within the startup grace window is
-    // still starting normally.
-    if !lock_exists && age_ms < STARTING_GRACE_MS && procid::is_alive(&handle.process) {
+    // Before the supervisor has created `lock`, a live root within the explicit launch deadline
+    // (or legacy startup grace window) is still starting normally.
+    if !lock_exists && still_launching && procid::is_alive(&handle.process) {
         let duration_s = created_ts.map(|started| elapsed_seconds(started, now));
         return DerivedStatus {
             state: JobState::Starting,
@@ -1140,6 +1163,7 @@ mod tests {
             created: created.to_owned(),
             boot_id: boot_id.to_owned(),
             exclusive: false,
+            launching: None,
             detach: None,
         }
     }
@@ -1255,5 +1279,45 @@ mod tests {
         assert!(load_all_records(state_dir).unwrap().is_empty());
         prune_retention(state_dir, jiff::Timestamp::now());
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn explicit_launching_state_reports_starting_and_matches_key_until_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        let dir = job_dir(state_dir, "job-launching");
+        fs::create_dir_all(&dir).unwrap();
+
+        let created: jiff::Timestamp = "2026-01-01T00:00:00.000Z".parse().unwrap();
+        let deadline: jiff::Timestamp = "2026-01-01T00:01:30.000Z".parse().unwrap();
+        let at_45s: jiff::Timestamp = "2026-01-01T00:00:45.000Z".parse().unwrap();
+        let at_95s: jiff::Timestamp = "2026-01-01T00:01:35.000Z".parse().unwrap();
+
+        let mut rec = sample_record("job-launching", &format_timestamp(created), "boot-1");
+        rec.key = Some("deploy-42".to_owned());
+        rec.launching = Some(LaunchingState {
+            deadline: format_timestamp(deadline),
+        });
+        write_job_record(&dir, &rec).unwrap();
+
+        // At 45s (past the 25s legacy grace, before the 90s launch deadline), status is `starting`
+        // and `find_by_key` returns this job so a retry with the same key does not start a second.
+        let status = derive_status(&dir, &rec, Some("boot-1"), at_45s);
+        assert_eq!(status.state, JobState::Starting);
+        let found = find_by_key(state_dir, "deploy-42", Some("boot-1"), at_45s)
+            .unwrap()
+            .expect("key should match job while in explicit launching state");
+        assert_eq!(found.1.id, "job-launching");
+        assert_eq!(found.2.state, JobState::Starting);
+
+        // Once the explicit launch deadline elapses with no lock, it transitions to `interrupted`
+        // and no longer blocks retries with the same key.
+        let expired = derive_status(&dir, &rec, Some("boot-1"), at_95s);
+        assert_eq!(expired.state, JobState::Interrupted);
+        assert!(
+            find_by_key(state_dir, "deploy-42", Some("boot-1"), at_95s)
+                .unwrap()
+                .is_none()
+        );
     }
 }

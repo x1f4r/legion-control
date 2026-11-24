@@ -683,8 +683,13 @@ async fn hand_over(
         id: record.id.clone(),
     };
     let give_up = |record: &mut Pending| {
-        record.abandoned = true;
-        let _ = pending::write_pending(dir, record);
+        if matches!(
+            pending::call_off(dir, &record.id),
+            pending::CallOff::Unsure | pending::CallOff::Gone
+        ) {
+            record.abandoned = true;
+            let _ = pending::write_pending(dir, record);
+        }
     };
     let warnings = match actuator.schedule(&job).await {
         Ok(started) => {
