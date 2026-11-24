@@ -129,13 +129,44 @@ Usage:
   legion stream [--as PRINCIPAL]
   legion gate --as PRINCIPAL
   legion serve [--listen ADDRESS]
+  legion init [--name NAME] [--no-roles] [--dry-run] [--on MACHINE] [--json]
+  legion agents list | add AGENT --as PRINCIPAL [--full] [--scope SCOPE] [--allow-owner] [--dry-run] | remove AGENT [--scope SCOPE] [--dry-run]
   legion token add NAME PRINCIPAL [expires_days=N] [allow_owner=true] | list | remove NAME
   legion --version
 
 A value that parses as JSON is JSON (n=3, ok=true, tags=[\"a\"]); anything else is a string.
 --args takes the arguments as one JSON object instead, or reads it from stdin when given -.
 Output is readable on a terminal and JSON otherwise; --json asks for JSON anywhere.
-`legion help cp`, `legion help stream` and `legion help gate` describe those commands.";
+`legion help cp`, `legion help init`, `legion help agents`, `legion help stream` and `legion help gate` describe those commands.";
+
+/// `legion help init`.
+pub const INIT_HELP: &str = "\
+Usage: legion init [--name NAME] [--no-roles] [--dry-run] [--as PRINCIPAL] [--on MACHINE] [--json]
+
+Runs meta.init to create starter node.toml and policy.toml files where they do not already exist.
+Existing files are never overwritten or reformatted, so it is safe to run again.
+
+  --name NAME   node name to write into node.toml when creating it
+  --no-roles    skip creating policy.toml with starter roles
+  --dry-run     report what would be created or kept without writing anything
+  --as P        act as the principal P
+  --on M        initialise machine M instead of this node
+  --json        print the result as JSON";
+
+/// `legion help agents`.
+pub const AGENTS_HELP: &str = "\
+Usage:
+  legion agents list [--as PRINCIPAL] [--on MACHINE] [--json]
+  legion agents add <claude|codex|antigravity|opencode> --as PRINCIPAL [--compact | --full] [--scope SCOPE] [--allow-owner] [--dry-run] [--on MACHINE] [--json]
+  legion agents remove <claude|codex|antigravity|opencode> [--scope SCOPE] [--dry-run] [--as PRINCIPAL] [--on MACHINE] [--json]
+
+Registers, lists, or removes the `legion` MCP server in supported AI coding agents through each
+agent's own CLI command, never by editing their configuration files directly.
+
+In `legion agents add`, `--as PRINCIPAL` names the principal the agent will act as (and must exist
+in policy.toml, or be `owner` with `--allow-owner`). Compact mode is enabled by default so the
+agent carries three meta-tools instead of every tool schema in every conversation; pass `--full`
+(or `--no-compact`) to expose every tool individually.";
 
 /// `legion help cp`.
 pub const CP_HELP: &str = "\
@@ -258,6 +289,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         }
         "cp" => cp(rest).map(Command::Cp),
         "serve" => serve(rest),
+        "init" => init(rest),
+        "agents" => agents(rest),
         "token" => token(rest),
         tool if tool.starts_with('-') => Err(UsageError(format!(
             "{tool} is not an option here; options come after the tool's name."
@@ -363,6 +396,8 @@ fn cp(rest: &[String]) -> Result<CpCommand, UsageError> {
 pub fn command_help(name: &str) -> Option<&'static str> {
     match name {
         "cp" => Some(CP_HELP),
+        "init" => Some(INIT_HELP),
+        "agents" => Some(AGENTS_HELP),
         "stream" => Some(STREAM_HELP),
         "gate" => Some(GATE_HELP),
         _ => None,
@@ -393,6 +428,383 @@ fn serve(rest: &[String]) -> Result<Command, UsageError> {
         }
     }
     Ok(Command::Serve { listen, help })
+}
+
+/// `legion init`, sugar over `meta.init`.
+fn init(rest: &[String]) -> Result<Command, UsageError> {
+    let mut pairs = Map::new();
+    let mut as_principal = None;
+    let mut on = None;
+    let mut json = false;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if word.starts_with('-') {
+            let (name, inline) = match word.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_owned())),
+                None => (word.as_str(), None),
+            };
+            let mut take_value = |opt: &str| {
+                inline
+                    .clone()
+                    .or_else(|| words.next().cloned())
+                    .ok_or_else(|| UsageError(format!("{opt} needs a value.")))
+            };
+            let no_inline = |opt: &str| {
+                if inline.is_some() {
+                    Err(UsageError(format!("{opt} takes no value.")))
+                } else {
+                    Ok(())
+                }
+            };
+            match name {
+                "--name" => {
+                    let value = take_value(name)?;
+                    if pairs
+                        .insert("name".to_owned(), Value::String(value))
+                        .is_some()
+                    {
+                        return Err(UsageError("name is given twice.".to_owned()));
+                    }
+                }
+                "--no-roles" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("roles".to_owned(), Value::Bool(false))
+                        .is_some()
+                    {
+                        return Err(UsageError("roles is given twice.".to_owned()));
+                    }
+                }
+                "--dry-run" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("dry_run".to_owned(), Value::Bool(true))
+                        .is_some()
+                    {
+                        return Err(UsageError("dry_run is given twice.".to_owned()));
+                    }
+                }
+                "--json" => {
+                    no_inline(name)?;
+                    json = true;
+                }
+                "--as" => {
+                    let value = take_value(name)?;
+                    Principal::parse(&value)
+                        .map_err(|error| UsageError(format!("--as: {}", error.message)))?;
+                    if as_principal.replace(value).is_some() {
+                        return Err(UsageError("--as is given twice.".to_owned()));
+                    }
+                }
+                "--on" => {
+                    let value = take_value(name)?;
+                    let target = Target::parse(&value)
+                        .map_err(|error| UsageError(format!("--on: {error}.")))?;
+                    if on.replace(target).is_some() {
+                        return Err(UsageError("--on is given twice.".to_owned()));
+                    }
+                }
+                _ => return Err(UsageError(format!("{name} is not an option of init."))),
+            }
+            continue;
+        }
+        match word.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                if pairs.contains_key(key) {
+                    return Err(UsageError(format!("{key} is given twice.")));
+                }
+                pairs.insert(key.to_owned(), value_of(value));
+            }
+            _ => {
+                return Err(UsageError(format!(
+                    "{word} was not expected here. Use --name NAME, --no-roles, --dry-run, or key=value."
+                )));
+            }
+        }
+    }
+    Ok(Command::Call(CallCommand {
+        tool: "meta.init".to_owned(),
+        args: ArgsSource::Pairs(pairs),
+        as_principal,
+        on,
+        json,
+    }))
+}
+
+/// `legion agents list|add|remove`, sugar over `agent.list`, `agent.add`, and `agent.remove`.
+fn agents(rest: &[String]) -> Result<Command, UsageError> {
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(UsageError("agents takes list, add or remove.".to_owned()));
+    };
+    match verb.as_str() {
+        "list" => {
+            let mut flags = Flags::read(rest, &["--json", "--as", "--on"])?;
+            flags.no_pairs("agents list")?;
+            Ok(Command::Call(CallCommand {
+                tool: "agent.list".to_owned(),
+                args: ArgsSource::Pairs(Map::new()),
+                as_principal: flags.as_principal,
+                on: flags.on,
+                json: flags.json,
+            }))
+        }
+        "add" => agents_add(rest),
+        "remove" => agents_remove(rest),
+        other => Err(UsageError(format!(
+            "{other} is not something agents does; it takes list, add or remove."
+        ))),
+    }
+}
+
+fn agents_add(rest: &[String]) -> Result<Command, UsageError> {
+    let mut pairs = Map::new();
+    let mut positional = Vec::new();
+    let mut on = None;
+    let mut json = false;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if word.starts_with('-') {
+            let (name, inline) = match word.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_owned())),
+                None => (word.as_str(), None),
+            };
+            let mut take_value = |opt: &str| {
+                inline
+                    .clone()
+                    .or_else(|| words.next().cloned())
+                    .ok_or_else(|| UsageError(format!("{opt} needs a value.")))
+            };
+            let no_inline = |opt: &str| {
+                if inline.is_some() {
+                    Err(UsageError(format!("{opt} takes no value.")))
+                } else {
+                    Ok(())
+                }
+            };
+            match name {
+                "--as" => {
+                    let principal = take_value(name)?;
+                    Principal::parse(&principal)
+                        .map_err(|error| UsageError(format!("--as: {}", error.message)))?;
+                    if pairs
+                        .insert("as".to_owned(), Value::String(principal))
+                        .is_some()
+                    {
+                        return Err(UsageError("as is given twice.".to_owned()));
+                    }
+                }
+                "--compact" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("compact".to_owned(), Value::Bool(true))
+                        .is_some()
+                    {
+                        return Err(UsageError("compact is given twice.".to_owned()));
+                    }
+                }
+                "--full" | "--no-compact" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("compact".to_owned(), Value::Bool(false))
+                        .is_some()
+                    {
+                        return Err(UsageError("compact is given twice.".to_owned()));
+                    }
+                }
+                "--scope" => {
+                    let scope = take_value(name)?;
+                    if pairs
+                        .insert("scope".to_owned(), Value::String(scope))
+                        .is_some()
+                    {
+                        return Err(UsageError("scope is given twice.".to_owned()));
+                    }
+                }
+                "--allow-owner" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("allow_owner".to_owned(), Value::Bool(true))
+                        .is_some()
+                    {
+                        return Err(UsageError("allow_owner is given twice.".to_owned()));
+                    }
+                }
+                "--dry-run" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("dry_run".to_owned(), Value::Bool(true))
+                        .is_some()
+                    {
+                        return Err(UsageError("dry_run is given twice.".to_owned()));
+                    }
+                }
+                "--json" => {
+                    no_inline(name)?;
+                    json = true;
+                }
+                "--on" => {
+                    let value = take_value(name)?;
+                    let target = Target::parse(&value)
+                        .map_err(|error| UsageError(format!("--on: {error}.")))?;
+                    if on.replace(target).is_some() {
+                        return Err(UsageError("--on is given twice.".to_owned()));
+                    }
+                }
+                _ => {
+                    return Err(UsageError(format!(
+                        "{name} is not an option of agents add."
+                    )));
+                }
+            }
+            continue;
+        }
+        match word.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                if pairs.contains_key(key) {
+                    return Err(UsageError(format!("{key} is given twice.")));
+                }
+                pairs.insert(key.to_owned(), value_of(value));
+            }
+            _ => positional.push(word.clone()),
+        }
+    }
+    let Some(agent) = positional.first().cloned() else {
+        return Err(UsageError(
+            "agents add takes an agent name: claude, codex, antigravity or opencode.".to_owned(),
+        ));
+    };
+    if positional.len() > 2 {
+        return Err(UsageError(
+            "agents add takes the agent name and an optional principal.".to_owned(),
+        ));
+    }
+    if pairs
+        .insert("agent".to_owned(), Value::String(agent))
+        .is_some()
+    {
+        return Err(UsageError("agent is given twice.".to_owned()));
+    }
+    if let Some(principal) = positional.get(1) {
+        Principal::parse(principal)
+            .map_err(|error| UsageError(format!("principal: {}", error.message)))?;
+        if pairs
+            .insert("as".to_owned(), Value::String(principal.clone()))
+            .is_some()
+        {
+            return Err(UsageError("as is given twice.".to_owned()));
+        }
+    }
+    Ok(Command::Call(CallCommand {
+        tool: "agent.add".to_owned(),
+        args: ArgsSource::Pairs(pairs),
+        as_principal: None,
+        on,
+        json,
+    }))
+}
+
+fn agents_remove(rest: &[String]) -> Result<Command, UsageError> {
+    let mut pairs = Map::new();
+    let mut positional = Vec::new();
+    let mut as_principal = None;
+    let mut on = None;
+    let mut json = false;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if word.starts_with('-') {
+            let (name, inline) = match word.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_owned())),
+                None => (word.as_str(), None),
+            };
+            let mut take_value = |opt: &str| {
+                inline
+                    .clone()
+                    .or_else(|| words.next().cloned())
+                    .ok_or_else(|| UsageError(format!("{opt} needs a value.")))
+            };
+            let no_inline = |opt: &str| {
+                if inline.is_some() {
+                    Err(UsageError(format!("{opt} takes no value.")))
+                } else {
+                    Ok(())
+                }
+            };
+            match name {
+                "--scope" => {
+                    let scope = take_value(name)?;
+                    if pairs
+                        .insert("scope".to_owned(), Value::String(scope))
+                        .is_some()
+                    {
+                        return Err(UsageError("scope is given twice.".to_owned()));
+                    }
+                }
+                "--dry-run" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("dry_run".to_owned(), Value::Bool(true))
+                        .is_some()
+                    {
+                        return Err(UsageError("dry_run is given twice.".to_owned()));
+                    }
+                }
+                "--json" => {
+                    no_inline(name)?;
+                    json = true;
+                }
+                "--as" => {
+                    let value = take_value(name)?;
+                    Principal::parse(&value)
+                        .map_err(|error| UsageError(format!("--as: {}", error.message)))?;
+                    if as_principal.replace(value).is_some() {
+                        return Err(UsageError("--as is given twice.".to_owned()));
+                    }
+                }
+                "--on" => {
+                    let value = take_value(name)?;
+                    let target = Target::parse(&value)
+                        .map_err(|error| UsageError(format!("--on: {error}.")))?;
+                    if on.replace(target).is_some() {
+                        return Err(UsageError("--on is given twice.".to_owned()));
+                    }
+                }
+                _ => {
+                    return Err(UsageError(format!(
+                        "{name} is not an option of agents remove."
+                    )));
+                }
+            }
+            continue;
+        }
+        match word.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                if pairs.contains_key(key) {
+                    return Err(UsageError(format!("{key} is given twice.")));
+                }
+                pairs.insert(key.to_owned(), value_of(value));
+            }
+            _ => positional.push(word.clone()),
+        }
+    }
+    let [agent] = <[String; 1]>::try_from(positional).map_err(|_| {
+        UsageError(
+            "agents remove takes one agent name: claude, codex, antigravity or opencode."
+                .to_owned(),
+        )
+    })?;
+    if pairs
+        .insert("agent".to_owned(), Value::String(agent))
+        .is_some()
+    {
+        return Err(UsageError("agent is given twice.".to_owned()));
+    }
+    Ok(Command::Call(CallCommand {
+        tool: "agent.remove".to_owned(),
+        args: ArgsSource::Pairs(pairs),
+        as_principal,
+        on,
+        json,
+    }))
 }
 
 /// `legion token add|list|remove`, which is `token.add`, `token.list` and `token.remove` with the
@@ -839,6 +1251,89 @@ mod tests {
             &["token", "add", "phone"],
             &["token", "list", "x"],
             &["token", "remove", "phone", "name=other"],
+        ] {
+            assert!(run(wrong).is_err(), "{wrong:?}");
+        }
+
+        let init_plain = call(&["init"]);
+        assert_eq!(init_plain.tool, "meta.init");
+        assert_eq!(init_plain.args, ArgsSource::Pairs(Map::new()));
+
+        let init_opts = call(&[
+            "init",
+            "--name",
+            "tower",
+            "--no-roles",
+            "--dry-run",
+            "--on",
+            "pi",
+            "--json",
+        ]);
+        assert_eq!(init_opts.tool, "meta.init");
+        assert!(init_opts.json);
+        assert_eq!(init_opts.on, Some(Target::One("pi".into())));
+        assert_eq!(
+            init_opts.args,
+            ArgsSource::Pairs(
+                json!({"name": "tower", "roles": false, "dry_run": true})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            )
+        );
+        assert_eq!(command_help("init"), Some(INIT_HELP));
+        for wrong in [
+            &["init", "stray"][..],
+            &["init", "--name"],
+            &["init", "--dry-run=yes"],
+            &["init", "--unknown"],
+        ] {
+            assert!(run(wrong).is_err(), "{wrong:?}");
+        }
+
+        assert_eq!(call(&["agents", "list"]).tool, "agent.list");
+        let add_agent = call(&[
+            "agents",
+            "add",
+            "claude",
+            "--as",
+            "agent:claude",
+            "--full",
+            "--scope",
+            "project",
+            "--dry-run",
+            "--json",
+        ]);
+        assert_eq!(add_agent.tool, "agent.add");
+        assert!(add_agent.json);
+        assert_eq!(add_agent.as_principal, None);
+        assert_eq!(
+            add_agent.args,
+            ArgsSource::Pairs(
+                json!({
+                    "agent": "claude",
+                    "as": "agent:claude",
+                    "compact": false,
+                    "scope": "project",
+                    "dry_run": true
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+            )
+        );
+        let remove_agent = call(&["agents", "remove", "codex", "--dry-run", "--on", "tower"]);
+        assert_eq!(remove_agent.tool, "agent.remove");
+        assert_eq!(remove_agent.on, Some(Target::One("tower".into())));
+        assert_eq!(command_help("agents"), Some(AGENTS_HELP));
+        for wrong in [
+            &["agents"][..],
+            &["agents", "sync"],
+            &["agents", "list", "extra"],
+            &["agents", "add"],
+            &["agents", "add", "claude", "--as"],
+            &["agents", "remove"],
+            &["agents", "remove", "claude", "extra"],
         ] {
             assert!(run(wrong).is_err(), "{wrong:?}");
         }

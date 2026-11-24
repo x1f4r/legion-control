@@ -105,7 +105,10 @@ async fn whoami_lists_what_the_caller_may_use() {
     assert_eq!(phone["door"], json!("mcp"));
     assert_eq!(phone["delegate"], json!(false));
     assert_eq!(phone["paths"], json!(["~/projects"]));
-    assert_eq!(phone["tools"], json!(["meta.version", "meta.whoami"]));
+    assert_eq!(
+        phone["tools"],
+        json!(["meta.init", "meta.version", "meta.whoami"])
+    );
 }
 
 #[tokio::test]
@@ -120,8 +123,8 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(
-        names,
-        [
+        &names[..6],
+        &[
             "configuration directory",
             "state directory",
             "node.toml",
@@ -131,6 +134,11 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
             "tools.d"
         ]
     );
+    assert!(names.contains(&"executable on PATH"), "{names:?}");
+    assert!(names.contains(&"ssh"), "{names:?}");
+    assert!(names.contains(&"policy exec with paths"), "{names:?}");
+    #[cfg(target_os = "linux")]
+    assert!(names.contains(&"systemd lingering"), "{names:?}");
     assert!(
         healthy["checks"][0]["detail"]
             .as_str()

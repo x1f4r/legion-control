@@ -1,11 +1,21 @@
 //! `meta`: which build this is, who the caller is, and whether the node is healthy.
 
+mod doctor;
+mod init;
+
 use std::io;
 use std::path::Path;
 
 use legion_core::proto::{Effect, PROTOCOL};
 use legion_core::{Ctx, Door, NoArgs, Registry, ToolError, VERSION};
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+pub use doctor::{
+    FleetPingEntry, check_executable_on_path, check_linux_lingering, check_policy_exec_paths,
+    check_ssh_on_path, extract_login_path, fleet_ping_checks, parse_linger_output,
+};
+pub use init::{InitResult, render_node_toml, render_policy_toml};
 
 /// Adds the `meta` tools.
 pub fn register(registry: &mut Registry) {
@@ -24,9 +34,10 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, and every configuration file parses. Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, roles do not silently combine paths with exec, and each machine in fleet.toml answers (unless quick=true). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
+    init::register(registry);
 }
 
 /// What `meta.version` returns.
@@ -94,6 +105,15 @@ async fn whoami(ctx: &Ctx, _args: NoArgs) -> Result<WhoAmI, ToolError> {
     })
 }
 
+/// Arguments of `meta.doctor`.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DoctorArgs {
+    /// Skip checking whether remote machines in fleet.toml answer.
+    #[serde(default)]
+    quick: bool,
+}
+
 /// What `meta.doctor` returns.
 #[derive(Debug, Serialize)]
 pub struct Doctor {
@@ -112,6 +132,9 @@ pub struct Check {
     pub name: String,
     /// Whether it is as it should be.
     pub ok: bool,
+    /// Advisory warning that does not make the node unhealthy on its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub warning: bool,
     /// What was found.
     pub detail: String,
     /// What to do about it, when something is wrong.
@@ -119,7 +142,11 @@ pub struct Check {
     pub hint: Option<String>,
 }
 
-async fn doctor(ctx: &Ctx, _args: NoArgs) -> Result<Doctor, ToolError> {
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+async fn doctor(ctx: &Ctx, args: DoctorArgs) -> Result<Doctor, ToolError> {
     let paths = ctx.paths();
     let mut checks = vec![
         directory_check("configuration directory", paths.config_dir(), Use::Read),
@@ -131,18 +158,21 @@ async fn doctor(ctx: &Ctx, _args: NoArgs) -> Result<Doctor, ToolError> {
             Ok(()) if file.exists() => Check {
                 name: document.file().to_owned(),
                 ok: true,
+                warning: false,
                 detail: format!("{} parses.", file.display()),
                 hint: None,
             },
             Ok(()) => Check {
                 name: document.file().to_owned(),
                 ok: true,
+                warning: false,
                 detail: format!("{} does not exist, so its defaults apply.", file.display()),
                 hint: None,
             },
             Err(error) => Check {
                 name: document.file().to_owned(),
                 ok: false,
+                warning: false,
                 detail: error.message,
                 hint: error.hint,
             },
@@ -153,10 +183,12 @@ async fn doctor(ctx: &Ctx, _args: NoArgs) -> Result<Doctor, ToolError> {
         checks.push(Check {
             name: source.name,
             ok: source.ok,
+            warning: false,
             detail: source.detail,
             hint: source.hint,
         });
     }
+    doctor::append_extra_checks(ctx, args.quick, &mut checks).await;
     Ok(Doctor {
         ok: checks.iter().all(|check| check.ok),
         node: ctx.node_name().to_owned(),
@@ -181,6 +213,7 @@ fn directory_check(name: &str, dir: &Path, needed: Use) -> Check {
     let check = |ok: bool, detail: String, hint: Option<&str>| Check {
         name: name.to_owned(),
         ok,
+        warning: false,
         detail,
         hint: hint.map(str::to_owned),
     };
