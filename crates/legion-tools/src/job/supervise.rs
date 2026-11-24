@@ -21,7 +21,8 @@ use legion_os::shell::CommandSpec;
 use super::platform;
 use super::store::{
     self, CANCEL_FILE, EXIT_FILE, ExitOutcome, ExitRecord, JobRecord, LOCK_FILE, LOG_FILE, job_dir,
-    now_rfc3339, read_env_file, read_job_record, validate_job_id, write_exit_record,
+    now_rfc3339, read_env_file, read_job_record, remove_env_file, validate_job_id,
+    write_exit_record,
 };
 
 /// Hidden CLI subcommand name used when `job.start` re-executes the current binary.
@@ -164,11 +165,13 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     // If a forced cancel already finalized the job before the supervisor acquired the lock, do not
     // run the command.
     if dir.join(EXIT_FILE).exists() {
+        remove_env_file(&dir);
         let _ = lock.unlock();
         return Ok(());
     }
 
     if dir.join(CANCEL_FILE).exists() {
+        remove_env_file(&dir);
         let exit = ExitRecord {
             outcome: ExitOutcome::Cancelled,
             exit_code: None,
@@ -185,6 +188,7 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     let record = match read_job_record(&dir, id) {
         Ok(record) => record,
         Err(error) => {
+            remove_env_file(&dir);
             record_failure(&dir, error.message);
             let _ = lock.unlock();
             return Ok(());
@@ -192,8 +196,14 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     };
 
     let env = match read_env_file(&dir) {
-        Ok(env) => env,
+        Ok(env) => {
+            // Delete `env.json` as soon as it is loaded into memory so secret values do not sit on
+            // disk while the job runs or during retention.
+            remove_env_file(&dir);
+            env
+        }
         Err(message) => {
+            remove_env_file(&dir);
             record_failure(&dir, format!("Could not read job environment: {message}."));
             let _ = lock.unlock();
             return Ok(());

@@ -367,7 +367,11 @@ pub(super) fn write_job_record(dir: &Path, record: &JobRecord) -> Result<(), Err
     })
 }
 
-/// Atomically writes `<job_dir>/env.json` with owner-only permissions.
+/// Atomically writes `<job_dir>/env.json` with owner-only permissions on Unix (`0o600`).
+///
+/// On Windows the file has no access control list of its own beyond what its parent directory
+/// inherits; the supervisor deletes `env.json` immediately after reading it so secret values sit
+/// on disk only for milliseconds rather than for the job's retention period.
 pub(super) fn write_env_file(dir: &Path, env: &BTreeMap<String, String>) -> Result<(), ErrorBody> {
     let path = dir.join(ENV_FILE);
     let bytes = serde_json::to_vec(env).map_err(|err| {
@@ -382,6 +386,11 @@ pub(super) fn write_env_file(dir: &Path, env: &BTreeMap<String, String>) -> Resu
             format!("Cannot write job environment {}: {err}.", path.display()),
         )
     })
+}
+
+/// Removes `<job_dir>/env.json` once the supervisor has loaded it (or when startup fails).
+pub(super) fn remove_env_file(dir: &Path) {
+    let _ = fs::remove_file(dir.join(ENV_FILE));
 }
 
 /// Atomically writes `<job_dir>/exit.json` with owner-only permissions.

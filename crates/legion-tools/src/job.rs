@@ -36,7 +36,8 @@ use store::{
     ExitOutcome, ExitRecord, JobRecord, command_summary, compare_newest_first, default_job_name,
     derive_status, find_by_key, generate_job_id, job_dir, jobs_dir, jobs_lock_path,
     load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record, read_job_record,
-    validate_job_id, write_cancel_request, write_env_file, write_exit_record, write_job_record,
+    remove_env_file, validate_job_id, write_cancel_request, write_env_file, write_exit_record,
+    write_job_record,
 };
 
 /// Default and maximum `limit` for `job.list`.
@@ -579,7 +580,11 @@ async fn record_start_failure(dir: &Path, detail: &str) {
         forced: false,
         detail: Some(detail.to_owned()),
     };
-    let _ = tokio::task::spawn_blocking(move || write_exit_record(&dir, &exit)).await;
+    let _ = tokio::task::spawn_blocking(move || {
+        remove_env_file(&dir);
+        write_exit_record(&dir, &exit)
+    })
+    .await;
 }
 
 /// Waits until the newly detached supervisor holds the job lock or has already written `exit.json`.

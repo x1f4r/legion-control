@@ -438,13 +438,15 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         json!(["LEGION_TEST_EXIT", "LEGION_TEST_HELPER", "MY_API_SECRET"])
     );
 
-    // Confirm `job.json` never holds the secret value while private `env.json` does, and verify
-    // private permissions on Unix.
+    // Confirm `job.json` never holds the secret value, `env.json` was deleted as soon as the
+    // supervisor read it, and directory/file permissions stay private on Unix.
     let job_dir = fixture.node.paths().state_dir().join("jobs").join(&id);
     let record_text = fs::read_to_string(job_dir.join("job.json")).unwrap();
     assert!(!record_text.contains(secret), "{record_text}");
-    let env_text = fs::read_to_string(job_dir.join("env.json")).unwrap();
-    assert!(env_text.contains(secret));
+    assert!(
+        !job_dir.join("env.json").exists(),
+        "env.json should be deleted by the supervisor immediately after reading"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -452,10 +454,41 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         assert_eq!(mode(&fixture.node.paths().state_dir().join("jobs")), 0o700);
         assert_eq!(mode(&job_dir), 0o700);
         assert_eq!(mode(&job_dir.join("job.json")), 0o600);
-        assert_eq!(mode(&job_dir.join("env.json")), 0o600);
         assert_eq!(mode(&job_dir.join("exit.json")), 0o600);
         assert_eq!(mode(&job_dir.join("output.log")), 0o600);
     }
+
+    // Also verify `env.json` is deleted while a long-running job is still active.
+    let live = fixture
+        .call(
+            "job.start",
+            merge_args(
+                support_helper_args("sleep", &["30"]),
+                json!({"env": {"EPHEMERAL_SECRET": "gone-fast"}}),
+            ),
+        )
+        .await
+        .unwrap();
+    let live_id = live["id"].as_str().unwrap().to_owned();
+    cleanup.track_job(&live_id);
+    let live_env = fixture
+        .node
+        .paths()
+        .state_dir()
+        .join("jobs")
+        .join(&live_id)
+        .join("env.json");
+    assert!(
+        wait_for(Duration::from_secs(5), || (!live_env.exists())
+            .then_some(()))
+        .await
+        .is_some(),
+        "env.json persisted while job was still running"
+    );
+    fixture
+        .call("job.cancel", json!({"id": live_id, "force": true}))
+        .await
+        .unwrap();
 
     // Confirm `cmd` works through the platform shell and a missing executable records `failed`
     // with a clear detail.
