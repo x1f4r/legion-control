@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
@@ -104,6 +105,7 @@ fn build_walker(
     max_depth: Option<usize>,
     cross_filesystems: bool,
     own_dirs: OwnDirFilter,
+    skipped: Arc<Mutex<Vec<String>>>,
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder.follow_links(false);
@@ -114,7 +116,19 @@ fn build_walker(
         builder.require_git(false);
     }
     builder.max_depth(max_depth);
-    builder.filter_entry(move |entry| entry.depth() == 0 || !own_dirs.is_blocked(entry.path()));
+    builder.filter_entry(move |entry| {
+        if entry.depth() == 0 {
+            return true;
+        }
+        if own_dirs.is_blocked(entry.path()) {
+            let mut list = skipped
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            list.push(path_to_string(entry.path()));
+            return false;
+        }
+        true
+    });
     builder
 }
 
@@ -168,6 +182,8 @@ struct FindMatch {
 struct FindResult {
     matches: Vec<FindMatch>,
     truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<String>,
 }
 
 async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
@@ -213,9 +229,11 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         let mut matches = Vec::new();
         let mut truncated = false;
         let mut visited: u64 = 0;
+        let skipped_buf = Arc::new(Mutex::new(Vec::new()));
         let mut reply_bytes = serde_json::to_vec(&FindResult {
             matches: Vec::new(),
             truncated: false,
+            skipped: Vec::new(),
         })
         .map_or(64, |v| v.len());
 
@@ -225,6 +243,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             max_depth,
             cross_filesystems,
             own_dirs,
+            Arc::clone(&skipped_buf),
         )
         .build()
         {
@@ -278,7 +297,16 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             matches.push(found);
         }
 
-        Ok(FindResult { matches, truncated })
+        let mut skipped = skipped_buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        skipped.sort();
+        Ok(FindResult {
+            matches,
+            truncated,
+            skipped,
+        })
     })
     .await
 }
@@ -335,6 +363,8 @@ struct GrepResult {
     matches: Vec<GrepMatch>,
     files_searched: u64,
     truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<String>,
 }
 
 async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
@@ -376,10 +406,12 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
 
     run_blocking(ctx, "fs.grep", move |cancel, mut progress| {
         let meta = fs::metadata(&root).map_err(|error| map_io_error("search", &root, error))?;
+        let skipped_buf = Arc::new(Mutex::new(Vec::new()));
         let reply_bytes = serde_json::to_vec(&GrepResult {
             matches: Vec::new(),
             files_searched: u64::MAX,
             truncated: false,
+            skipped: Vec::new(),
         })
         .map_or(96, |v| v.len());
         let mut state = GrepState {
@@ -402,8 +434,15 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
                 grep_file(&root, true, &mut state)?;
             }
         } else if meta.is_dir() {
-            for item in
-                build_walker(&root, respect_ignore, None, cross_filesystems, own_dirs).build()
+            for item in build_walker(
+                &root,
+                respect_ignore,
+                None,
+                cross_filesystems,
+                own_dirs,
+                Arc::clone(&skipped_buf),
+            )
+            .build()
             {
                 if state.cancel.is_cancelled() {
                     return Err(cancelled_error("fs.grep"));
@@ -452,10 +491,16 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
             ));
         }
 
+        let mut skipped = skipped_buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        skipped.sort();
         Ok(GrepResult {
             matches: state.matches,
             files_searched: state.files_searched,
             truncated: state.truncated,
+            skipped,
         })
     })
     .await

@@ -102,6 +102,8 @@ struct ListResult {
     path: String,
     entries: Vec<ListEntry>,
     truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<String>,
 }
 
 async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
@@ -144,9 +146,11 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             path: root_str.clone(),
             entries: Vec::new(),
             truncated: false,
+            skipped: Vec::new(),
         })
         .map_or(64, |v| v.len());
         let mut entries = Vec::new();
+        let mut skipped = Vec::new();
         let mut truncated = false;
         let mut state = ListWalk {
             max_depth,
@@ -157,13 +161,16 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             cancel: &cancel,
             progress: &mut progress,
             entries: &mut entries,
+            skipped: &mut skipped,
             truncated: &mut truncated,
         };
         list_dir(&root, 1, &mut state)?;
+        skipped.sort();
         Ok(ListResult {
             path: root_str,
             entries,
             truncated,
+            skipped,
         })
     })
     .await
@@ -178,6 +185,7 @@ struct ListWalk<'a> {
     cancel: &'a CancellationToken,
     progress: &'a mut Progress,
     entries: &'a mut Vec<ListEntry>,
+    skipped: &'a mut Vec<String>,
     truncated: &'a mut bool,
 }
 
@@ -203,6 +211,7 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         };
         let child_path = entry.path();
         if walk.own_dirs.is_blocked(&child_path) {
+            walk.skipped.push(path_to_string(&child_path));
             continue;
         }
         let meta = match fs::symlink_metadata(&child_path) {
