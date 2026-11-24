@@ -407,6 +407,7 @@ pub(crate) fn parse_status_json(
         pid,
         since: None,
         instance_id: None,
+        oneshot_completed: false,
         description,
         exit_code: effective_exit,
         detail,

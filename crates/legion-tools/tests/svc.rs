@@ -493,3 +493,45 @@ async fn linux_stop_on_failed_unit_reports_failed_immediately() {
     assert_eq!(res["previous_state"], json!("failed"));
     assert_eq!(res["state"], json!("failed"));
 }
+
+#[tokio::test]
+async fn linux_oneshot_service_start_reports_ran_and_exited() {
+    if !linux_user_systemd_available() {
+        return;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let unit = format!("legion-svc-oneshot-{}-{nanos}.service", std::process::id());
+    let _guard = TransientUnitGuard { unit: unit.clone() };
+
+    let out = Command::new("systemd-run")
+        .args([
+            "--user",
+            &format!("--unit={unit}"),
+            "--property=Type=oneshot",
+            "--remain-after-exit",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let fixture = Fixture::new();
+    let restarted = fixture
+        .call("svc.restart", json!({"name": unit, "scope": "user"}))
+        .await
+        .unwrap();
+    assert!(
+        restarted["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("ran and exited")),
+        "{restarted:#}"
+    );
+}

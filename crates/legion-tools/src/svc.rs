@@ -354,6 +354,9 @@ pub struct ActionResult {
     pub state: ServiceState,
     /// Observed state before the command ran.
     pub previous_state: ServiceState,
+    /// Additional context when a one-shot or on-demand service ran to completion and exited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Start of a log window: an RFC 3339 timestamp or a positive duration in seconds.
@@ -577,8 +580,9 @@ async fn execute_action(
     let canonical = before.name.clone();
     let previous_state = before.state;
     let before_identity = StartIdentity::from_status(&before);
-    let need_new_instance = action == Action::Restart
-        && previous_state == ServiceState::Running
+    let need_new_instance = ((action == Action::Restart
+        && previous_state == ServiceState::Running)
+        || before.oneshot_completed)
         && before_identity.has_identity();
     let use_sudo = scope == Scope::System && sudo_enabled;
 
@@ -608,6 +612,20 @@ async fn execute_action(
 
         let last_state = match backend.status(ctx, &canonical, scope).await {
             Ok(now) => {
+                // One-shot / on-demand services that ran and exited cleanly succeed without
+                // waiting for a long-running daemon process.
+                if expected == ServiceState::Running
+                    && now.oneshot_completed
+                    && (!need_new_instance || before_identity.changed(&now))
+                {
+                    return Ok(ActionResult {
+                        name: now.name,
+                        scope,
+                        state: now.state,
+                        previous_state,
+                        note: Some("Service ran and exited cleanly.".to_owned()),
+                    });
+                }
                 if now.state == expected {
                     if expected == ServiceState::Running {
                         if need_new_instance && !before_identity.changed(&now) {
@@ -631,6 +649,17 @@ async fn execute_action(
                                 }
                             }
                             let settled = backend.status(ctx, &canonical, scope).await?;
+                            if settled.oneshot_completed
+                                && (!need_new_instance || before_identity.changed(&settled))
+                            {
+                                return Ok(ActionResult {
+                                    name: settled.name,
+                                    scope,
+                                    state: settled.state,
+                                    previous_state,
+                                    note: Some("Service ran and exited cleanly.".to_owned()),
+                                });
+                            }
                             if settled.state == ServiceState::Running
                                 && (!need_new_instance || before_identity.changed(&settled))
                             {
@@ -639,6 +668,7 @@ async fn execute_action(
                                     scope,
                                     state: settled.state,
                                     previous_state,
+                                    note: None,
                                 });
                             }
                             let mut error = ErrorBody::new(
@@ -670,6 +700,7 @@ async fn execute_action(
                             scope,
                             state: now.state,
                             previous_state,
+                            note: None,
                         });
                     }
                 }
@@ -684,6 +715,7 @@ async fn execute_action(
                         scope,
                         state: ServiceState::Failed,
                         previous_state,
+                        note: None,
                     });
                 }
                 // Stop waiting immediately if start/restart transitioned to failed.
@@ -716,6 +748,7 @@ async fn execute_action(
                     scope,
                     state: ServiceState::Stopped,
                     previous_state,
+                    note: None,
                 });
             }
             Err(err) => return Err(err),
@@ -1275,6 +1308,7 @@ mod tests {
                 pid,
                 since: None,
                 instance_id: instance_id.map(str::to_owned),
+                oneshot_completed: false,
                 description: Some("test service".to_owned()),
                 exit_code: (state == ServiceState::Failed).then_some(1),
                 detail: BTreeMap::new(),
@@ -1606,6 +1640,55 @@ mod tests {
             .unwrap();
             assert_eq!(stopped_failed.previous_state, ServiceState::Failed);
             assert_eq!(stopped_failed.state, ServiceState::Failed);
+
+            // Starting a Type=oneshot service that runs and returns to `stopped` succeeds with a note.
+            let oneshot = FakeBackend::new(BackendKind::Systemd, true);
+            oneshot.push_status_with(
+                Scope::User,
+                "migrate.service",
+                ServiceState::Stopped,
+                None,
+                None,
+            );
+            oneshot
+                .statuses
+                .lock()
+                .unwrap()
+                .entry((Scope::User, "migrate.service".to_owned()))
+                .or_default()
+                .push(Ok(BackendStatus {
+                    name: "migrate.service".to_owned(),
+                    scope: Scope::User,
+                    state: ServiceState::Stopped,
+                    enabled: Some(false),
+                    pid: None,
+                    since: None,
+                    instance_id: Some("inv-one".to_owned()),
+                    oneshot_completed: true,
+                    description: Some("One-shot migration".to_owned()),
+                    exit_code: None,
+                    detail: BTreeMap::new(),
+                }));
+            let ran_once = execute_action(
+                &oneshot,
+                ctx,
+                "migrate.service",
+                Some(Scope::User),
+                Action::Start,
+                false,
+                fast,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ran_once.previous_state, ServiceState::Stopped);
+            assert_eq!(ran_once.state, ServiceState::Stopped);
+            assert!(
+                ran_once
+                    .note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("ran and exited")),
+                "{ran_once:?}"
+            );
 
             Ok(json!({}))
         }

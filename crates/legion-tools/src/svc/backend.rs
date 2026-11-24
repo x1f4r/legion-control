@@ -95,6 +95,10 @@ pub(crate) struct BackendStatus {
     /// Backend-specific run identity (such as systemd `InvocationID` or monotonic start time, or
     /// launchd `runs` counter) used to prove a restart actually created a new instance.
     pub(crate) instance_id: Option<String>,
+    /// Whether this service is a one-shot or on-demand job that ran to completion and exited
+    /// cleanly (systemd `Type=oneshot` with `Result=success`, or launchd on-demand with
+    /// `runs > 0` and exit code 0).
+    pub(crate) oneshot_completed: bool,
     /// Human-readable description, when available.
     pub(crate) description: Option<String>,
     /// Last reported exit code, when available.

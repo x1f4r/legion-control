@@ -472,6 +472,11 @@ pub(crate) fn parse_print(
         detail.insert("keep_alive".to_owned(), Value::Bool(true));
     }
 
+    let oneshot_completed = !keep_alive
+        && state == ServiceState::Stopped
+        && exit_code == Some(0)
+        && runs.is_some_and(|r| r > 0);
+
     Ok(BackendStatus {
         name: label.to_owned(),
         scope,
@@ -480,6 +485,7 @@ pub(crate) fn parse_print(
         pid,
         since: None,
         instance_id: runs.map(|r| format!("runs:{r}")),
+        oneshot_completed,
         description: program,
         exit_code,
         detail,
@@ -803,6 +809,19 @@ system/com.example.broken = {
         let mismatched =
             parse_print(running, "com.example.other", Scope::User, "gui/501").unwrap_err();
         assert_eq!(mismatched.code, ErrorCode::NotFound);
+
+        let ondemand = "\
+gui/501/com.example.task = {
+    active count = 0
+    type = LaunchAgent
+    state = not running
+    runs = 1
+    last exit code = 0
+}
+";
+        let st = parse_print(ondemand, "com.example.task", Scope::User, "gui/501").unwrap();
+        assert_eq!(st.state, ServiceState::Stopped);
+        assert!(st.oneshot_completed);
     }
 
     #[test]

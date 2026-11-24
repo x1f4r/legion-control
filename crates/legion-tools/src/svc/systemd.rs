@@ -14,7 +14,7 @@ use super::backend::{
 use super::{Action, BackendKind, Scope, ServiceState, ServiceSummary};
 
 /// Properties requested from `systemctl show`.
-const SHOW_PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,InvocationID,ExecMainStatus,ExecMainCode,Description,Result,FragmentPath";
+const SHOW_PROPERTIES: &str = "Id,Type,LoadState,ActiveState,SubState,UnitFileState,MainPID,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,InvocationID,ExecMainStatus,ExecMainCode,Description,Result,FragmentPath";
 
 /// Linux systemd service manager backend.
 pub(crate) struct Systemd;
@@ -454,8 +454,15 @@ pub(crate) fn parse_show(
         _ => None,
     };
 
+    let service_type = props.get("Type").map(String::as_str).unwrap_or("");
+    let result = props.get("Result").map(String::as_str).unwrap_or("");
+    let oneshot_completed = service_type == "oneshot"
+        && result == "success"
+        && (active_state == "inactive" || (active_state == "active" && sub_state == "exited"));
+
     let mut detail = BTreeMap::new();
     for (prop_key, detail_key) in [
+        ("Type", "type"),
         ("LoadState", "load_state"),
         ("ActiveState", "active_state"),
         ("SubState", "sub_state"),
@@ -481,6 +488,7 @@ pub(crate) fn parse_show(
         pid,
         since,
         instance_id,
+        oneshot_completed,
         description,
         exit_code,
         detail,
@@ -866,6 +874,21 @@ SubState=running
         assert_eq!(err.code, ErrorCode::Conflict);
         assert!(err.message.contains("legion-a.service"), "{}", err.message);
         assert!(err.message.contains("legion-b.service"), "{}", err.message);
+
+        let oneshot = "\
+Id=migrate.service
+Type=oneshot
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+Result=success
+MainPID=0
+InvocationID=abc123
+";
+        let st = parse_show(oneshot, "migrate.service", Scope::User).unwrap();
+        assert_eq!(st.state, ServiceState::Stopped);
+        assert!(st.oneshot_completed);
+        assert_eq!(st.detail.get("type"), Some(&json!("oneshot")));
     }
 
     #[test]
