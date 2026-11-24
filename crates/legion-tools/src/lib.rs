@@ -10,6 +10,7 @@ pub mod exec;
 pub mod fs;
 pub mod job;
 pub mod meta;
+pub mod proj;
 pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -24,6 +25,7 @@ pub fn register_all(registry: &mut Registry) {
     exec::register(registry);
     fs::register(registry);
     job::register(registry);
+    proj::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }
