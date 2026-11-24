@@ -63,7 +63,8 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Wmi::{
     IWbemClassObject, IWbemLocator, IWbemServices, WBEM_E_ACCESS_DENIED, WBEM_E_INVALID_CLASS,
-    WBEM_E_INVALID_METHOD, WBEM_E_INVALID_NAMESPACE, WBEM_E_INVALID_PARAMETER, WBEM_E_NOT_FOUND,
+    WBEM_E_INVALID_METHOD, WBEM_E_INVALID_METHOD_PARAMETERS, WBEM_E_INVALID_NAMESPACE,
+    WBEM_E_INVALID_OBJECT, WBEM_E_INVALID_OBJECT_PATH, WBEM_E_INVALID_PARAMETER, WBEM_E_NOT_FOUND,
     WBEM_E_SERVER_TOO_BUSY, WBEM_E_SHUTTING_DOWN, WBEM_E_TRANSPORT_FAILURE, WBEM_GENERIC_FLAG_TYPE,
     WbemLocator,
 };
@@ -994,34 +995,34 @@ impl Drop for ComMtaGuard {
     }
 }
 
+// Verify at compile time that our cross-platform WMI HRESULT table matches the Windows SDK.
+const _: () = {
+    use crate::detach::wmi_hresult;
+    assert!(WBEM_E_NOT_FOUND.0 == wmi_hresult::WBEM_E_NOT_FOUND);
+    assert!(WBEM_E_ACCESS_DENIED.0 == wmi_hresult::WBEM_E_ACCESS_DENIED);
+    assert!(WBEM_E_INVALID_PARAMETER.0 == wmi_hresult::WBEM_E_INVALID_PARAMETER);
+    assert!(WBEM_E_INVALID_NAMESPACE.0 == wmi_hresult::WBEM_E_INVALID_NAMESPACE);
+    assert!(WBEM_E_INVALID_OBJECT.0 == wmi_hresult::WBEM_E_INVALID_OBJECT);
+    assert!(WBEM_E_INVALID_CLASS.0 == wmi_hresult::WBEM_E_INVALID_CLASS);
+    assert!(WBEM_E_TRANSPORT_FAILURE.0 == wmi_hresult::WBEM_E_TRANSPORT_FAILURE);
+    assert!(WBEM_E_INVALID_METHOD.0 == wmi_hresult::WBEM_E_INVALID_METHOD);
+    assert!(WBEM_E_INVALID_METHOD_PARAMETERS.0 == wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS);
+    assert!(WBEM_E_SHUTTING_DOWN.0 == wmi_hresult::WBEM_E_SHUTTING_DOWN);
+    assert!(WBEM_E_INVALID_OBJECT_PATH.0 == wmi_hresult::WBEM_E_INVALID_OBJECT_PATH);
+    assert!(WBEM_E_SERVER_TOO_BUSY.0 == wmi_hresult::WBEM_E_SERVER_TOO_BUSY);
+    assert!(RPC_E_DISCONNECTED.0 == wmi_hresult::RPC_E_DISCONNECTED);
+    assert!(
+        HRESULT::from_win32(RPC_S_SERVER_UNAVAILABLE.0 as u32).0
+            == wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR
+    );
+};
+
 fn is_transient_wmi_connect_hresult(hr: HRESULT) -> bool {
-    let raw = hr.0;
-    raw == WBEM_E_TRANSPORT_FAILURE.0
-        || raw == WBEM_E_SERVER_TOO_BUSY.0
-        || raw == WBEM_E_SHUTTING_DOWN.0
-        || hr == RPC_E_DISCONNECTED
-        || hr == HRESULT::from_win32(RPC_S_SERVER_UNAVAILABLE.0 as u32)
+    crate::detach::classify_wmi_connect_hresult(hr.0)
 }
 
-fn classify_exec_method_hresult(hr: HRESULT) -> Option<bool> {
-    let raw = hr.0;
-    if raw == WBEM_E_SERVER_TOO_BUSY.0
-        || raw == WBEM_E_SHUTTING_DOWN.0
-        || hr == RPC_E_DISCONNECTED
-        || hr == HRESULT::from_win32(RPC_S_SERVER_UNAVAILABLE.0 as u32)
-    {
-        return Some(true);
-    }
-    if raw == WBEM_E_ACCESS_DENIED.0
-        || raw == WBEM_E_INVALID_NAMESPACE.0
-        || raw == WBEM_E_INVALID_CLASS.0
-        || raw == WBEM_E_INVALID_METHOD.0
-        || raw == WBEM_E_INVALID_PARAMETER.0
-        || raw == WBEM_E_NOT_FOUND.0
-    {
-        return Some(false);
-    }
-    None
+fn classify_exec_method_hresult(hr: HRESULT) -> crate::detach::WmiExecMethodClass {
+    crate::detach::classify_wmi_exec_method_hresult(hr.0)
 }
 
 fn variant_to_u32(val: &VARIANT) -> Option<u32> {
@@ -1194,8 +1195,12 @@ pub(crate) fn wmi_create_process(
     } {
         let detail = format!("IWbemServices::ExecMethod(Win32_Process.Create) failed: {err}");
         return match classify_exec_method_hresult(err.code()) {
-            Some(transient) => Err(WmiCreateError::NotStarted { transient, detail }),
-            None => Err(WmiCreateError::MaybeStarted { detail }),
+            crate::detach::WmiExecMethodClass::NotStarted { transient } => {
+                Err(WmiCreateError::NotStarted { transient, detail })
+            }
+            crate::detach::WmiExecMethodClass::MaybeStarted => {
+                Err(WmiCreateError::MaybeStarted { detail })
+            }
         };
     }
 
@@ -1244,13 +1249,23 @@ pub(crate) fn wmi_create_process(
     }
 
     if return_value != 0 && pid == 0 {
-        let (reason, transient) = crate::detach::classify_wmi_return_value(return_value);
-        return Err(WmiCreateError::NotStarted {
-            transient,
-            detail: format!(
-                "Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
-            ),
-        });
+        return match crate::detach::classify_wmi_return_value(return_value) {
+            crate::detach::WmiReturnValueClass::NotStarted { reason } => {
+                Err(WmiCreateError::NotStarted {
+                    transient: false,
+                    detail: format!(
+                        "Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
+                    ),
+                })
+            }
+            crate::detach::WmiReturnValueClass::MaybeStarted { reason } => {
+                Err(WmiCreateError::MaybeStarted {
+                    detail: format!(
+                        "Win32_Process.Create failed with ambiguous ReturnValue={return_value} ({reason})"
+                    ),
+                })
+            }
+        };
     }
 
     Err(WmiCreateError::MaybeStarted {

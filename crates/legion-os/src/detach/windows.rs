@@ -467,6 +467,14 @@ async fn spawn_via_wmi(
         WmiCreateOutcome::HandoffReady => {
             wait_for_handoff(&handoff_path, None, Duration::from_secs(5)).await?
         }
+        WmiCreateOutcome::MaybeStarted(cause) => {
+            // The WMI provider host may have created the process before failing or timing out.
+            // Wait for the full hand-off timeout before concluding failure, and never retry.
+            match wait_for_handoff(&handoff_path, None, WMI_HANDOFF_TIMEOUT).await {
+                Ok(id) => id,
+                Err(_) => return Err(cause),
+            }
+        }
         WmiCreateOutcome::Unavailable(wmi_reason) => {
             let (process, windows_job) = win_proc::spawn_detached_in_current_job(
                 direct_fallback.program_display,
@@ -516,6 +524,7 @@ async fn spawn_via_wmi(
 enum WmiCreateOutcome {
     Started(u32),
     HandoffReady,
+    MaybeStarted(OsError),
     Unavailable(String),
 }
 
@@ -577,20 +586,14 @@ async fn create_wmi_wrapper_with_retry(
                 break;
             }
             Ok(Err(WmiCreateError::MaybeStarted { detail })) => {
-                if handoff_file_ready(handoff_path) {
-                    return Ok(WmiCreateOutcome::HandoffReady);
-                }
-                return Err(OsError::Platform {
+                return Ok(WmiCreateOutcome::MaybeStarted(OsError::Platform {
                     detail: format!(
                         "{detail}; verify whether the process started (for example via `job.status`) and ensure the Windows Management Instrumentation (Winmgmt) service is running before retrying"
                     ),
-                });
+                }));
             }
             Err(timeout_err) => {
-                if handoff_file_ready(handoff_path) {
-                    return Ok(WmiCreateOutcome::HandoffReady);
-                }
-                return Err(timeout_err);
+                return Ok(WmiCreateOutcome::MaybeStarted(timeout_err));
             }
         }
     }

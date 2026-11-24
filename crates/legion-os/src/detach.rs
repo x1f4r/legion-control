@@ -463,17 +463,116 @@ pub(crate) fn resolve_windows_powershell_exe(system_root: Option<&str>) -> Strin
     }
 }
 
-/// Describe a non-zero `Win32_Process.Create` `ReturnValue` and report whether it is safe to treat
-/// as a transient failure for bounded retry.
+/// Windows WMI / COM HRESULT values used to classify pre-dispatch vs ambiguous failures.
 #[allow(dead_code)]
-pub(crate) fn classify_wmi_return_value(code: u32) -> (&'static str, bool) {
+pub(crate) mod wmi_hresult {
+    pub(crate) const WBEM_E_NOT_FOUND: i32 = 0x8004_1002_u32 as i32;
+    pub(crate) const WBEM_E_ACCESS_DENIED: i32 = 0x8004_1003_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_PARAMETER: i32 = 0x8004_1008_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_NAMESPACE: i32 = 0x8004_100E_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_OBJECT: i32 = 0x8004_100F_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_CLASS: i32 = 0x8004_1010_u32 as i32;
+    pub(crate) const WBEM_E_TRANSPORT_FAILURE: i32 = 0x8004_1015_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_METHOD: i32 = 0x8004_102E_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_METHOD_PARAMETERS: i32 = 0x8004_102F_u32 as i32;
+    pub(crate) const WBEM_E_SHUTTING_DOWN: i32 = 0x8004_1033_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_OBJECT_PATH: i32 = 0x8004_103A_u32 as i32;
+    pub(crate) const WBEM_E_SERVER_TOO_BUSY: i32 = 0x8004_1045_u32 as i32;
+    pub(crate) const RPC_E_DISCONNECTED: i32 = 0x8001_0108_u32 as i32;
+    pub(crate) const RPC_S_SERVER_UNAVAILABLE_HR: i32 = 0x8007_06BA_u32 as i32;
+}
+
+/// Classification of an HRESULT returned from `IWbemServices::ExecMethod("Win32_Process", "Create")`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WmiExecMethodClass {
+    /// Definitive pre-dispatch rejection: WMI provably did not start the process.
+    NotStarted { transient: bool },
+    /// Ambiguous post-dispatch or transport error: the WMI provider host may have started the
+    /// process before disconnecting or failing, so callers must wait for handoff and never retry.
+    MaybeStarted,
+}
+
+/// Classification of a non-zero `Win32_Process.Create` `ReturnValue` when `ProcessId == 0`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WmiReturnValueClass {
+    /// Documented pre-launch rejection that provably did not create a process.
+    NotStarted { reason: &'static str },
+    /// Ambiguous failure (including `ReturnValue == 8` "unknown failure" and unrecognized codes)
+    /// that cannot prove no process was started.
+    MaybeStarted { reason: &'static str },
+}
+
+/// Return `true` when an HRESULT returned *before* `ExecMethod` (during `CoCreateInstance`,
+/// `ConnectServer`, `GetObject`, or `GetMethod`) is a transient connectivity/service-startup
+/// error safe to retry because `Win32_Process.Create` has not been invoked yet.
+#[allow(dead_code)]
+pub(crate) const fn classify_wmi_connect_hresult(hr: i32) -> bool {
+    matches!(
+        hr,
+        wmi_hresult::WBEM_E_TRANSPORT_FAILURE
+            | wmi_hresult::WBEM_E_SERVER_TOO_BUSY
+            | wmi_hresult::WBEM_E_SHUTTING_DOWN
+            | wmi_hresult::RPC_E_DISCONNECTED
+            | wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR
+    )
+}
+
+/// Classify an HRESULT returned *from* `IWbemServices::ExecMethod("Win32_Process", "Create")`.
+///
+/// Only definitive pre-dispatch rejections are classified as [`WmiExecMethodClass::NotStarted`].
+/// Transport/provider-host disconnect errors (`RPC_E_DISCONNECTED`, `RPC_S_SERVER_UNAVAILABLE`,
+/// `WBEM_E_SHUTTING_DOWN`, `WBEM_E_TRANSPORT_FAILURE`) mean the reply was lost — `wmiprvse.exe`
+/// may have created the process and then died over a quota — so they are classified as
+/// [`WmiExecMethodClass::MaybeStarted`].
+#[allow(dead_code)]
+pub(crate) const fn classify_wmi_exec_method_hresult(hr: i32) -> WmiExecMethodClass {
+    match hr {
+        wmi_hresult::WBEM_E_SERVER_TOO_BUSY => WmiExecMethodClass::NotStarted { transient: true },
+        wmi_hresult::WBEM_E_ACCESS_DENIED
+        | wmi_hresult::WBEM_E_NOT_FOUND
+        | wmi_hresult::WBEM_E_INVALID_NAMESPACE
+        | wmi_hresult::WBEM_E_INVALID_OBJECT
+        | wmi_hresult::WBEM_E_INVALID_CLASS
+        | wmi_hresult::WBEM_E_INVALID_METHOD
+        | wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS
+        | wmi_hresult::WBEM_E_INVALID_PARAMETER
+        | wmi_hresult::WBEM_E_INVALID_OBJECT_PATH => {
+            WmiExecMethodClass::NotStarted { transient: false }
+        }
+        _ => WmiExecMethodClass::MaybeStarted,
+    }
+}
+
+/// Classify a non-zero `Win32_Process.Create` `ReturnValue` (when `ProcessId == 0`).
+///
+/// Per Microsoft's `Win32_Process.Create` documentation:
+/// - `2` (access denied), `3` (insufficient privilege), `9` (path not found), and `21` (invalid
+///   parameter) are definitive pre-creation rejections.
+/// - `8` (unknown failure) and any undocumented code cannot prove no process was created and are
+///   treated as [`WmiReturnValueClass::MaybeStarted`].
+#[allow(dead_code)]
+pub(crate) const fn classify_wmi_return_value(code: u32) -> WmiReturnValueClass {
     match code {
-        2 => ("access denied", false),
-        3 => ("insufficient privilege", false),
-        8 => ("unknown failure", true),
-        9 => ("path not found", false),
-        21 => ("invalid parameter", false),
-        _ => ("unrecognized error", false),
+        2 => WmiReturnValueClass::NotStarted {
+            reason: "access denied",
+        },
+        3 => WmiReturnValueClass::NotStarted {
+            reason: "insufficient privilege",
+        },
+        8 => WmiReturnValueClass::MaybeStarted {
+            reason: "unknown failure",
+        },
+        9 => WmiReturnValueClass::NotStarted {
+            reason: "path not found",
+        },
+        21 => WmiReturnValueClass::NotStarted {
+            reason: "invalid parameter",
+        },
+        _ => WmiReturnValueClass::MaybeStarted {
+            reason: "unrecognized error",
+        },
     }
 }
 
@@ -1622,9 +1721,87 @@ mod tests {
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
         );
         assert_eq!(resolve_windows_powershell_exe(None), "powershell.exe");
-        assert_eq!(classify_wmi_return_value(8), ("unknown failure", true));
-        assert_eq!(classify_wmi_return_value(2), ("access denied", false));
-        assert_eq!(classify_wmi_return_value(9), ("path not found", false));
+    }
+
+    #[test]
+    fn wmi_error_classification_treats_post_dispatch_and_unknown_failures_as_maybe_started() {
+        // Pre-ExecMethod (connect/lookup) transport and shutdown errors are safely transient.
+        for hr in [
+            wmi_hresult::WBEM_E_TRANSPORT_FAILURE,
+            wmi_hresult::WBEM_E_SERVER_TOO_BUSY,
+            wmi_hresult::WBEM_E_SHUTTING_DOWN,
+            wmi_hresult::RPC_E_DISCONNECTED,
+            wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR,
+        ] {
+            assert!(classify_wmi_connect_hresult(hr), "hr={hr:#x}");
+        }
+        assert!(!classify_wmi_connect_hresult(
+            wmi_hresult::WBEM_E_ACCESS_DENIED
+        ));
+
+        // From ExecMethod, disconnect/shutdown/transport errors mean the reply was lost and the
+        // provider host may have already created the process -> MaybeStarted (never retry).
+        for hr in [
+            wmi_hresult::RPC_E_DISCONNECTED,
+            wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR,
+            wmi_hresult::WBEM_E_SHUTTING_DOWN,
+            wmi_hresult::WBEM_E_TRANSPORT_FAILURE,
+            0x8000_4005_u32 as i32, // E_FAIL
+        ] {
+            assert_eq!(
+                classify_wmi_exec_method_hresult(hr),
+                WmiExecMethodClass::MaybeStarted,
+                "ExecMethod hr={hr:#x} must be MaybeStarted"
+            );
+        }
+
+        // Only definitive pre-dispatch rejections are NotStarted from ExecMethod.
+        assert_eq!(
+            classify_wmi_exec_method_hresult(wmi_hresult::WBEM_E_SERVER_TOO_BUSY),
+            WmiExecMethodClass::NotStarted { transient: true }
+        );
+        for hr in [
+            wmi_hresult::WBEM_E_ACCESS_DENIED,
+            wmi_hresult::WBEM_E_NOT_FOUND,
+            wmi_hresult::WBEM_E_INVALID_NAMESPACE,
+            wmi_hresult::WBEM_E_INVALID_OBJECT,
+            wmi_hresult::WBEM_E_INVALID_CLASS,
+            wmi_hresult::WBEM_E_INVALID_METHOD,
+            wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS,
+            wmi_hresult::WBEM_E_INVALID_PARAMETER,
+            wmi_hresult::WBEM_E_INVALID_OBJECT_PATH,
+        ] {
+            assert_eq!(
+                classify_wmi_exec_method_hresult(hr),
+                WmiExecMethodClass::NotStarted { transient: false },
+                "ExecMethod hr={hr:#x} should be non-transient NotStarted"
+            );
+        }
+
+        // ReturnValue 8 ("unknown failure") and unrecognized codes must be MaybeStarted.
+        assert_eq!(
+            classify_wmi_return_value(8),
+            WmiReturnValueClass::MaybeStarted {
+                reason: "unknown failure"
+            }
+        );
+        assert_eq!(
+            classify_wmi_return_value(99),
+            WmiReturnValueClass::MaybeStarted {
+                reason: "unrecognized error"
+            }
+        );
+        for (code, reason) in [
+            (2, "access denied"),
+            (3, "insufficient privilege"),
+            (9, "path not found"),
+            (21, "invalid parameter"),
+        ] {
+            assert_eq!(
+                classify_wmi_return_value(code),
+                WmiReturnValueClass::NotStarted { reason }
+            );
+        }
     }
 
     #[tokio::test]
