@@ -27,7 +27,8 @@ TABLET_AVD="${LEGION_E2E_TABLET_AVD:-legion-tablet}"
 SKIP_TABLET=0
 KEEP_RUNNING=0
 
-APP_ID="com.x1f4r.legion"
+APP_ID="com.x1f4r.legion.debug"
+export LEGION_APP_ID="$APP_ID"
 
 die() { printf '\nERROR: %s\n' "$1" >&2; exit 1; }
 say() { printf '%s\n' "$1"; }

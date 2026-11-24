@@ -19,8 +19,8 @@
 set -euo pipefail
 
 AVD="${LEGION_AVD:-legion-test}"
-APP_ID="com.x1f4r.legion"
-ACTIVITY="$APP_ID/.MainActivity"
+APP_ID="${LEGION_APP_ID:-com.x1f4r.legion}"
+ACTIVITY="$APP_ID/com.x1f4r.legion.MainActivity"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/legion-app"
 
 die() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }

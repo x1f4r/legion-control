@@ -14,8 +14,8 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { chromium } = require(path.resolve(HERE, '../ui/test/node_modules/playwright-core'));
 
-const APP_ID = 'com.x1f4r.legion';
-const ACTIVITY = `${APP_ID}/.MainActivity`;
+const APP_ID = process.env.E2E_APP_ID || 'com.x1f4r.legion.debug';
+const ACTIVITY = `${APP_ID}/com.x1f4r.legion.MainActivity`;
 
 const SERIAL = requiredEnv('E2E_ADB_SERIAL');
 const SHOTS_DIR = requiredEnv('E2E_SHOTS_DIR');

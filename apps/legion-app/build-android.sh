@@ -95,8 +95,10 @@ BUILD_TOOLS_VER="$(find "$SDK_DIR/build-tools" -mindepth 1 -maxdepth 1 -type d -
 [ -n "$BUILD_TOOLS_VER" ] || die "no build-tools under $SDK_DIR/build-tools."
 APKSIGNER="$SDK_DIR/build-tools/$BUILD_TOOLS_VER/apksigner"
 ZIPALIGN="$SDK_DIR/build-tools/$BUILD_TOOLS_VER/zipalign"
+AAPT2="$SDK_DIR/build-tools/$BUILD_TOOLS_VER/aapt2"
 [ -x "$APKSIGNER" ] || die "apksigner not found at $APKSIGNER."
 [ -x "$ZIPALIGN" ] || die "zipalign not found at $ZIPALIGN."
+[ -x "$AAPT2" ] || die "aapt2 not found at $AAPT2."
 
 # ---------------------------------------------------------------------------
 # Signing key
@@ -176,6 +178,11 @@ rm -f "$ALIGNED" "$SIGNED" "$SIGNED.idsig"
 rm -f "$ALIGNED" "$SIGNED.idsig"
 
 VERIFY_OUTPUT="$("$APKSIGNER" verify --print-certs --verbose "$SIGNED")"
+BADGING_OUTPUT="$("$AAPT2" dump badging "$SIGNED")"
+if printf '%s\n' "$BADGING_OUTPUT" | grep -q '^application-debuggable'; then
+	rm -f "$SIGNED"
+	die "release APK has android:debuggable=true ($SIGNED); refusing to ship."
+fi
 CERT_SHA256="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n 's/^.*certificate SHA-256 digest: //p' | head -n 1)"
 SIZE_BYTES="$(wc -c < "$SIGNED" | tr -d '[:space:]')"
 SIZE_HUMAN="$(du -h "$SIGNED" | cut -f1)"

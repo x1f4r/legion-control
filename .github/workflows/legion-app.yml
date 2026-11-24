@@ -153,7 +153,7 @@ jobs:
           adb install -r "$APK"
           adb logcat -c
           adb shell cmd uimode night yes
-          adb shell am start -W -n com.x1f4r.legion/.MainActivity
+          adb shell am start -W -n com.x1f4r.legion.debug/com.x1f4r.legion.MainActivity
           FOUND=0
           for i in $(seq 1 90); do
             if adb logcat -d -s legion-app:I | grep -q "legion-app: interface ready"; then
