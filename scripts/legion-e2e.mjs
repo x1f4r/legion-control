@@ -13,7 +13,8 @@
 // workflow .github/workflows/legion-e2e.yml sets all of that up and explains the choices per OS.
 //
 // With --real-power, and only then, the far node really schedules a restart and a shutdown and
-// calls them off again (steps l): that is for a throwaway CI runner, never a machine anyone uses.
+// calls them off again (steps l): that is for a throwaway CI runner, never a machine anyone uses,
+// so it is refused unless CI=true says this is one.
 //
 // Each step prints what it checks and the run stops at the first failure, naming the step. What
 // is worth keeping when it fails (both audit logs, the doctor's answers, every call this script
@@ -86,7 +87,37 @@ function parseArgs(argv) {
   };
 }
 
-const opts = parseArgs(process.argv.slice(2));
+/**
+ * Why --real-power may not run here, or null when it may: it restarts the machine this runs on if
+ * calling the restart off fails. A CI runner is thrown away after the job; anyone else's machine
+ * is not, so without CI=true it is refused.
+ */
+export function realPowerRefusal(options, env) {
+  if (options.realPower && env.CI !== 'true') {
+    return '--real-power really schedules a restart and a shutdown of this machine and calls them off; if calling off failed, this machine would go down. It runs only where CI=true says the machine is a throwaway CI runner.';
+  }
+  return null;
+}
+
+/**
+ * The operating system's own way of stopping what the far node may have scheduled: Windows'
+ * `shutdown /a`; on Unix killing the far node's delayed runner, by the mode and the directory only
+ * it is started with (`legion power-delay <far LEGION_HOME>/state/power <id>`), so the pattern
+ * cannot match this script, whose own command line has neither next to the other.
+ */
+export function emergencyAbort(isWindows, farHome) {
+  if (isWindows) return ['shutdown', ['/a']];
+  const runnerDir = path.join(farHome, 'state', 'power');
+  const pattern = `power-delay ${runnerDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} `;
+  return ['pkill', ['-f', '--', pattern]];
+}
+
+// Imported by its tests, the script does nothing but define; run, it parses its arguments and
+// goes. Compared through realpath, as scripts/check-syntax.mjs does.
+const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
+const isMain = process.argv[1] !== undefined && real(process.argv[1]) === real(fileURLToPath(import.meta.url));
+const opts = isMain ? parseArgs(process.argv.slice(2)) : { work: '.', farHome: '.', skip: [], realPower: false };
+if (isMain && realPowerRefusal(opts, process.env)) usage(realPowerRefusal(opts, process.env));
 const run = crypto.randomBytes(4).toString('hex');
 const farRoot = `~/legion-e2e-${run}`;
 const artifacts = path.join(opts.work, 'artifacts');
@@ -868,13 +899,22 @@ step('k2 an extension tool with a shell command on far prints the argument verba
 // like here. To make it unlikely, the delay is the longest there is, and every way out of these
 // steps first calls the operating system's own abort (abortPowerOutright) whatever Legion said.
 
-/** The operating system's own way of stopping what the far node may have scheduled. */
+/** Calls the operating system's own abort for what the far node may have scheduled. */
 function abortPowerOutright() {
   if (!opts.realPower) return;
-  const result = windows
-    ? spawnSync('shutdown', ['/a'], { encoding: 'utf8', windowsHide: true })
-    : spawnSync('pkill', ['-f', 'power-delay'], { encoding: 'utf8' });
-  record({ program: windows ? 'shutdown' : 'pkill', args: windows ? ['/a'] : ['-f', 'power-delay'], status: result.status, stdout: clip(result.stdout), stderr: clip(result.stderr), note: 'emergency abort' });
+  const [program, args] = emergencyAbort(windows, opts.farHome);
+  const result = spawnSync(program, args, { encoding: 'utf8', windowsHide: true });
+  record({ program, args, status: result.status, stdout: clip(result.stdout), stderr: clip(result.stderr), note: 'emergency abort' });
+}
+
+// Interrupted or told to stop (a cancelled job, a timeout), the script calls the operating
+// system's own abort before it goes, as every other way out of the power steps does.
+for (const signal of isMain ? ['SIGINT', 'SIGTERM', 'SIGHUP'] : []) {
+  process.on(signal, () => {
+    abortPowerOutright();
+    console.error(`legion e2e: stopped by ${signal}; anything the far node had scheduled was aborted.`);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  });
 }
 
 /** The far node's node.toml for these steps: not busy, and on Unix acting through sudo when asked. */
@@ -1064,11 +1104,13 @@ async function main() {
 
 // Said outright: a timer or a child left behind by a step would otherwise keep the run, and the
 // runner it holds, waiting after the verdict.
-try {
-  await main();
-  process.exit(0);
-} catch (error) {
-  abortPowerOutright();
-  console.error(`legion e2e: the driver itself failed: ${error.stack}`);
-  process.exit(1);
+if (isMain) {
+  try {
+    await main();
+    process.exit(0);
+  } catch (error) {
+    abortPowerOutright();
+    console.error(`legion e2e: the driver itself failed: ${error.stack}`);
+    process.exit(1);
+  }
 }
