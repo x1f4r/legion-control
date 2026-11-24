@@ -1308,13 +1308,43 @@ pub(crate) fn parse_wmi_cim_output(stdout: &str, stderr: &str, exit_success: boo
     WmiCimResult::MaybeStarted { detail }
 }
 
+/// `CREATE_BREAKAWAY_FROM_JOB` (`0x0100_0000`, decimal `16777216`), passed in
+/// `Win32_ProcessStartup.CreateFlags` so processes launched via `Win32_Process.Create` leave the
+/// WMI provider host's (`wmiprvse.exe`) job object and do not count against its quotas.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// Return `true` when a proven-not-started `Win32_Process.Create` `ReturnValue` could indicate
+/// that `CREATE_BREAKAWAY_FROM_JOB` in `ProcessStartupInformation` was refused (`2` access denied,
+/// `3` insufficient privilege, or `21` invalid parameter), warranting one retry without the flag.
+#[allow(dead_code)]
+pub(crate) const fn wmi_breakaway_return_value_rejected(code: u32) -> bool {
+    matches!(code, 2 | 3 | 21)
+}
+
+/// Return `true` when an `ExecMethod` HRESULT could indicate a pre-dispatch rejection of the
+/// `ProcessStartupInformation` breakaway parameter, warranting one retry without it.
+#[allow(dead_code)]
+pub(crate) const fn wmi_breakaway_hresult_rejected(hr: i32) -> bool {
+    matches!(
+        hr,
+        wmi_hresult::WBEM_E_ACCESS_DENIED
+            | wmi_hresult::WBEM_E_INVALID_PARAMETER
+            | wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS
+    )
+}
+
 /// Build the outer PowerShell script that invokes `Win32_Process.Create` via `Invoke-CimMethod`
 /// for a pre-built `command_line` and writes a machine-readable
 /// `LEGION_WMI_RESULT:<ReturnValue>:<ProcessId>` line to stdout.
+///
+/// When `breakaway_from_job` is `true`, passes a client-only `Win32_ProcessStartup` instance with
+/// `CreateFlags = CREATE_BREAKAWAY_FROM_JOB` (`0x01000000`) as `ProcessStartupInformation`.
 #[allow(dead_code)]
 pub(crate) fn build_wmi_create_script_for_cmdline(
     command_line: &str,
     cwd: Option<&str>,
+    breakaway_from_job: bool,
 ) -> Result<String> {
     if command_line.len() > WINDOWS_WMI_MAX_CMDLINE {
         return Err(OsError::InvalidArgument {
@@ -1338,6 +1368,12 @@ pub(crate) fn build_wmi_create_script_for_cmdline(
             powershell_single_quote(dir)
         ));
     }
+    if breakaway_from_job {
+        lines.push(format!(
+            "$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{{ CreateFlags = [uint32]{WINDOWS_CREATE_BREAKAWAY_FROM_JOB} }}"
+        ));
+        lines.push("$cimArgs['ProcessStartupInformation'] = $startup".to_owned());
+    }
     lines.extend([
         "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments $cimArgs"
             .to_owned(),
@@ -1360,7 +1396,7 @@ pub(crate) fn build_wmi_create_script(launcher_script: &str, cwd: Option<&str>) 
     let command_line = format!(
         "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
     );
-    build_wmi_create_script_for_cmdline(&command_line, cwd)
+    build_wmi_create_script_for_cmdline(&command_line, cwd, true)
 }
 
 #[cfg(test)]
@@ -1395,7 +1431,28 @@ mod tests {
         let cim = build_wmi_create_script(&launcher, Some(r"C:\Users\me\work")).unwrap();
         assert!(cim.contains("Invoke-CimMethod -ClassName Win32_Process -MethodName Create"));
         assert!(cim.contains("$cimArgs['CurrentDirectory'] = 'C:\\Users\\me\\work'"));
+        assert!(cim.contains("Win32_ProcessStartup"));
+        assert!(cim.contains("CreateFlags = [uint32]16777216"));
+        assert!(cim.contains("$cimArgs['ProcessStartupInformation'] = $startup"));
         assert!(!cim.contains("$args ="));
+
+        let cim_no_breakaway =
+            build_wmi_create_script_for_cmdline("cmd.exe /c echo hi", None, false).unwrap();
+        assert!(!cim_no_breakaway.contains("ProcessStartupInformation"));
+        assert!(wmi_breakaway_return_value_rejected(2));
+        assert!(wmi_breakaway_return_value_rejected(3));
+        assert!(wmi_breakaway_return_value_rejected(21));
+        assert!(!wmi_breakaway_return_value_rejected(8));
+        assert!(!wmi_breakaway_return_value_rejected(9));
+        assert!(wmi_breakaway_hresult_rejected(
+            wmi_hresult::WBEM_E_ACCESS_DENIED
+        ));
+        assert!(wmi_breakaway_hresult_rejected(
+            wmi_hresult::WBEM_E_INVALID_PARAMETER
+        ));
+        assert!(!wmi_breakaway_hresult_rejected(
+            wmi_hresult::RPC_E_DISCONNECTED
+        ));
     }
 
     #[test]

@@ -40,6 +40,8 @@ use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
+#[cfg(test)]
+use windows::Win32::System::JobObjects::IsProcessInJob;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JobObjectBasicProcessIdList, OpenJobObjectW, QueryInformationJobObject, TerminateJobObject,
@@ -68,7 +70,7 @@ use windows::Win32::System::Wmi::{
     WBEM_E_SERVER_TOO_BUSY, WBEM_E_SHUTTING_DOWN, WBEM_E_TRANSPORT_FAILURE, WBEM_GENERIC_FLAG_TYPE,
     WbemLocator,
 };
-use windows::core::{BOOL, BSTR, HRESULT, PCWSTR, PWSTR};
+use windows::core::{BOOL, BSTR, HRESULT, IUnknown, Interface, PCWSTR, PWSTR};
 
 use crate::procid::{EnvMarkerCheck, ProcessId, windows_env_utf16_has_marker};
 use crate::{OsError, Result};
@@ -1031,13 +1033,264 @@ fn variant_to_u32(val: &VARIANT) -> Option<u32> {
         .or_else(|| i32::try_from(val).ok().and_then(|n| u32::try_from(n).ok()))
 }
 
+fn build_wmi_startup_info_breakaway(
+    service: &IWbemServices,
+) -> std::result::Result<IWbemClassObject, WmiCreateError> {
+    let startup_class_name = BSTR::from("Win32_ProcessStartup");
+    let mut startup_class: Option<IWbemClassObject> = None;
+    // SAFETY: `service` is connected and `startup_class` is a valid out-pointer.
+    unsafe {
+        service.GetObject(
+            &startup_class_name,
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            Some(&mut startup_class),
+            None,
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: is_transient_wmi_connect_hresult(err.code()),
+        detail: format!("IWbemServices::GetObject(Win32_ProcessStartup) failed: {err}"),
+    })?;
+    let startup_class = startup_class.ok_or_else(|| WmiCreateError::NotStarted {
+        transient: false,
+        detail: "IWbemServices::GetObject(Win32_ProcessStartup) returned null object".into(),
+    })?;
+
+    // SAFETY: `startup_class` is a valid WMI class definition object.
+    let startup_instance =
+        unsafe { startup_class.SpawnInstance(0) }.map_err(|err| WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::SpawnInstance(Win32_ProcessStartup) failed: {err}"),
+        })?;
+
+    // Per Microsoft's `IWbemClassObject::Put` rules, CIM `uint32` (`CreateFlags`) accepts `VT_I4`.
+    // `CREATE_BREAKAWAY_FROM_JOB` (`0x0100_0000` = 16_777_216) fits cleanly in positive `i32`.
+    let flags_name = to_wide_null(OsStr::new("CreateFlags"));
+    let flags_var = VARIANT::from(CREATE_BREAKAWAY_FROM_JOB.0 as i32);
+    // SAFETY: `flags_name` is NUL-terminated UTF-16 and `flags_var` is a valid `VT_I4` VARIANT.
+    unsafe { startup_instance.Put(PCWSTR::from_raw(flags_name.as_ptr()), 0, &flags_var, 0) }
+        .map_err(|err| WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::Put(CreateFlags) failed: {err}"),
+        })?;
+
+    Ok(startup_instance)
+}
+
+/// Outcome of a single `Win32_Process.Create` `ExecMethod` call on an established WMI connection.
+enum WmiExecOutcome {
+    Started(u32),
+    /// Proven pre-launch rejection that may be caused specifically by `CREATE_BREAKAWAY_FROM_JOB`.
+    BreakawayRejected(WmiCreateError),
+    Failed(WmiCreateError),
+}
+
+fn exec_wmi_create_once(
+    service: &IWbemServices,
+    class_name: &BSTR,
+    in_sig: &IWbemClassObject,
+    command_line: &str,
+    cwd: Option<&str>,
+    startup_info: Option<&IWbemClassObject>,
+) -> WmiExecOutcome {
+    // SAFETY: `in_sig` is a valid method input parameter class object.
+    let in_params = match unsafe { in_sig.SpawnInstance(0) } {
+        Ok(params) => params,
+        Err(err) => {
+            return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+                transient: false,
+                detail: format!("IWbemClassObject::SpawnInstance failed: {err}"),
+            });
+        }
+    };
+
+    let cmdline_name = to_wide_null(OsStr::new("CommandLine"));
+    let cmdline_var = VARIANT::from(command_line);
+    // SAFETY: `cmdline_name` is NUL-terminated UTF-16 and `cmdline_var` is a valid BSTR VARIANT.
+    if let Err(err) =
+        unsafe { in_params.Put(PCWSTR::from_raw(cmdline_name.as_ptr()), 0, &cmdline_var, 0) }
+    {
+        return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::Put(CommandLine) failed: {err}"),
+        });
+    }
+
+    if let Some(dir) = cwd {
+        let cwd_name = to_wide_null(OsStr::new("CurrentDirectory"));
+        let cwd_var = VARIANT::from(dir);
+        // SAFETY: `cwd_name` is NUL-terminated UTF-16 and `cwd_var` is a valid BSTR VARIANT.
+        if let Err(err) =
+            unsafe { in_params.Put(PCWSTR::from_raw(cwd_name.as_ptr()), 0, &cwd_var, 0) }
+        {
+            return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+                transient: false,
+                detail: format!("IWbemClassObject::Put(CurrentDirectory) failed: {err}"),
+            });
+        }
+    }
+
+    if let Some(startup) = startup_info {
+        // Per Microsoft's `IWbemClassObject::Put` contract, embedded WMI objects must be passed as
+        // `VT_UNKNOWN` obtained by querying `IID_IUnknown`.
+        let startup_unk: IUnknown = match startup.cast() {
+            Ok(unk) => unk,
+            Err(err) => {
+                return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+                    transient: false,
+                    detail: format!(
+                        "QueryInterface(IUnknown) on Win32_ProcessStartup failed: {err}"
+                    ),
+                });
+            }
+        };
+        let startup_name = to_wide_null(OsStr::new("ProcessStartupInformation"));
+        let startup_var = VARIANT::from(startup_unk);
+        // SAFETY: `startup_name` is NUL-terminated UTF-16 and `startup_var` is a valid
+        // `VT_UNKNOWN` VARIANT that releases its COM ref on drop via `VariantClear`.
+        if let Err(err) =
+            unsafe { in_params.Put(PCWSTR::from_raw(startup_name.as_ptr()), 0, &startup_var, 0) }
+        {
+            return WmiExecOutcome::BreakawayRejected(WmiCreateError::NotStarted {
+                transient: false,
+                detail: format!("IWbemClassObject::Put(ProcessStartupInformation) failed: {err}"),
+            });
+        }
+    }
+
+    let method_bstr = BSTR::from("Create");
+    let mut out_params: Option<IWbemClassObject> = None;
+    // SAFETY: All COM objects and BSTR arguments are valid; `out_params` is a valid out-pointer.
+    if let Err(err) = unsafe {
+        service.ExecMethod(
+            class_name,
+            &method_bstr,
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            &in_params,
+            Some(&mut out_params),
+            None,
+        )
+    } {
+        let detail = format!("IWbemServices::ExecMethod(Win32_Process.Create) failed: {err}");
+        let hr = err.code();
+        return match classify_exec_method_hresult(hr) {
+            crate::detach::WmiExecMethodClass::NotStarted { transient } => {
+                let wmi_err = WmiCreateError::NotStarted { transient, detail };
+                if startup_info.is_some() && crate::detach::wmi_breakaway_hresult_rejected(hr.0) {
+                    WmiExecOutcome::BreakawayRejected(wmi_err)
+                } else {
+                    WmiExecOutcome::Failed(wmi_err)
+                }
+            }
+            crate::detach::WmiExecMethodClass::MaybeStarted => {
+                WmiExecOutcome::Failed(WmiCreateError::MaybeStarted { detail })
+            }
+        };
+    }
+
+    let Some(out_params) = out_params else {
+        return WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+            detail: "Win32_Process.Create returned no output parameters".into(),
+        });
+    };
+
+    let ret_name = to_wide_null(OsStr::new("ReturnValue"));
+    let mut ret_var = VARIANT::default();
+    // SAFETY: `ret_name` is NUL-terminated UTF-16 and `ret_var` is a valid mutable `VARIANT`.
+    if let Err(err) = unsafe {
+        out_params.Get(
+            PCWSTR::from_raw(ret_name.as_ptr()),
+            0,
+            &mut ret_var,
+            None,
+            None,
+        )
+    } {
+        return WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+            detail: format!("reading Win32_Process.Create ReturnValue failed: {err}"),
+        });
+    }
+    let Some(return_value) = variant_to_u32(&ret_var) else {
+        return WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+            detail: "Win32_Process.Create ReturnValue was not an integer".into(),
+        });
+    };
+
+    let pid_name = to_wide_null(OsStr::new("ProcessId"));
+    let mut pid_var = VARIANT::default();
+    let pid = unsafe {
+        out_params.Get(
+            PCWSTR::from_raw(pid_name.as_ptr()),
+            0,
+            &mut pid_var,
+            None,
+            None,
+        )
+    }
+    .ok()
+    .and_then(|()| variant_to_u32(&pid_var))
+    .unwrap_or(0);
+
+    if return_value == 0 && pid > 0 {
+        return WmiExecOutcome::Started(pid);
+    }
+
+    if return_value != 0 && pid == 0 {
+        return match crate::detach::classify_wmi_return_value(return_value) {
+            crate::detach::WmiReturnValueClass::NotStarted { reason } => {
+                let wmi_err = WmiCreateError::NotStarted {
+                    transient: false,
+                    detail: format!(
+                        "Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
+                    ),
+                };
+                if startup_info.is_some()
+                    && crate::detach::wmi_breakaway_return_value_rejected(return_value)
+                {
+                    WmiExecOutcome::BreakawayRejected(wmi_err)
+                } else {
+                    WmiExecOutcome::Failed(wmi_err)
+                }
+            }
+            crate::detach::WmiReturnValueClass::MaybeStarted { reason } => {
+                WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+                    detail: format!(
+                        "Win32_Process.Create failed with ambiguous ReturnValue={return_value} ({reason})"
+                    ),
+                })
+            }
+        };
+    }
+
+    WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+        detail: format!(
+            "Win32_Process.Create returned ambiguous result (ReturnValue={return_value}, ProcessId={pid})"
+        ),
+    })
+}
+
 /// Invoke `Win32_Process.Create` directly via COM (`IWbemLocator` -> `ROOT\CIMV2`) without
 /// spawning an outer `powershell.exe` / `Invoke-CimMethod` process.
+///
+/// Requests `CREATE_BREAKAWAY_FROM_JOB` via `Win32_ProcessStartup.CreateFlags` so the created
+/// process leaves the WMI provider host's job object and does not count against its quotas. Falls
+/// back once without `ProcessStartupInformation` only when WMI provably rejects the breakaway
+/// request before creating a process.
 ///
 /// Must be called on a dedicated OS thread so it always initializes a clean MTA apartment.
 pub(crate) fn wmi_create_process(
     command_line: &str,
     cwd: Option<&str>,
+) -> std::result::Result<u32, WmiCreateError> {
+    wmi_create_process_with_breakaway(command_line, cwd, true)
+}
+
+fn wmi_create_process_with_breakaway(
+    command_line: &str,
+    cwd: Option<&str>,
+    try_breakaway: bool,
 ) -> std::result::Result<u32, WmiCreateError> {
     // SAFETY: Standard per-thread COM MTA initialization paired with `ComMtaGuard`.
     let init_hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -1130,129 +1383,51 @@ pub(crate) fn wmi_create_process(
         detail: "IWbemClassObject::GetMethod(Create) returned null signature".into(),
     })?;
 
-    // SAFETY: `in_sig` is a valid method input parameter class object.
-    let in_params =
-        unsafe { in_sig.SpawnInstance(0) }.map_err(|err| WmiCreateError::NotStarted {
-            transient: false,
-            detail: format!("IWbemClassObject::SpawnInstance failed: {err}"),
-        })?;
-
-    let cmdline_name = to_wide_null(OsStr::new("CommandLine"));
-    let cmdline_var = VARIANT::from(command_line);
-    // SAFETY: `cmdline_name` is NUL-terminated UTF-16 and `cmdline_var` is a valid BSTR VARIANT.
-    unsafe { in_params.Put(PCWSTR::from_raw(cmdline_name.as_ptr()), 0, &cmdline_var, 0) }.map_err(
-        |err| WmiCreateError::NotStarted {
-            transient: false,
-            detail: format!("IWbemClassObject::Put(CommandLine) failed: {err}"),
-        },
-    )?;
-
-    if let Some(dir) = cwd {
-        let cwd_name = to_wide_null(OsStr::new("CurrentDirectory"));
-        let cwd_var = VARIANT::from(dir);
-        // SAFETY: `cwd_name` is NUL-terminated UTF-16 and `cwd_var` is a valid BSTR VARIANT.
-        unsafe { in_params.Put(PCWSTR::from_raw(cwd_name.as_ptr()), 0, &cwd_var, 0) }.map_err(
-            |err| WmiCreateError::NotStarted {
-                transient: false,
-                detail: format!("IWbemClassObject::Put(CurrentDirectory) failed: {err}"),
-            },
-        )?;
-    }
-
-    let method_bstr = BSTR::from("Create");
-    let mut out_params: Option<IWbemClassObject> = None;
-    // SAFETY: All COM objects and BSTR arguments are valid; `out_params` is a valid out-pointer.
-    if let Err(err) = unsafe {
-        service.ExecMethod(
-            &class_name,
-            &method_bstr,
-            WBEM_GENERIC_FLAG_TYPE(0),
-            None,
-            &in_params,
-            Some(&mut out_params),
-            None,
-        )
-    } {
-        let detail = format!("IWbemServices::ExecMethod(Win32_Process.Create) failed: {err}");
-        return match classify_exec_method_hresult(err.code()) {
-            crate::detach::WmiExecMethodClass::NotStarted { transient } => {
-                Err(WmiCreateError::NotStarted { transient, detail })
+    if try_breakaway {
+        let startup_info = build_wmi_startup_info_breakaway(&service).ok();
+        if let Some(ref startup) = startup_info {
+            match exec_wmi_create_once(
+                &service,
+                &class_name,
+                &in_sig,
+                command_line,
+                cwd,
+                Some(startup),
+            ) {
+                WmiExecOutcome::Started(pid) => return Ok(pid),
+                WmiExecOutcome::Failed(err) => return Err(err),
+                WmiExecOutcome::BreakawayRejected(_) => {
+                    // Breakaway was provably rejected before process creation; fall back once
+                    // without `ProcessStartupInformation` on the same WMI connection.
+                }
             }
-            crate::detach::WmiExecMethodClass::MaybeStarted => {
-                Err(WmiCreateError::MaybeStarted { detail })
+        }
+    }
+
+    match exec_wmi_create_once(&service, &class_name, &in_sig, command_line, cwd, None) {
+        WmiExecOutcome::Started(pid) => Ok(pid),
+        WmiExecOutcome::BreakawayRejected(err) | WmiExecOutcome::Failed(err) => Err(err),
+    }
+}
+
+/// Return `true` when live process `pid` is currently associated with any Windows Job Object.
+#[cfg(test)]
+pub(crate) fn is_process_in_any_job(pid: u32) -> Result<bool> {
+    // SAFETY: `OpenProcess` takes plain integer arguments and returns an owned handle.
+    let handle = OwnedHandle(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.map_err(|err| {
+            OsError::Platform {
+                detail: format!("OpenProcess failed for pid {pid}: {err}"),
             }
-        };
-    }
-
-    let Some(out_params) = out_params else {
-        return Err(WmiCreateError::MaybeStarted {
-            detail: "Win32_Process.Create returned no output parameters".into(),
-        });
-    };
-
-    let ret_name = to_wide_null(OsStr::new("ReturnValue"));
-    let mut ret_var = VARIANT::default();
-    // SAFETY: `ret_name` is NUL-terminated UTF-16 and `ret_var` is a valid mutable `VARIANT`.
-    unsafe {
-        out_params.Get(
-            PCWSTR::from_raw(ret_name.as_ptr()),
-            0,
-            &mut ret_var,
-            None,
-            None,
-        )
-    }
-    .map_err(|err| WmiCreateError::MaybeStarted {
-        detail: format!("reading Win32_Process.Create ReturnValue failed: {err}"),
+        })?,
+    );
+    let mut in_job = BOOL::default();
+    // SAFETY: `handle.0` has `PROCESS_QUERY_LIMITED_INFORMATION` (the minimum right documented
+    // for `IsProcessInJob`), `None` checks membership in any job, and `in_job` is a valid out-ptr.
+    unsafe { IsProcessInJob(handle.0, None, &mut in_job) }.map_err(|err| OsError::Platform {
+        detail: format!("IsProcessInJob failed for pid {pid}: {err}"),
     })?;
-    let return_value = variant_to_u32(&ret_var).ok_or_else(|| WmiCreateError::MaybeStarted {
-        detail: "Win32_Process.Create ReturnValue was not an integer".into(),
-    })?;
-
-    let pid_name = to_wide_null(OsStr::new("ProcessId"));
-    let mut pid_var = VARIANT::default();
-    let pid = unsafe {
-        out_params.Get(
-            PCWSTR::from_raw(pid_name.as_ptr()),
-            0,
-            &mut pid_var,
-            None,
-            None,
-        )
-    }
-    .ok()
-    .and_then(|()| variant_to_u32(&pid_var))
-    .unwrap_or(0);
-
-    if return_value == 0 && pid > 0 {
-        return Ok(pid);
-    }
-
-    if return_value != 0 && pid == 0 {
-        return match crate::detach::classify_wmi_return_value(return_value) {
-            crate::detach::WmiReturnValueClass::NotStarted { reason } => {
-                Err(WmiCreateError::NotStarted {
-                    transient: false,
-                    detail: format!(
-                        "Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
-                    ),
-                })
-            }
-            crate::detach::WmiReturnValueClass::MaybeStarted { reason } => {
-                Err(WmiCreateError::MaybeStarted {
-                    detail: format!(
-                        "Win32_Process.Create failed with ambiguous ReturnValue={return_value} ({reason})"
-                    ),
-                })
-            }
-        };
-    }
-
-    Err(WmiCreateError::MaybeStarted {
-        detail: format!(
-            "Win32_Process.Create returned ambiguous result (ReturnValue={return_value}, ProcessId={pid})"
-        ),
-    })
+    Ok(in_job.as_bool())
 }
 
 /// Query all PIDs currently assigned to the named Job Object `job_name`.
@@ -1952,5 +2127,46 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn wmi_create_process_breaks_away_from_wmiprvse_job_and_supports_no_breakaway_fallback() {
+        let spawn_on_mta = |try_breakaway: bool| -> u32 {
+            std::thread::spawn(move || {
+                wmi_create_process_with_breakaway("ping.exe -n 30 127.0.0.1", None, try_breakaway)
+            })
+            .join()
+            .expect("WMI worker thread panicked")
+            .unwrap_or_else(|err| match err {
+                WmiCreateError::NotStarted { detail, .. }
+                | WmiCreateError::MaybeStarted { detail } => {
+                    panic!("wmi_create_process(try_breakaway={try_breakaway}) failed: {detail}")
+                }
+            })
+        };
+
+        let breakaway_pid = spawn_on_mta(true);
+        let breakaway_id = query_process_identity(breakaway_pid, false)
+            .expect("query breakaway child identity")
+            .expect("breakaway child should be running");
+        let in_job_breakaway =
+            is_process_in_any_job(breakaway_pid).expect("IsProcessInJob for breakaway child");
+        let _ = open_verify_terminate(&breakaway_id);
+
+        let plain_pid = spawn_on_mta(false);
+        let plain_id = query_process_identity(plain_pid, false)
+            .expect("query plain child identity")
+            .expect("plain child should be running");
+        let in_job_plain =
+            is_process_in_any_job(plain_pid).expect("IsProcessInJob for plain child");
+        let _ = open_verify_terminate(&plain_id);
+
+        eprintln!(
+            "windows-wmi-job-diagnostic: breakaway_in_any_job={in_job_breakaway} plain_in_any_job={in_job_plain}"
+        );
+        assert!(
+            !in_job_breakaway,
+            "process created via WMI with CREATE_BREAKAWAY_FROM_JOB should not remain in wmiprvse.exe's job object (plain_in_any_job={in_job_plain})"
+        );
     }
 }

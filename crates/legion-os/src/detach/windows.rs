@@ -41,7 +41,7 @@ use super::{
     build_wmi_launcher_script, generate_detach_marker, merge_recheck_survivors, merge_windows_env,
     parse_wmi_cim_output, parse_wmi_handoff, reconcile_wmi_identity, resolve_windows_job_name,
     resolve_windows_powershell_exe, resolve_wmi_program, validate_wmi_batch_target,
-    wmi_unavailable_error,
+    wmi_breakaway_return_value_rejected, wmi_unavailable_error,
 };
 
 const WMI_CREATE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -609,49 +609,65 @@ async fn create_wmi_wrapper_with_retry(
         return Ok(WmiCreateOutcome::HandoffReady);
     }
 
-    let cim_script = build_wmi_create_script_for_cmdline(command_line, Some(cwd))?;
-    let mut cim = tokio::process::Command::new(powershell_exe);
-    cim.args(["-NoProfile", "-NonInteractive", "-Command", &cim_script])
-        .env_remove("PSModulePath")
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    for breakaway in [true, false] {
+        let cim_script = build_wmi_create_script_for_cmdline(command_line, Some(cwd), breakaway)?;
+        let mut cim = tokio::process::Command::new(powershell_exe);
+        cim.args(["-NoProfile", "-NonInteractive", "-Command", &cim_script])
+            .env_remove("PSModulePath")
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
-    let output = match tokio::time::timeout(WMI_CREATE_TIMEOUT, cim.output()).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(err)) => {
-            // `powershell.exe` itself could not be spawned, so `Invoke-CimMethod` never ran.
-            return Ok(WmiCreateOutcome::Unavailable(format!(
-                "COM WMI failed ({last_com_err}); PowerShell CIM spawn failed ({err})"
-            )));
-        }
-        Err(_) => {
-            return Ok(WmiCreateOutcome::MaybeStarted(OsError::TimedOut {
-                detail: format!(
-                    "WMI Win32_Process.Create via PowerShell did not respond within {}s (after COM WMI error: {last_com_err}); check system load and the Windows Management Instrumentation (Winmgmt) service, and inspect `job.status` before retrying",
-                    WMI_CREATE_TIMEOUT.as_secs()
-                ),
-            }));
-        }
-    };
+        let output = match tokio::time::timeout(WMI_CREATE_TIMEOUT, cim.output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(err)) => {
+                // `powershell.exe` itself could not be spawned, so `Invoke-CimMethod` never ran.
+                return Ok(WmiCreateOutcome::Unavailable(format!(
+                    "COM WMI failed ({last_com_err}); PowerShell CIM spawn failed ({err})"
+                )));
+            }
+            Err(_) => {
+                return Ok(WmiCreateOutcome::MaybeStarted(OsError::TimedOut {
+                    detail: format!(
+                        "WMI Win32_Process.Create via PowerShell did not respond within {}s (after COM WMI error: {last_com_err}); check system load and the Windows Management Instrumentation (Winmgmt) service, and inspect `job.status` before retrying",
+                        WMI_CREATE_TIMEOUT.as_secs()
+                    ),
+                }));
+            }
+        };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    match parse_wmi_cim_output(&stdout, &stderr, output.status.success()) {
-        WmiCimResult::Started(wrapper_pid) => Ok(WmiCreateOutcome::Started(wrapper_pid)),
-        WmiCimResult::NotStarted { detail, .. } => Ok(WmiCreateOutcome::Unavailable(format!(
-            "COM WMI failed ({last_com_err}); {detail}"
-        ))),
-        WmiCimResult::MaybeStarted { detail } => {
-            Ok(WmiCreateOutcome::MaybeStarted(OsError::Platform {
-                detail: format!(
-                    "{detail} (after COM WMI error: {last_com_err}); verify whether the process started (for example via `job.status`) and ensure the Windows Management Instrumentation (Winmgmt) service is running before retrying"
-                ),
-            }))
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match parse_wmi_cim_output(&stdout, &stderr, output.status.success()) {
+            WmiCimResult::Started(wrapper_pid) => {
+                return Ok(WmiCreateOutcome::Started(wrapper_pid));
+            }
+            WmiCimResult::NotStarted {
+                return_value,
+                detail,
+            } => {
+                if breakaway && wmi_breakaway_return_value_rejected(return_value) {
+                    continue;
+                }
+                return Ok(WmiCreateOutcome::Unavailable(format!(
+                    "COM WMI failed ({last_com_err}); {detail}"
+                )));
+            }
+            WmiCimResult::MaybeStarted { detail } => {
+                return Ok(WmiCreateOutcome::MaybeStarted(OsError::Platform {
+                    detail: format!(
+                        "{detail} (after COM WMI error: {last_com_err}); verify whether the process started (for example via `job.status`) and ensure the Windows Management Instrumentation (Winmgmt) service is running before retrying"
+                    ),
+                }));
+            }
         }
     }
+
+    Ok(WmiCreateOutcome::Unavailable(format!(
+        "COM WMI failed ({last_com_err}); Invoke-CimMethod failed"
+    )))
 }
 
 async fn wait_for_handoff(
