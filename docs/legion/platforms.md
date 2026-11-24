@@ -85,7 +85,7 @@ unavailable rather than hidden, with the reason.
 A device pairs with a node once. The device makes its own ed25519 key and the private half never
 leaves it.
 
-1. On the node: `legion pair --as phone` (the tool `device.invite`). It makes a single-use
+1. On the node: `legion pair` (the tool `device.invite`). It makes a single-use
    temporary key, adds it to `authorized_keys` with a forced command that can only enrol a device
    and with a portable 12-digit `expiry-time` bound (compatible with OpenSSH 8.9+), and prints an
    invite as a QR code and as text. The invite carries where to connect (the Tailscale name when
@@ -114,6 +114,39 @@ act as, and never via a forwarded or local expiring credential.
 
 The key is kept in the app's private storage, like the earlier Android app did. Wrapping it with
 the platform's hardware keystore is a later step.
+
+## A device belongs to the fleet, not to one machine
+
+Nothing is central. Any node can pair a device, any node can serve one, and a device keeps working
+when the node that paired it is switched off. Three rules make that true.
+
+**The role is chosen when pairing.** `legion pair` asks what the device may do, or takes
+`--role <role>`: any role the node's policy defines, from looking only to the owner role. It makes
+a principal of its own for the device (`device:<name>`), so two devices never share an identity,
+and `device.set` changes the role later. A device paired as owner can do everything any computer
+can, including pairing further devices. `--as <principal>` still pairs under an existing principal.
+No role and no device name is built in; what a person prefers lives in their own policy.
+
+**Paired devices are fleet configuration.** They are kept in `devices.toml` beside `policy.toml`:
+the device's name, public key, principal, when and where it was paired, and, once removed, a
+tombstone. `fleet.sync` carries the file like the policy, but merges it instead of replacing it:
+entries are added from both sides and a tombstone always wins, so two nodes that each paired or
+removed something while apart agree again when they meet. Every node keeps its own
+`authorized_keys` in step with the file whenever it pairs, syncs, lists or removes, and the gate
+refuses a device the file no longer names. Pairing and removing push to every node that can be
+reached at that moment and say which ones could not; those catch up at their next sync. Until
+then a removed device is still accepted by a node that has not heard: that is the price of having
+no hub, and `device.remove` says so by name.
+
+**The device learns every way in.** Each node can describe how a device reaches it (`device.endpoint`:
+names, port, account, ssh host keys). After pairing, and from then on in the background, the app
+asks for that from every machine through whichever node answers, and keeps it. It then talks to
+each machine directly where it can and through another node where it cannot, and shows which.
+A machine added to the fleet later appears in the app by itself once the fleet has synced.
+
+What a device is told about a machine comes from a node it already trusts; the host keys it pins
+for a new machine are the ones that node reports. A node with the owner role over the fleet could
+lie about them, and could equally do anything else.
 
 ## The browser door
 
