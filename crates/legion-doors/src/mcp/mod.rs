@@ -140,7 +140,7 @@ impl McpDoor {
             .extensions
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<Authenticated>())
-            .map(|authenticated| Some(authenticated.0.clone()))
+            .map(|authenticated| Some(authenticated.principal.clone()))
             .ok_or_else(|| {
                 self.door_error(
                     ErrorCode::Denied,

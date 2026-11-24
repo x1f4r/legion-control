@@ -8,6 +8,8 @@ use axum::http::{HeaderMap, Uri};
 use legion_core::config::ServeConfig;
 use legion_core::tokens::Tokens;
 
+use crate::Authenticated;
+
 /// Why a request's token will not do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -70,8 +72,8 @@ pub(crate) fn origin_allowed(headers: &HeaderMap, config: &ServeConfig) -> bool 
         .any(|allowed| normalise_origin(allowed) == origin)
 }
 
-/// The principal the request's bearer token stands for.
-pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<String, Refusal> {
+/// Who the request's bearer token says it is.
+pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<Authenticated, Refusal> {
     let Some(value) = headers.get(AUTHORIZATION) else {
         return Err(Refusal::NoToken);
     };
@@ -81,8 +83,12 @@ pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<String, 
         return Err(Refusal::BadToken);
     }
     tokens
-        .verify(token.trim(), jiff::Timestamp::now())
-        .map(str::to_owned)
+        .verify_entry(token.trim(), jiff::Timestamp::now())
+        .map(|(name, entry)| Authenticated {
+            principal: entry.principal.as_str().to_owned(),
+            token: name.to_owned(),
+            hash: entry.hash.clone(),
+        })
         .ok_or(Refusal::BadToken)
 }
 

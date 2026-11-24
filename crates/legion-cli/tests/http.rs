@@ -95,6 +95,10 @@ fn main() -> ExitCode {
             "a_token_gives_no_one_more_than_they_have",
             a_token_gives_no_one_more_than_they_have,
         ),
+        (
+            "an_mcp_session_belongs_to_its_token",
+            an_mcp_session_belongs_to_its_token,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -1341,4 +1345,105 @@ fn a_token_gives_no_one_more_than_they_have() {
     assert_eq!(minted.status, 403, "{}", minted.text());
     assert!(!minted.text().contains("lgn_"));
     assert_eq!(names(&["token", "list"]), ["keeper", "phone", "root"]);
+}
+
+/// Opens an MCP session of the revision with a handshake, and returns its id.
+fn open_session(server: &Server, token: &str) -> String {
+    let mut mcp = Mcp {
+        server,
+        token,
+        path: "/mcp",
+        session: None,
+        inline: false,
+        next_id: 0,
+    };
+    mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }),
+    );
+    let session = mcp.session.clone().expect("no session header");
+    let initialized = mcp.post(
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        "notifications/initialized",
+        None,
+    );
+    assert_eq!(initialized.status, 202);
+    session
+}
+
+/// What `token` gets for `tools/list` (or, with `DELETE`, for ending the session) in `session`.
+fn in_session(server: &Server, token: &str, session: &str, method: &str) -> Reply {
+    let mcp = Mcp {
+        server,
+        token,
+        path: "/mcp",
+        session: Some(session.to_owned()),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/list", None);
+    let body = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+    match method {
+        "DELETE" => http(server.port, "DELETE", "/mcp", &headers, b""),
+        _ => http(
+            server.port,
+            "POST",
+            "/mcp",
+            &headers,
+            body.to_string().as_bytes(),
+        ),
+    }
+}
+
+fn an_mcp_session_belongs_to_its_token() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let admins = open_session(&server, &fixture.admin);
+
+    // Another token gets what a session that does not exist gets, whatever it tries.
+    let unknown = in_session(&server, &fixture.phone, "no-such-session", "POST");
+    assert_eq!(unknown.status, 404);
+    for method in ["POST", "DELETE"] {
+        let reply = in_session(&server, &fixture.phone, &admins, method);
+        assert_eq!(reply.status, 404, "{method}");
+        assert_eq!(reply.body, unknown.body, "{method}");
+        assert!(!reply.text().contains("exec_run"), "{method}");
+    }
+    let still = in_session(&server, &fixture.admin, &admins, "POST");
+    assert_eq!(still.status, 200, "{}", still.text());
+    assert!(still.text().contains("exec_run"));
+
+    // A token holds only so many sessions; its oldest makes way.
+    let first = open_session(&server, &fixture.phone);
+    for _ in 0..16 {
+        open_session(&server, &fixture.phone);
+    }
+    assert_eq!(
+        in_session(&server, &fixture.phone, &first, "POST").status,
+        404
+    );
+    assert_eq!(
+        in_session(&server, &fixture.admin, &admins, "POST").status,
+        200
+    );
+
+    // Removing a token ends its sessions, even when a new token takes its name.
+    let tablet = make_token(&fixture.home, &["tablet", "phone"]);
+    let tablets = open_session(&server, &tablet);
+    assert_eq!(in_session(&server, &tablet, &tablets, "POST").status, 200);
+    fixture.home.run(&["token", "remove", "tablet"]);
+    assert_eq!(in_session(&server, &tablet, &tablets, "POST").status, 401);
+    let tablet = make_token(&fixture.home, &["tablet", "phone"]);
+    assert_eq!(in_session(&server, &tablet, &tablets, "POST").status, 404);
+
+    // A session ended by its own token is gone.
+    assert!((200..300).contains(&in_session(&server, &fixture.admin, &admins, "DELETE").status));
+    assert_eq!(
+        in_session(&server, &fixture.admin, &admins, "POST").status,
+        404
+    );
 }
