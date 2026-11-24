@@ -8,6 +8,8 @@
 pub mod agent;
 pub mod audit;
 pub mod binfmt;
+mod caller;
+pub mod device;
 pub mod exec;
 pub mod ext;
 pub mod floor;
@@ -41,6 +43,7 @@ pub fn register_all(registry: &mut Registry) {
     svc::register(registry);
     xfer::register(registry);
     token::register(registry);
+    device::register(registry);
     power::register(registry);
     ext::register(registry);
     #[cfg(feature = "testing")]

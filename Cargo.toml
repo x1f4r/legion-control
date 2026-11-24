@@ -58,6 +58,8 @@ blake3 = "1.8.7"
 getrandom = "0.4.3"
 globset = "0.4.22"
 ignore = "0.4.35"
+# Pure-Rust QR encoder (no image/svg features) for terminal pairing codes in `legion pair`.
+qrcode = { version = "0.15.0", default-features = false }
 regex = "1.13.2"
 legion-doors = { path = "crates/legion-doors" }
 # The official MCP SDK; it speaks the revisions with and without the initialize handshake.

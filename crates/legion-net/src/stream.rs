@@ -334,6 +334,19 @@ pub fn serve<R: Read, W: Write>(
     input: R,
     output: W,
 ) -> Result<(), ErrorBody> {
+    serve_with_door(host, pinned, Door::Stream, None, input, output)
+}
+
+/// Like [`serve`], allowing the caller to specify the audit [`Door`] (for example [`Door::Ssh`]
+/// when served behind `legion gate`) and optional paired `device` name.
+pub fn serve_with_door<R: Read, W: Write>(
+    host: &Host,
+    pinned: Option<&str>,
+    door: Door,
+    device: Option<&str>,
+    input: R,
+    output: W,
+) -> Result<(), ErrorBody> {
     let started = Instant::now();
     let mut input = BufReader::new(input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
@@ -375,7 +388,9 @@ pub fn serve<R: Read, W: Write>(
         }
         Err(Failure::Raw(error)) => Err(machine(error, host)),
     };
-    record(host, principal, &tool, recorded, started, &result);
+    record(
+        host, principal, door, device, &tool, recorded, started, &result,
+    );
     result
 }
 
@@ -507,9 +522,12 @@ fn authorise(
         .map_err(|error| (Some(principal), error))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record(
     host: &Host,
     principal: Option<String>,
+    door: Door,
+    device: Option<&str>,
     tool: &str,
     args: Value,
     started: Instant,
@@ -518,7 +536,8 @@ fn record(
     let entry = AuditEntry {
         time: audit::now(),
         principal,
-        door: Door::Stream,
+        door,
+        device: device.map(str::to_owned),
         tool: tool.to_owned(),
         target: host.name.clone(),
         outcome: match result {

@@ -39,11 +39,41 @@ impl Run {
 
 impl Home {
     pub fn new() -> Home {
-        let home = Home {
-            dir: tempfile::tempdir().unwrap(),
+        Self::new_from(tempfile::tempdir().unwrap())
+    }
+
+    /// Creates a `Home` under a directory with no group-/world-writable ancestors (preferring
+    /// Cargo's `CARGO_TARGET_TMPDIR` over `/tmp`), so real `sshd` with `StrictModes yes` accepts
+    /// `AuthorizedKeysFile` paths inside it on runners where `/tmp` is `1777`.
+    pub fn new_strict() -> Home {
+        let dir = if let Some(base) = option_env!("CARGO_TARGET_TMPDIR") {
+            let base_path = PathBuf::from(base);
+            std::fs::create_dir_all(&base_path).unwrap();
+            tempfile::tempdir_in(&base_path).unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700));
+        }
+        Self::new_from(dir)
+    }
+
+    fn new_from(dir: tempfile::TempDir) -> Home {
+        let home = Home { dir };
         std::fs::create_dir_all(home.home().join("projects").join("app")).unwrap();
         std::fs::create_dir_all(home.home().join(".ssh")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(home.home(), std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(
+                home.home().join(".ssh"),
+                std::fs::Permissions::from_mode(0o700),
+            );
+        }
         home
     }
 

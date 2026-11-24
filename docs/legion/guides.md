@@ -675,6 +675,98 @@ that `would_refuse` is absent:
      then run one supervised `power.wake machine=<name> wait_s=90` while the target is asleep to
      confirm BIOS/NIC Wake-on-LAN and LAN broadcast delivery.
 
+## Pair a phone or tablet (`legion pair`)
+
+A phone, tablet, or other controller pairs with a node once and afterwards connects over SSH,
+confined to one principal by `legion gate --as <principal>`.
+
+First make sure the principal exists in `policy.toml` with the role you want (for example
+`[principals.phone]` with `role = "observer"`), then run `legion pair`:
+
+```sh
+legion pair --as phone
+```
+
+`legion pair` calls `device.invite`, prints who the device will act as and when the invite expires,
+draws the invite as a terminal QR code, prints the invite text on one line (for copying and pasting
+when a camera is inconvenient), and prints the commands to list and remove devices. Pass `--invert`
+if your light-background terminal needs inverted QR polarity, `--valid 1h` (up to `24h`) to change
+the 15-minute default, `--host`, `--port`, or `--user` to override detected connection details, or
+`--json` for the raw `device.invite` output.
+
+What happens during pairing:
+
+1. `device.invite` generates a fresh single-use Ed25519 key pair and appends one line to
+   `authorized_keys` carrying `restrict`, a portable 12-digit `expiry-time` upper bound (compatible
+   with OpenSSH 8.9+), and `command="<legion> gate --enrol <id> ..."` (always pinning the node's
+   resolved `--home` or `--config-dir`/`--state-dir` so SSH environment variables cannot redirect
+   the gate, plus `--account` on Windows's shared `administrators_authorized_keys`). The invite
+   carries the node's detected Tailscale MagicDNS name and Tailscale addresses (or the system
+   hostname when Tailscale is absent), the account and port, the node's sshd public host keys
+   (pinned — when `[devices] host_keys` is unset, `ssh-keyscan` against local `sshd` is intersected
+   with readable default host `.pub` files as `ssh-keyscan+files`, refusing disjoint results with a
+   `[devices] host_keys` hint, and falling back to scan alone — labelled `ssh-keyscan only`, with a
+   warning in `legion pair` — or files alone only when the other is unavailable; invites without a
+   usable host key are refused), and the temporary key. Neither the invite text nor the temporary
+   key is logged or audited.
+   **Keep the invite secret until used:** `device.invite` returns the invite text (which carries
+   the temporary private key seed) in its tool result, so invoking `device.invite` through an AI
+   agent puts the live invite into that agent's conversation transcript. Run `legion pair` directly
+   in your own terminal whenever you do not want an agent transcript to see the invite.
+2. The device scans the QR code or pastes the invite, connects over SSH verifying the pinned host
+   key, and sends its own newly generated Ed25519 public key and name.
+3. `legion gate --enrol <id>` validates the invite and public key under an owner-only lock file
+   beside `authorized_keys`, enforces exact UTC expiry from `state/devices.json` (an expired
+   temporary key stops working at its exact expiry because `legion gate --enrol` refuses it and
+   the expired line is swept on the next `device.*` command), refuses enrolling the invite's own
+   temporary key or any key already present in `authorized_keys`, replaces the temporary line with
+   a permanent `restrict,command="<legion> gate --as phone --device <name> --pairing <id> ..."` line
+   pinning a random per-pairing id and the node's config and state directories, records the device
+   in `state/devices.json`, and writes an audit record (`door: "ssh"`, `tool: "device.enrol"`,
+   `device: "<name>"`). The temporary key immediately stops working. Every subsequent call served
+   through `legion gate` is reported and audited with `door: "ssh"` (and `device: "<name>"` when
+   `--device` is set).
+
+Inspect paired devices and pending invites, or revoke one at once (removing a paired device also
+terminates any active sessions and same-account parent `sshd` connections — including multiplexed
+`ControlMaster` connections — immediately and reports `sessions_ended`, while `legion gate`
+re-checks `authorized_keys` for its exact `--device` and `--pairing` id after registering and tears
+down its verified same-account parent `sshd` on refusal, so neither a newly opened channel on an
+already-open connection nor a later re-pair under the same name can revive a revoked pairing;
+detached background jobs the device started keep running and their IDs are reported in
+`jobs_left_running`, so cancel them separately with `job.cancel` if needed). For owner callers,
+`device.list` also shows Legion lines pointing at another or deleted Legion home (`foreign: true`,
+`missing_home: true`, `home`), `meta.doctor` warns about orphaned keys, and
+`device.remove ... foreign=true` cleans them up (removing a foreign device's key without ending
+sessions tracked under that other home and reporting `sessions_not_ended: true` with a hint):
+
+```sh
+legion device.list
+legion device.remove name=my-phone
+legion device.remove id=<invite-id>
+legion device.remove name=old-phone foreign=true
+```
+
+### Overriding `authorized_keys` and host keys (`[devices]`)
+
+By default Legion edits `~/.ssh/authorized_keys` (on Windows, when the account is in the
+`Administrators` group and `sshd_config` uses `administrators_authorized_keys`, it edits
+`%ProgramData%\ssh\administrators_authorized_keys`, sets its owner to `BUILTIN\Administrators`
+alongside the `Administrators` and `SYSTEM` ACL, pins `--account` on forced commands so each
+administrator sees and manages only their own entries, and quotes forced commands for the shell
+configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` — `cmd.exe` by default, PowerShell (refusing
+Unicode curly single-quote delimiters `U+2018`–`U+201B`), or a POSIX shell such as Git Bash,
+refusing unrecognised shells clearly). Host keys intersect `ssh-keyscan`
+against local `sshd` on the invite's port with `/etc/ssh/ssh_host_*_key.pub` (or
+`%ProgramData%\ssh\ssh_host_*_key.pub` on Windows), refusing disjoint keys unless configured
+explicitly. To override either for a custom sshd setup, set `[devices]` in `node.toml`:
+
+```toml
+[devices]
+authorized_keys = "/home/me/.ssh/authorized_keys"
+host_keys = ["/etc/ssh/ssh_host_ed25519_key.pub"]
+```
+
 ## The HTTP door (`legion serve`)
 
 `legion serve` exposes the node's tools over HTTP for phones, scripts, and remote MCP clients. It
@@ -856,8 +948,9 @@ How arguments and output work:
 - Use `run = ["prog", "arg1"]` (no shell) whenever possible instead of `cmd`.
 - Always declare `effect` honestly (`read`, `write`, `exec`, `destroy`, `power`, `admin`): a role
   permitted that effect can invoke the tool. Built-in names and every family registered in the
-  built-in registry (plus reserved families `agent`, `audit`, `config`, `exec`, `ext`, `fleet`,
-  `fs`, `job`, `legion`, `meta`, `power`, `proj`, `svc`, `sys`, `token`) cannot be shadowed.
+  built-in registry (plus reserved families `agent`, `audit`, `config`, `device`, `exec`, `ext`,
+  `fleet`, `fs`, `job`, `legion`, `meta`, `power`, `proj`, `svc`, `sys`, `token`) cannot be
+  shadowed.
 - Full-mode MCP sessions receive `notifications/tools/list_changed` when `tools.d/` changes.
 
 Inspect or remove extensions with `ext.list`, `ext.show`, and `ext.remove`. `ext.list` prints an

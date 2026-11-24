@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use legion_core::Ctx;
+use legion_core::config::NodeFile;
 use legion_core::policy::{OWNER, Policy, Role};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_os::run::{RunOptions, run};
@@ -94,6 +95,11 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check_policy_exec_roles(&policy, &specs));
     }
 
+    let orphans = query_orphaned_device_lines(ctx);
+    if let Some(check) = check_orphaned_device_lines(&orphans) {
+        checks.push(check);
+    }
+
     if !quick
         && let Some(ping_tool) = ctx.node().registry().get("fleet.ping")
         && let Ok(value) = ping_tool
@@ -103,6 +109,115 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     {
         checks.extend(fleet_ping_checks(&parsed.results));
     }
+}
+
+/// One Legion-managed `authorized_keys` line whose pinned Legion home no longer exists on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrphanedDeviceLine {
+    /// `"device"` or `"invite"`.
+    pub kind: &'static str,
+    /// Device name or invite id.
+    pub label: String,
+    /// Missing pinned Legion home path.
+    pub home: String,
+}
+
+/// Read-only scan of `authorized_keys` for Legion device or invite lines pointing at a missing
+/// Legion home (missing config directory or `node.toml`). Never creates files or directories.
+fn query_orphaned_device_lines(ctx: &Ctx) -> Vec<OrphanedDeviceLine> {
+    let Ok(node_file) = ctx.config().get::<NodeFile>() else {
+        return Vec::new();
+    };
+    let Ok(target) = crate::device::authkeys::resolve_target(ctx.paths(), &node_file) else {
+        return Vec::new();
+    };
+    let Ok(write_path) =
+        crate::device::authkeys::resolve_safe_write_path(&target, ctx.paths().home())
+    else {
+        return Vec::new();
+    };
+    if !write_path.is_file() {
+        return Vec::new();
+    }
+    let caller_account = legion_os::user::current_username().ok();
+    let Ok(auth_keys) = crate::device::authkeys::read_auth_keys(&write_path) else {
+        return Vec::new();
+    };
+
+    let mut orphans = Vec::new();
+    for line in &auth_keys.lines {
+        match &line.kind {
+            crate::device::authkeys::LineKind::Device {
+                name,
+                home: Some(pinned),
+                account,
+                ..
+            } if crate::device::authkeys::line_matches_account(
+                account.as_deref(),
+                caller_account.as_deref(),
+                target.windows_admin_acl,
+                cfg!(windows),
+            ) && !pinned.config_exists() =>
+            {
+                orphans.push(OrphanedDeviceLine {
+                    kind: "device",
+                    label: name.clone(),
+                    home: pinned.display_label(),
+                });
+            }
+            crate::device::authkeys::LineKind::Invite {
+                id,
+                home: Some(pinned),
+                account,
+                ..
+            } if crate::device::authkeys::line_matches_account(
+                account.as_deref(),
+                caller_account.as_deref(),
+                target.windows_admin_acl,
+                cfg!(windows),
+            ) && !pinned.config_exists() =>
+            {
+                orphans.push(OrphanedDeviceLine {
+                    kind: "invite",
+                    label: id.clone(),
+                    home: pinned.display_label(),
+                });
+            }
+            _ => {}
+        }
+    }
+    orphans
+}
+
+/// Builds a `meta.doctor` warning when `authorized_keys` contains Legion device or invite lines
+/// whose pinned Legion home no longer exists on disk.
+pub fn check_orphaned_device_lines(orphans: &[OrphanedDeviceLine]) -> Option<Check> {
+    if orphans.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = orphans
+        .iter()
+        .take(5)
+        .map(|o| format!("{} {} (missing home {})", o.kind, o.label, o.home))
+        .collect();
+    let suffix = if orphans.len() > 5 {
+        format!(", and {} more", orphans.len() - 5)
+    } else {
+        String::new()
+    };
+    Some(Check {
+        name: "orphaned device keys".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "authorized_keys has {} orphaned Legion key line(s) pointing at a missing Legion home: {}{suffix}.",
+            orphans.len(),
+            items.join("; ")
+        ),
+        hint: Some(
+            "Inspect them with `legion device.list` and remove stale keys with `legion device.remove name=<device> foreign=true` (or `id=<invite> foreign=true`).".to_owned(),
+        ),
+    })
 }
 
 /// A warning while a sleep, restart or shutdown has been handed over and not carried out yet: the
@@ -919,5 +1034,29 @@ deny = [\"effect:power\", \"effect:admin\"]
         );
         assert!(pacman.ok && !pacman.warning);
         assert!(pacman.detail.contains("pacman"));
+    }
+
+    #[test]
+    fn orphaned_device_lines_check_warns_only_when_present() {
+        assert!(check_orphaned_device_lines(&[]).is_none());
+
+        let check = check_orphaned_device_lines(&[OrphanedDeviceLine {
+            kind: "device",
+            label: "old-phone".to_owned(),
+            home: "/home/me/deleted-legion".to_owned(),
+        }])
+        .unwrap();
+        assert_eq!(check.name, "orphaned device keys");
+        assert!(check.ok && check.warning);
+        assert!(check.detail.contains("old-phone"));
+        assert!(check.detail.contains("/home/me/deleted-legion"));
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("foreign=true")),
+            "{:?}",
+            check.hint
+        );
     }
 }

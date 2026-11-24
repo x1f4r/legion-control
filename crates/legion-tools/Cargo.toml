@@ -22,6 +22,7 @@ base64.workspace = true
 blake3.workspace = true
 dunce.workspace = true
 ed25519-dalek.workspace = true
+gethostname.workspace = true
 getrandom.workspace = true
 globset.workspace = true
 ignore.workspace = true
@@ -38,7 +39,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sysinfo.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
+tokio = { workspace = true, features = ["io-util", "rt", "time", "macros", "sync"] }
 toml_edit.workspace = true
 
 # sys.kill asks a Unix kernel whether a pid exists with signal 0, through nix's safe wrapper.

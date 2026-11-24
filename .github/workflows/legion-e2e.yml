@@ -97,10 +97,11 @@ jobs:
             ssh-keygen -q -t ed25519 -N '' -C "legion-e2e-$key" -f "$keys/$key"
           done
           # The gated key may only ever start `legion gate`, with the binary where fleet.install
-          # will put it; the driver checks that fleet.install agrees.
+          # will put it; the driver checks that fleet.install agrees. Pass `--home` explicitly
+          # because `legion gate` ignores `LEGION_HOME` from the SSH session environment.
           {
             cat "$keys/far.pub"
-            printf 'command="%s gate --as e2e:gate",restrict %s\n' "$far_bin" "$(cat "$keys/gate.pub")"
+            printf "command=\"'%s' gate --as e2e:gate --home '%s'\",restrict %s\n" "$far_bin" "$far_home" "$(cat "$keys/gate.pub")"
           } > "$keys/authorized_keys"
           chmod 600 "$keys/authorized_keys"
           cat > "$keys/sshd_config" <<EOF
@@ -144,6 +145,8 @@ jobs:
             echo "E2E_DIR=$e2e"
             echo "E2E_FAR_HOME=$far_home"
             echo "E2E_FAR_BIN=$far_bin"
+            echo "E2E_FAR_AUTH_KEYS=$keys/authorized_keys"
+            echo "E2E_FAR_HOST_KEY=$keys/host.pub"
             echo "E2E_SSHD_LOG=$e2e/sshd.log"
           } >> "$GITHUB_ENV"
 
@@ -192,7 +195,12 @@ jobs:
           $farPub = (Get-Content (Join-Path $sshDir 'legion_e2e_far.pub') -Raw).Trim()
           $gatePub = (Get-Content (Join-Path $sshDir 'legion_e2e_gate.pub') -Raw).Trim()
           $auth = Join-Path $programData 'administrators_authorized_keys'
-          @($farPub, "command=""$farBin gate --as e2e:gate"",restrict $gatePub") | Set-Content -Path $auth -Encoding ascii
+          $gateLine = if ($env:E2E_SHELL -eq 'powershell') {
+            "command=""& '$farBin' gate --as 'e2e:gate' --home '$farHome'"",restrict $gatePub"
+          } else {
+            "command=""$farBin gate --as e2e:gate --home $farHome"",restrict $gatePub"
+          }
+          @($farPub, $gateLine) | Set-Content -Path $auth -Encoding ascii
           & icacls $auth /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
           # Each leg sets the shell it tests rather than taking the image's: the cmd leg removes any
           # DefaultShell, and both check below, through ssh, which shell sshd actually used.
@@ -247,16 +255,19 @@ jobs:
         run: >-
           node scripts/legion-e2e.mjs --bin target/release/legion --work "$E2E_DIR/work"
           --far legion-e2e-far --gate legion-e2e-gate --far-home "$E2E_FAR_HOME" --far-bin "$E2E_FAR_BIN"
+          --far-auth-keys "$E2E_FAR_AUTH_KEYS" --far-host-key "$E2E_FAR_HOST_KEY" --far-port 2222
           --real-power
       # From PowerShell rather than Git's bash, whose PATH would put Git's own ssh ahead of the
       # Windows OpenSSH client people use.
       - name: Run the scenario (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          E2E_SHELL: ${{ matrix.shell }}
         run: >-
           node scripts/legion-e2e.mjs --bin target/release/legion.exe --work "$env:E2E_DIR/work"
           --far legion-e2e-far --gate legion-e2e-gate --far-home "$env:E2E_FAR_HOME" --far-bin "$env:E2E_FAR_BIN"
-          --real-power
+          --far-shell "$env:E2E_SHELL" --real-power
 
       # What there is to read when it fails: both audit logs, the doctor's answers, every call the
       # driver made, and sshd's log. None of it is key material, and the check below makes sure.

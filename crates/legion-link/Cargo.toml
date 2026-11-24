@@ -43,5 +43,10 @@ name = "sshd"
 path = "tests/sshd.rs"
 required-features = ["ssh"]
 
+[[test]]
+name = "pairing"
+path = "tests/pairing.rs"
+required-features = ["ssh"]
+
 [lints]
 workspace = true

@@ -43,9 +43,14 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct WriteOptions {
     /// Unix permission bits (for example `0o600` or `0o644`) to apply when creating a new file.
     ///
-    /// When the target file already exists, its existing permissions are preserved instead so
-    /// atomic rewrites never widen or alter permissions unexpectedly. Ignored on Windows.
+    /// When the target file already exists, its existing permissions are preserved instead unless
+    /// [`WriteOptions::force_mode`] is `true`, so atomic rewrites never widen or alter permissions
+    /// unexpectedly. Ignored on Windows.
     pub mode: Option<u32>,
+    /// When `true` and [`WriteOptions::mode`] is `Some`, apply `mode` on Unix even when replacing
+    /// an existing file (used for security-sensitive files such as `authorized_keys` that must
+    /// stay `0o600`). Ignored on Windows.
+    pub force_mode: bool,
     /// When `true`, create the target exclusively and fail with [`OsError::AlreadyExists`] if it
     /// already exists instead of replacing it.
     ///
@@ -62,6 +67,7 @@ impl WriteOptions {
     pub fn with_mode(mode: u32) -> Self {
         Self {
             mode: Some(mode),
+            force_mode: false,
             no_replace: false,
         }
     }
@@ -70,6 +76,7 @@ impl WriteOptions {
     pub fn create_new() -> Self {
         Self {
             mode: None,
+            force_mode: false,
             no_replace: true,
         }
     }
@@ -77,6 +84,12 @@ impl WriteOptions {
     /// Set the Unix permission mode applied to newly created files.
     pub fn mode(mut self, mode: u32) -> Self {
         self.mode = Some(mode);
+        self
+    }
+
+    /// Apply [`WriteOptions::mode`] on Unix even when replacing an existing file.
+    pub fn force_mode(mut self, force_mode: bool) -> Self {
+        self.force_mode = force_mode;
         self
     }
 
@@ -94,7 +107,27 @@ impl WriteOptions {
 /// left untouched.
 pub fn write_atomic(path: impl AsRef<Path>, bytes: &[u8], options: WriteOptions) -> Result<()> {
     let mut cursor = io::Cursor::new(bytes);
-    write_atomic_from_reader(path, &mut cursor, options)?;
+    write_atomic_from_reader_prepared(path, &mut cursor, options, |_| Ok(()))?;
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically, running `prepare` on the closed, synced sibling temporary
+/// file immediately before renaming it into place.
+///
+/// Used when platform-specific metadata (such as a Windows ACL) must be applied to the staged file
+/// before it becomes visible at `path`. If `prepare` fails, the temporary file is removed and
+/// `path` is left untouched.
+pub fn write_atomic_prepared<F>(
+    path: impl AsRef<Path>,
+    bytes: &[u8],
+    options: WriteOptions,
+    prepare: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let mut cursor = io::Cursor::new(bytes);
+    write_atomic_from_reader_prepared(path, &mut cursor, options, prepare)?;
     Ok(())
 }
 
@@ -107,6 +140,18 @@ pub fn write_atomic_from_reader<R: Read>(
     reader: &mut R,
     options: WriteOptions,
 ) -> Result<u64> {
+    write_atomic_from_reader_prepared(path, reader, options, |_| Ok(()))
+}
+
+fn write_atomic_from_reader_prepared<R: Read, F>(
+    path: impl AsRef<Path>,
+    reader: &mut R,
+    options: WriteOptions,
+    prepare: F,
+) -> Result<u64>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     let target = path.as_ref();
     let (parent, existing_meta) = inspect_target(target, options.no_replace)?;
     let (mut file, mut guard) =
@@ -133,8 +178,11 @@ pub fn write_atomic_from_reader<R: Read>(
 
     apply_final_permissions(&file, existing_meta.as_ref(), options, target)?;
 
-    // Drop the open file handle before committing so Windows does not reject rename/link.
+    // Drop the open file handle before running `prepare` or committing so Windows does not reject
+    // ACL updates or rename/link.
     drop(file);
+
+    prepare(&guard.path)?;
 
     if options.no_replace {
         commit_exclusive(&mut guard, target)?;
@@ -733,6 +781,47 @@ mod tests {
         let mode_after = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode_after, 0o600);
         assert_eq!(fs::read(&target).unwrap(), b"v2");
+
+        // force_mode tightens an existing permissive file atomically before renaming it in place.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(
+            &target,
+            b"v3",
+            WriteOptions::with_mode(0o600).force_mode(true),
+        )
+        .unwrap();
+        let tightened = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(tightened, 0o600);
+        assert_eq!(fs::read(&target).unwrap(), b"v3");
+    }
+
+    #[test]
+    fn write_atomic_prepared_runs_before_replace_and_cleans_up_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("auth");
+        write_atomic(&target, b"before", WriteOptions::default()).unwrap();
+
+        let err = write_atomic_prepared(&target, b"after", WriteOptions::default(), |temp| {
+            assert_ne!(temp, target.as_path());
+            assert_eq!(fs::read(temp).unwrap(), b"after");
+            Err(OsError::Platform {
+                detail: "acl failed".to_owned(),
+            })
+        })
+        .unwrap_err();
+        assert!(matches!(err, OsError::Platform { .. }));
+        assert_eq!(fs::read(&target).unwrap(), b"before");
+        assert_eq!(list_dir_names(dir.path()), vec!["auth"]);
+
+        let mut saw_temp = false;
+        write_atomic_prepared(&target, b"after", WriteOptions::default(), |temp| {
+            saw_temp = temp != target.as_path() && temp.exists();
+            Ok(())
+        })
+        .unwrap();
+        assert!(saw_temp);
+        assert_eq!(fs::read(&target).unwrap(), b"after");
+        assert_eq!(list_dir_names(dir.path()), vec!["auth"]);
     }
 
     #[test]

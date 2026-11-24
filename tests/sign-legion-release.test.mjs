@@ -199,3 +199,38 @@ test('install/legion.sh --from accepts both old and build-tagged --version outpu
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('install/legion.sh keeps ~/.local and ~/.local/bin non-group-writable under umask 0002', () => {
+  if (process.platform === 'win32') return;
+  const shPath = repoFile('install/legion.sh');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-sh-umask-test-'));
+  try {
+    const fakeBin = path.join(dir, 'fake-legion');
+    fs.writeFileSync(fakeBin, '#!/bin/sh\necho legion 0.2.0\n', { mode: 0o755 });
+
+    // 1. Fresh home under Ubuntu-style umask 0002 creates non-group/world-writable dirs.
+    const freshHome = path.join(dir, 'fresh-home');
+    fs.mkdirSync(freshHome, { mode: 0o755 });
+    const run1 = spawnSync('sh', ['-c', 'umask 0002 && sh "$1" --from "$2"', 'sh', shPath, fakeBin], {
+      env: { ...process.env, HOME: freshHome },
+      encoding: 'utf8',
+    });
+    assert.equal(run1.status, 0, run1.stderr);
+    assert.equal(fs.statSync(path.join(freshHome, '.local')).mode & 0o022, 0);
+    assert.equal(fs.statSync(path.join(freshHome, '.local', 'bin')).mode & 0o022, 0);
+
+    // 2. Existing group-writable ~/.local (0775) is tightened so pairing accepts the binary.
+    const existingHome = path.join(dir, 'existing-home');
+    fs.mkdirSync(path.join(existingHome, '.local'), { recursive: true });
+    fs.chmodSync(path.join(existingHome, '.local'), 0o775);
+    const run2 = spawnSync('sh', ['-c', 'umask 0002 && sh "$1" --from "$2"', 'sh', shPath, fakeBin], {
+      env: { ...process.env, HOME: existingHome },
+      encoding: 'utf8',
+    });
+    assert.equal(run2.status, 0, run2.stderr);
+    assert.equal(fs.statSync(path.join(existingHome, '.local')).mode & 0o022, 0);
+    assert.equal(fs.statSync(path.join(existingHome, '.local', 'bin')).mode & 0o022, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

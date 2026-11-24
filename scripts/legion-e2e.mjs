@@ -56,7 +56,7 @@ const TRICKY_TEXT = TRICKY.join(' | ');
 
 function usage(message) {
   if (message) console.error(`legion-e2e: ${message}`);
-  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--skip <steps>] [--real-power]');
+  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--far-auth-keys <path>] [--far-host-key <path>] [--far-port <port>] [--far-shell cmd|powershell] [--skip <steps>] [--real-power]');
   process.exit(2);
 }
 
@@ -74,6 +74,14 @@ function parseArgs(argv) {
   for (const required of ['bin', 'work', 'far', 'gate', 'far-home', 'far-bin']) {
     if (!options[required]) usage(`--${required} is required`);
   }
+  const farPort = options['far-port'] === undefined ? 22 : Number(options['far-port']);
+  if (!Number.isInteger(farPort) || farPort < 1 || farPort > 65535) {
+    usage(`--far-port must be 1..65535, not ${options['far-port']}`);
+  }
+  const farShell = options['far-shell'] ?? null;
+  if (farShell !== null && farShell !== 'cmd' && farShell !== 'powershell') {
+    usage(`--far-shell must be cmd or powershell, not ${farShell}`);
+  }
   return {
     bin: path.resolve(options.bin),
     work: path.resolve(options.work),
@@ -81,10 +89,35 @@ function parseArgs(argv) {
     gate: options.gate,
     farHome: path.resolve(options['far-home']),
     farBin: options['far-bin'],
+    farAuthKeys: options['far-auth-keys'] ? path.resolve(options['far-auth-keys']) : null,
+    farHostKey: options['far-host-key'] ? path.resolve(options['far-host-key']) : null,
+    farPort,
+    farShell,
     // Step names or their letters (`h,i3`) to leave out, for a machine without, say, systemd.
     skip: (options.skip ?? '').split(',').map(s => s.trim()).filter(Boolean),
     realPower: options['real-power'] === true,
   };
+}
+
+/**
+ * Verifies that the forced command on the line carrying `marker` inside Windows
+ * `administrators_authorized_keys` matches the expected DefaultShell form (`powershell` requires
+ * `command="& '`, `cmd` forbids `command="& '`). Returns `null` when valid or a failure message.
+ */
+export function windowsForcedCommandError(authKeysContents, marker, shell) {
+  if (!shell) return null;
+  const line = authKeysContents.split(/\r?\n/).find(l => l.includes(marker));
+  if (!line) {
+    return `administrators_authorized_keys does not contain a line with ${marker}`;
+  }
+  const isPowerShellForm = line.includes('command="& \'');
+  if (shell === 'powershell' && !isPowerShellForm) {
+    return `Windows PowerShell leg expected PowerShell forced command (command="& '...") for ${marker}, got: ${line}`;
+  }
+  if (shell === 'cmd' && (!line.includes('command="') || isPowerShellForm)) {
+    return `Windows cmd leg expected cmd.exe forced command (not PowerShell) for ${marker}, got: ${line}`;
+  }
+  return null;
 }
 
 /**
@@ -120,11 +153,101 @@ export function blockerOf(needs, failedNames, skippedNames) {
   return [...failedNames, ...skippedNames].find(other => needs.some(prefix => other.startsWith(prefix)));
 }
 
+const knownSecrets = new Set();
+
+function rememberSecret(value) {
+  if (typeof value === 'string' && value.length >= 16) knownSecrets.add(value);
+}
+
+/** Redacts pairing invite strings, decoded key seeds, and PEM private keys from logs and failure text. */
+export function redactSecrets(text, extraSecrets = knownSecrets) {
+  if (typeof text !== 'string') return text;
+  let out = text
+    .replace(/legion-invite-1\.[A-Za-z0-9_-]+/g, 'legion-invite-1.<redacted>')
+    .replace(
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+      '<redacted private key>',
+    );
+  for (const secret of extraSecrets) {
+    if (typeof secret === 'string' && secret.length > 0 && out.includes(secret)) {
+      out = out.split(secret).join('<redacted>');
+    }
+  }
+  return out;
+}
+
+/** Decodes a `legion-invite-1.<base64url>` invite text into its JSON payload object. */
+export function decodeInvite(inviteText) {
+  const prefix = 'legion-invite-1.';
+  if (typeof inviteText !== 'string' || !inviteText.startsWith(prefix)) {
+    throw new Error('invite does not start with legion-invite-1.');
+  }
+  rememberSecret(inviteText);
+  const jsonText = Buffer.from(inviteText.slice(prefix.length), 'base64url').toString('utf8');
+  const payload = JSON.parse(jsonText);
+  rememberSecret(payload?.key);
+  return payload;
+}
+
+/** Encodes a 32-byte Ed25519 seed into an unencrypted OpenSSH (`openssh-key-v1`) PEM private key. */
+export function buildOpenSshEd25519Key(seed32, comment = 'legion-e2e') {
+  if (!Buffer.isBuffer(seed32) || seed32.length !== 32) {
+    throw new Error('Ed25519 seed must be a 32-byte Buffer');
+  }
+  const pkcs8Prefix = Buffer.from('302e020100300506032b657004220420', 'hex');
+  const privKey = crypto.createPrivateKey({
+    key: Buffer.concat([pkcs8Prefix, seed32]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  const spki = crypto.createPublicKey(privKey).export({ format: 'der', type: 'spki' });
+  const pub32 = spki.subarray(-32);
+
+  const sshStr = (buf) => {
+    const data = Buffer.isBuffer(buf) ? buf : Buffer.from(buf, 'utf8');
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length, 0);
+    return Buffer.concat([len, data]);
+  };
+  const u32 = (n) => {
+    const b = Buffer.alloc(4);
+    b.writeUInt32BE(n, 0);
+    return b;
+  };
+
+  const pubBlob = Buffer.concat([sshStr('ssh-ed25519'), sshStr(pub32)]);
+  const check = Buffer.from([0x11, 0x22, 0x33, 0x44]);
+  const privParts = [
+    check,
+    check,
+    sshStr('ssh-ed25519'),
+    sshStr(pub32),
+    sshStr(Buffer.concat([seed32, pub32])),
+    sshStr(comment),
+  ];
+  let priv = Buffer.concat(privParts);
+  const padBytes = [];
+  for (let p = 1; (priv.length + padBytes.length) % 8 !== 0; p += 1) padBytes.push(p);
+  if (padBytes.length > 0) priv = Buffer.concat([priv, Buffer.from(padBytes)]);
+
+  const blob = Buffer.concat([
+    Buffer.from('openssh-key-v1\0', 'ascii'),
+    sshStr('none'),
+    sshStr('none'),
+    sshStr(Buffer.alloc(0)),
+    u32(1),
+    sshStr(pubBlob),
+    sshStr(priv),
+  ]);
+  const lines = blob.toString('base64').match(/.{1,70}/g) ?? [];
+  return `-----BEGIN OPENSSH PRIVATE KEY-----\n${lines.join('\n')}\n-----END OPENSSH PRIVATE KEY-----\n`;
+}
+
 // Imported by its tests, the script does nothing but define; run, it parses its arguments and
 // goes. Compared through realpath, as scripts/check-syntax.mjs does.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
 const isMain = process.argv[1] !== undefined && real(process.argv[1]) === real(fileURLToPath(import.meta.url));
-const opts = isMain ? parseArgs(process.argv.slice(2)) : { work: '.', farHome: '.', skip: [], realPower: false };
+const opts = isMain ? parseArgs(process.argv.slice(2)) : { work: '.', farHome: '.', farPort: 22, skip: [], realPower: false };
 if (isMain && realPowerRefusal(opts, process.env)) usage(realPowerRefusal(opts, process.env));
 const run = crypto.randomBytes(4).toString('hex');
 const farRoot = `~/legion-e2e-${run}`;
@@ -138,7 +261,8 @@ class Failure extends Error {}
 
 function check(condition, message, detail) {
   if (!condition) {
-    throw new Failure(detail === undefined ? message : `${message}\n${typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2)}`);
+    const raw = detail === undefined ? message : `${message}\n${typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2)}`;
+    throw new Failure(redactSecrets(raw));
   }
 }
 
@@ -148,7 +272,13 @@ function clip(text, limit = 4000) {
 }
 
 function record(entry) {
-  transcript.push(entry);
+  transcript.push({
+    ...entry,
+    args: Array.isArray(entry.args) ? entry.args.map(arg => redactSecrets(String(arg))) : entry.args,
+    stdin: redactSecrets(entry.stdin),
+    stdout: redactSecrets(entry.stdout),
+    stderr: redactSecrets(entry.stderr),
+  });
 }
 
 /** The environment every near-node process gets: its own LEGION_HOME and nothing else of ours. */
@@ -207,11 +337,11 @@ function parseOutcome(result, what) {
   try {
     value = JSON.parse(lines.at(-1));
   } catch {
-    throw new Failure(`${what} exited ${result.status} without a JSON answer on stdout.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`);
+    throw new Failure(redactSecrets(`${what} exited ${result.status} without a JSON answer on stdout.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`));
   }
   if (result.status === 0) return { ok: true, value, stderr: result.stderr };
   if (result.status === 1) return { ok: false, error: value, stderr: result.stderr };
-  throw new Failure(`${what} exited ${result.status}.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`);
+  throw new Failure(redactSecrets(`${what} exited ${result.status}.\nstdout: ${clip(result.stdout)}\nstderr: ${clip(result.stderr)}`));
 }
 
 function ok(tool, args, options) {
@@ -720,6 +850,289 @@ step('g4 the gated key refuses to run an arbitrary command', () => {
   }
 }, ['f1']);
 
+// Device pairing over real sshd: on Unix, far points [devices] at the throwaway sshd's files; on
+// Windows, [devices] is left unset so far exercises %ProgramData%\ssh\administrators_authorized_keys
+// (with its Administrators/SYSTEM ACL) and %ProgramData%\ssh\ssh_host_*_key.pub directly.
+const pairState = {
+  dir: null,
+  invite: null,
+  payload: null,
+  tempKey: null,
+  deviceKey: null,
+  knownHosts: null,
+  deviceName: null,
+  configuredFarNode: false,
+};
+
+function lockDownPrivateKey(filePath) {
+  if (windows) {
+    const acl = exec('icacls.exe', [filePath, '/inheritance:r', '/grant:r', `${process.env.USERNAME}:F`]);
+    check(acl.status === 0, `icacls failed on ${filePath}`, acl.stderr || acl.stdout);
+  } else {
+    fs.chmodSync(filePath, 0o600);
+  }
+}
+
+function sshDirect(keyPath, knownHostsPath, user, port, remoteCommand, input = '') {
+  const khArg = windows ? knownHostsPath.replace(/\\/g, '/') : knownHostsPath;
+  const keyArg = windows ? keyPath.replace(/\\/g, '/') : keyPath;
+  const args = [
+    '-T',
+    '-o', 'BatchMode=yes',
+    '-o', 'IdentitiesOnly=yes',
+    '-o', 'StrictHostKeyChecking=yes',
+    '-o', `UserKnownHostsFile=${khArg}`,
+    '-o', 'GlobalKnownHostsFile=none',
+    '-o', 'ControlMaster=no',
+    '-o', 'ConnectTimeout=15',
+    '-o', 'LogLevel=ERROR',
+    '-p', String(port),
+    '-i', keyArg,
+    `${user}@127.0.0.1`,
+  ];
+  if (remoteCommand !== undefined) args.push(remoteCommand);
+  return exec('ssh', args, { input, timeout: 60_000 });
+}
+
+step('g5 device.invite --on far creates a single-use invite with pinned host keys', () => {
+  if (!windows && opts.farAuthKeys && opts.farHostKey) {
+    const lit = (p) => `'${p.replace(/'/g, "''")}'`;
+    const content = `name = "far"\n\n[devices]\nauthorized_keys = ${lit(opts.farAuthKeys)}\nhost_keys = [${lit(opts.farHostKey)}]\n`;
+    ok('fs.write', { path: path.join(opts.farHome, 'config', 'node.toml'), content }, { on: 'far' });
+    pairState.configuredFarNode = true;
+  }
+  const invited = ok('device.invite', { principal: 'e2e:gate', host: '127.0.0.1', port: opts.farPort }, { on: 'far' });
+  check(typeof invited.invite === 'string' && invited.invite.startsWith('legion-invite-1.'), 'device.invite did not return an invite string', invited);
+  const payload = decodeInvite(invited.invite);
+  check(payload.v === 1 && payload.node === 'far' && payload.principal === 'e2e:gate', 'decoded invite payload mismatch', payload);
+  check(payload.port === opts.farPort, `invite port was ${payload.port}, expected ${opts.farPort}`, payload);
+  check(Array.isArray(payload.host_keys) && payload.host_keys.length >= 1, 'invite has no pinned host keys', payload);
+  check(Buffer.from(payload.key, 'base64').length === 32, 'invite key is not a 32-byte seed');
+
+  const listed = ok('device.list', {}, { on: 'far' });
+  check(listed.invites.some(inv => inv.id === payload.id && inv.principal === 'e2e:gate'), 'device.list --on far does not show the pending invite', listed);
+  if (windows && opts.farShell) {
+    const adminAuth = path.join(process.env.ProgramData ?? 'C:\\ProgramData', 'ssh', 'administrators_authorized_keys');
+    const err = windowsForcedCommandError(fs.readFileSync(adminAuth, 'utf8'), `legion-invite:${payload.id}`, opts.farShell);
+    check(err === null, err ?? '');
+  }
+
+  pairState.invite = invited;
+  pairState.payload = payload;
+  return `${payload.host_keys.length} host key(s), port ${payload.port}`;
+}, ['f1']);
+
+step('g6 connecting with the temporary invite key enrols a fresh device key over real ssh', () => {
+  const { payload } = pairState;
+  pairState.dir = path.join(opts.work, 'pair-keys');
+  fs.rmSync(pairState.dir, { recursive: true, force: true });
+  fs.mkdirSync(pairState.dir, { recursive: true });
+
+  pairState.tempKey = path.join(pairState.dir, 'temp_invite_key');
+  fs.writeFileSync(pairState.tempKey, buildOpenSshEd25519Key(Buffer.from(payload.key, 'base64'), 'legion-e2e-invite'));
+  lockDownPrivateKey(pairState.tempKey);
+
+  pairState.knownHosts = path.join(pairState.dir, 'known_hosts');
+  const khHost = payload.port === 22 ? '127.0.0.1' : `[127.0.0.1]:${payload.port}`;
+  fs.writeFileSync(pairState.knownHosts, `${payload.host_keys.map(k => `${khHost} ${k}`).join('\n')}\n`);
+
+  pairState.deviceKey = path.join(pairState.dir, 'device_ed25519');
+  const gen = exec('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'e2e-paired', '-f', pairState.deviceKey]);
+  check(gen.status === 0, 'ssh-keygen failed for paired device key', gen.stderr || gen.stdout);
+  lockDownPrivateKey(pairState.deviceKey);
+  const devicePub = fs.readFileSync(`${pairState.deviceKey}.pub`, 'utf8').trim();
+
+  const requestLine = `${JSON.stringify({ enrol: 1, id: payload.id, public_key: devicePub, name: 'E2E Phone' })}\n`;
+  // Pass an arbitrary remote command to confirm `legion gate --enrol` ignores SSH_ORIGINAL_COMMAND.
+  const enrol = sshDirect(pairState.tempKey, pairState.knownHosts, payload.user, payload.port, 'ignored-command', requestLine);
+  check(enrol.status === 0, `ssh enrolment failed with exit ${enrol.status}`, { stdout: enrol.stdout, stderr: enrol.stderr });
+  const reply = JSON.parse(enrol.stdout.trim());
+  check(
+    reply.ok === true && reply.node === 'far' && reply.principal === 'e2e:gate' && reply.role === 'editor' && reply.device === 'e2e-phone',
+    'unexpected enrolment reply',
+    reply,
+  );
+  pairState.deviceName = reply.device;
+  if (windows) {
+    const adminAuth = path.join(process.env.ProgramData ?? 'C:\\ProgramData', 'ssh', 'administrators_authorized_keys');
+    check(fs.existsSync(adminAuth), `${adminAuth} does not exist after pairing on Windows`);
+    const contents = fs.readFileSync(adminAuth, 'utf8');
+    check(contents.includes('legion-device:e2e-phone'), `${adminAuth} does not contain the enrolled device line`);
+    if (opts.farShell) {
+      const err = windowsForcedCommandError(contents, 'legion-device:e2e-phone', opts.farShell);
+      check(err === null, err ?? '');
+    }
+  }
+  return `device ${reply.device} (${reply.role})`;
+}, ['g5']);
+
+step('g7 the paired device key speaks legion rpc as e2e:gate, refuses other commands, and invalidates the invite key', () => {
+  const { payload, tempKey, deviceKey, knownHosts } = pairState;
+  const rpcInput = [
+    JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'hello', params: { client: 'legion-e2e-pair', version: '1', protocol: 1 } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'call', params: { tool: 'meta.whoami', args: {}, as: 'owner' } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'call', params: { tool: 'fs.write', args: { path: `${farRoot}/projects/paired.txt`, content: 'paired\n' } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'call', params: { tool: 'exec.run', args: { argv: [NODE, '-e', '0'] } } }),
+  ].join('\n') + '\n';
+  const rpc = sshDirect(deviceKey, knownHosts, payload.user, payload.port, 'legion rpc', rpcInput);
+  check(rpc.status === 0, `paired legion rpc exited ${rpc.status}`, { stdout: rpc.stdout, stderr: rpc.stderr });
+  const replies = new Map();
+  for (const line of rpc.stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const msg = JSON.parse(trimmed);
+      if (msg.id !== undefined && msg.method === undefined) replies.set(msg.id, msg);
+    } catch {
+      // Skip any login banner lines before JSON-RPC replies.
+    }
+  }
+  check(replies.get(1)?.result?.node === 'far', 'paired hello did not answer as far', replies.get(1));
+  check(
+    replies.get(2)?.result?.principal === 'e2e:gate' && replies.get(2)?.result?.role === 'editor' && replies.get(2)?.result?.door === 'ssh',
+    'paired session is not pinned to e2e:gate via ssh door',
+    replies.get(2),
+  );
+  check(replies.get(3)?.result?.size === 7, 'paired allowed fs.write failed', replies.get(3));
+  check(replies.get(4)?.error?.data?.code === 'denied', 'paired exec.run was not denied', replies.get(4));
+
+  for (const cmd of ['whoami', `${windows ? 'cmd /c echo' : 'echo'} pwned`]) {
+    const bad = sshDirect(deviceKey, knownHosts, payload.user, payload.port, cmd);
+    check(bad.status !== 0, `paired key allowed arbitrary command: ${cmd}`, bad.entry);
+    check(bad.stderr.includes('legion gate:') && !bad.stdout.includes('pwned'), `paired key did not refuse ${cmd} via legion gate`, bad.entry);
+  }
+
+  const reuse = sshDirect(tempKey, knownHosts, payload.user, payload.port, 'legion rpc');
+  check(reuse.status !== 0, 'temporary invite key still authenticated after enrolment');
+}, ['g6']);
+
+step('g8 device.list shows the paired device and device.remove revokes its ssh key', () => {
+  const { payload, deviceKey, knownHosts, deviceName } = pairState;
+  try {
+    const listed = ok('device.list', {}, { on: 'far' });
+    check(listed.invites.length === 0, 'used invite is still listed', listed);
+    const dev = listed.devices.find(d => d.name === deviceName && d.principal === 'e2e:gate');
+    check(dev && typeof dev.fingerprint === 'string' && dev.fingerprint.startsWith('SHA256:'), 'paired device missing from device.list', listed);
+
+    const removed = ok('device.remove', { name: deviceName }, { on: 'far' });
+    check(removed.removed === true && removed.kind === 'device', 'device.remove did not remove the device', removed);
+
+    const revoked = sshDirect(deviceKey, knownHosts, payload.user, payload.port, 'legion rpc');
+    check(revoked.status !== 0, 'revoked device key still authenticated');
+  } finally {
+    if (pairState.configuredFarNode) {
+      ok('fs.write', { path: path.join(opts.farHome, 'config', 'node.toml'), content: 'name = "far"\n' }, { on: 'far' });
+      pairState.configuredFarNode = false;
+    }
+    if (pairState.dir) fs.rmSync(pairState.dir, { recursive: true, force: true });
+  }
+}, ['g6']);
+
+step('g9 on Windows, pairing works from a legion.exe and LEGION_HOME path containing spaces under the configured DefaultShell', () => {
+  if (!windows) return 'not applicable on Unix';
+  const spaceDir = path.join(opts.work, 'Far Space');
+  const spaceHome = path.join(opts.work, 'Far Space Home');
+  const spaceKeys = path.join(opts.work, 'pair-space-keys');
+  const spaceBin = path.join(spaceDir, 'legion.exe');
+  const spaceEnv = { ...process.env, LEGION_HOME: spaceHome };
+  let enrolledDevice = null;
+  try {
+    fs.rmSync(spaceDir, { recursive: true, force: true });
+    fs.rmSync(spaceHome, { recursive: true, force: true });
+    fs.rmSync(spaceKeys, { recursive: true, force: true });
+    fs.mkdirSync(spaceDir, { recursive: true });
+    fs.mkdirSync(path.join(spaceHome, 'config'), { recursive: true });
+    fs.mkdirSync(spaceKeys, { recursive: true });
+    fs.copyFileSync(opts.bin, spaceBin);
+    fs.writeFileSync(path.join(spaceHome, 'config', 'node.toml'), 'name = "far-space"\n');
+    fs.writeFileSync(
+      path.join(spaceHome, 'config', 'policy.toml'),
+      'default = "owner"\n\n[roles.editor]\nallow = ["effect:read"]\n\n[principals."e2e:gate"]\nrole = "editor"\n',
+    );
+
+    const invOutcome = parseOutcome(
+      exec(spaceBin, ['device.invite', 'principal=e2e:gate', 'host=127.0.0.1', `port=${opts.farPort}`, '--json'], { env: spaceEnv }),
+      'space device.invite',
+    );
+    check(invOutcome.ok, 'device.invite from path with space failed', invOutcome.error);
+    const payload = decodeInvite(invOutcome.value.invite);
+    check(payload.node === 'far-space', 'space invite node mismatch', payload);
+
+    const adminAuth = path.join(process.env.ProgramData ?? 'C:\\ProgramData', 'ssh', 'administrators_authorized_keys');
+    const authAfterInvite = fs.readFileSync(adminAuth, 'utf8');
+    check(authAfterInvite.includes('--account'), 'Windows administrators_authorized_keys invite line missing --account');
+    check(authAfterInvite.includes('--home'), 'Windows administrators_authorized_keys invite line missing --home');
+    if (opts.farShell) {
+      const err = windowsForcedCommandError(authAfterInvite, `legion-invite:${payload.id}`, opts.farShell);
+      check(err === null, err ?? '');
+    }
+
+    const tempKey = path.join(spaceKeys, 'temp_invite_key');
+    fs.writeFileSync(tempKey, buildOpenSshEd25519Key(Buffer.from(payload.key, 'base64'), 'legion-e2e-space-invite'));
+    lockDownPrivateKey(tempKey);
+
+    const knownHosts = path.join(spaceKeys, 'known_hosts');
+    const khHost = payload.port === 22 ? '127.0.0.1' : `[127.0.0.1]:${payload.port}`;
+    fs.writeFileSync(knownHosts, `${payload.host_keys.map(k => `${khHost} ${k}`).join('\n')}\n`);
+
+    const deviceKey = path.join(spaceKeys, 'device_ed25519');
+    const gen = exec('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'e2e-space', '-f', deviceKey]);
+    check(gen.status === 0, 'ssh-keygen failed for space-path device key', gen.stderr || gen.stdout);
+    lockDownPrivateKey(deviceKey);
+    const devicePub = fs.readFileSync(`${deviceKey}.pub`, 'utf8').trim();
+
+    const reqLine = `${JSON.stringify({ enrol: 1, id: payload.id, public_key: devicePub, name: 'Space Phone' })}\n`;
+    const enrol = sshDirect(tempKey, knownHosts, payload.user, payload.port, 'ignored', reqLine);
+    check(enrol.status === 0, `space-path ssh enrolment failed with exit ${enrol.status}`, { stdout: enrol.stdout, stderr: enrol.stderr });
+    const reply = JSON.parse(enrol.stdout.trim());
+    check(reply.ok === true && reply.node === 'far-space' && reply.principal === 'e2e:gate', 'unexpected space-path enrolment reply', reply);
+    enrolledDevice = reply.device;
+    if (opts.farShell) {
+      const authAfterEnrol = fs.readFileSync(adminAuth, 'utf8');
+      const err = windowsForcedCommandError(authAfterEnrol, `legion-device:${enrolledDevice}`, opts.farShell);
+      check(err === null, err ?? '');
+    }
+
+    const rpcInput = [
+      JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'hello', params: { client: 'legion-e2e-space', version: '1', protocol: 1 } }),
+      JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'call', params: { tool: 'meta.whoami', args: {} } }),
+    ].join('\n') + '\n';
+    const rpc = sshDirect(deviceKey, knownHosts, payload.user, payload.port, 'legion rpc', rpcInput);
+    check(rpc.status === 0, `space-path paired rpc exited ${rpc.status}`, { stdout: rpc.stdout, stderr: rpc.stderr });
+    const replies = new Map();
+    for (const line of rpc.stdout.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const msg = JSON.parse(trimmed);
+        if (msg.id !== undefined && msg.method === undefined) replies.set(msg.id, msg);
+      } catch {
+        // Ignore non-JSON preamble lines.
+      }
+    }
+    check(replies.get(1)?.result?.node === 'far-space', 'space-path hello did not answer as far-space', replies.get(1));
+    check(replies.get(2)?.result?.principal === 'e2e:gate', 'space-path whoami did not stay pinned to e2e:gate', replies.get(2));
+
+    const rmOutcome = parseOutcome(
+      exec(spaceBin, ['device.remove', `name=${enrolledDevice}`, '--json'], { env: spaceEnv }),
+      'space device.remove',
+    );
+    check(rmOutcome.ok && rmOutcome.value.removed === true, 'space-path device.remove failed', rmOutcome.error);
+    enrolledDevice = null;
+
+    const afterRevoke = sshDirect(deviceKey, knownHosts, payload.user, payload.port, 'legion rpc');
+    check(afterRevoke.status !== 0, 'revoked space-path device key still authenticated');
+    return `paired and revoked via ${spaceBin}`;
+  } finally {
+    if (enrolledDevice) {
+      spawnSync(spaceBin, ['device.remove', `name=${enrolledDevice}`, '--json'], { env: spaceEnv, windowsHide: true });
+    }
+    fs.rmSync(spaceKeys, { recursive: true, force: true });
+    fs.rmSync(spaceHome, { recursive: true, force: true });
+    fs.rmSync(spaceDir, { recursive: true, force: true });
+  }
+}, ['g8']);
+
 // --- h. services ---------------------------------------------------------------------------------
 
 const backends = { linux: 'systemd', macos: 'launchd', windows: 'windows' };
@@ -1058,6 +1471,7 @@ step('l4 after the time they were due, far still answers on the same boot', asyn
 // --- run -----------------------------------------------------------------------------------------
 
 function collect() {
+  if (pairState.dir) fs.rmSync(pairState.dir, { recursive: true, force: true });
   fs.mkdirSync(artifacts, { recursive: true });
   for (const [name, home] of [['near', nearHome], ['far', opts.farHome]]) {
     const audit = path.join(home, 'state', 'audit.jsonl');
@@ -1092,7 +1506,7 @@ async function main() {
       const note = await body();
       process.stdout.write(`    ok (${Date.now() - started} ms)${note ? `: ${note}` : ''}\n`);
     } catch (error) {
-      const message = error instanceof Failure ? error.message : error.stack;
+      const message = redactSecrets(error instanceof Failure ? error.message : String(error?.stack ?? error));
       failed.push({ name, message });
       process.stdout.write(`    FAILED (${Date.now() - started} ms):\n${message.replace(/^/gm, '      ')}\n`);
       if (fatal) break;
@@ -1118,7 +1532,7 @@ if (isMain) {
     process.exit(0);
   } catch (error) {
     abortPowerOutright();
-    console.error(`legion e2e: the driver itself failed: ${error.stack}`);
+    console.error(`legion e2e: the driver itself failed: ${redactSecrets(String(error?.stack ?? error))}`);
     process.exit(1);
   }
 }

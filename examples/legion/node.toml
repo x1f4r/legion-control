@@ -55,3 +55,11 @@ hosts = ["tower.example.ts.net"]
 origins = ["https://app.example.net"]
 # Set false to turn off the built-in web interface at `/`.
 ui = true
+
+# Optional overrides for device pairing (`legion pair` / `device.*`).
+# When omitted, Legion edits ~/.ssh/authorized_keys (or %ProgramData%\ssh\administrators_authorized_keys
+# on Windows administrator accounts) and discovers sshd's public host keys via ssh-keyscan (falling back
+# to /etc/ssh or %ProgramData%\ssh).
+# [devices]
+# authorized_keys = "/home/me/.ssh/authorized_keys"
+# host_keys = ["/etc/ssh/ssh_host_ed25519_key.pub"]

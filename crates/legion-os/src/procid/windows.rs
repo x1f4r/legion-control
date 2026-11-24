@@ -5,6 +5,7 @@
 //! reuse, and calls `TerminateProcess` through that handle—eliminating bare-PID TOCTOU races.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::win_proc::{self, OpenPinnedOutcome, PinnedProcess, TerminateOutcome};
@@ -28,6 +29,59 @@ pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
         return Some("ancestor of current process");
     }
     win_proc::check_protected_system_process(identity)
+}
+
+fn windows_info_is_same_account_sshd(info: &win_proc::WindowsProcSshdInfo) -> bool {
+    if !info.same_account || info.id.pid <= 4 || info.id.pid == std::process::id() {
+        return false;
+    }
+    let Some(cmdline) = info.cmdline.as_deref() else {
+        return false;
+    };
+    let argv = super::split_windows_cmdline(cmdline);
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    super::is_sshd_session_process(&info.image_path, &argv_refs, true)
+}
+
+pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
+    let own_pid = std::process::id();
+    let OpenPinnedOutcome::Pinned(self_proc) = win_proc::open_pinned_query_only(own_pid, false)
+    else {
+        return None;
+    };
+    let parent_pid = self_proc.parent_pid;
+    let child_start = self_proc.id.start_time;
+    drop(self_proc);
+
+    // On Windows, `sshd.exe` session workers do not rewrite argv[0] with setproctitle, so only
+    // accept a bare same-account `sshd.exe` / `sshd-session.exe` when it is the direct parent of
+    // this gate process (hop 0) — never walk through shell wrappers to a higher process.
+    if parent_pid <= 4 || parent_pid == own_pid {
+        return None;
+    }
+    let info = win_proc::inspect_process_for_sshd(parent_pid)?;
+    if !child_not_older_than_parent(
+        child_start,
+        info.id.start_time,
+        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+    ) {
+        return None;
+    }
+    windows_info_is_same_account_sshd(&info).then_some(info.id)
+}
+
+pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
+    if identity.pid <= 4 || identity.pid == std::process::id() {
+        return false;
+    }
+    let Some(info) = win_proc::inspect_process_for_sshd(identity.pid) else {
+        return false;
+    };
+    identity.matches(&info.id) && windows_info_is_same_account_sshd(&info)
+}
+
+pub(super) fn executable_of(identity: &ProcessId) -> Option<PathBuf> {
+    win_proc::query_verified_image_path(identity)
 }
 
 fn is_ancestor_of_current(identity: &ProcessId) -> bool {

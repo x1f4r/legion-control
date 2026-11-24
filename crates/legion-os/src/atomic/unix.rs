@@ -20,7 +20,9 @@ pub(super) fn apply_final_permissions(
     options: WriteOptions,
     target: &Path,
 ) -> Result<()> {
-    let desired = if let Some(meta) = existing_meta {
+    let desired = if options.force_mode && options.mode.is_some() {
+        options.mode.map(Permissions::from_mode)
+    } else if let Some(meta) = existing_meta {
         Some(meta.permissions())
     } else {
         options.mode.map(Permissions::from_mode)

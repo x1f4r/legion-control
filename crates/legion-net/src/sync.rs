@@ -798,10 +798,11 @@ async fn apply_local_write(
         "backup": outcome.backup,
     });
     ctx.node()
-        .record_audit(
+        .record_audit_with_device(
             ctx.node_name().to_owned(),
             Some(ctx.principal().to_owned()),
             ctx.door(),
+            ctx.device().map(str::to_owned),
             "config.write.applied".to_owned(),
             &audit_args,
             started,
