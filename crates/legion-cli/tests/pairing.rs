@@ -3291,14 +3291,26 @@ role = \"phone_admin\"
 
     let bin = env!("CARGO_BIN_EXE_legion");
     let fleet_a = if cfg!(windows) {
-        let cmdline = format!(
-            "set \"LEGION_HOME={}\" && \"{}\" rpc --as tablet",
+        // Write a tiny batch wrapper rather than passing embedded quotes to `cmd.exe /C`, which
+        // Rust's Command quoting escapes as `\"` (unparsed by cmd.exe).
+        let script = node_b.home().join("run-b-rpc.cmd");
+        let body = format!(
+            "@echo off\r\n\
+             set \"LEGION_HOME={}\"\r\n\
+             set \"HOME={}\"\r\n\
+             set \"USERPROFILE={}\"\r\n\
+             set \"XDG_CONFIG_HOME=\"\r\n\
+             set \"XDG_STATE_HOME=\"\r\n\
+             \"{}\" rpc --as tablet\r\n",
             home_b_legion.display(),
-            bin
+            node_b.home().display(),
+            node_b.home().display(),
+            bin,
         );
+        std::fs::write(&script, body).unwrap();
         format!(
-            "[machines.b]\ncommand = [\"cmd.exe\", \"/C\", {}]\n",
-            toml_literal(Path::new(&cmdline)),
+            "[machines.b]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+            toml_literal(&script),
         )
     } else {
         let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
