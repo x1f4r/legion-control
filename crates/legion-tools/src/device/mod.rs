@@ -818,7 +818,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             None
         };
 
-        updated_entry.updated_at = next_updated_timestamp(Some(&current_entry.updated_at));
+        updated_entry.updated_at = next_updated_timestamp(Some(&current_entry.updated_at))?;
         updated_entry.updated_on = valid_node_name;
         devices_file
             .devices
@@ -1288,7 +1288,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     let entry = devices_file.devices.remove(&pairing_id).ok_or_else(|| {
                         ErrorBody::new(ErrorCode::Internal, "Matched device disappeared.")
                     })?;
-                    let removed_at = next_updated_timestamp(Some(&entry.updated_at));
+                    let removed_at = next_updated_timestamp(Some(&entry.updated_at))?;
                     devices_file.removed.insert(
                         pairing_id.clone(),
                         DeviceTombstone {
@@ -1399,7 +1399,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         "Matched device disappeared.",
                                     )
                                 })?;
-                            let removed_at = next_updated_timestamp(Some(&entry.updated_at));
+                            let removed_at = next_updated_timestamp(Some(&entry.updated_at))?;
                             devices_file.removed.insert(
                                 pairing_id.clone(),
                                 DeviceTombstone {

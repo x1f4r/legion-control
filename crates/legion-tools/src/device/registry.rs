@@ -46,6 +46,11 @@ const MAX_ROLE_NAME_LEN: usize = 128;
 /// Longest time an operation waits for `state/sync/config.lock`.
 const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum future clock skew accepted on incoming `devices.toml` timestamps (`paired_at`,
+/// `updated_at`, `removed_at`). Timestamps further ahead than `now + MAX_FUTURE_SKEW` are
+/// refused so a peer cannot pin an entry with a far-future timestamp that defeats later edits.
+pub const MAX_FUTURE_SKEW: SignedDuration = SignedDuration::from_mins(10);
+
 /// Fleet-wide paired device registry (`devices.toml`), stored beside `policy.toml`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -312,17 +317,84 @@ pub fn format_precise_rfc3339(time: Timestamp) -> String {
     time.to_string()
 }
 
-/// Returns a current RFC 3339 UTC timestamp strictly greater than `previous` (if present and
-/// parseable), preventing same-second ties during rapid local updates.
-pub fn next_updated_timestamp(previous: Option<&str>) -> String {
-    let now = Timestamp::now();
-    let chosen = match previous.and_then(|s| s.parse::<Timestamp>().ok()) {
-        Some(prev) if now <= prev => prev
-            .checked_add(SignedDuration::from_nanos(1))
-            .unwrap_or(now),
-        _ => now,
+/// Returns a current RFC 3339 UTC timestamp strictly greater than `previous` (if present),
+/// preventing same-second ties during rapid local updates.
+///
+/// Returns an error rather than going backwards if `previous` cannot be parsed or is already at
+/// the maximum representable timestamp (`Timestamp::MAX`).
+pub fn next_updated_timestamp(previous: Option<&str>) -> Result<String, ErrorBody> {
+    next_updated_timestamp_at(previous, Timestamp::now())
+}
+
+/// Deterministic variant of [`next_updated_timestamp`] using an explicit `now`.
+pub fn next_updated_timestamp_at(
+    previous: Option<&str>,
+    now: Timestamp,
+) -> Result<String, ErrorBody> {
+    let chosen = match previous {
+        None => now,
+        Some(raw) => {
+            let prev = raw.parse::<Timestamp>().map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Existing device timestamp {raw:?} is not valid RFC 3339 UTC: {error}."),
+                )
+            })?;
+            if now <= prev {
+                prev.checked_add(SignedDuration::from_nanos(1)).map_err(|_| {
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "Cannot advance device timestamp past maximum representable time ({raw})."
+                        ),
+                    )
+                    .with_hint(
+                        "Inspect devices.toml for a corrupt or maximum-value timestamp before updating.",
+                    )
+                })?
+            } else {
+                now
+            }
+        }
     };
-    format_precise_rfc3339(chosen)
+    Ok(format_precise_rfc3339(chosen))
+}
+
+/// Rejects any incoming `devices.toml` entry whose `paired_at`, `updated_at`, or `removed_at`
+/// lies further in the future than `now + MAX_FUTURE_SKEW`.
+pub fn validate_incoming_timestamps(devices: &DevicesFile, now: Timestamp) -> Result<(), ErrorBody> {
+    let limit = now.checked_add(MAX_FUTURE_SKEW).unwrap_or(Timestamp::MAX);
+    let check = |section: &str, id: &str, field: &str, raw: &str| -> Result<(), ErrorBody> {
+        let parsed = raw.parse::<Timestamp>().map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("devices.toml {section}.{id}.{field} ({raw:?}) is not valid RFC 3339 UTC: {error}."),
+            )
+        })?;
+        if parsed > limit {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "devices.toml {section}.{id}.{field} ({raw}) is further in the future than the allowed {} minute clock skew.",
+                    MAX_FUTURE_SKEW.as_mins()
+                ),
+            )
+            .with_hint("Check the clock on the sending machine and try syncing again."));
+        }
+        Ok(())
+    };
+
+    for (id, entry) in &devices.devices {
+        check("devices", id, "paired_at", &entry.paired_at)?;
+        check("devices", id, "updated_at", &entry.updated_at)?;
+    }
+    for (id, tomb) in &devices.removed {
+        if let Some(paired_at) = &tomb.paired_at {
+            check("removed", id, "paired_at", paired_at)?;
+        }
+        check("removed", id, "removed_at", &tomb.removed_at)?;
+    }
+    Ok(())
 }
 
 fn timestamp_sort_key(raw: &str) -> (bool, i128, &str) {
@@ -1431,6 +1503,7 @@ pub fn apply_devices_merge_blocking(
         }
     };
     check_precondition(bytes_before.as_deref())?;
+    validate_incoming_timestamps(incoming, Timestamp::now())?;
 
     let had_existing_file = bytes_before.is_some();
     let local = match bytes_before.as_deref() {
@@ -2006,5 +2079,98 @@ role = "editor"
         let auth_after = std::fs::read_to_string(&auth_path).unwrap();
         assert!(auth_after.contains(&foreign_line));
         assert!(!auth_after.contains("legion-device:legacy-phone"));
+    }
+
+    #[test]
+    fn future_timestamps_beyond_skew_and_max_time_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_path = dir.path().join("authorized_keys");
+        let mut node_file = NodeFile::default();
+        node_file.devices.authorized_keys = Some(auth_path.display().to_string());
+
+        let now = Timestamp::now();
+        let far_future = (now + SignedDuration::from_mins(20)).to_string();
+        let max_time = Timestamp::MAX.to_string();
+
+        for (label, incoming) in [
+            ("live updated_at far future", {
+                let mut f = DevicesFile::default();
+                let mut d = sample_device(1, "pixel", Some("observer"), &far_future, "pi");
+                d.paired_at = now.to_string();
+                f.devices.insert(sample_id(1), d);
+                f
+            }),
+            ("live updated_at Timestamp::MAX", {
+                let mut f = DevicesFile::default();
+                let mut d = sample_device(2, "pixel", Some("observer"), &max_time, "pi");
+                d.paired_at = now.to_string();
+                f.devices.insert(sample_id(2), d);
+                f
+            }),
+            ("live paired_at far future", {
+                let mut f = DevicesFile::default();
+                let mut d = sample_device(3, "pixel", Some("observer"), &now.to_string(), "pi");
+                d.paired_at = far_future.clone();
+                f.devices.insert(sample_id(3), d);
+                f
+            }),
+            ("tombstone removed_at far future", {
+                let mut f = DevicesFile::default();
+                f.removed
+                    .insert(sample_id(4), sample_tombstone("pixel", &far_future, "pi"));
+                f
+            }),
+            ("tombstone removed_at Timestamp::MAX", {
+                let mut f = DevicesFile::default();
+                f.removed
+                    .insert(sample_id(5), sample_tombstone("pixel", &max_time, "pi"));
+                f
+            }),
+            ("tombstone paired_at far future", {
+                let mut f = DevicesFile::default();
+                let mut t = sample_tombstone("pixel", &now.to_string(), "pi");
+                t.paired_at = Some(far_future.clone());
+                f.removed.insert(sample_id(6), t);
+                f
+            }),
+        ] {
+            let err = apply_devices_merge_blocking(
+                &paths,
+                "tower",
+                &node_file,
+                &incoming,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .expect_err(label);
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{label}: {err:?}");
+        }
+
+        // Timestamps within the 10-minute skew allowance are accepted.
+        let within_skew = (now + SignedDuration::from_mins(5)).to_string();
+        let mut ok_file = DevicesFile::default();
+        let mut d = sample_device(7, "pixel", Some("observer"), &within_skew, "pi");
+        d.paired_at = within_skew.clone();
+        ok_file.devices.insert(sample_id(7), d);
+        validate_incoming_timestamps(&ok_file, now).unwrap();
+
+        // next_updated_timestamp returns an error at Timestamp::MAX rather than going backwards.
+        let err = next_updated_timestamp_at(Some(&max_time), now).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+        assert!(
+            err.message.contains("maximum representable time"),
+            "{}",
+            err.message
+        );
+        // Normal advancement moves strictly forward by 1ns when now <= previous.
+        let prev = "2026-11-24T18:00:00Z";
+        let prev_ts: Timestamp = prev.parse().unwrap();
+        let next = next_updated_timestamp_at(Some(prev), prev_ts).unwrap();
+        let next_ts: Timestamp = next.parse().unwrap();
+        assert!(next_ts > prev_ts);
     }
 }
