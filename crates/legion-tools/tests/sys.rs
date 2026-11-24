@@ -234,12 +234,22 @@ async fn kill_refuses_a_reused_pid_and_protected_processes() {
     child.kill().unwrap();
     child.wait().unwrap();
 
-    for pid in [0, 1, std::process::id()] {
+    // Legion itself, the test runner that started it, and the system's own.
+    let parent = parent_of(std::process::id());
+    let mut protected = vec![0, std::process::id()];
+    protected.extend(parent);
+    if std::env::consts::OS == "windows" {
+        protected.push(4);
+    } else {
+        protected.push(1);
+    }
+    for pid in protected {
         let error = fixture
             .call("sys.kill", json!({"pid": pid}))
             .await
             .unwrap_err();
-        assert_eq!(error.code, ErrorCode::Denied, "{pid}");
+        assert_eq!(error.code, ErrorCode::Denied, "{pid}: {}", error.message);
+        assert!(error.details.unwrap()["reason"].is_string());
     }
 }
 
@@ -261,4 +271,12 @@ async fn a_role_without_the_effect_is_denied() {
     assert_eq!(error.code, ErrorCode::Denied);
     assert!(error.message.contains("sys.kill"), "{}", error.message);
     let _: Value = error.details.unwrap();
+}
+
+/// The parent of a process, as sys.procs reports it.
+fn parent_of(pid: u32) -> Option<u32> {
+    let mut system = sysinfo::System::new().ok()?;
+    let target = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    system.process(target)?.parent().map(sysinfo::Pid::as_u32)
 }

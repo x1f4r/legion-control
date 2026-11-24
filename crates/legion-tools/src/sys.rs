@@ -403,18 +403,8 @@ pub struct Killed {
 
 async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     let pid = args.pid;
-    let own = std::process::id();
-    if pid == 0 || pid == 1 || pid == own {
-        let what = if pid == own {
-            "the legion process answering this call"
-        } else {
-            "part of the operating system itself"
-        };
-        return Err(ErrorBody::new(
-            ErrorCode::Denied,
-            format!("sys.kill does not stop process {pid}: it is {what}."),
-        )
-        .with_hint("Restart or shut down the machine with the power tools instead."));
+    if pid == 0 {
+        return Err(protected(pid, procid::is_protected(&ProcessId::new(0, 0))));
     }
     let expected = args
         .start_time
@@ -430,13 +420,21 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
         })
         .transpose()?;
 
-    let (identity, started) = blocking(move || identify(pid)).await?.ok_or_else(|| {
+    let (identity, started, protection) = blocking(move || {
+        Ok(identify(pid)?
+            .map(|(identity, started)| (identity, started, procid::is_protected(&identity))))
+    })
+    .await?
+    .ok_or_else(|| {
         ErrorBody::new(
             ErrorCode::NotFound,
             format!("There is no process {pid} on this machine."),
         )
         .with_hint("It may have exited already; sys.procs lists the processes running now.")
     })?;
+    if protection.is_some() {
+        return Err(protected(pid, protection));
+    }
     if let Some(expected) = expected
         && expected != started
     {
@@ -479,6 +477,18 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
         stopped: survivors.is_empty(),
         survivors,
     })
+}
+
+/// Why sys.kill refuses a process legion-os names as protected: legion itself, the processes it
+/// runs under, and those the operating system cannot do without.
+fn protected(pid: u32, reason: Option<&str>) -> ErrorBody {
+    let reason = reason.unwrap_or("protected");
+    ErrorBody::new(
+        ErrorCode::Denied,
+        format!("sys.kill does not stop process {pid}, which is protected: {reason}."),
+    )
+    .with_hint("Legion never stops itself, the processes it runs under, or the system's own; a process that must go anyway has to be stopped outside legion.")
+    .with_details(json!({"pid": pid, "reason": reason}))
 }
 
 /// The identity of a live process and when it started, in seconds since the epoch, or `None`
