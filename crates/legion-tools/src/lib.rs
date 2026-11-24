@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod exec;
+pub mod fs;
 pub mod meta;
 pub mod sys;
 #[cfg(feature = "testing")]
@@ -20,6 +21,7 @@ pub fn register_all(registry: &mut Registry) {
     audit::register(registry);
     sys::register(registry);
     exec::register(registry);
+    fs::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }
