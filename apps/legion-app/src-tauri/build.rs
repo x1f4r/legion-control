@@ -67,10 +67,19 @@ fn check_workspace_version(root_cargo: &Path) {
 }
 
 fn stage_frontend(ui_dir: &Path, dist_dir: &Path) -> io::Result<()> {
-    if dist_dir.exists() {
-        fs::remove_dir_all(dist_dir)?;
-    }
     fs::create_dir_all(dist_dir)?;
+    for entry in fs::read_dir(dist_dir)? {
+        let entry = entry?;
+        if entry.file_name() == ".gitkeep" {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
 
     if ui_dir.is_dir() {
         copy_ui_tree(ui_dir, ui_dir, dist_dir)?;

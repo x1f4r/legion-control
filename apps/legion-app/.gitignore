@@ -1,5 +1,8 @@
-# Staged static frontend copied from apps/ui by build.rs.
-dist/
+# Staged static frontend copied from apps/ui by build.rs; keep the directory tracked via .gitkeep
+# so tauri-cli finds frontendDist before build.rs runs on a clean checkout.
+!dist/
+dist/*
+!dist/.gitkeep
 # Cargo build outputs and build-time capability schemas for the standalone app workspace.
 src-tauri/target/
 src-tauri/gen/schemas/
