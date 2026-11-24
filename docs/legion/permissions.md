@@ -100,7 +100,9 @@ Even when a role has broad or unconfined `paths`, Legion refuses file-tool acces
 and directory transfers) — for a built-in list of well-known secret locations under `~` for every
 role that does not allow `effect:admin`:
 
-- **SSH and GPG**: `~/.ssh`, `~/.gnupg` (plus `%ProgramData%\ssh` on Windows and any path configured in `[devices] authorized_keys` in `node.toml`).
+- **SSH and GPG**: `~/.ssh`, `~/.gnupg` (plus `%ProgramData%\ssh` on Windows, any path configured
+  in `[devices] authorized_keys` in `node.toml`, any symlinked `~/.ssh/authorized_keys` target
+  path, and the `.legion.lock` / `.legion-tmp-*` atomic-write siblings beside those files).
 - **Cloud, container, and git credentials**: `~/.aws`, `~/.azure`, `~/.kube`,
   `~/.docker/config.json`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/gcloud`.
 - **Password stores and keyrings**: `~/.password-store`, `~/.local/share/keyrings`,
@@ -188,19 +190,34 @@ serves the session directly pinned to `<principal>`, and refuses anything else w
 ### Paired devices
 
 A device paired with `legion pair` (`device.invite`) receives its own `authorized_keys` line forced
-through `legion gate --as <principal>` with `restrict`. Once paired, it can only speak `legion rpc`
-and `legion stream` pinned to `<principal>` — never an interactive shell, arbitrary command, PTY,
-or forwarding — and may do only what `<principal>`'s role in `policy.toml` allows (a real wall for
-roles without `exec`, and still as strong as the OS account if given `exec`). Requests naming a
-different `as` are ignored, and calls forwarded to other nodes with `on` are re-checked by each
-target node's own `policy.toml`.
+through `legion gate --as <principal> --device <name>` with `restrict` (plus `--home` when
+`LEGION_HOME` is non-default and `--account` on Windows's shared
+`administrators_authorized_keys`). Once paired, it can only speak `legion rpc` and `legion stream`
+pinned to `<principal>` — never an interactive shell, arbitrary command, PTY, or forwarding — and
+may do only what `<principal>`'s role in `policy.toml` allows (a real wall for roles without
+`exec`, and still as strong as the OS account if given `exec`). Requests naming a different `as`
+are ignored, and calls forwarded to other nodes with `on` are re-checked by each target node's own
+`policy.toml`.
 
-During pairing itself, the temporary key in the invite is single-use, carries sshd's `expiry-time`,
-is forced to `legion gate --enrol <id>` (ignoring `SSH_ORIGINAL_COMMAND`), and is removed as soon as
-enrolment completes or expires. Creating, listing, or removing invites and paired devices
-(`device.*`) requires `effect:admin`, follows the same caller-scoping and `allow_owner` rules as
-`token.*`, and refuses creating a permanent SSH key from an expiring HTTP bearer token. Removing a
-device with `legion device.remove` removes its `authorized_keys` line at once.
+During pairing itself, the temporary key in the invite is single-use, carries a portable 12-digit
+`expiry-time` upper bound for OpenSSH 8.9+ compatibility, and is forced to
+`legion gate --enrol <id>` (ignoring `SSH_ORIGINAL_COMMAND`). Exact expiry is enforced by
+`legion gate --enrol` against `state/devices.json`, so an expired temporary key stops working at
+its exact expiry time and its line is swept on the next `device.*` command. Enrolment also refuses
+the invite's own temporary key and any key already present in `authorized_keys`. Note that the
+invite text is a secret until used and is returned by `device.invite`; if an AI agent invokes
+`device.invite`, the live invite enters the agent's transcript, so run `legion pair` in your own
+terminal when you want to keep it out of agent transcripts.
+
+Creating, listing, or removing invites and paired devices (`device.*`) requires `effect:admin`,
+follows the same caller-scoping and `allow_owner` rules as `token.*`, and refuses creating a
+permanent SSH key from an expiring HTTP bearer token — both locally and across remote hops (a
+forwarding node refuses to forward `device.invite` or `token.add` when the caller arrived with an
+expiring credential). Removing a device with `legion device.remove` deletes its `authorized_keys`
+line and immediately terminates any live sessions registered by `legion gate --device <name>`
+(reporting `sessions_ended`). On Windows, forced commands on shared
+`administrators_authorized_keys` pin `--account`, set file ownership to `BUILTIN\Administrators`,
+and scope `device.list` / `device.remove` to the caller's own account.
 
 ### HTTP bearer tokens and MCP sessions
 

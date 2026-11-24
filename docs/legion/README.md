@@ -199,8 +199,11 @@ PowerShell as sshd's shell), so a Linux node driving a Windows one, or any other
 covered. That run installs with the install script and covers `fleet.install`, routed calls with
 awkward arguments, file transfer, jobs started with an argument list and with a shell command that
 outlive their session, policy and both audit logs across the hop, a key forced to `legion gate`,
-device pairing (`device.invite`, `legion gate --enrol`, `device.list`, `device.remove`),
-services, MCP, and an extension tool; it does not cover `via` relays or the HTTP door. Of power,
+device pairing (`device.invite`, `legion gate --enrol`, `device.list`, `device.remove`, including
+pairing from paths containing spaces under both `cmd` and PowerShell on Windows),
+services, MCP, and an extension tool; a companion Docker job (`scripts/pairing-openssh-test.sh`)
+verifies real-sshd pairing against Ubuntu 22.04 (OpenSSH 8.9) and Debian 12 (OpenSSH 9.2); it does
+not cover `via` relays or the HTTP door. Of power,
 that run schedules a real restart and a real shutdown on every leg, ten minutes out, calls each
 off with `power.cancel` and waits past the time to see the same boot: on Windows the operating
 system's own `shutdown /r /t` and `shutdown /a` (a second `shutdown /a` then finds nothing to

@@ -118,7 +118,7 @@ Validate and atomically replace one shared configuration document (fleet.toml, p
 | --- | --- | --- |
 | `device.invite` | `admin` | Create a single-use pairing invite for a remote device to connect over SSH, pinned to one principal that policy.toml names and the caller could act as itself. |
 | `device.list` | `admin` | List paired devices and pending pairing invites for principals the caller could act as, reading authorized_keys as the source of truth joined with recorded metadata, and sweeping any expired or used invites. |
-| `device.remove` | `admin` | Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata. |
+| `device.remove` | `admin` | Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions for a removed device. |
 
 ### `device.invite`
 
@@ -147,7 +147,7 @@ Takes no arguments.
 
 Effect: `admin`
 
-Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata.
+Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions for a removed device.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |

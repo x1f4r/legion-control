@@ -697,20 +697,33 @@ the 15-minute default, `--host`, `--port`, or `--user` to override detected conn
 What happens during pairing:
 
 1. `device.invite` generates a fresh single-use Ed25519 key pair and appends one line to
-   `authorized_keys` carrying `restrict`, sshd's `expiry-time`, and
-   `command="<legion> gate --enrol <id>"`. The invite carries the node's detected Tailscale MagicDNS
+   `authorized_keys` carrying `restrict`, a portable 12-digit `expiry-time` upper bound (compatible
+   with OpenSSH 8.9+), and `command="<legion> gate --enrol <id>"` (pinning `--home` when
+   `LEGION_HOME` is non-default and `--account` on Windows's shared
+   `administrators_authorized_keys`). The invite carries the node's detected Tailscale MagicDNS
    name and Tailscale addresses (or the system hostname when Tailscale is absent), the account and
-   port, the node's sshd public host keys (pinned — invites without a readable host key are
+   port, the node's sshd public host keys (pinned — scanned from local `sshd` via `ssh-keyscan`
+   first, falling back to host `.pub` files, with `host_keys_source` noting where they came from
+   and whether scanned keys differed from the files; invites without a usable host key are
    refused), and the temporary key. Neither the invite text nor the temporary key is logged or
    audited.
+   **Keep the invite secret until used:** `device.invite` returns the invite text (which carries
+   the temporary private key seed) in its tool result, so invoking `device.invite` through an AI
+   agent puts the live invite into that agent's conversation transcript. Run `legion pair` directly
+   in your own terminal whenever you do not want an agent transcript to see the invite.
 2. The device scans the QR code or pastes the invite, connects over SSH verifying the pinned host
    key, and sends its own newly generated Ed25519 public key and name.
-3. `legion gate --enrol <id>` validates the invite and public key under a file lock, replaces the
-   temporary `authorized_keys` line with a permanent `restrict,command="<legion> gate --as phone"`
-   line, records the device in `state/devices.json`, and writes an audit record (`door: "ssh"`,
+3. `legion gate --enrol <id>` validates the invite and public key under an owner-only lock file
+   beside `authorized_keys`, enforces exact UTC expiry from `state/devices.json` (an expired
+   temporary key stops working at its exact expiry because `legion gate --enrol` refuses it and
+   the expired line is swept on the next `device.*` command), refuses enrolling the invite's own
+   temporary key or any key already present in `authorized_keys`, replaces the temporary line with
+   a permanent `restrict,command="<legion> gate --as phone --device <name>"` line, records the
+   device in `state/devices.json`, and writes an audit record (`door: "ssh"`,
    `tool: "device.enrol"`). The temporary key immediately stops working.
 
-Inspect paired devices and pending invites, or revoke one at once:
+Inspect paired devices and pending invites, or revoke one at once (removing a paired device also
+terminates any active sessions for that device immediately and reports `sessions_ended`):
 
 ```sh
 legion device.list
@@ -722,10 +735,13 @@ legion device.remove id=<invite-id>
 
 By default Legion edits `~/.ssh/authorized_keys` (on Windows, when the account is in the
 `Administrators` group and `sshd_config` uses `administrators_authorized_keys`, it edits
-`%ProgramData%\ssh\administrators_authorized_keys` with the `Administrators` and `SYSTEM` ACL sshd
-requires) and reads sshd's public host keys from `/etc/ssh/ssh_host_*_key.pub` (or
-`%ProgramData%\ssh\ssh_host_*_key.pub` on Windows). To override either path for a custom sshd setup,
-set `[devices]` in `node.toml`:
+`%ProgramData%\ssh\administrators_authorized_keys`, sets its owner to `BUILTIN\Administrators`
+alongside the `Administrators` and `SYSTEM` ACL, pins `--account` on forced commands so each
+administrator sees and manages only their own entries, and quotes forced commands for the shell
+configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` — `cmd.exe` by default or PowerShell when set).
+Host keys prefer `ssh-keyscan` against local `sshd` on the invite's port, falling back to
+`/etc/ssh/ssh_host_*_key.pub` (or `%ProgramData%\ssh\ssh_host_*_key.pub` on Windows). To override
+either for a custom sshd setup, set `[devices]` in `node.toml`:
 
 ```toml
 [devices]

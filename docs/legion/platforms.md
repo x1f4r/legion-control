@@ -87,17 +87,25 @@ leaves it.
 
 1. On the node: `legion pair --as phone` (the tool `device.invite`). It makes a single-use
    temporary key, adds it to `authorized_keys` with a forced command that can only enrol a device
-   and with sshd's own `expiry-time`, and prints an invite as a QR code and as text. The invite
-   carries where to connect (the Tailscale name when there is one), the account, the node's ssh
-   host keys, and the temporary key.
+   and with a portable 12-digit `expiry-time` bound (compatible with OpenSSH 8.9+), and prints an
+   invite as a QR code and as text. The invite carries where to connect (the Tailscale name when
+   there is one), the account, the node's ssh host keys (scanned from local `sshd` via
+   `ssh-keyscan` when available, falling back to host `.pub` files), and the temporary key. The
+   invite text is a secret until used: run `legion pair` in your own terminal rather than letting
+   an AI agent call `device.invite`, which would place the invite in the agent's transcript.
 2. In the app: scan or paste the invite. The app connects, checks the host key against the
    invite (there is no trust on first use), and hands over its public key and a name.
-3. The node replaces the temporary line with a permanent one that forces
-   `legion gate --as <principal>`, records the device, and audits it. From then on the device can
-   only speak the Legion protocol as that principal, with that principal's role.
+3. The node enforces exact UTC expiry against `state/devices.json` (and refuses the temporary key
+   or any key already present in `authorized_keys`), replaces the temporary line with a permanent
+   one that forces `legion gate --as <principal> --device <name>` (plus `--account` on Windows's
+   shared `administrators_authorized_keys` and `--home` when `LEGION_HOME` is non-default),
+   records the device, and audits it. From then on the device can only speak the Legion protocol as
+   that principal, with that principal's role.
 
-`device.list` shows paired devices and `device.remove` takes one away at once. Making an invite
-needs the `admin` effect and follows the token rule: only for a principal the caller could act as.
+`device.list` shows paired devices (and sweeps expired invites recorded by this home) and
+`device.remove` removes the key and immediately terminates any live sessions for that device.
+Making an invite needs the `admin` effect and follows the token rule: only for a principal the
+caller could act as, and never via a forwarded or local expiring credential.
 
 The key is kept in the app's private storage, like the earlier Android app did. Wrapping it with
 the platform's hardware keystore is a later step.
