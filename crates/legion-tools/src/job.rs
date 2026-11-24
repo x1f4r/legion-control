@@ -535,7 +535,7 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolError> {
     })
     .await?;
 
-    let state = wait_for_supervisor_ready(&dir, &handle).await?;
+    let state = wait_for_supervisor_ready(&dir, &record.id, &handle).await?;
 
     Ok(Started {
         id: record.id,
@@ -587,6 +587,10 @@ async fn record_start_failure(dir: &Path, detail: &str) {
         detail: Some(detail.to_owned()),
     };
     let _ = tokio::task::spawn_blocking(move || {
+        // Never overwrite an existing exit record or write one while the supervisor holds `lock`.
+        if read_exit_record(&dir).is_some() || probe_lock(&dir).1 {
+            return Ok(());
+        }
         remove_env_file(&dir);
         write_exit_record(&dir, &exit)
     })
@@ -596,6 +600,7 @@ async fn record_start_failure(dir: &Path, detail: &str) {
 /// Waits until the newly detached supervisor holds the job lock or has already written `exit.json`.
 async fn wait_for_supervisor_ready(
     dir: &Path,
+    id: &str,
     handle: &DetachHandle,
 ) -> Result<JobState, ErrorBody> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -627,6 +632,9 @@ async fn wait_for_supervisor_ready(
             ReadyProbe::Running => return Ok(JobState::Running),
             ReadyProbe::Finished(state) => return Ok(state),
             ReadyProbe::SupervisorExited => {
+                if detached_active(handle).await.unwrap_or(false) {
+                    return Ok(JobState::Running);
+                }
                 let message =
                     "The detached job supervisor exited before taking the job lock.".to_owned();
                 record_start_failure(dir, &message).await;
@@ -637,19 +645,107 @@ async fn wait_for_supervisor_ready(
             ReadyProbe::Pending => {
                 let now = Instant::now();
                 if now >= deadline {
-                    let _ = stop_detached(handle, Duration::from_secs(1)).await;
-                    let message =
-                        "The detached job supervisor did not become ready within 10 seconds and was stopped."
-                            .to_owned();
-                    record_start_failure(dir, &message).await;
-                    return Err(ErrorBody::new(ErrorCode::Timeout, message)
-                        .with_hint("Retry `job.start` or check system load with `sys.info`."));
+                    let stop_result = stop_detached(handle, Duration::from_secs(1)).await;
+                    return finish_startup_timeout(
+                        dir,
+                        id,
+                        handle,
+                        stop_result,
+                        LOCK_SETTLE_TIMEOUT,
+                    )
+                    .await;
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 tokio::time::sleep(STARTUP_POLL.min(remaining)).await;
             }
         }
     }
+}
+
+/// Finalizes a `job.start` startup timeout after attempting `stop_detached`.
+///
+/// Writes `exit.json` only once the stop succeeded with no survivors, the lock is free, and
+/// `detached_active` is false; otherwise leaves `exit.json` unwritten and reports that the job is
+/// still running along with any surviving process ids.
+async fn finish_startup_timeout(
+    dir: &Path,
+    id: &str,
+    handle: &DetachHandle,
+    stop_result: Result<procid::KillTreeReport, OsError>,
+    lock_settle: Duration,
+) -> Result<JobState, ErrorBody> {
+    let (stop_err, survivors) = match stop_result {
+        Ok(report) => (
+            None,
+            report
+                .survivors
+                .into_iter()
+                .map(|p| p.pid)
+                .collect::<Vec<_>>(),
+        ),
+        Err(err) => (Some(err.to_string()), Vec::new()),
+    };
+
+    if stop_err.is_none() && survivors.is_empty() {
+        wait_for_lock_release(dir, lock_settle).await;
+    }
+
+    let tree_active = if stop_err.is_some() || !survivors.is_empty() {
+        true
+    } else {
+        detached_active(handle).await.unwrap_or(true)
+    };
+
+    let dir_check = dir.to_path_buf();
+    let (existing_exit, lock_held) = blocking("job.start", move || {
+        let exit = read_exit_record(&dir_check);
+        let lock_held = probe_lock(&dir_check).1;
+        let exit = exit.or_else(|| read_exit_record(&dir_check));
+        Ok((exit, lock_held))
+    })
+    .await?;
+
+    if let Some(exit) = existing_exit
+        && !tree_active
+        && !lock_held
+    {
+        return Ok(JobState::from(exit.outcome));
+    }
+
+    if stop_err.is_none() && survivors.is_empty() && !tree_active && !lock_held {
+        let message =
+            "The detached job supervisor did not become ready within 10 seconds and was stopped."
+                .to_owned();
+        record_start_failure(dir, &message).await;
+        return Err(ErrorBody::new(ErrorCode::Timeout, message)
+            .with_hint("Retry `job.start` or check system load with `sys.info`.")
+            .with_details(json!({
+                "id": id,
+                "state": JobState::Failed,
+                "survivors": [],
+            })));
+    }
+
+    let detail = match stop_err {
+        Some(err) => format!(
+            "The detached job supervisor for {id} did not become ready within 10 seconds and stopping it failed ({err}); the job is still running."
+        ),
+        None if !survivors.is_empty() => format!(
+            "The detached job supervisor for {id} did not become ready within 10 seconds and could not be stopped; the job is still running (surviving pids: {survivors:?})."
+        ),
+        None => format!(
+            "The detached job supervisor for {id} did not become ready within 10 seconds and is still running."
+        ),
+    };
+    Err(ErrorBody::new(ErrorCode::Timeout, detail)
+        .with_hint(
+            "Inspect the job with `job.status` or stop it with `job.cancel` (`force: true`).",
+        )
+        .with_details(json!({
+            "id": id,
+            "state": JobState::Running,
+            "survivors": survivors,
+        })))
 }
 
 enum ReadyProbe {
@@ -1010,28 +1106,47 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
 
     if !still_active && survivors.is_empty() {
         wait_for_lock_release(&dir, LOCK_SETTLE_TIMEOUT).await;
-        let dir_for_finalize = dir.clone();
-        let final_state = blocking("job.cancel", move || {
-            if let Some(exit) = read_exit_record(&dir_for_finalize) {
-                return Ok(JobState::from(exit.outcome));
+        // Re-check both the detached tree and the kernel lock right before writing `exit.json`.
+        // Never write an exit record while the lock is held (for example if the starter died
+        // before writing `detach` into `job.json`) or while anything under the handle is active.
+        let tree_still_active = match record.detach.as_ref() {
+            Some(handle) if same_boot => detached_active(handle).await.unwrap_or(true),
+            _ => false,
+        };
+        if !tree_still_active {
+            let dir_for_finalize = dir.clone();
+            let final_state = blocking("job.cancel", move || {
+                if let Some(exit) = read_exit_record(&dir_for_finalize) {
+                    return Ok(Some(JobState::from(exit.outcome)));
+                }
+                if probe_lock(&dir_for_finalize).1 {
+                    return Ok(None);
+                }
+                if let Some(exit) = read_exit_record(&dir_for_finalize) {
+                    return Ok(Some(JobState::from(exit.outcome)));
+                }
+                let exit = ExitRecord {
+                    outcome: ExitOutcome::Cancelled,
+                    exit_code: None,
+                    signal: None,
+                    finished: now_rfc3339(),
+                    forced: true,
+                    detail: Some(
+                        "Cancelled forcefully; detached process tree was stopped.".to_owned(),
+                    ),
+                };
+                write_exit_record(&dir_for_finalize, &exit)?;
+                Ok(Some(JobState::Cancelled))
+            })
+            .await?;
+            if let Some(state) = final_state {
+                return Ok(CancelledJob {
+                    id,
+                    state,
+                    survivors,
+                });
             }
-            let exit = ExitRecord {
-                outcome: ExitOutcome::Cancelled,
-                exit_code: None,
-                signal: None,
-                finished: now_rfc3339(),
-                forced: true,
-                detail: Some("Cancelled forcefully; detached process tree was stopped.".to_owned()),
-            };
-            write_exit_record(&dir_for_finalize, &exit)?;
-            Ok(JobState::Cancelled)
-        })
-        .await?;
-        return Ok(CancelledJob {
-            id,
-            state: final_state,
-            survivors,
-        });
+        }
     }
 
     Ok(CancelledJob {
@@ -1275,5 +1390,95 @@ mod tests {
         assert!(wait_timeout_of(Some(0.0)).is_err());
         assert!(wait_timeout_of(Some(3601.0)).is_err());
         assert_eq!(wait_timeout_of(None).unwrap(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_refuses_exit_record_when_survivors_or_lock_remain() {
+        let dead_handle = DetachHandle {
+            process: procid::ProcessId {
+                pid: u32::MAX,
+                start_time: 1,
+            },
+            systemd_unit: None,
+            warnings: Vec::new(),
+        };
+
+        // 1. Survivors reported by `stop_detached`: never write `exit.json`, report `running`.
+        let tmp1 = tempfile::tempdir().unwrap();
+        let current = procid::current().unwrap();
+        let err = finish_startup_timeout(
+            tmp1.path(),
+            "job-surv",
+            &dead_handle,
+            Ok(procid::KillTreeReport {
+                all_gone: false,
+                survivors: vec![current],
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(!tmp1.path().join(store::EXIT_FILE).exists());
+        let details = err.details.unwrap();
+        assert_eq!(details["state"], json!("running"));
+        assert_eq!(details["survivors"], json!([current.pid]));
+
+        // 2. Empty `stop_detached` report while the supervisor still holds `lock`: never write
+        //    `exit.json`, report `running`.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let guard = FileLock::try_lock_exclusive(tmp2.path().join(store::LOCK_FILE)).unwrap();
+        let err = finish_startup_timeout(
+            tmp2.path(),
+            "job-locked",
+            &dead_handle,
+            Ok(procid::KillTreeReport {
+                all_gone: true,
+                survivors: Vec::new(),
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(!tmp2.path().join(store::EXIT_FILE).exists());
+        assert_eq!(err.details.unwrap()["state"], json!("running"));
+        drop(guard);
+
+        // 3. `stop_detached` returned an error: never write `exit.json`, report `running`.
+        let tmp3 = tempfile::tempdir().unwrap();
+        let err = finish_startup_timeout(
+            tmp3.path(),
+            "job-stop-err",
+            &dead_handle,
+            Err(OsError::Platform {
+                detail: "simulated stop failure".into(),
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert!(!tmp3.path().join(store::EXIT_FILE).exists());
+        assert_eq!(err.details.unwrap()["state"], json!("running"));
+
+        // 4. Clean stop, free lock, inactive tree: writes `exit.json` as failed.
+        let tmp4 = tempfile::tempdir().unwrap();
+        let err = finish_startup_timeout(
+            tmp4.path(),
+            "job-clean",
+            &dead_handle,
+            Ok(procid::KillTreeReport {
+                all_gone: true,
+                survivors: Vec::new(),
+            }),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout);
+        let exit = read_exit_record(tmp4.path()).expect("exit.json should be written");
+        assert_eq!(exit.outcome, ExitOutcome::Failed);
+        assert_eq!(err.details.unwrap()["state"], json!("failed"));
     }
 }

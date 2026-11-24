@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use legion_core::proto::ErrorCode;
 use legion_core::{Call, CancellationToken, Door, Node, Paths};
 use legion_os::detach::{DetachHandle, stop_detached};
+use legion_os::lock::FileLock;
 use legion_os::procid;
 use legion_tools::job::exclusive_running_jobs;
 use serde_json::{Value, json};
@@ -68,6 +69,10 @@ fn main() -> ExitCode {
         (
             "forced_cancel_works_when_supervisor_was_killed_first",
             || Box::pin(forced_cancel_works_when_supervisor_was_killed_first()),
+        ),
+        (
+            "forced_cancel_without_handle_keeps_running_while_lock_held",
+            || Box::pin(forced_cancel_without_handle_keeps_running_while_lock_held()),
         ),
         ("killed_supervisor_and_reboot_yield_interrupted", || {
             Box::pin(killed_supervisor_and_reboot_yield_interrupted())
@@ -844,6 +849,52 @@ async fn forced_cancel_works_when_supervisor_was_killed_first() {
         assert_eq!(cancelled["state"], json!("interrupted"), "{cancelled:#}");
         assert_eq!(cancelled["survivors"], json!([]));
     }
+}
+
+async fn forced_cancel_without_handle_keeps_running_while_lock_held() {
+    let fixture = Fixture::new();
+    let jobs_root = fixture.node.paths().state_dir().join("jobs");
+    let id = "locked-no-handle";
+    let dir = jobs_root.join(id);
+    fs::create_dir_all(&dir).unwrap();
+
+    // Simulate a job whose starter died between spawning the supervisor and writing `detach`
+    // into `job.json`, while the supervisor still holds `lock`.
+    let boot = procid::boot_id().unwrap();
+    let created = jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    fs::write(
+        dir.join("job.json"),
+        serde_json::to_vec(&json!({
+            "id": id,
+            "name": "no-handle",
+            "cmd": "sleep 60",
+            "env_names": [],
+            "principal": "owner",
+            "created": created,
+            "boot_id": boot,
+            "exclusive": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let guard = FileLock::try_lock_exclusive(dir.join("lock")).unwrap();
+
+    let res = fixture
+        .call("job.cancel", json!({"id": id, "force": true}))
+        .await
+        .unwrap();
+    assert_eq!(res["state"], json!("running"), "{res:#}");
+    assert_eq!(res["survivors"], json!([]));
+    assert!(
+        !dir.join("exit.json").exists(),
+        "forced cancel wrote exit.json while the job lock was still held"
+    );
+
+    let status = fixture.call("job.status", json!({"id": id})).await.unwrap();
+    assert_eq!(status["state"], json!("running"), "{status:#}");
+    let _ = guard.unlock();
 }
 
 async fn killed_supervisor_and_reboot_yield_interrupted() {
