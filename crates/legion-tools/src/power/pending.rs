@@ -54,8 +54,13 @@ pub struct Pending {
     pub into: Option<String>,
     /// The command.
     pub argv: Vec<String>,
-    /// Seconds between the hand-over and the command.
+    /// Seconds the runner waits before the command.
     pub delay_s: u32,
+    /// Seconds the runner keeps the lock after the command: a sleep command returns before the
+    /// machine is asleep, and a second sleep asked for in between would put it back to sleep as
+    /// it woke.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hold_s: u32,
     /// When it was handed over, RFC 3339.
     pub since: String,
     /// The boot it was handed over in.
@@ -130,6 +135,10 @@ pub fn write_outcome(dir: &Path, outcome: &Outcome) -> Result<(), String> {
     let text = serde_json::to_vec_pretty(outcome).map_err(|error| error.to_string())?;
     legion_core::config::write_atomically(&dir.join("last.json"), &text)
         .map_err(|error| error.to_string())
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// What a running call is doing, for the message a second call gets.
@@ -388,6 +397,7 @@ mod tests {
             into: Some("windows".to_owned()),
             argv: vec!["systemctl".to_owned(), "reboot".to_owned()],
             delay_s: 3,
+            hold_s: 0,
             since: now(),
             boot_id: Some("boot-1".to_owned()),
             runner,

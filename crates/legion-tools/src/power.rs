@@ -48,6 +48,9 @@ const DELAY_S: (u32, u32, u32) = (3, 1, 60);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long each `before_sleep` command, and a command that schedules itself, may take.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the runner keeps the power lock after a sleep command returns, while the machine goes
+/// to sleep.
+const SLEEP_SETTLE_S: u32 = 5;
 /// How long a call waits for its delayed runner to take over before giving the action up.
 const HANDOFF_PATIENCE: Duration = Duration::from_secs(15);
 
@@ -537,7 +540,16 @@ async fn act(
         action: request.action,
         into: request.into.clone(),
         argv: plan.argv.clone(),
-        delay_s: request.delay_s,
+        delay_s: if plan.waits_itself {
+            0
+        } else {
+            request.delay_s
+        },
+        hold_s: match request.action {
+            Action::Sleep if plan.waits_itself => request.delay_s + SLEEP_SETTLE_S,
+            Action::Sleep => SLEEP_SETTLE_S,
+            Action::Restart | Action::Shutdown => 0,
+        },
         since: pending::now(),
         boot_id,
         runner: plan.timing == Timing::Delayed,

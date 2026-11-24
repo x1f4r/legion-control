@@ -371,7 +371,7 @@ pub async fn arm(
     let ran = actuator.run(&arming.arm, ARM_TIMEOUT, cancel).await?;
     if !ran.ok() {
         let said = said(&ran);
-        if looks_refused(&said) || (platform == Platform::Windows && ran.exit_code == Some(5)) {
+        if was_refused(actuator, cancel, platform, &ran, &said).await {
             return Err(refused(platform, &what, sudo, &arming.arm, &said));
         }
         return Err(ErrorBody::new(
@@ -492,7 +492,7 @@ async fn run_read(
         return Ok(ran);
     }
     let said = said(&ran);
-    if looks_refused(&said) || (platform == Platform::Windows && ran.exit_code == Some(5)) {
+    if was_refused(actuator, cancel, platform, &ran, &said).await {
         return Err(refused(platform, what, sudo, argv, &said));
     }
     Err(ErrorBody::new(
@@ -500,6 +500,44 @@ async fn run_read(
         format!("Could not {what}: `{}` {}.", program(argv), failure(&ran)),
     )
     .with_details(json!({"argv": argv, "said": said})))
+}
+
+/// Whether a failed command was the system refusing this account.
+///
+/// On Windows that is decided by asking whether this process is elevated, not by the words:
+/// bcdedit says "Access is denied." in English only, and exits 1 for that as for most other
+/// failures. Only when the question cannot be answered are the exit code and the words used.
+async fn was_refused(
+    actuator: &dyn Actuator,
+    cancel: &CancellationToken,
+    platform: Platform,
+    ran: &Ran,
+    said: &str,
+) -> bool {
+    if platform == Platform::Windows {
+        let probe = actuator.run(&elevation_probe(), LIST_TIMEOUT, cancel).await;
+        match probe
+            .ok()
+            .filter(Ran::ok)
+            .map(|ran| ran.stdout.trim().to_owned())
+        {
+            Some(answer) if answer.eq_ignore_ascii_case("false") => return true,
+            Some(answer) if answer.eq_ignore_ascii_case("true") => return false,
+            _ => return ran.exit_code == Some(5) || looks_refused(said),
+        }
+    }
+    looks_refused(said)
+}
+
+/// Asks Windows whether this process runs elevated: `True` or `False`, the same in every language.
+pub fn elevation_probe() -> Vec<String> {
+    strings(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+    ])
 }
 
 fn said(ran: &Ran) -> String {
@@ -902,6 +940,65 @@ description             UEFI: PXE IPv4 Ethernet\r\n";
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Denied);
         assert!(error.hint.unwrap().contains("elevated"));
+    }
+
+    #[tokio::test]
+    async fn a_windows_refusal_is_known_by_the_token_not_the_words() {
+        let target = BootTarget::EfiLabel("Linux Boot Manager".to_owned());
+        let cancel = CancellationToken::new();
+        // A German Windows: bcdedit exits 1 and says it in German.
+        let german = |elevated: &str| {
+            RecordingActuator::new()
+                .reply(Reply::new(&["bcdedit", "/enum", "firmware"], 0, BCDEDIT_FIRMWARE))
+                .reply(Reply::new(
+                    &["bcdedit", "/set"],
+                    1,
+                    "Der Speicher für die Startkonfigurationsdaten konnte nicht geöffnet werden.\r\nZugriff verweigert\r\n",
+                ))
+                .reply(Reply::new(&["powershell.exe"], 0, elevated))
+        };
+        let unelevated = german("False\r\n");
+        let arming = prepare(
+            &unelevated,
+            &cancel,
+            Platform::Windows,
+            false,
+            "linux",
+            &target,
+        )
+        .await
+        .unwrap();
+        let error = arm(
+            &unelevated,
+            &cancel,
+            Platform::Windows,
+            false,
+            "linux",
+            &arming,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert_eq!(unelevated.runs().last(), Some(&elevation_probe()));
+
+        // Elevated and still failing: a failure, not a refusal.
+        let elevated = german("True\r\n");
+        let error = arm(
+            &elevated,
+            &cancel,
+            Platform::Windows,
+            false,
+            "linux",
+            &arming,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Failed);
+        assert!(
+            error.message.contains("Zugriff verweigert"),
+            "{}",
+            error.message
+        );
     }
 
     #[tokio::test]

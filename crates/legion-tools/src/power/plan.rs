@@ -152,6 +152,8 @@ pub struct ActionPlan {
     pub timing: Timing,
     /// The questions to ask first, in order, because the answer would otherwise never come back.
     pub checks: Vec<Check>,
+    /// Whether the command takes the delay itself, so the runner starting it does not wait.
+    pub waits_itself: bool,
 }
 
 /// `["sudo", "-n", …argv]`: a password prompt fails at once instead of hanging the call.
@@ -189,6 +191,7 @@ pub fn action_plan(
             argv: argv.to_vec(),
             timing: Timing::Delayed,
             checks: Vec::new(),
+            waits_itself: false,
         });
     }
     let delay = delay_s.to_string();
@@ -214,18 +217,22 @@ pub fn action_plan(
                 argv: maybe_sudo(platform, sudo, plain),
                 timing: Timing::Delayed,
                 checks,
+                waits_itself: false,
             })
         }
         Platform::Macos => {
             let plain = match action {
-                Action::Sleep => {
-                    // pmset needs no privilege: it is what the Apple menu does.
+                // pmset needs no privilege from the desktop, where it is what the Apple menu
+                // does, but may over ssh: with [power] sudo it goes through sudo like the rest.
+                Action::Sleep if !sudo => {
                     return Ok(ActionPlan {
                         argv: strings(&["pmset", "sleepnow"]),
                         timing: Timing::Delayed,
                         checks: Vec::new(),
+                        waits_itself: false,
                     });
                 }
+                Action::Sleep => strings(&["pmset", "sleepnow"]),
                 Action::Restart => strings(&["shutdown", "-r", "now"]),
                 Action::Shutdown => strings(&["shutdown", "-h", "now"]),
             };
@@ -238,6 +245,7 @@ pub fn action_plan(
                 argv: maybe_sudo(platform, sudo, plain),
                 timing: Timing::Delayed,
                 checks: vec![check],
+                waits_itself: false,
             })
         }
         Platform::Windows => {
@@ -247,13 +255,24 @@ pub fn action_plan(
                         .into_iter()
                         .find_map(find)
                         .ok_or_else(no_psshutdown)?;
-                    vec![
-                        tool.to_string_lossy().into_owned(),
-                        "-d".to_owned(),
-                        "-t".to_owned(),
-                        delay,
-                        "-accepteula".to_owned(),
-                    ]
+                    // psshutdown returns at once and leaves the countdown to a process of its
+                    // own. Started by the node, it would run in the job object `run` contains
+                    // its commands in, which is torn down, that process with it, when psshutdown
+                    // exits; started by the detached runner it is outside any such job. The
+                    // runner does not wait first: psshutdown takes the delay itself, and needs a
+                    // delay, since with -t 0 it never returns in a session without a desktop.
+                    return Ok(ActionPlan {
+                        argv: vec![
+                            tool.to_string_lossy().into_owned(),
+                            "-d".to_owned(),
+                            "-t".to_owned(),
+                            delay,
+                            "-accepteula".to_owned(),
+                        ],
+                        timing: Timing::Delayed,
+                        checks: Vec::new(),
+                        waits_itself: true,
+                    });
                 }
                 Action::Restart => strings(&["shutdown", "/r", "/t", &delay]),
                 Action::Shutdown => strings(&["shutdown", "/s", "/t", &delay]),
@@ -262,6 +281,7 @@ pub fn action_plan(
                 argv,
                 timing: Timing::SelfTimed,
                 checks: Vec::new(),
+                waits_itself: false,
             })
         }
     }
@@ -678,10 +698,22 @@ mod tests {
     }
 
     #[test]
-    fn macos_sleeps_without_privilege_and_restarts_as_root() {
-        let sleep = plan(Platform::Macos, Action::Sleep, true);
+    fn macos_sleeps_through_sudo_when_told_and_restarts_as_root() {
+        let sleep = plan(Platform::Macos, Action::Sleep, false);
         assert_eq!(sleep.argv, strings(&["pmset", "sleepnow"]));
         assert!(sleep.checks.is_empty());
+        // Over ssh pmset may need root: [power] sudo applies, with the same check.
+        let sudo_sleep = plan(Platform::Macos, Action::Sleep, true);
+        assert_eq!(
+            sudo_sleep.argv,
+            strings(&["sudo", "-n", "pmset", "sleepnow"])
+        );
+        assert_eq!(
+            sudo_sleep.checks,
+            [Check::Sudo(strings(&[
+                "sudo", "-n", "-l", "-l", "pmset", "sleepnow"
+            ]))]
+        );
         let restart = plan(Platform::Macos, Action::Restart, false);
         assert_eq!(restart.argv, strings(&["shutdown", "-r", "now"]));
         assert_eq!(restart.checks, [Check::Root(strings(&["id", "-u"]))]);
@@ -723,6 +755,9 @@ mod tests {
                 "-accepteula"
             ])
         );
+        // Started by the detached runner, which does not wait first: psshutdown waits itself.
+        assert_eq!(sleep.timing, Timing::Delayed);
+        assert!(sleep.waits_itself);
         // Only the 32-bit one installed.
         let found = action_plan(
             Platform::Windows,

@@ -498,6 +498,8 @@ async fn one_power_action_is_carried_out_at_a_time() {
     let status = fixture.call("power.status", json!({})).await.unwrap();
     assert_eq!(status["pending"]["action"], json!("sleep"), "{status}");
     assert_eq!(status["pending"]["argv"], json!(["go-to-sleep"]));
+    // Its runner keeps the lock a while after the command, while the machine goes to sleep.
+    assert_eq!(status["pending"]["hold_s"], json!(5));
 
     // Once it has run, the next one goes ahead.
     fixture.fake.finish_runners();
@@ -522,6 +524,7 @@ async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
         into: None,
         argv: strings(&["x"]),
         delay_s: 3,
+        hold_s: 0,
         since: pending::now(),
         boot_id: None,
         runner: true,

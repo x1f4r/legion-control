@@ -139,6 +139,10 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
             "legion power-delay {id}: its outcome could not be recorded: {error}"
         ));
     }
+    if record.hold_s > 0 {
+        // The machine may go to sleep during this; the rest of the wait is after it wakes.
+        commands.pause(Duration::from_secs(u64::from(record.hold_s)));
+    }
     say(&format!(
         "legion power-delay {id}: {:?} ended: exit {:?}{}{}",
         record.argv,
@@ -306,6 +310,7 @@ mod tests {
             into: None,
             argv: vec!["systemctl".to_owned(), "suspend".to_owned()],
             delay_s: 3,
+            hold_s: 0,
             since: now(),
             boot_id: None,
             runner: true,
@@ -444,6 +449,26 @@ mod tests {
         };
         carry_out(done.path(), "a1", &worked);
         assert_eq!(worked.ran.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn after_a_sleep_command_the_runner_keeps_the_lock_a_while() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = handed_over(dir.path());
+        record.delay_s = 0;
+        record.hold_s = 8;
+        write_pending(dir.path(), &record).unwrap();
+        let commands = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            ..Recorded::default()
+        };
+        carry_out(dir.path(), "a1", &commands);
+        // Both waits under the lock (Recorded::pause checks), the second after the command.
+        assert_eq!(
+            *commands.paused.lock().unwrap(),
+            [Duration::from_secs(0), Duration::from_secs(8)]
+        );
     }
 
     #[test]
