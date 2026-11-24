@@ -777,19 +777,100 @@ pub fn verify_gate_account(expected: Option<&str>) -> Result<(), ErrorBody> {
     Ok(())
 }
 
+/// Pinned Legion home embedded in every Legion-managed `authorized_keys` forced command so `sshd`
+/// session environment variables (`AcceptEnv LEGION_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`)
+/// can never redirect a paired key to another configuration or policy directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PinnedHome {
+    /// Explicit `LEGION_HOME` root (`--home <root>`, containing `config/` and `state/`).
+    Root(PathBuf),
+    /// Resolved split config and state directories (`--config-dir <cfg> --state-dir <st>`), used
+    /// when Legion runs from the account's standard config/state locations.
+    Split {
+        /// Pinned configuration directory (`node.toml`, `policy.toml`, ...).
+        config_dir: PathBuf,
+        /// Pinned state directory (`audit.jsonl`, `devices.json`, ...).
+        state_dir: PathBuf,
+    },
+}
+
+impl PinnedHome {
+    /// Extracts the pinned home flags to embed in forced commands for `paths`.
+    pub fn from_paths(paths: &Paths) -> PinnedHome {
+        if let Some(root) = paths.explicit_home() {
+            PinnedHome::Root(root.to_path_buf())
+        } else {
+            PinnedHome::Split {
+                config_dir: paths.config_dir().to_path_buf(),
+                state_dir: paths.state_dir().to_path_buf(),
+            }
+        }
+    }
+
+    /// Returns the configuration directory referenced by this pinned home.
+    pub fn config_dir(&self) -> PathBuf {
+        match self {
+            PinnedHome::Root(root) => root.join("config"),
+            PinnedHome::Split { config_dir, .. } => config_dir.clone(),
+        }
+    }
+
+    /// Returns the state directory referenced by this pinned home.
+    pub fn state_dir(&self) -> PathBuf {
+        match self {
+            PinnedHome::Root(root) => root.join("state"),
+            PinnedHome::Split { state_dir, .. } => state_dir.clone(),
+        }
+    }
+
+    /// Returns `true` when this pinned home refers to the same config and state directories as
+    /// `paths`.
+    pub fn matches_paths(&self, paths: &Paths) -> bool {
+        paths_equal(&self.config_dir(), paths.config_dir())
+            && paths_equal(&self.state_dir(), paths.state_dir())
+    }
+
+    fn push_cli_args(&self, out: &mut Vec<String>) -> Result<(), ErrorBody> {
+        let to_utf8 = |label: &str, path: &Path| -> Result<String, ErrorBody> {
+            path.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{label} {} is not valid Unicode.", path.display()),
+                )
+            })
+        };
+        match self {
+            PinnedHome::Root(root) => {
+                out.push("--home".to_owned());
+                out.push(to_utf8("Legion home path", root)?);
+            }
+            PinnedHome::Split {
+                config_dir,
+                state_dir,
+            } => {
+                out.push("--config-dir".to_owned());
+                out.push(to_utf8("Legion config directory", config_dir)?);
+                out.push("--state-dir".to_owned());
+                out.push(to_utf8("Legion state directory", state_dir)?);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Formats a temporary invite line for `authorized_keys`.
 ///
-/// When `explicit_home` is `Some`, appends `--home <path>` to the forced command so `legion gate
-/// --enrol` always reads the same Legion home that issued the invite regardless of `sshd`'s
-/// session environment. When `account` is `Some` (such as on Windows's shared
-/// `administrators_authorized_keys`), appends `--account <name>` so only that OS account may use
-/// the temporary key.
+/// Always pins `pinned_home` (`--home <root>` or `--config-dir <cfg> --state-dir <st>`) in the
+/// forced command so `legion gate --enrol` always reads the exact Legion home that issued the
+/// invite regardless of `sshd`'s session environment or `AcceptEnv`. When `account` is `Some`
+/// (such as on Windows's shared `administrators_authorized_keys`), appends `--account <name>` so
+/// only that OS account may use the temporary key.
 pub fn format_invite_line(
     exe: &Path,
     id: &str,
     expires: Timestamp,
     pubkey: &str,
-    explicit_home: Option<&Path>,
+    pinned_home: &PinnedHome,
     account: Option<&str>,
     shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
@@ -799,16 +880,7 @@ pub fn format_invite_line(
         owned_args.push("--account".to_owned());
         owned_args.push(acct.to_owned());
     }
-    if let Some(home) = explicit_home {
-        let home_str = home.to_str().ok_or_else(|| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Legion home path {} is not valid Unicode.", home.display()),
-            )
-        })?;
-        owned_args.push("--home".to_owned());
-        owned_args.push(home_str.to_owned());
-    }
+    pinned_home.push_cli_args(&mut owned_args)?;
     let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     let cmd = format_forced_command(exe, &arg_refs, shell)?;
     let expiry = format_sshd_expiry(expires);
@@ -820,17 +892,17 @@ pub fn format_invite_line(
 /// Formats a permanent paired device line for `authorized_keys`.
 ///
 /// Includes `--device <device_name>` so `legion gate --as` tracks live sessions for immediate
-/// revocation by `device.remove`. When `account` is `Some` (such as on Windows's shared
-/// `administrators_authorized_keys`), appends `--account <name>` so no other account on the same
-/// machine can authenticate with this key. When `explicit_home` is `Some`, also appends
-/// `--home <path>` so `legion gate --as` always reads the same Legion home regardless of `sshd`'s
-/// session environment.
+/// revocation by `device.remove`, and always pins `pinned_home` (`--home <root>` or
+/// `--config-dir <cfg> --state-dir <st>`) so `legion gate --as` always reads the same Legion home
+/// regardless of `sshd`'s session environment or `AcceptEnv`. When `account` is `Some` (such as on
+/// Windows's shared `administrators_authorized_keys`), appends `--account <name>` so no other
+/// account on the same machine can authenticate with this key.
 pub fn format_device_line(
     exe: &Path,
     principal: &str,
     pubkey: &str,
     device_name: &str,
-    explicit_home: Option<&Path>,
+    pinned_home: &PinnedHome,
     account: Option<&str>,
     shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
@@ -846,16 +918,7 @@ pub fn format_device_line(
         owned_args.push("--account".to_owned());
         owned_args.push(acct.to_owned());
     }
-    if let Some(home) = explicit_home {
-        let home_str = home.to_str().ok_or_else(|| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Legion home path {} is not valid Unicode.", home.display()),
-            )
-        })?;
-        owned_args.push("--home".to_owned());
-        owned_args.push(home_str.to_owned());
-    }
+    pinned_home.push_cli_args(&mut owned_args)?;
     let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     let cmd = format_forced_command(exe, &arg_refs, shell)?;
     Ok(format!(
@@ -877,8 +940,8 @@ pub enum LineKind {
         key_b64: String,
         /// Raw `expiry-time` option value on the line, when present.
         expiry_time: Option<String>,
-        /// Pinned `--home` path extracted from the forced command, when present.
-        home: Option<String>,
+        /// Pinned Legion home (`--home` or `--config-dir`/`--state-dir`) from the forced command.
+        home: Option<PinnedHome>,
         /// Pinned `--account` name extracted from the forced command, when present.
         account: Option<String>,
     },
@@ -891,8 +954,8 @@ pub enum LineKind {
         key_b64: String,
         /// Principal extracted from `command="... gate --as <principal> --device <name>"`.
         principal: String,
-        /// Pinned `--home` path extracted from the forced command, when present.
-        home: Option<String>,
+        /// Pinned Legion home (`--home` or `--config-dir`/`--state-dir`) from the forced command.
+        home: Option<PinnedHome>,
         /// Pinned `--account` name extracted from the forced command, when present.
         account: Option<String>,
     },
@@ -1577,7 +1640,7 @@ enum GateCommandMode {
 
 struct ParsedGateCommand {
     mode: GateCommandMode,
-    home: Option<String>,
+    home: Option<PinnedHome>,
     account: Option<String>,
 }
 
@@ -1618,7 +1681,9 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
     let mut principal: Option<String> = None;
     let mut device: Option<String> = None;
     let mut enrol_id: Option<String> = None;
-    let mut home: Option<String> = None;
+    let mut home_root: Option<PathBuf> = None;
+    let mut config_dir: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
     let mut account: Option<String> = None;
 
     let mut i = 0;
@@ -1657,13 +1722,33 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
             }
             "--home" => {
                 let p = Path::new(value);
-                if home.is_some()
+                if home_root.is_some()
                     || value.is_empty()
                     || (!p.is_absolute() && !looks_windows_absolute(p))
                 {
                     return None;
                 }
-                home = Some(value.to_owned());
+                home_root = Some(PathBuf::from(value));
+            }
+            "--config-dir" => {
+                let p = Path::new(value);
+                if config_dir.is_some()
+                    || value.is_empty()
+                    || (!p.is_absolute() && !looks_windows_absolute(p))
+                {
+                    return None;
+                }
+                config_dir = Some(PathBuf::from(value));
+            }
+            "--state-dir" => {
+                let p = Path::new(value);
+                if state_dir.is_some()
+                    || value.is_empty()
+                    || (!p.is_absolute() && !looks_windows_absolute(p))
+                {
+                    return None;
+                }
+                state_dir = Some(PathBuf::from(value));
             }
             "--account" => {
                 if account.is_some() || validate_account_name(value).is_err() {
@@ -1675,6 +1760,16 @@ fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
         }
         i += step;
     }
+
+    let home = match (home_root, config_dir, state_dir) {
+        (Some(root), None, None) => Some(PinnedHome::Root(root)),
+        (None, Some(config_dir), Some(state_dir)) => Some(PinnedHome::Split {
+            config_dir,
+            state_dir,
+        }),
+        (None, None, None) => None,
+        _ => return None,
+    };
 
     let mode = match (principal, device, enrol_id) {
         (Some(principal), Some(device), None) => GateCommandMode::Device { principal, device },
@@ -1804,17 +1899,14 @@ pub fn line_matches_account(
     }
 }
 
-/// Returns `true` when a line's pinned `--home` matches `paths`'s Legion home.
+/// Returns `true` when a line's pinned home matches `paths`'s Legion home.
 ///
-/// Lines pinned to a different `--home` belong to another Legion home sharing this
-/// `authorized_keys` file and are never listed or removed by this home.
-pub fn line_matches_home(line_home: Option<&str>, paths: &Paths) -> bool {
-    match (line_home, paths.explicit_home()) {
-        (Some(lh), Some(eh)) => paths_equal(Path::new(lh), eh),
-        (None, None) => true,
-        // A line pinned to an explicit home does not belong to the default home, and a default-home
-        // line does not belong to an explicit home unless explicitly matched by state metadata.
-        (Some(_), None) | (None, Some(_)) => false,
+/// Lines pinned to a different home belong to another Legion home sharing this `authorized_keys`
+/// file.
+pub fn line_matches_home(line_home: Option<&PinnedHome>, paths: &Paths) -> bool {
+    match line_home {
+        Some(pinned) => pinned.matches_paths(paths),
+        None => paths.explicit_home().is_none(),
     }
 }
 
@@ -1968,7 +2060,7 @@ mod tests {
             "agent:example",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             "pixel",
-            Some(Path::new(r"C:\Users\me\O'Neil\Legion Home")),
+            &PinnedHome::Root(PathBuf::from(r"C:\Users\me\O'Neil\Legion Home")),
             Some("O'Neil"),
             ForcedCommandShell::WindowsPowerShell,
         )
@@ -1979,12 +2071,12 @@ mod tests {
             LineKind::Device {
                 name,
                 principal,
-                home: Some(h),
+                home: Some(PinnedHome::Root(h)),
                 account: Some(a),
                 ..
             } if name == "pixel"
                 && principal == "agent:example"
-                && h == r"C:\Users\me\O'Neil\Legion Home"
+                && h == Path::new(r"C:\Users\me\O'Neil\Legion Home")
                 && a == "O'Neil"
         ));
 
@@ -2013,7 +2105,7 @@ mod tests {
             "agent:example",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             "pixel",
-            Some(Path::new(r"C:\Users\me\Legion Home")),
+            &PinnedHome::Root(PathBuf::from(r"C:\Users\me\Legion Home")),
             Some("me"),
             ForcedCommandShell::Posix,
         )
@@ -2028,13 +2120,47 @@ mod tests {
             LineKind::Device {
                 name,
                 principal,
-                home: Some(h),
+                home: Some(PinnedHome::Root(h)),
                 account: Some(a),
                 ..
             } if name == "pixel"
                 && principal == "agent:example"
-                && h == r"C:\Users\me\Legion Home"
+                && h == Path::new(r"C:\Users\me\Legion Home")
                 && a == "me"
+        ));
+
+        // Split default-home lines pin both `--config-dir` and `--state-dir` and round-trip cleanly.
+        let split_line = format_device_line(
+            Path::new("/home/me/.local/bin/legion"),
+            "phone",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
+            "pixel",
+            &PinnedHome::Split {
+                config_dir: PathBuf::from("/home/me/.config/legion"),
+                state_dir: PathBuf::from("/home/me/.local/state/legion"),
+            },
+            None,
+            ForcedCommandShell::Posix,
+        )
+        .unwrap();
+        assert!(
+            split_line.contains(
+                "--config-dir /home/me/.config/legion --state-dir /home/me/.local/state/legion"
+            ),
+            "{split_line}"
+        );
+        let parsed_split = AuthKeysFile::parse(format!("{split_line}\n").as_bytes());
+        assert!(matches!(
+            &parsed_split.lines[0].kind,
+            LineKind::Device {
+                name,
+                principal,
+                home: Some(PinnedHome::Split { config_dir, state_dir }),
+                ..
+            } if name == "pixel"
+                && principal == "phone"
+                && config_dir == Path::new("/home/me/.config/legion")
+                && state_dir == Path::new("/home/me/.local/state/legion")
         ));
 
         // Control characters and relative paths are refused.
@@ -2308,7 +2434,7 @@ Match Group users
             "deadbeef01",
             ts,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
-            Some(Path::new("/Users/me/My Legion Home")),
+            &PinnedHome::Root(PathBuf::from("/Users/me/My Legion Home")),
             Some("Alice"),
             ForcedCommandShell::Posix,
         )
@@ -2334,7 +2460,10 @@ Match Group users
                 assert_eq!(id, "deadbeef01");
                 assert!(key_b64.starts_with("AAAAC3Nza"));
                 assert_eq!(expiry_time.as_deref(), Some("202611250215"));
-                assert_eq!(home.as_deref(), Some("/Users/me/My Legion Home"));
+                assert_eq!(
+                    home.as_ref(),
+                    Some(&PinnedHome::Root(PathBuf::from("/Users/me/My Legion Home")))
+                );
                 assert_eq!(account.as_deref(), Some("Alice"));
             }
             other => panic!("unexpected {other:?}"),
@@ -2591,7 +2720,7 @@ Match Group users
             "phone",
             key,
             "pixel",
-            Some(Path::new("/home/me/legion")),
+            &PinnedHome::Root(PathBuf::from("/home/me/legion")),
             None,
             ForcedCommandShell::Posix,
         )

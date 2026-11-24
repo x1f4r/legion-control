@@ -29,7 +29,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::args::{ArgsSource, CallCommand, Command, GateCommand, USAGE, UsageError, command_help};
+use crate::args::{
+    ArgsSource, CallCommand, Command, GateCommand, GateHome, USAGE, UsageError, command_help,
+};
 
 const FAILED: u8 = 1;
 const USAGE_ERROR: u8 = 2;
@@ -94,14 +96,15 @@ async fn run(command: Command) -> ExitCode {
         _ => false,
     };
     let paths_result = match &command {
-        Command::Gate(
-            GateCommand::As {
-                home: Some(root), ..
-            }
-            | GateCommand::Enrol {
-                home: Some(root), ..
-            },
-        ) => Paths::from_explicit_home(root),
+        Command::Gate(GateCommand::As { home, .. } | GateCommand::Enrol { home, .. }) => match home
+        {
+            GateHome::Root(root) => Paths::from_explicit_home(root),
+            GateHome::Split {
+                config_dir,
+                state_dir,
+            } => Paths::from_explicit_dirs(config_dir, state_dir),
+            GateHome::Default => Paths::from_gate_default(),
+        },
         _ => Paths::from_env(),
     };
     let (node, router) = match paths_result {

@@ -28,9 +28,9 @@ use serde::{Deserialize, Serialize};
 use crate::caller::Caller;
 
 use self::authkeys::{
-    AuthKeysTarget, ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_invite_line,
-    line_matches_account, line_matches_home, resolve_safe_write_path, resolve_target,
-    verify_exe_not_group_or_world_writable, verify_owner_matches_euid,
+    AuthKeysTarget, ForcedCommandShell, LineKind, PinnedHome, edit_auth_keys_with_retry,
+    format_invite_line, line_matches_account, line_matches_home, resolve_safe_write_path,
+    resolve_target, verify_exe_not_group_or_world_writable, verify_owner_matches_euid,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
@@ -250,12 +250,13 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
 
     let id = generate_invite_id()?;
     let ephemeral = generate_ephemeral_ed25519()?;
+    let pinned_home = PinnedHome::from_paths(ctx.paths());
     let invite_line = format_invite_line(
         &exe,
         &id,
         expires_ts,
         &ephemeral.public_key,
-        ctx.paths().explicit_home(),
+        &pinned_home,
         pinned_account.as_deref(),
         ForcedCommandShell::host()?,
     )?;
@@ -400,7 +401,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     ) {
                         continue;
                     }
-                    if !line_matches_home(home.as_deref(), &paths)
+                    if !line_matches_home(home.as_ref(), &paths)
                         && !(home.is_none() && state.devices.contains_key(name))
                     {
                         continue;
@@ -585,7 +586,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                 ) {
                                     continue;
                                 }
-                                if !line_matches_home(home.as_deref(), &paths)
+                                if !line_matches_home(home.as_ref(), &paths)
                                     && !(home.is_none() && state.devices.contains_key(line_name))
                                 {
                                     continue;
@@ -637,7 +638,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                             target.windows_admin_acl,
                                             cfg!(windows),
                                         )
-                                        && (line_matches_home(home.as_deref(), &paths)
+                                        && (line_matches_home(home.as_ref(), &paths)
                                             || (home.is_none()
                                                 && state.devices.contains_key(line_name)))
                             )
@@ -1708,7 +1709,7 @@ role = "owner"
                 &id,
                 exp,
                 &eph.public_key,
-                paths.explicit_home(),
+                &PinnedHome::from_paths(&paths),
                 None,
                 ForcedCommandShell::Posix,
             )

@@ -1321,8 +1321,9 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
     let pi = node("pi");
     pi.write_config("policy.toml", POLICY);
     fs::write(pi.home().join("projects/a.txt"), b"a").unwrap();
+    let pi_root = pi.state().parent().unwrap().to_string_lossy().into_owned();
     let gate = |original: Option<&str>| {
-        let mut command = pi.command(&["gate", "--as", "agent:x"]);
+        let mut command = pi.command(&["gate", "--as", "agent:x", "--home", &pi_root]);
         command.env_remove("SSH_ORIGINAL_COMMAND");
         if let Some(original) = original {
             command.env("SSH_ORIGINAL_COMMAND", original);

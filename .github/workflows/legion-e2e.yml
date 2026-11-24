@@ -98,10 +98,11 @@ jobs:
             ssh-keygen -q -t ed25519 -N '' -C "legion-e2e-$key" -f "$keys/$key"
           done
           # The gated key may only ever start `legion gate`, with the binary where fleet.install
-          # will put it; the driver checks that fleet.install agrees.
+          # will put it; the driver checks that fleet.install agrees. Pass `--home` explicitly
+          # because `legion gate` ignores `LEGION_HOME` from the SSH session environment.
           {
             cat "$keys/far.pub"
-            printf 'command="%s gate --as e2e:gate",restrict %s\n' "$far_bin" "$(cat "$keys/gate.pub")"
+            printf "command=\"'%s' gate --as e2e:gate --home '%s'\",restrict %s\n" "$far_bin" "$far_home" "$(cat "$keys/gate.pub")"
           } > "$keys/authorized_keys"
           chmod 600 "$keys/authorized_keys"
           cat > "$keys/sshd_config" <<EOF
@@ -195,7 +196,12 @@ jobs:
           $farPub = (Get-Content (Join-Path $sshDir 'legion_e2e_far.pub') -Raw).Trim()
           $gatePub = (Get-Content (Join-Path $sshDir 'legion_e2e_gate.pub') -Raw).Trim()
           $auth = Join-Path $programData 'administrators_authorized_keys'
-          @($farPub, "command=""$farBin gate --as e2e:gate"",restrict $gatePub") | Set-Content -Path $auth -Encoding ascii
+          $gateLine = if ($env:E2E_SHELL -eq 'powershell') {
+            "command=""& '$farBin' gate --as 'e2e:gate' --home '$farHome'"",restrict $gatePub"
+          } else {
+            "command=""$farBin gate --as e2e:gate --home $farHome"",restrict $gatePub"
+          }
+          @($farPub, $gateLine) | Set-Content -Path $auth -Encoding ascii
           & icacls $auth /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
           # Each leg sets the shell it tests rather than taking the image's: the cmd leg removes any
           # DefaultShell, and both check below, through ssh, which shell sshd actually used.

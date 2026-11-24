@@ -19,7 +19,7 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use super::authkeys::{
-    ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_device_line,
+    ForcedCommandShell, LineKind, PinnedHome, edit_auth_keys_with_retry, format_device_line,
     resolve_safe_write_path, resolve_target, verify_exe_not_group_or_world_writable,
     verify_owner_matches_euid,
 };
@@ -451,12 +451,13 @@ fn process_enrol_blocking(
             Ok(shell) => shell,
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
+        let pinned_home = PinnedHome::from_paths(paths);
         let permanent_line = match format_device_line(
             &exe,
             &principal,
             &validated_key.canonical,
             &device_name,
-            paths.explicit_home(),
+            &pinned_home,
             pinned_account.as_deref(),
             shell,
         ) {

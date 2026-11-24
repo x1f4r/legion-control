@@ -60,8 +60,24 @@ pub enum Command {
     Version,
 }
 
-/// `legion gate --as P [--device NAME] [--account USER] [--home PATH]` or
-/// `legion gate --enrol ID [--account USER] [--home PATH]`.
+/// Pinned Legion home passed to `legion gate`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GateHome {
+    /// No explicit home flags on a hand-written gate line (ignores `LEGION_HOME` and `XDG_*`).
+    Default,
+    /// `--home <root>` (`<root>/config` and `<root>/state`).
+    Root(PathBuf),
+    /// `--config-dir <config> --state-dir <state>`.
+    Split {
+        /// Pinned configuration directory (`node.toml`, `policy.toml`, ...).
+        config_dir: PathBuf,
+        /// Pinned state directory (`audit.jsonl`, `devices.json`, ...).
+        state_dir: PathBuf,
+    },
+}
+
+/// `legion gate --as P [--device NAME] [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`
+/// or `legion gate --enrol ID [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`.
 #[derive(Debug, PartialEq)]
 pub enum GateCommand {
     /// Confine an ssh key to `legion rpc` and `legion stream` as `pinned`.
@@ -72,8 +88,8 @@ pub enum GateCommand {
         device: Option<String>,
         /// Optional pinned OS account name (used on shared `administrators_authorized_keys`).
         account: Option<String>,
-        /// Optional pinned absolute `LEGION_HOME` path overriding the ssh session environment.
-        home: Option<PathBuf>,
+        /// Pinned Legion home directories (`--home` or `--config-dir`/`--state-dir`).
+        home: GateHome,
     },
     /// Single-use forced command that enrols one device for invite `id`.
     Enrol {
@@ -81,8 +97,8 @@ pub enum GateCommand {
         id: String,
         /// Optional pinned OS account name (used on shared `administrators_authorized_keys`).
         account: Option<String>,
-        /// Optional pinned absolute `LEGION_HOME` path overriding the ssh session environment.
-        home: Option<PathBuf>,
+        /// Pinned Legion home directories (`--home` or `--config-dir`/`--state-dir`).
+        home: GateHome,
     },
 }
 
@@ -478,13 +494,16 @@ pub fn command_help(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `legion gate --as PRINCIPAL [--device NAME] [--account USER] [--home PATH] | --enrol ID [--account USER] [--home PATH]`.
+/// `legion gate --as PRINCIPAL [--device NAME] [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`
+/// or `--enrol ID [--account USER] [--home PATH | --config-dir CFG --state-dir ST]`.
 fn gate(rest: &[String]) -> Result<Command, UsageError> {
     let mut pinned = None;
     let mut device = None;
     let mut account = None;
     let mut enrol_id = None;
     let mut home: Option<PathBuf> = None;
+    let mut config_dir: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
         if !word.starts_with('-') {
@@ -547,15 +566,57 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
                     return Err(UsageError("--home is given twice.".to_owned()));
                 }
             }
+            "--config-dir" => {
+                let value = take_value(name)?;
+                let path = PathBuf::from(&value);
+                if value.is_empty() || !path.is_absolute() {
+                    return Err(UsageError(format!(
+                        "--config-dir must be an absolute path, not {value:?}."
+                    )));
+                }
+                if config_dir.replace(path).is_some() {
+                    return Err(UsageError("--config-dir is given twice.".to_owned()));
+                }
+            }
+            "--state-dir" => {
+                let value = take_value(name)?;
+                let path = PathBuf::from(&value);
+                if value.is_empty() || !path.is_absolute() {
+                    return Err(UsageError(format!(
+                        "--state-dir must be an absolute path, not {value:?}."
+                    )));
+                }
+                if state_dir.replace(path).is_some() {
+                    return Err(UsageError("--state-dir is given twice.".to_owned()));
+                }
+            }
             _ => return Err(UsageError(format!("{name} is not an option of gate."))),
         }
     }
+    let gate_home = match (home, config_dir, state_dir) {
+        (Some(root), None, None) => GateHome::Root(root),
+        (None, Some(config_dir), Some(state_dir)) => GateHome::Split {
+            config_dir,
+            state_dir,
+        },
+        (None, None, None) => GateHome::Default,
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(UsageError(
+                "gate takes --home or --config-dir/--state-dir, not both.".to_owned(),
+            ));
+        }
+        (None, Some(_), None) | (None, None, Some(_)) => {
+            return Err(UsageError(
+                "gate requires --config-dir and --state-dir to be given together.".to_owned(),
+            ));
+        }
+    };
     match (pinned, enrol_id) {
         (Some(pinned), None) => Ok(Command::Gate(GateCommand::As {
             pinned,
             device,
             account,
-            home,
+            home: gate_home,
         })),
         (None, Some(id)) => {
             if device.is_some() {
@@ -563,7 +624,11 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
                     "--device is only valid with `gate --as`, not `gate --enrol`.".to_owned(),
                 ));
             }
-            Ok(Command::Gate(GateCommand::Enrol { id, account, home }))
+            Ok(Command::Gate(GateCommand::Enrol {
+                id,
+                account,
+                home: gate_home,
+            }))
         }
         (Some(_), Some(_)) => Err(UsageError(
             "gate takes --as or --enrol, not both.".to_owned(),
@@ -1509,11 +1574,15 @@ mod tests {
                 pinned: "agent:example".into(),
                 device: None,
                 account: None,
-                home: None,
+                home: GateHome::Default,
             }))
         );
         let abs_home = std::env::temp_dir().join("legion-gate-home");
         let abs_home_str = abs_home.to_string_lossy().into_owned();
+        let abs_cfg = std::env::temp_dir().join("legion-gate-cfg");
+        let abs_state = std::env::temp_dir().join("legion-gate-state");
+        let abs_cfg_str = abs_cfg.to_string_lossy().into_owned();
+        let abs_state_str = abs_state.to_string_lossy().into_owned();
         assert_eq!(
             run(&[
                 "gate",
@@ -1530,7 +1599,29 @@ mod tests {
                 pinned: "agent:example".into(),
                 device: Some("pixel".into()),
                 account: Some("me".into()),
-                home: Some(abs_home.clone()),
+                home: GateHome::Root(abs_home.clone()),
+            }))
+        );
+        assert_eq!(
+            run(&[
+                "gate",
+                "--as",
+                "agent:example",
+                "--device",
+                "pixel",
+                "--config-dir",
+                &abs_cfg_str,
+                "--state-dir",
+                &abs_state_str,
+            ]),
+            Ok(Command::Gate(GateCommand::As {
+                pinned: "agent:example".into(),
+                device: Some("pixel".into()),
+                account: None,
+                home: GateHome::Split {
+                    config_dir: abs_cfg,
+                    state_dir: abs_state,
+                },
             }))
         );
         assert_eq!(
@@ -1538,7 +1629,7 @@ mod tests {
             Ok(Command::Gate(GateCommand::Enrol {
                 id: "0123456789abcdef0123456789abcdef".into(),
                 account: None,
-                home: None,
+                home: GateHome::Default,
             }))
         );
         assert_eq!(
@@ -1554,12 +1645,34 @@ mod tests {
             Ok(Command::Gate(GateCommand::Enrol {
                 id: "0123456789abcdef0123456789abcdef".into(),
                 account: Some("me".into()),
-                home: Some(abs_home),
+                home: GateHome::Root(abs_home),
             }))
         );
         for bad_gate in [
             &["gate", "--as", "phone", "--enrol", "0123456789abcdef"][..],
             &["gate", "--as", "phone", "--home", "relative/path"],
+            &["gate", "--as", "phone", "--config-dir", &abs_cfg_str],
+            &["gate", "--as", "phone", "--state-dir", &abs_state_str],
+            &[
+                "gate",
+                "--as",
+                "phone",
+                "--home",
+                &abs_home_str,
+                "--config-dir",
+                &abs_cfg_str,
+                "--state-dir",
+                &abs_state_str,
+            ],
+            &[
+                "gate",
+                "--as",
+                "phone",
+                "--config-dir",
+                "relative",
+                "--state-dir",
+                &abs_state_str,
+            ],
             &["gate", "--as", "phone", "--device", "../escape"],
             &["gate", "--as", "phone", "--account", "-bad"],
             &["gate", "--as", "phone", "--account", "has space"],

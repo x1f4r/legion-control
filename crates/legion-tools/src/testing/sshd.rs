@@ -54,6 +54,16 @@ impl TestSshd {
         authorized_keys: PathBuf,
         env: &[(&str, &str)],
     ) -> Result<Option<TestSshd>, String> {
+        Self::start_with_accept_env(authorized_keys, env, &[])
+    }
+
+    /// Starts a throwaway loopback `sshd` serving `authorized_keys`, exporting `env` via `SetEnv`,
+    /// and accepting client-sent environment variables listed in `accept_env` via `AcceptEnv`.
+    pub fn start_with_accept_env(
+        authorized_keys: PathBuf,
+        env: &[(&str, &str)],
+        accept_env: &[&str],
+    ) -> Result<Option<TestSshd>, String> {
         if !cfg!(unix) {
             return Ok(None);
         }
@@ -134,6 +144,7 @@ impl TestSshd {
                 &authorized_keys,
                 &user,
                 env,
+                accept_env,
                 supports_no_penalties,
             );
             fs::write(&config_path, &config).map_err(|e| format!("write sshd_config: {e}"))?;
@@ -459,6 +470,7 @@ fn render_sshd_config(
     authorized_keys: &Path,
     user: &str,
     env: &[(&str, &str)],
+    accept_env: &[&str],
     disable_penalties: bool,
 ) -> String {
     let mut cfg = String::new();
@@ -490,6 +502,9 @@ fn render_sshd_config(
             .map(|(k, v)| quote_sshd_arg(&format!("{k}={v}")))
             .collect();
         let _ = writeln!(cfg, "SetEnv {}", pairs.join(" "));
+    }
+    if !accept_env.is_empty() {
+        let _ = writeln!(cfg, "AcceptEnv {}", accept_env.join(" "));
     }
     let _ = writeln!(cfg, "Subsystem sftp internal-sftp");
     let _ = writeln!(cfg, "LogLevel VERBOSE");

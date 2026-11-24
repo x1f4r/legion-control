@@ -330,10 +330,10 @@ fn state_path(paths: &Paths) -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::device::authkeys::{ForcedCommandShell, format_invite_line};
+    use crate::device::authkeys::{ForcedCommandShell, PinnedHome, format_invite_line};
     use crate::device::keys::generate_ephemeral_ed25519;
 
     #[test]
@@ -363,12 +363,16 @@ mod tests {
         let key2 = generate_ephemeral_ed25519().unwrap();
         let key3 = generate_ephemeral_ed25519().unwrap();
 
+        let default_home = PinnedHome::Split {
+            config_dir: PathBuf::from("/home/me/.config/legion"),
+            state_dir: PathBuf::from("/home/me/.local/state/legion"),
+        };
         let expired_line = format_invite_line(
             Path::new("/home/me/legion"),
             "invexpired",
             past,
             &key1.public_key,
-            None,
+            &default_home,
             None,
             ForcedCommandShell::Posix,
         )
@@ -378,7 +382,7 @@ mod tests {
             "invotherhome",
             future,
             &key2.public_key,
-            Some(Path::new("/home/me/other-legion")),
+            &PinnedHome::Root(PathBuf::from("/home/me/other-legion")),
             None,
             ForcedCommandShell::Posix,
         )
@@ -388,7 +392,7 @@ mod tests {
             "invvalid",
             future,
             &key3.public_key,
-            None,
+            &default_home,
             None,
             ForcedCommandShell::Posix,
         )

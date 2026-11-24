@@ -819,12 +819,15 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
     let my_pub = ed25519_public_key_from_seed(&[21_u8; 32]);
     let other_pub = ed25519_public_key_from_seed(&[22_u8; 32]);
     let exe = Path::new("/usr/local/bin/legion");
+    let pinned_home = legion_tools::device::authkeys::PinnedHome::Root(
+        home.state().parent().unwrap().to_path_buf(),
+    );
     let my_line = legion_tools::device::authkeys::format_device_line(
         exe,
         "phone",
         &my_pub,
         "my-phone",
-        Some(home.state().parent().unwrap()),
+        &pinned_home,
         Some(&me),
         legion_tools::device::authkeys::ForcedCommandShell::Posix,
     )
@@ -834,7 +837,7 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
         "phone",
         &other_pub,
         "other-phone",
-        Some(home.state().parent().unwrap()),
+        &pinned_home,
         Some(&other_account),
         legion_tools::device::authkeys::ForcedCommandShell::Posix,
     )
@@ -874,8 +877,22 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
     );
 
     // `legion gate --as` and `legion gate --enrol` both refuse a mismatched `--account`.
+    let home_root = home
+        .state()
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let bad_as = home
-        .command(&["gate", "--as", "phone", "--account", &other_account])
+        .command(&[
+            "gate",
+            "--as",
+            "phone",
+            "--account",
+            &other_account,
+            "--home",
+            &home_root,
+        ])
         .env("SSH_ORIGINAL_COMMAND", "legion rpc")
         .stdin(Stdio::null())
         .output()
@@ -894,6 +911,8 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
             "0123456789abcdef0123456789abcdef",
             "--account",
             &other_account,
+            "--home",
+            &home_root,
         ])
         .stdin(Stdio::null())
         .output()
@@ -1062,4 +1081,273 @@ fn device_invite_refuses_disjoint_keyscan_when_host_key_files_exist_and_falls_ba
     let reply: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(reply["ok"], json!(true));
     assert_eq!(reply["device"], json!("scanned-phone"));
+}
+
+#[test]
+fn accept_env_cannot_redirect_gate_home_to_crafted_policy() {
+    if !TestSshd::available() {
+        eprintln!(
+            "skipping accept_env_cannot_redirect_gate_home_to_crafted_policy: sshd unavailable"
+        );
+        return;
+    }
+
+    let root = Home::new_strict();
+    let user_home = root.home().to_path_buf();
+    let default_cfg = user_home.join(".config").join("legion");
+    let default_state = user_home.join(".local").join("state").join("legion");
+    std::fs::create_dir_all(&default_cfg).unwrap();
+    std::fs::create_dir_all(&default_state).unwrap();
+    let auth_keys = user_home.join(".ssh").join("authorized_keys");
+    std::fs::create_dir_all(auth_keys.parent().unwrap()).unwrap();
+
+    // Start sshd WITH `AcceptEnv LEGION_HOME XDG_CONFIG_HOME XDG_STATE_HOME` so a connecting SSH
+    // client can pass arbitrary LEGION_HOME / XDG_* values into the remote session environment.
+    let home_dir_str = user_home.to_string_lossy().into_owned();
+    let Some(sshd) = TestSshd::start_with_accept_env(
+        auth_keys.clone(),
+        &[("HOME", &home_dir_str)],
+        &["LEGION_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"],
+    )
+    .expect("throwaway sshd failed to start") else {
+        return;
+    };
+
+    // Real default-home node: `phone` is restricted to `observer` (read-only).
+    std::fs::write(
+        default_cfg.join("node.toml"),
+        format!(
+            "name = \"default-tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(sshd.host_key_path()),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        default_cfg.join("policy.toml"),
+        "default = \"owner\"\n\n\
+         [roles.observer]\n\
+         allow = [\"effect:read\"]\n\n\
+         [principals.phone]\n\
+         role = \"observer\"\n",
+    )
+    .unwrap();
+
+    // Attacker-controlled policy directories granting `phone` the `owner` role.
+    let evil_legion_home = user_home.join("evil-home");
+    std::fs::create_dir_all(evil_legion_home.join("config")).unwrap();
+    std::fs::write(
+        evil_legion_home.join("config").join("node.toml"),
+        "name = \"evil-tower\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        evil_legion_home.join("config").join("policy.toml"),
+        "default = \"owner\"\n\n[principals.phone]\nrole = \"owner\"\n",
+    )
+    .unwrap();
+
+    let evil_xdg_cfg = user_home.join("evil-xdg-cfg");
+    let evil_xdg_state = user_home.join("evil-xdg-state");
+    std::fs::create_dir_all(evil_xdg_cfg.join("legion")).unwrap();
+    std::fs::create_dir_all(evil_xdg_state.join("legion")).unwrap();
+    std::fs::write(
+        evil_xdg_cfg.join("legion").join("node.toml"),
+        "name = \"evil-xdg\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        evil_xdg_cfg.join("legion").join("policy.toml"),
+        "default = \"owner\"\n\n[principals.phone]\nrole = \"owner\"\n",
+    )
+    .unwrap();
+
+    // 1. Run `device.invite` with NO LEGION_HOME and NO XDG_* so it uses the default home; the
+    //    invite and resulting device line MUST still pin `--config-dir` and `--state-dir`.
+    let legion_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_legion"));
+    let invite_out = std::process::Command::new(&legion_bin)
+        .args([
+            "device.invite",
+            "principal=phone",
+            "host=127.0.0.1",
+            &format!("port={}", sshd.port()),
+            &format!("user={}", sshd.user()),
+            "--json",
+        ])
+        .env("HOME", &user_home)
+        .env_remove("LEGION_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        invite_out.status.success(),
+        "default-home device.invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&invite_out.stdout),
+        String::from_utf8_lossy(&invite_out.stderr)
+    );
+    let invite_json: Value = serde_json::from_slice(&invite_out.stdout).expect("invite json");
+    let payload = InvitePayload::decode(invite_json["invite"].as_str().unwrap()).unwrap();
+
+    let auth_after_invite = std::fs::read_to_string(&auth_keys).unwrap();
+    assert!(
+        auth_after_invite.contains("--config-dir") && auth_after_invite.contains("--state-dir"),
+        "default-home invite line must pin --config-dir and --state-dir:\n{auth_after_invite}"
+    );
+
+    // 2. Enrol over SSH while sending attacker LEGION_HOME and XDG_* via SendEnv.
+    let client_dir = tempfile::tempdir().unwrap();
+    let temp_key = client_dir.path().join("temp_key");
+    write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), "acceptenv")
+        .unwrap();
+    let known_hosts = client_dir.path().join("known_hosts");
+    write_known_hosts(
+        &known_hosts,
+        &payload.hosts[0],
+        payload.port,
+        &payload.host_keys,
+    )
+    .unwrap();
+    let device_key = client_dir.path().join("device_ed25519");
+    let device_pub =
+        generate_ed25519_keypair(sshd.ssh_keygen_bin(), &device_key, "phone@acceptenv").unwrap();
+
+    let mut enrol_child = sshd
+        .ssh_command(&temp_key, &known_hosts)
+        .args([
+            "-o",
+            "SendEnv=LEGION_HOME",
+            "-o",
+            "SendEnv=XDG_CONFIG_HOME",
+            "-o",
+            "SendEnv=XDG_STATE_HOME",
+        ])
+        .env("LEGION_HOME", &evil_legion_home)
+        .env("XDG_CONFIG_HOME", &evil_xdg_cfg)
+        .env("XDG_STATE_HOME", &evil_xdg_state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        enrol_child.stdin.take().unwrap(),
+        "{}",
+        json!({
+            "enrol": 1,
+            "id": payload.id,
+            "public_key": device_pub,
+            "name": "Default Home Phone",
+        })
+    )
+    .unwrap();
+    let enrol_out = enrol_child.wait_with_output().unwrap();
+    assert!(
+        enrol_out.status.success(),
+        "default-home enrolment failed: stdout={} stderr={}\nsshd:\n{}",
+        String::from_utf8_lossy(&enrol_out.stdout),
+        String::from_utf8_lossy(&enrol_out.stderr),
+        sshd.logs(),
+    );
+    let enrol_reply: Value =
+        serde_json::from_str(String::from_utf8_lossy(&enrol_out.stdout).trim()).unwrap();
+    assert_eq!(enrol_reply["node"], json!("default-tower"));
+    assert_eq!(enrol_reply["role"], json!("observer"));
+
+    let auth_after_enrol = std::fs::read_to_string(&auth_keys).unwrap();
+    assert!(
+        auth_after_enrol.contains("--config-dir") && auth_after_enrol.contains("--state-dir"),
+        "default-home device line must pin --config-dir and --state-dir:\n{auth_after_enrol}"
+    );
+
+    // 3. Also append a hand-written `legion gate --as phone` line WITHOUT --home/--config-dir to
+    //    prove `legion gate` ignores LEGION_HOME and XDG_* from the environment even without flags.
+    let hand_key = client_dir.path().join("hand_ed25519");
+    let hand_pub =
+        generate_ed25519_keypair(sshd.ssh_keygen_bin(), &hand_key, "phone@hand").unwrap();
+    let hand_line = format!(
+        "restrict,command=\"'{}' gate --as phone\" {hand_pub}\n",
+        legion_bin.display()
+    );
+    let mut current_auth = std::fs::read_to_string(&auth_keys).unwrap();
+    current_auth.push_str(&hand_line);
+    std::fs::write(&auth_keys, current_auth).unwrap();
+
+    for (label, key_path) in [
+        ("paired-default-home", &device_key),
+        ("handwritten-no-home-flag", &hand_key),
+    ] {
+        let mut rpc_child = sshd
+            .ssh_command(key_path, &known_hosts)
+            .args([
+                "-o",
+                "SendEnv=LEGION_HOME",
+                "-o",
+                "SendEnv=XDG_CONFIG_HOME",
+                "-o",
+                "SendEnv=XDG_STATE_HOME",
+                "legion rpc",
+            ])
+            .env("LEGION_HOME", &evil_legion_home)
+            .env("XDG_CONFIG_HOME", &evil_xdg_cfg)
+            .env("XDG_STATE_HOME", &evil_xdg_state)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = rpc_child.stdin.take().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+            )
+            .unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                rpc_request(
+                    json!(2),
+                    "call",
+                    json!({
+                        "tool": "fs.write",
+                        "args": {
+                            "path": user_home.join("pwned.txt").to_string_lossy(),
+                            "content": "should not write",
+                        }
+                    })
+                )
+            )
+            .unwrap();
+        }
+        let mut stdout = BufReader::new(rpc_child.stdout.take().unwrap());
+        let mut replies = std::collections::HashMap::new();
+        for n in 0..2 {
+            let msg = read_json_line(&mut stdout, &format!("{label} reply {n}"));
+            let id = msg["id"].as_i64().unwrap();
+            replies.insert(id, msg);
+        }
+        let whoami = &replies[&1];
+        assert_eq!(
+            whoami["result"]["principal"],
+            json!("phone"),
+            "{label}: {whoami}"
+        );
+        assert_eq!(
+            whoami["result"]["role"],
+            json!("observer"),
+            "{label}: SendEnv escalated role! {whoami}"
+        );
+        let write_reply = &replies[&2];
+        assert_eq!(
+            write_reply["error"]["data"]["code"],
+            json!("denied"),
+            "{label}: SendEnv bypassed observer confinement! {write_reply}"
+        );
+        let status = rpc_child.wait().unwrap();
+        assert!(status.success(), "{label}: ssh exited {status}");
+        assert!(!user_home.join("pwned.txt").exists(), "{label}");
+    }
 }
