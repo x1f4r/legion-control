@@ -25,7 +25,10 @@ use crate::shell::ResolvedCommand;
 use crate::win_proc;
 use crate::{OsError, Result};
 
-use super::{DetachOptions, build_wmi_create_script, build_wmi_launcher_script, open_append_stdio};
+use super::{
+    DetachHandle, DetachOptions, build_wmi_create_script, build_wmi_launcher_script,
+    open_append_stdio,
+};
 
 const WMI_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const ERROR_ACCESS_DENIED: i32 = 5;
@@ -33,7 +36,7 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 pub(super) async fn spawn_detached(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
-) -> Result<ProcessId> {
+) -> Result<DetachHandle> {
     let (stdout_stdio, stderr_stdio) = open_append_stdio(
         options.stdout_path.as_deref(),
         options.stderr_path.as_deref(),
@@ -67,7 +70,11 @@ pub(super) async fn spawn_detached(
             // Dropping std::process::Child on Windows closes our process handle without killing
             // the detached child.
             drop(child);
-            Ok(ProcessId::new(pid, start_time))
+            Ok(DetachHandle {
+                process: ProcessId::new(pid, start_time),
+                systemd_unit: None,
+                warnings: Vec::new(),
+            })
         }
         Err(err) if is_breakaway_refused(&err) => spawn_via_wmi(resolved, options).await,
         Err(err) => Err(OsError::from_spawn_io(program_display, err)),
@@ -78,7 +85,10 @@ fn is_breakaway_refused(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(ERROR_ACCESS_DENIED)
 }
 
-async fn spawn_via_wmi(resolved: &ResolvedCommand, options: &DetachOptions) -> Result<ProcessId> {
+async fn spawn_via_wmi(
+    resolved: &ResolvedCommand,
+    options: &DetachOptions,
+) -> Result<DetachHandle> {
     let base_cwd = match options.cwd {
         Some(ref dir) => absolutize(dir)?,
         None => std::env::current_dir()
@@ -173,8 +183,13 @@ async fn spawn_via_wmi(resolved: &ResolvedCommand, options: &DetachOptions) -> R
             ),
         })?;
 
-    procid::of_pid_including_zombie(pid)?.ok_or_else(|| OsError::Platform {
+    let process = procid::of_pid_including_zombie(pid)?.ok_or_else(|| OsError::Platform {
         detail: format!("could not read process creation time for detached pid {pid}"),
+    })?;
+    Ok(DetachHandle {
+        process,
+        systemd_unit: None,
+        warnings: Vec::new(),
     })
 }
 
