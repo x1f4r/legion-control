@@ -767,8 +767,7 @@ async fn close_idle_inner(inner: &LinkInner) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut keep = Vec::new();
         for live in retired.drain(..) {
-            if Arc::strong_count(&live.session) == 1
-                && live.in_flight.load(Ordering::Acquire) == 0
+            if Arc::strong_count(&live.session) == 1 && live.in_flight.load(Ordering::Acquire) == 0
             {
                 to_close.push(live.session);
             } else {
@@ -1225,8 +1224,15 @@ mod tests {
                         }
                     }
                 });
-                Session::open_io(client_r, client_w, &entry.node, None, Duration::from_secs(5), cancel)
-                    .await
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
             })
         });
 
@@ -1423,7 +1429,13 @@ mod tests {
 
         let link = Link::with_opener(test_config("tower"), LinkOptions::default(), opener);
         let err = link
-            .call("tower", "fs.remove", json!({"path": "/tmp/x"}), None, |_| {})
+            .call(
+                "tower",
+                "fs.remove",
+                json!({"path": "/tmp/x"}),
+                None,
+                |_| {},
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Unreachable);
@@ -1442,7 +1454,10 @@ mod tests {
         };
         let rendered = format!("{cfg:?}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
-        assert!(!rendered.contains("SUPER-SECRET-KEY-MATERIAL"), "{rendered}");
+        assert!(
+            !rendered.contains("SUPER-SECRET-KEY-MATERIAL"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("BEGIN OPENSSH"), "{rendered}");
 
         let empty = LinkConfig::default();

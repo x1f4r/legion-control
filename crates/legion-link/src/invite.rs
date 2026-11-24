@@ -899,7 +899,12 @@ mod tests {
 
     #[test]
     fn validates_expires_as_rfc3339_and_parses_host_keys() {
-        for bad_expires in ["tomorrow", "2026-11-24", "2026-11-24 12:00:00", "not-a-date"] {
+        for bad_expires in [
+            "tomorrow",
+            "2026-11-24",
+            "2026-11-24 12:00:00",
+            "not-a-date",
+        ] {
             let mut v = serde_json::to_value(sample_invite()).unwrap();
             v["expires"] = json!(bad_expires);
             let err = Invite::parse(&encode_raw(&v)).unwrap_err();
@@ -959,12 +964,7 @@ mod tests {
             assert_eq!(req["enrol"], json!(1));
             assert_eq!(req["id"], json!("inv-01"));
             assert_eq!(req["name"], json!("phone"));
-            assert!(
-                req["public_key"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with(" phone")
-            );
+            assert!(req["public_key"].as_str().unwrap().ends_with(" phone"));
             server_w
                 .write_all(
                     br#"{"ok":true,"node":"tower","principal":"phone","role":"observer","device":"phone-1"}"#,
