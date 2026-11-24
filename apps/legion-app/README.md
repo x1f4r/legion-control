@@ -2,7 +2,25 @@
 
 `apps/legion-app` is the Tauri 2 native shell for Legion on Android, iOS, macOS, Windows and Linux
 ([design](../../docs/legion/platforms.md)). It ships the static frontend from `apps/ui` directly
-(no npm or bundler step) and exposes a small Rust command surface over an internal `Backend` trait.
+(no npm or bundler step) and connects to Legion nodes through `crates/legion-link` behind an
+internal `Backend` trait.
+
+## What the app does
+
+- **Pairing and SSH transport:** On every platform, the app enrols with a node from a single-use
+  `legion pair` invite (via camera QR scan on Android or pasted invite text), generates an Ed25519
+  device key on first use, and keeps its configuration (`LinkConfig`, active node, and node
+  metadata) in `legion-app.json` inside the platform app data directory.
+- **Desktop local pipe:** On Linux, macOS and Windows, if a `legion` binary is present on `PATH`
+  or in a standard user/system install location, the app is ready immediately over a local
+  `legion gate` child process without pairing, while still allowing additional SSH nodes to be
+  paired.
+- **Streaming, failover, and reconnect:** Tool calls stream live output over Tauri IPC channels
+  with caller-scoped cancellation, fail over to another configured node on unreachable/timeout
+  errors, and reconnect transparently after backgrounding or a dropped node-side session.
+- **Revocation and unpairing:** If a node revokes the device (`legion device.remove`), the app
+  shows a calm error with a direct path back to pairing. Unpairing forgets the node locally and
+  prints the `legion device.remove` command to revoke the key on the node as well.
 
 Its Rust crate (`apps/legion-app/src-tauri`) is its own Cargo workspace with its own `Cargo.lock`,
 excluded from the root workspace so building the `legion` node binary never pulls in a web view.
@@ -92,3 +110,25 @@ screenshots. The default AVD is `legion-test`; pass `--avd legion-tablet` for th
 ./apps/legion-app/emulator.sh logcat
 ./apps/legion-app/emulator.sh stop
 ```
+
+## End-to-end Android test (`e2e-android.sh`)
+
+`apps/legion-app/e2e-android.sh` proves the full Android path against a real throwaway Legion node
+and loopback `sshd` (`127.0.0.1` on an ephemeral high port):
+
+```sh
+./apps/legion-app/e2e-android.sh
+./apps/legion-app/e2e-android.sh --node-ref origin/link/pairing --shots-dir /home/me/shots/e2e
+./apps/legion-app/e2e-android.sh --skip-tablet
+```
+
+The script builds a release `legion` binary from `--node-ref` (default `origin/link/pairing`) in a
+cache checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, creates a throwaway
+`LEGION_HOME` node named `tower` with principal `phone` in role `operator`, starts a loopback
+`sshd` using a throwaway host key and `authorized_keys` file, builds a WebView-debuggable `x86_64`
+debug APK (used only by this test), installs it on `legion-test`, and drives the real UI over
+`adb forward` + Chrome DevTools Protocol (`playwright-core` from `apps/ui/test`). It verifies
+first-start pairing, live machine metrics, streamed command execution, file listing, `meta.whoami`,
+power confirmation with dry run only, force-stop/relaunch persistence, transparent reconnect after
+killing the node-side session, revocation recovery and re-pairing, plus a wide paired screenshot on
+`legion-tablet`. It never touches `~/.ssh`, the system `sshd`, `~/.config/legion`, or `/tmp`.
