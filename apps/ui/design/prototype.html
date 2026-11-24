@@ -129,8 +129,8 @@
       <button role="tab">Projects</button>
       <button role="tab">Power</button>
     </div>
-    <div class="prompt"><input value="df -h /" aria-label="Command"><button class="btn primary" style="min-height:36px;padding:0 14px">Run</button></div>
-    <label class="switch"><span>Keep running after I leave <small class="dim" style="display:block">Starts it as a job you can come back to.</small></span><input type="checkbox"></label>
+    <div class="prompt"><input value="df -h /" aria-label="Command"><button class="btn primary">Run</button></div>
+    <label class="switch"><span>Keep running after I leave <small class="help">Starts it as a job you can come back to.</small></span><input type="checkbox"></label>
 <pre class="out"><span class="meta">tower · ~ · exit 0 · 38 ms</span>
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/nvme0n1p5  2.8T  247G  2.5T   9% /</pre>
@@ -165,7 +165,7 @@ Filesystem      Size  Used Avail Use% Mounted on
     <label class="field"><span>delay_s <em>optional</em></span>
       <input inputmode="numeric" placeholder="0">
       <small>Seconds to wait first. It can be cancelled until then.</small></label>
-    <label class="switch"><span class="mono" style="font-size:13px">force</span><input type="checkbox"></label>
+    <label class="switch"><span class="mono">force</span><input type="checkbox"></label>
     <div class="actions">
       <button class="btn">Try it (dry run)</button>
       <button class="btn danger">Restart tower</button>
@@ -199,15 +199,15 @@ Filesystem      Size  Used Avail Use% Mounted on
 <div class="frame"><div class="shell"><div class="app">
   <header class="bar"><h1 class="wordmark"><b>▍</b>Legion</h1></header>
   <main class="main">
-    <h2 style="font-size:26px;line-height:1.15;letter-spacing:-0.02em;margin:36px 2px 10px">Pair this phone with one of your machines.</h2>
+    <h2 class="start-heading">Pair this phone with one of your machines.</h2>
     <p class="lede">One is enough: through it you reach the others. On that machine, run</p>
     <div class="code"><code>legion pair --as phone</code><button class="btn icon" aria-label="Copy"><svg><use href="#i-copy"/></svg></button></div>
-    <p class="lede" style="margin-top:14px">It shows a code. Scan it here, or paste the line under it.</p>
+    <p class="lede spaced">It shows a code. Scan it here, or paste the line under it.</p>
     <div class="actions">
       <button class="btn primary">Scan the code</button>
       <button class="btn">Paste invite</button>
     </div>
-    <div class="notice" style="margin-top:28px">
+    <div class="notice spaced-lg">
       <strong>What pairing allows</strong>
       <span>This phone gets its own key. It can only use Legion on that machine, as the role you name, and you can remove it there at any time.</span>
     </div>
@@ -228,7 +228,7 @@ Filesystem      Size  Used Avail Use% Mounted on
     <section>
       <p class="label">Machines · 3 of 4 answering</p>
       <div class="list">
-        <a class="row" href="#" style="background:var(--raised)"><span class="dot busy"></span><span class="body"><span class="title mono">tower</span><span class="sub">Linux · x86_64 · 2 jobs running</span></span><span class="meters"><span class="meter high" style="--v:71"><i></i></span><span class="meter" style="--v:48"><i></i></span><span class="meter" style="--v:9"><i></i></span></span></a>
+        <a class="row selected" href="#"><span class="dot busy"></span><span class="body"><span class="title mono">tower</span><span class="sub">Linux · x86_64 · 2 jobs running</span></span><span class="meters"><span class="meter high" style="--v:71"><i></i></span><span class="meter" style="--v:48"><i></i></span><span class="meter" style="--v:9"><i></i></span></span></a>
         <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title mono">pi</span><span class="sub">Linux · aarch64 · up 41 days</span></span><span class="meters"><span class="meter" style="--v:6"><i></i></span><span class="meter" style="--v:31"><i></i></span><span class="meter" style="--v:44"><i></i></span></span></a>
         <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title mono">studio</span><span class="sub">macOS · aarch64 · up 3 days</span></span><span class="meters"><span class="meter" style="--v:12"><i></i></span><span class="meter high" style="--v:78"><i></i></span><span class="meter full" style="--v:93"><i></i></span></span></a>
         <a class="row off" href="#"><span class="dot off"></span><span class="body"><span class="title mono">laptop</span><span class="sub">Did not answer · last seen 14 days ago</span></span><span class="chip">wake</span></a>
