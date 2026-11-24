@@ -123,7 +123,7 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(
-        &names[..6],
+        &names[..7],
         &[
             "configuration directory",
             "state directory",
