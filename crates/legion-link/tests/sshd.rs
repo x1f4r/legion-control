@@ -55,6 +55,7 @@ async fn real_sshd_session_and_security_checks() {
         ..target.clone()
     };
     let mismatch_err = ssh::open(
+        &node,
         &bad_pin,
         &key,
         Subcommand::Rpc,
@@ -65,6 +66,7 @@ async fn real_sshd_session_and_security_checks() {
     .err()
     .unwrap();
     assert_eq!(mismatch_err.code, ErrorCode::Denied, "{mismatch_err}");
+    assert_eq!(mismatch_err.machine.as_deref(), Some(node.as_str()));
     assert!(
         mismatch_err.message.contains("SHA256:"),
         "{}",
@@ -78,6 +80,7 @@ async fn real_sshd_session_and_security_checks() {
     // 2. Unauthorized client key is rejected with auth_failed.
     let rogue_key = DeviceKey::generate().unwrap();
     let auth_err = ssh::open(
+        &node,
         &target,
         &rogue_key,
         Subcommand::Rpc,
@@ -88,6 +91,7 @@ async fn real_sshd_session_and_security_checks() {
     .err()
     .unwrap();
     assert_eq!(auth_err.code, ErrorCode::Denied, "{auth_err}");
+    assert_eq!(auth_err.machine.as_deref(), Some(node.as_str()));
     assert_eq!(
         auth_err.details.as_ref().unwrap()["reason"],
         json!(REASON_AUTH_FAILED)

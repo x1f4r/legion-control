@@ -801,14 +801,14 @@ async fn default_open_session(
             })?;
             let key = crate::key::DeviceKey::from_openssh(key_text)?;
             return crate::ssh::open(
+                &entry.node,
                 _target,
                 &key,
                 crate::command::Subcommand::Rpc,
                 options.ssh_timeouts,
                 cancel,
             )
-            .await
-            .map_err(|err| err.with_machine(&entry.node));
+            .await;
         }
         #[cfg(not(feature = "ssh"))]
         {

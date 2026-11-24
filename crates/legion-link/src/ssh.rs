@@ -144,20 +144,22 @@ impl Drop for SshPipeHandle {
 /// `remote_command` can produce across both Unix and Windows (see `crates/legion-net/src/gate.rs`),
 /// so the Unix `rpc` command is accepted by gated Windows nodes as well as Linux and macOS nodes.
 pub async fn open(
+    machine: &str,
     target: &SshTarget,
     key: &DeviceKey,
     subcommand: Subcommand,
     timeouts: SshTimeouts,
     cancel: CancellationToken,
 ) -> Result<Session, ErrorBody> {
-    let pipe = open_raw(target, key, subcommand, timeouts, cancel.clone()).await?;
+    let pipe = open_raw(target, key, subcommand, timeouts, cancel.clone())
+        .await
+        .map_err(|err| err.with_machine(machine))?;
     let (reader, writer, handle) = pipe.into_parts();
-    let label = target.hosts.first().map_or("remote", String::as_str);
     Session::open_transport(
         reader,
         writer,
         Box::new(handle),
-        label,
+        machine,
         None,
         timeouts.handshake,
         cancel,
