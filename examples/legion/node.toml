@@ -1,0 +1,53 @@
+# Example node.toml: machine-local settings for one Legion node.
+# This file is never synced across machines.
+
+# Node name used in fleet listings, projects.toml, and audit logs.
+# When omitted, derived from the machine's host name.
+name = "tower"
+
+# Which OS of a dual-boot machine this is (reported in `hello` and `power.status`).
+system = "linux"
+
+# Busy detection blocks unattended power changes while important work is running.
+# Omitting `busy` leaves the node `unmonitored` (which blocks unattended power changes).
+# If nothing on this machine needs protecting, replace the probes below with:
+#   busy = "none"
+[[busy.probes]]
+name = "render"
+# Exit 0 means busy, exit 1 means idle, any other exit or timeout counts as busy.
+run = ["pgrep", "-x", "blender"]
+timeout_s = 5
+
+[[busy.probes]]
+name = "backup"
+run = ["pgrep", "-x", "restic"]
+timeout_s = 10
+
+# Service control settings.
+[svc]
+# Keep false unless you have configured narrow non-interactive sudoers rules for system services.
+sudo = false
+
+# Power action settings.
+[power]
+# Set true on Unix when built-in power commands (systemctl, efibootmgr, shutdown) run via `sudo -n`.
+sudo = true
+# Override the platform default sleep command (optional).
+sleep = ["systemctl", "suspend"]
+# Commands run in order before sleeping; any non-zero exit aborts the sleep.
+before_sleep = [["sync"]]
+
+# One-time boot targets selectable with `power.restart into=<name>` or `power.switch`.
+[boot.windows]
+# Firmware entry matched by exact label (`efibootmgr --bootnext` on Linux, `bcdedit` on Windows).
+efi_label = "Windows Boot Manager"
+
+[boot.rescue]
+# Custom arm + verify commands; verify must exit 0 only when the arming took.
+arm = ["sudo", "-n", "grub-reboot", "Rescue"]
+verify = ["sh", "-c", "grub-editenv list | grep -qx 'next_entry=Rescue'"]
+
+# Extra hosts and browser origins accepted by `legion serve` (for example behind Tailscale Serve).
+[serve]
+hosts = ["tower.example.ts.net"]
+origins = ["https://app.example.net"]

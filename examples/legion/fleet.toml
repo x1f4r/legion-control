@@ -1,0 +1,34 @@
+# Example fleet.toml: single-system, dual-boot, relayed (`via`), wake-helper, and command machines.
+
+# Single-system machine reached over SSH.
+[machines.pi]
+ssh = "pi"
+os = "unix"
+
+# Dual-boot workstation with a hardware address and an always-on wake helper (`pi`).
+[machines.tower]
+mac = "02:00:00:00:00:01"
+wake_via = ["pi"]
+
+[[machines.tower.systems]]
+name = "linux"
+ssh = "tower"
+os = "unix"
+
+[[machines.tower.systems]]
+name = "windows"
+ssh = "tower-win"
+os = "windows"
+program = 'C:\Tools\legion.exe'
+
+# Machine on another network reached through `pi` (`pi`'s own fleet.toml must define `shed`).
+# `via` replaces `ssh`/`command`/`systems` on this node.
+[machines.shed]
+via = "pi"
+mac = "02:00:00:00:00:03"
+wake_via = ["pi"]
+
+# Container or custom transport reached by running an exact command that speaks `legion rpc`.
+# Ending the argv with "rpc" lets `legion cp` derive "stream" automatically.
+[machines.studio]
+command = ["docker", "exec", "-i", "studio", "legion", "rpc"]

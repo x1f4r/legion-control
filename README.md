@@ -16,6 +16,15 @@ left running to serve the others.
 Every app is a peer. Any of them can edit the setup and hand it to the rest; none of them is in
 charge, and a device can be both a thing you control from and a thing you control.
 
+## Legion (Rust rewrite)
+
+A from-scratch Rust rewrite, `legion`, lives in this repository (`crates/`) beside the Node.js
+agent and desktop/mobile apps described below, without touching their files. It puts one small
+binary on every machine to expose system state, commands, detached jobs, files and transfers,
+projects, services, power, and fleet management through one self-describing tool registry over the
+command line, MCP, and an optional loopback HTTP door. See [docs/legion/README.md](docs/legion/README.md)
+for installation, permissions, AI agent setup, guides, and the tool reference.
+
 ## How it fits together
 
 Four clients, one agent, one contract, and the only thing between them is ssh:

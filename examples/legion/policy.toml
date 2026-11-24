@@ -1,0 +1,50 @@
+# Example policy.toml: principals, roles, allow/deny rules, and path confinement.
+# Deny always wins over allow. Any principal not listed here gets the built-in `nobody` role.
+
+# Principal used on an unpinned door (such as a local CLI shell) when `--as` is omitted.
+default = "owner"
+
+# Read-only inspection confined to projects. Safe as a real boundary behind a pinned door.
+[roles.observer]
+allow = ["effect:read"]
+deny = ["audit.*"]
+paths = ["~/projects/**"]
+
+# Read and write files inside one project folder, with no command execution.
+# Real boundary when paired with a restricted SSH key (`legion gate`) or HTTP bearer token.
+[roles.editor]
+allow = ["effect:read", "effect:write"]
+deny = ["audit.*", "fs.remove"]
+paths = ["~/projects/**"]
+
+# Full working access except power and administration.
+# Because `exec` can run any command as the OS user, treat this as a guard rail and audit trail,
+# not a filesystem sandbox.
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny = ["effect:power", "effect:admin"]
+
+# Narrow role for a phone over HTTP (status checks and waking sleeping machines only).
+[roles.phone_remote]
+allow = [
+  "meta.version",
+  "meta.whoami",
+  "sys.info",
+  "fleet.list",
+  "fleet.ping",
+  "power.status",
+  "power.wake",
+  "power.wol",
+]
+
+[principals."agent:reader"]
+role = "observer"
+
+[principals."agent:editor"]
+role = "editor"
+
+[principals."agent:claude"]
+role = "operator"
+
+[principals.phone]
+role = "phone_remote"
