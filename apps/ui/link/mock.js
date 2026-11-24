@@ -485,6 +485,8 @@ export function createMockLink(mode = '') {
       .filter(Boolean),
   );
   const isLimited = flags.has('limited');
+  const isNone = flags.has('none');
+  const isEmpty = flags.has('empty');
   const isMulti = flags.has('multi');
   const isFirst = flags.has('first');
   const isRepair = flags.has('repair');
@@ -499,10 +501,12 @@ export function createMockLink(mode = '') {
   let activeNode = 'tower';
   let pairedNodes = isMulti ? ['tower', 'pi'] : ['tower'];
 
-  const role = isLimited ? 'observer' : 'owner';
-  const allowedTools = isLimited
-    ? MOCK_TOOLS.filter((t) => t.effect === 'read').map((t) => t.name)
-    : MOCK_TOOLS.map((t) => t.name);
+  const role = isNone ? 'guest' : isLimited ? 'observer' : 'owner';
+  const allowedTools = isNone
+    ? ['meta.whoami', 'meta.version', 'fleet.list', 'sys.info', 'power.status']
+    : isLimited
+      ? MOCK_TOOLS.filter((t) => t.effect === 'read').map((t) => t.name)
+      : MOCK_TOOLS.map((t) => t.name);
 
   let incomingDevices = [
     {
@@ -969,6 +973,7 @@ export function createMockLink(mode = '') {
           bytes: 124,
         };
       case 'job.list': {
+        if (isEmpty) return { jobs: [], truncated: false };
         const jobs = args?.state ? m.jobs.filter((j) => j.state === args.state) : m.jobs;
         return {
           jobs: jobs.map(({ logs: _logs, ...rest }) => rest),

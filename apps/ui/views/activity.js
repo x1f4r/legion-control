@@ -210,7 +210,7 @@ export function ActivityGroups({
   selectedKey = '',
   hrefForJob,
   onStopJob,
-  emptyText = 'Nothing has run yet.',
+  emptyText = 'Nothing has run yet. Things you start here or on a machine appear in this list.',
 }) {
   const groups = useMemo(() => groupActivity(jobs || []), [jobs]);
 
@@ -373,7 +373,7 @@ export function ActivityView({
     </section>
   `;
 
-  if (wide) {
+  if (wide && (hasSelected || !jobs || jobs.length > 0)) {
     return html`
       <div class="split">
         ${listPane}

@@ -401,21 +401,57 @@ async function runPhoneSuite() {
   });
   await takeShot(page, '04-files.png');
 
-  // 5. Android system Back steps back in WebView history; then return to Machines -> Settings -> Technical details -> Actions -> All tools -> meta.whoami.
-  log('Step 5: verifying Android system Back, enabling Technical details in Settings, and running meta.whoami');
+  // 5. Android system Back steps back in WebView history; check plain Actions and plain Power dry-run
+  // before enabling Technical details in Settings and running meta.whoami via All tools.
+  log('Step 5: verifying Android system Back, plain Actions, plain Power dry-run, then Technical details -> meta.whoami');
   adb(['shell', 'input', 'keyevent', '4']);
   await page.locator('.dock input[aria-label="Command"]').waitFor({ state: 'visible', timeout: 10000 });
   await page.locator('header.top button[aria-label="Back"]').click();
   await page.locator('header.top button[aria-label="Back"]').click();
   await page.locator('header.top a[aria-label="Settings"]').waitFor({ state: 'visible', timeout: 10000 });
-  await page.locator('header.top a[aria-label="Settings"]').click();
+
+  // Plain Actions (Technical details off): zero tool names, no All tools row.
+  await page.locator('nav.nav a', { hasText: 'Actions' }).click();
+  await page.locator('.tile[href="#/actions/restart"]').waitFor({ state: 'visible', timeout: 10000 });
+  const plainActionsText = await page.locator('body').innerText();
+  assert.equal(await page.locator('a.row', { hasText: 'All tools' }).count(), 0, 'All tools must stay hidden in plain mode');
+  const leakedTools = plainActionsText.match(/\b(?:power|fs|exec|job|svc|proj|fleet|sys|meta|device|token|config)\.[a-z_]+\b/g) || [];
+  assert.deepEqual(leakedTools, [], `Tool name(s) leaked in plain Android Actions: ${leakedTools.join(', ')}`);
+  await takeShot(page, '05b-actions-plain.png');
+
+  // Step 6 (in plain mode): Power part asks first and dry run shows plain neutral notice with collapsed More.
+  log('Step 6: checking plain power tool confirmation and dry run');
+  await page.evaluate(() => {
+    window.location.hash = '#/machines/tower/power';
+  });
+  const sleepRow = page.locator('.row', { hasText: /Sleep tower/i }).first();
+  await sleepRow.waitFor({ state: 'visible', timeout: 15000 });
+  await sleepRow.getByRole('button', { name: 'Sleep' }).click();
+  const dialog = page.locator('[role="dialog"]');
+  await dialog.waitFor({ state: 'visible', timeout: 10000 });
+  const dryBtn = dialog.getByRole('button', { name: /Try it \(dry run\)/i });
+  await dryBtn.waitFor({ state: 'visible', timeout: 10000 });
+  await dryBtn.click();
+  await dialog.locator('.notice.neutral').waitFor({ state: 'visible', timeout: 15000 });
+  assert.equal(await dialog.locator('.notice.bad').count(), 0, 'Dry-run refusal must be neutral, not red');
+  assert.equal(await dialog.locator('pre.out').count(), 0, 'Plain dry-run sheet must not show raw commands');
+  const plainDryText = await dialog.innerText();
+  assert.ok(plainDryText.trim().length > 0, 'Expected non-empty plain dry run summary');
+  await takeShot(page, '06-power-dryrun.png');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await dialog.waitFor({ state: 'detached', timeout: 10000 });
+
+  // Open Settings, enable Technical details, and run meta.whoami via Actions -> All tools.
+  await page.evaluate(() => {
+    window.location.hash = '#/settings';
+  });
   await page.locator('header.top h1', { hasText: 'Settings' }).waitFor({ state: 'visible', timeout: 10000 });
   await takeShot(page, '05a-settings.png');
   await page.getByLabel(/Technical details/i).check();
   await page.locator('header.top button[aria-label="Back"]').click();
   await page.locator('nav.nav a', { hasText: 'Actions' }).click();
-  await page.locator('.tile[href="#/actions/restart"]').waitFor({ state: 'visible', timeout: 10000 });
-  await takeShot(page, '05b-actions.png');
+  await page.locator('a.row', { hasText: 'All tools' }).waitFor({ state: 'visible', timeout: 10000 });
+  await takeShot(page, '05b-actions-tech.png');
   await page.locator('a.row', { hasText: 'All tools' }).click();
   const filterInput = page.locator('input[type="search"]').first();
   if (await filterInput.isVisible().catch(() => false)) {
@@ -436,26 +472,6 @@ async function runPhoneSuite() {
     `Expected door ssh or rpc, got ${reportedDoor}`,
   );
   await takeShot(page, '05-tools-whoami.png');
-
-  // 6. Power part asks first and only the dry run is performed.
-  log('Step 6: checking power tool confirmation and dry run');
-  await page.evaluate(() => {
-    window.location.hash = '#/machines/tower/power';
-  });
-  const sleepRow = page.locator('.row', { hasText: /Sleep tower/i }).first();
-  await sleepRow.waitFor({ state: 'visible', timeout: 15000 });
-  await sleepRow.getByRole('button', { name: 'Sleep' }).click();
-  const dialog = page.locator('[role="dialog"]');
-  await dialog.waitFor({ state: 'visible', timeout: 10000 });
-  const dryBtn = dialog.getByRole('button', { name: /Try it \(dry run\)/i });
-  await dryBtn.waitFor({ state: 'visible', timeout: 10000 });
-  await dryBtn.click();
-  await dialog.locator('pre.out').waitFor({ state: 'visible', timeout: 15000 });
-  const dryText = await dialog.locator('pre.out').innerText();
-  assert.ok(dryText.trim().length > 0, 'Expected non-empty dry run output');
-  await takeShot(page, '06-power-dryrun.png');
-  await dialog.getByRole('button', { name: 'Cancel' }).click();
-  await dialog.waitFor({ state: 'detached', timeout: 10000 });
 
   // 7. Force-stop and relaunch: still paired, no pairing prompt.
   log('Step 7: force-stopping and relaunching the app');
