@@ -7,7 +7,7 @@ use legion_core::proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
 
-/// The argument every tool gains, naming where to run it.
+/// The argument every tool gains in full mode, naming where to run it.
 pub(crate) const ON: &str = "on";
 
 /// The registry's tools, each with the MCP tool that serves it, sorted by registry name.
@@ -21,14 +21,18 @@ pub(crate) struct Catalog {
 pub(crate) struct Entry {
     /// The tool as the node knows it.
     pub(crate) spec: ToolSpec,
-    /// The tool as `tools/list` shows it.
+    /// The tool as `tools/list` shows it in full mode.
     pub(crate) tool: Tool,
 }
 
 impl Catalog {
-    /// The catalog of these tools, or why they cannot be served: two registry names that become
-    /// the same MCP name, or a tool that takes an argument called `on`.
-    pub(crate) fn new(specs: Vec<ToolSpec>) -> Result<Catalog, ErrorBody> {
+    /// The catalog of these tools.
+    ///
+    /// `full` is whether each tool is served as an MCP tool of its own. Only then do two registry
+    /// names that become the same MCP name, or a tool that takes an argument called `on`, make the
+    /// door unable to serve the registry; compact mode names tools as the registry does and passes
+    /// `on` beside the arguments, so neither is a problem there.
+    pub(crate) fn new(specs: Vec<ToolSpec>, full: bool) -> Result<Catalog, ErrorBody> {
         let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for spec in &specs {
             aliases
@@ -38,20 +42,22 @@ impl Catalog {
         }
         let mut entries = Vec::with_capacity(specs.len());
         for spec in specs {
-            let taken = aliases
-                .get(&mcp_name(&spec.name))
-                .map_or(&[][..], Vec::as_slice);
-            if let [first, second, ..] = taken {
-                return Err(ErrorBody::new(
-                    ErrorCode::Conflict,
-                    format!(
-                        "{first} and {second} would both be served over MCP as {}, so neither could be called.",
-                        mcp_name(first)
-                    ),
-                )
-                .with_hint("Rename one of the tools."));
+            if full {
+                let taken = aliases
+                    .get(&mcp_name(&spec.name))
+                    .map_or(&[][..], Vec::as_slice);
+                if let [first, second, ..] = taken {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            "{first} and {second} would both be served over MCP as {}, so neither could be called.",
+                            mcp_name(first)
+                        ),
+                    )
+                    .with_hint("Rename one of the tools, or serve the registry with --compact, which keeps the registry's names."));
+                }
             }
-            let tool = mcp_tool(&spec)?;
+            let tool = mcp_tool(&spec, full)?;
             entries.push(Entry { spec, tool });
         }
         entries.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
@@ -83,9 +89,13 @@ pub(crate) fn mcp_name(tool: &str) -> String {
 }
 
 /// The MCP tool serving a registry tool: its name without dots, its own description, its schema
-/// with `on` added, and its effect as annotations.
-pub(crate) fn mcp_tool(spec: &ToolSpec) -> Result<Tool, ErrorBody> {
-    let schema = schema_with_on(spec)?;
+/// with `on` added when `with_on`, and its effect as annotations.
+pub(crate) fn mcp_tool(spec: &ToolSpec, with_on: bool) -> Result<Tool, ErrorBody> {
+    let schema = if with_on {
+        schema_with_on(spec)?
+    } else {
+        object_schema(&spec.input_schema)
+    };
     Ok(
         Tool::new(mcp_name(&spec.name), spec.description.clone(), schema)
             .with_title(spec.name.clone())
@@ -159,13 +169,13 @@ fn add_on(schema: &mut JsonObject, spec: &ToolSpec) -> Result<(), ErrorBody> {
                 spec.name
             ),
         )
-        .with_hint("Rename the tool's argument."));
+        .with_hint("Rename the tool's argument, or serve the registry with --compact, which passes on beside the arguments."));
     }
     properties.insert(ON.to_owned(), on_schema());
     Ok(())
 }
 
-/// The schema of `on`.
+/// The schema of `on`, the same in full and compact mode.
 pub(crate) fn on_schema() -> Value {
     json!({
         "description": "Where to run: a machine's name, a list of machine names, or \"all\". Leave it out to run on this machine.",
@@ -174,6 +184,15 @@ pub(crate) fn on_schema() -> Value {
             {"type": "array", "items": {"type": "string"}, "minItems": 1}
         ]
     })
+}
+
+/// The first sentence of a description, or its first line, for listings that show many tools.
+pub(crate) fn summary(description: &str) -> &str {
+    let line = description.lines().next().unwrap_or_default().trim();
+    match line.find(". ") {
+        Some(end) => &line[..=end],
+        None => line,
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +219,7 @@ mod tests {
 
     #[test]
     fn a_tool_is_served_without_dots_with_on_and_its_effect() {
-        let tool = mcp_tool(&spec("fs.read", Effect::Read, closed())).unwrap();
+        let tool = mcp_tool(&spec("fs.read", Effect::Read, closed()), true).unwrap();
         assert_eq!(tool.name, "fs_read");
         assert_eq!(tool.title.as_deref(), Some("fs.read"));
         assert_eq!(tool.description.as_deref(), Some("Does it. Then more."));
@@ -236,13 +255,16 @@ mod tests {
                 Effect::Read,
                 json!({"$schema": "https://json-schema.org/draft/2020-12/schema", "type": ["object", "null"]}),
             ),
+            true,
         )
         .unwrap();
         assert_eq!(odd.input_schema.get("$schema"), None);
         assert_eq!(odd.input_schema["type"], json!("object"));
-        let broken = mcp_tool(&spec("x.broken", Effect::Read, json!("string"))).unwrap();
+        let broken = mcp_tool(&spec("x.broken", Effect::Read, json!("string")), true).unwrap();
         assert_eq!(broken.input_schema["type"], json!("object"));
         assert!(broken.input_schema["properties"]["on"].is_object());
+        let compact = mcp_tool(&spec("x.y", Effect::Read, closed()), false).unwrap();
+        assert_eq!(compact.input_schema["properties"].get("on"), None);
     }
 
     #[test]
@@ -255,7 +277,7 @@ mod tests {
                 {"required": ["x"]}
             ]
         });
-        let tool = mcp_tool(&spec("exec.run", Effect::Exec, schema)).unwrap();
+        let tool = mcp_tool(&spec("exec.run", Effect::Exec, schema), true).unwrap();
         let branches = tool.input_schema["oneOf"].as_array().unwrap();
         assert!(branches[0]["properties"]["on"].is_object());
         assert!(branches[1]["properties"]["on"].is_object());
@@ -263,35 +285,34 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_with_its_own_on_cannot_be_served() {
+    fn a_tool_with_its_own_on_cannot_be_served_in_full_mode() {
         let schema = json!({"type": "object", "properties": {"on": {"type": "boolean"}}});
         let tools = vec![spec("x.switch", Effect::Write, schema)];
-        let error = Catalog::new(tools).err().unwrap();
+        let error = Catalog::new(tools.clone(), true).err().unwrap();
         assert_eq!(error.code, ErrorCode::Conflict);
         assert!(error.message.contains("x.switch"), "{}", error.message);
+        assert!(Catalog::new(tools, false).is_ok());
     }
 
     #[test]
-    fn names_that_would_collide_are_refused() {
+    fn names_that_would_collide_are_refused_in_full_mode_only() {
         let tools = vec![
             spec("a.b_c", Effect::Read, closed()),
             spec("a_b.c", Effect::Read, closed()),
             spec("fs.read", Effect::Read, closed()),
         ];
-        let error = Catalog::new(tools).err().unwrap();
+        let error = Catalog::new(tools.clone(), true).err().unwrap();
         assert!(
             error.message.contains("a.b_c and a_b.c"),
             "{}",
             error.message
         );
         assert!(error.message.contains("a_b_c"), "{}", error.message);
-    }
-
-    #[test]
-    fn a_tool_is_found_by_either_name() {
-        let catalog = Catalog::new(vec![spec("fs.read", Effect::Read, closed())]).unwrap();
+        let catalog = Catalog::new(tools, false).unwrap();
         assert_eq!(catalog.resolve("fs_read"), "fs.read");
         assert_eq!(catalog.resolve("fs.read"), "fs.read");
+        // Ambiguous, so left as it is, for the node to call unknown.
+        assert_eq!(catalog.resolve("a_b_c"), "a_b_c");
         assert_eq!(catalog.resolve("nope"), "nope");
     }
 
@@ -318,7 +339,7 @@ mod tests {
     #[test]
     fn every_registry_tool_is_served_with_a_plain_object_schema_taking_on() {
         let registry = legion_tools::registry();
-        let catalog = Catalog::new(registry.specs()).unwrap();
+        let catalog = Catalog::new(registry.specs(), true).unwrap();
         assert_eq!(catalog.entries().len(), registry.names().count());
         for entry in catalog.entries() {
             let name = &entry.spec.name;
@@ -364,5 +385,13 @@ mod tests {
             }
             assert!(tool.annotations.is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn a_summary_is_the_first_sentence() {
+        assert_eq!(summary("Does it. Then more."), "Does it.");
+        assert_eq!(summary("One line\nand another."), "One line");
+        assert_eq!(summary("Reads 1.5 GiB files."), "Reads 1.5 GiB files.");
+        assert_eq!(summary(""), "");
     }
 }

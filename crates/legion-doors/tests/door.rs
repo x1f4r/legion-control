@@ -52,6 +52,7 @@ async fn on_is_taken_out_of_the_arguments_and_handed_to_the_router() {
         recorder.clone(),
         Options {
             pinned: Some("agent:test".to_owned()),
+            compact: false,
         },
     )
     .unwrap();

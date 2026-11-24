@@ -5,12 +5,14 @@
 //! client may first ask `server/discover`. The door itself does not care which one a client
 //! speaks; the SDK shapes each reply for the revision of the request it answers.
 //!
-//! Every registry tool is an MCP tool of its own, named with an underscore for the dot (`fs.read`
-//! is `fs_read`) and taking one more optional argument, `on`, the machine or machines to run on. A
-//! failed call is a tool result with `isError` set and the error object as its text, so an agent
+//! In full mode every registry tool is an MCP tool of its own, named with an underscore for the
+//! dot (`fs.read` is `fs_read`) and taking one more optional argument, `on`, the machine or
+//! machines to run on. In compact mode three tools list, describe and call the others. Either way
+//! a failed call is a tool result with `isError` set and the error object as its text, so an agent
 //! reads the code and the hint instead of a protocol error it cannot see.
 
 mod catalog;
+mod compact;
 mod events;
 
 use std::io;
@@ -25,11 +27,12 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, ServerInitializeError};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::task::TaskTracker;
 
-use self::catalog::{Catalog, ON};
+use self::catalog::{Catalog, ON, summary};
 use self::events::{Forwarder, Level};
 
 /// How a session is served.
@@ -38,6 +41,9 @@ pub struct Options {
     /// The principal every call in the session acts as, as `legion mcp --as` pins it. A pinned
     /// session cannot be talked into acting as anyone else.
     pub pinned: Option<String>,
+    /// Serve `legion_tools`, `legion_describe` and `legion_call` instead of one tool per registry
+    /// tool, so an agent carries three schemas rather than every one.
+    pub compact: bool,
 }
 
 /// One MCP session over a node.
@@ -56,14 +62,14 @@ pub struct McpDoor {
 impl McpDoor {
     /// A door serving `node`'s tools, running each call through `router`.
     ///
-    /// Fails when the registry cannot be served as it is: two tool names that become the same MCP
-    /// name, or a tool with an argument of its own called `on`.
+    /// Fails in full mode when the registry cannot be served as it is: two tool names that become
+    /// the same MCP name, or a tool with an argument of its own called `on`.
     pub fn new(
         node: Node,
         router: Arc<dyn Router>,
         options: Options,
     ) -> Result<McpDoor, ErrorBody> {
-        let catalog = Catalog::new(node.specs())?;
+        let catalog = Catalog::new(node.specs(), !options.compact)?;
         Ok(McpDoor {
             node,
             router,
@@ -108,8 +114,8 @@ impl McpDoor {
         Some(policy.grant(&principal, self.node.paths().home()))
     }
 
-    /// The tools listed: those the principal may use. Listing is a courtesy that keeps an agent
-    /// from trying what will be refused; the node checks every call regardless.
+    /// The tools listed in full mode: those the principal may use. Listing is a courtesy that
+    /// keeps an agent from trying what will be refused; the node checks every call regardless.
     fn listed(&self) -> Vec<Tool> {
         let grant = self.grant();
         self.catalog
@@ -121,7 +127,20 @@ impl McpDoor {
     }
 
     fn instructions(&self) -> String {
-        "Legion gives you the tools of the machine it runs on, and through `on` those of the other machines it can reach. Call meta_whoami first: it says who you act as here, your role, the directories file tools are confined to, and the tools you may use. Every tool takes an optional `on`: a machine's name, a list of names, or \"all\"; leave it out to act on this machine. A failed call returns a JSON error object with a `code` to branch on and, usually, a `hint` saying what to do.".to_owned()
+        let (whoami, on) = if self.options.compact {
+            (
+                "legion_tools lists the tools, legion_describe gives one tool's arguments, and legion_call runs one. Call legion_call with tool meta.whoami first",
+                "legion_call takes an optional `on`",
+            )
+        } else {
+            (
+                "Call meta_whoami first",
+                "Every tool takes an optional `on`",
+            )
+        };
+        format!(
+            "Legion gives you the tools of the machine it runs on, and through `on` those of the other machines it can reach. {whoami}: it says who you act as here, your role, the directories file tools are confined to, and the tools you may use. {on}: a machine's name, a list of names, or \"all\"; leave it out to act on this machine. A failed call returns a JSON error object with a `code` to branch on and, usually, a `hint` saying what to do."
+        )
     }
 
     /// Runs one call through the router, forwarding its events while it runs.
@@ -196,6 +215,109 @@ impl McpDoor {
             })
     }
 
+    /// A call to one of the three tools compact mode serves.
+    async fn call_compact(
+        &self,
+        name: &str,
+        args: JsonObject,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<Value, ErrorBody> {
+        match name {
+            compact::TOOLS => {
+                let args: compact::ToolsArgs = compact::parse(name, args)?;
+                self.list_compact(args.family.as_deref())
+            }
+            compact::DESCRIBE => {
+                let args: compact::DescribeArgs = compact::parse(name, args)?;
+                let spec = self
+                    .node
+                    .spec(self.catalog.resolve(&args.tool))
+                    .map_err(|error| error.with_hint("legion_tools lists the tools here."))?;
+                to_object(&spec)
+            }
+            compact::CALL => {
+                let args: compact::CallArgs = compact::parse(name, args)?;
+                let tool = self.catalog.resolve(&args.tool);
+                let tool_args = Value::Object(args.args.unwrap_or_default());
+                self.run(tool, tool_args, args.on, context)
+                    .await
+                    .map_err(|error| match error.code {
+                        ErrorCode::UnknownTool => {
+                            error.with_hint("legion_tools lists the tools here.")
+                        }
+                        _ => error,
+                    })
+            }
+            other => {
+                let tool = self.catalog.resolve(other);
+                let hint = if self.node.spec(tool).is_ok() {
+                    format!("Run it with legion_call, giving tool \"{tool}\".")
+                } else {
+                    "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned()
+                };
+                Err(self
+                    .door_error(
+                        ErrorCode::UnknownTool,
+                        format!("There is no tool called {other} in this session."),
+                    )
+                    .with_hint(hint))
+            }
+        }
+    }
+
+    /// `legion_tools`: the tools the principal may use, optionally of one family.
+    fn list_compact(&self, family: Option<&str>) -> Result<Value, ErrorBody> {
+        #[derive(Serialize)]
+        struct Listing<'a> {
+            tools: Vec<Listed<'a>>,
+        }
+        #[derive(Serialize)]
+        struct Listed<'a> {
+            name: &'a str,
+            effect: &'a str,
+            description: &'a str,
+        }
+        let grant = self.grant();
+        let allowed: Vec<&catalog::Entry> = self
+            .catalog
+            .entries()
+            .iter()
+            .filter(|entry| grant.as_ref().is_none_or(|grant| grant.allows(&entry.spec)))
+            .collect();
+        let chosen: Vec<Listed<'_>> = allowed
+            .iter()
+            .filter(|entry| {
+                family.is_none_or(|family| {
+                    compact::in_family(&entry.spec.name, compact::family(family))
+                })
+            })
+            .map(|entry| Listed {
+                name: &entry.spec.name,
+                effect: entry.spec.effect.as_str(),
+                description: summary(&entry.spec.description),
+            })
+            .collect();
+        if let Some(family) = family
+            && chosen.is_empty()
+        {
+            let mut families: Vec<&str> = allowed
+                .iter()
+                .filter_map(|entry| entry.spec.name.split('.').next())
+                .collect();
+            families.dedup();
+            return Err(self
+                .door_error(
+                    ErrorCode::NotFound,
+                    format!("You may use no tools of a family called {family} here."),
+                )
+                .with_hint(format!(
+                    "The families you may use here are {}. Leave out family to list every tool.",
+                    families.join(", ")
+                )));
+        }
+        to_object(&Listing { tools: chosen })
+    }
+
     /// An error the door itself finds, before any call reaches the node, naming the node as the
     /// node's own errors do.
     fn door_error(&self, code: ErrorCode, message: String) -> ErrorBody {
@@ -224,6 +346,15 @@ fn tool_result(outcome: Result<Value, ErrorBody>) -> CallToolResult {
     result
 }
 
+fn to_object<T: Serialize>(value: &T) -> Result<Value, ErrorBody> {
+    serde_json::to_value(value).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("The reply cannot be written as JSON: {error}."),
+        )
+    })
+}
+
 impl ServerHandler for McpDoor {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(events::capabilities())
@@ -236,7 +367,12 @@ impl ServerHandler for McpDoor {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(self.listed()))
+        let tools = if self.options.compact {
+            compact::tools()
+        } else {
+            self.listed()
+        };
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -245,7 +381,11 @@ impl ServerHandler for McpDoor {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let args = request.arguments.unwrap_or_default();
-        let outcome = self.call_tool_by_name(&request.name, args, &context).await;
+        let outcome = if self.options.compact {
+            self.call_compact(&request.name, args, &context).await
+        } else {
+            self.call_tool_by_name(&request.name, args, &context).await
+        };
         Ok(tool_result(outcome).into())
     }
 
