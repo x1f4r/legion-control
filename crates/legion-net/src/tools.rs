@@ -1,0 +1,709 @@
+//! The `fleet` tool family: listing, pinging, editing, and discovering machines in `fleet.toml`.
+//!
+//! These tools hold a clone of [`Fleet`] so `fleet.ping` reuses the session pool and
+//! `fleet.add`/`fleet.remove` evict stale connections after editing `fleet.toml`.
+
+use std::collections::{BTreeMap, HashSet};
+use std::marker::PhantomData;
+use std::time::Duration;
+
+use legion_core::config::{Document, NodeName};
+use legion_core::{BoxFuture, Ctx, NoArgs, Registry, Tool, ToolError, input_schema, parse_args};
+use legion_os::OsError;
+use legion_os::run::{RunOptions, run};
+use legion_os::shell::CommandSpec;
+use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::task::JoinSet;
+
+use crate::config::{
+    FleetFile, MachineEntry, RemoteOs, SystemEntry, Transport, add_missing_machines,
+    remove_machine, upsert_machine, validate_ssh_target,
+};
+use crate::pool::Fleet;
+
+/// Default `fleet.ping` timeout in seconds.
+const DEFAULT_PING_TIMEOUT_S: f64 = 8.0;
+/// Maximum `fleet.ping` timeout in seconds.
+const MAX_PING_TIMEOUT_S: f64 = 60.0;
+/// Timeout for running `tailscale status --json`.
+const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Registers `fleet.toml` with `meta.doctor` and adds every `fleet.*` tool to `registry`.
+pub fn register(registry: &mut Registry, fleet: Fleet) {
+    registry.add_document::<FleetFile>();
+
+    registry.add(FleetTool::<NoArgs, ListResult, _>::new(
+        "fleet.list",
+        Effect::Read,
+        "List the machines configured in fleet.toml, their systems and transport targets, without making network connections.",
+        fleet.clone(),
+        |fleet, ctx, args| Box::pin(fleet_list(fleet, ctx, args)),
+    ));
+    registry.add(FleetTool::<PingArgs, PingResult, _>::new(
+        "fleet.ping",
+        Effect::Read,
+        "Check whether machines in fleet.toml answer hello, concurrently, reporting their node name, system, version, platform and latency.",
+        fleet.clone(),
+        |fleet, ctx, args| Box::pin(fleet_ping(fleet, ctx, args)),
+    ));
+    registry.add(FleetTool::<AddArgs, AddResult, _>::new(
+        "fleet.add",
+        Effect::Admin,
+        "Add or replace a machine entry in fleet.toml atomically while preserving comments and unrelated entries.",
+        fleet.clone(),
+        |fleet, ctx, args| Box::pin(fleet_add(fleet, ctx, args)),
+    ));
+    registry.add(FleetTool::<RemoveArgs, RemoveResult, _>::new(
+        "fleet.remove",
+        Effect::Admin,
+        "Remove a machine entry from fleet.toml atomically while preserving comments and unrelated entries.",
+        fleet.clone(),
+        |fleet, ctx, args| Box::pin(fleet_remove(fleet, ctx, args)),
+    ));
+    registry.add(FleetTool::<DiscoverArgs, DiscoverResult, _>::new(
+        "fleet.discover",
+        Effect::Read,
+        "Discover peer machines from `tailscale status --json` using their MagicDNS names. Pass `add: true` (requires admin permission) to add unlisted peers to fleet.toml.",
+        fleet,
+        |fleet, ctx, args| Box::pin(fleet_discover(fleet, ctx, args)),
+    ));
+}
+
+struct FleetTool<A, O, F> {
+    spec: ToolSpec,
+    fleet: Fleet,
+    handler: F,
+    types: PhantomData<fn(A) -> O>,
+}
+
+impl<A, O, F> FleetTool<A, O, F>
+where
+    A: DeserializeOwned + JsonSchema + Send + 'static,
+    O: Serialize + 'static,
+    F: for<'a> Fn(&'a Fleet, &'a Ctx, A) -> BoxFuture<'a, Result<O, ToolError>>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn new(name: &str, effect: Effect, description: &str, fleet: Fleet, handler: F) -> Self {
+        Self {
+            spec: ToolSpec {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                effect,
+                input_schema: input_schema::<A>(),
+            },
+            fleet,
+            handler,
+            types: PhantomData,
+        }
+    }
+}
+
+impl<A, O, F> Tool for FleetTool<A, O, F>
+where
+    A: DeserializeOwned + JsonSchema + Send + 'static,
+    O: Serialize + 'static,
+    F: for<'a> Fn(&'a Fleet, &'a Ctx, A) -> BoxFuture<'a, Result<O, ToolError>>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn call<'a>(&'a self, ctx: &'a Ctx, args: Value) -> BoxFuture<'a, Result<Value, ToolError>> {
+        Box::pin(async move {
+            let parsed = parse_args::<A>(&self.spec.name, args)?;
+            let out = (self.handler)(&self.fleet, ctx, parsed).await?;
+            match serde_json::to_value(&out) {
+                Ok(value @ Value::Object(_)) => Ok(value),
+                Ok(_) => Err(ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("{} did not return a JSON object.", self.spec.name),
+                )),
+                Err(error) => Err(ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "{} returned a result that cannot be written as JSON: {error}.",
+                        self.spec.name
+                    ),
+                )),
+            }
+        })
+    }
+}
+
+/// What `fleet.list` returns.
+#[derive(Debug, Serialize)]
+struct ListResult {
+    node: String,
+    machines: Vec<ListedMachine>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListedMachine {
+    name: String,
+    this_node: bool,
+    systems: Vec<ListedSystem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mac: Option<String>,
+    wake_via: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListedSystem {
+    name: String,
+    via: &'static str,
+    target: SystemTarget,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum SystemTarget {
+    Ssh(String),
+    Command(Vec<String>),
+}
+
+async fn fleet_list(_fleet: &Fleet, ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
+    let file = ctx.config().get::<FleetFile>()?;
+    let here = ctx.node_name();
+    let machines = file
+        .machines
+        .iter()
+        .map(|(name, entry)| {
+            let systems = entry
+                .resolved_systems()
+                .into_iter()
+                .map(|sys| match sys.transport {
+                    Transport::Ssh { target, .. } => ListedSystem {
+                        name: sys.name,
+                        via: "ssh",
+                        target: SystemTarget::Ssh(target),
+                    },
+                    Transport::Command { argv } => ListedSystem {
+                        name: sys.name,
+                        via: "command",
+                        target: SystemTarget::Command(argv),
+                    },
+                })
+                .collect();
+            ListedMachine {
+                name: name.clone(),
+                this_node: name == here,
+                systems,
+                mac: entry.mac.clone(),
+                wake_via: entry.wake_via.clone(),
+            }
+        })
+        .collect();
+    Ok(ListResult {
+        node: here.to_owned(),
+        machines,
+    })
+}
+
+/// Arguments of `fleet.ping`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PingArgs {
+    /// Machine names to probe; every machine in fleet.toml when absent.
+    #[serde(default)]
+    machines: Option<Vec<String>>,
+    /// Seconds to wait per machine, up to 60; 8 when absent.
+    #[serde(default)]
+    timeout_s: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PingResult {
+    results: Vec<PingEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct PingEntry {
+    machine: String,
+    reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorBody>,
+}
+
+async fn fleet_ping(fleet: &Fleet, ctx: &Ctx, args: PingArgs) -> Result<PingResult, ToolError> {
+    let timeout_s = args.timeout_s.unwrap_or(DEFAULT_PING_TIMEOUT_S);
+    if !timeout_s.is_finite() || timeout_s <= 0.0 || timeout_s > MAX_PING_TIMEOUT_S {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "fleet.ping timeout_s must be greater than 0 and at most {MAX_PING_TIMEOUT_S}, and {timeout_s} was given."
+            ),
+        )
+        .with_hint("Give timeout_s as a positive number of seconds up to 60."));
+    }
+    let timeout = Duration::from_secs_f64(timeout_s);
+    let file = ctx.config().get::<FleetFile>()?;
+    let targets: Vec<String> = match args.machines {
+        Some(names) => names,
+        None => file.machines.keys().cloned().collect(),
+    };
+
+    let here = ctx.node_name().to_owned();
+    let config_dir = ctx.config().dir().to_path_buf();
+    let mut set = JoinSet::new();
+    for (index, machine) in targets.into_iter().enumerate() {
+        let fleet = fleet.clone();
+        let here = here.clone();
+        let config_dir = config_dir.clone();
+        let cancel = ctx.cancel_token().child_token();
+        set.spawn(async move {
+            let store = legion_core::ConfigStore::new(config_dir);
+            let outcome = fleet.ping(&store, &here, &machine, timeout, cancel).await;
+            (index, outcome)
+        });
+    }
+
+    let mut ordered = BTreeMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((index, outcome)) = joined {
+            ordered.insert(
+                index,
+                PingEntry {
+                    machine: outcome.machine,
+                    reachable: outcome.reachable,
+                    node: outcome.node,
+                    system: outcome.system,
+                    version: outcome.version,
+                    os: outcome.os,
+                    arch: outcome.arch,
+                    latency_ms: outcome.latency_ms,
+                    error: outcome.error,
+                },
+            );
+        }
+    }
+
+    Ok(PingResult {
+        results: ordered.into_values().collect(),
+    })
+}
+
+/// One bootable system of a machine, for `fleet.add`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddSystemArgs {
+    /// Name of this bootable system, such as `"linux"` or `"windows"`.
+    name: String,
+    /// SSH target accepted by the system ssh client. Give this or `command`, not both.
+    #[serde(default)]
+    ssh: Option<String>,
+    /// Exact argv to start `legion rpc`. Give this or `ssh`, not both.
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    /// Remote `legion` binary name or path when it is not found the default way.
+    #[serde(default)]
+    program: Option<String>,
+    /// Operating system hint (`"unix"` or `"windows"`).
+    #[serde(default)]
+    os: Option<RemoteOs>,
+}
+
+/// Arguments of `fleet.add`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddArgs {
+    /// Machine name (lower-case letters, digits, `-` and `_`, starting with a letter or digit).
+    name: String,
+    /// SSH target accepted by the system ssh client. Give one of `ssh`, `command` or `systems`.
+    #[serde(default)]
+    ssh: Option<String>,
+    /// Exact argv to start `legion rpc`. Give one of `ssh`, `command` or `systems`.
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    /// Multiple bootable systems for a dual-boot machine. Give one of `ssh`, `command` or `systems`.
+    #[serde(default)]
+    systems: Option<Vec<AddSystemArgs>>,
+    /// Remote `legion` binary name or path when it is not found the default way.
+    #[serde(default)]
+    program: Option<String>,
+    /// Operating system hint (`"unix"` or `"windows"`).
+    #[serde(default)]
+    os: Option<RemoteOs>,
+    /// Hardware MAC address for waking the machine, such as `"02:00:00:00:00:01"`.
+    #[serde(default)]
+    mac: Option<String>,
+    /// Helper machines that can wake this machine.
+    #[serde(default)]
+    wake_via: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AddResult {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    added: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replaced: Option<bool>,
+}
+
+async fn fleet_add(fleet: &Fleet, ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
+    let entry = MachineEntry {
+        ssh: args.ssh,
+        command: args.command,
+        program: args.program,
+        os: args.os,
+        systems: args.systems.map(|list| {
+            list.into_iter()
+                .map(|sys| SystemEntry {
+                    name: sys.name,
+                    ssh: sys.ssh,
+                    command: sys.command,
+                    program: sys.program,
+                    os: sys.os,
+                })
+                .collect()
+        }),
+        mac: args.mac,
+        wake_via: args.wake_via.unwrap_or_default(),
+    };
+    let path = ctx.paths().config_file(FleetFile::FILE);
+    let replaced = upsert_machine(&path, &args.name, &entry)?;
+    fleet.evict(&args.name).await;
+    Ok(AddResult {
+        name: args.name,
+        added: (!replaced).then_some(true),
+        replaced: replaced.then_some(true),
+    })
+}
+
+/// Arguments of `fleet.remove`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemoveArgs {
+    /// Name of the machine to remove from fleet.toml.
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoveResult {
+    name: String,
+    removed: bool,
+}
+
+async fn fleet_remove(
+    fleet: &Fleet,
+    ctx: &Ctx,
+    args: RemoveArgs,
+) -> Result<RemoveResult, ToolError> {
+    let path = ctx.paths().config_file(FleetFile::FILE);
+    remove_machine(&path, &args.name)?;
+    fleet.evict(&args.name).await;
+    Ok(RemoveResult {
+        name: args.name,
+        removed: true,
+    })
+}
+
+/// Arguments of `fleet.discover`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DiscoverArgs {
+    /// Add every discovered machine that is not already listed in fleet.toml. Requires admin
+    /// permission.
+    #[serde(default)]
+    add: bool,
+}
+
+/// One candidate machine parsed from `tailscale status --json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DiscoveredMachine {
+    /// Normalized Legion machine name derived from the peer's MagicDNS label or host name.
+    pub name: String,
+    /// MagicDNS name used as the SSH target.
+    pub ssh: String,
+    /// Remote operating system reported by Tailscale (lower-cased).
+    pub os: String,
+    /// Whether Tailscale currently reports the peer as online.
+    pub online: bool,
+    /// Whether this machine name or SSH target is already listed in `fleet.toml`.
+    pub already_listed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoverResult {
+    candidates: Vec<DiscoveredMachine>,
+}
+
+async fn fleet_discover(
+    fleet: &Fleet,
+    ctx: &Ctx,
+    args: DiscoverArgs,
+) -> Result<DiscoverResult, ToolError> {
+    if args.add {
+        let add_spec = ToolSpec {
+            name: "fleet.add".to_owned(),
+            description: String::new(),
+            effect: Effect::Admin,
+            input_schema: Value::Null,
+        };
+        if !ctx.grant().allows(&add_spec) {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "{} may not use fleet.discover with add = true: its role {} is not allowed to call fleet.add (effect admin).",
+                    ctx.grant().principal(),
+                    ctx.grant().role(),
+                ),
+            )
+            .with_hint(
+                "Call fleet.discover without add, or ask the owner to allow fleet.add or effect:admin in policy.toml.",
+            ));
+        }
+    }
+
+    let existing = ctx.config().get::<FleetFile>()?;
+    let options = RunOptions::new(CommandSpec::argv("tailscale", ["status", "--json"]))
+        .c_locale()
+        .timeout(TAILSCALE_TIMEOUT)
+        .cancel(ctx.cancel_token().child_token());
+
+    let output = run(options).await.map_err(|err| match err {
+        OsError::ProgramNotFound { .. } => ErrorBody::new(
+            ErrorCode::Unsupported,
+            "Cannot discover machines: `tailscale` is not installed or not on PATH.",
+        )
+        .with_hint("Install Tailscale, or add machines directly with fleet.add."),
+        other => ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("Cannot run `tailscale status --json`: {other}."),
+        )
+        .with_hint("Ensure Tailscale is installed and reachable, or add machines with fleet.add."),
+    })?;
+
+    if output.cancelled {
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            "The call to fleet.discover was cancelled.",
+        ));
+    }
+    if output.timed_out {
+        return Err(ErrorBody::new(
+            ErrorCode::Unsupported,
+            "Running `tailscale status --json` timed out.",
+        )
+        .with_hint("Check that the Tailscale daemon is running, or add machines with fleet.add."));
+    }
+    if !output.success() {
+        let detail = output.stderr.text.trim();
+        let message = if detail.is_empty() {
+            format!(
+                "`tailscale status --json` failed (exit {:?}).",
+                output.exit_code
+            )
+        } else {
+            format!("`tailscale status --json` failed: {detail}")
+        };
+        return Err(ErrorBody::new(ErrorCode::Unsupported, message).with_hint(
+            "Check that Tailscale is running and logged in (`tailscale status`), or add machines with fleet.add.",
+        ));
+    }
+
+    let candidates = parse_tailscale_status(&output.stdout.text, &existing, ctx.node_name())?;
+
+    if args.add {
+        let to_add: Vec<(String, MachineEntry)> = candidates
+            .iter()
+            .filter(|c| !c.already_listed)
+            .map(|c| {
+                let entry = MachineEntry {
+                    ssh: Some(c.ssh.clone()),
+                    os: infer_remote_os(&c.os),
+                    ..Default::default()
+                };
+                (c.name.clone(), entry)
+            })
+            .collect();
+        let path = ctx.paths().config_file(FleetFile::FILE);
+        let added = add_missing_machines(&path, &to_add)?;
+        for name in &added {
+            fleet.evict(name).await;
+        }
+    }
+
+    Ok(DiscoverResult { candidates })
+}
+
+/// Parses a `tailscale status --json` document into sorted fleet discovery candidates.
+///
+/// Pure function so it can be unit-tested exhaustively against canned Tailscale snapshots without
+/// running `tailscale` or touching the network.
+pub fn parse_tailscale_status(
+    json: &str,
+    existing: &FleetFile,
+    this_node: &str,
+) -> Result<Vec<DiscoveredMachine>, ErrorBody> {
+    #[derive(Deserialize)]
+    struct TailscaleStatus {
+        #[serde(rename = "Peer", default)]
+        peers: Option<BTreeMap<String, TailscalePeer>>,
+    }
+
+    #[derive(Deserialize)]
+    struct TailscalePeer {
+        #[serde(rename = "HostName", default)]
+        host_name: String,
+        #[serde(rename = "DNSName", default)]
+        dns_name: String,
+        #[serde(rename = "OS", default)]
+        os: String,
+        #[serde(rename = "Online", default)]
+        online: bool,
+    }
+
+    let parsed: TailscaleStatus = serde_json::from_str(json).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("Could not parse `tailscale status --json` output: {err}."),
+        )
+        .with_hint("Ensure a supported version of the Tailscale CLI is installed.")
+    })?;
+
+    let mut seen_names = HashSet::new();
+    let mut candidates = Vec::new();
+    for peer in parsed.peers.unwrap_or_default().into_values() {
+        let ssh = peer.dns_name.trim().trim_end_matches('.').to_owned();
+        if ssh.is_empty() || validate_ssh_target(&ssh).is_err() {
+            continue;
+        }
+        let raw_label = ssh
+            .split('.')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&peer.host_name);
+        let name = NodeName::from_host_name(raw_label).to_string();
+        if name == this_node || !seen_names.insert(name.clone()) {
+            continue;
+        }
+        let already_listed = existing.machines.contains_key(&name) || existing.has_ssh_target(&ssh);
+        candidates.push(DiscoveredMachine {
+            name,
+            ssh,
+            os: peer.os.to_lowercase(),
+            online: peer.online,
+            already_listed,
+        });
+    }
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(candidates)
+}
+
+fn infer_remote_os(tailscale_os: &str) -> Option<RemoteOs> {
+    match tailscale_os.to_lowercase().as_str() {
+        "windows" => Some(RemoteOs::Windows),
+        "linux" | "macos" | "freebsd" | "openbsd" | "netbsd" => Some(RemoteOs::Unix),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use legion_core::config::parse;
+
+    use super::*;
+
+    const CANNED_TAILSCALE: &str = r#"{
+        "BackendState": "Running",
+        "Self": {
+            "HostName": "laptop",
+            "DNSName": "laptop.tailnet.example.",
+            "OS": "macOS",
+            "Online": true
+        },
+        "Peer": {
+            "nodekey:aaa": {
+                "HostName": "Tower",
+                "DNSName": "tower.tailnet.example.",
+                "OS": "linux",
+                "Online": true
+            },
+            "nodekey:bbb": {
+                "HostName": "tower-win",
+                "DNSName": "tower-win.tailnet.example.",
+                "OS": "windows",
+                "Online": false
+            },
+            "nodekey:ccc": {
+                "HostName": "pi",
+                "DNSName": "pi.tailnet.example.",
+                "OS": "linux",
+                "Online": true
+            },
+            "nodekey:ddd": {
+                "HostName": "no-dns",
+                "DNSName": "",
+                "OS": "linux",
+                "Online": true
+            }
+        }
+    }"#;
+
+    #[test]
+    fn parses_canned_tailscale_status_json_and_marks_already_listed() {
+        let existing = parse::<FleetFile>(
+            Path::new("fleet.toml"),
+            b"[machines.pi]\nssh = \"pi.tailnet.example\"\n",
+        )
+        .unwrap();
+
+        let candidates = parse_tailscale_status(CANNED_TAILSCALE, &existing, "laptop").unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                DiscoveredMachine {
+                    name: "pi".into(),
+                    ssh: "pi.tailnet.example".into(),
+                    os: "linux".into(),
+                    online: true,
+                    already_listed: true,
+                },
+                DiscoveredMachine {
+                    name: "tower".into(),
+                    ssh: "tower.tailnet.example".into(),
+                    os: "linux".into(),
+                    online: true,
+                    already_listed: false,
+                },
+                DiscoveredMachine {
+                    name: "tower-win".into(),
+                    ssh: "tower-win.tailnet.example".into(),
+                    os: "windows".into(),
+                    online: false,
+                    already_listed: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_tailscale_json_returns_unsupported() {
+        let err = parse_tailscale_status("not json", &FleetFile::default(), "laptop").unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+    }
+}
