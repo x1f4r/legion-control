@@ -2273,12 +2273,62 @@ pub fn read_devices_for_sync_blocking(
     }
 }
 
+/// Collects `pairing_id -> principal` for local-only Legion device lines belonging to THIS home
+/// and OS account in `authorized_keys` (lines not present in `local.devices` or `local.removed`).
+/// Read-only: never creates files or fails when `authorized_keys` is absent or not a regular file.
+fn collect_local_only_pairing_principals(
+    paths: &Paths,
+    node_file: &NodeFile,
+    local: &DevicesFile,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Ok(target) = resolve_target(paths, node_file) else {
+        return out;
+    };
+    let Ok(write_path) = resolve_safe_write_path(&target, paths.home()) else {
+        return out;
+    };
+    if !write_path.is_file() {
+        return out;
+    }
+    let Ok(caller_account) = caller_account_for_target(&target) else {
+        return out;
+    };
+    let Ok(auth_keys) = read_auth_keys(&write_path) else {
+        return out;
+    };
+    for line in &auth_keys.lines {
+        if let LineKind::Device {
+            principal,
+            pairing_id,
+            home,
+            account,
+            ..
+        } = &line.kind
+            && !local.devices.contains_key(pairing_id.as_str())
+            && !local.removed.contains_key(pairing_id.as_str())
+            && line_matches_home(home.as_ref(), paths)
+            && line_matches_account(
+                account.as_deref(),
+                caller_account.as_deref(),
+                target.windows_admin_acl,
+                cfg!(windows),
+            )
+        {
+            out.entry(pairing_id.clone())
+                .or_insert_with(|| principal.clone());
+        }
+    }
+    out
+}
+
 /// Applies an incoming `DevicesFile` (e.g. from `fleet.sync` or `config.write`) by merging it with
 /// this node's current `devices.toml` (after adopting any legacy lines when `devices.toml` is
 /// absent), verifying preconditions, preparing/validating incoming entries against the live
-/// `policy.toml` and `devices.toml`, enforcing registry-owned principal uniqueness for every
-/// caller, checking caller authorization, saving the merged `devices.toml` FIRST, then updating
-/// registry-owned `device:*` principals in `policy.toml` and reconciling `authorized_keys`.
+/// `policy.toml`, `devices.toml`, and local-only `authorized_keys` lines, enforcing registry-owned
+/// principal uniqueness for every caller, checking caller authorization, saving the merged
+/// `devices.toml` FIRST, then updating registry-owned `device:*` principals in `policy.toml` and
+/// reconciling `authorized_keys`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_devices_merge_blocking(
     paths: &Paths,
@@ -2286,7 +2336,12 @@ pub fn apply_devices_merge_blocking(
     node_file: &NodeFile,
     incoming: &DevicesFile,
     check_precondition: impl FnOnce(Option<&[u8]>) -> Result<(), ErrorBody>,
-    prepare_incoming: impl FnOnce(&DevicesFile, &Policy, &mut DevicesFile) -> Result<(), ErrorBody>,
+    prepare_incoming: impl FnOnce(
+        &DevicesFile,
+        &Policy,
+        &BTreeMap<String, String>,
+        &mut DevicesFile,
+    ) -> Result<(), ErrorBody>,
     authorize_change: impl Fn(MergeChange<'_>) -> Result<(), ErrorBody>,
 ) -> Result<MergeApplyOutcome, MergeApplyError> {
     let _cfg_guard = lock_config(paths).map_err(MergeApplyError::BeforeSave)?;
@@ -2347,9 +2402,15 @@ pub fn apply_devices_merge_blocking(
         }
     };
 
+    let local_only_ids = collect_local_only_pairing_principals(paths, node_file, &local);
     let mut prepared_incoming = incoming.clone();
-    prepare_incoming(&local, &live_policy, &mut prepared_incoming)
-        .map_err(MergeApplyError::BeforeSave)?;
+    prepare_incoming(
+        &local,
+        &live_policy,
+        &local_only_ids,
+        &mut prepared_incoming,
+    )
+    .map_err(MergeApplyError::BeforeSave)?;
 
     let merged = merge_devices(&local, &prepared_incoming);
 
@@ -3348,7 +3409,7 @@ role = "editor"
                 &node_file,
                 &incoming,
                 |_| Ok(()),
-                |_, _, _| Ok(()),
+                |_, _, _, _| Ok(()),
                 |_| Ok(()),
             ) {
                 Err(MergeApplyError::BeforeSave(err)) => err,

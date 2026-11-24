@@ -267,11 +267,12 @@ one that owned it. Merging `devices.toml` via `fleet.sync` or `config.write` ref
 timestamps more than 10 minutes in the future, refuses introducing duplicate live public keys,
 always merges with the local file (tombstones always win and can never be dropped by syncing),
 refuses setting `confirmed_by`/`confirmed_at` or dropping `paired_by` on an existing entry even for
-owner callers (confirmation is only allowed through `device.set confirm=true`), restricts non-owner
-admins to devices pinned to their own principal (recording `paired_by` from the call's context —
-including the caller's pairing id when the caller is a paired device — and refusing entries that
-claim otherwise, while treating `paired_at`, `paired_on`, `paired_by`, and `public_key` as
-immutable once written), pushes non-owner revocations independently of unrelated entries, and
+owner callers (confirmation is only allowed through `device.set confirm=true`), restricts non-owner admins to devices pinned to their own principal (refusing to add an entry with
+a pairing id already used by a local-only line in `authorized_keys`, recording `paired_by` from the
+call's context — including the caller's pairing id when the caller is a paired device — and
+refusing entries that claim otherwise, while treating `paired_at`, `paired_on`, `paired_by`, and
+`public_key` as immutable once written), pushes non-owner revocations independently of unrelated
+entries, and
 reconciles only registry-owned `device:*` principals in `policy.toml` to the exact recorded role —
 leaving shared and unmarked `device:*` principals untouched and failing closed to `nobody` when a
 role is undefined on the receiving node or two live devices collide on one `device:*` principal. A

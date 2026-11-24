@@ -886,6 +886,7 @@ async fn apply_local_write(
             let caller_role_prep = caller_role.clone();
             let prepare_incoming = |local: &DevicesFile,
                                     live_policy: &Policy,
+                                    local_only_ids: &BTreeMap<String, String>,
                                     incoming_mut: &mut DevicesFile|
              -> Result<(), ErrorBody> {
                 let caller_device_id: Option<String> = caller_pairing_id.clone().or_else(|| {
@@ -1015,6 +1016,20 @@ async fn apply_local_write(
                             .with_hint("Confirm a quarantined device with `legion device.set id=<pairing_id> confirm=true`."));
                         }
                         if !caller_is_owner {
+                            // A local-only line's pairing id counts as an existing entry owned by
+                            // that line's principal; a non-owner caller cannot add or replace an
+                            // entry with the same pairing id.
+                            if let Some(local_owner_principal) = local_only_ids.get(id) {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    format!(
+                                        "Pairing {id} already exists as a local-only device owned by {local_owner_principal} in authorized_keys and cannot be added or replaced by {caller_principal_prep}."
+                                    ),
+                                )
+                                .with_hint(
+                                    "Remove the local-only line or pair the device with a new pairing id.",
+                                ));
+                            }
                             // For a non-owner adding a live entry, `paired_by` must match the
                             // caller's principal (and its pairing id when the caller is itself a
                             // paired device); fill omitted fields from call context and reject any
@@ -4412,5 +4427,115 @@ updated_on = \"box-a\"
             None,
             "reconcile must never re-create device:d for id_e"
         );
+    }
+
+    #[tokio::test]
+    async fn s4_non_owner_cannot_add_entry_matching_local_only_pairing_id() {
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::authkeys::{ForcedCommandShell, PinnedHome, format_device_line};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{FleetDevice, PairedBy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+",
+        )
+        .unwrap();
+        std::fs::write(paths.config_file("devices.toml"), "version = 1\n").unwrap();
+
+        // Two local-only lines in authorized_keys (neither present in devices.toml):
+        // one owned by `owner` and one owned by `tablet`.
+        let local_owner_id = "f1".repeat(16);
+        let local_tablet_id = "f2".repeat(16);
+        let exe = legion_core::current_exe().unwrap();
+        let shell = ForcedCommandShell::host().unwrap();
+        let pinned_home = PinnedHome::from_paths(&paths);
+        let line_owner = format_device_line(
+            &exe,
+            "owner",
+            &ed25519_public_key_from_seed(&[0xf1; 32]),
+            "local-owner",
+            &local_owner_id,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        let line_tablet = format_device_line(
+            &exe,
+            "tablet",
+            &ed25519_public_key_from_seed(&[0xf2; 32]),
+            "local-tablet",
+            &local_tablet_id,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        let auth_before = format!("{line_owner}\n{line_tablet}\n");
+        std::fs::write(&auth_keys, &auth_before).unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let now = Timestamp::now().to_string();
+        for (label, target_id, seed) in [
+            ("local-only owner id", &local_owner_id, 0xf3u8),
+            ("local-only tablet id", &local_tablet_id, 0xf4u8),
+        ] {
+            let mut attempt = DevicesFile::default();
+            attempt.devices.insert(
+                target_id.clone(),
+                FleetDevice {
+                    name: "hijack".to_owned(),
+                    public_key: ed25519_public_key_from_seed(&[seed; 32]),
+                    principal: "tablet".to_owned(),
+                    role: None,
+                    paired_at: now.clone(),
+                    paired_on: "box-a".to_owned(),
+                    paired_by: Some(PairedBy {
+                        principal: "tablet".to_owned(),
+                        device: None,
+                    }),
+                    confirmed_by: None,
+                    confirmed_at: None,
+                    updated_at: now.clone(),
+                    updated_on: "box-a".to_owned(),
+                },
+            );
+            let mut call = Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": attempt.to_toml_string()}),
+            );
+            call.pinned = Some("tablet".to_owned());
+            let err = node.call(call).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{label}: {err:?}");
+        }
+
+        // authorized_keys must remain completely untouched.
+        assert_eq!(std::fs::read_to_string(&auth_keys).unwrap(), auth_before);
     }
 }
