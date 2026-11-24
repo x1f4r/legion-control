@@ -184,6 +184,10 @@ pub struct NodeLink {
     pub role: String,
     /// Transport used to reach the node (`ssh` or `local`).
     pub via: String,
+    /// True when this node is only acting as a temporary in-memory failover link (not persisted
+    /// as the user's chosen default node).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub temporary: bool,
 }
 
 /// Snapshot returned by the `state` command.
@@ -401,6 +405,7 @@ mod tests {
                 principal: "phone".to_owned(),
                 role: "operator".to_owned(),
                 via: "ssh".to_owned(),
+                temporary: false,
             }],
             needs: None,
             repair: None,

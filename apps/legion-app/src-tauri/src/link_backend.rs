@@ -37,7 +37,13 @@ struct BackendState {
     store_error: Option<AppError>,
     local_program: Option<String>,
     active_node: Option<String>,
+    temporary_failover: bool,
     link: Link,
+}
+
+struct CandidateNode {
+    name: String,
+    is_implicit_local: bool,
 }
 
 impl LinkBackend {
@@ -99,6 +105,7 @@ impl LinkBackend {
                 store_error,
                 local_program,
                 active_node,
+                temporary_failover: false,
                 link,
             }),
             mutate_lock: AsyncMutex::new(()),
@@ -125,7 +132,7 @@ impl LinkBackend {
         build_app_state(&guard, self.store.path())
     }
 
-    fn candidate_nodes(&self) -> Result<(Link, Vec<String>), AppError> {
+    fn candidate_nodes(&self) -> Result<(Link, Vec<CandidateNode>), AppError> {
         let guard = self
             .state
             .lock()
@@ -135,19 +142,30 @@ impl LinkBackend {
         }
         let link = guard.link.clone();
         let app_state = build_app_state(&guard, self.store.path());
-        let names = app_state.nodes.into_iter().map(|n| n.node).collect();
-        Ok((link, names))
+        let candidates = app_state
+            .nodes
+            .into_iter()
+            .map(|n| {
+                let is_implicit_local = n.via == "local" && guard.data.link.node(&n.node).is_none();
+                CandidateNode {
+                    name: n.node,
+                    is_implicit_local,
+                }
+            })
+            .collect();
+        Ok((link, candidates))
     }
 
-    fn mark_active(&self, node: &str) {
+    fn mark_temporary_failover(&self, node: &str) {
         let mut guard = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.store_error.is_some() || guard.active_node.as_deref() == Some(node) {
+        if guard.store_error.is_some() {
             return;
         }
         guard.active_node = Some(node.to_owned());
+        guard.temporary_failover = true;
     }
 
     fn next_call_id(&self, provided: Option<CallId>) -> String {
@@ -173,12 +191,22 @@ impl Backend for LinkBackend {
                 return Err(AppError::not_paired());
             }
 
+            let primary = &candidates[0];
             let mut last_err: Option<AppError> = None;
-            for (idx, node) in candidates.iter().enumerate() {
-                match link.tools(node, on.clone()).await {
+            for (idx, candidate) in candidates.iter().enumerate() {
+                let effective_on = if idx == 0 {
+                    on.clone()
+                } else {
+                    match &on {
+                        Some(explicit) => Some(explicit.clone()),
+                        None if primary.is_implicit_local => break,
+                        None => Some(Value::String(primary.name.clone())),
+                    }
+                };
+                match link.tools(&candidate.name, effective_on).await {
                     Ok(value) => {
                         if idx > 0 {
-                            self.mark_active(node);
+                            self.mark_temporary_failover(&candidate.name);
                         }
                         let tools = value
                             .get("tools")
@@ -213,18 +241,28 @@ impl Backend for LinkBackend {
                 return Err(AppError::not_paired());
             }
 
+            let primary = &candidates[0];
             let call_id = self.next_call_id(request.id);
             let mut last_err: Option<AppError> = None;
 
-            for (idx, node) in candidates.iter().enumerate() {
+            for (idx, candidate) in candidates.iter().enumerate() {
+                let effective_on = if idx == 0 {
+                    request.on.clone()
+                } else {
+                    match &request.on {
+                        Some(explicit) => Some(explicit.clone()),
+                        None if primary.is_implicit_local => break,
+                        None => Some(Value::String(primary.name.clone())),
+                    }
+                };
                 let channel = on_event.clone();
                 let outcome = link
                     .call_with_id(
                         &call_id,
-                        node,
+                        &candidate.name,
                         &request.tool,
                         request.args.clone(),
-                        request.on.clone(),
+                        effective_on,
                         move |event| {
                             if let Some(ch) = &channel {
                                 let _ = ch.send(event);
@@ -236,7 +274,7 @@ impl Backend for LinkBackend {
                 match outcome {
                     Ok(value) => {
                         if idx > 0 {
-                            self.mark_active(node);
+                            self.mark_temporary_failover(&candidate.name);
                         }
                         return Ok(value);
                     }
@@ -344,6 +382,7 @@ impl Backend for LinkBackend {
                 self.store.save(&updated_data)?;
                 guard.data = updated_data;
                 guard.active_node = Some(node_name);
+                guard.temporary_failover = false;
                 build_app_state(&guard, self.store.path())
             };
 
@@ -411,6 +450,7 @@ impl Backend for LinkBackend {
                 let local_program = guard.local_program.clone();
                 guard.data = next;
                 guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
+                guard.temporary_failover = false;
                 (device, guard.link.clone())
             };
 
@@ -465,6 +505,7 @@ impl Backend for LinkBackend {
                 self.store.save(&next)?;
                 guard.data = next;
                 guard.active_node = Some(trimmed.to_owned());
+                guard.temporary_failover = false;
                 build_app_state(&guard, self.store.path())
             };
 
@@ -503,6 +544,7 @@ impl Backend for LinkBackend {
                 guard.data = fresh;
                 guard.store_error = None;
                 guard.active_node = active;
+                guard.temporary_failover = false;
                 (old, build_app_state(&guard, self.store.path()))
             };
 
@@ -521,8 +563,16 @@ impl Backend for LinkBackend {
     }
 }
 
+/// Returns `true` only when `legion-link` proved the request never left this device (`details.sent
+/// == false`) and the failure was a transport-level unreachable or connect/handshake timeout.
 fn is_failover_error(err: &AppError) -> bool {
     matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout)
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get(legion_link::DETAIL_SENT))
+            .and_then(Value::as_bool)
+            == Some(false)
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -586,6 +636,8 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             principal: "local".to_owned(),
             role: "owner".to_owned(),
             via: "local".to_owned(),
+            temporary: state.temporary_failover
+                && state.active_node.as_deref() == Some(LOCAL_NODE_ID),
         });
     }
 
@@ -596,6 +648,8 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         } else {
             "ssh"
         };
+        let temporary =
+            state.temporary_failover && state.active_node.as_deref() == Some(entry.node.as_str());
         nodes.push(NodeLink {
             node: entry.node.clone(),
             principal: entry
@@ -606,6 +660,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
                 .and_then(|m| m.role.clone())
                 .unwrap_or_else(|| "unknown".to_owned()),
             via: via.to_owned(),
+            temporary,
         });
     }
 
@@ -1030,6 +1085,317 @@ mod tests {
         release.notify_one();
         let outcome = call_task.await??;
         assert_eq!(outcome, serde_json::json!({ "ok": true }));
+        Ok(())
+    }
+
+    fn two_ssh_nodes_store(
+        dir: &tempfile::TempDir,
+    ) -> Result<AppStore, Box<dyn std::error::Error>> {
+        let store = AppStore::in_dir(dir.path());
+        let mut data = AppStoreData::default();
+        data.link.upsert_node(sample_ssh_node("tower"));
+        data.link.upsert_node(sample_ssh_node("pi"));
+        data.current_node = Some("tower".to_owned());
+        store.save(&data)?;
+        Ok(store)
+    }
+
+    #[tokio::test]
+    async fn call_lost_in_flight_is_not_retried() -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = two_ssh_nodes_store(&dir)?;
+        let pi_opens = Arc::new(AtomicUsize::new(0));
+        let pi_opens_c = Arc::clone(&pi_opens);
+
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let pi_opens_c = Arc::clone(&pi_opens_c);
+            Box::pin(async move {
+                if entry.node == "pi" {
+                    pi_opens_c.fetch_add(1, Ordering::SeqCst);
+                }
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        if req.method == method::HELLO {
+                            let reply = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            );
+                            let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                            out.push('\n');
+                            let _ = server_w.write_all(out.as_bytes()).await;
+                            let _ = server_w.flush().await;
+                        } else {
+                            // Drop the server end after reading the request to simulate lost-in-flight.
+                            break;
+                        }
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store, None, opener);
+        let err = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.reboot".to_owned(),
+                    args: serde_json::json!({}),
+                    on: None,
+                },
+                None,
+            )
+            .await
+            .err()
+            .ok_or("expected lost-in-flight error")?;
+        assert_eq!(err.code, ErrorCode::Unreachable);
+        assert_eq!(
+            pi_opens.load(Ordering::SeqCst),
+            0,
+            "lost-in-flight call must never retry on a backup node"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_timeout_is_not_retried() -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, RpcError, method};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = two_ssh_nodes_store(&dir)?;
+        let pi_opens = Arc::new(AtomicUsize::new(0));
+        let pi_opens_c = Arc::clone(&pi_opens);
+
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let pi_opens_c = Arc::clone(&pi_opens_c);
+            Box::pin(async move {
+                if entry.node == "pi" {
+                    pi_opens_c.fetch_add(1, Ordering::SeqCst);
+                }
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            )
+                        } else {
+                            Response::error(
+                                req.id,
+                                RpcError::new(
+                                    legion_link::proto::TOOL_ERROR,
+                                    legion_link::proto::ErrorBody::new(
+                                        legion_link::proto::ErrorCode::Timeout,
+                                        "tool timed out on tower",
+                                    ),
+                                ),
+                            )
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                        out.push('\n');
+                        if server_w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store, None, opener);
+        let err = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.reboot".to_owned(),
+                    args: serde_json::json!({}),
+                    on: None,
+                },
+                None,
+            )
+            .await
+            .err()
+            .ok_or("expected tool timeout error")?;
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert_eq!(
+            pi_opens.load(Ordering::SeqCst),
+            0,
+            "tool timeout from primary node must never retry on a backup node"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsent_call_fails_over_with_on_set_to_first_node_and_temporary_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = two_ssh_nodes_store(&dir)?;
+        let seen_on = Arc::new(Mutex::new(None::<Value>));
+        let seen_on_c = Arc::clone(&seen_on);
+
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let seen_on_c = Arc::clone(&seen_on_c);
+            Box::pin(async move {
+                if entry.node == "tower" {
+                    return Err(legion_link::proto::ErrorBody::new(
+                        legion_link::proto::ErrorCode::Unreachable,
+                        "tower is offline",
+                    ));
+                }
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            )
+                        } else {
+                            let on_val = req.params.get("on").cloned().unwrap_or(Value::Null);
+                            *seen_on_c.lock().unwrap_or_else(|p| p.into_inner()) = Some(on_val);
+                            Response::ok(req.id, serde_json::json!({ "relayed": true }))
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                        out.push('\n');
+                        if server_w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store.clone(), None, opener);
+        let outcome = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.reboot".to_owned(),
+                    args: serde_json::json!({}),
+                    on: None,
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(outcome, serde_json::json!({ "relayed": true }));
+        assert_eq!(
+            seen_on.lock().unwrap_or_else(|p| p.into_inner()).as_ref(),
+            Some(&Value::String("tower".to_owned())),
+            "failover must preserve the original target node in params.on"
+        );
+
+        let st = backend.state().await?;
+        assert_eq!(st.nodes[0].node, "pi");
+        assert!(st.nodes[0].temporary);
+        assert_eq!(st.nodes[1].node, "tower");
+        assert!(!st.nodes[1].temporary);
+
+        // Persisted default node stays "tower" so restarts return to the user's chosen node.
+        let persisted = store.load()?;
+        assert_eq!(persisted.current_node.as_deref(), Some("tower"));
+
+        // Explicitly choosing a node clears the temporary flag.
+        let reset = backend.select_node("tower".to_owned()).await?;
+        assert_eq!(reset.nodes[0].node, "tower");
+        assert!(!reset.nodes[0].temporary);
         Ok(())
     }
 }
