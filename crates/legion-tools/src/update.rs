@@ -65,7 +65,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.update",
         Effect::Admin,
-        "Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. Release downloads require a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it) and SHA-256 verification; passing `from=<local file>` installs an unsigned binary that the admin naming the file vouches for. Checks binary format and architecture, enforces downgrade protection unless `allow_downgrade` is set, stages and runs `--version` preflight, keeps the previous binary as `.prev` (restoring it if the replaced binary does not run), and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.",
+        "Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. Refuses installations managed by a system package manager (such as `deb` or `pacman`) and points at the package manager's upgrade command instead. Release downloads require a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it) and SHA-256 verification; passing `from=<local file>` installs an unsigned binary that the admin naming the file vouches for. Checks binary format and architecture, enforces downgrade protection unless `allow_downgrade` is set, stages and runs `--version` preflight, keeps the previous binary as `.prev` (restoring it if the replaced binary does not run), and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.",
         meta_update,
     );
 }
@@ -1336,6 +1336,9 @@ async fn run_meta_update_inner(
     }
 
     let current_exe = legion_core::validate_recorded_exe(current_exe)?;
+    if let Some(manager) = crate::package::detect_package_manager(&current_exe) {
+        return Err(crate::package::managed_update_error(&manager, &current_exe));
+    }
     let macos_translated = detect_macos_rosetta(os, arch, cancel.clone()).await;
     let resolved = resolve_target_for(os, arch, macos_translated)?;
     let target = resolved.target;
@@ -2905,5 +2908,91 @@ mod tests {
             crate::floor::read_floor(&node_floor_path(&paths)),
             crate::floor::FloorState::Recorded(SemVer::parse("0.1.0").unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn meta_update_refuses_package_managed_installations() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("home"));
+        let usr_bin = dir.path().join("usr").join("bin");
+        let usr_lib = dir.path().join("usr").join("lib").join("legion");
+        fs::create_dir_all(&usr_bin).unwrap();
+        fs::create_dir_all(&usr_lib).unwrap();
+        let exe = usr_bin.join("legion");
+        fs::write(&exe, b"packaged-binary").unwrap();
+        let local_bin = dir.path().join("custom-legion");
+        fs::write(&local_bin, b"custom-binary").unwrap();
+        let fetcher = FakeFetcher::new("0.2.0", HashMap::new());
+
+        // Debian/Ubuntu package marker refuses normal, dry-run, and `from` updates.
+        fs::write(usr_lib.join("managed-by"), "deb\n").unwrap();
+        for args in [
+            UpdateArgs {
+                version: None,
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            UpdateArgs {
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: true,
+                allow_downgrade: false,
+            },
+            UpdateArgs {
+                version: None,
+                from: Some(local_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+        ] {
+            let err = run_meta_update(
+                &paths,
+                &fetcher,
+                "linux",
+                "x86_64",
+                "0.1.0",
+                &exe,
+                false,
+                args,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unsupported);
+            assert!(err.message.contains("deb (apt)"), "{}", err.message);
+            assert!(
+                err.hint.as_deref().unwrap().contains("apt-get install"),
+                "{:?}",
+                err.hint
+            );
+            assert_eq!(err.details.as_ref().unwrap()["managed_by"], "deb");
+        }
+        assert_eq!(fetcher.download_count(), 0);
+        assert_eq!(fs::read(&exe).unwrap(), b"packaged-binary");
+
+        // Arch pacman marker refuses with pacman hint.
+        fs::write(usr_lib.join("managed-by"), "pacman\n").unwrap();
+        let err = run_meta_update(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.1.0",
+            &exe,
+            false,
+            UpdateArgs::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("pacman"), "{}", err.message);
+        assert!(
+            err.hint.as_deref().unwrap().contains("pacman"),
+            "{:?}",
+            err.hint
+        );
+        assert_eq!(err.details.as_ref().unwrap()["managed_by"], "pacman");
     }
 }

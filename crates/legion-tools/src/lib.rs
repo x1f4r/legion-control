@@ -14,6 +14,7 @@ pub mod floor;
 pub mod fs;
 pub mod job;
 pub mod meta;
+pub mod package;
 pub mod power;
 pub mod proj;
 pub mod svc;

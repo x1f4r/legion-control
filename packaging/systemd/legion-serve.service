@@ -1,0 +1,31 @@
+# Legion HTTP server, systemd user unit.
+#
+# Serves this node's tools over HTTP on loopback only (127.0.0.1:7117 unless
+# [serve].listen in node.toml says otherwise). Nothing is enabled by default;
+# enable and start it for your account with:
+#
+#   systemctl --user enable --now legion-serve.service
+#
+# Legion runs user commands, touches the home directory, and invokes helpers
+# such as ssh and sudo on purpose, so this unit intentionally avoids mount or
+# privilege sandboxing that would break those tools.
+
+[Unit]
+Description=Legion HTTP server (loopback only)
+Documentation=man:legion(1) https://github.com/x1f4r/legion-control
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/legion serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+KeyringMode=private
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
