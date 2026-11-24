@@ -25,6 +25,9 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "appimage", "dmg", "nsis"],
+    "android": {
+      "debugApplicationIdSuffix": ".debug"
+    },
     "iOS": {
       "minimumSystemVersion": "15.0"
     },
