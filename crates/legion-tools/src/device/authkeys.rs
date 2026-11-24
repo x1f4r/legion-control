@@ -323,6 +323,84 @@ pub fn resolve_safe_write_path(
     }
 }
 
+/// Verifies on Unix that the effective user ID (`euid`) owns the existing `authorized_keys` file
+/// (or its parent `.ssh` directory, or `home` when neither exists yet), refusing to rewrite
+/// another user's file (for example when `sudo legion pair` runs as root with a user's `HOME`).
+///
+/// No-op on non-Unix platforms.
+pub fn verify_owner_matches_euid(
+    write_path: &Path,
+    home: Option<&Path>,
+    is_default_home_ssh: bool,
+    euid: Option<u32>,
+) -> Result<(), ErrorBody> {
+    let Some(euid) = euid else {
+        return Ok(());
+    };
+    let check_path = |path: &Path| -> Result<(), ErrorBody> {
+        let Some(owner_uid) = legion_os::user::path_owner_uid(path).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be inspected: {error}.", path.display()),
+            )
+        })?
+        else {
+            return Ok(());
+        };
+        if owner_uid != euid {
+            let owner_label = legion_os::user::username_for_uid(owner_uid)
+                .map(|name| format!("{name} (uid {owner_uid})"))
+                .unwrap_or_else(|| format!("uid {owner_uid}"));
+            let runner_label = legion_os::user::username_for_uid(euid)
+                .map(|name| format!("{name} (uid {euid})"))
+                .unwrap_or_else(|| format!("uid {euid}"));
+            let hint_user = legion_os::user::username_for_uid(owner_uid)
+                .unwrap_or_else(|| format!("#{owner_uid}"));
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Refusing to modify {} because {} is owned by {owner_label}, not the running account {runner_label}.",
+                    write_path.display(),
+                    path.display(),
+                ),
+            )
+            .with_hint(format!(
+                "Run legion as {hint_user} (for example `sudo -u {hint_user} legion ...`) so authorized_keys keeps its owner and SSH login stays working, or point `[devices] authorized_keys` at a file owned by this account."
+            )));
+        }
+        Ok(())
+    };
+
+    // Check the nearest existing path along write_path -> parent -> home -> ancestors.
+    let mut checked = false;
+    for candidate in [Some(write_path), write_path.parent(), home]
+        .into_iter()
+        .flatten()
+    {
+        if candidate.exists() {
+            check_path(candidate)?;
+            checked = true;
+            break;
+        }
+    }
+    if !checked {
+        for ancestor in write_path.ancestors().skip(1) {
+            if ancestor.exists() {
+                check_path(ancestor)?;
+                break;
+            }
+        }
+    }
+    // For the default `~/.ssh/authorized_keys`, also ensure the home directory itself belongs to euid.
+    if is_default_home_ssh
+        && let Some(home) = home
+        && home.exists()
+    {
+        check_path(home)?;
+    }
+    Ok(())
+}
+
 /// Formats the value placed inside `command="..."` in `authorized_keys`.
 ///
 /// The executable path must be absolute, valid UTF-8, and free of control characters.
@@ -1133,5 +1211,44 @@ Match Group users
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_owner_refuses_mismatched_effective_uid_for_file_ssh_dir_and_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let actual_uid = legion_os::user::effective_uid().unwrap();
+        let wrong_uid = if actual_uid == 0 { 65534 } else { 0 };
+
+        let ssh_dir = home.join(".ssh");
+        let auth_file = ssh_dir.join("authorized_keys");
+
+        // 1. Neither authorized_keys nor ~/.ssh exists yet: falls back to home directory owner.
+        assert!(verify_owner_matches_euid(&auth_file, Some(&home), true, Some(actual_uid)).is_ok());
+        let err =
+            verify_owner_matches_euid(&auth_file, Some(&home), true, Some(wrong_uid)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(err.message.contains("owned by"), "{}", err.message);
+        assert!(
+            err.hint.as_deref().is_some_and(|h| h.contains("sudo -u")),
+            "{:?}",
+            err.hint
+        );
+
+        // 2. ~/.ssh exists, authorized_keys missing: checks ~/.ssh owner.
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        assert!(verify_owner_matches_euid(&auth_file, Some(&home), true, Some(actual_uid)).is_ok());
+        let err =
+            verify_owner_matches_euid(&auth_file, Some(&home), true, Some(wrong_uid)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // 3. authorized_keys exists: checks file owner directly.
+        std::fs::write(&auth_file, "# existing\n").unwrap();
+        assert!(verify_owner_matches_euid(&auth_file, Some(&home), true, Some(actual_uid)).is_ok());
+        let err =
+            verify_owner_matches_euid(&auth_file, Some(&home), true, Some(wrong_uid)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
     }
 }

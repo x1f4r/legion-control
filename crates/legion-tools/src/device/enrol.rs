@@ -20,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use super::authkeys::{
     LineKind, format_device_line, read_auth_keys, resolve_safe_write_path, resolve_target,
-    write_auth_keys,
+    verify_owner_matches_euid, write_auth_keys,
 };
 use super::keys::{validate_ed25519_public_key, validate_invite_id};
 use super::store::{
@@ -263,6 +263,14 @@ fn process_enrol_blocking(
         Ok(path) => path,
         Err(error) => return (None, base_args, Err(error)),
     };
+    if let Err(error) = verify_owner_matches_euid(
+        &write_path,
+        paths.home(),
+        target.is_default_home_ssh,
+        legion_os::user::effective_uid(),
+    ) {
+        return (None, base_args, Err(error));
+    }
 
     let _guard = match lock_devices(paths) {
         Ok(guard) => guard,

@@ -3,9 +3,54 @@
 //! Isolates the platform differences needed when managing `authorized_keys` files across Linux,
 //! macOS, and Windows.
 
+use std::io;
 use std::path::Path;
 
 use crate::{OsError, Result};
+
+/// Returns the effective Unix user ID of the current process, or `None` on non-Unix platforms.
+pub fn effective_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(nix::unistd::Uid::effective().as_raw())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Looks up the Unix account name for `uid` in the system user database, returning `None` if no
+/// entry exists or on non-Unix platforms.
+pub fn username_for_uid(uid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .filter(|name| !name.is_empty())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        None
+    }
+}
+
+/// Returns the owning Unix user ID of `path` (following symlinks), or `Ok(None)` on non-Unix.
+pub fn path_owner_uid(path: &Path) -> io::Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(std::fs::metadata(path)?.uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
 
 /// Returns the operating-system account name that the current process runs as.
 ///

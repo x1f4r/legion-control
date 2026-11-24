@@ -28,7 +28,7 @@ use crate::caller::Caller;
 
 use self::authkeys::{
     LineKind, format_invite_line, read_auth_keys, resolve_safe_write_path, resolve_target,
-    write_auth_keys,
+    verify_owner_matches_euid, write_auth_keys,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
@@ -188,13 +188,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
             }
             trimmed.to_owned()
         }
-        None => legion_os::user::current_username().map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Cannot determine the account legion runs as: {error}."),
-            )
-            .with_hint("Pass `user` explicitly to device.invite.")
-        })?,
+        None => resolve_default_ssh_user(ctx.paths().home(), legion_os::user::effective_uid())?,
     };
 
     let hosts = resolve_hosts(args.host, ctx.cancel_token().child_token()).await?;
@@ -241,6 +235,12 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     blocking(move || {
         let target = resolve_target(&paths, &node_file)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
+        verify_owner_matches_euid(
+            &write_path,
+            paths.home(),
+            target.is_default_home_ssh,
+            legion_os::user::effective_uid(),
+        )?;
         let _guard = lock_devices(&paths)?;
 
         let mut auth_keys = read_auth_keys(&write_path)?;
@@ -316,6 +316,12 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
     let (raw_devices, raw_invites) = blocking(move || {
         let target = resolve_target(&paths, &node_file)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
+        verify_owner_matches_euid(
+            &write_path,
+            paths.home(),
+            target.is_default_home_ssh,
+            legion_os::user::effective_uid(),
+        )?;
         let _guard = lock_devices(&paths)?;
 
         let mut auth_keys = read_auth_keys(&write_path)?;
@@ -471,6 +477,12 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     blocking(move || {
         let target = resolve_target(&paths, &node_file)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
+        verify_owner_matches_euid(
+            &write_path,
+            paths.home(),
+            target.is_default_home_ssh,
+            legion_os::user::effective_uid(),
+        )?;
         let _guard = lock_devices(&paths)?;
 
         let mut auth_keys = read_auth_keys(&write_path)?;
@@ -605,6 +617,55 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         }
     })
     .await
+}
+
+fn resolve_default_ssh_user(
+    home: Option<&std::path::Path>,
+    euid: Option<u32>,
+) -> Result<String, ErrorBody> {
+    if let (Some(home), Some(euid)) = (home, euid)
+        && home.exists()
+        && let Some(owner_uid) = legion_os::user::path_owner_uid(home).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Home directory {} cannot be inspected: {error}.",
+                    home.display()
+                ),
+            )
+        })?
+    {
+        if owner_uid != euid {
+            let owner_label = legion_os::user::username_for_uid(owner_uid)
+                .map(|name| format!("{name} (uid {owner_uid})"))
+                .unwrap_or_else(|| format!("uid {owner_uid}"));
+            let runner_label = legion_os::user::username_for_uid(euid)
+                .map(|name| format!("{name} (uid {euid})"))
+                .unwrap_or_else(|| format!("uid {euid}"));
+            let hint_user = legion_os::user::username_for_uid(owner_uid)
+                .unwrap_or_else(|| format!("#{owner_uid}"));
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Home directory {} is owned by {owner_label}, which does not match the running account {runner_label}.",
+                    home.display()
+                ),
+            )
+            .with_hint(format!(
+                "Run legion as {hint_user} (for example `sudo -u {hint_user} legion pair ...`) instead of running with another user's HOME."
+            )));
+        }
+        if let Some(name) = legion_os::user::username_for_uid(owner_uid) {
+            return Ok(name);
+        }
+    }
+    legion_os::user::current_username().map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot determine the account legion runs as: {error}."),
+        )
+        .with_hint("Pass `user` explicitly to device.invite.")
+    })
 }
 
 enum RemoveTarget {
@@ -1083,5 +1144,22 @@ role = "owner"
         // Invite is still intact and usable after all rejected attempts.
         let listed = h.call("device.list", json!({})).await.unwrap();
         assert_eq!(listed["invites"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_ssh_user_uses_home_owner_and_refuses_euid_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual_uid = legion_os::user::effective_uid().unwrap();
+        let wrong_uid = if actual_uid == 0 { 65534 } else { 0 };
+
+        let resolved = resolve_default_ssh_user(Some(dir.path()), Some(actual_uid)).unwrap();
+        let expected = legion_os::user::username_for_uid(actual_uid)
+            .unwrap_or_else(|| legion_os::user::current_username().unwrap());
+        assert_eq!(resolved, expected);
+
+        let err = resolve_default_ssh_user(Some(dir.path()), Some(wrong_uid)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(err.message.contains("owned by"), "{}", err.message);
     }
 }
