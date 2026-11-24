@@ -59,9 +59,22 @@ jobs:
         with:
           persist-credentials: false
       # The runners come with rustup, so the toolchain is installed through it rather than through an
-      # action that would be one more thing to pin. Stable is what the workspace is written for.
+      # action that would be one more thing to pin. rust-toolchain.toml names the release and its
+      # components, so CI builds with the compiler a local checkout does.
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+        run: rustup toolchain install
+      # Downloaded crates and what was built from them, for the compiler and the lock file they
+      # were built with. A newer key starts from the nearest older one, and the workspace's own
+      # crates are rebuilt on every run anyway.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
       # Formatting, clippy with warnings as errors, and the tests, as scripts/check.sh runs them. The
       # tests run the built binary under a LEGION_HOME of their own, so Windows is the one place its
       # paths, its locks and its line endings are exercised.

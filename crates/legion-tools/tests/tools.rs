@@ -24,7 +24,7 @@ impl Fixture {
     fn write_config(&self, name: &str, text: &str) {
         let config = self.dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join(name), text).unwrap();
+        legion_core::config::write_atomically(&config.join(name), text.as_bytes()).unwrap();
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, ErrorBody> {
@@ -149,7 +149,7 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
     assert_eq!(
         broken["checks"][0]["detail"]
             .as_str()
-            .map(|d| d.contains("writable")),
+            .map(|d| d.contains("readable")),
         Some(true)
     );
 
@@ -163,6 +163,61 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
             .contains("policy.toml does not parse at line 1"),
         "{}",
         error.message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_doctor_writes_only_to_the_state_directory_and_leaves_nothing_there() {
+    let fixture = Fixture::new();
+    fixture.write_config("node.toml", "name = \"tower\"\n");
+    let config = fixture.dir.path().join("config");
+    let state = fixture.dir.path().join("state");
+    let before = |dir: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let config_before = before(&config);
+    let calls: Vec<_> = (0..16)
+        .map(|_| {
+            let node = fixture.node.clone();
+            tokio::spawn(async move {
+                node.call(Call::new(Door::Cli, "meta.doctor", json!({})))
+                    .await
+            })
+        })
+        .collect();
+    for call in calls {
+        let report = call.await.unwrap().unwrap();
+        assert_eq!(report["ok"], json!(true), "{report}");
+    }
+    assert_eq!(before(&config), config_before);
+    let left: Vec<_> = before(&state)
+        .into_iter()
+        .filter(|name| name.to_string_lossy().contains("doctor"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_configuration_directory_kept_read_only_is_healthy() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.write_config("node.toml", "name = \"tower\"\n");
+    let config = fixture.dir.path().join("config");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let report = fixture.call("meta.doctor", json!({})).await.unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let check = &report["checks"][0];
+    assert_eq!(check["name"], json!("configuration directory"));
+    assert_eq!(check["ok"], json!(true), "{check}");
+    assert!(
+        check["detail"].as_str().unwrap().contains("readable"),
+        "{check}"
     );
 }
 

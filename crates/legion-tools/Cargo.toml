@@ -28,11 +28,11 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
 toml_edit.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 # These re-execute their own binary as the child processes they need, so they cannot use the

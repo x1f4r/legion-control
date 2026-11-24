@@ -208,7 +208,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
 
         let hash = format_blake3(blake3::hash(&final_bytes));
         let size = final_bytes.len() as u64;
-        let options = WriteOptions { mode: unix_mode };
+        let options = WriteOptions { mode: unix_mode, no_replace: false };
         write_atomic(&path, &final_bytes, options)
             .map_err(|error| map_os_error("write", &path, error))?;
         // `legion-os` preserves the existing file's mode on overwrite; honor an explicit

@@ -1,58 +1,59 @@
 //! Windows detached process launcher with WMI fallback.
 //!
 //! Primary path: `CreateProcessW` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW |
-//! CREATE_NEW_PROCESS_GROUP` starts the process outside the caller's Job Object in its own console
-//! process group without allowing child console programs to open visible console windows (unlike
-//! `DETACHED_PROCESS`, which causes console children to allocate new visible windows).
+//! CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT` and a
+//! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` restricted strictly to the three freshly opened standard
+//! handles (`stdin` null, `stdout` and `stderr` log files or null). This places the process
+//! outside the caller's Job Object without opening visible console windows for console children
+//! (unlike `DETACHED_PROCESS`) and prevents any other inheritable handle in the parent process
+//! (such as parent stdout/stderr pipes) from leaking into the detached job.
 //!
 //! Fallback path: when the caller runs inside a Job Object that forbids breakaway (OpenSSH's
 //! `sshd` session job does), `CreateProcessW` returns `ERROR_ACCESS_DENIED`. In that case we
-//! launch through WMI (`Win32_Process.Create` via `Invoke-CimMethod`), which creates the process
-//! under the WMI service host outside the caller's job so it outlives the SSH session. Because
-//! WMI launches under the service environment and returns the wrapper's PID, the launcher script
-//! explicitly forwards the merged caller environment and writes the real target's PID and creation
-//! timestamp to a handoff file read back by the caller.
+//! launch through WMI (`Win32_Process.Create` via `Invoke-CimMethod`), which asks the out-of-process
+//! WMI provider host (`wmiprvse.exe`) in its own service session to spawn the launcher. Because
+//! WMI creates the process from `wmiprvse.exe` rather than from our process, the detached target
+//! inherits **zero** handles from the caller process (its only open standard handles are the
+//! redirected pipes connected to the launcher's freshly opened append `FileStream`s).
 
 use std::fs;
-use std::io;
-use std::os::windows::io::AsHandle;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-};
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::atomic::{WriteOptions, write_atomic};
 use crate::procid::ProcessId;
 use crate::shell::{ResolvedCommand, encode_utf16le_base64, windows_cmdline_escape};
-use crate::win_proc;
+use crate::win_proc::{self, DirectSpawnError};
 use crate::{OsError, Result};
 
 use super::{
     DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE, build_wmi_create_script_for_cmdline,
-    build_wmi_launcher_script, merge_windows_env, open_append_stdio, parse_wmi_handoff,
+    build_wmi_launcher_script, merge_windows_env, parse_wmi_handoff, reconcile_wmi_identity,
+    resolve_wmi_program, validate_wmi_batch_target,
 };
 
 const WMI_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const ERROR_ACCESS_DENIED: i32 = 5;
 
 static WMI_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Removes temporary handoff files when `spawn_via_wmi` exits.
+/// Removes temporary handoff and fallback launcher files whenever `spawn_via_wmi` exits (on
+/// every error path as well as after handoff completes).
 struct HandoffCleanup {
     path: PathBuf,
     tmp_path: PathBuf,
+    script_path: PathBuf,
 }
 
 impl Drop for HandoffCleanup {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
         let _ = fs::remove_file(&self.tmp_path);
+        let _ = fs::remove_file(&self.script_path);
     }
 }
 
@@ -60,52 +61,84 @@ pub(super) async fn spawn_detached(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
 ) -> Result<DetachHandle> {
-    let (stdout_stdio, stderr_stdio) = open_append_stdio(
-        options.stdout_path.as_deref(),
-        options.stderr_path.as_deref(),
-    )?;
+    let base_cwd = match options.cwd {
+        Some(ref dir) => absolutize(dir)?,
+        None => std::env::current_dir()
+            .map_err(|err| OsError::from_io("cannot determine current directory", err))?,
+    };
 
     let program_display = resolved.program_display();
-    let mut cmd = resolved.to_std_command();
-    for (key, value) in &options.env {
-        cmd.env(key, value);
-    }
-    if let Some(ref cwd) = options.cwd {
-        cmd.current_dir(cwd);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(stdout_stdio)
-        .stderr(stderr_stdio)
-        .creation_flags(
-            (CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP).0,
-        );
+    let args_vec: Vec<String> = resolved
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let env_remove_str: Vec<String> = resolved
+        .env_remove
+        .iter()
+        .map(|key| key.to_string_lossy().into_owned())
+        .collect();
+    let overrides_str: Vec<(String, String)> = options
+        .env
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let inherited_str = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    let merged_env = merge_windows_env(inherited_str, &env_remove_str, &overrides_str);
 
-    let spawn_result = cmd.spawn();
-    // Release the command (and its appended log handles) before falling back to WMI.
-    drop(cmd);
+    let resolved_program = resolve_wmi_program(&program_display, &base_cwd, &merged_env);
+    let command_line = build_direct_command_line(&resolved_program, &args_vec)?;
 
-    match spawn_result {
-        Ok(child) => {
-            let pid = child.id();
-            // Read the exact 100-ns FILETIME creation timestamp directly from the process handle we
-            // already hold; this stays valid even if the child exits immediately and never guesses.
-            let start_time = win_proc::creation_time_from_handle(child.as_handle())?;
-            // Dropping std::process::Child on Windows closes our process handle without killing
-            // the detached child.
-            drop(child);
+    match win_proc::spawn_detached_direct(
+        &program_display,
+        &command_line,
+        options.cwd.as_deref(),
+        &resolved.env_remove,
+        &options.env,
+        options.stdout_path.as_deref(),
+        options.stderr_path.as_deref(),
+    ) {
+        Ok(process) => {
+            // The detached child is already running and may still be reading a spilled `.ps1`
+            // wrapper (which deletes itself as its first action); disarm caller-side removal.
+            resolved.disarm_temp_script();
             Ok(DetachHandle {
-                process: ProcessId::new(pid, start_time),
+                process,
                 systemd_unit: None,
                 warnings: Vec::new(),
             })
         }
-        Err(err) if is_breakaway_refused(&err) => spawn_via_wmi(resolved, options).await,
-        Err(err) => Err(OsError::from_spawn_io(program_display, err)),
+        Err(DirectSpawnError::BreakawayRefused) => spawn_via_wmi(resolved, options).await,
+        Err(DirectSpawnError::Other(err)) => Err(err),
     }
 }
 
-fn is_breakaway_refused(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+fn build_direct_command_line(program: &str, args: &[String]) -> Result<String> {
+    let trimmed = program.trim().trim_end_matches(['.', ' ']);
+    let lower = trimmed.to_ascii_lowercase();
+    let is_batch = lower.ends_with(".cmd") || lower.ends_with(".bat");
+    if is_batch {
+        validate_wmi_batch_target(program, args)?;
+        let mut inner = windows_cmdline_escape(program);
+        for arg in args {
+            inner.push(' ');
+            inner.push_str(&windows_cmdline_escape(arg));
+        }
+        return Ok(format!("cmd.exe /d /s /c \"{inner}\""));
+    }
+
+    let mut line = windows_cmdline_escape(program);
+    for arg in args {
+        line.push(' ');
+        line.push_str(&windows_cmdline_escape(arg));
+    }
+    Ok(line)
 }
 
 async fn spawn_via_wmi(
@@ -133,9 +166,10 @@ async fn spawn_via_wmi(
     let _handoff_cleanup = HandoffCleanup {
         tmp_path: PathBuf::from(format!("{handoff_str}.tmp")),
         path: handoff_path.clone(),
+        script_path: script_fallback_path.clone(),
     };
 
-    let program_str = resolved.program_display();
+    let raw_program = resolved.program_display();
     let args_vec: Vec<String> = resolved
         .args
         .iter()
@@ -156,7 +190,17 @@ async fn spawn_via_wmi(
             )
         })
         .collect();
-    let merged_env = merge_windows_env(std::env::vars(), &env_remove, &overrides);
+    // Use `vars_os()` rather than `vars()` so unpaired UTF-16 surrogates in unrelated inherited
+    // environment variables never panic.
+    let inherited_env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    let merged_env = merge_windows_env(inherited_env, &env_remove, &overrides);
+
+    // Resolve bare program names using the caller's forwarded PATH + PATHEXT (before building the
+    // launcher, because WMI's `Process::Start` searches the service PATH rather than `$psi`'s env)
+    // and refuse `.cmd`/`.bat` targets with cmd.exe metacharacters in their arguments.
+    let program_str = resolve_wmi_program(&raw_program, &base_cwd, &merged_env);
+    validate_wmi_batch_target(&program_str, &args_vec)?;
 
     let launcher_script = build_wmi_launcher_script(
         &program_str,
@@ -253,13 +297,14 @@ async fn spawn_via_wmi(
 
     // Wait for the launcher to start the real target process and write its PID + creation time.
     let reported = wait_for_handoff(&handoff_path, wrapper_pid, WMI_LAUNCH_TIMEOUT).await?;
+    resolved.disarm_temp_script();
 
-    // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID (avoiding any
-    // local-time DST ambiguity in .NET's Process.StartTime), falling back to the launcher's
-    // reported FILETIME only if the target already exited before we queried it.
+    // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID, accepting the
+    // queried identity only when it matches `reported` exactly or differs by exactly +/- 1 hour
+    // (DST ambiguity in .NET's Process.StartTime); reject any other mismatch as a recycled PID.
     let process = match win_proc::query_process_identity(reported.pid, true) {
-        Ok(Some(exact)) => exact,
-        _ => reported,
+        Ok(queried) => reconcile_wmi_identity(reported, queried)?,
+        Err(_) => reported,
     };
 
     Ok(DetachHandle {

@@ -33,6 +33,44 @@ async fn wait(ctx: &Ctx, _args: Map<String, Value>) -> Result<Done, ToolError> {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct MarkerArgs {
+    marker: String,
+}
+
+/// Hands its work to a blocking thread, which cannot be dropped, so the work watches the token
+/// itself, cleans up and leaves a marker once it has stopped.
+async fn blocking(ctx: &Ctx, args: MarkerArgs) -> Result<Done, ToolError> {
+    let token = ctx.cancel_token().clone();
+    ctx.emit(EventKind::Progress, json!({"started": true}));
+    let stopped = tokio::task::spawn_blocking(move || {
+        while !token.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::write(&args.marker, "stopped")
+    })
+    .await;
+    match stopped {
+        Ok(Ok(())) => Err(ToolError::new(
+            ErrorCode::Cancelled,
+            "t.blocking stopped once it had cleaned up.",
+        )),
+        _ => Err(ToolError::new(
+            ErrorCode::Internal,
+            "the marker was not written",
+        )),
+    }
+}
+
+/// Stops when cancelled and says how far it got, which is its result.
+async fn stops(ctx: &Ctx, _args: Map<String, Value>) -> Result<Done, ToolError> {
+    ctx.emit(EventKind::Progress, json!({"started": true}));
+    ctx.cancelled().await;
+    Ok(Done { done: false })
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PathArgs {
     path: String,
 }
@@ -62,6 +100,8 @@ impl Fixture {
         registry.add_fn("t.write", Effect::Write, "Writes nothing.", write);
         registry.add_fn("t.wait", Effect::Read, "Waits a minute.", wait);
         registry.add_fn("t.path", Effect::Read, "Checks a path.", path);
+        registry.add_fn("t.blocking", Effect::Write, "Blocks.", blocking);
+        registry.add_fn("t.stops", Effect::Read, "Stops when asked.", stops);
         let home = dir.path().join("home");
         std::fs::create_dir_all(home.join("projects")).unwrap();
         let node = Node::new(Paths::under(dir.path()).with_home(home), registry);
@@ -71,7 +111,7 @@ impl Fixture {
     fn write_config(&self, name: &str, text: &str) {
         let config = self.dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join(name), text).unwrap();
+        legion_core::config::write_atomically(&config.join(name), text.as_bytes()).unwrap();
     }
 
     fn audit(&self) -> Vec<Value> {
@@ -231,6 +271,23 @@ async fn a_policy_that_does_not_parse_fails_every_call_instead_of_allowing_it() 
 }
 
 #[tokio::test]
+async fn a_policy_file_with_nothing_in_it_fails_every_call_instead_of_allowing_it() {
+    let fixture = Fixture::new();
+    fixture.write_config("policy.toml", "[principals.phone]\nrole = \"nobody\"\n");
+    // Caught half way through a rewrite that is not atomic, a policy can read as empty.
+    for empty in ["", " \n\t\r\n", "# the policy for tower\n"] {
+        fixture.write_config("policy.toml", empty);
+        let error = fixture.call("t.echo", json!({})).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Failed, "{empty:?}");
+        assert!(error.message.contains("policy.toml"), "{}", error.message);
+        assert!(
+            error.hint.as_deref().unwrap_or_default().contains("Delete"),
+            "{error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_refused_request_to_act_as_someone_else_is_recorded_as_the_caller() {
     let fixture = Fixture::new();
     fixture.write_config("policy.toml", &format!("default = \"phone\"\n{POLICY}"));
@@ -279,7 +336,28 @@ async fn the_grant_confines_paths_for_the_tool() {
 }
 
 #[tokio::test]
-async fn events_reach_the_sink_and_cancel_ends_the_call() {
+async fn file_tools_keep_out_of_the_node_s_own_files_unless_the_role_administers_it() {
+    let fixture = Fixture::new();
+    fixture.write_config("policy.toml", POLICY);
+    let policy_file = fixture.dir.path().join("config").join("policy.toml");
+    let mut call = Call::new(Door::Cli, "t.path", json!({"path": policy_file}));
+    call.as_principal = Some("phone".to_owned());
+    let error = fixture.node.call(call).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    assert!(error.message.contains("effect:admin"), "{}", error.message);
+    // The owner's role allows everything, admin included.
+    assert!(
+        fixture
+            .call("t.path", json!({"path": policy_file}))
+            .await
+            .is_ok()
+    );
+}
+
+// The clock is paused and moves on only when nothing else can, so the grace a tool that never looks
+// at its token is given passes at once.
+#[tokio::test(start_paused = true)]
+async fn events_reach_the_sink_and_cancel_ends_a_call_that_never_looks_once_its_grace_is_up() {
     let fixture = Fixture::new();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -296,6 +374,7 @@ async fn events_reach_the_sink_and_cancel_ends_the_call() {
     let node = fixture.node.clone();
     let running = tokio::spawn(async move { node.call(call).await });
     started_rx.await.unwrap();
+    let cancelled_at = tokio::time::Instant::now();
     cancel.cancel();
     let error = tokio::time::timeout(Duration::from_secs(10), running)
         .await
@@ -303,11 +382,65 @@ async fn events_reach_the_sink_and_cancel_ends_the_call() {
         .unwrap()
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Cancelled);
+    assert!(cancelled_at.elapsed() >= legion_core::CANCEL_GRACE);
     assert_eq!(
         *seen.lock().unwrap(),
         vec![(EventKind::Progress, json!({"started": true}))]
     );
     assert_eq!(fixture.audit()[0]["outcome"], json!("cancelled"));
+}
+
+/// Starts a call, waits for its first event, cancels it and returns what it came to.
+async fn cancel_once_started(
+    fixture: &Fixture,
+    tool: &str,
+    args: Value,
+) -> Result<Value, legion_core::proto::ErrorBody> {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started_tx = Mutex::new(Some(started_tx));
+    let mut call = Call::new(Door::Rpc, tool, args);
+    call.events = EventSink::new(move |_, _| {
+        if let Some(tx) = started_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+    });
+    let cancel = call.cancel.clone();
+    let node = fixture.node.clone();
+    let running = tokio::spawn(async move { node.call(call).await });
+    started_rx.await.unwrap();
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(30), running)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_call_is_not_reported_until_its_blocking_work_has_stopped() {
+    let fixture = Fixture::new();
+    let marker = fixture.dir.path().join("stopped");
+    let error = cancel_once_started(
+        &fixture,
+        "t.blocking",
+        json!({"marker": marker.to_string_lossy()}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        marker.exists(),
+        "the call was reported while its work went on"
+    );
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(error.message, "t.blocking stopped once it had cleaned up.");
+    assert_eq!(fixture.audit()[0]["outcome"], json!("cancelled"));
+}
+
+#[tokio::test]
+async fn a_tool_that_answers_a_cancel_in_time_has_its_answer_reported() {
+    let fixture = Fixture::new();
+    let result = cancel_once_started(&fixture, "t.stops", json!({})).await;
+    assert_eq!(result.unwrap(), json!({"done": false}));
+    assert_eq!(fixture.audit()[0]["outcome"], json!("ok"));
 }
 
 #[tokio::test]
