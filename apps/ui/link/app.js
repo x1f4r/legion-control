@@ -225,7 +225,28 @@ export function createAppLink() {
       };
     }
     try {
-      await invoke('pair', { invite: inviteText, name: name || null });
+      const paired = await invoke('pair', { invite: inviteText, name: name || null });
+      const next = await state();
+      return {
+        ...next,
+        last_paired: paired?.last_paired || next?.last_paired || null,
+      };
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function learn() {
+    try {
+      return await invoke('learn');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function acceptIdentityChange(node) {
+    try {
+      await invoke('accept_identity_change', { node });
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -298,6 +319,8 @@ export function createAppLink() {
     pair,
     unpair,
     selectNode,
+    learn,
+    acceptIdentityChange,
     repairStore,
     invalidateSessions,
     scanInvite,

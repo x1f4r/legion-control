@@ -873,3 +873,93 @@ test('fast start with an offline dual-boot machine paints immediately and keeps 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('fleet connections routes, identity-change acceptance, pairing sync notice, and role invite delivery', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const root = makeWorkRoot();
+  const fleet = setupFleet(root);
+  const server = await startServer(fleet.towerHome, fleet.towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      colorScheme: 'dark',
+    });
+    const p = await ctx.newPage();
+    p.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    p.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Pairing shows plain fleet sync summary without tool names.
+    await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
+    await p.getByRole('button', { name: 'Paste invite' }).click();
+    await p.locator('textarea').fill('legion-invite-1.mock.test');
+    await p.getByRole('button', { name: 'Pair device' }).click();
+    await p.getByText('Paired with tower and shared with pi.').waitFor({ timeout: 5000 });
+    await p.getByText('studio did not answer and will get this device at the next sync.').waitFor();
+    await assertNoToolNames(p, 'post-pair sync summary plain');
+
+    // 2. Settings -> Connections shows direct, relay, unsynced (plain hint), and identity-changed warning.
+    await p.goto(`${server.url}/?mock=fleet,enrol#/settings/connections`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Paired machines').waitFor();
+    await p.locator('a.row', { hasText: 'pi' }).getByText('directly').waitFor();
+    await p.locator('a.row', { hasText: 'studio' }).getByText('not yet: tower has not passed this device on to it').waitFor();
+    await p.locator('a.row', { hasText: 'studio' }).getByText('Ask the owner to sync the machines').waitFor();
+    await p.getByText('Reached through another machine').waitFor();
+    await p.locator('.row', { hasText: 'nas' }).getByText('through tower').waitFor();
+    await p.getByText('Identity changed for mini').waitFor();
+    await assertNoToolNames(p, 'fleet connections plain');
+
+    // Explicitly accept mini's identity change (never silent).
+    await p.getByRole('button', { name: 'Accept new identity' }).click();
+    await p.getByText('Identity changed for mini').waitFor({ state: 'hidden' });
+    await p.locator('a.row', { hasText: 'mini' }).getByText('directly').waitFor();
+
+    // 3. Technical mode shows the exact fleet.sync hint for unsynced machines.
+    await p.goto(`${server.url}/?mock=fleet,tech#/settings/connections`, { waitUntil: 'domcontentloaded' });
+    await p.locator('a.row', { hasText: 'studio' }).getByText('legion fleet.sync').waitFor();
+
+    // 4. "Let another device in" offers policy roles with plain descriptions, owner-strength switch,
+    //    and reports which machines received the newly paired device.
+    await p.goto(`${server.url}/?mock=fleet,enrol#/settings/connections/invite`, { waitUntil: 'domcontentloaded' });
+    const roleSelect = p.locator('label.field select');
+    await roleSelect.waitFor();
+    await p.getByText('Name for this device').waitFor();
+    await p.getByText('Look only.').waitFor();
+    await assertNoToolNames(p, 'fleet invite plain observer');
+
+    // Selecting owner reveals the Allow full owner access switch and disables Make invite until ticked.
+    await p.locator('label.field input[type="text"]').fill('tablet');
+    await roleSelect.selectOption('owner');
+    await p.getByText('Allow full owner access').waitFor();
+    const makeBtn = p.getByRole('button', { name: 'Make invite' });
+    assert.equal(await makeBtn.isDisabled(), true, 'Owner invite must stay disabled until Allow full owner access is ticked');
+    await p.locator('label.row-switch input[type="checkbox"]').check();
+    assert.equal(await makeBtn.isDisabled(), false);
+
+    // Switch back to operator and create invite; auto-enrol completes and shows fleet delivery.
+    await roleSelect.selectOption('operator');
+    await p.getByText('Do everything except change permissions.').waitFor();
+    await makeBtn.click();
+    await p.getByText('tablet is paired.').waitFor({ timeout: 5000 });
+    await p.getByText('Received by pi and tower. laptop, nas and studio will get it at the next sync.').waitFor();
+    await assertNoToolNames(p, 'fleet invite paired delivery plain');
+
+    await ctx.close();
+    assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
+    assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

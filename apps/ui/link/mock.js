@@ -7,6 +7,8 @@ import { formatBusyReasonLines } from '../lib/format.js';
 //   repair  - damaged state file recovery screen
 //   limited - observer role (no exec, write, power, destroy, admin)
 //   multi   - native app mode with two paired nodes (tower, pi)
+//   fleet   - native app mode with learned routes, unsynced peer, relay peer, identity change, and fleet device.invite schema
+//   enrol   - with fleet, auto-completes the next created invite so post-pairing delivery appears
 //   first   - adds a never-seen machine ("mini") that starts in asking state
 //   tech    - starts with Technical details turned on
 
@@ -488,6 +490,8 @@ export function createMockLink(mode = '') {
   const isNone = flags.has('none');
   const isEmpty = flags.has('empty');
   const isMulti = flags.has('multi');
+  const isFleet = flags.has('fleet');
+  const isAutoEnrol = flags.has('enrol');
   const isFirst = flags.has('first');
   const isRepair = flags.has('repair');
   const isPair = flags.has('pair');
@@ -495,18 +499,60 @@ export function createMockLink(mode = '') {
 
   let authed = !isToken && !isPair && !isRepair;
   let repaired = false;
-  const kind = isPair || isMulti || isRepair ? 'app' : 'mock';
+  const kind = isPair || isMulti || isRepair || isFleet ? 'app' : 'mock';
   let jobCounter = 10;
   let inviteCounter = 1;
   let activeNode = 'tower';
-  let pairedNodes = isMulti ? ['tower', 'pi'] : ['tower'];
+  let pairedNodes = isFleet ? ['tower', 'pi', 'studio', 'mini'] : isMulti ? ['tower', 'pi'] : ['tower'];
+  let miniIdentityChanged = isFleet;
+  let lastPaired = null;
+  let deviceListPollCount = 0;
+  let fleetDevicesByMachine = null;
+
+  const mockToolsList = isFleet
+    ? [
+        ...MOCK_TOOLS.map((t) =>
+          t.name === 'device.invite'
+            ? {
+                ...t,
+                input_schema: {
+                  type: 'object',
+                  properties: {
+                    principal: { type: 'string', description: 'Existing principal in policy.toml.' },
+                    name: { type: 'string', description: 'Display name for the new device.' },
+                    role: { type: 'string', description: 'Role from policy.toml or owner.' },
+                    allow_owner: { type: 'boolean', description: 'Confirm granting owner-strength access.' },
+                    valid_minutes: { type: 'integer', default: 15, minimum: 1, maximum: 1440 },
+                  },
+                },
+              }
+            : t,
+        ),
+        {
+          name: 'config.read',
+          effect: 'admin',
+          description: 'Read a shared configuration document on this node.',
+          input_schema: {
+            type: 'object',
+            required: ['document'],
+            properties: { document: { type: 'string' } },
+          },
+        },
+        {
+          name: 'device.endpoint',
+          effect: 'read',
+          description: 'Return this node SSH endpoint and host keys for direct pairing.',
+          input_schema: { type: 'object', properties: {} },
+        },
+      ]
+    : MOCK_TOOLS;
 
   const role = isNone ? 'guest' : isLimited ? 'observer' : 'owner';
   const allowedTools = isNone
     ? ['meta.whoami', 'meta.version', 'fleet.list', 'sys.info', 'power.status']
     : isLimited
-      ? MOCK_TOOLS.filter((t) => t.effect === 'read').map((t) => t.name)
-      : MOCK_TOOLS.map((t) => t.name);
+      ? mockToolsList.filter((t) => t.effect === 'read').map((t) => t.name)
+      : mockToolsList.map((t) => t.name);
 
   let incomingDevices = [
     {
@@ -793,7 +839,7 @@ export function createMockLink(mode = '') {
       throw m.error;
     }
 
-    const spec = MOCK_TOOLS.find((t) => t.name === tool);
+    const spec = mockToolsList.find((t) => t.name === tool);
     if (spec && !allowedTools.includes(tool)) {
       throw {
         code: 'denied',
@@ -885,16 +931,82 @@ export function createMockLink(mode = '') {
         }
         return { added: true, machine: addedName, host: addedHost, system: args?.system || 'linux' };
       }
-      case 'device.list':
-        return { devices: incomingDevices, invites: pendingInvites };
+      case 'config.read': {
+        if (args?.document === 'policy.toml') {
+          return {
+            exists: true,
+            document: 'policy.toml',
+            content: [
+              'default = "nobody"',
+              '',
+              '[principals.phone]',
+              'role = "operator"',
+              '',
+              '[roles.observer]',
+              'allow = ["effect:read"]',
+              '',
+              '[roles.editor]',
+              'allow = ["effect:read", "effect:write"]',
+              '',
+              '[roles.operator]',
+              'allow = ["effect:read", "effect:write", "effect:exec", "effect:power"]',
+              '',
+            ].join('\n'),
+          };
+        }
+        return { exists: false, document: args?.document || '' };
+      }
+      case 'device.list': {
+        if (isFleet && isAutoEnrol && pendingInvites.length > 0 && name === activeNode) {
+          deviceListPollCount += 1;
+          if (deviceListPollCount >= 2) {
+            const consumed = pendingInvites.shift();
+            const newDev = {
+              id: '0123456789abcdef0123456789abcdef',
+              name: consumed.name || consumed.principal || 'tablet',
+              principal: consumed.principal,
+              role: consumed.role || 'observer',
+              fingerprint: 'SHA256:enrolled-device-fp',
+              added: new Date().toISOString(),
+              foreign: false,
+              missing_home: false,
+            };
+            incomingDevices = [newDev, ...incomingDevices];
+            fleetDevicesByMachine = {
+              tower: [...incomingDevices],
+              pi: [...incomingDevices],
+              studio: incomingDevices.filter((d) => d.id !== newDev.id),
+            };
+          }
+        }
+        const devs =
+          fleetDevicesByMachine && fleetDevicesByMachine[name]
+            ? fleetDevicesByMachine[name]
+            : incomingDevices;
+        return { devices: devs, invites: name === activeNode ? pendingInvites : [] };
+      }
       case 'device.invite': {
-        const principal = String(args?.principal || 'phone').trim() || 'phone';
+        const chosenRole = String(args?.role || '').trim();
+        const deviceName = String(args?.name || '').trim();
+        const principal = deviceName
+          ? `device:${deviceName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-')}`
+          : String(args?.principal || 'phone').trim() || 'phone';
+        const effectiveRole = chosenRole || (principal === 'owner' ? 'owner' : 'operator');
         const validMin = Number(args?.valid_minutes) || 15;
         const id = `inv-mock-${inviteCounter++}`;
         const expires = new Date(Date.now() + validMin * 60_000).toISOString();
         const invite = `legion-invite-1.mock.${id}.${name}.${principal}.example`;
+        deviceListPollCount = 0;
         pendingInvites = [
-          { id, principal, fingerprint: 'SHA256:pending-invite', expires, created: new Date().toISOString() },
+          {
+            id,
+            name: deviceName || undefined,
+            principal,
+            role: effectiveRole,
+            fingerprint: 'SHA256:pending-invite',
+            expires,
+            created: new Date().toISOString(),
+          },
           ...pendingInvites,
         ];
         return {
@@ -902,7 +1014,7 @@ export function createMockLink(mode = '') {
           id,
           node: name,
           principal,
-          role: principal === 'owner' ? 'owner' : 'operator',
+          role: effectiveRole,
           expires,
           hosts: [`${name}.example.ts.net`],
           port: 22,
@@ -1177,25 +1289,83 @@ export function createMockLink(mode = '') {
     }
     const ordered = [activeNode, ...pairedNodes.filter((n) => n !== activeNode)];
     const nodes = ordered.map((nodeName) => {
-      const whoami = resolveOne(nodeName, 'meta.whoami', {});
-      return {
+      const hasMachine = Boolean(machines[nodeName]?.reachable);
+      const whoami = hasMachine
+        ? resolveOne(nodeName, 'meta.whoami', {})
+        : {
+            principal: 'phone',
+            role,
+            door: kind === 'app' ? 'ssh' : 'mock',
+            node: nodeName,
+            delegate: false,
+            paths: null,
+            tools: allowedTools,
+          };
+      const base = {
         node: nodeName,
         principal: whoami.principal,
         role: whoami.role,
         via: kind === 'app' ? 'ssh' : 'mock',
-        origin: typeof window !== 'undefined' ? window.location.origin : `https://${nodeName}.example.ts.net`,
+        origin: isFleet
+          ? nodeName === 'tower'
+            ? 'paired'
+            : 'learned'
+          : typeof window !== 'undefined'
+            ? window.location.origin
+            : `https://${nodeName}.example.ts.net`,
         version: '0.1.0',
         build: 'mock00000000',
         protocol: 1,
         whoami,
       };
+      if (isFleet) {
+        if (nodeName === 'tower') {
+          base.route = 'direct';
+        } else if (nodeName === 'pi') {
+          base.learned_from = 'tower';
+          base.route = 'direct';
+        } else if (nodeName === 'studio') {
+          base.learned_from = 'tower';
+          base.route = 'not_synced';
+          base.route_via = 'tower';
+        } else if (nodeName === 'mini') {
+          base.learned_from = 'tower';
+          if (miniIdentityChanged) {
+            base.route = 'identity_changed';
+            base.route_via = 'tower';
+            base.identity_changed = {
+              reported_by: 'tower',
+              hosts: ['mini.example.net'],
+              port: 22,
+              old_fingerprints: ['SHA256:oldMiniKey1111111111111111111111111111111'],
+              new_fingerprints: ['SHA256:newMiniKey2222222222222222222222222222222'],
+            };
+          } else {
+            base.route = 'direct';
+          }
+        }
+      }
+      return base;
     });
+    const routes = isFleet
+      ? {
+          tower: { kind: 'direct' },
+          pi: { kind: 'direct' },
+          studio: { kind: 'not_synced', introducer: 'tower', via: 'tower' },
+          nas: { kind: 'relay', via: 'tower' },
+          mini: miniIdentityChanged
+            ? { kind: 'identity_changed', via: 'tower' }
+            : { kind: 'direct' },
+        }
+      : {};
     return {
       ready: true,
       needs: null,
       can_scan: kind === 'app',
       health: { ok: true, node: activeNode, version: '0.1.0' },
       nodes,
+      routes,
+      last_paired: lastPaired,
     };
   }
 
@@ -1217,7 +1387,7 @@ export function createMockLink(mode = '') {
   }
 
   async function tools() {
-    return MOCK_TOOLS;
+    return mockToolsList;
   }
 
   async function setToken(t) {
@@ -1235,6 +1405,36 @@ export function createMockLink(mode = '') {
   async function pair() {
     authed = true;
     if (!pairedNodes.includes('tower')) pairedNodes.push('tower');
+    if (isFleet || isPair) {
+      lastPaired = {
+        node: 'tower',
+        device: 'Pixel 10',
+        role: 'operator',
+        synced: ['pi'],
+        not_synced: [{ node: 'studio', reason: 'connection refused' }],
+        sync_command: 'legion fleet.sync direction=push documents=\'["devices.toml"]\'',
+      };
+    }
+    return state();
+  }
+
+  async function learn() {
+    return {
+      report: {
+        introducer: activeNode,
+        added: [],
+        updated: [],
+        identity_changed: miniIdentityChanged ? ['mini'] : [],
+        skipped: [],
+      },
+      state: await state(),
+    };
+  }
+
+  async function acceptIdentityChange(node) {
+    if (node === 'mini') {
+      miniIdentityChanged = false;
+    }
     return state();
   }
 
@@ -1284,6 +1484,8 @@ export function createMockLink(mode = '') {
     pair,
     unpair,
     selectNode,
+    learn,
+    acceptIdentityChange,
     repairStore,
     scanInvite,
     initialFleetCache,

@@ -5,6 +5,7 @@ import { Meter, Notice } from './common.js';
 import { formatMachineStatusPhrase } from '../lib/activity.js';
 import { machineMetrics } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
+import { formatPairSyncNotice } from '../lib/settings.js';
 import { MachineDetail } from './machine.js';
 
 function OnlineMachineCard({ machine, selected, showMetrics }) {
@@ -83,6 +84,8 @@ function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake }) 
 export function MachinesView({
   snapshot,
   error,
+  pairNotice,
+  onDismissPairNotice,
   loading,
   wide,
   route,
@@ -103,6 +106,7 @@ export function MachinesView({
   const canWake = allowedSet ? allowedSet.has('power.wake') : false;
   const showMetrics = settings?.showMetrics !== false;
   const showOffline = settings?.showOffline !== false;
+  const syncBanner = formatPairSyncNotice(pairNotice, Boolean(settings?.technical));
 
   const onlineMachines = machines.filter((m) => m.reachable);
   const askingMachines = machines.filter((m) => !m.reachable && (m.status === 'asking' || m.asking));
@@ -116,6 +120,16 @@ export function MachinesView({
   const listColumn = html`
     <section>
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${syncBanner
+        ? html`
+            <${Notice}
+              title=${syncBanner.title}
+              hint=${syncBanner.detail}
+              kind=${syncBanner.kind}
+              onDismiss=${onDismissPairNotice}
+            />
+          `
+        : null}
 
       ${machines.length === 0
         ? loading

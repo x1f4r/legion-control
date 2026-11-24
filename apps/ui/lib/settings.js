@@ -518,3 +518,294 @@ export function isInviteOwnerStrength({
   }
   return false;
 }
+
+function joinNamesPlain(names) {
+  const list = (names || []).filter(Boolean);
+  if (list.length === 0) return '';
+  if (list.length === 1) return list[0];
+  if (list.length === 2) return `${list[0]} and ${list[1]}`;
+  return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+}
+
+/**
+ * Plain-language summary of which fleet machines received this device right after pairing
+ * and which will receive it at their next sync.
+ */
+export function formatPairSyncNotice(lastPaired, technical = false) {
+  if (!lastPaired || typeof lastPaired !== 'object') return null;
+  const node = String(lastPaired.node || '').trim();
+  const synced = Array.isArray(lastPaired.synced) ? lastPaired.synced.filter(Boolean) : [];
+  const notSynced = Array.isArray(lastPaired.not_synced)
+    ? lastPaired.not_synced
+        .map((p) => (typeof p === 'string' ? p : p?.node))
+        .filter(Boolean)
+    : [];
+  if (synced.length === 0 && notSynced.length === 0) return null;
+
+  const syncedNames = joinNamesPlain(synced);
+  const pendingNames = joinNamesPlain(notSynced);
+  const title =
+    synced.length > 0
+      ? `Paired with ${node || 'this machine'} and shared with ${syncedNames}.`
+      : `Paired with ${node || 'this machine'}.`;
+
+  if (notSynced.length === 0) {
+    return {
+      kind: 'neutral',
+      title,
+      detail: 'This device can reach them directly.',
+    };
+  }
+
+  const pendingVerb = notSynced.length === 1 ? 'did not answer and will get' : 'did not answer and will get';
+  let detail = `${pendingNames} ${pendingVerb} this device at the next sync.`;
+  if (technical) {
+    const cmd =
+      String(lastPaired.sync_command || '').trim() ||
+      'legion fleet.sync direction=push documents=\'["devices.toml"]\'';
+    detail = `${detail} Run \`${cmd}\` to sync now.`;
+  }
+  return {
+    kind: 'warn',
+    title,
+    detail,
+  };
+}
+
+/**
+ * Describes how this device reaches a machine for Settings -> Connections.
+ * Never exposes tool names when `technical` is false.
+ */
+export function describeConnectionRoute(entry, technical = false) {
+  const node = entry?.node || 'this machine';
+  const idChanged = entry?.identity_changed || null;
+  const route = idChanged ? 'identity_changed' : entry?.route || 'direct';
+
+  if (route === 'identity_changed') {
+    const reporter = idChanged?.reported_by || entry?.route_via || entry?.learned_from || 'another machine';
+    return {
+      kind: 'identity_changed',
+      label: 'Identity changed',
+      hint: `${reporter} reported a different host key for ${node}. Accept it only if ${node} was reinstalled or its keys changed.`,
+      isWarning: true,
+      isIdentityChanged: true,
+    };
+  }
+
+  if (route === 'not_synced') {
+    const introducer = entry?.learned_from || entry?.route_via || 'another machine';
+    return {
+      kind: 'not_synced',
+      label: `not yet: ${introducer} has not passed this device on to it`,
+      hint: technical
+        ? `Run \`legion fleet.sync\` on ${introducer}.`
+        : 'Ask the owner to sync the machines',
+      isWarning: false,
+      isIdentityChanged: false,
+    };
+  }
+
+  if (route === 'relay') {
+    const via = entry?.route_via || 'another machine';
+    return {
+      kind: 'relay',
+      label: `through ${via}`,
+      hint: null,
+      isWarning: false,
+      isIdentityChanged: false,
+    };
+  }
+
+  return {
+    kind: 'direct',
+    label: 'directly',
+    hint: null,
+    isWarning: false,
+    isIdentityChanged: false,
+  };
+}
+
+/**
+ * Lists relay-only machines known via `linkState.routes` or the live fleet snapshot that do not
+ * have their own direct node entry in `linkState.nodes`.
+ */
+export function buildRelayedConnections(linkState, snapshot) {
+  const directNodes = new Set((linkState?.nodes || []).map((n) => n?.node).filter(Boolean));
+  const fallbackVia = linkState?.nodes?.[0]?.node || null;
+  const routes = linkState?.routes && typeof linkState.routes === 'object' ? linkState.routes : {};
+  const byName = new Map();
+
+  for (const [name, info] of Object.entries(routes)) {
+    if (!name || directNodes.has(name)) continue;
+    byName.set(name, {
+      node: name,
+      route: info?.kind || 'relay',
+      route_via: info?.via || fallbackVia,
+      learned_from: info?.introducer || null,
+      identity_changed: null,
+      relayedOnly: true,
+    });
+  }
+
+  for (const m of snapshot?.machines || []) {
+    if (!m?.name || directNodes.has(m.name) || byName.has(m.name)) continue;
+    byName.set(m.name, {
+      node: m.name,
+      route: 'relay',
+      route_via: fallbackVia,
+      learned_from: null,
+      identity_changed: null,
+      relayedOnly: true,
+    });
+  }
+
+  return Array.from(byName.values()).sort((a, b) => (a.node < b.node ? -1 : a.node > b.node ? 1 : 0));
+}
+
+/**
+ * Plain-English description of a policy role (built-in or custom from `policy.toml`).
+ */
+export function describePolicyRolePlain(roleName, policy = null) {
+  const trimmed = String(roleName || '').trim();
+  const lower = trimmed.toLowerCase();
+  if (lower === 'owner') return 'Do everything on this machine';
+  if (lower === 'operator') return 'Do everything except change permissions';
+  if (lower === 'editor') return 'Look at machines and edit files';
+  if (lower === 'observer') return 'Look only';
+
+  const def = policy?.roles?.[trimmed];
+  if (def && Array.isArray(def.allow)) {
+    if (isRoleOwnerStrength(trimmed, { policy })) {
+      return 'Do everything on this machine';
+    }
+    const allow = def.allow;
+    const deny = new Set(Array.isArray(def.deny) ? def.deny : []);
+    const has = (tag) => allow.includes(tag) && !deny.has(tag);
+    const hasRead = has('effect:read') || allow.some((r) => !r.startsWith('effect:'));
+    const hasWrite = has('effect:write');
+    const hasExec = has('effect:exec');
+    const hasPower = has('effect:power');
+    if (hasPower && hasExec && hasWrite) return 'Do everything except change permissions';
+    if (hasRead && !hasWrite && !hasExec && !hasPower) return 'Look only';
+    const caps = [];
+    if (hasRead) caps.push('look');
+    if (hasWrite) caps.push('edit files');
+    if (hasExec) caps.push('run commands');
+    if (hasPower) caps.push('control power');
+    if (caps.length === 1) return `May ${caps[0]}`;
+    if (caps.length > 1) return `May ${caps.slice(0, -1).join(', ')} and ${caps[caps.length - 1]}`;
+  }
+
+  return 'Use this machine with that role';
+}
+
+const STANDARD_ROLE_ORDER = ['observer', 'editor', 'operator'];
+
+/**
+ * Builds the list of selectable roles for "Let another device in" from `policy.toml` + `owner`
+ * (or from a schema `enum` if present).
+ */
+export function extractInviteRoles(policy, roleProp, { allowOwner = true } = {}) {
+  const names = [];
+  const seen = new Set();
+  const push = (name) => {
+    const s = String(name || '').trim();
+    if (!s || s === 'nobody' || seen.has(s)) return;
+    seen.add(s);
+    names.push(s);
+  };
+
+  if (Array.isArray(roleProp?.enum) && roleProp.enum.length > 0) {
+    for (const opt of roleProp.enum) push(opt);
+  } else if (policy?.roles && typeof policy.roles === 'object') {
+    const policyNames = Object.keys(policy.roles);
+    for (const std of STANDARD_ROLE_ORDER) {
+      if (policyNames.includes(std)) push(std);
+    }
+    for (const custom of [...policyNames].sort()) {
+      if (custom !== 'owner') push(custom);
+    }
+    if (allowOwner || policyNames.includes('owner')) {
+      push('owner');
+    }
+  }
+
+  return names.map((name) => ({
+    name,
+    description: describePolicyRolePlain(name, policy),
+    ownerStrength: isRoleOwnerStrength(name, { policy }),
+  }));
+}
+
+/**
+ * Checks a fan-out `device.list` (`on: "all"`) result to see which fleet machines received
+ * `invitedDevice` and which have not yet.
+ */
+export function summarizeInvitedDeviceFleet(allResult, invitedDevice) {
+  const results = allResult?.results && typeof allResult.results === 'object' ? allResult.results : {};
+  const received = [];
+  const pending = [];
+  const targetId = invitedDevice?.id || null;
+  const targetFp = invitedDevice?.fingerprint || null;
+  const targetName = invitedDevice?.name || null;
+  const targetPrincipal = invitedDevice?.principal || null;
+
+  for (const machine of Object.keys(results).sort()) {
+    const entry = results[machine];
+    const devices = Array.isArray(entry?.ok?.devices) ? entry.ok.devices : null;
+    if (!devices) {
+      pending.push(machine);
+      continue;
+    }
+    const found = devices.some((d) => {
+      if (targetId && d?.id) return d.id === targetId;
+      if (targetFp && d?.fingerprint) return d.fingerprint === targetFp;
+      return Boolean(targetName && d?.name === targetName && (!targetPrincipal || d?.principal === targetPrincipal));
+    });
+    if (found) received.push(machine);
+    else pending.push(machine);
+  }
+
+  return { received, pending };
+}
+
+/**
+ * Plain-language notice for the invite screen once the other device has paired.
+ */
+export function formatInvitedDeviceSyncNotice(deviceName, summary, technical = false) {
+  const who = String(deviceName || '').trim() || 'The new device';
+  const received = Array.isArray(summary?.received) ? summary.received.filter(Boolean) : [];
+  const pending = Array.isArray(summary?.pending) ? summary.pending.filter(Boolean) : [];
+
+  const title = `${who} is paired.`;
+  if (received.length > 0 && pending.length === 0) {
+    return {
+      kind: 'neutral',
+      title,
+      detail: `Received by ${joinNamesPlain(received)}.`,
+    };
+  }
+  if (received.length > 0 && pending.length > 0) {
+    let detail = `Received by ${joinNamesPlain(received)}. ${joinNamesPlain(pending)} will get it at the next sync.`;
+    if (technical) {
+      detail = `${detail} Run \`legion fleet.sync direction=push documents='["devices.toml"]'\` to sync now.`;
+    }
+    return {
+      kind: 'warn',
+      title,
+      detail,
+    };
+  }
+  if (pending.length > 0) {
+    return {
+      kind: 'warn',
+      title,
+      detail: `${joinNamesPlain(pending)} will get it at the next sync.`,
+    };
+  }
+  return {
+    kind: 'neutral',
+    title,
+    detail: 'Ready to connect.',
+  };
+}

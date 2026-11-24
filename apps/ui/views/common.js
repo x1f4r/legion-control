@@ -29,7 +29,7 @@ export function Meter({ value, level, className = '' }) {
   return html`<span ref=${ref} class=${cls}><i></i></span>`;
 }
 
-export function Notice({ error, title, message, hint, kind = 'bad', className = '' }) {
+export function Notice({ error, title, message, hint, kind = 'bad', className = '', onDismiss }) {
   const heading = title || (error ? error.message : message);
   const detail = hint ?? (error ? error.hint : null);
   const machine = error?.machine ? `${error.machine}: ` : '';
@@ -40,21 +40,36 @@ export function Notice({ error, title, message, hint, kind = 'bad', className = 
       reason === 'auth_failed' ||
       reason === 'host_key_mismatch');
   if (!heading) return null;
-  const cls = ['notice', kind === 'bad' ? 'bad' : '', className].filter(Boolean).join(' ');
+  const cls = [
+    'notice',
+    kind === 'bad' ? 'bad' : kind === 'neutral' ? 'neutral' : '',
+    className,
+  ]
+    .filter(Boolean)
+    .join(' ');
   return html`
     <div class=${cls} role="status">
       <strong>${machine}${heading}</strong>
       ${detail ? html`<span><${CodeText} text=${detail} /></span>` : null}
-      ${canRepair
+      ${canRepair || typeof onDismiss === 'function'
         ? html`
             <div class="actions">
-              <button
-                type="button"
-                class="btn small primary"
-                onClick=${() => window.dispatchEvent(new CustomEvent('legion:open-pairing'))}
-              >
-                Pair again
-              </button>
+              ${canRepair
+                ? html`
+                    <button
+                      type="button"
+                      class="btn small primary"
+                      onClick=${() => window.dispatchEvent(new CustomEvent('legion:open-pairing'))}
+                    >
+                      Pair again
+                    </button>
+                  `
+                : null}
+              ${typeof onDismiss === 'function'
+                ? html`
+                    <button type="button" class="btn small" onClick=${onDismiss}>Dismiss</button>
+                  `
+                : null}
             </div>
           `
         : null}
