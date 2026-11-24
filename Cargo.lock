@@ -417,8 +417,11 @@ dependencies = [
 name = "legion-os"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nix",
  "process-wrap",
+ "serde",
+ "serde_json",
  "sysinfo",
  "tempfile",
  "thiserror",
