@@ -257,6 +257,7 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
             fs::create_dir_all(&root).unwrap();
             let temporary = root.join(".legion-unpack-1-0.tmp");
             fs::write(&temporary, b"half").unwrap();
+            println!("{}", json!({"protocol": 1}));
             println!("{}", json!({"ready": true}));
             std::io::stdout().flush().unwrap();
             let _ = std::io::copy(&mut input, &mut std::io::sink());
@@ -268,6 +269,7 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
         ("fail-pack", "pack") => {
             let error =
                 json!({"code": "failed", "message": "The disk went away.", "machine": "broken"});
+            println!("{}", json!({"protocol": 1}));
             println!("{}", json!({ "error": error }));
             return ExitCode::from(1);
         }
@@ -291,7 +293,8 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
             let mut kept = 0;
             for line in replies.lines() {
                 let mut reply: Value = serde_json::from_str(&line.unwrap()).unwrap();
-                if reply.get("done").is_some() {
+                if reply.get("protocol").is_some() {
+                } else if reply.get("done").is_some() {
                     reply["entries"] = json!(kept);
                 } else if reply["path"] != "readme.txt" {
                     continue;
@@ -301,7 +304,7 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
                 writeln!(out, "{reply}").unwrap();
             }
         }
-        // Speaks an older protocol, whose archive came without a line before it.
+        // Speaks the protocol before this one, which did not open by saying which it speaks.
         ("old", "pack") => {
             let mut line = String::new();
             replies.read_line(&mut line).unwrap();
@@ -309,14 +312,13 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
         }
         // Says its file system ignores letter case, as macOS and Windows usually do.
         ("caseless", "stat") => {
-            let mut line = String::new();
-            replies.read_line(&mut line).unwrap();
-            let mut reply: Value = serde_json::from_str(&line).unwrap();
-            if reply.get("kind").is_some() {
-                reply["case_insensitive"] = json!(true);
+            for line in replies.lines() {
+                let mut reply: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if reply.get("kind").is_some() {
+                    reply["case_insensitive"] = json!(true);
+                }
+                writeln!(out, "{reply}").unwrap();
             }
-            writeln!(out, "{reply}").unwrap();
-            std::io::copy(&mut replies, &mut out).unwrap();
         }
         // Stops half way through its archive and fails.
         ("truncate", "pack") => {
@@ -384,6 +386,15 @@ fn twice(header: Value, mut command: Command) -> ExitCode {
     out.write_all(second).unwrap();
     out.flush().unwrap();
     ExitCode::SUCCESS
+}
+
+/// The first reply on a stream's output, after the line that opens every stream and says which
+/// protocol it speaks.
+fn first_reply(stdout: &[u8]) -> Value {
+    let mut lines = stdout.split(|b| *b == b'\n');
+    let opening: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
+    assert_eq!(opening, json!({"protocol": 1}));
+    serde_json::from_slice(lines.next().unwrap()).unwrap()
 }
 
 fn exit_of(status: std::process::ExitStatus) -> ExitCode {
@@ -1194,8 +1205,7 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
         let output = child.wait_with_output().unwrap();
         assert!(started.elapsed() < PATIENCE);
         assert_eq!(output.status.code(), Some(1));
-        let reply: Value =
-            serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let reply: Value = first_reply(&output.stdout);
         assert_eq!(reply["error"]["code"], "denied", "{reply}");
         assert_eq!(reply["error"]["machine"], "pi");
         assert!(String::from_utf8_lossy(&output.stderr).contains("legion stream:"));
@@ -1352,8 +1362,7 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
-        let reply: Value =
-            serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let reply: Value = first_reply(&output.stdout);
         if outcome == "ok" {
             assert_eq!(reply["kind"], "file", "{reply}");
         } else {
@@ -1640,8 +1649,7 @@ fn an_end_that_speaks_another_protocol_is_told_apart_from_a_banner() {
     .unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(1));
-    let reply: Value =
-        serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    let reply: Value = first_reply(&output.stdout);
     assert_eq!(reply["error"]["code"], "unsupported", "{reply}");
     assert_eq!(reply["error"]["details"]["protocol"], json!([1]), "{reply}");
 }

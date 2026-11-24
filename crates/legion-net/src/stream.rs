@@ -6,15 +6,18 @@
 //! every path and value rides inside the header, so nothing a caller supplies is ever quoted for a
 //! remote shell.
 //!
-//! Every header carries `protocol`, the version of this exchange it speaks. A node that does not
-//! speak that version, or does not know the operation, answers `unsupported` and names what it
-//! speaks, so two nodes of different ages fail plainly rather than misread each other.
+//! Every header carries `protocol`, the version of this exchange it speaks, and a node's first
+//! line, before any reply or refusal, is `{"protocol": N}`, the version it speaks. A node that
+//! does not speak a header's version, or does not know the operation, answers `unsupported` and
+//! names what it speaks; a reader refuses a node whose first line does not say, before it sends
+//! anything that relies on the node holding to this version. Two nodes of different ages fail
+//! plainly rather than misread each other.
 //!
-//! Every reply starts with one JSON line, so a client can skip a login banner before it and tell a
-//! refusal (`{"error": …}`) from data. While an operation works on something long (hashing a
-//! large file, listing a large tree, verifying what it received), it writes `{"busy": true}` every
-//! [`HEARTBEAT`] where a line is awaited, so a reader can give up on silence without giving up on
-//! work:
+//! After that line every reply starts with one JSON line, so a client can skip a login banner
+//! before it and tell a refusal (`{"error": …}`) from data. While an operation works on something
+//! long (hashing a large file, listing a large tree, verifying what it received), it writes
+//! `{"busy": true}` every [`HEARTBEAT`] where a line is awaited, so a reader can give up on
+//! silence without giving up on work:
 //!
 //! | `op` | Header | Reply |
 //! | --- | --- | --- |
@@ -331,6 +334,10 @@ pub fn serve<R: Read, W: Write>(
     let started = Instant::now();
     let mut input = BufReader::new(input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
+    // Said before anything else, refusals included, so a reader can tell this node's replies
+    // from those of one too old to hold to what it asks.
+    let _ =
+        line(&mut output, &json!({ "protocol": STREAM_PROTOCOL })).and_then(|()| output.flush());
     let (header, recorded) = match read_header(&mut input) {
         Ok(read) => read,
         Err(error) => {

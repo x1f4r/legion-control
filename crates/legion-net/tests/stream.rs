@@ -84,20 +84,23 @@ struct Ran {
 
 impl Ran {
     /// The output's first line, as JSON, and what follows it.
+    /// What follows the line every stream opens with, which says the protocol it speaks.
+    fn replies(&self) -> &[u8] {
+        after_protocol(&self.output)
+    }
+
+    /// The first reply, as JSON, and what follows it.
     fn first(&self) -> (Value, &[u8]) {
-        let end = self
-            .output
-            .iter()
-            .position(|b| *b == b'\n')
-            .expect("a line");
+        let replies = self.replies();
+        let end = replies.iter().position(|b| *b == b'\n').expect("a line");
         (
-            serde_json::from_slice(&self.output[..end]).unwrap(),
-            &self.output[end + 1..],
+            serde_json::from_slice(&replies[..end]).unwrap(),
+            &replies[end + 1..],
         )
     }
 
     fn lines(&self) -> Vec<Value> {
-        self.output
+        self.replies()
             .lines()
             .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
             .collect()
@@ -122,6 +125,14 @@ impl Ran {
         assert_eq!(line["error"]["code"], json!(code.as_str()), "{line}");
         line["error"].clone()
     }
+}
+
+/// A stream's output after its first line, which must say the protocol it speaks.
+fn after_protocol(output: &[u8]) -> &[u8] {
+    let end = output.iter().position(|b| *b == b'\n').expect("a line");
+    let opening: Value = serde_json::from_slice(&output[..end]).unwrap();
+    assert_eq!(opening, json!({"protocol": STREAM_PROTOCOL}));
+    &output[end + 1..]
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -390,7 +401,7 @@ fn manifest_of_a_home_leaves_out_legions_own_files_for_a_role_without_admin() {
             &mut output,
         )
         .unwrap();
-        output
+        after_protocol(&output)
             .lines()
             .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
             .collect::<Vec<_>>()
@@ -490,8 +501,13 @@ fn unpack_checks_where_each_entry_lands_and_leaves_legions_own_files_alone() {
     input.extend_from_slice(&archive);
     let mut output = Vec::new();
     serve(&host, Some("writer"), Cursor::new(input), &mut output).unwrap();
-    let done: Value =
-        serde_json::from_slice(output.split(|b| *b == b'\n').nth(1).unwrap()).unwrap();
+    let done: Value = serde_json::from_slice(
+        after_protocol(&output)
+            .split(|b| *b == b'\n')
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(done["files"], 1, "{done}");
     let skipped = done["skipped"].to_string();
     assert!(
@@ -808,8 +824,14 @@ fn a_header_that_cannot_be_read_is_refused_on_the_first_line() {
         let mut output = Vec::new();
         let error = serve(&node.host, None, Cursor::new(input.to_vec()), &mut output).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgs, "{input:?}");
-        let line: Value =
-            serde_json::from_slice(output.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        // Even a header that cannot be read is answered after the line saying the protocol.
+        let line: Value = serde_json::from_slice(
+            after_protocol(&output)
+                .split(|b| *b == b'\n')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(line["error"]["code"], "invalid_args");
     }
     let relative = node.run(None, &json!({"op": "stat", "path": "relative/path"}), b"");

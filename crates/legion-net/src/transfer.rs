@@ -75,6 +75,11 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// file it was writing) and exit before it is killed.
 const ABORT_GRACE: Duration = Duration::from_secs(2);
 
+/// The longest `busy` lines may put off one reply. A node hashing or listing something very large
+/// says it is busy every few seconds for as long as that takes; past this, a node that only ever
+/// says so is taken to be stuck.
+const MOST_BUSY: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// How long an ended stream is given to exit and say why on stderr.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
 
@@ -1140,6 +1145,8 @@ struct Conn {
     answered: bool,
     noise_lines: usize,
     noise_bytes: usize,
+    /// Whether the other end has said, on its first line, that it speaks this protocol.
+    greeted: bool,
     /// When the pipe was opened, which the first reply's time limit counts from.
     opened: tokio::time::Instant,
 }
@@ -1230,6 +1237,7 @@ impl Conn {
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
+            greeted: false,
             opened: tokio::time::Instant::now(),
         };
         let mut line = header.to_string().into_bytes();
@@ -1263,29 +1271,68 @@ impl Conn {
         writer.flush().await
     }
 
-    /// The next reply, which has the shape `T` or is the other end's error. `{"busy": true}`
-    /// lines, which say the other end is at work, are passed over wherever they come. Before the
-    /// first reply, lines of text that are neither (a login banner, a shell's own noise, even one
-    /// that happens to be JSON) are skipped within bounds, while bytes that are not text at all
-    /// mean the other end speaks another protocol; after it, anything else is the other end gone
-    /// wrong.
+    /// The next reply, which has the shape `T` or is the other end's error.
+    ///
+    /// The other end's first line says which protocol it speaks, and nothing it says is taken
+    /// before that: a node too old to say it would ignore what this one asks of it (the entries an
+    /// unpack must hold to, the hashes it must check), so it is refused before anything is sent
+    /// that relies on them. `{"busy": true}` lines, which say the other end is at work, are passed
+    /// over wherever they come, for at most [`MOST_BUSY`] for one reply. Before the first line,
+    /// lines of text that are neither (a login banner, a shell's own noise, even one that happens
+    /// to be JSON) are skipped within bounds, while bytes that are not text at all mean the other
+    /// end speaks another protocol; after it, anything else is the other end gone wrong.
     async fn first<T: DeserializeOwned>(&mut self) -> Result<T, ErrorBody> {
+        let waiting = tokio::time::Instant::now();
         loop {
             let line = self.line().await?;
             if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&line) {
-                if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
-                    self.answered = true;
+                if !self.greeted {
+                    if let Some(spoken) = fields.get("protocol") {
+                        if spoken.as_u64() != Some(u64::from(stream::STREAM_PROTOCOL)) {
+                            return Err(self.older(&format!(
+                                "speaks stream protocol {spoken}, and this node speaks stream protocol {}",
+                                stream::STREAM_PROTOCOL
+                            )));
+                        }
+                        self.greeted = true;
+                        self.answered = true;
+                        continue;
+                    }
+                    if looks_like_a_reply(&fields) {
+                        let said = fields
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                            .map(|message| format!(" (it said: {message})"))
+                            .unwrap_or_default();
+                        return Err(self.older(&format!(
+                            "answered without saying which stream protocol it speaks{said}, as a legion older than this one does"
+                        )));
+                    }
+                } else if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                    if waiting.elapsed() > MOST_BUSY {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "{} said it was busy for more than {} hours without answering.",
+                                self.machine,
+                                MOST_BUSY.as_secs() / 3600
+                            ),
+                        )
+                        .with_hint("Transfer a smaller part at a time, or check what is keeping that machine busy.")
+                        .with_machine(self.machine.clone()));
+                    }
                     continue;
                 }
-                if let Some(error) = fields.get("error")
-                    && let Ok(error) = serde_json::from_value::<ErrorBody>(error.clone())
-                {
-                    self.answered = true;
-                    return Err(with_machine(error, &self.machine));
-                }
-                if let Ok(reply) = serde_json::from_value::<T>(Value::Object(fields)) {
-                    self.answered = true;
-                    return Ok(reply);
+                if self.greeted {
+                    if let Some(error) = fields.get("error")
+                        && let Ok(error) = serde_json::from_value::<ErrorBody>(error.clone())
+                    {
+                        return Err(with_machine(error, &self.machine));
+                    }
+                    if let Ok(reply) = serde_json::from_value::<T>(Value::Object(fields)) {
+                        return Ok(reply);
+                    }
                 }
             }
             if self.answered {
@@ -1364,6 +1411,19 @@ impl Conn {
             .with_machine(self.machine.clone())),
             Ok(Err(error)) => Err(self.ended(&format!("while it answered ({error})")).await),
         }
+    }
+
+    /// The other end speaks another version of the protocol, or one too old to say which.
+    fn older(&self, what: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("{} {what}.", self.machine),
+        )
+        .with_hint(format!(
+            "Update legion on {} (or on this machine, if it is the older one), so both speak the same stream protocol.",
+            self.machine
+        ))
+        .with_machine(self.machine.clone())
     }
 
     /// The other end answered with something other than this protocol's first line.
@@ -1564,6 +1624,15 @@ impl Conn {
             Some(Process::Local(None)) | None => {}
         }
     }
+}
+
+/// Whether a JSON line before the protocol line is a reply from a node too old to send that line,
+/// rather than a banner that happens to be JSON: it has a field one of this protocol's replies has.
+fn looks_like_a_reply(fields: &serde_json::Map<String, Value>) -> bool {
+    const REPLY_FIELDS: [&str; 10] = [
+        "error", "kind", "path", "size", "offset", "ready", "removed", "done", "ok", "busy",
+    ];
+    REPLY_FIELDS.iter().any(|field| fields.contains_key(*field))
 }
 
 /// How reading a line ended.
@@ -2012,6 +2081,59 @@ mod tests {
         assert_eq!(join("~", "a.txt"), "~/a.txt");
     }
 
+    /// The line a node opens every stream with.
+    const HELLO: &[u8] = b"{\"protocol\":1}\n";
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_does_not_say_it_speaks_this_protocol_is_refused() {
+        for (said, says) in [
+            // Older: it answers straight away, ignoring what it does not know.
+            ("{\"ready\":true}\n", "without saying"),
+            (
+                "{\"error\":{\"code\":\"denied\",\"message\":\"No.\"}}\n",
+                "it said: No.",
+            ),
+            // Newer.
+            (
+                "{\"protocol\":2}\n{\"ready\":true}\n",
+                "speaks stream protocol 2",
+            ),
+        ] {
+            let (mut conn, mut out, _in) = conn("old");
+            out.write_all(said.as_bytes()).await.unwrap();
+            let error = conn.first::<UnpackReady>().await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Unsupported, "{said}: {error:?}");
+            assert!(error.message.contains(says), "{said}: {error:?}");
+            assert!(error.hint.unwrap().contains("Update legion on old"));
+        }
+        // A banner before the protocol line is still passed over.
+        let (mut conn, mut out, _in) = conn("pi");
+        out.write_all(b"Welcome!\n{\"motd\":\"hi\"}\n{\"protocol\":1}\n{\"ready\":true}\n")
+            .await
+            .unwrap();
+        assert!(conn.first::<UnpackReady>().await.unwrap().ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_lines_put_a_reply_off_only_so_long() {
+        let (mut conn, mut out, _in) = conn("pi");
+        tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
+            loop {
+                tokio::time::sleep(stream::HEARTBEAT).await;
+                if out.write_all(b"{\"busy\":true}\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let error = conn.first::<StatReply>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert!(error.message.contains("busy"), "{error:?}");
+        assert!(started.elapsed() > MOST_BUSY);
+        assert!(started.elapsed() < MOST_BUSY + stream::HEARTBEAT * 2);
+    }
+
     /// A pipe end that nobody writes to until a test says so, standing for the other node.
     fn conn(machine: &str) -> (Conn, tokio::io::DuplexStream, tokio::io::DuplexStream) {
         let (reader, peer_out) = tokio::io::duplex(CHUNK);
@@ -2027,6 +2149,7 @@ mod tests {
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
+            greeted: false,
             opened: tokio::time::Instant::now(),
         };
         (conn, peer_out, peer_in)
@@ -2047,6 +2170,7 @@ mod tests {
     async fn an_end_that_says_it_is_busy_is_waited_for() {
         let (mut conn, mut out, _in) = conn("pi");
         let talker = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
             for _ in 0..30 {
                 tokio::time::sleep(stream::HEARTBEAT).await;
                 out.write_all(b"{\"busy\":true}\n").await.unwrap();
@@ -2116,7 +2240,8 @@ mod tests {
             )
         };
         let listing = |count: usize, done: Option<usize>| {
-            let mut text: String = (0..count).map(|at| entry(&format!("f{at}"))).collect();
+            let mut text = String::from_utf8_lossy(HELLO).into_owned();
+            text.extend((0..count).map(|at| entry(&format!("f{at}"))));
             if let Some(said) = done {
                 text.push_str(&format!("{{\"done\":true,\"entries\":{said}}}\n"));
             }
@@ -2162,6 +2287,7 @@ mod tests {
         let (mut listing, mut out, _in) = conn("pi");
         // More than the pipe holds, so it is written while the reply is read.
         let writer = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
             out.write_all(format!("{done}\n").as_bytes()).await.unwrap();
             out
         });
