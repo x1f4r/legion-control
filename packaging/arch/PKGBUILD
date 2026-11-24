@@ -1,0 +1,41 @@
+# Maintainer: x1f4r <106302360+x1f4r@users.noreply.github.com>
+pkgname=legion
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Remote control node and CLI for managing machines'
+arch=('x86_64' 'aarch64')
+url='https://github.com/x1f4r/legion-control'
+license=('MIT')
+depends=('glibc' 'libgcc')
+makedepends=('cargo')
+optdepends=(
+  'openssh: connect to and manage remote machines'
+  'tailscale: discover peers and publish legion serve over a tailnet'
+)
+options=('!debug' '!lto')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/legion-v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${srcdir}/legion-control-legion-v${pkgver}"
+  export CARGO_HOME="${CARGO_HOME:-${srcdir}/.cargo}"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "${srcdir}/legion-control-legion-v${pkgver}"
+  export CARGO_HOME="${CARGO_HOME:-${srcdir}/.cargo}"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  cargo build --frozen --release -p legion-cli
+}
+
+package() {
+  cd "${srcdir}/legion-control-legion-v${pkgver}"
+  install -Dm755 "${srcdir}/target/release/legion" "${pkgdir}/usr/bin/legion"
+  install -Dm644 /dev/stdin "${pkgdir}/usr/lib/legion/managed-by" <<< 'pacman'
+  install -Dm644 packaging/systemd/legion-serve.service "${pkgdir}/usr/lib/systemd/user/legion-serve.service"
+  install -d "${pkgdir}/usr/share/man/man1"
+  gzip -n -9 -c packaging/man/legion.1 > "${pkgdir}/usr/share/man/man1/legion.1.gz"
+  chmod 0644 "${pkgdir}/usr/share/man/man1/legion.1.gz"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
