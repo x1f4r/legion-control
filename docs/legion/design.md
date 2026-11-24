@@ -68,13 +68,14 @@ stderr is for human-readable diagnostics only and is never parsed.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `hello` | `{client, version}` | `{node, version, protocol, os, arch, systems, system?, boot_id?}` |
+| `hello` | `{client, version, protocol}` | `{node, version, protocol, os, arch, systems, system?, boot_id?}` |
 | `tools` | `{}` | `{tools: [ToolSpec]}` |
-| `call` | `{tool, args, as?, on?}` | the tool's result object |
+| `call` | `{tool, args, as?, on?, hops?}` | the tool's result object |
 | `cancel` | `{id}` | `{}` |
 
 While a call runs the node may send notifications, `{"method":"event","params":{"id":<call id>,
-"kind":"stdout"|"stderr"|"progress"|"log","data":…}}`. A client that does not care ignores them.
+"kind":"stdout"|"stderr"|"progress"|"log","data":…,"machine"?:…}}`. A client that does not care
+ignores them.
 
 `protocol` is an integer, starting at 1. A node refuses a `hello` whose protocol it does not
 speak with the `unsupported` error and says which it does. Additive changes (new tools, new
@@ -104,17 +105,24 @@ Machines are called concurrently and one failing never fails the others.
 
 JSON carries control, never bulk bytes. File content beyond what `fs.read` allows in one reply
 (1 MiB) moves over a second pipe, `legion stream`. Its first line on stdin is one JSON object
-saying what to do; raw bytes follow in the direction the operation needs:
+carrying `protocol` (starting at 1), `op`, optional `as`, and the operation's fields; raw bytes
+follow in the direction the operation needs. Every reply starts with one JSON line, and while an
+operation works on something long it writes a `{"busy": true}` heartbeat every 10 seconds where a
+reply line is awaited:
 
 | `op` | Header | Then |
 | --- | --- | --- |
-| `get` | `{path, offset?}` | one JSON line `{size, hash?}` on stdout, then the file's bytes |
-| `put` | `{path, size, hash, offset?, mode?}` | bytes on stdin; one JSON line on stdout when verified and renamed |
-| `pack` | `{root, names: […]}` | a tar stream of those names on stdout |
-| `unpack` | `{root}` | a tar stream on stdin; one JSON line on stdout when done |
+| `manifest` | `{protocol, op, root, checksum?, exclude?}` | one JSON line per entry on stdout, then `{done, entries, skipped}` |
+| `stat` | `{protocol, op, path, checksum?, if_size?}` | one JSON line `{kind, size, mode?, hash?, mtime?, partial?, case_insensitive?}` on stdout |
+| `get` | `{protocol, op, path, offset?}` | one JSON line `{size}` on stdout, then the file's bytes from `offset` to the end |
+| `put` | `{protocol, op, path, size, hash, mode?, mtime?}` | `{offset}` on stdout (what is on disk decides where it starts); bytes on stdin; `{ok, size, hash}` when verified and renamed |
+| `pack` | `{protocol, op, root, names: […]}` | `{ready, skipped}` on stdout, then a tar stream of those names |
+| `unpack` | `{protocol, op, root, names: […], hash?}` | `{ready}` on stdout; a tar stream on stdin (only planned `names` are accepted); `{ok, files, …}` when done |
+| `delete` | `{protocol, op, root, names: […]}` | `{removed, skipped}` on stdout |
 
-They are the same permission-checked operations as the `fs.*` tools. Hashes are BLAKE3, written
-`blake3:<hex>`.
+They are the same permission-checked operations as the `fs.*` tools (`fs.read` for `manifest`,
+`stat`, `get` and `pack`; `fs.write` for `put` and `unpack`; `fs.remove` for `delete`), audited
+with door `stream`. Hashes are BLAKE3, written `blake3:<hex>`.
 
 The remote command line is therefore always one of two fixed strings, `legion rpc` or
 `legion stream`, with every path and value inside JSON. Nothing a caller supplies is ever quoted
@@ -130,18 +138,21 @@ are RFC 3339 UTC, durations are seconds.
 
 | Family | Tools | Notes |
 | --- | --- | --- |
-| `meta` | `meta.version`, `meta.whoami`, `meta.doctor` | who am I, what may I do, is this node healthy |
-| `sys` | `sys.info`, `sys.procs`, `sys.kill` | OS, CPU, memory, disks, GPU, uptime, busy |
+| `meta` | `meta.version`, `meta.whoami`, `meta.doctor`, `meta.init`, `meta.update` | who am I, what may I do, node health, first-run setup, self-update |
+| `sys` | `sys.info`, `sys.procs`, `sys.kill` | OS, CPU, memory, disks, GPU, uptime, process control |
 | `exec` | `exec.run` | bounded command: timeout, captured output, kills the whole tree |
 | `job` | `job.start`, `job.list`, `job.status`, `job.logs`, `job.cancel`, `job.wait` | outlives the session |
-| `fs` | `fs.list`, `fs.stat`, `fs.read`, `fs.write`, `fs.edit`, `fs.mkdir`, `fs.move`, `fs.copy`, `fs.remove`, `fs.find`, `fs.grep`, `fs.hash` | one machine |
+| `fs` | `fs.list`, `fs.stat`, `fs.read`, `fs.write`, `fs.edit`, `fs.mkdir`, `fs.move`, `fs.copy`, `fs.remove`, `fs.find`, `fs.grep`, `fs.hash`, `fs.manifest` | one machine |
 | `fs` (fleet) | `fs.transfer` | between any two machines, or to and from this one |
 | `proj` | `proj.list`, `proj.add`, `proj.remove`, `proj.status`, `proj.clone`, `proj.pull`, `proj.run`, `proj.discover` | named projects and where they live |
 | `svc` | `svc.list`, `svc.status`, `svc.start`, `svc.stop`, `svc.restart`, `svc.logs` | systemd, launchd, Windows services |
 | `power` | `power.status`, `power.sleep`, `power.restart`, `power.shutdown` | busy-gated; `restart` can name the system to land in |
 | `power` (fleet) | `power.wol`, `power.wake`, `power.switch` | wake a machine through a helper; restart one and confirm which system came back |
-| `fleet` | `fleet.list`, `fleet.ping`, `fleet.add`, `fleet.remove`, `fleet.discover`, `fleet.install` | the machines and whether they answer |
-| `ext` | `ext.list`, `ext.define`, `ext.remove` | tools you add yourself |
+| `fleet` | `fleet.list`, `fleet.ping`, `fleet.add`, `fleet.remove`, `fleet.discover`, `fleet.install`, `fleet.sync` | the machines, reachability, remote install, config sync |
+| `config` (fleet) | `config.list`, `config.read`, `config.write` | shared configuration documents (`fleet.toml`, `policy.toml`, `projects.toml`, `tools.d/*.toml`) |
+| `token` | `token.add`, `token.list`, `token.remove` | bearer tokens for `legion serve` (hashes in `tokens.toml`) |
+| `agent` | `agent.list`, `agent.add`, `agent.remove` | register Legion with AI coding agents through their own CLIs |
+| `ext` | `ext.list`, `ext.show`, `ext.define`, `ext.remove` | tools you add yourself |
 | `audit` | `audit.tail` | what was called, by whom |
 
 Rules that hold for every tool:
@@ -199,10 +210,12 @@ changes until the file says `busy = "none"` in so many words: not knowing is not
 
 ### Extension tools
 
-A file in `tools.d/` defines a tool: name, description, effect, parameter schema and a command.
-Arguments reach the command as `LEGION_ARG_<NAME>` environment variables. Its standard output is
-the result: parsed as JSON when it is JSON, otherwise returned as text. An extension cannot take
-the name of a built-in tool, and defining one needs the `admin` effect.
+A file in `tools.d/` defines a tool: name, description, effect, parameter schema and a command
+(`run` as exact argv or `cmd` for the platform shell). Arguments reach the command as
+`LEGION_ARG_<NAME>` environment variables and as one JSON object on stdin, alongside `LEGION_TOOL`,
+`LEGION_PRINCIPAL` and `LEGION_NODE`. Its standard output is returned directly when it parses as a
+JSON object, as `{"value": …}` for other JSON, and as `{"output": …, "truncated": …}` otherwise. An
+extension cannot take the name of a built-in tool, and defining one needs the `admin` effect.
 
 ## Reaching other machines
 
@@ -238,10 +251,10 @@ before the call fails with `unreachable`, and a call is retried only if it was n
 
 A call sent to a machine carries no target of its own: the machine that receives it runs it,
 whatever it calls itself, so two fleet files that disagree about names can never send a call to
-the wrong place. Reaching a machine through another is said out loud, never guessed:
+the wrong place. Reaching a machine through another is said out loud, never guessed, and `via` replaces `ssh`,
+`command` or `systems` for that machine (a relayed entry has no direct transport of its own):
 
     [machines.shed]
-    ssh = "shed"
     via = "pi"                      # ask pi to forward; pi must know shed too
 
 A node that is asked to forward to a name it does not know answers `not_found`. It never runs the
@@ -324,23 +337,30 @@ replaced by their size.
 
 ## Doors
 
-- **CLI.** `legion <tool> [key=value …] [--on M] [--as P] [--json]`. A value that parses as JSON
-  is JSON, anything else is a string. `legion tools` lists them; `legion help <tool>` prints the
-  schema. Output is a readable rendering on a terminal and the raw JSON object otherwise.
+- **CLI.** `legion <tool> [key=value …] [--args JSON|-] [--on M] [--as P] [--json]`, plus sugar
+  commands `legion cp`, `legion init`, `legion agents`, `legion token` and `legion gate`. A value
+  that parses as JSON is JSON, anything else is a string. `legion tools` lists them;
+  `legion help <tool>` prints the schema. Output is a readable rendering on a terminal and the raw
+  JSON object otherwise.
 - **MCP.** `legion mcp` serves the registry over stdio. Tool names swap the dot for an underscore
   (`fs_read`), every tool gains the optional `on` argument, and effects become the standard
   annotations (`readOnlyHint` for `read`, `destructiveHint` for every other effect). A failed
   call is a result with `isError` and the same error object as text, so the agent can read the
   code and the hint. `--compact` serves three tools instead (`legion_tools`, `legion_describe`,
-  `legion_call`) for agents that should not carry forty schemas in their context. Two revisions
+  `legion_call`) for agents that should not carry dozens of schemas in their context. Two revisions
   of the protocol are in use, one with an `initialize` handshake and one without; the official
   SDK (`rmcp`) speaks both, so the door is built on it rather than written by hand.
-- **HTTP.** `legion serve` listens on `127.0.0.1` only: `GET /v1/tools`, `POST /v1/call`, and MCP
-  at `/mcp`. Every request needs a bearer token from `tokens.toml`, where only the token's hash
-  is stored, and a request with an `Origin` header that is not this server is refused. Publishing
-  it beyond the machine is Tailscale Serve's job, never a wider bind address.
-- **Agents.** `legion agents add <claude|codex|antigravity|opencode>` registers the stdio door
-  with that tool through the tool's own `mcp add` command, pinned to the principal you name.
+- **HTTP.** `legion serve` listens on a loopback address only (`127.0.0.1:7117` by default) and
+  refuses any other: `GET /v1/health` (without a token), `GET /v1/tools`, `POST /v1/call` (with
+  optional `Accept: text/event-stream` for live events), and streamable-HTTP MCP at `/mcp`
+  (`?compact=1` or `Legion-Compact: 1`). Every request besides `/v1/health` needs a bearer token
+  from `tokens.toml`, where only the token's BLAKE3 hash is stored. Before a token is checked,
+  `Host` must match this loopback address and port or `[serve] hosts` in `node.toml`, and any
+  `Origin` header must be listed in `[serve] origins`. Publishing it beyond the machine is
+  Tailscale Serve's job, never a wider bind address.
+- **Agents.** `legion agents add <claude|codex|antigravity|opencode> --as <principal>` registers
+  the stdio door (compact by default, `--full` for all tools) through the tool's own `mcp add`
+  command, pinned to the principal you name; `list` and `remove` inspect and remove it.
 - **RPC.** `legion rpc`, the pipe other nodes use.
 
 ## Files on disk
@@ -390,8 +410,8 @@ Traps the Node agent already paid for, which the Rust code handles from the star
 
 ## Milestones
 
-1. **Foundation**: proto, core, CLI, `meta` tools, CI on three platforms.
-2. **One machine**: `sys`, `exec`, `fs`, MCP over stdio.
-3. **The fleet**: sessions, routing, fan-out, `fleet`, `job`, transfer.
-4. **The rest**: `proj`, `svc`, `power`, `ext`, HTTP, tokens.
-5. **Shipping**: install and update, release builds, the handbook.
+1. **Foundation** *(done)*: proto, core, CLI, `meta` tools, CI on three platforms.
+2. **One machine** *(done)*: `sys`, `exec`, `fs`, MCP over stdio.
+3. **The fleet** *(done)*: sessions, routing, fan-out, `fleet`, `job`, transfer.
+4. **The rest** *(done)*: `proj`, `svc`, `power`, `ext`, HTTP, tokens.
+5. **Shipping** *(done)*: install and update, release builds, first-run setup, agent registration, config sync, the handbook.
