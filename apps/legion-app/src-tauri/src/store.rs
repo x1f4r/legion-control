@@ -37,27 +37,27 @@ const APPLE_BACKUP_EXCLUDE_VALUE: &[u8] = &[
 ];
 
 /// Marks `path` excluded from iCloud, iTunes and Time Machine backups on Apple platforms.
+///
+/// Best-effort: if the underlying filesystem does not support extended attributes, logs a warning
+/// and continues so startup and saves never fail on non-APFS/HFS+ volumes.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
-fn exclude_from_backup(path: &Path) -> Result<(), AppError> {
-    rustix::fs::setxattr(
+fn exclude_from_backup(path: &Path) {
+    if let Err(err) = rustix::fs::setxattr(
         path,
         APPLE_BACKUP_EXCLUDE_XATTR,
         APPLE_BACKUP_EXCLUDE_VALUE,
         rustix::fs::XattrFlags::empty(),
-    )
-    .map_err(|err| {
-        AppError::new(
-            ErrorCode::Internal,
-            format!("Could not exclude app data from Apple backups: {err}"),
-        )
-    })
+    ) {
+        eprintln!(
+            "legion-app: could not exclude {} from Apple backups: {err}",
+            path.display()
+        );
+    }
 }
 
 /// No-op on non-Apple platforms (Android uses `data_extraction_rules.xml`).
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
-fn exclude_from_backup(_path: &Path) -> Result<(), AppError> {
-    Ok(())
-}
+fn exclude_from_backup(_path: &Path) {}
 
 /// Non-secret display metadata recorded alongside each paired node in [`LinkConfig`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,7 +178,7 @@ impl AppStore {
             let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
         }
 
-        exclude_from_backup(parent)?;
+        exclude_from_backup(parent);
         Ok(())
     }
 
@@ -301,7 +301,7 @@ impl AppStore {
                 })?;
         }
 
-        exclude_from_backup(temp.path())?;
+        exclude_from_backup(temp.path());
 
         temp.write_all(&payload).map_err(|err| {
             AppError::new(
@@ -323,7 +323,12 @@ impl AppStore {
             )
         })?;
 
-        exclude_from_backup(&self.path)?;
+        #[cfg(unix)]
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+
+        exclude_from_backup(&self.path);
 
         Ok(())
     }

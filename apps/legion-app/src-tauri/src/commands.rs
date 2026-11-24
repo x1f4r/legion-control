@@ -22,6 +22,33 @@ pub const INTERFACE_READY_MARKER: &str = "legion-app: interface ready";
 /// Optional environment variable naming a file to write [`INTERFACE_READY_MARKER`] to on ready.
 pub const READY_FILE_ENV: &str = "LEGION_APP_READY_FILE";
 
+/// Maximum accepted pairing invite length at the command seam (8 KiB).
+pub const MAX_INVITE_BYTES: usize = 8 * 1024;
+
+/// Maximum accepted device or node label length at the command seam (256 bytes).
+pub const MAX_LABEL_BYTES: usize = 256;
+
+fn validate_invite_size(invite: &str) -> Result<(), AppError> {
+    if invite.len() > MAX_INVITE_BYTES {
+        return Err(AppError::new(
+            ErrorCode::InvalidArgs,
+            format!("Pairing invite exceeds the {MAX_INVITE_BYTES}-byte limit."),
+        )
+        .with_hint("Paste the single invite line printed by `legion pair`."));
+    }
+    Ok(())
+}
+
+fn validate_label_size(field: &str, value: &str) -> Result<(), AppError> {
+    if value.len() > MAX_LABEL_BYTES {
+        return Err(AppError::new(
+            ErrorCode::InvalidArgs,
+            format!("{field} exceeds the {MAX_LABEL_BYTES}-byte limit."),
+        ));
+    }
+    Ok(())
+}
+
 static READY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Result returned by `scan_invite`.
@@ -108,10 +135,15 @@ pub async fn pair(
     invite: String,
     name: Option<String>,
 ) -> Result<AppState, AppError> {
+    validate_invite_size(&invite)?;
+    if let Some(raw_name) = &name {
+        validate_label_size("Device name", raw_name)?;
+    }
     let resolved_name = name
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_device_name);
+    validate_label_size("Device name", &resolved_name)?;
     backend.0.pair(invite, resolved_name).await
 }
 
@@ -121,6 +153,7 @@ pub async fn unpair(
     backend: State<'_, SharedBackend>,
     node: String,
 ) -> Result<UnpairResult, AppError> {
+    validate_label_size("Node name", &node)?;
     backend.0.unpair(node).await
 }
 
@@ -130,6 +163,7 @@ pub async fn select_node(
     backend: State<'_, SharedBackend>,
     node: String,
 ) -> Result<AppState, AppError> {
+    validate_label_size("Node name", &node)?;
     backend.0.select_node(node).await
 }
 
@@ -373,6 +407,22 @@ mod tests {
         assert_eq!(plugin_json["formats"], serde_json::json!(["QR_CODE"]));
         assert_eq!(plugin_json["camera_direction"], "back");
         assert_eq!(plugin_json["windowed"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn command_seam_caps_invite_and_label_sizes() -> Result<(), Box<dyn std::error::Error>> {
+        validate_invite_size(&"a".repeat(MAX_INVITE_BYTES))?;
+        let err = validate_invite_size(&"a".repeat(MAX_INVITE_BYTES + 1))
+            .err()
+            .ok_or("expected invite cap error")?;
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+
+        validate_label_size("Device name", &"b".repeat(MAX_LABEL_BYTES))?;
+        let err = validate_label_size("Device name", &"b".repeat(MAX_LABEL_BYTES + 1))
+            .err()
+            .ok_or("expected label cap error")?;
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
         Ok(())
     }
 }
