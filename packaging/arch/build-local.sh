@@ -64,15 +64,60 @@ trap cleanup EXIT
 cp "$PKGBUILD_SRC" "${WORK}/PKGBUILD"
 
 if [[ "$MODE" == "source" ]]; then
+  # Every path that `cargo build --release -p legion-cli` and `package()` read from the repo root:
+  # `apps/ui` is embedded at compile time by `crates/legion-doors/build.rs`, and `contract` holds
+  # the compiled-in release public key. Verify all required paths before archiving so a missing
+  # directory or renamed asset fails immediately with a clear error.
+  REQUIRED_PATHS=(
+    Cargo.toml
+    Cargo.lock
+    rust-toolchain.toml
+    LICENSE
+    crates
+    contract
+    packaging
+    apps/ui
+  )
+  REQUIRED_FILES=(
+    apps/ui/index.html
+    contract/release-public-key.pem
+  )
+  for rel in "${REQUIRED_PATHS[@]}"; do
+    [[ -e "${REPO_ROOT}/${rel}" ]] || die "Required source path is missing from checkout: ${rel}"
+  done
+  for rel in "${REQUIRED_FILES[@]}"; do
+    [[ -f "${REPO_ROOT}/${rel}" ]] || die "Required compile-time asset is missing from checkout: ${rel}"
+  done
+
+  BUILD_REV="${LEGION_BUILD_REV:-}"
+  if [[ -z "$BUILD_REV" ]] && command -v git >/dev/null 2>&1 \
+    && git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null || true)" ]]; then
+      SHORT_REV="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || true)"
+      if [[ -n "$SHORT_REV" ]]; then
+        BUILD_REV="${SHORT_REV}, modified"
+      fi
+    else
+      BUILD_REV="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+    fi
+  fi
+
   ARCHIVE="${WORK}/legion-${PKGVER}.tar.gz"
   PREFIX="legion-control-legion-v${PKGVER}/"
   # Archive the workspace files needed to build and package legion, including uncommitted edits,
-  # while skipping target/ and other build artifacts. apps/ui is the interface that legion serve
-  # embeds at compile time.
-  tar -C "$REPO_ROOT" \
-    --transform "s,^,${PREFIX}," \
-    -czf "$ARCHIVE" \
-    Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging apps/ui
+  # while skipping target/ and other build artifacts. When building from a clean commit SHA, write
+  # the same PAX `comment=<sha>` header that GitHub's tag archives carry so PKGBUILD extracts it
+  # identically to a published release tag.
+  TAR_ARGS=(-C "$REPO_ROOT" --transform "s,^,${PREFIX},")
+  if [[ "$BUILD_REV" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    TAR_ARGS+=(--format=posix --pax-option="comment=${BUILD_REV,,}")
+    MAKEPKG_ENV=(-u LEGION_BUILD_REV PKGDEST="$OUT_DIR_ABS")
+  elif [[ -n "$BUILD_REV" ]]; then
+    MAKEPKG_ENV=(PKGDEST="$OUT_DIR_ABS" LEGION_BUILD_REV="$BUILD_REV")
+  else
+    MAKEPKG_ENV=(PKGDEST="$OUT_DIR_ABS")
+  fi
+  tar "${TAR_ARGS[@]}" -czf "$ARCHIVE" "${REQUIRED_PATHS[@]}"
   HASH="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
   sed -i "s/^sha256sums=.*/sha256sums=('${HASH}')/" "${WORK}/PKGBUILD"
 else
@@ -88,11 +133,12 @@ else
   H_BIN="$(sha256sum "${WORK}/legion-${PKGVER}-${CARCH}-unknown-linux-musl" | awk '{print $1}')"
   sed -i "s/^sha256sums=.*/sha256sums=('${H_UNIT}' '${H_MAN}' '${H_LIC}')/" "${WORK}/PKGBUILD"
   sed -i "s/^sha256sums_${CARCH}=.*/sha256sums_${CARCH}=('${H_BIN}')/" "${WORK}/PKGBUILD"
+  MAKEPKG_ENV=(PKGDEST="$OUT_DIR_ABS")
 fi
 
 (
   cd "$WORK"
-  PKGDEST="$OUT_DIR_ABS" makepkg --clean --force --nodeps
+  env "${MAKEPKG_ENV[@]}" makepkg --clean --force --nodeps
 )
 
 find "$OUT_DIR_ABS" -maxdepth 1 -type f -name 'legion*.pkg.tar*' -print | LC_ALL=C sort

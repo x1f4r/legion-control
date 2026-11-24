@@ -6,4 +6,6 @@
 *.sh text eol=lf
 *.ps1 text eol=lf
 gradlew text eol=lf
-gradlew.bat text eol=crlf
+# The Windows wrapper is stored and checked out with CRLF exactly as Gradle wrote it. It is marked
+# as not text so git never tries to normalise it, which would show it as modified in every checkout.
+gradlew.bat -text

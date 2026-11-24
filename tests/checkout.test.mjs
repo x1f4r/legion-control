@@ -46,7 +46,7 @@ test('Android Gradle wrapper scripts keep LF for gradlew and CRLF for gradlew.ba
   assert.ok(files.has(winWrapper), `${winWrapper} is not in the checkout`);
   for (const [file, { index, attributes }] of files) {
     if (file.endsWith('.bat')) {
-      assert.equal(attributes, 'text eol=crlf', `${file} has no CRLF rule`);
+      assert.equal(attributes, '-text', `${file} must be left exactly as stored`);
       assert.equal(index, 'crlf', `${file} is stored with ${index} line endings`);
     } else {
       assert.equal(attributes, 'text eol=lf', `${file} has no LF rule`);

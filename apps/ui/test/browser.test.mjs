@@ -1,4 +1,4 @@
-// End-to-end browser test for the Legion web interface served by a real `legion serve`.
+// End-to-end browser test for the Legion v2 web interface served by a real `legion serve`.
 // Drives headless Chromium/Chrome at 390x844 (phone) and 1100x720 (wide) against a real two-node
 // fleet reached through a local `command = [...]` pipe, verifying zero console/CSP errors.
 
@@ -171,10 +171,36 @@ function setupFleet(root) {
 
 async function setTheme(page, theme) {
   await page.evaluate((t) => {
-    localStorage.setItem('legion.theme', t);
+    const raw = localStorage.getItem('legion.settings.v1');
+    const obj = raw ? JSON.parse(raw) : {};
+    obj.theme = t;
+    localStorage.setItem('legion.settings.v1', JSON.stringify(obj));
     document.documentElement.dataset.theme = t;
   }, theme);
   await page.waitForTimeout(80);
+}
+
+async function dispatchSwipe(page, selector, { startX, startY, endX, endY }) {
+  await page.evaluate(
+    ({ sel, sx, sy, ex, ey }) => {
+      const target = document.querySelector(sel);
+      if (!target) throw new Error(`Swipe target not found: ${sel}`);
+      const opts = (x, y) => ({
+        bubbles: true,
+        cancelable: true,
+        pointerId: 1,
+        pointerType: 'touch',
+        button: 0,
+        clientX: x,
+        clientY: y,
+      });
+      target.dispatchEvent(new PointerEvent('pointerdown', opts(sx, sy)));
+      target.dispatchEvent(new PointerEvent('pointermove', opts((sx + ex) / 2, (sy + ey) / 2)));
+      target.dispatchEvent(new PointerEvent('pointerup', opts(ex, ey)));
+    },
+    { sel: selector, sx: startX, sy: startY, ex: endX, ey: endY },
+  );
+  await page.waitForTimeout(120);
 }
 
 async function maybeShot(page, name) {
@@ -183,7 +209,7 @@ async function maybeShot(page, name) {
   await page.screenshot({ path: path.join(SHOTS_DIR, `${name}.png`) });
 }
 
-test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)', async () => {
+test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x720)', async () => {
   assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
   const root = makeWorkRoot();
   const fleet = setupFleet(root);
@@ -211,6 +237,7 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
 
     await page.goto(server.url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('heading', { name: /Connect this browser to tower/ }).waitFor();
+    assert.equal(await page.locator('.wordmark').count(), 0, 'No wordmark in header');
     await maybeShot(page, 'real-phone-dark-start');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-start');
@@ -221,89 +248,166 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     await page.getByLabel('Token', { exact: true }).fill(fleet.token);
     await page.getByRole('button', { name: 'Connect' }).click();
 
-    // Machines appear (both local tower and remote pi over command pipe).
-    await page.getByText('Machines · 2 of 2 answering').waitFor({ timeout: 15_000 });
-    await page.locator('a.row', { hasText: 'tower' }).waitFor();
-    const piRow = page.locator('a.row', { hasText: 'pi' });
-    await piRow.waitFor();
-    await page.locator('a.row .meters').nth(1).waitFor({ timeout: 5_000 });
-    // Busy probe reason formats cleanly as "busy: agents" without [object Object] or raw detail.
-    await piRow.getByText(/busy: agents/).waitFor({ timeout: 5_000 });
-    const piRowText = await piRow.innerText();
-    assert.ok(!piRowText.includes('[object Object]'), `raw object in pi row: ${piRowText}`);
-    assert.ok(!piRowText.includes('1239887'), `raw probe detail leaked into list row: ${piRowText}`);
+    // Machines appear with labelled Processor / Memory / Disk, no wordmark/role chip/refresh button.
+    await page.getByText('2 are on').waitFor({ timeout: 15_000 });
+    assert.equal(await page.locator('.wordmark').count(), 0);
+    assert.equal(await page.locator('header.top .chip').count(), 0);
+    assert.equal(await page.locator('button[aria-label="Refresh"]').count(), 0);
+    await page.locator('header.top a[aria-label="Settings"]').waitFor();
+    assert.equal(await page.locator('nav.nav a').count(), 3, 'Root bottom bar has 3 places');
+
+    const towerCard = page.locator('a.machine', { hasText: 'tower' });
+    await towerCard.waitFor();
+    await towerCard.getByText('Processor').waitFor();
+    await towerCard.getByText('Memory').waitFor();
+    await towerCard.getByText('Disk').waitFor();
+
+    const piCard = page.locator('a.machine', { hasText: 'pi' });
+    await piCard.waitFor();
+    await piCard.getByText(/Busy · agents/).waitFor({ timeout: 5_000 });
+    const piCardText = await piCard.innerText();
+    assert.ok(!piCardText.includes('[object Object]'), `raw object in pi card: ${piCardText}`);
+    assert.ok(!piCardText.includes('1239887'), `raw probe detail leaked into card: ${piCardText}`);
     await maybeShot(page, 'real-phone-dark-machines');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-machines');
     await setTheme(page, 'dark');
 
-    // Open busy machine (pi) -> Overview and Power tabs show full "name: detail" reason lines.
-    await piRow.first().click();
-    await page.getByRole('tab', { name: 'Overview', selected: true }).waitFor();
+    // Pull-to-refresh gesture on Machines list works without error.
+    await dispatchSwipe(page, 'main.main', { startX: 195, startY: 160, endX: 195, endY: 280 });
+    await page.getByText('2 are on').waitFor({ timeout: 10_000 });
+
+    // Horizontal swipe across root places: Machines -> Activity -> Actions -> Machines.
+    await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Actions' }).waitFor();
+    await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Machines' }).waitFor();
+
+    // Open busy machine (pi) -> bottom nav becomes 4 machine parts (Overview, Files, Power, More).
+    await piCard.click();
+    assert.equal(await page.locator('nav.nav.parts a').count(), 4);
     await page.getByText('agents: busy: 1239887 worker').waitFor({ timeout: 5_000 });
-    await page.getByRole('tab', { name: 'Power' }).click();
+    await page.locator('nav.nav.parts a', { hasText: 'Power' }).click();
     await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
     await page.getByText('agents: busy: 1239887 worker').waitFor({ timeout: 5_000 });
-    const piPowerText = await page.locator('.main').innerText();
-    assert.ok(!piPowerText.includes('[object Object]'), `raw object in pi Power tab: ${piPowerText}`);
 
-    // Back to Machines and open tower -> Overview.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Machines' }).click();
-    await page.locator('a.row', { hasText: 'tower' }).first().click();
-    await page.getByRole('tab', { name: 'Overview', selected: true }).waitFor();
-    await page.getByText('Processor').waitFor();
+    // Back to Machines and open tower.
+    await page.locator('header.top button[aria-label="Back"]').click();
+    await page.locator('a.machine', { hasText: 'tower' }).click();
+    await page.getByText('Health').waitFor();
     await maybeShot(page, 'real-phone-dark-machine-overview');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-machine-overview');
     await setTheme(page, 'dark');
 
-    // Run tab: run echo and observe streamed output.
-    await page.getByRole('tab', { name: 'Run' }).click();
-    await page.getByLabel('Command').fill('echo hello-stream-one; sleep 0.15; echo hello-stream-two');
-    await page.getByRole('button', { name: 'Run', exact: true }).click();
-    await page.locator('pre.out').getByText('hello-stream-two').waitFor({ timeout: 10_000 });
-    const runOut = await page.locator('pre.out').innerText();
-    assert.match(runOut, /hello-stream-one/);
-    assert.match(runOut, /hello-stream-two/);
-    assert.match(runOut, /exit 0/);
-    await maybeShot(page, 'real-phone-dark-machine-run');
-
-    // Start a background job using the switch and stop it.
-    await page.getByLabel(/Keep running after I leave/i).check();
-    await page.getByLabel('Command').fill('echo job-live-line; sleep 30');
-    await page.getByRole('button', { name: 'Run', exact: true }).click();
-    await page.getByRole('button', { name: 'Follow output' }).click();
-    await page.locator('pre.out').getByText('job-live-line').waitFor({ timeout: 10_000 });
-    await maybeShot(page, 'real-phone-dark-job-follow');
-    await page.getByRole('button', { name: 'Stop job' }).click();
-    await page.getByText('cancelled').first().waitFor({ timeout: 10_000 });
-
-    // Files tab: browse docs/ and preview hello.txt.
-    await page.getByRole('tab', { name: 'Files' }).click();
+    // Horizontal swipe across machine parts: Overview -> Files -> Power -> More.
+    await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 362 });
+    await page.locator('nav.nav.parts a[aria-current="page"]', { hasText: 'Files' }).waitFor();
     await page.locator('button.row', { hasText: 'docs/' }).click();
-    await page.locator('.crumbs a', { hasText: 'docs' }).waitFor();
-    await page.getByRole('button', { name: 'Copy path' }).waitFor();
     await page.locator('button.row', { hasText: 'hello.txt' }).click();
     await page.locator('pre.out').getByText('Hello from Legion real server preview.').waitFor();
-    await page.locator('button.btn.quiet', { hasText: 'Back to folder' }).waitFor();
     await maybeShot(page, 'real-phone-dark-machine-files');
 
-    // Power tab screenshot and verb-labeled buttons.
-    await page.getByRole('tab', { name: 'Power' }).click();
-    await page.getByText('Power actions').waitFor();
+    // Power part.
+    await page.locator('nav.nav.parts a', { hasText: 'Power' }).click();
     await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
     await page.getByRole('button', { name: 'Sleep', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Restart', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Shut down', exact: true }).waitFor();
     await maybeShot(page, 'real-phone-dark-machine-power');
 
-    // Jobs top-level tab.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Jobs' }).click();
-    await page.getByText('job-live-line').first().waitFor();
-    await maybeShot(page, 'real-phone-dark-jobs');
+    // More -> Command (docked at bottom with "Keep running after I leave" + "Name it").
+    await page.locator('nav.nav.parts a', { hasText: 'More' }).click();
+    await page.locator('a.row', { hasText: 'Command' }).click();
+    await page.locator('.dock input[aria-label="Command"]').waitFor();
+    await page.locator('.dock input[aria-label="Command"]').fill('echo hello-stream-one; sleep 0.15; echo hello-stream-two');
+    await page.locator('.dock button[type="submit"]').click();
+    await page.locator('pre.out').getByText('Finished').waitFor({ timeout: 10_000 });
+    const runOut = await page.locator('pre.out').innerText();
+    assert.match(runOut, /\nhello-stream-one\n/);
+    assert.match(runOut, /\nhello-stream-two/);
+    assert.match(runOut, /Finished/);
+    await maybeShot(page, 'real-phone-dark-machine-command');
 
-    // Tools tab: unavailable admin tool is listed, read tool runs with on: all.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Tools' }).click();
+    // Start a named background job using "Keep running after I leave" + "Name it".
+    await page.getByLabel(/Keep running after I leave/i).check();
+    await page.getByLabel('Name for background task').fill('Stream check');
+    await page.locator('.dock input[aria-label="Command"]').fill('echo job-live-line; sleep 30');
+    await page.locator('.dock button[type="submit"]').click();
+    await page.getByRole('button', { name: 'Follow output' }).click();
+    await page.getByText('Stream check').first().waitFor({ timeout: 10_000 });
+    // In plain mode, "Show what it printed" starts collapsed and expands on click.
+    const outputDisclosure = page.locator('details.more', { hasText: 'Show what it printed' });
+    await outputDisclosure.waitFor();
+    assert.equal(await outputDisclosure.getAttribute('open'), null);
+    await outputDisclosure.locator('summary').click();
+    await page.locator('pre.out').getByText('job-live-line').waitFor({ timeout: 10_000 });
+    await maybeShot(page, 'real-phone-dark-activity-detail');
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await page.locator('.state', { hasText: 'Stopped' }).first().waitFor({ timeout: 10_000 });
+
+    // Start an unnamed background job to verify raw commands/exit codes stay hidden in plain Activity.
+    await page.goto(`${server.url}/#/machines/tower/command`, { waitUntil: 'domcontentloaded' });
+    await page.getByLabel(/Keep running after I leave/i).check();
+    await page.getByLabel('Name for background task').fill('');
+    await page.locator('.dock input[aria-label="Command"]').fill('echo secret-shell-cmd-token');
+    await page.locator('.dock button[type="submit"]').click();
+    await page.locator('.notice', { hasText: 'Started Command' }).waitFor({ timeout: 10_000 });
+
+    // Activity screen in plain mode: shows "Stream check" and "Command", NO raw shell command, NO exit 0.
+    await page.goto(`${server.url}/#/activity`, { waitUntil: 'domcontentloaded' });
+    await page.getByText('Stream check').first().waitFor({ timeout: 10_000 });
+    await page.getByText('Command').first().waitFor({ timeout: 10_000 });
+    const plainActivityText = await page.locator('main.main').innerText();
+    assert.ok(!plainActivityText.includes('secret-shell-cmd-token'), `Raw command leaked in plain Activity: ${plainActivityText}`);
+    assert.ok(!plainActivityText.includes('job-live-line'), `Raw command leaked in plain Activity: ${plainActivityText}`);
+    assert.ok(!/\bexit \d+\b/i.test(plainActivityText), `Exit code leaked in plain Activity: ${plainActivityText}`);
+    await maybeShot(page, 'real-phone-dark-activity-plain');
+
+    // Actions screen: tiles + bottom-docked search, NO All tools while Technical details is off.
+    await page.locator('nav.nav a', { hasText: 'Actions' }).click();
+    await page.locator('.dock input[aria-label="Find something to do"]').waitFor();
+    await page.locator('.tile[href="#/actions/restart"]').waitFor();
+    assert.equal(await page.locator('a.row', { hasText: 'All tools' }).count(), 0);
+    await maybeShot(page, 'real-phone-dark-actions');
+
+    // Settings via top-right gear: turn Technical details on, inspect Appearance live, check This browser.
+    await page.locator('header.top a[aria-label="Settings"]').click();
+    await page.locator('header.top h1', { hasText: 'Settings' }).waitFor();
+    await maybeShot(page, 'real-phone-dark-settings');
+
+    // Left-edge swipe back from Settings works on non-Android browsers.
+    await dispatchSwipe(page, 'main.main', { startX: 12, startY: 360, endX: 180, endY: 362 });
+    await page.locator('header.top h1', { hasText: 'Machines' }).waitFor();
+
+    // Open Settings -> Appearance and verify live theme/accent/text changes without reload.
+    await page.locator('header.top a[aria-label="Settings"]').click();
+    await page.locator('a.row', { hasText: 'Appearance' }).click();
+    await page.getByRole('button', { name: 'Blue' }).click();
+    assert.equal(await page.evaluate(() => document.documentElement.dataset.accent), 'blue');
+    await page.getByRole('button', { name: 'Large' }).click();
+    assert.equal(await page.evaluate(() => document.documentElement.dataset.text), 'large');
+    await maybeShot(page, 'real-phone-dark-appearance');
+    await page.getByRole('button', { name: 'Green' }).click();
+    await page.getByRole('button', { name: 'Medium' }).click();
+
+    // Back to Settings index, enable Technical details.
+    await page.locator('header.top button[aria-label="Back"]').click();
+    await page.getByLabel(/Technical details/i).check();
+
+    // Activity in technical mode NOW shows raw command and exit 0.
+    await page.goto(`${server.url}/#/activity`, { waitUntil: 'domcontentloaded' });
+    await page.getByText('echo secret-shell-cmd-token').first().waitFor({ timeout: 10_000 });
+    await page.locator('.state', { hasText: 'exit 0' }).first().waitFor({ timeout: 10_000 });
+    await maybeShot(page, 'real-phone-dark-activity-tech');
+
+    // Actions in technical mode shows All tools -> fan-out meta.version & power.restart dry-run + sheet.
+    await page.locator('nav.nav a', { hasText: 'Actions' }).click();
+    await page.locator('a.row', { hasText: 'All tools' }).click();
     await page.getByLabel('Search tools').fill('token.add');
     await page.locator('a.row.off', { hasText: 'token.add' }).waitFor();
     await page.getByLabel('Search tools').fill('meta.version');
@@ -312,59 +416,31 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     await page.getByRole('button', { name: 'Run', exact: true }).click();
     await page.locator('.label', { hasText: /^pi$/i }).waitFor({ timeout: 10_000 });
     await page.locator('.label', { hasText: /^tower$/i }).waitFor();
-    await maybeShot(page, 'real-phone-dark-tools-fanout');
 
-    // Power tool: long description collapses behind disclosure, inline code has no raw backticks,
-    // dry run runs without confirmation, real button opens plain-word confirmation sheet.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Tools' }).click();
-    await page.getByLabel('Search tools').fill('power.restart');
-    await page.locator('a.row', { hasText: 'power.restart' }).first().click();
-    const ledeText = await page.locator('.lede').innerText();
-    assert.ok(!ledeText.includes('`'), `raw backtick in tool lede: ${ledeText}`);
-    const moreDetails = page.locator('details.more', { hasText: 'More about this tool' });
-    if ((await moreDetails.count()) > 0) {
-      assert.equal(await moreDetails.first().getAttribute('open'), null);
-      await moreDetails.first().locator('summary').click();
-      assert.notEqual(await moreDetails.first().getAttribute('open'), null);
-      await moreDetails.first().locator('summary').click();
-    }
+    await page.goto(`${server.url}/#/actions/all/power.restart`, { waitUntil: 'domcontentloaded' });
     await page.getByRole('button', { name: 'Try it (dry run)' }).click();
     await page.locator('dl.kv').getByText('restart').first().waitFor({ timeout: 10_000 });
-    const dryText = await page.locator('.main').innerText();
-    assert.match(dryText, /dry_run/);
-    assert.match(dryText, /scheduled\s+no/i);
-
     await page.getByRole('button', { name: 'Restart tower', exact: true }).click();
     const dialog = page.getByRole('dialog');
     await dialog.waitFor();
     await dialog.getByRole('heading', { name: 'Restart tower now?' }).waitFor();
     await maybeShot(page, 'real-phone-dark-power-sheet');
-    await setTheme(page, 'light');
-    await maybeShot(page, 'real-phone-light-power-sheet');
-    await setTheme(page, 'dark');
     await dialog.getByRole('button', { name: 'Cancel' }).click();
     await dialog.waitFor({ state: 'hidden' });
 
-    // Confirm nothing was scheduled on tower.
     const powerStatus = JSON.parse(
       runLegion(['power.status', '--json'], fleet.towerHome, fleet.towerUser),
     );
     assert.equal(powerStatus.pending, undefined);
 
-    // This device screen: multi-line allows + calm Forget this browser with confirmation sheet.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /device/i }).click();
-    await page.getByText(/May not change settings or permissions/i).waitFor();
+    // Settings -> This browser: Forget this browser opens calm confirmation sheet.
+    await page.goto(`${server.url}/#/settings/device`, { waitUntil: 'domcontentloaded' });
     const forgetBtn = page.getByRole('button', { name: 'Forget this browser' });
     await forgetBtn.waitFor();
     assert.ok(!(await forgetBtn.getAttribute('class')).includes('danger'));
-    await maybeShot(page, 'real-phone-dark-device');
-    await setTheme(page, 'light');
-    await maybeShot(page, 'real-phone-light-device');
-    await setTheme(page, 'dark');
     await forgetBtn.click();
     const forgetDialog = page.getByRole('dialog');
     await forgetDialog.waitFor();
-    await forgetDialog.getByText('This browser will need a token again.').waitFor();
     await forgetDialog.getByRole('button', { name: 'Cancel' }).click();
     await forgetDialog.waitFor({ state: 'hidden' });
 
@@ -381,36 +457,36 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     });
     wide.on('pageerror', (err) => pageErrors.push(String(err)));
 
-    // Verify one-time #token= URL fragment login removes the token from the address bar immediately.
+    // One-time #token= URL fragment login removes the token from the address bar immediately.
     await wide.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
       waitUntil: 'domcontentloaded',
     });
-    await wide.getByText('Machines · 2 of 2 answering').waitFor({ timeout: 15_000 });
+    await wide.getByText('2 are on').waitFor({ timeout: 15_000 });
     assert.ok(!wide.url().includes(fleet.token), `token leaked in URL: ${wide.url()}`);
 
-    // Wide split view shows machine list beside selected machine overview.
+    // Rail has 3 root places + Settings at the foot.
+    await wide.locator('nav.nav a.last', { hasText: 'Settings' }).waitFor();
     await wide.locator('.split h2.pane-title', { hasText: 'tower' }).waitFor();
-    await wide.locator('a.row .meters').nth(1).waitFor({ timeout: 5_000 });
     await maybeShot(wide, 'real-wide-dark-machines');
     await setTheme(wide, 'light');
     await maybeShot(wide, 'real-wide-light-machines');
     await setTheme(wide, 'dark');
 
-    await wide.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Tools' }).click();
-    await wide.locator('a.row', { hasText: 'power.restart' }).first().click();
-    await wide.locator('.split h2.pane-title', { hasText: 'power.restart' }).waitFor();
-    await maybeShot(wide, 'real-wide-dark-tools');
-    await setTheme(wide, 'light');
-    await maybeShot(wide, 'real-wide-light-tools');
-    await setTheme(wide, 'dark');
+    await wide.locator('nav.nav a', { hasText: 'Activity' }).click();
+    await wide.getByText('Stream check').first().waitFor({ timeout: 10_000 });
+    await maybeShot(wide, 'real-wide-dark-activity');
 
-    await wide.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /Device/i }).click();
+    await wide.locator('nav.nav a', { hasText: 'Actions' }).click();
+    await wide.locator('.tile[href="#/actions/restart"]').waitFor();
+    await maybeShot(wide, 'real-wide-dark-actions');
+
+    await wide.locator('nav.nav a.last', { hasText: 'Settings' }).click();
     await wide.getByText('Forget this browser').waitFor();
-    await maybeShot(wide, 'real-wide-dark-device');
+    await maybeShot(wide, 'real-wide-dark-settings');
 
     await wideCtx.close();
 
-    // ── Mock mode checks (unreachable machine detail, remote tool error, pairing defaults) ────
+    // ── Mock mode checks (v2 full suite: off vs last-on, plain vs tech, QR invite, limited, multi)
     const mockViewports = SHOTS_DIR
       ? [
           ['phone', { width: 390, height: 844 }],
@@ -426,40 +502,18 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
       });
       p.on('pageerror', (err) => pageErrors.push(String(err)));
 
-      await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
-      await p.getByText(/Pair this device/).waitFor();
-      assert.equal(await p.getByLabel('Name this device').inputValue(), 'Pixel 10');
-      await maybeShot(p, `mock-${label}-dark-start-pair`);
-      if (SHOTS_DIR) {
-        await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-start-pair`);
-      }
-
-      if (SHOTS_DIR) {
-        await p.goto(`${server.url}/?mock=token`, { waitUntil: 'domcontentloaded' });
-        await p.getByText(/Connect this browser/).waitFor();
-        await setTheme(p, 'dark');
-        await maybeShot(p, `mock-${label}-dark-start-token`);
-        await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-start-token`);
-      }
-
+      // Default mock: 3 on, 2 off (laptop with "Last on 14 days ago" + Wake, nas with "Off" & no Wake).
       await p.goto(`${server.url}/?mock`, { waitUntil: 'domcontentloaded' });
-      await p.getByText('Machines · 3 of 4 answering').waitFor();
-      // Multi-reason busy machine shows "busy: agents +1" (never [object Object] or raw detail).
-      const studioRow = p.locator('a.row', { hasText: 'studio' }).first();
-      await studioRow.getByText(/busy: agents \+1/).waitFor();
-      const studioRowText = await studioRow.innerText();
-      assert.ok(!studioRowText.includes('[object Object]'), `raw object in studio row: ${studioRowText}`);
-      assert.ok(!studioRowText.includes('1239887'), `raw probe detail in studio row: ${studioRowText}`);
-      // Offline dual-boot machine row shows short "Did not answer" without raw transport error.
-      const laptopRow = p.locator('a.row.off', { hasText: 'laptop' }).first();
-      await laptopRow.getByText(/Did not answer/).waitFor();
-      const laptopRowText = await laptopRow.innerText();
-      assert.ok(
-        !laptopRowText.includes("None of laptop's systems answered"),
-        `raw node error leaked into list row: ${laptopRowText}`,
-      );
+      await p.getByText('3 are on, 2 are off').waitFor();
+      await p.locator('a.machine', { hasText: 'tower' }).getByText('Busy · 2 things running').waitFor();
+      await p.locator('a.machine', { hasText: 'studio' }).getByText('Busy · agents').waitFor();
+      await p.locator('a.machine', { hasText: 'pi' }).getByText('Idle').waitFor();
+      const laptopRow = p.locator('.machine.off', { hasText: 'laptop' });
+      await laptopRow.getByText(/Last on 14 days ago/).waitFor();
+      await laptopRow.getByRole('button', { name: 'Wake' }).waitFor();
+      const nasRow = p.locator('.machine.off', { hasText: 'nas' });
+      await nasRow.getByText('Off').waitFor();
+      assert.equal(await nasRow.getByRole('button', { name: 'Wake' }).count(), 0);
       await setTheme(p, 'dark');
       await maybeShot(p, `mock-${label}-dark-machines`);
       if (SHOTS_DIR) {
@@ -468,75 +522,112 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
         await setTheme(p, 'dark');
       }
 
-      // Unreachable machine detail shows full message and hint.
-      await p.goto(`${server.url}/?mock#/machines/laptop`, { waitUntil: 'domcontentloaded' });
-      await p.getByText(/None of laptop's systems answered/i).waitFor();
-      await p.getByText(/Check that laptop is powered on/i).waitFor();
-      await maybeShot(p, `mock-${label}-dark-laptop`);
+      // Activity plain vs technical + row swipe to reveal Stop on running item.
+      await p.goto(`${server.url}/?mock#/activity`, { waitUntil: 'domcontentloaded' });
+      await p.getByText('Photo backup').first().waitFor();
+      await p.getByText('Tests for website').first().waitFor();
+      await p.getByText('Restart').first().waitFor();
+      const mockPlainAct = await p.locator('main.main').innerText();
+      assert.ok(!mockPlainAct.includes('rsync -av'), `Raw command leaked: ${mockPlainAct}`);
+      assert.ok(!mockPlainAct.includes('npm test'), `Raw command leaked: ${mockPlainAct}`);
+      assert.ok(!/\bexit \d+\b/i.test(mockPlainAct), `Exit code leaked: ${mockPlainAct}`);
+      await maybeShot(p, `mock-${label}-dark-activity-plain`);
       if (SHOTS_DIR) {
         await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-laptop`);
+        await maybeShot(p, `mock-${label}-light-activity-plain`);
         await setTheme(p, 'dark');
       }
 
-      // Remote tool target shows honest note and displays remote error cleanly.
-      await p.goto(`${server.url}/?mock#/tools/audit.tail`, { waitUntil: 'domcontentloaded' });
-      await p.locator('#tool-target-on').selectOption('pi');
-      await p.getByText(/pi checks its own tools and permissions\s+when you run/i).waitFor();
-      await p.getByRole('button', { name: 'Run', exact: true }).click();
-      await p.locator('.notice.bad').getByText(/may not call audit\.tail on pi/i).waitFor();
-      await maybeShot(p, `mock-${label}-dark-remote-error`);
+      // Swipe left on a running Activity row reveals Stop button.
+      if (label === 'phone') {
+        await dispatchSwipe(p, '.swipe-row', { startX: 310, startY: 200, endX: 160, endY: 202 });
+        await p.locator('.swipe-action', { hasText: 'Stop' }).waitFor();
+      }
+
+      // Mock Actions + Which machine?
+      await p.goto(`${server.url}/?mock#/actions`, { waitUntil: 'domcontentloaded' });
+      await p.locator('.tile', { hasText: 'Sleep' }).waitFor();
+      await maybeShot(p, `mock-${label}-dark-actions`);
       if (SHOTS_DIR) {
         await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-remote-error`);
+        await maybeShot(p, `mock-${label}-light-actions`);
         await setTheme(p, 'dark');
       }
+
+      // Mock Connections + Let another device in (in-page SVG QR code).
+      await p.goto(`${server.url}/?mock=multi#/settings/connections`, { waitUntil: 'domcontentloaded' });
+      await p.getByText('Paired machines').waitFor();
+      await p.getByText('Devices that may come in').waitFor();
+      await p.getByText('Pixel 10').waitFor();
+      await maybeShot(p, `mock-${label}-dark-connections`);
+
+      await p.locator('a.row', { hasText: 'Let another device in' }).click();
+      await p.getByRole('button', { name: 'Make invite' }).click();
+      const qrSvg = p.locator('.qr-box svg path');
+      await qrSvg.waitFor();
+      const qrD = await qrSvg.getAttribute('d');
+      assert.ok(qrD && qrD.length > 200, 'Expected non-trivial SVG QR path');
+      await maybeShot(p, `mock-${label}-dark-invite-qr`);
+      if (SHOTS_DIR) {
+        await setTheme(p, 'light');
+        await maybeShot(p, `mock-${label}-light-invite-qr`);
+        await setTheme(p, 'dark');
+      }
+
+      // Mock Technical details mode.
+      await p.goto(`${server.url}/?mock=tech#/activity`, { waitUntil: 'domcontentloaded' });
+      await p.getByText('rsync -av /home/me/photos/ nas:/volume1/photos/').first().waitFor();
+      await p.locator('.state', { hasText: 'exit 1' }).first().waitFor();
+      await maybeShot(p, `mock-${label}-dark-activity-tech`);
+
+      // Mock limited role: unavailable tiles show plain reasons.
+      await p.goto(`${server.url}/?mock=limited#/actions`, { waitUntil: 'domcontentloaded' });
+      await p.locator('.tile.na', { hasText: 'Power controls are not allowed on this device' }).first().waitFor();
+      await maybeShot(p, `mock-${label}-dark-actions-limited`);
+
+      // Mock pairing start screen.
+      await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
+      await p.getByRole('heading', { name: 'Pair this device' }).waitFor();
+      await p.waitForFunction(
+        () => {
+          const el = document.querySelector('label.field input');
+          return el && el.value === 'Pixel 10';
+        },
+        null,
+        { timeout: 5000 },
+      );
+      await maybeShot(p, `mock-${label}-dark-start-pair`);
 
       if (SHOTS_DIR) {
         await p.goto(`${server.url}/?mock#/machines/tower`, { waitUntil: 'domcontentloaded' });
-        await p.getByText('Processor').waitFor();
+        await p.getByText('Health').waitFor();
         await setTheme(p, 'dark');
         await maybeShot(p, `mock-${label}-dark-overview`);
         await setTheme(p, 'light');
         await maybeShot(p, `mock-${label}-light-overview`);
         await setTheme(p, 'dark');
 
-        await p.goto(`${server.url}/?mock#/machines/tower/run`, { waitUntil: 'domcontentloaded' });
-        await p.getByLabel('Command').fill('df -h /');
-        await p.getByRole('button', { name: 'Run', exact: true }).click();
+        await p.goto(`${server.url}/?mock#/machines/tower/command`, { waitUntil: 'domcontentloaded' });
+        await p.locator('input[aria-label="Command"]').fill('df -h /');
+        await p.locator('form.prompt button[type="submit"]').click();
         await p.locator('pre.out').getByText('/dev/nvme0n1p5').waitFor();
-        await maybeShot(p, `mock-${label}-dark-run`);
+        await maybeShot(p, `mock-${label}-dark-command`);
         await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-run`);
+        await maybeShot(p, `mock-${label}-light-command`);
         await setTheme(p, 'dark');
 
-        await p.goto(`${server.url}/?mock#/machines/tower/files`, { waitUntil: 'domcontentloaded' });
-        await p.locator('button.row', { hasText: 'projects/' }).waitFor();
-        await maybeShot(p, `mock-${label}-dark-files`);
+        await p.goto(`${server.url}/?mock#/settings`, { waitUntil: 'domcontentloaded' });
+        await p.getByText('Technical details').waitFor();
+        await maybeShot(p, `mock-${label}-dark-settings`);
         await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-files`);
+        await maybeShot(p, `mock-${label}-light-settings`);
         await setTheme(p, 'dark');
 
-        await p.goto(`${server.url}/?mock#/jobs`, { waitUntil: 'domcontentloaded' });
-        await p.getByText('cargo build --release').first().waitFor();
-        await maybeShot(p, `mock-${label}-dark-jobs`);
+        await p.goto(`${server.url}/?mock#/settings/appearance`, { waitUntil: 'domcontentloaded' });
+        await p.getByText('Accent').waitFor();
+        await maybeShot(p, `mock-${label}-dark-appearance`);
         await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-jobs`);
-        await setTheme(p, 'dark');
-
-        await p.goto(`${server.url}/?mock#/tools/power.restart`, { waitUntil: 'domcontentloaded' });
-        await p.getByRole('button', { name: 'Restart tower', exact: true }).click();
-        await p.getByRole('dialog').waitFor();
-        await maybeShot(p, `mock-${label}-dark-tools-sheet`);
-        await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-tools-sheet`);
-        await setTheme(p, 'dark');
-
-        await p.goto(`${server.url}/?mock#/device`, { waitUntil: 'domcontentloaded' });
-        await p.getByText('Forget this browser').waitFor();
-        await maybeShot(p, `mock-${label}-dark-device`);
-        await setTheme(p, 'light');
-        await maybeShot(p, `mock-${label}-light-device`);
+        await maybeShot(p, `mock-${label}-light-appearance`);
       }
 
       await ctx.close();
@@ -551,12 +642,11 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
   }
 });
 
-test('fast start with an offline dual-boot machine paints this node immediately and caches across visits', async () => {
+test('fast start with an offline dual-boot machine paints immediately and keeps known-off machines calm on reload', async () => {
   assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
   const root = makeWorkRoot();
   const fleet = setupFleet(root);
 
-  // Add a dead dual-boot machine whose two command transports never answer.
   const hangCmd = [process.execPath, '-e', 'setInterval(() => {}, 60000)'];
   fs.appendFileSync(
     path.join(fleet.towerHome, 'config', 'fleet.toml'),
@@ -600,60 +690,27 @@ test('fast start with an offline dual-boot machine paints this node immediately 
     const tClick = performance.now();
     await page.getByRole('button', { name: 'Connect' }).click();
 
-    // This node paints immediately (well under 2 seconds), never waiting for the dead machine.
-    await page.locator('a.row:not(.asking):not(.off)', { hasText: 'tower' }).waitFor({ timeout: 2000 });
+    // This node paints immediately (under 2s).
+    await page.locator('a.machine', { hasText: 'tower' }).waitFor({ timeout: 2000 });
     const tTower = Math.round(performance.now() - tClick);
     assert.ok(tTower < 2000, `tower took ${tTower} ms to appear`);
 
-    // The dead machine appears as a quiet "asking…" row while pi answers on its own.
-    await page.locator('a.row.asking', { hasText: 'dead' }).waitFor({ timeout: 2000 });
-    await page.locator('a.row:not(.asking):not(.off)', { hasText: 'pi' }).waitFor({ timeout: 2000 });
-    const tPi = Math.round(performance.now() - tClick);
-    assert.ok(tPi < 2000, `pi took ${tPi} ms to appear`);
-    await maybeShot(page, 'real-phone-dark-machines-asking');
+    // Never-seen dead machine appears briefly as Checking… while pi answers on its own.
+    await page.locator('.machine.asking', { hasText: 'dead' }).waitFor({ timeout: 2000 });
+    await page.locator('a.machine', { hasText: 'pi' }).waitFor({ timeout: 2000 });
 
-    // Full list settles after a single ping timeout for the dead dual-boot machine.
-    const deadRow = page.locator('a.row.off', { hasText: 'dead' });
+    // Full list settles to "2 are on, 1 is off" with dead calmly under Off.
+    const deadRow = page.locator('.machine.off', { hasText: 'dead' });
     await deadRow.waitFor({ timeout: 10_000 });
-    await page.getByText('Machines · 2 of 3 answering').waitFor({ timeout: 5000 });
-    const tSettled = Math.round(performance.now() - tClick);
-    assert.ok(tSettled < 8000, `fleet took ${tSettled} ms to settle (expected one timeout)`);
-    // Offline list row stays calm ("Did not answer"), keeping raw dual-boot errors on the detail page.
+    await page.getByText('2 are on, 1 is off').waitFor({ timeout: 5000 });
     const deadRowText = await deadRow.innerText();
-    assert.match(deadRowText, /Did not answer/);
+    assert.match(deadRowText, /Off/);
     assert.ok(
       !deadRowText.includes("None of dead's systems answered"),
       `raw dual-boot error leaked into list row: ${deadRowText}`,
     );
-    await maybeShot(page, 'real-phone-dark-machines-offline');
 
-    // Opening dead shows the full dual-boot error message on the detail page.
-    await deadRow.click();
-    await page.getByText(/None of dead's systems answered/i).waitFor({ timeout: 5000 });
-
-    // Jobs view queries answering machines only and paints without waiting on dead.
-    const tJobs0 = performance.now();
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Jobs' }).click();
-    await page.getByText('No background jobs recorded.').waitFor({ timeout: 2000 });
-    const tJobs = Math.round(performance.now() - tJobs0);
-    assert.ok(tJobs < 2000, `Jobs view took ${tJobs} ms`);
-
-    // Target picker labels the offline machine and "All answering machines" skips it.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Tools' }).click();
-    await page.getByLabel('Search tools').fill('meta.version');
-    await page.locator('a.row', { hasText: 'meta.version' }).first().click();
-    const deadOpt = await page.locator('#tool-target-on option[value="dead"]').textContent();
-    assert.match(deadOpt || '', /offline/i);
-    await page.locator('#tool-target-on').selectOption('all');
-    await page.getByText(/skipping dead/i).waitFor();
-    const tFan0 = performance.now();
-    await page.getByRole('button', { name: 'Run', exact: true }).click();
-    await page.locator('.label', { hasText: /^pi$/i }).waitFor({ timeout: 2000 });
-    await page.locator('.label', { hasText: /^tower$/i }).waitFor({ timeout: 2000 });
-    const tFan = Math.round(performance.now() - tFan0);
-    assert.ok(tFan < 2000, `All-answering fan-out took ${tFan} ms`);
-
-    // Persistent localStorage cache stores non-secret machine metadata and no token.
+    // Persistent cache stores non-secret machine metadata (no token).
     const cachedRaw = await page.evaluate(() => localStorage.getItem('legion.cache.fleet'));
     assert.ok(cachedRaw, 'expected legion.cache.fleet in localStorage');
     assert.ok(!cachedRaw.includes(fleet.token), 'token must never be written to fleet cache');
@@ -661,19 +718,21 @@ test('fast start with an offline dual-boot machine paints this node immediately 
     assert.equal(cached.value.node, 'tower');
     assert.equal(cached.value.machines.length, 3);
 
-    // Return visit paints cached machines immediately with "as of …" while refreshing.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Machines' }).click();
+    // Return visit keeps known-off `dead` calmly under Off (NEVER flips it back to Checking…).
     const tReload0 = performance.now();
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.getByText(/as of /i).waitFor({ timeout: 2000 });
-    await page.locator('a.row', { hasText: 'dead' }).waitFor({ timeout: 2000 });
+    await page.locator('.machine.off', { hasText: 'dead' }).waitFor({ timeout: 2000 });
+    assert.equal(
+      await page.locator('.machine.asking', { hasText: 'dead' }).count(),
+      0,
+      'Known-off machine must not flip back to asking/checking on reload',
+    );
     const tReload = Math.round(performance.now() - tReload0);
     assert.ok(tReload < 2000, `Cached return paint took ${tReload} ms`);
-    await maybeShot(page, 'real-phone-dark-machines-cached');
-    await page.locator('a.row.off', { hasText: 'dead' }).waitFor({ timeout: 10_000 });
 
-    // Forgetting this browser clears the persistent fleet cache too.
-    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /device/i }).click();
+    // Forgetting this browser via Settings -> This browser clears the persistent fleet cache too.
+    await page.locator('header.top a[aria-label="Settings"]').click();
+    await page.locator('a.row', { hasText: 'This browser' }).click();
     await page.getByRole('button', { name: 'Forget this browser' }).click();
     const dialog = page.getByRole('dialog');
     await dialog.waitFor();

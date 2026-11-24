@@ -25,6 +25,10 @@ legion \- remote control node and CLI for managing machines
 [\fB\-\-delete\fR] [\fB\-\-checksum\fR] [\fB\-\-dry\-run\fR]
 .br
 .B legion
+.B pair
+\fB\-\-as\fR \fIprincipal\fR [\fB\-\-valid\fR \fI15m\fR] [\fB\-\-host\fR \fIhost\fR]... [\fB\-\-json\fR]
+.br
+.B legion
 .B serve
 [\fB\-\-listen\fR \fIaddress\fR]
 .SH DESCRIPTION
@@ -56,8 +60,13 @@ Run a tool locally, or on another machine named in \fIfleet.toml\fR with
 .B legion cp \fIfrom to\fR
 Copy a file or directory tree between machines with resume and sync support.
 .TP
+.B legion pair \fB\-\-as\fR \fIprincipal\fR
+Create a time-limited pairing invite for a mobile or remote client and display
+it as a QR code and text token.
+.TP
 .B legion serve
-Serve the node's tools over HTTP on loopback only (127.0.0.1:7117 by default).
+Serve the built-in web interface and the node's tools over HTTP on loopback
+only (127.0.0.1:7117 by default).
 .TP
 .B legion rpc\fR, \fBlegion mcp\fR, \fBlegion stream\fR, \fBlegion gate
 Protocol endpoints for SSH transport, AI agents, bulk file transfers, and
@@ -78,7 +87,7 @@ and \fItools.d/*.toml\fR.
 .TP
 .I ~/.local/state/legion/
 State directory (or \fI$XDG_STATE_HOME/legion\fR): \fIaudit.jsonl\fR,
-\fIjobs/\fR, and \fIsync/\fR.
+\fIdevices.json\fR, \fIjobs/\fR, and \fIsync/\fR.
 .TP
 .I /usr/lib/systemd/user/legion\-serve.service
 Optional systemd user unit for \fBlegion serve\fR (not enabled by default).

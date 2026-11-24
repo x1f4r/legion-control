@@ -6,6 +6,7 @@ export const PING_TIMEOUT_S = 4;
 export const PING_CLIENT_TIMEOUT_MS = 6_000;
 export const DETAIL_TIMEOUT_MS = 5_000;
 export const MAX_CONCURRENT_PINGS = 8;
+export const OFFLINE_RECHECK_MS = 2 * 60 * 1000;
 
 function makeTimeoutError(timeoutMs, machine) {
   const secs = Math.max(1, Math.round(timeoutMs / 1000));
@@ -115,6 +116,7 @@ export function serializeFleetCache(node, machines, now = Date.now()) {
       canWake: Boolean(m.canWake),
       reachable: Boolean(m.reachable),
       lastSeenAt: typeof m.lastSeenAt === 'number' ? m.lastSeenAt : null,
+      lastCheckedAt: typeof m.lastCheckedAt === 'number' ? m.lastCheckedAt : now,
     }));
   return {
     node: node || null,
@@ -125,6 +127,7 @@ export function serializeFleetCache(node, machines, now = Date.now()) {
 
 /**
  * Restores a cached fleet summary as an immediate initial snapshot while live checks run.
+ * Machines known to be off stay calmly `offline` (never `asking…`).
  */
 export function hydrateFleetCache(cached, expectedNode = null) {
   if (!cached || typeof cached !== 'object' || !Array.isArray(cached.machines)) return null;
@@ -133,29 +136,38 @@ export function hydrateFleetCache(cached, expectedNode = null) {
 
   const machines = cached.machines
     .filter((m) => m && typeof m.name === 'string' && m.name)
-    .map((m) => ({
-      name: m.name,
-      thisNode: Boolean(m.thisNode),
-      status: 'asking',
-      reachable: false,
-      asking: true,
-      fromCache: true,
-      reason: null,
-      error: null,
-      busy: false,
-      busyState: null,
-      busyReasons: [],
-      runningJobs: 0,
-      jobs: [],
-      os: m.os || null,
-      arch: m.arch || null,
-      version: m.version || null,
-      system: m.system || null,
-      latencyMs: null,
-      canWake: Boolean(m.canWake),
-      lastSeenAt: typeof m.lastSeenAt === 'number' ? m.lastSeenAt : null,
-      sys: null,
-    }));
+    .map((m) => {
+      const wasOff = m.reachable === false && !m.thisNode;
+      return {
+        name: m.name,
+        thisNode: Boolean(m.thisNode),
+        status: wasOff ? 'offline' : 'asking',
+        reachable: false,
+        asking: !wasOff,
+        fromCache: true,
+        reason: null,
+        error: null,
+        busy: false,
+        busyState: null,
+        busyReasons: [],
+        runningJobs: 0,
+        jobs: [],
+        os: m.os || null,
+        arch: m.arch || null,
+        version: m.version || null,
+        system: m.system || null,
+        latencyMs: null,
+        canWake: Boolean(m.canWake),
+        lastSeenAt: typeof m.lastSeenAt === 'number' ? m.lastSeenAt : null,
+        lastCheckedAt:
+          typeof m.lastCheckedAt === 'number'
+            ? m.lastCheckedAt
+            : typeof cached.savedAt === 'number'
+              ? cached.savedAt
+              : null,
+        sys: null,
+      };
+    });
 
   if (machines.length === 0) return null;
   return {
@@ -166,17 +178,18 @@ export function hydrateFleetCache(cached, expectedNode = null) {
   };
 }
 
-function makeAskingEntry(name, isLocal, listed, prev) {
+function makeEntry(name, isLocal, listed, prev) {
   const keepLive = prev && !prev.fromCache && prev.status === 'answering';
+  const keepOff = prev && prev.status === 'offline' && !isLocal;
   return {
     name,
     thisNode: isLocal,
-    status: keepLive ? 'answering' : 'asking',
+    status: keepLive ? 'answering' : keepOff ? 'offline' : 'asking',
     reachable: keepLive ? true : false,
-    asking: !keepLive,
+    asking: !keepLive && !keepOff,
     fromCache: Boolean(prev?.fromCache && !keepLive),
-    reason: null,
-    error: null,
+    reason: keepOff ? prev.reason || null : null,
+    error: keepOff ? prev.error || null : null,
     busy: keepLive ? Boolean(prev.busy) : false,
     busyState: keepLive ? prev.busyState || null : null,
     busyReasons: keepLive ? prev.busyReasons || [] : [],
@@ -193,6 +206,7 @@ function makeAskingEntry(name, isLocal, listed, prev) {
         : prev?.canWake,
     ),
     lastSeenAt: typeof prev?.lastSeenAt === 'number' ? prev.lastSeenAt : null,
+    lastCheckedAt: typeof prev?.lastCheckedAt === 'number' ? prev.lastCheckedAt : null,
     sys: keepLive ? prev.sys || null : null,
   };
 }
@@ -234,6 +248,9 @@ export async function refreshFleetProgressive({
   pingClientTimeoutMs = PING_CLIENT_TIMEOUT_MS,
   detailTimeoutMs = DETAIL_TIMEOUT_MS,
   maxConcurrentPings = MAX_CONCURRENT_PINGS,
+  forceOffline = false,
+  checkOffline = true,
+  offlineRecheckMs = OFFLINE_RECHECK_MS,
 }) {
   const map = new Map();
   for (const m of initialMachines || []) {
@@ -244,7 +261,7 @@ export async function refreshFleetProgressive({
   let activeCachedAt = cachedAt;
 
   if (here && !map.has(here)) {
-    map.set(here, makeAskingEntry(here, true, null, null));
+    map.set(here, makeEntry(here, true, null, null));
   }
 
   function snapshot(settled = false) {
@@ -263,7 +280,7 @@ export async function refreshFleetProgressive({
   }
 
   function updateMachine(name, updater) {
-    const prev = map.get(name) || makeAskingEntry(name, name === here, null, null);
+    const prev = map.get(name) || makeEntry(name, name === here, null, null);
     const next = updater(prev);
     map.set(name, next);
     emit(false);
@@ -370,7 +387,8 @@ export async function refreshFleetProgressive({
     listedMap.set(here, { name: here, this_node: true, systems: [], wake_via: [] });
   }
 
-  // Reconcile the machine map with fleet.toml and immediately show remotes as `asking`.
+  // Reconcile the machine map with fleet.toml; never-seen remotes show as `asking`, while machines
+  // known to be off stay calmly `offline`.
   for (const existing of Array.from(map.keys())) {
     if (!listedMap.has(existing)) map.delete(existing);
   }
@@ -380,20 +398,29 @@ export async function refreshFleetProgressive({
     const prev = map.get(name);
     if (isLocal) {
       map.set(name, {
-        ...(prev || makeAskingEntry(name, true, listed, null)),
+        ...(prev || makeEntry(name, true, listed, null)),
         thisNode: true,
         canWake: Boolean(listed.mac || (listed.wake_via && listed.wake_via.length > 0)),
       });
     } else {
-      map.set(name, makeAskingEntry(name, false, listed, prev));
+      map.set(name, makeEntry(name, false, listed, prev));
       remoteNames.push(name);
     }
   }
   emit(false);
 
-  // Probe each remote machine once; only machines that answer get detail calls.
+  // Probe each remote machine once; machines known to be off are checked quietly at most every
+  // `offlineRecheckMs` (or when `forceOffline` is set) without flipping back to `asking`.
   const remotesPromise = runPool(remoteNames, maxConcurrentPings, async (name) => {
     if (signal?.aborted) return;
+    const current = map.get(name);
+    if (current?.status === 'offline' && !forceOffline) {
+      if (!checkOffline) return;
+      if (current.lastCheckedAt && now() - current.lastCheckedAt < offlineRecheckMs) {
+        return;
+      }
+    }
+
     let pingEntry = null;
     let pingErr = null;
     try {
@@ -412,6 +439,7 @@ export async function refreshFleetProgressive({
 
     if (signal?.aborted) return;
 
+    const checkedAt = now();
     if (!pingEntry || !pingEntry.reachable) {
       const error = pingEntry?.error || pingErr || {
         code: 'unreachable',
@@ -425,6 +453,7 @@ export async function refreshFleetProgressive({
         reachable: false,
         asking: false,
         fromCache: false,
+        lastCheckedAt: checkedAt,
         error,
         reason: firstSentence(error.message) || 'Did not answer',
         sys: null,
@@ -445,7 +474,8 @@ export async function refreshFleetProgressive({
       fromCache: false,
       error: null,
       reason: null,
-      lastSeenAt: now(),
+      lastSeenAt: checkedAt,
+      lastCheckedAt: checkedAt,
       os: pingEntry.os || prev.os,
       arch: pingEntry.arch || prev.arch,
       version: pingEntry.version || prev.version,

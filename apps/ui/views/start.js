@@ -114,8 +114,8 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
     const repair = linkState?.repair || {};
     return html`
       <div class="app standalone">
-        <header class="bar">
-          <h1 class="wordmark"><b>▍</b>Legion</h1>
+        <header class="top">
+          <h1>Saved state</h1>
         </header>
         <main class="main">
           <div class="start-column">
@@ -151,8 +151,8 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
   if (archivedInfo && archivedInfo.nextState?.ready) {
     return html`
       <div class="app standalone">
-        <header class="bar">
-          <h1 class="wordmark"><b>▍</b>Legion</h1>
+        <header class="top">
+          <h1>Saved state</h1>
         </header>
         <main class="main">
           <div class="start-column">
@@ -189,7 +189,7 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
     const isDesktopFirstStart = !canScan && !onCancel && !linkState?.ready;
     return html`
       <div class="app standalone">
-        <header class="bar">
+        <header class=${onCancel ? 'top sub' : 'top'}>
           ${onCancel
             ? html`
                 <button type="button" class="btn icon back" aria-label="Back" onClick=${onCancel}>
@@ -197,7 +197,7 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
                 </button>
               `
             : null}
-          <h1 class="wordmark"><b>▍</b>Legion</h1>
+          <h1>Pair this device</h1>
         </header>
         <main class="main">
           <div class="start-column">
@@ -212,7 +212,7 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
                   </div>
                 `
               : null}
-            <h2 class="start-heading">Pair this device with one of your machines.</h2>
+            <h2 class="start-heading">Connect to one of your machines.</h2>
             ${isDesktopFirstStart
               ? html`
                   <p class="lede">
@@ -295,8 +295,8 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
 
   return html`
     <div class="app standalone">
-      <header class="bar">
-        <h1 class="wordmark"><b>▍</b>Legion</h1>
+      <header class="top">
+        <h1>Connect</h1>
       </header>
       <main class="main">
         <div class="start-column">
@@ -321,7 +321,7 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
                 placeholder="lgn_…"
                 required
               />
-              <small>Kept in this browser only. You can remove it anytime under This device.</small>
+              <small>Kept in this browser only. You can remove it anytime under Settings.</small>
             </div>
             ${error ? html`<${Notice} error=${error} />` : null}
             <div class="actions">
