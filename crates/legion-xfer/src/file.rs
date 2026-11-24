@@ -252,6 +252,7 @@ pub fn put<R: Read>(
         Some(m) => m & 0o777,
         None => fs::symlink_metadata(path)
             .ok()
+            .filter(|meta| meta.file_type().is_file())
             .and_then(|meta| platform::entry_mode(&meta))
             .map(|m| m & 0o777)
             .unwrap_or(0o644),
@@ -720,5 +721,33 @@ mod tests {
             fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
             0o640
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_with_no_mode_over_symlink_defaults_to_0644_not_0777() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        let link = dir.path().join("link.txt");
+        fs::write(&real, b"real").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let payload = b"replacement";
+        put(
+            &link,
+            payload.len() as u64,
+            hash_bytes(payload),
+            0,
+            Cursor::new(payload),
+            None,
+        )
+        .unwrap();
+
+        let meta = fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(fs::read(&real).unwrap(), b"real");
     }
 }
