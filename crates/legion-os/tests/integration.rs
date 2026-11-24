@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic, write_atomic_from_reader};
-use legion_os::detach::{DetachOptions, spawn_detached};
+use legion_os::detach::{DetachHandle, DetachOptions, spawn_detached, stop_detached};
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid::{self, ProcessId};
 use legion_os::run::{OutputStream, RunOptions, run};
@@ -63,6 +63,16 @@ fn main() -> ExitCode {
         ("run_escalation_kills_term_ignoring_grandchild", || {
             Box::pin(test_run_escalation_kills_term_ignoring_grandchild())
         }),
+        ("run_delivers_single_sigterm_for_graceful_cleanup", || {
+            Box::pin(test_run_delivers_single_sigterm_for_graceful_cleanup())
+        }),
+        ("run_dropped_future_kills_grandchildren", || {
+            Box::pin(test_run_dropped_future_kills_grandchildren())
+        }),
+        (
+            "run_normal_exit_kills_background_grandchild_without_timeout",
+            || Box::pin(test_run_normal_exit_kills_background_grandchild_without_timeout()),
+        ),
         (
             "run_does_not_hang_when_escaped_grandchild_keeps_pipes_open",
             || Box::pin(test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open()),
@@ -155,10 +165,12 @@ fn run_helper(mode: &str) -> ExitCode {
         "flood" => helper_flood(&args),
         "sleep" => helper_sleep(&args),
         "spawn_tree" => helper_spawn_tree(&args),
+        "spawn_and_exit" => helper_spawn_and_exit(&args),
         "escape_pipes" => helper_escape_pipes(&args),
         "detach_parent" => helper_detach_parent(&args),
         "detach_worker" => helper_detach_worker(&args),
         "lock_holder" => helper_lock_holder(&args),
+        "count_sigterm" => helper_count_sigterm(),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -263,6 +275,31 @@ fn helper_spawn_tree(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn helper_spawn_and_exit(args: &[String]) -> ExitCode {
+    let grandchild_id_file = &args[0];
+
+    // Spawn a long-lived background grandchild that keeps stdout/stderr open, then exit immediately
+    // without waiting for it (equivalent to `sleep 999 & echo done`).
+    #[allow(clippy::zombie_processes)]
+    let _bg = Command::new(current_exe())
+        .env(HELPER_ENV, "sleep")
+        .args(["30000", grandchild_id_file])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("failed to spawn background grandchild");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(grandchild_id_file).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    println!("DONE");
+    let _ = io::stdout().flush();
+    ExitCode::SUCCESS
+}
+
 fn helper_escape_pipes(args: &[String]) -> ExitCode {
     let escaped_id_file = &args[0];
 
@@ -307,32 +344,35 @@ fn helper_escape_pipes(args: &[String]) -> ExitCode {
 }
 
 fn helper_detach_parent(args: &[String]) -> ExitCode {
-    let worker_id_file = PathBuf::from(&args[0]);
+    let handle_file = PathBuf::from(&args[0]);
     let subchild_id_file = args[1].clone();
-    let stdout_log = PathBuf::from(&args[2]);
-    let stderr_log = PathBuf::from(&args[3]);
+    let setsid_id_file = args[2].clone();
+    let stdout_log = PathBuf::from(&args[3]);
+    let stderr_log = PathBuf::from(&args[4]);
+    let job_name = args[5].clone();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("helper tokio runtime");
 
-    let worker_id = rt
+    let handle = rt
         .block_on(spawn_detached(
-            DetachOptions::new(CommandSpec::argv(current_exe(), [subchild_id_file]))
-                .env(HELPER_ENV, "detach_worker")
-                .env("LEGION_DETACH_MARK", "alive-after-parent")
-                .stdout_path(stdout_log)
-                .stderr_path(stderr_log),
+            DetachOptions::new(CommandSpec::argv(
+                current_exe(),
+                [subchild_id_file, setsid_id_file],
+            ))
+            .name(job_name)
+            .env(HELPER_ENV, "detach_worker")
+            .env("LEGION_DETACH_MARK", "alive-after-parent")
+            .stdout_path(stdout_log)
+            .stderr_path(stderr_log),
         ))
         .expect("spawn_detached failed inside detach_parent");
 
-    write_atomic(
-        &worker_id_file,
-        format!("{}:{}\n", worker_id.pid, worker_id.start_time).as_bytes(),
-        WriteOptions::default(),
-    )
-    .expect("failed to write worker_id");
+    let serialized = serde_json::to_string(&handle).expect("failed to serialize DetachHandle");
+    write_atomic(&handle_file, serialized.as_bytes(), WriteOptions::default())
+        .expect("failed to write DetachHandle");
 
     // Exit immediately so the test can verify the detached worker outlives its parent.
     ExitCode::SUCCESS
@@ -340,6 +380,7 @@ fn helper_detach_parent(args: &[String]) -> ExitCode {
 
 fn helper_detach_worker(args: &[String]) -> ExitCode {
     let subchild_id_file = &args[0];
+    let setsid_id_file = &args[1];
 
     // Give the parent a moment to exit first so log writes happen after parent exit.
     std::thread::sleep(Duration::from_millis(250));
@@ -350,7 +391,7 @@ fn helper_detach_worker(args: &[String]) -> ExitCode {
     eprintln!("worker-stderr:{mark}");
     let _ = io::stderr().flush();
 
-    // Also spawn a child of our own so the test verifies kill_tree terminates the whole detached tree.
+    // Spawn a regular child so stop_detached/kill_tree verifies tree termination.
     let mut sub = Command::new(current_exe())
         .env(HELPER_ENV, "sleep")
         .args(["30000", subchild_id_file])
@@ -359,6 +400,26 @@ fn helper_detach_worker(args: &[String]) -> ExitCode {
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to spawn subchild of detached worker");
+
+    // On Unix, also spawn a grandchild in its own session (`setsid`) to verify that a Linux
+    // systemd user scope still contains and terminates `setsid` descendants via stop_detached.
+    #[cfg(unix)]
+    {
+        use process_wrap::std::{CommandWrap, ProcessSession};
+        let mut escaped = CommandWrap::with_new(current_exe(), |cmd| {
+            cmd.env(HELPER_ENV, "sleep")
+                .args(["30000", setsid_id_file])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        });
+        escaped.wrap(ProcessSession);
+        let _escaped_child = escaped
+            .spawn()
+            .expect("failed to spawn setsid grandchild of detached worker");
+    }
+    #[cfg(not(unix))]
+    let _ = setsid_id_file;
 
     let _ = sub.wait();
     ExitCode::SUCCESS
@@ -378,6 +439,33 @@ fn helper_lock_holder(args: &[String]) -> ExitCode {
     // Hold the lock until stdin closes or the parent kills us.
     let mut buf = Vec::new();
     let _ = io::stdin().read_to_end(&mut buf);
+    ExitCode::SUCCESS
+}
+
+fn helper_count_sigterm() -> ExitCode {
+    #[cfg(unix)]
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("helper tokio runtime");
+        rt.block_on(async {
+            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            println!("READY");
+            let _ = io::stdout().flush();
+
+            if sig.recv().await.is_some() {
+                let mut count = 1u32;
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+                while tokio::time::timeout_at(deadline, sig.recv()).await.is_ok() {
+                    count += 1;
+                }
+                println!("sigterm_count={count}");
+                let _ = io::stdout().flush();
+            }
+        });
+    }
     ExitCode::SUCCESS
 }
 
@@ -593,6 +681,105 @@ async fn test_run_escalation_kills_term_ignoring_grandchild() {
     );
 }
 
+async fn test_run_delivers_single_sigterm_for_graceful_cleanup() {
+    #[cfg(unix)]
+    {
+        let token = CancellationToken::new();
+        let trigger = token.clone();
+        let (spec, helper_env) = helper_spec("count_sigterm", &[]);
+        let res = run(RunOptions::new(spec)
+            .envs(helper_env)
+            .timeout(Duration::from_secs(10))
+            .kill_grace(Duration::from_millis(500))
+            .cancel(token)
+            .on_output(Arc::new(move |chunk| {
+                if String::from_utf8_lossy(&chunk.bytes).contains("READY") {
+                    trigger.cancel();
+                }
+            })))
+        .await
+        .unwrap();
+
+        assert!(res.cancelled);
+        assert_eq!(res.exit_code, Some(0));
+        assert!(
+            res.stdout.text.contains("sigterm_count=1"),
+            "expected exactly one SIGTERM, got stdout: {:?}",
+            res.stdout.text
+        );
+    }
+}
+
+async fn test_run_dropped_future_kills_grandchildren() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild_file = dir.path().join("grandchild_drop.pid");
+    let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let notify_ready = Arc::clone(&ready);
+    let (spec, helper_env) = helper_spec("spawn_tree", &[&grandchild_str]);
+    let handle = tokio::spawn(run(RunOptions::new(spec)
+        .envs(helper_env)
+        .timeout(Duration::from_secs(30))
+        .on_output(Arc::new(move |chunk| {
+            if String::from_utf8_lossy(&chunk.bytes).contains("READY") {
+                notify_ready.notify_one();
+            }
+        }))));
+
+    tokio::time::timeout(Duration::from_secs(5), ready.notified())
+        .await
+        .expect("timed out waiting for spawn_tree READY");
+
+    let grandchild_id =
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+    assert!(procid::is_alive(&grandchild_id));
+
+    // Abort the task running `run(...)`, dropping its future mid-flight.
+    handle.abort();
+    let _ = handle.await;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while procid::is_alive(&grandchild_id) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !procid::is_alive(&grandchild_id),
+        "grandchild {grandchild_id} leaked after dropping run() future"
+    );
+}
+
+async fn test_run_normal_exit_kills_background_grandchild_without_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild_file = dir.path().join("grandchild_bg.pid");
+    let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+
+    // No timeout set: once the direct child exits, run() must stop the background grandchild
+    // holding stdout open and return promptly instead of hanging or leaking it.
+    let (spec, helper_env) = helper_spec("spawn_and_exit", &[&grandchild_str]);
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(RunOptions::new(spec)
+            .envs(helper_env)
+            .kill_grace(Duration::from_millis(150))),
+    )
+    .await
+    .expect("run() hung waiting on background grandchild's stdout pipe")
+    .unwrap();
+
+    assert!(res.success(), "expected clean exit, got {res:?}");
+    assert!(!res.timed_out);
+    assert!(!res.cancelled);
+    assert_eq!(res.stdout.text.trim(), "DONE");
+
+    let grandchild_id =
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+    assert!(
+        !procid::is_alive(&grandchild_id),
+        "background grandchild {grandchild_id} survived after direct child exited"
+    );
+}
+
 async fn test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open() {
     let dir = tempfile::tempdir().unwrap();
     let escaped_file = dir.path().join("escaped.pid");
@@ -637,27 +824,32 @@ async fn test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open() {
 
 async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree() {
     let dir = tempfile::tempdir().unwrap();
-    let worker_id_file = dir.path().join("worker.pid");
+    let handle_file = dir.path().join("worker.handle.json");
     let subchild_id_file = dir.path().join("subchild.pid");
+    let setsid_id_file = dir.path().join("setsid.pid");
     let stdout_log = dir.path().join("stdout.log");
     let stderr_log = dir.path().join("stderr.log");
+    let job_name = format!("it-{}", std::process::id());
 
     // Pre-populate logs so we verify append semantics (existing lines are preserved).
     write_atomic(&stdout_log, b"existing-stdout\n", WriteOptions::default()).unwrap();
     write_atomic(&stderr_log, b"existing-stderr\n", WriteOptions::default()).unwrap();
 
-    let worker_id_str = worker_id_file.to_string_lossy().into_owned();
+    let handle_str = handle_file.to_string_lossy().into_owned();
     let subchild_id_str = subchild_id_file.to_string_lossy().into_owned();
+    let setsid_id_str = setsid_id_file.to_string_lossy().into_owned();
     let stdout_log_str = stdout_log.to_string_lossy().into_owned();
     let stderr_log_str = stderr_log.to_string_lossy().into_owned();
 
     let (spec, helper_env) = helper_spec(
         "detach_parent",
         &[
-            &worker_id_str,
+            &handle_str,
             &subchild_id_str,
+            &setsid_id_str,
             &stdout_log_str,
             &stderr_log_str,
+            &job_name,
         ],
     );
     let parent_out = run(RunOptions::new(spec)
@@ -672,17 +864,24 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
         parent_out.stderr.text
     );
 
-    // Parent has now completely exited; verify the detached worker is alive and finishes its writes.
-    let worker_id = parse_procid(&wait_for_file(&worker_id_file, Duration::from_secs(5)).await);
+    // Parent has now completely exited; deserialize the persisted DetachHandle and verify the
+    // detached worker is alive and finished writing to its logs.
+    let handle_json = wait_for_file(&handle_file, Duration::from_secs(5)).await;
+    let handle: DetachHandle =
+        serde_json::from_str(&handle_json).expect("failed to deserialize DetachHandle");
     assert!(
-        procid::is_alive(&worker_id),
-        "detached worker {worker_id} did not survive its parent exiting"
+        procid::is_alive(&handle.process),
+        "detached worker {} did not survive its parent exiting",
+        handle.process
     );
 
     let subchild_id =
         parse_procid(&wait_for_file(&subchild_id_file, Duration::from_secs(10)).await);
-    assert!(procid::is_alive(&worker_id));
+    assert!(procid::is_alive(&handle.process));
     assert!(procid::is_alive(&subchild_id));
+
+    #[cfg(unix)]
+    let setsid_id = parse_procid(&wait_for_file(&setsid_id_file, Duration::from_secs(5)).await);
 
     let out_log = fs::read_to_string(&stdout_log).unwrap();
     let err_log = fs::read_to_string(&stderr_log).unwrap();
@@ -695,14 +894,25 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
         "unexpected stderr log: {err_log:?}"
     );
 
-    // Stop the entire detached process tree (worker + its subchild) using procid::kill_tree.
-    let report = procid::kill_tree(&worker_id, Duration::from_millis(300))
+    // Stop the entire detached process tree via stop_detached(&handle, grace).
+    let report = stop_detached(&handle, Duration::from_millis(300))
         .await
         .unwrap();
     assert!(report.all_gone, "detached tree left survivors: {report:?}");
     assert!(report.survivors.is_empty());
-    assert!(!procid::is_alive(&worker_id));
+    assert!(!procid::is_alive(&handle.process));
     assert!(!procid::is_alive(&subchild_id));
+
+    #[cfg(unix)]
+    if let Some(ref unit) = handle.systemd_unit {
+        assert_eq!(unit, &format!("legion-job-{job_name}.scope"));
+        assert!(
+            !procid::is_alive(&setsid_id),
+            "setsid grandchild {setsid_id} survived stop_detached on systemd scope {unit}"
+        );
+    } else if procid::is_alive(&setsid_id) {
+        let _ = procid::kill_tree(&setsid_id, Duration::from_millis(200)).await;
+    }
 }
 
 async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time() {

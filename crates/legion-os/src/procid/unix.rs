@@ -12,7 +12,7 @@ use crate::{OsError, Result};
 
 use super::{KillTreeReport, ProcessId, is_alive};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(target_os = "linux")]
@@ -48,7 +48,61 @@ const fn libc_esrch() -> i32 {
     Errno::ESRCH as i32
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos_proc {
+    use std::mem::{size_of, zeroed};
+
+    use crate::procid::ProcessId;
+    use crate::{OsError, Result};
+
+    // Darwin `<sys/proc.h>` `SZOMB` state indicating an exited, unreaped zombie process.
+    const SZOMB: u32 = 5;
+
+    pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
+        let Ok(raw_pid) = i32::try_from(pid) else {
+            return Err(OsError::InvalidArgument {
+                detail: format!("pid {pid} exceeds Unix pid_t range"),
+            });
+        };
+
+        // SAFETY: `libc::proc_bsdinfo` is a plain C struct safe to zero-initialize; `proc_pidinfo`
+        // writes at most `size_of::<libc::proc_bsdinfo>()` bytes into `info` and returns the byte
+        // count written (0 or negative when the PID does not exist or cannot be queried).
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let expected = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                raw_pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                expected,
+            )
+        };
+        if written != expected {
+            return Ok(None);
+        }
+        if !include_zombie && info.pbi_status == SZOMB {
+            return Ok(None);
+        }
+        let start_us = info
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec);
+        if start_us == 0 {
+            return Ok(None);
+        }
+        Ok(Some(ProcessId::new(pid, start_us)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
+    macos_proc::of_pid(pid, include_zombie)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
     let mut system = System::new().map_err(|err| OsError::Platform {
         detail: format!("failed to initialize system process view: {err}"),
@@ -93,19 +147,18 @@ pub(super) fn boot_id() -> Result<String> {
 
 #[cfg(target_os = "macos")]
 pub(super) fn boot_id() -> Result<String> {
-    if let Ok(output) = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "kern.boottime"])
-        .output()
-        && output.status.success()
-        && let Some(parsed) = super::parse_macos_boottime(&String::from_utf8_lossy(&output.stdout))
-    {
-        return Ok(parsed);
+    // kern.bootsessionuuid is a kernel-generated UUID immutable across NTP/wall-clock steps.
+    let mut cmd = std::process::Command::new("/usr/sbin/sysctl");
+    cmd.args(["-n", "kern.bootsessionuuid"]);
+    let raw =
+        super::run_command_stdout_with_timeout(cmd, Duration::from_secs(5), "/usr/sbin/sysctl")?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(OsError::Platform {
+            detail: "sysctl kern.bootsessionuuid returned empty output".into(),
+        });
     }
-
-    let secs = System::boot_time().map_err(|err| OsError::Platform {
-        detail: format!("failed to read macOS boot time: {err}"),
-    })?;
-    Ok(format!("boot-{secs}"))
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -113,7 +166,7 @@ pub(super) fn boot_id() -> Result<String> {
     let secs = System::boot_time().map_err(|err| OsError::Platform {
         detail: format!("failed to read system boot time: {err}"),
     })?;
-    Ok(format!("boot-{secs}"))
+    Ok(format!("boot-sec-{secs}"))
 }
 
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
@@ -121,40 +174,59 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         detail: format!("pid {} exceeds Unix pid_t range", identity.pid),
     })?;
     let root_nix_pid = Pid::from_raw(raw_pid);
+    let identity = *identity;
+    let own_pid = std::process::id();
 
-    if !is_alive(identity) {
+    // Run the initial liveness check, full-table descendant discovery, and SIGTERM wave off the
+    // async worker thread.
+    let (mut tracked, target_pgid) = tokio::task::spawn_blocking(move || {
+        if !is_alive(&identity) {
+            return (HashMap::new(), None);
+        }
+
+        let own_pgid = getpgrp();
+        // Only signal the process group as a whole when the target leads its own group and that
+        // group is not ours; otherwise signaling the group would hit unrelated siblings or ourselves.
+        let target_pgid = getpgid(Some(root_nix_pid))
+            .ok()
+            .filter(|&pgid| pgid == root_nix_pid && pgid != own_pgid);
+
+        let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
+        tracked.insert(identity.pid, identity);
+        collect_tree_into(&identity, target_pgid, own_pid, &mut tracked);
+
+        if let Some(pgid) = target_pgid
+            && root_not_recycled(&identity)
+        {
+            let _ = killpg(pgid, Signal::SIGTERM);
+        }
+        signal_tracked(&tracked, Signal::SIGTERM, own_pid);
+        (tracked, target_pgid)
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_tree worker task failed: {err}"),
+    })?;
+
+    if tracked.is_empty() {
         return Ok(KillTreeReport {
             all_gone: true,
             survivors: Vec::new(),
         });
     }
 
-    let own_pid = std::process::id();
-    let own_pgid = getpgrp();
-    // Only signal the process group as a whole when the target leads its own group and that
-    // group is not ours; otherwise signaling the group would hit unrelated siblings or ourselves.
-    let target_pgid = getpgid(Some(root_nix_pid))
-        .ok()
-        .filter(|&pgid| pgid == root_nix_pid && pgid != own_pgid);
-
-    let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
-    tracked.insert(identity.pid, *identity);
-    collect_tree_into(identity, target_pgid, own_pid, &mut tracked);
-
-    // Phase 1: send SIGTERM to the group (when isolated) and every discovered descendant.
-    if let Some(pgid) = target_pgid
-        && root_not_recycled(identity)
-    {
-        let _ = killpg(pgid, Signal::SIGTERM);
-    }
-    signal_tracked(&tracked, Signal::SIGTERM, own_pid);
-
+    // Poll only the already-tracked PIDs (plus killpg(0) when isolated) off the async executor.
     let grace_deadline = Instant::now() + grace;
     loop {
-        if root_not_recycled(identity) {
-            collect_tree_into(identity, target_pgid, own_pid, &mut tracked);
-        }
-        if tree_is_gone(identity, target_pgid, &tracked) {
+        let tracked_snapshot: Vec<ProcessId> = tracked.values().copied().collect();
+        let gone = tokio::task::spawn_blocking(move || {
+            tracked_is_gone(&identity, target_pgid, &tracked_snapshot)
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_tree poll task failed: {err}"),
+        })?;
+        if gone {
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
@@ -168,18 +240,34 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 
-    // Phase 2: escalate any survivors to SIGKILL.
-    if root_not_recycled(identity) {
-        collect_tree_into(identity, target_pgid, own_pid, &mut tracked);
-        if let Some(pgid) = target_pgid {
-            let _ = killpg(pgid, Signal::SIGKILL);
+    // Phase 2: one last descendant discovery pass to catch any child spawned during grace, then
+    // escalate all survivors to SIGKILL.
+    tracked = tokio::task::spawn_blocking(move || {
+        if root_not_recycled(&identity) {
+            collect_tree_into(&identity, target_pgid, own_pid, &mut tracked);
+            if let Some(pgid) = target_pgid {
+                let _ = killpg(pgid, Signal::SIGKILL);
+            }
         }
-    }
-    signal_tracked(&tracked, Signal::SIGKILL, own_pid);
+        signal_tracked(&tracked, Signal::SIGKILL, own_pid);
+        tracked
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_tree SIGKILL task failed: {err}"),
+    })?;
 
     let settle_deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
-        if tree_is_gone(identity, target_pgid, &tracked) {
+        let tracked_snapshot: Vec<ProcessId> = tracked.values().copied().collect();
+        let gone = tokio::task::spawn_blocking(move || {
+            tracked_is_gone(&identity, target_pgid, &tracked_snapshot)
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_tree settle task failed: {err}"),
+        })?;
+        if gone {
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
@@ -193,8 +281,17 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 
-    let mut survivors: Vec<ProcessId> = tracked.values().copied().filter(is_alive).collect();
-    survivors.sort_by_key(|id| id.pid);
+    let tracked_snapshot: Vec<ProcessId> = tracked.values().copied().collect();
+    let survivors = tokio::task::spawn_blocking(move || {
+        let mut left: Vec<ProcessId> = tracked_snapshot.into_iter().filter(is_alive).collect();
+        left.sort_by_key(|id| id.pid);
+        left
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_tree survivor check failed: {err}"),
+    })?;
+
     Ok(KillTreeReport {
         all_gone: survivors.is_empty(),
         survivors,
@@ -210,12 +307,8 @@ fn root_not_recycled(identity: &ProcessId) -> bool {
     }
 }
 
-fn tree_is_gone(
-    identity: &ProcessId,
-    target_pgid: Option<Pid>,
-    tracked: &HashMap<u32, ProcessId>,
-) -> bool {
-    if tracked.values().any(is_alive) {
+fn tracked_is_gone(identity: &ProcessId, target_pgid: Option<Pid>, tracked: &[ProcessId]) -> bool {
+    if tracked.iter().any(is_alive) {
         return false;
     }
     if let Some(pgid) = target_pgid

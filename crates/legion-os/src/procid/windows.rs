@@ -1,104 +1,101 @@
-//! Windows process identity, boot identity, and process-tree termination.
+//! Windows process identity, boot identity, and handle-pinned process-tree termination.
+//!
+//! Termination opens each process with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`,
+//! verifies its exact 100-ns `FILETIME` creation time while the held handle pins the PID against
+//! reuse, and calls `TerminateProcess` through that handle—eliminating bare-PID TOCTOU races.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::windows::process::CommandExt;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
+use crate::win_proc::{self, TerminateOutcome};
 use crate::{OsError, Result};
 
 use super::{KillTreeReport, ProcessId, is_alive};
 
-const TASKKILL_TIMEOUT: Duration = Duration::from_secs(15);
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BOOT_ID_TIMEOUT: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(super) fn of_pid(pid: u32, _include_zombie: bool) -> Result<Option<ProcessId>> {
-    let mut system = System::new().map_err(|err| OsError::Platform {
-        detail: format!("failed to initialize system process view: {err}"),
-    })?;
-    let sys_pid = sysinfo::Pid::from_u32(pid);
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[sys_pid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    let Some(proc_info) = system.process(sys_pid) else {
-        return Ok(None);
-    };
-    let start_time = proc_info.start_time();
-    if start_time == 0 {
-        return Err(OsError::PermissionDenied {
-            detail: format!("cannot query creation time for process {pid}"),
-            source: None,
-        });
-    }
-    Ok(Some(ProcessId::new(pid, start_time)))
+pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
+    win_proc::query_process_identity(pid, include_zombie)
 }
 
 pub(super) fn boot_id() -> Result<String> {
-    // Query Win32_OperatingSystem.LastBootUpTime via Windows PowerShell with PSModulePath
-    // cleared so a PowerShell 7 parent environment cannot break CimCmdlets. Unlike subtracting
-    // GetTickCount64() from wall-clock time, LastBootUpTime stays invariant across invocations.
-    if let Ok(output) = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks",
-        ])
-        .env_remove("PSModulePath")
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .output()
-        && output.status.success()
+    // Always use one single source and format (`boot-ticks-<ticks>` from Win32_OperatingSystem
+    // LastBootUpTime) with a hard timeout so a stalled WMI service cannot hang a caller and two
+    // incompatible boot-id formats are never mixed. Callers compare with `procid::same_boot`.
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().Ticks",
+    ])
+    .env_remove("PSModulePath")
+    .creation_flags(CREATE_NO_WINDOW.0);
+
+    let stdout = super::run_command_stdout_with_timeout(cmd, BOOT_ID_TIMEOUT, "powershell.exe")?;
+    let ticks = stdout.trim();
+    if !ticks.is_empty()
+        && ticks.bytes().all(|b| b.is_ascii_digit())
+        && ticks.parse::<u64>().is_ok()
     {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let ticks = stdout.trim();
-        if !ticks.is_empty() && ticks.bytes().all(|b| b.is_ascii_digit()) {
-            return Ok(format!("boot-{ticks}"));
-        }
+        return Ok(format!("boot-ticks-{ticks}"));
     }
 
-    let secs = System::boot_time().map_err(|err| OsError::Platform {
-        detail: format!("failed to read Windows boot time: {err}"),
-    })?;
-    Ok(format!("boot-{secs}"))
+    Err(OsError::Platform {
+        detail: format!("unexpected Windows LastBootUpTime output: {ticks:?}"),
+    })
 }
 
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
-    if !is_alive(identity) {
+    let identity = *identity;
+    let own_pid = std::process::id();
+
+    let tracked_list: Vec<ProcessId> =
+        tokio::task::spawn_blocking(move || -> Result<Vec<ProcessId>> {
+            if !is_alive(&identity) {
+                return Ok(Vec::new());
+            }
+
+            let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
+            tracked.insert(identity.pid, identity);
+            collect_descendants_into(&identity, own_pid, &mut tracked)?;
+            terminate_tracked(&tracked, own_pid)?;
+
+            // Take one more snapshot right after the first wave in case a process spawned a late child
+            // just before TerminateProcess landed.
+            if collect_descendants_into(&identity, own_pid, &mut tracked).is_ok() {
+                terminate_tracked(&tracked, own_pid)?;
+            }
+
+            Ok(tracked.into_values().collect())
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_tree worker task failed: {err}"),
+        })??;
+
+    if tracked_list.is_empty() {
         return Ok(KillTreeReport {
             all_gone: true,
             survivors: Vec::new(),
         });
     }
 
-    let own_pid = std::process::id();
-    let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
-    tracked.insert(identity.pid, *identity);
-    collect_descendants_into(identity, own_pid, &mut tracked);
-
-    run_taskkill(identity.pid).await?;
-
-    // Also terminate any discovered descendants that survived (for example if an intermediate
-    // child exited earlier and broke the parent chain that taskkill /T traverses).
-    for proc_id in tracked.values() {
-        if proc_id.pid == identity.pid || proc_id.pid == own_pid {
-            continue;
-        }
-        if is_alive(proc_id) {
-            let _ = run_taskkill(proc_id.pid).await;
-        }
-    }
-
     let settle = SETTLE_TIMEOUT.max(grace.min(Duration::from_secs(5)));
     let deadline = Instant::now() + settle;
     loop {
-        if !tracked.values().any(is_alive) {
+        let probe_list = tracked_list.clone();
+        let any_alive = tokio::task::spawn_blocking(move || probe_list.iter().any(is_alive))
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("kill_tree poll task failed: {err}"),
+            })?;
+        if !any_alive {
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
@@ -112,80 +109,76 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 
-    let mut survivors: Vec<ProcessId> = tracked.values().copied().filter(is_alive).collect();
-    survivors.sort_by_key(|id| id.pid);
+    let survivors = tokio::task::spawn_blocking(move || {
+        let mut left: Vec<ProcessId> = tracked_list.into_iter().filter(is_alive).collect();
+        left.sort_by_key(|id| id.pid);
+        left
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_tree survivor check failed: {err}"),
+    })?;
+
     Ok(KillTreeReport {
         all_gone: survivors.is_empty(),
         survivors,
     })
 }
 
-async fn run_taskkill(pid: u32) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("taskkill.exe");
-    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| OsError::from_spawn_io("taskkill.exe", err))?;
-
-    match tokio::time::timeout(TASKKILL_TIMEOUT, child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(OsError::from_io("failed waiting for taskkill.exe", err)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Err(OsError::TimedOut {
-                detail: format!("taskkill.exe did not finish stopping pid {pid} in time"),
-            })
-        }
-    }
-}
-
-fn collect_descendants_into(root: &ProcessId, own_pid: u32, tracked: &mut HashMap<u32, ProcessId>) {
-    let Ok(mut system) = System::new() else {
-        return;
-    };
-    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-
-    let mut children_by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
-    for (sys_pid, proc_info) in system.processes() {
-        let pid = sys_pid.as_u32();
-        let started = proc_info.start_time();
-        if started == 0 {
+fn terminate_tracked(tracked: &HashMap<u32, ProcessId>, own_pid: u32) -> Result<()> {
+    for proc_id in tracked.values() {
+        if proc_id.pid == own_pid {
             continue;
         }
-        if let Some(parent) = proc_info.parent() {
-            children_by_parent
-                .entry(parent.as_u32())
-                .or_default()
-                .push((pid, started));
+        match win_proc::open_verify_terminate(proc_id)? {
+            TerminateOutcome::Terminated
+            | TerminateOutcome::AlreadyGone
+            | TerminateOutcome::IdentityMismatch
+            | TerminateOutcome::AccessDenied => {}
         }
+    }
+    Ok(())
+}
+
+fn collect_descendants_into(
+    root: &ProcessId,
+    own_pid: u32,
+    tracked: &mut HashMap<u32, ProcessId>,
+) -> Result<()> {
+    let entries = win_proc::snapshot_processes()?;
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries {
+        if entry.pid == 0 || entry.parent_pid == 0 || entry.pid == entry.parent_pid {
+            continue;
+        }
+        children_by_parent
+            .entry(entry.parent_pid)
+            .or_default()
+            .push(entry.pid);
     }
 
     let mut visited: HashSet<u32> = HashSet::new();
-    let mut queue: VecDeque<(u32, u64)> = VecDeque::new();
+    let mut queue: VecDeque<ProcessId> = VecDeque::new();
     visited.insert(root.pid);
-    queue.push_back((root.pid, root.start_time));
+    queue.push_back(*root);
 
-    while let Some((parent_pid, parent_start)) = queue.pop_front() {
-        if let Some(children) = children_by_parent.get(&parent_pid) {
-            for &(child_pid, child_start) in children {
+    while let Some(parent) = queue.pop_front() {
+        if let Some(children) = children_by_parent.get(&parent.pid) {
+            for &child_pid in children {
                 if child_pid == own_pid || !visited.insert(child_pid) {
                     continue;
                 }
-                // Reject a process that started earlier than its nominal parent (PID reuse).
-                if child_start.saturating_add(1) < parent_start {
+                let Ok(Some(child_id)) = win_proc::query_process_identity(child_pid, false) else {
+                    continue;
+                };
+                // Full 100-ns FILETIME precision: a real child cannot be created before its parent.
+                if child_id.start_time < parent.start_time {
                     continue;
                 }
-                tracked
-                    .entry(child_pid)
-                    .or_insert_with(|| ProcessId::new(child_pid, child_start));
-                queue.push_back((child_pid, child_start));
+                tracked.entry(child_pid).or_insert(child_id);
+                queue.push_back(child_id);
             }
         }
     }
+    Ok(())
 }

@@ -6,10 +6,22 @@
 //! identifies the current boot so records from before a reboot can be discarded immediately.
 
 use std::fmt;
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{OsError, Result};
+
+/// Tolerance applied by [`same_boot`] when comparing time-derived boot IDs (such as Windows
+/// `LastBootUpTime`, which can shift by a few seconds when NTP adjusts the system clock).
+const SAME_BOOT_TOLERANCE_SECS: u64 = 5;
+const TICKS_PER_SEC: u64 = 10_000_000;
+const SAME_BOOT_TOLERANCE_TICKS: u64 = SAME_BOOT_TOLERANCE_SECS * TICKS_PER_SEC;
+const BOOT_TICKS_PREFIX: &str = "boot-ticks-";
+const BOOT_SEC_PREFIX: &str = "boot-sec-";
 
 #[cfg(unix)]
 #[path = "procid/unix.rs"]
@@ -24,16 +36,21 @@ static CACHED_BOOT_ID: OnceLock<String> = OnceLock::new();
 /// Unambiguous identity of a process within a single system boot.
 ///
 /// Comparing two [`ProcessId`] values checks both `pid` and `start_time` so a recycled PID
-/// never masquerades as an earlier process.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+/// never masquerades as an earlier process. The serialized representation (`{ pid, start_time }`)
+/// is stable across releases for persistence in job records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ProcessId {
     /// Operating system process identifier.
     pub pid: u32,
-    /// Kernel start timestamp for the process.
+    /// Full-precision kernel start timestamp for the process.
     ///
-    /// On Linux this is the monotonic tick count since boot from `/proc/<pid>/stat` field 22,
-    /// which is unaffected by wall-clock jumps. On macOS and Windows it is the process creation
-    /// timestamp in seconds since the Unix epoch.
+    /// Units per platform (never compared across machines or operating systems):
+    /// - **Linux:** clock ticks (jiffies) since boot from `/proc/<pid>/stat` field 22, immune to
+    ///   wall-clock adjustments.
+    /// - **macOS:** microseconds since the Unix epoch from `proc_bsdinfo`
+    ///   (`pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`).
+    /// - **Windows:** 100-nanosecond `FILETIME` ticks since 1601-01-01 UTC from
+    ///   `GetProcessTimes` (`CreationTime`).
     pub start_time: u64,
 }
 
@@ -106,9 +123,11 @@ pub fn is_alive(identity: &ProcessId) -> bool {
 
 /// Return an identifier string that stays constant for the current boot and changes on every reboot.
 ///
-/// - Linux: `/proc/sys/kernel/random/boot_id`
-/// - macOS: `kern.boottime` (`sec` and `usec`)
-/// - Windows: `Win32_OperatingSystem.LastBootUpTime` UTC ticks
+/// - **Linux:** `/proc/sys/kernel/random/boot_id` (kernel UUID, unaffected by clock steps).
+/// - **macOS:** `sysctl -n kern.bootsessionuuid` (kernel UUID, unaffected by clock steps).
+/// - **Windows:** `boot-ticks-<ticks>` from `Win32_OperatingSystem.LastBootUpTime` UTC ticks
+///   (single source and format; compare with [`same_boot`] so minor NTP clock steps do not look
+///   like a reboot).
 pub fn boot_id() -> Result<String> {
     if let Some(cached) = CACHED_BOOT_ID.get() {
         return Ok(cached.clone());
@@ -118,13 +137,53 @@ pub fn boot_id() -> Result<String> {
     Ok(id)
 }
 
+/// Compare two boot identifiers returned by [`boot_id`].
+///
+/// UUID-based boot IDs (Linux `boot_id` and macOS `kern.bootsessionuuid`) require exact equality.
+/// Time-derived boot IDs (`boot-ticks-<ticks>` on Windows and `boot-sec-<secs>` on fallback Unix
+/// platforms) allow up to 5 seconds of clock-step tolerance so routine NTP adjustments do not
+/// falsely indicate a reboot.
+pub fn same_boot(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    if let (Some(ta), Some(tb)) = (
+        parse_prefixed_u64(a, BOOT_TICKS_PREFIX),
+        parse_prefixed_u64(b, BOOT_TICKS_PREFIX),
+    ) {
+        return ta.abs_diff(tb) <= SAME_BOOT_TOLERANCE_TICKS;
+    }
+    if let (Some(sa), Some(sb)) = (
+        parse_prefixed_u64(a, BOOT_SEC_PREFIX),
+        parse_prefixed_u64(b, BOOT_SEC_PREFIX),
+    ) {
+        return sa.abs_diff(sb) <= SAME_BOOT_TOLERANCE_SECS;
+    }
+    false
+}
+
+fn parse_prefixed_u64(value: &str, prefix: &str) -> Option<u64> {
+    let rest = value.strip_prefix(prefix)?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<u64>().ok()
+}
+
 /// Stop a process and all of its descendants when the root is not a direct child of this process.
 ///
 /// On Unix, signals both the target's process group (when the target leads its own group distinct
 /// from ours) and every discovered descendant with `SIGTERM`, waits up to `grace`, and escalates
-/// any survivors to `SIGKILL`. On Windows, runs `taskkill /T /F` against the root and any
-/// orphaned descendants discovered in the process table. Returns only after every tracked process
-/// has exited or the post-kill settle period elapses, reporting any survivors.
+/// any survivors to `SIGKILL`. On Windows, opens each target and descendant handle with
+/// `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verifies its exact 100-ns `FILETIME`
+/// creation time while the held handle pins the PID, and calls `TerminateProcess` through that
+/// handle. Returns only once every tracked process has exited or the post-kill settle period
+/// elapses, reporting any survivors.
 pub async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     if identity.pid == 0 {
         return Err(OsError::InvalidArgument {
@@ -191,29 +250,70 @@ pub(crate) fn parse_linux_proc_stat(contents: &str) -> Option<(char, u64)> {
     Some((state, start_ticks))
 }
 
-/// Parse `sec` and `usec` from macOS `sysctl -n kern.boottime` output, e.g.
-/// `{ sec = 1700000000, usec = 123456 } ...`.
+/// Run a short helper command synchronously with a hard timeout and return its stdout.
+///
+/// Used by macOS and Windows `boot_id` lookups so a stalled WMI/sysctl call cannot block a caller
+/// indefinitely.
 #[allow(dead_code)]
-pub(crate) fn parse_macos_boottime(output: &str) -> Option<String> {
-    let sec = extract_sysctl_u64(output, "sec")?;
-    let usec = extract_sysctl_u64(output, "usec")?;
-    Some(format!("boot-{sec}-{usec}"))
-}
+pub(crate) fn run_command_stdout_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
-#[allow(dead_code)]
-fn extract_sysctl_u64(text: &str, key: &str) -> Option<u64> {
-    let idx = text.find(key)?;
-    let after_key = text.get(idx + key.len()..)?;
-    let eq = after_key.find('=')?;
-    let digits_start = after_key.get(eq + 1..)?.trim_start();
-    let digits: String = digits_start
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
-        return None;
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| OsError::from_spawn_io(label, err))?;
+
+    let stdout_pipe = child.stdout.take();
+    let reader = std::thread::spawn(move || -> String {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(OsError::TimedOut {
+                        detail: format!(
+                            "`{label}` did not respond within {} ms",
+                            timeout.as_millis()
+                        ),
+                    });
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(Duration::from_millis(20).min(remaining));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(OsError::from_io(
+                    format!("failed waiting for `{label}`"),
+                    err,
+                ));
+            }
+        }
+    };
+
+    let stdout = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(OsError::Platform {
+            detail: format!("`{label}` exited with status {status}"),
+        });
     }
-    digits.parse::<u64>().ok()
+    Ok(stdout)
 }
 
 #[cfg(test)]
@@ -232,6 +332,15 @@ mod tests {
         assert!(!original.matches(&recycled));
         assert_ne!(original, recycled);
         assert!(!original.matches(&different_pid));
+    }
+
+    #[test]
+    fn process_id_serializes_with_stable_schema() {
+        let id = ProcessId::new(1234, 133_700_000_000_000_001);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, r#"{"pid":1234,"start_time":133700000000000001}"#);
+        let decoded: ProcessId = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, id);
     }
 
     #[test]
@@ -269,13 +378,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_macos_boottime_extracts_sec_and_usec() {
-        let sample = "{ sec = 1730000123, usec = 456789 } Sun Oct 27 00:02:03 2024\n";
-        assert_eq!(
-            parse_macos_boottime(sample),
-            Some("boot-1730000123-456789".to_owned())
-        );
-        assert_eq!(parse_macos_boottime("not a boottime"), None);
+    fn same_boot_handles_uuids_and_tolerant_time_derived_ids() {
+        // UUID boot IDs (Linux boot_id and macOS kern.bootsessionuuid) require exact match.
+        let uuid_a = "550e8400-e29b-41d4-a716-446655440000";
+        let uuid_b = "550e8400-e29b-41d4-a716-446655440001";
+        assert!(same_boot(uuid_a, uuid_a));
+        assert!(!same_boot(uuid_a, uuid_b));
+
+        // Windows LastBootUpTime ticks allow up to 5 seconds of clock-step drift.
+        let base_ticks: u64 = 638_600_000_000_000_000;
+        let a = format!("boot-ticks-{base_ticks}");
+        let drift_3s = format!("boot-ticks-{}", base_ticks + 3 * TICKS_PER_SEC);
+        let drift_5s = format!("boot-ticks-{}", base_ticks + 5 * TICKS_PER_SEC);
+        let drift_over = format!("boot-ticks-{}", base_ticks + 5 * TICKS_PER_SEC + 1);
+        assert!(same_boot(&a, &a));
+        assert!(same_boot(&a, &drift_3s));
+        assert!(same_boot(&drift_3s, &a));
+        assert!(same_boot(&a, &drift_5s));
+        assert!(!same_boot(&a, &drift_over));
+
+        // Fallback Unix second-based IDs allow up to 5 seconds of drift.
+        assert!(same_boot("boot-sec-1700000000", "boot-sec-1700000005"));
+        assert!(!same_boot("boot-sec-1700000000", "boot-sec-1700000006"));
+
+        // Empty, malformed, and cross-format comparisons never match.
+        assert!(!same_boot("", ""));
+        assert!(!same_boot(&a, uuid_a));
+        assert!(!same_boot(&a, "boot-sec-1700000000"));
+        assert!(!same_boot("boot-ticks-abc", "boot-ticks-abc-2"));
     }
 
     #[tokio::test]
