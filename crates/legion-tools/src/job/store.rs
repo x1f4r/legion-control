@@ -65,7 +65,7 @@ pub(super) const RETENTION_MAX_FINISHED: usize = 200;
 pub(super) const RETENTION_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// Window during which a brand-new record with no lock yet counts as `starting` rather than
 /// `interrupted`, covering the brief handoff while `job.start` spawns the supervisor.
-const STARTING_GRACE_MS: i64 = 15_000;
+const STARTING_GRACE_MS: i64 = 25_000;
 /// Maximum characters kept in `job.list`'s command summary.
 const COMMAND_SUMMARY_CHARS: usize = 200;
 /// Maximum characters for a derived default job name.

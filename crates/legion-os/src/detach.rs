@@ -444,6 +444,39 @@ pub(crate) fn cgroup_matches_unit(contents: &str, full_unit: &str) -> bool {
 #[allow(dead_code)]
 pub(crate) const LINGER_DISABLED_WARNING: &str = "systemd user lingering is disabled for this account, so the process was detached with setsid instead of a systemd user scope and may be stopped on logout; run `loginctl enable-linger` to keep user scopes alive across sessions";
 
+/// Warning recorded on [`DetachHandle::warnings`] when Windows `CREATE_BREAKAWAY_FROM_JOB` was
+/// refused and WMI `Win32_Process.Create` was unavailable, so the process started inside the
+/// caller's Job Object without breaking away.
+#[allow(dead_code)]
+pub(crate) const WMI_FALLBACK_WARNING: &str = "Windows Job Object breakaway was refused and WMI Win32_Process.Create was unavailable, so the process started inside the caller's Job Object and may stop if the parent session ends; ensure the Windows Management Instrumentation (Winmgmt) service is running";
+
+/// Resolve the full path to Windows PowerShell 5.1 under `SystemRoot` when available, falling back
+/// to `"powershell.exe"` on `PATH`.
+#[allow(dead_code)]
+pub(crate) fn resolve_windows_powershell_exe(system_root: Option<&str>) -> String {
+    match system_root.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(root) => format!(
+            r"{}\System32\WindowsPowerShell\v1.0\powershell.exe",
+            root.trim_end_matches(['\\', '/'])
+        ),
+        None => "powershell.exe".to_owned(),
+    }
+}
+
+/// Describe a non-zero `Win32_Process.Create` `ReturnValue` and report whether it is safe to treat
+/// as a transient failure for bounded retry.
+#[allow(dead_code)]
+pub(crate) fn classify_wmi_return_value(code: u32) -> (&'static str, bool) {
+    match code {
+        2 => ("access denied", false),
+        3 => ("insufficient privilege", false),
+        8 => ("unknown failure", true),
+        9 => ("path not found", false),
+        21 => ("invalid parameter", false),
+        _ => ("unrecognized error", false),
+    }
+}
+
 /// Return `true` when `linger_dir/<username>` exists as a file.
 #[allow(dead_code)]
 pub(crate) fn linger_file_exists(linger_dir: &Path, username: &str) -> bool {
@@ -1583,6 +1616,15 @@ mod tests {
 
         assert!(LINGER_DISABLED_WARNING.contains("loginctl enable-linger"));
         assert!(LINGER_DISABLED_WARNING.contains("setsid"));
+        assert!(WMI_FALLBACK_WARNING.contains("Winmgmt"));
+        assert_eq!(
+            resolve_windows_powershell_exe(Some(r"C:\Windows\")),
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+        assert_eq!(resolve_windows_powershell_exe(None), "powershell.exe");
+        assert_eq!(classify_wmi_return_value(8), ("unknown failure", true));
+        assert_eq!(classify_wmi_return_value(2), ("access denied", false));
+        assert_eq!(classify_wmi_return_value(9), ("path not found", false));
     }
 
     #[tokio::test]

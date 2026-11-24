@@ -12,13 +12,14 @@
 //!
 //! Fallback path: when the caller runs inside a Job Object that forbids breakaway (OpenSSH's
 //! `sshd` session job does), `CreateProcessW` returns `ERROR_ACCESS_DENIED`. In that case we
-//! launch through WMI (`Win32_Process.Create` via `Invoke-CimMethod`), which asks the out-of-process
-//! WMI provider host (`wmiprvse.exe`) in its own service session to spawn the launcher. Because
-//! WMI creates the process from `wmiprvse.exe` rather than from our process, the detached target
-//! inherits **zero** handles from the caller process (its only open standard handles are the
-//! redirected pipes connected to the launcher's freshly opened append `FileStream`s), and
-//! `LEGION_DETACH_ID=<marker>` in its environment provides orphan proof after root exit.
+//! invoke WMI `Win32_Process.Create` directly via COM (`IWbemLocator` -> `ROOT\CIMV2`) so the
+//! out-of-process WMI provider host (`wmiprvse.exe`) in its own service session spawns the
+//! launcher without paying for an outer PowerShell 5.1 + `CimCmdlets` startup. Transient errors
+//! that provably did not start a process are retried with bounded backoff, falling back to
+//! `Invoke-CimMethod` and finally to a non-breakaway direct launch (with a warning) only when WMI
+//! provably never started anything, so the same process is never launched twice.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,21 +32,24 @@ use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use crate::atomic::{WriteOptions, write_atomic};
 use crate::procid::{self, KillTreeReport, ProcessId};
 use crate::shell::{ResolvedCommand, encode_utf16le_base64, windows_cmdline_escape};
-use crate::win_proc::{self, DirectSpawnError};
+use crate::win_proc::{self, DirectSpawnError, WmiCreateError};
 use crate::{OsError, Result};
 
 use super::{
-    DETACH_MARKER_ENV, DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE,
+    DETACH_MARKER_ENV, DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE, WMI_FALLBACK_WARNING,
     build_windows_direct_launch, build_wmi_create_script_for_cmdline, build_wmi_launcher_script,
     generate_detach_marker, merge_recheck_survivors, merge_windows_env, parse_wmi_handoff,
-    reconcile_wmi_identity, resolve_windows_job_name, resolve_wmi_program,
-    validate_wmi_batch_target,
+    reconcile_wmi_identity, resolve_windows_job_name, resolve_windows_powershell_exe,
+    resolve_wmi_program, validate_wmi_batch_target,
 };
 
-const WMI_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+const WMI_CREATE_TIMEOUT: Duration = Duration::from_secs(45);
+const WMI_HANDOFF_TIMEOUT: Duration = Duration::from_secs(45);
+const WMI_MAX_ATTEMPTS: usize = 3;
+const WMI_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(750)];
 const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const JOB_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const JOB_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 static WMI_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -139,9 +143,35 @@ pub(super) async fn spawn_detached(
                 warnings: Vec::new(),
             })
         }
-        Err(DirectSpawnError::BreakawayRefused) => spawn_via_wmi(resolved, options, marker).await,
+        Err(DirectSpawnError::BreakawayRefused) => {
+            let direct_fallback = DirectFallbackLaunch {
+                program_display: &program_display,
+                application_name: application_name.as_deref(),
+                command_line: &command_line,
+                env_remove: &combined_env_remove_os,
+                env_overrides: &direct_env_overrides,
+                job_name: &job_name,
+            };
+            spawn_via_wmi(
+                resolved,
+                options,
+                marker,
+                system_root.as_deref(),
+                &direct_fallback,
+            )
+            .await
+        }
         Err(DirectSpawnError::Other(err)) => Err(err),
     }
+}
+
+struct DirectFallbackLaunch<'a> {
+    program_display: &'a str,
+    application_name: Option<&'a str>,
+    command_line: &'a str,
+    env_remove: &'a [OsString],
+    env_overrides: &'a BTreeMap<OsString, OsString>,
+    job_name: &'a str,
 }
 
 pub(super) async fn detached_active(handle: &DetachHandle) -> Result<bool> {
@@ -302,6 +332,8 @@ async fn spawn_via_wmi(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
     marker: String,
+    system_root: Option<&str>,
+    direct_fallback: &DirectFallbackLaunch<'_>,
 ) -> Result<DetachHandle> {
     let base_cwd = match options.cwd {
         Some(ref dir) => absolutize(dir)?,
@@ -362,6 +394,9 @@ async fn spawn_via_wmi(
     let program_str = resolve_wmi_program(&raw_program, &base_cwd, &merged_env);
     validate_wmi_batch_target(&program_str, &args_vec)?;
 
+    let powershell_exe = resolve_windows_powershell_exe(system_root);
+    let powershell_escaped = windows_cmdline_escape(&powershell_exe);
+
     let launcher_script = build_wmi_launcher_script(
         &program_str,
         &args_vec,
@@ -376,7 +411,7 @@ async fn spawn_via_wmi(
 
     let encoded = encode_utf16le_base64(&launcher_script);
     let encoded_cmdline = format!(
-        "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
+        "{powershell_escaped} -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
     );
 
     // Prefer -EncodedCommand when it fits within Win32_Process.Create's 32 KB command-line cap.
@@ -403,60 +438,52 @@ async fn spawn_via_wmi(
         bom_bytes.extend_from_slice(file_script.as_bytes());
         write_atomic(&script_fallback_path, &bom_bytes, WriteOptions::default())?;
         format!(
-            "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File {}",
+            "{powershell_escaped} -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File {}",
             windows_cmdline_escape(&script_str)
         )
     };
 
-    let cim_script = build_wmi_create_script_for_cmdline(&command_line, Some(&cwd_str))?;
-
-    // Invoke Windows PowerShell with PSModulePath cleared so a PowerShell 7 parent environment
-    // cannot break CimCmdlets / Invoke-CimMethod.
-    let mut cim = tokio::process::Command::new("powershell.exe");
-    cim.args(["-NoProfile", "-NonInteractive", "-Command", &cim_script])
-        .env_remove("PSModulePath")
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let output = tokio::time::timeout(WMI_LAUNCH_TIMEOUT, cim.output())
-        .await
-        .map_err(|_| OsError::TimedOut {
-            detail: "WMI Win32_Process.Create did not respond before its deadline".into(),
-        })?
-        .map_err(|err| OsError::from_spawn_io("powershell.exe", err))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(OsError::Platform {
-            detail: if stderr.is_empty() {
-                format!(
-                    "WMI detached launch failed with exit status {}",
-                    output.status
-                )
-            } else {
-                format!("WMI detached launch failed: {stderr}")
-            },
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let wrapper_pid = stdout
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|&pid| pid > 0)
-        .ok_or_else(|| OsError::Platform {
-            detail: format!(
-                "WMI detached launch did not return a valid wrapper PID: {:?}",
-                stdout.trim()
-            ),
-        })?;
-
-    // Wait for the launcher to start the real target process and write its PID + creation time.
-    let reported = wait_for_handoff(&handoff_path, wrapper_pid, WMI_LAUNCH_TIMEOUT).await?;
+    let reported = match create_wmi_wrapper_with_retry(
+        &command_line,
+        &cwd_str,
+        &handoff_path,
+        &powershell_exe,
+    )
+    .await?
+    {
+        WmiCreateOutcome::Started(wrapper_pid) => {
+            wait_for_handoff(&handoff_path, Some(wrapper_pid), WMI_HANDOFF_TIMEOUT).await?
+        }
+        WmiCreateOutcome::HandoffReady => {
+            wait_for_handoff(&handoff_path, None, Duration::from_secs(5)).await?
+        }
+        WmiCreateOutcome::Unavailable(wmi_reason) => {
+            let (process, windows_job) = win_proc::spawn_detached_in_current_job(
+                direct_fallback.program_display,
+                direct_fallback.application_name,
+                direct_fallback.command_line,
+                options.cwd.as_deref(),
+                direct_fallback.env_remove,
+                direct_fallback.env_overrides,
+                options.stdout_path.as_deref(),
+                options.stderr_path.as_deref(),
+                Some(direct_fallback.job_name),
+            )
+            .map_err(|direct_err| OsError::Platform {
+                detail: format!(
+                    "WMI detached launch unavailable ({wmi_reason}) and direct fallback failed ({direct_err}); ensure the Windows Management Instrumentation (Winmgmt) service is running and check permissions"
+                ),
+            })?;
+            resolved.disarm_temp_script();
+            return Ok(DetachHandle {
+                process,
+                systemd_unit: None,
+                windows_job,
+                marker: Some(marker),
+                warnings: vec![format!("{WMI_FALLBACK_WARNING} ({wmi_reason})")],
+            });
+        }
+    };
     resolved.disarm_temp_script();
 
     // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID, accepting the
@@ -476,9 +503,158 @@ async fn spawn_via_wmi(
     })
 }
 
+enum WmiCreateOutcome {
+    Started(u32),
+    HandoffReady,
+    Unavailable(String),
+}
+
+fn handoff_file_ready(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|contents| !contents.trim().is_empty())
+}
+
+async fn run_native_wmi_create_once(
+    command_line: String,
+    cwd: String,
+) -> std::result::Result<std::result::Result<u32, WmiCreateError>, OsError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("legion-wmi-create".to_owned())
+        .spawn(move || {
+            let res = win_proc::wmi_create_process(&command_line, Some(&cwd));
+            let _ = tx.send(res);
+        })
+        .map_err(|err| OsError::from_io("cannot spawn WMI worker thread", err))?;
+
+    match tokio::time::timeout(WMI_CREATE_TIMEOUT, rx).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Ok(Err(WmiCreateError::MaybeStarted {
+            detail: "WMI worker thread exited before returning a result".into(),
+        })),
+        Err(_) => Err(OsError::TimedOut {
+            detail: format!(
+                "WMI Win32_Process.Create did not respond within {}s; check system load and the Windows Management Instrumentation (Winmgmt) service, and inspect `job.status` before retrying",
+                WMI_CREATE_TIMEOUT.as_secs()
+            ),
+        }),
+    }
+}
+
+async fn create_wmi_wrapper_with_retry(
+    command_line: &str,
+    cwd: &str,
+    handoff_path: &Path,
+    powershell_exe: &str,
+) -> Result<WmiCreateOutcome> {
+    let mut last_com_err = String::new();
+    for attempt in 0..WMI_MAX_ATTEMPTS {
+        if attempt > 0 && handoff_file_ready(handoff_path) {
+            return Ok(WmiCreateOutcome::HandoffReady);
+        }
+
+        match run_native_wmi_create_once(command_line.to_owned(), cwd.to_owned()).await {
+            Ok(Ok(wrapper_pid)) => return Ok(WmiCreateOutcome::Started(wrapper_pid)),
+            Ok(Err(WmiCreateError::NotStarted { transient, detail })) => {
+                last_com_err = detail;
+                if transient && attempt + 1 < WMI_MAX_ATTEMPTS {
+                    let backoff = WMI_RETRY_BACKOFFS
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or(Duration::from_millis(750));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                break;
+            }
+            Ok(Err(WmiCreateError::MaybeStarted { detail })) => {
+                if handoff_file_ready(handoff_path) {
+                    return Ok(WmiCreateOutcome::HandoffReady);
+                }
+                return Err(OsError::Platform {
+                    detail: format!(
+                        "{detail}; verify whether the process started (for example via `job.status`) and ensure the Windows Management Instrumentation (Winmgmt) service is running before retrying"
+                    ),
+                });
+            }
+            Err(timeout_err) => {
+                if handoff_file_ready(handoff_path) {
+                    return Ok(WmiCreateOutcome::HandoffReady);
+                }
+                return Err(timeout_err);
+            }
+        }
+    }
+
+    // Native COM WMI provably did not start a process. Try `Invoke-CimMethod` once in case COM
+    // process security was initialized incompatibly by the host process, unless the handoff file
+    // already appeared.
+    if handoff_file_ready(handoff_path) {
+        return Ok(WmiCreateOutcome::HandoffReady);
+    }
+
+    let cim_script = build_wmi_create_script_for_cmdline(command_line, Some(cwd))?;
+    let mut cim = tokio::process::Command::new(powershell_exe);
+    cim.args(["-NoProfile", "-NonInteractive", "-Command", &cim_script])
+        .env_remove("PSModulePath")
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(WMI_CREATE_TIMEOUT, cim.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(err)) => {
+            return Ok(WmiCreateOutcome::Unavailable(format!(
+                "COM WMI failed ({last_com_err}); PowerShell CIM spawn failed ({err})"
+            )));
+        }
+        Err(_) => {
+            if handoff_file_ready(handoff_path) {
+                return Ok(WmiCreateOutcome::HandoffReady);
+            }
+            return Err(OsError::TimedOut {
+                detail: format!(
+                    "WMI Win32_Process.Create via PowerShell did not respond within {}s (after COM WMI error: {last_com_err}); check system load and the Windows Management Instrumentation (Winmgmt) service, and inspect `job.status` before retrying",
+                    WMI_CREATE_TIMEOUT.as_secs()
+                ),
+            });
+        }
+    };
+
+    if !output.status.success() {
+        if handoff_file_ready(handoff_path) {
+            return Ok(WmiCreateOutcome::HandoffReady);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let cim_detail = if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr
+        };
+        return Ok(WmiCreateOutcome::Unavailable(format!(
+            "COM WMI failed ({last_com_err}); Invoke-CimMethod failed ({cim_detail})"
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let wrapper_pid = stdout
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&pid| pid > 0)
+        .ok_or_else(|| OsError::Platform {
+            detail: format!(
+                "WMI detached launch did not return a valid wrapper PID: {:?}",
+                stdout.trim()
+            ),
+        })?;
+    Ok(WmiCreateOutcome::Started(wrapper_pid))
+}
+
 async fn wait_for_handoff(
     handoff_path: &Path,
-    wrapper_pid: u32,
+    wrapper_pid: Option<u32>,
     timeout: Duration,
 ) -> Result<ProcessId> {
     let deadline = Instant::now() + timeout;
@@ -491,27 +667,29 @@ async fn wait_for_handoff(
 
         // If the WMI wrapper exited without producing a handoff file, fail promptly rather than
         // waiting out the full timeout.
-        let wrapper_gone = matches!(
-            win_proc::query_process_identity(wrapper_pid, false),
-            Ok(None)
-        );
-        if wrapper_gone {
-            if let Ok(contents) = fs::read_to_string(handoff_path)
-                && !contents.trim().is_empty()
-            {
-                return parse_wmi_handoff(&contents);
+        if let Some(pid) = wrapper_pid {
+            let wrapper_gone = matches!(win_proc::query_process_identity(pid, false), Ok(None));
+            if wrapper_gone {
+                if let Ok(contents) = fs::read_to_string(handoff_path)
+                    && !contents.trim().is_empty()
+                {
+                    return parse_wmi_handoff(&contents);
+                }
+                return Err(OsError::Platform {
+                    detail: format!(
+                        "WMI detached launcher (pid {pid}) exited without reporting target identity"
+                    ),
+                });
             }
-            return Err(OsError::Platform {
-                detail: format!(
-                    "WMI detached launcher (pid {wrapper_pid}) exited without reporting target identity"
-                ),
-            });
         }
 
         let now = Instant::now();
         if now >= deadline {
             return Err(OsError::TimedOut {
-                detail: "timed out waiting for WMI detached launcher to report target PID".into(),
+                detail: format!(
+                    "timed out after {}s waiting for WMI detached launcher to report target PID; check system load and inspect `job.status` before retrying",
+                    timeout.as_secs()
+                ),
             });
         }
         let remaining = deadline.saturating_duration_since(now);

@@ -21,12 +21,18 @@ use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS, DuplicateHandle,
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, STILL_ACTIVE,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, RPC_E_DISCONNECTED, RPC_E_TOO_LATE,
+    STILL_ACTIVE,
 };
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
+};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CoInitializeSecurity, CoSetProxyBlanket, CoUninitialize, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
+    RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -39,6 +45,7 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
 };
+use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_S_SERVER_UNAVAILABLE};
 use windows::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
@@ -51,7 +58,14 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW, RTL_USER_PROCESS_PARAMETERS, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
-use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Wmi::{
+    IWbemClassObject, IWbemLocator, IWbemServices, WBEM_E_ACCESS_DENIED, WBEM_E_INVALID_CLASS,
+    WBEM_E_INVALID_METHOD, WBEM_E_INVALID_NAMESPACE, WBEM_E_INVALID_PARAMETER, WBEM_E_NOT_FOUND,
+    WBEM_E_SERVER_TOO_BUSY, WBEM_E_SHUTTING_DOWN, WBEM_E_TRANSPORT_FAILURE, WBEM_GENERIC_FLAG_TYPE,
+    WbemLocator,
+};
+use windows::core::{BOOL, BSTR, HRESULT, PCWSTR, PWSTR};
 
 use crate::procid::{EnvMarkerCheck, ProcessId, windows_env_utf16_has_marker};
 use crate::{OsError, Result};
@@ -571,6 +585,69 @@ pub(crate) fn spawn_detached_direct(
     stderr_path: Option<&Path>,
     job_name: Option<&str>,
 ) -> std::result::Result<(ProcessId, Option<String>), DirectSpawnError> {
+    spawn_detached_with_breakaway(
+        program_display,
+        application_name,
+        command_line,
+        cwd,
+        env_remove,
+        env_overrides,
+        stdout_path,
+        stderr_path,
+        job_name,
+        true,
+    )
+}
+
+/// Spawn a detached Windows process via `CreateProcessW` without `CREATE_BREAKAWAY_FROM_JOB`,
+/// used only as a last-resort fallback when the caller's Job Object forbids breakaway and WMI
+/// `Win32_Process.Create` is provably unavailable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_detached_in_current_job(
+    program_display: &str,
+    application_name: Option<&str>,
+    command_line: &str,
+    cwd: Option<&Path>,
+    env_remove: &[OsString],
+    env_overrides: &BTreeMap<OsString, OsString>,
+    stdout_path: Option<&Path>,
+    stderr_path: Option<&Path>,
+    job_name: Option<&str>,
+) -> Result<(ProcessId, Option<String>)> {
+    match spawn_detached_with_breakaway(
+        program_display,
+        application_name,
+        command_line,
+        cwd,
+        env_remove,
+        env_overrides,
+        stdout_path,
+        stderr_path,
+        job_name,
+        false,
+    ) {
+        Ok(res) => Ok(res),
+        Err(DirectSpawnError::BreakawayRefused) => Err(OsError::PermissionDenied {
+            detail: format!("CreateProcessW refused to launch `{program_display}`"),
+            source: None,
+        }),
+        Err(DirectSpawnError::Other(err)) => Err(err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_detached_with_breakaway(
+    program_display: &str,
+    application_name: Option<&str>,
+    command_line: &str,
+    cwd: Option<&Path>,
+    env_remove: &[OsString],
+    env_overrides: &BTreeMap<OsString, OsString>,
+    stdout_path: Option<&Path>,
+    stderr_path: Option<&Path>,
+    job_name: Option<&str>,
+    breakaway: bool,
+) -> std::result::Result<(ProcessId, Option<String>), DirectSpawnError> {
     // Open base stdio handles non-inheritable before taking the spawn lock.
     let stdin_base = open_non_inheritable_nul(GENERIC_READ.0).map_err(DirectSpawnError::Other)?;
 
@@ -638,11 +715,13 @@ pub(crate) fn spawn_detached_direct(
         ptr: attr_ptr,
     };
 
-    let mut flags = CREATE_BREAKAWAY_FROM_JOB
-        | CREATE_NO_WINDOW
+    let mut flags = CREATE_NO_WINDOW
         | CREATE_NEW_PROCESS_GROUP
         | CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT;
+    if breakaway {
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
     if job_base.is_some() {
         // Start suspended so we assign the child into the named Job Object before it can spawn
         // any descendants or exit.
@@ -743,7 +822,7 @@ pub(crate) fn spawn_detached_direct(
     drop(stdin_base);
 
     if let Err(err) = create_res {
-        if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+        if breakaway && err.code() == ERROR_ACCESS_DENIED.to_hresult() {
             return Err(DirectSpawnError::BreakawayRefused);
         }
         if err.code() == ERROR_FILE_NOT_FOUND.to_hresult()
@@ -781,6 +860,291 @@ pub(crate) fn spawn_detached_direct(
     let (creation, _) = query_times_raw(proc_handle.0, "detached child process")
         .map_err(DirectSpawnError::Other)?;
     Ok((ProcessId::new(pi.dwProcessId, creation), assigned_job_name))
+}
+
+/// Outcome of an in-process COM WMI `Win32_Process.Create` attempt.
+pub(crate) enum WmiCreateError {
+    /// WMI provably did not start the target process, so retrying (when `transient`) or falling
+    /// back cannot start a duplicate copy.
+    NotStarted { transient: bool, detail: String },
+    /// `ExecMethod("Win32_Process", "Create")` returned an ambiguous result after invoking the
+    /// method; callers must NOT retry or fall back to avoid starting the same process twice.
+    MaybeStarted { detail: String },
+}
+
+struct ComMtaGuard;
+
+impl Drop for ComMtaGuard {
+    fn drop(&mut self) {
+        // SAFETY: Matches the successful `CoInitializeEx` on this thread.
+        unsafe { CoUninitialize() };
+    }
+}
+
+fn is_transient_wmi_connect_hresult(hr: HRESULT) -> bool {
+    let raw = hr.0;
+    raw == WBEM_E_TRANSPORT_FAILURE.0
+        || raw == WBEM_E_SERVER_TOO_BUSY.0
+        || raw == WBEM_E_SHUTTING_DOWN.0
+        || hr == RPC_E_DISCONNECTED
+        || hr == HRESULT::from_win32(RPC_S_SERVER_UNAVAILABLE.0 as u32)
+}
+
+fn classify_exec_method_hresult(hr: HRESULT) -> Option<bool> {
+    let raw = hr.0;
+    if raw == WBEM_E_SERVER_TOO_BUSY.0
+        || raw == WBEM_E_SHUTTING_DOWN.0
+        || hr == RPC_E_DISCONNECTED
+        || hr == HRESULT::from_win32(RPC_S_SERVER_UNAVAILABLE.0 as u32)
+    {
+        return Some(true);
+    }
+    if raw == WBEM_E_ACCESS_DENIED.0
+        || raw == WBEM_E_INVALID_NAMESPACE.0
+        || raw == WBEM_E_INVALID_CLASS.0
+        || raw == WBEM_E_INVALID_METHOD.0
+        || raw == WBEM_E_INVALID_PARAMETER.0
+        || raw == WBEM_E_NOT_FOUND.0
+    {
+        return Some(false);
+    }
+    None
+}
+
+fn variant_to_u32(val: &VARIANT) -> Option<u32> {
+    u32::try_from(val)
+        .ok()
+        .or_else(|| i32::try_from(val).ok().and_then(|n| u32::try_from(n).ok()))
+}
+
+/// Invoke `Win32_Process.Create` directly via COM (`IWbemLocator` -> `ROOT\CIMV2`) without
+/// spawning an outer `powershell.exe` / `Invoke-CimMethod` process.
+///
+/// Must be called on a dedicated OS thread so it always initializes a clean MTA apartment.
+pub(crate) fn wmi_create_process(
+    command_line: &str,
+    cwd: Option<&str>,
+) -> std::result::Result<u32, WmiCreateError> {
+    // SAFETY: Standard per-thread COM MTA initialization paired with `ComMtaGuard`.
+    let init_hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if init_hr.is_err() {
+        return Err(WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("CoInitializeEx failed: {init_hr:?}"),
+        });
+    }
+    let _com_guard = ComMtaGuard;
+
+    // `CoInitializeSecurity` is process-wide; `RPC_E_TOO_LATE` simply means another component
+    // already initialized COM security and is not an error.
+    // SAFETY: Null security descriptor uses the process default token with impersonation.
+    if let Err(err) = unsafe {
+        CoInitializeSecurity(
+            None,
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+            None,
+        )
+    } && err.code() != RPC_E_TOO_LATE
+    {
+        return Err(WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("CoInitializeSecurity failed: {err}"),
+        });
+    }
+
+    // SAFETY: `WbemLocator` is a standard system COM class returning `IWbemLocator`.
+    let locator: IWbemLocator = unsafe {
+        CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: is_transient_wmi_connect_hresult(err.code()),
+        detail: format!("CoCreateInstance(WbemLocator) failed: {err}"),
+    })?;
+
+    let namespace = BSTR::from(r"ROOT\CIMV2");
+    let empty = BSTR::new();
+    // SAFETY: Valid `IWbemLocator` and BSTR arguments.
+    let service: IWbemServices =
+        unsafe { locator.ConnectServer(&namespace, &empty, &empty, &empty, 0, &empty, None) }
+            .map_err(|err| WmiCreateError::NotStarted {
+                transient: is_transient_wmi_connect_hresult(err.code()),
+                detail: format!("IWbemLocator::ConnectServer(ROOT\\CIMV2) failed: {err}"),
+            })?;
+
+    // SAFETY: `service` is a valid COM proxy returned by `ConnectServer`.
+    unsafe {
+        CoSetProxyBlanket(
+            &service,
+            RPC_C_AUTHN_WINNT,
+            RPC_C_AUTHZ_NONE,
+            None,
+            RPC_C_AUTHN_LEVEL_CALL,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: false,
+        detail: format!("CoSetProxyBlanket failed: {err}"),
+    })?;
+
+    let class_name = BSTR::from("Win32_Process");
+    let mut class_obj: Option<IWbemClassObject> = None;
+    // SAFETY: `service` is connected and `class_obj` is a valid out-pointer.
+    unsafe {
+        service.GetObject(
+            &class_name,
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            Some(&mut class_obj),
+            None,
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: is_transient_wmi_connect_hresult(err.code()),
+        detail: format!("IWbemServices::GetObject(Win32_Process) failed: {err}"),
+    })?;
+    let class_obj = class_obj.ok_or_else(|| WmiCreateError::NotStarted {
+        transient: false,
+        detail: "IWbemServices::GetObject(Win32_Process) returned null object".into(),
+    })?;
+
+    let method_wide = to_wide_null(OsStr::new("Create"));
+    let mut in_sig: Option<IWbemClassObject> = None;
+    // SAFETY: `method_wide` is NUL-terminated UTF-16 and `in_sig` is a valid out-pointer.
+    unsafe {
+        class_obj.GetMethod(
+            PCWSTR::from_raw(method_wide.as_ptr()),
+            0,
+            &mut in_sig,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: false,
+        detail: format!("IWbemClassObject::GetMethod(Create) failed: {err}"),
+    })?;
+    let in_sig = in_sig.ok_or_else(|| WmiCreateError::NotStarted {
+        transient: false,
+        detail: "IWbemClassObject::GetMethod(Create) returned null signature".into(),
+    })?;
+
+    // SAFETY: `in_sig` is a valid method input parameter class object.
+    let in_params =
+        unsafe { in_sig.SpawnInstance(0) }.map_err(|err| WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::SpawnInstance failed: {err}"),
+        })?;
+
+    let cmdline_name = to_wide_null(OsStr::new("CommandLine"));
+    let cmdline_var = VARIANT::from(command_line);
+    // SAFETY: `cmdline_name` is NUL-terminated UTF-16 and `cmdline_var` is a valid BSTR VARIANT.
+    unsafe { in_params.Put(PCWSTR::from_raw(cmdline_name.as_ptr()), 0, &cmdline_var, 0) }.map_err(
+        |err| WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::Put(CommandLine) failed: {err}"),
+        },
+    )?;
+
+    if let Some(dir) = cwd {
+        let cwd_name = to_wide_null(OsStr::new("CurrentDirectory"));
+        let cwd_var = VARIANT::from(dir);
+        // SAFETY: `cwd_name` is NUL-terminated UTF-16 and `cwd_var` is a valid BSTR VARIANT.
+        unsafe { in_params.Put(PCWSTR::from_raw(cwd_name.as_ptr()), 0, &cwd_var, 0) }.map_err(
+            |err| WmiCreateError::NotStarted {
+                transient: false,
+                detail: format!("IWbemClassObject::Put(CurrentDirectory) failed: {err}"),
+            },
+        )?;
+    }
+
+    let method_bstr = BSTR::from("Create");
+    let mut out_params: Option<IWbemClassObject> = None;
+    // SAFETY: All COM objects and BSTR arguments are valid; `out_params` is a valid out-pointer.
+    if let Err(err) = unsafe {
+        service.ExecMethod(
+            &class_name,
+            &method_bstr,
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            &in_params,
+            Some(&mut out_params),
+            None,
+        )
+    } {
+        let detail = format!("IWbemServices::ExecMethod(Win32_Process.Create) failed: {err}");
+        return match classify_exec_method_hresult(err.code()) {
+            Some(transient) => Err(WmiCreateError::NotStarted { transient, detail }),
+            None => Err(WmiCreateError::MaybeStarted { detail }),
+        };
+    }
+
+    let Some(out_params) = out_params else {
+        return Err(WmiCreateError::MaybeStarted {
+            detail: "Win32_Process.Create returned no output parameters".into(),
+        });
+    };
+
+    let ret_name = to_wide_null(OsStr::new("ReturnValue"));
+    let mut ret_var = VARIANT::default();
+    // SAFETY: `ret_name` is NUL-terminated UTF-16 and `ret_var` is a valid mutable `VARIANT`.
+    unsafe {
+        out_params.Get(
+            PCWSTR::from_raw(ret_name.as_ptr()),
+            0,
+            &mut ret_var,
+            None,
+            None,
+        )
+    }
+    .map_err(|err| WmiCreateError::MaybeStarted {
+        detail: format!("reading Win32_Process.Create ReturnValue failed: {err}"),
+    })?;
+    let return_value = variant_to_u32(&ret_var).ok_or_else(|| WmiCreateError::MaybeStarted {
+        detail: "Win32_Process.Create ReturnValue was not an integer".into(),
+    })?;
+
+    let pid_name = to_wide_null(OsStr::new("ProcessId"));
+    let mut pid_var = VARIANT::default();
+    let pid = unsafe {
+        out_params.Get(
+            PCWSTR::from_raw(pid_name.as_ptr()),
+            0,
+            &mut pid_var,
+            None,
+            None,
+        )
+    }
+    .ok()
+    .and_then(|()| variant_to_u32(&pid_var))
+    .unwrap_or(0);
+
+    if return_value == 0 && pid > 0 {
+        return Ok(pid);
+    }
+
+    if return_value != 0 && pid == 0 {
+        let (reason, transient) = crate::detach::classify_wmi_return_value(return_value);
+        return Err(WmiCreateError::NotStarted {
+            transient,
+            detail: format!(
+                "Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
+            ),
+        });
+    }
+
+    Err(WmiCreateError::MaybeStarted {
+        detail: format!(
+            "Win32_Process.Create returned ambiguous result (ReturnValue={return_value}, ProcessId={pid})"
+        ),
+    })
 }
 
 /// Query all PIDs currently assigned to the named Job Object `job_name`.

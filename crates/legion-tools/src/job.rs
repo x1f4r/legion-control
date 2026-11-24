@@ -51,7 +51,7 @@ const MAX_KEY_BYTES: usize = 256;
 /// Maximum time `job.start` waits for the node-wide jobs lock.
 const JOBS_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time `job.start` waits for the detached supervisor to acquire the job lock or finish.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Poll interval while `job.start` waits for supervisor readiness.
 const STARTUP_POLL: Duration = Duration::from_millis(20);
 /// Cooperative grace period `job.cancel` gives the supervisor before escalating to `stop_detached`.
@@ -59,7 +59,7 @@ const CANCEL_GRACE: Duration = Duration::from_secs(6);
 /// Poll interval during `job.cancel`.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 /// Settle window waiting for the kernel to release `lock` after `stop_detached`.
-const LOCK_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Initial and maximum poll interval for `job.wait`.
 const WAIT_INITIAL_POLL: Duration = Duration::from_millis(25);
 const WAIT_MAX_POLL: Duration = Duration::from_millis(100);
@@ -742,10 +742,11 @@ async fn finish_startup_timeout(
         return Ok(JobState::from(exit.outcome));
     }
 
+    let timeout_secs = STARTUP_TIMEOUT.as_secs();
     if stop_err.is_none() && survivors.is_empty() && !tree_active && !lock_held {
-        let message =
-            "The detached job supervisor did not become ready within 10 seconds and was stopped."
-                .to_owned();
+        let message = format!(
+            "The detached job supervisor did not become ready within {timeout_secs} seconds and was stopped."
+        );
         record_start_failure(dir, &message).await;
         return Err(ErrorBody::new(ErrorCode::Timeout, message)
             .with_hint("Retry `job.start` or check system load with `sys.info`.")
@@ -758,13 +759,13 @@ async fn finish_startup_timeout(
 
     let detail = match stop_err {
         Some(err) => format!(
-            "The detached job supervisor for {id} did not become ready within 10 seconds and stopping it failed ({err}); the job is still running."
+            "The detached job supervisor for {id} did not become ready within {timeout_secs} seconds and stopping it failed ({err}); the job is still running."
         ),
         None if !survivors.is_empty() => format!(
-            "The detached job supervisor for {id} did not become ready within 10 seconds and could not be stopped; the job is still running (surviving pids: {survivors:?})."
+            "The detached job supervisor for {id} did not become ready within {timeout_secs} seconds and could not be stopped; the job is still running (surviving pids: {survivors:?})."
         ),
         None => format!(
-            "The detached job supervisor for {id} did not become ready within 10 seconds and is still running."
+            "The detached job supervisor for {id} did not become ready within {timeout_secs} seconds and is still running."
         ),
     };
     Err(ErrorBody::new(ErrorCode::Timeout, detail)
