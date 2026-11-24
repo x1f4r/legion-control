@@ -30,6 +30,7 @@ serde_json.workspace = true
 sysinfo.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
+toml_edit.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal"] }
@@ -38,6 +39,14 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sign
 # standard harness, which writes to stdout before any test code runs.
 [[test]]
 name = "exec"
+harness = false
+
+[[test]]
+name = "job"
+harness = false
+
+[[test]]
+name = "proj"
 harness = false
 
 [[test]]

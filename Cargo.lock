@@ -611,6 +611,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+ "toml_edit",
 ]
 
 [[package]]

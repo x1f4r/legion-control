@@ -30,7 +30,8 @@ tempfile = "3.27.0"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
-toml_edit = "0.25.20"
+# Edits fleet.toml and projects.toml in place, keeping the comments and layout a person gave them.
+toml_edit = { version = "0.25.20", default-features = false, features = ["parse", "display"] }
 legion-os = { path = "crates/legion-os" }
 # Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.
 sysinfo = { version = "0.40.4", default-features = false, features = ["system", "disk", "user"] }

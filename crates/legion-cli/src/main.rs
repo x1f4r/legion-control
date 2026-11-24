@@ -26,6 +26,9 @@ const FAILED: u8 = 1;
 const USAGE_ERROR: u8 = 2;
 
 fn main() -> ExitCode {
+    if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
+        return code;
+    }
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,
         Err(error) => return usage_error(&error),
