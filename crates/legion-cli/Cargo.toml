@@ -49,5 +49,10 @@ harness = false
 name = "power"
 harness = false
 
+# Tests calling extension tools locally and on another node over the command connector.
+[[test]]
+name = "ext"
+harness = false
+
 [lints]
 workspace = true

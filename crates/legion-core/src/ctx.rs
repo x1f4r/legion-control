@@ -12,7 +12,7 @@ use crate::config::ConfigStore;
 use crate::node::Node;
 use crate::paths::Paths;
 use crate::policy::Grant;
-use crate::registry::DocumentInfo;
+use crate::registry::{DocumentInfo, SourceCheck};
 
 /// How a call arrived. Recorded in the audit log, and the reason a principal can be trusted as far
 /// as it is: a local shell is the owner, a pinned ssh key or token is a wall.
@@ -227,9 +227,14 @@ impl Ctx {
         self.events.emit(kind, data);
     }
 
-    /// Every tool the node offers.
+    /// Every tool the node offers, built-ins and reloadable extensions alike.
     pub fn tools(&self) -> Vec<ToolSpec> {
-        self.node.registry().specs()
+        self.node.specs()
+    }
+
+    /// Whether `name` is registered as a built-in tool on this node.
+    pub fn has_builtin(&self, name: &str) -> bool {
+        self.node.registry().get(name).is_some()
     }
 
     /// The node's configuration files.
@@ -240,6 +245,11 @@ impl Ctx {
     /// The configuration documents the node reads.
     pub fn documents(&self) -> &[DocumentInfo] {
         self.node.registry().documents()
+    }
+
+    /// Health checks reported by reloadable tool sources.
+    pub fn source_checks(&self) -> Vec<SourceCheck> {
+        self.node.source_checks()
     }
 }
 

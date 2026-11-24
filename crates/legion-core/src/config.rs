@@ -271,6 +271,23 @@ pub fn parse<D: Document>(path: &Path, bytes: &[u8]) -> Result<D, ErrorBody> {
     Ok(document)
 }
 
+/// Parses arbitrary TOML bytes into `T`, returning `(message, Some(1-based line))` on UTF-8 or
+/// TOML syntax/type errors. Useful for per-item configuration files (such as `tools.d/*.toml`)
+/// that are skipped individually rather than failing the whole node.
+pub fn parse_toml_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, (String, Option<usize>)> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        let line = line_and_column(bytes, error.valid_up_to()).0;
+        ("file is not UTF-8 text".to_owned(), Some(line))
+    })?;
+    toml::from_str(text).map_err(|error| {
+        let message = error.message().trim_end_matches('.').to_owned();
+        let line = error
+            .span()
+            .map(|span| line_and_column(bytes, span.start).0);
+        (message, line)
+    })
+}
+
 /// The 1-based line and column of a byte offset.
 fn line_and_column(bytes: &[u8], offset: usize) -> (usize, usize) {
     let before = bytes.get(..offset).unwrap_or(bytes);
