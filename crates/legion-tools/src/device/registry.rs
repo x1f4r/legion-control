@@ -324,6 +324,8 @@ struct RawFleetDevice {
     role_updated_on: Option<String>,
     #[serde(default)]
     conflict: bool,
+    #[serde(default)]
+    role_conflict: bool,
 }
 
 impl TryFrom<RawFleetDevice> for FleetDevice {
@@ -371,6 +373,7 @@ impl TryFrom<RawFleetDevice> for FleetDevice {
             role_updated_at,
             role_updated_on,
             conflict: raw.conflict,
+            role_conflict: raw.role_conflict,
         })
     }
 }
@@ -384,6 +387,9 @@ impl TryFrom<RawFleetDevice> for FleetDevice {
 /// Immutable identity and pairing-provenance fields (`public_key`, `principal`, `paired_at`,
 /// `paired_on`, `paired_by`) must agree across peers; a mismatch sets `conflict = true` (never
 /// "newest wins") so the entry receives no `authorized_keys` line and warns until removed.
+/// Conflicting role updates that carry identical `(role_updated_at, role_updated_on)` stamps set
+/// `role_conflict = true` (blocking access until an owner resolves the role with
+/// `device.set role=<role>` or removes the device).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawFleetDevice")]
 pub struct FleetDevice {
@@ -431,6 +437,12 @@ pub struct FleetDevice {
     /// `nobody`, denied by `legion gate`) until removed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub conflict: bool,
+    /// `true` when two peers held different `role` values with equal `(role_updated_at,
+    /// role_updated_on)` during a merge. Inactive (no `authorized_keys` line, `nobody`, denied by
+    /// `legion gate`) until an owner resolves it with `device.set role=<role>` (advancing
+    /// `role_updated_at`) or removes the device.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub role_conflict: bool,
 }
 
 /// One removed-device tombstone in `devices.toml`.
@@ -664,6 +676,9 @@ fn build_live_device_table(dev: &FleetDevice) -> Table {
     t["role_updated_on"] = value(dev.role_updated_on.as_str());
     if dev.conflict {
         t["conflict"] = value(true);
+    }
+    if dev.role_conflict {
+        t["role_conflict"] = value(true);
     }
     t
 }
@@ -978,11 +993,10 @@ fn name_sort_key(d: &FleetDevice) -> impl Ord + '_ {
     )
 }
 
-fn role_sort_key(d: &FleetDevice) -> impl Ord + '_ {
+fn role_stamp_key(d: &FleetDevice) -> ((bool, i128, &str), &str) {
     (
         timestamp_sort_key(&d.role_updated_at),
         d.role_updated_on.as_str(),
-        d.role.as_deref(),
     )
 }
 
@@ -1009,11 +1023,38 @@ fn merge_live_device(da: &FleetDevice, db: &FleetDevice) -> FleetDevice {
     } else {
         db
     };
-    let role_src = if role_sort_key(da) >= role_sort_key(db) {
-        da
-    } else {
-        db
-    };
+    let (role, role_updated_at, role_updated_on, role_conflict) =
+        match role_stamp_key(da).cmp(&role_stamp_key(db)) {
+            std::cmp::Ordering::Greater => (
+                da.role.clone(),
+                da.role_updated_at.clone(),
+                da.role_updated_on.clone(),
+                da.role_conflict,
+            ),
+            std::cmp::Ordering::Less => (
+                db.role.clone(),
+                db.role_updated_at.clone(),
+                db.role_updated_on.clone(),
+                db.role_conflict,
+            ),
+            std::cmp::Ordering::Equal => {
+                // Equal role stamp AND equal origin with differing roles: never let the larger
+                // role string win. Mark `role_conflict = true` and choose a canonical min role so
+                // the merge remains strictly commutative, associative, and idempotent.
+                let role_conflict = da.role_conflict || db.role_conflict || da.role != db.role;
+                let role = if da.role <= db.role {
+                    da.role.clone()
+                } else {
+                    db.role.clone()
+                };
+                (
+                    role,
+                    da.role_updated_at.clone(),
+                    da.role_updated_on.clone(),
+                    role_conflict,
+                )
+            }
+        };
     let updated_src = if updated_sort_key(da) >= updated_sort_key(db) {
         da
     } else {
@@ -1033,7 +1074,7 @@ fn merge_live_device(da: &FleetDevice, db: &FleetDevice) -> FleetDevice {
         name: name_src.name.clone(),
         public_key: imm.public_key.clone(),
         principal: imm.principal.clone(),
-        role: role_src.role.clone(),
+        role,
         paired_at: imm.paired_at.clone(),
         paired_on: imm.paired_on.clone(),
         paired_by: imm.paired_by.clone(),
@@ -1043,9 +1084,10 @@ fn merge_live_device(da: &FleetDevice, db: &FleetDevice) -> FleetDevice {
         updated_on: updated_src.updated_on.clone(),
         name_updated_at: name_src.name_updated_at.clone(),
         name_updated_on: name_src.name_updated_on.clone(),
-        role_updated_at: role_src.role_updated_at.clone(),
-        role_updated_on: role_src.role_updated_on.clone(),
+        role_updated_at,
+        role_updated_on,
         conflict,
+        role_conflict,
     }
 }
 
@@ -1177,6 +1219,21 @@ pub fn inspect_immutable_conflict_devices(paths: &Paths) -> Vec<(String, String)
         .devices
         .iter()
         .filter(|(_, entry)| entry.conflict)
+        .map(|(id, entry)| (entry.name.clone(), id.clone()))
+        .collect()
+}
+
+/// Read-only list of `(name, pairing_id)` for live devices in `devices.toml` whose ONLY conflict
+/// is a role tie-break on equal `(role_updated_at, role_updated_on)` across peers, used by
+/// `meta.doctor`.
+pub fn inspect_role_conflict_devices(paths: &Paths) -> Vec<(String, String)> {
+    let Ok(Some(devices)) = load_devices_raw(paths) else {
+        return Vec::new();
+    };
+    devices
+        .devices
+        .iter()
+        .filter(|(_, entry)| !entry.conflict && entry.role_conflict)
         .map(|(id, entry)| (entry.name.clone(), id.clone()))
         .collect()
 }
@@ -1871,6 +1928,22 @@ pub fn reconcile_device_principals_locked(
             continue;
         }
 
+        if devices
+            .devices
+            .get(pairing_id)
+            .is_some_and(|d| d.role_conflict)
+        {
+            warnings.push(format!(
+                "Principal {principal} belongs to role-conflicted device {pairing_id} (conflicting role updates with equal stamp and origin across peers); leaving it restricted to `nobody` until resolved with `legion device.set id={pairing_id} role=<role>` or removed."
+            ));
+            if let Some(existing) = existing_entry
+                && existing.device.as_deref() == Some(pairing_id)
+            {
+                upsert_device_principal_locked(paths, principal, NOBODY, pairing_id)?;
+            }
+            continue;
+        }
+
         if let Some(reason) = quarantined.get(pairing_id) {
             warnings.push(format!(
                 "Principal {principal} belongs to quarantined device {pairing_id} ({reason}); leaving it restricted to `nobody` until confirmed by the owner."
@@ -2047,6 +2120,7 @@ pub fn adopt_legacy_devices_from_auth_keys(
                 role_updated_at: paired_at,
                 role_updated_on: valid_node.clone(),
                 conflict: false,
+                role_conflict: false,
             });
     }
 
@@ -2075,6 +2149,9 @@ pub struct AuthKeysReconcileReport {
     /// Live pairing ids skipped because two peers disagreed on immutable identity or
     /// pairing-provenance fields during a merge.
     pub immutable_conflict_ids: BTreeSet<String>,
+    /// Live pairing ids skipped because two peers held different roles with identical
+    /// `(role_updated_at, role_updated_on)` during a merge.
+    pub role_conflict_ids: BTreeSet<String>,
     /// Live pairing ids quarantined because an unconfirmed ancestor was removed at or before their
     /// pairing time, mapped to a human-readable reason.
     pub quarantined_ids: BTreeMap<String, String>,
@@ -2374,11 +2451,20 @@ pub fn reconcile_authorized_keys_in_memory(
     let mut expected_lines: BTreeMap<&str, (String, Vec<u8>)> = BTreeMap::new();
     let mut foreign_key_ids: BTreeSet<String> = BTreeSet::new();
     let mut immutable_conflict_ids: BTreeSet<String> = BTreeSet::new();
+    let mut role_conflict_ids: BTreeSet<String> = BTreeSet::new();
     for (id, entry) in &devices.devices {
         if entry.conflict {
             immutable_conflict_ids.insert(id.clone());
             warnings.push(format!(
                 "Device {} ({id}) has conflicting immutable identity or pairing provenance across peers and is not active here; remove it with `legion device.remove id={id}`.",
+                entry.name
+            ));
+            continue;
+        }
+        if entry.role_conflict {
+            role_conflict_ids.insert(id.clone());
+            warnings.push(format!(
+                "Device {} ({id}) has conflicting role updates with equal stamp and origin across peers and is not active here; resolve as owner with `legion device.set id={id} role=<role>` or remove with `legion device.remove id={id}`.",
                 entry.name
             ));
             continue;
@@ -2497,6 +2583,7 @@ pub fn reconcile_authorized_keys_in_memory(
         duplicate_key_ids,
         foreign_key_ids,
         immutable_conflict_ids,
+        role_conflict_ids,
         quarantined_ids,
         principal_conflict_ids,
         warnings,
@@ -2756,6 +2843,19 @@ pub fn verify_gate_device(
         )
         .with_hint(format!(
             "Remove the conflicted entry with `legion device.remove id={pairing_id}` and re-pair if needed."
+        )));
+    }
+
+    if entry.role_conflict {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Device {device_name} ({pairing_id}) has conflicting role updates with equal stamp and origin across peers and cannot connect."
+            ),
+        )
+        .with_hint(format!(
+            "Resolve the role conflict as owner with `legion device.set id={pairing_id} role=<role>`, or remove the device with `legion device.remove id={pairing_id}`."
         )));
     }
 
@@ -3170,6 +3270,7 @@ pub fn apply_devices_merge_blocking(
             merged.removed.contains_key(*id)
                 || (quarantined_after.contains_key(*id) && !quarantined_before.contains_key(*id))
                 || (!prev.conflict && merged.devices.get(*id).is_some_and(|d| d.conflict))
+                || (!prev.role_conflict && merged.devices.get(*id).is_some_and(|d| d.role_conflict))
         })
         .map(|(id, prev)| SessionTarget::new(prev.name.clone(), Some(id.clone())))
         .collect();
@@ -3426,6 +3527,7 @@ mod tests {
             role_updated_at: updated_at.to_owned(),
             role_updated_on: node.to_owned(),
             conflict: false,
+            role_conflict: false,
         }
     }
 
@@ -3489,6 +3591,7 @@ mod tests {
                     let role_updated_at = *rng.pick(&times);
                     let role_updated_on = *rng.pick(&nodes);
                     let conflict = rng.next().is_multiple_of(5);
+                    let role_conflict = rng.next().is_multiple_of(5);
                     let key_seed = ((idx + 1) as u8) * 10 + (rng.next() % 3) as u8;
                     let paired_by = match rng.next() % 3 {
                         0 => None,
@@ -3527,6 +3630,7 @@ mod tests {
                             role_updated_at: role_updated_at.to_owned(),
                             role_updated_on: role_updated_on.to_owned(),
                             conflict,
+                            role_conflict,
                         },
                     );
                 }
@@ -3598,6 +3702,7 @@ mod tests {
             role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
             role_updated_on: "pi".to_owned(),
             conflict: false,
+            role_conflict: false,
         };
 
         let mut variants: Vec<FleetDevice> = Vec::new();
@@ -3612,6 +3717,7 @@ mod tests {
         push_variant(|d| d.name = "beta".to_owned());
         push_variant(|d| d.role = Some("editor".to_owned()));
         push_variant(|d| d.conflict = true);
+        push_variant(|d| d.role_conflict = true);
         push_variant(|d| d.principal = "device:beta".to_owned());
         push_variant(|d| d.public_key = sample_key(11));
         push_variant(|d| d.paired_at = "2026-11-24T09:30:00Z".to_owned());
@@ -3978,6 +4084,150 @@ updated_on = \"pi\"
         )
         .unwrap_err();
         assert_eq!(gate_err.code, ErrorCode::Denied, "{gate_err:?}");
+    }
+
+    #[test]
+    fn role_tie_on_equal_stamp_and_origin_marks_conflict_and_blocks_access_until_newer_role_set() {
+        let id = sample_id(8);
+        let ts = "2026-11-24T10:00:00Z";
+        let newer_ts = "2026-11-24T10:05:00Z";
+
+        let mut side_a = DevicesFile::default();
+        let mut da = sample_device(8, "pixel", Some("admin"), ts, "tower");
+        da.confirmed_by = Some("owner".to_owned());
+        da.confirmed_at = Some(ts.to_owned());
+        side_a.devices.insert(id.clone(), da);
+
+        let mut side_b = DevicesFile::default();
+        let mut db = sample_device(8, "pixel", Some("observer"), ts, "tower");
+        db.confirmed_by = Some("owner".to_owned());
+        db.confirmed_at = Some(ts.to_owned());
+        side_b.devices.insert(id.clone(), db);
+
+        // Equal role_updated_at AND equal role_updated_on with differing role must NOT let the
+        // lexicographically larger role ("observer") win silently; it must be commutative and
+        // block access (nobody in policy.toml, no authorized_keys line, denied by gate).
+        let ab = merge_devices(&side_a, &side_b);
+        let ba = merge_devices(&side_b, &side_a);
+        assert_eq!(ab, ba, "role tie merge must be commutative");
+        assert!(
+            !ab.devices[&id].conflict,
+            "role tie alone must not mark immutable conflict"
+        );
+        assert!(
+            ab.to_toml_string().contains("role_conflict = true"),
+            "serialized role-tie merge must record role_conflict = true:\n{}",
+            ab.to_toml_string()
+        );
+
+        // Equal role_updated_at with DIFFERENT origin nodes still resolves deterministically by
+        // origin node without marking a conflict.
+        let mut diff_origin = side_b.clone();
+        diff_origin.devices.get_mut(&id).unwrap().role_updated_on = "zebra".to_owned();
+        let resolved_by_origin = merge_devices(&side_a, &diff_origin);
+        assert_eq!(
+            resolved_by_origin,
+            merge_devices(&diff_origin, &side_a),
+            "different origin tie-break must stay commutative"
+        );
+        assert!(
+            !resolved_by_origin
+                .to_toml_string()
+                .contains("role_conflict"),
+            "different origin nodes must not mark role_conflict"
+        );
+        assert_eq!(
+            resolved_by_origin.devices[&id].role.as_deref(),
+            Some("observer")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        std::fs::write(&auth_keys, "").unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        let node_toml =
+            format!("name = \"tower\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n");
+        std::fs::write(paths.config_file("node.toml"), &node_toml).unwrap();
+        let node_file: NodeFile =
+            parse(&paths.config_file("node.toml"), node_toml.as_bytes()).unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[roles.admin]\nallow = [\"*\"]\n\n[principals.\"device:pixel\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
+            ),
+        )
+        .unwrap();
+
+        {
+            let _lock = lock_config(&paths).unwrap();
+            save_devices_locked(&paths, &ab).unwrap();
+            let pol_warnings = reconcile_device_principals_locked(&paths, &ab).unwrap();
+            assert!(
+                pol_warnings.iter().any(|w| w.contains(&id)),
+                "expected policy warning for role-conflicted device: {pol_warnings:?}"
+            );
+        }
+        let pol: Policy = parse(
+            &paths.config_file("policy.toml"),
+            &std::fs::read(paths.config_file("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pol.role_of("device:pixel").0,
+            NOBODY,
+            "role-conflicted device must be restricted to nobody"
+        );
+
+        let rec =
+            reconcile_devices_and_auth_keys_blocking(&paths, "tower", &node_file, false).unwrap();
+        assert!(
+            rec.warnings.iter().any(|w| w.contains(&id)),
+            "expected auth_keys warning for role-conflicted device: {:?}",
+            rec.warnings
+        );
+        assert!(
+            std::fs::read_to_string(&auth_keys)
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "role-conflicted device must receive NO authorized_keys line"
+        );
+        let gate_err = verify_gate_device(
+            &paths,
+            "tower",
+            &node_file,
+            "pixel",
+            &id,
+            "device:pixel",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(gate_err.code, ErrorCode::Denied, "{gate_err:?}");
+
+        // Merging a 3rd entry with a strictly newer role_updated_at clears role_conflict
+        // associatively regardless of merge order.
+        let mut side_c = side_a.clone();
+        let dc = side_c.devices.get_mut(&id).unwrap();
+        dc.role = Some("observer".to_owned());
+        dc.role_updated_at = newer_ts.to_owned();
+        dc.role_updated_on = "pi".to_owned();
+        let left = merge_devices(&merge_devices(&side_a, &side_b), &side_c);
+        let right = merge_devices(&side_a, &merge_devices(&side_b, &side_c));
+        assert_eq!(left, right, "resolving role conflict must be associative");
+        assert!(
+            !left.to_toml_string().contains("role_conflict"),
+            "newer role_updated_at must clear role_conflict"
+        );
+        assert_eq!(left.devices[&id].role.as_deref(), Some("observer"));
+        assert_eq!(
+            left.devices[&id].confirmed_by.as_deref(),
+            Some("owner"),
+            "role tie and its resolution must preserve immutable pairing confirmation associatively"
+        );
     }
 
     #[test]

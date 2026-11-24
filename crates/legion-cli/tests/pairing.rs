@@ -3139,6 +3139,7 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
                 role_updated_at: now_str,
                 role_updated_on: "b".to_owned(),
                 conflict: false,
+                role_conflict: false,
             },
         );
         std::fs::write(&b_devices_path, b_devices.to_toml_string()).unwrap();
@@ -3373,6 +3374,7 @@ role = \"phone_admin\"
             role_updated_at: now_str.clone(),
             role_updated_on: "a".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     devices_a.devices.insert(
@@ -3394,6 +3396,7 @@ role = \"phone_admin\"
             role_updated_at: now_str.clone(),
             role_updated_on: "a".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     node_a.write_config("devices.toml", &devices_a.to_toml_string());
@@ -3418,6 +3421,7 @@ role = \"phone_admin\"
             role_updated_at: now_str.clone(),
             role_updated_on: "a".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     devices_b.removed.insert(
@@ -3611,6 +3615,7 @@ role = \"ops\"
             role_updated_at: t0.clone(),
             role_updated_on: "stamp-box".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     initial.devices.insert(
@@ -3632,6 +3637,7 @@ role = \"ops\"
             role_updated_at: t0,
             role_updated_on: "stamp-box".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     home.write_config("devices.toml", &initial.to_toml_string());
@@ -3932,6 +3938,7 @@ role = \"ops\"
             role_updated_at: t0.clone(),
             role_updated_on: "a".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     node_a.write_config("devices.toml", &dev_a.to_toml_string());
@@ -3961,6 +3968,7 @@ role = \"ops\"
             role_updated_at: t0.clone(),
             role_updated_on: "a".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     node_b.write_config("devices.toml", &dev_b.to_toml_string());
@@ -4022,6 +4030,7 @@ role = \"ops\"
             role_updated_at: t3,
             role_updated_on: "b".to_owned(),
             conflict: false,
+            role_conflict: false,
         },
     );
     node_b.write_config("devices.toml", &dev_b2.to_toml_string());
