@@ -376,8 +376,9 @@ async fn gate(
             .config()
             .get::<legion_core::config::NodeFile>()
             .and_then(|node_file| {
-                legion_tools::device::authkeys::verify_device_authorized(
+                legion_tools::device::registry::verify_gate_device(
                     node.paths(),
+                    &node.name(),
                     &node_file,
                     device_name,
                     pairing_id,
@@ -385,15 +386,29 @@ async fn gate(
                     account.as_deref(),
                 )
             });
-        if let Err(error) = auth_check {
-            err(&format!("legion gate: {}\n", error.message));
-            router.shutdown().await;
-            if error.code == ErrorCode::Denied
-                && let Some(guard) = session.take()
-            {
-                guard.reject_and_terminate_parent().await;
+        match auth_check {
+            Ok(removed_stale) => {
+                for stale_name in removed_stale {
+                    if stale_name != device_name {
+                        let _ = legion_tools::device::sessions::terminate_device_sessions(
+                            node.paths(),
+                            &stale_name,
+                            legion_tools::device::sessions::DEFAULT_TERMINATE_GRACE,
+                        )
+                        .await;
+                    }
+                }
             }
-            return ExitCode::from(FAILED);
+            Err(error) => {
+                err(&format!("legion gate: {}\n", error.message));
+                router.shutdown().await;
+                if error.code == ErrorCode::Denied
+                    && let Some(guard) = session.take()
+                {
+                    guard.reject_and_terminate_parent().await;
+                }
+                return ExitCode::from(FAILED);
+            }
         }
     }
     let _session = session;

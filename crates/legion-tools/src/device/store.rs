@@ -51,6 +51,12 @@ pub struct InviteRecord {
     pub id: String,
     /// Principal the enrolled device will act as.
     pub principal: String,
+    /// Role recorded when the invite was created for a `device:*` principal (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Preferred device label when chosen at invite creation time (`--name`, optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
     /// RFC 3339 UTC creation timestamp.
     pub created: String,
     /// RFC 3339 UTC expiry timestamp.
@@ -412,6 +418,8 @@ mod tests {
                     InviteRecord {
                         id: "invexpired".to_owned(),
                         principal: "phone".to_owned(),
+                        role: None,
+                        device_name: None,
                         created: "2026-11-24T11:44:00Z".to_owned(),
                         expires: format_rfc3339(past),
                         fingerprint: key1.fingerprint,
@@ -422,6 +430,8 @@ mod tests {
                     InviteRecord {
                         id: "invvalid".to_owned(),
                         principal: "phone".to_owned(),
+                        role: None,
+                        device_name: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: key3.fingerprint,
@@ -432,6 +442,8 @@ mod tests {
                     InviteRecord {
                         id: "invmissingline".to_owned(),
                         principal: "phone".to_owned(),
+                        role: None,
+                        device_name: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: "SHA256:abc".to_owned(),

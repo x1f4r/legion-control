@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use legion_core::config::NodeFile;
+use legion_core::config::{NodeFile, NodeName};
 use legion_core::policy::{OWNER, Policy};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::{Door, Node};
@@ -24,6 +24,11 @@ use super::authkeys::{
     verify_owner_matches_euid,
 };
 use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
+use super::registry::{
+    DEVICE_PRINCIPAL_PREFIX, DevicesFile, FleetDevice, adopt_legacy_devices_from_auth_keys,
+    format_precise_rfc3339, load_devices_raw, lock_config, reconcile_authorized_keys_in_memory,
+    save_devices_locked,
+};
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
     unique_device_name,
@@ -278,6 +283,10 @@ fn process_enrol_blocking(
         return (None, base_args, Err(error));
     }
 
+    let _cfg_guard = match lock_config(paths) {
+        Ok(guard) => guard,
+        Err(error) => return (None, base_args, Err(error)),
+    };
     let _guard = match lock_auth_keys(&target, &write_path) {
         Ok(guard) => guard,
         Err(error) => return (None, base_args, Err(error)),
@@ -290,6 +299,7 @@ fn process_enrol_blocking(
             device_name: String,
             fingerprint: String,
             state: super::store::DevicesState,
+            devices: DevicesFile,
         },
         Failed {
             principal: Option<String>,
@@ -297,6 +307,11 @@ fn process_enrol_blocking(
             swept_state: Option<super::store::DevicesState>,
         },
     }
+
+    let node_name = node.name();
+    let valid_node_name = NodeName::try_from(node_name.clone())
+        .map(|n| n.as_str().to_owned())
+        .unwrap_or_else(|_| "node".to_owned());
 
     let attempt = match edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
         let mut state = load_state(paths)?;
@@ -346,41 +361,6 @@ fn process_enrol_blocking(
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
 
-        // Refuse enrolling the invite's own temporary key (its private seed was carried in the QR and
-        // transcripts) or any key already present on any line of authorized_keys (managed or foreign).
-        let matches_invite_key = validated_key.fingerprint == invite.fingerprint
-            || auth_keys.lines.iter().any(|line| {
-                matches!(&line.kind, LineKind::Invite { id, key_b64, .. } if id == forced_id && key_b64 == &validated_key.key_b64)
-            });
-        if matches_invite_key {
-            return fail_with_sweep(
-                Some(principal),
-                ErrorBody::new(
-                    ErrorCode::Denied,
-                    "The device public key cannot be the temporary key from the pairing invite.",
-                )
-                .with_hint(
-                    "Generate a fresh Ed25519 key pair on the device and send its public key instead.",
-                ),
-                auth_keys,
-                state,
-            );
-        }
-        if auth_keys.contains_key_blob(&validated_key.wire_blob) {
-            return fail_with_sweep(
-                Some(principal),
-                ErrorBody::new(
-                    ErrorCode::Conflict,
-                    "That public key is already present in authorized_keys.",
-                )
-                .with_hint(
-                    "Generate a fresh, dedicated Ed25519 key pair for this device and try again.",
-                ),
-                auth_keys,
-                state,
-            );
-        }
-
         // Resolve the principal's current role from policy.toml.
         let policy = match node.config().get::<Policy>() {
             Ok(policy) => policy,
@@ -406,25 +386,6 @@ fn process_enrol_blocking(
                 state,
             );
         }
-
-        let exe = match legion_core::current_exe() {
-            Ok(exe) => exe,
-            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
-        };
-        if let Err(error) = verify_exe_not_group_or_world_writable(&exe) {
-            return fail_with_sweep(Some(principal), error, auth_keys, state);
-        }
-
-        let existing_names: HashSet<String> = auth_keys
-            .lines
-            .iter()
-            .filter_map(|line| match &line.kind {
-                LineKind::Device { name, .. } => Some(name.clone()),
-                _ => None,
-            })
-            .chain(state.devices.keys().cloned())
-            .collect();
-        let device_name = unique_device_name(&request.name, &existing_names);
 
         let pinned_account: Option<String> = auth_keys
             .lines
@@ -452,6 +413,84 @@ fn process_enrol_blocking(
             );
         }
 
+        // Load devices.toml, adopting any pre-existing `--pairing` lines on first run.
+        let mut devices = match load_devices_raw(paths) {
+            Ok(Some(file)) => file,
+            Ok(None) => adopt_legacy_devices_from_auth_keys(
+                paths,
+                &valid_node_name,
+                &auth_keys,
+                &target,
+                pinned_account.as_deref(),
+                &state,
+                &policy,
+            ),
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
+
+        // Refuse enrolling the invite's own temporary key (its private seed was carried in the QR and
+        // transcripts) or any key already present on any line of authorized_keys or devices.toml.
+        let matches_invite_key = validated_key.fingerprint == invite.fingerprint
+            || auth_keys.lines.iter().any(|line| {
+                matches!(&line.kind, LineKind::Invite { id, key_b64, .. } if id == forced_id && key_b64 == &validated_key.key_b64)
+            });
+        if matches_invite_key {
+            return fail_with_sweep(
+                Some(principal),
+                ErrorBody::new(
+                    ErrorCode::Denied,
+                    "The device public key cannot be the temporary key from the pairing invite.",
+                )
+                .with_hint(
+                    "Generate a fresh Ed25519 key pair on the device and send its public key instead.",
+                ),
+                auth_keys,
+                state,
+            );
+        }
+        let key_in_registry = devices
+            .devices
+            .values()
+            .any(|dev| dev.public_key == validated_key.canonical);
+        if key_in_registry || auth_keys.contains_key_blob(&validated_key.wire_blob) {
+            return fail_with_sweep(
+                Some(principal),
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    "That public key is already present in authorized_keys.",
+                )
+                .with_hint(
+                    "Generate a fresh, dedicated Ed25519 key pair for this device and try again.",
+                ),
+                auth_keys,
+                state,
+            );
+        }
+
+        let exe = match legion_core::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
+        if let Err(error) = verify_exe_not_group_or_world_writable(&exe) {
+            return fail_with_sweep(Some(principal), error, auth_keys, state);
+        }
+
+        let existing_names: HashSet<String> = devices
+            .devices
+            .values()
+            .map(|d| d.name.clone())
+            .chain(auth_keys.lines.iter().filter_map(|line| match &line.kind {
+                LineKind::Device { name, .. } => Some(name.clone()),
+                _ => None,
+            }))
+            .chain(state.devices.keys().cloned())
+            .collect();
+        let requested_name = invite
+            .device_name
+            .as_deref()
+            .unwrap_or(request.name.as_str());
+        let device_name = unique_device_name(requested_name, &existing_names);
+
         let shell = match ForcedCommandShell::host() {
             Ok(shell) => shell,
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
@@ -461,7 +500,7 @@ fn process_enrol_blocking(
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
         let pinned_home = PinnedHome::from_paths(paths);
-        let permanent_line = match format_device_line(
+        let _permanent_line = match format_device_line(
             &exe,
             &principal,
             &validated_key.canonical,
@@ -475,10 +514,40 @@ fn process_enrol_blocking(
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
 
-        // Swap temporary invite line for the permanent device line in authorized_keys atomically.
+        let precise_now = format_precise_rfc3339(now);
+        let recorded_role = if principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+            invite.role.clone().or_else(|| Some(role.clone()))
+        } else {
+            None
+        };
+        devices.devices.insert(
+            pairing_id.clone(),
+            FleetDevice {
+                name: device_name.clone(),
+                public_key: validated_key.canonical.clone(),
+                principal: principal.clone(),
+                role: recorded_role,
+                paired_at: precise_now.clone(),
+                paired_on: valid_node_name.clone(),
+                updated_at: precise_now,
+                updated_on: valid_node_name.clone(),
+            },
+        );
+
+        // Swap temporary invite line and reconcile authorized_keys from devices.toml atomically.
         auth_keys
             .retain(|line| !matches!(&line.kind, LineKind::Invite { id, .. } if id == forced_id));
-        auth_keys.append_line(&permanent_line);
+        if let Err(error) = reconcile_authorized_keys_in_memory(
+            &mut auth_keys,
+            &devices,
+            paths,
+            &target,
+            pinned_account.as_deref(),
+            &exe,
+            shell,
+        ) {
+            return fail_with_sweep(Some(principal), error, auth_keys, state);
+        }
 
         let added = Timestamp::from_second(now.as_second())
             .map(format_rfc3339)
@@ -503,6 +572,7 @@ fn process_enrol_blocking(
                 device_name,
                 fingerprint: validated_key.fingerprint,
                 state,
+                devices,
             },
         ))
     }) {
@@ -510,14 +580,15 @@ fn process_enrol_blocking(
         Err(error) => return (None, base_args, Err(error)),
     };
 
-    let (principal, role, device_name, fingerprint, state) = match attempt {
+    let (principal, role, device_name, fingerprint, state, devices) = match attempt {
         EnrolAttempt::Succeeded {
             principal,
             role,
             device_name,
             fingerprint,
             state,
-        } => (principal, role, device_name, fingerprint, state),
+            devices,
+        } => (principal, role, device_name, fingerprint, state, devices),
         EnrolAttempt::Failed {
             principal,
             error,
@@ -530,8 +601,12 @@ fn process_enrol_blocking(
         }
     };
 
-    // authorized_keys is the source of truth and already holds the permanent device line (with the
-    // temporary invite line removed), and device.list tolerates missing metadata. If persisting
+    if let Err(error) = save_devices_locked(paths, &devices) {
+        return (Some(principal), base_args, Err(error));
+    }
+
+    // authorized_keys and devices.toml already hold the permanent device (with the temporary invite
+    // line removed), and device.list tolerates missing state/devices.json metadata. If persisting
     // state/devices.json fails after the swap, record the warning in the audit args and still reply
     // ok: true so the controller does not mistakenly believe enrolment failed.
     let state_warning = save_state(paths, &state).err().map(|error| error.message);

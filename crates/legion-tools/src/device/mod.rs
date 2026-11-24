@@ -19,8 +19,8 @@ pub mod store;
 use std::collections::BTreeMap;
 
 use jiff::{SignedDuration, Timestamp};
-use legion_core::config::NodeFile;
-use legion_core::policy::Principal;
+use legion_core::config::{NodeFile, NodeName};
+use legion_core::policy::{Policy, Principal};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Ctx, NoArgs, Registry, ToolError};
 use schemars::JsonSchema;
@@ -37,6 +37,11 @@ use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
     InvitePayload, fingerprint_key_b64, generate_ephemeral_ed25519, generate_invite_id,
     resolve_host_keys, validate_invite_id,
+};
+use self::registry::{
+    DeviceTombstone, DevicesFile, adopt_legacy_devices_from_auth_keys, load_devices_raw,
+    lock_config, next_updated_timestamp, reconcile_authorized_keys_in_memory,
+    reconcile_device_principals_locked, save_devices_locked,
 };
 use self::store::{InviteRecord, format_rfc3339, load_state, lock_auth_keys, save_state, sweep};
 
@@ -65,13 +70,13 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.list",
         Effect::Admin,
-        "List paired devices and pending pairing invites for principals the caller could act as, reading authorized_keys as the source of truth joined with recorded metadata, and sweeping any expired or used invites. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).",
+        "List paired devices (from devices.toml, adopting pre-existing --pairing lines on first run) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).",
         list,
     );
     registry.add_fn(
         "device.remove",
         Effect::Admin,
-        "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions and same-account SSH connections for a removed device. Detached background jobs the device started keep running and are listed in `jobs_left_running` (stop them separately with `job.cancel` if needed). Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home; for foreign devices this removes the key without ending sessions tracked under that other home and reports `sessions_not_ended: true`.",
+        "Remove a paired device by name or pairing id, or revoke a pending pairing invite by id, for a principal the caller could act as. Records a permanent tombstone in devices.toml, reconciles authorized_keys, and immediately ends live sessions and same-account SSH connections on this node. A removed device is still accepted by any other machine in the fleet that has not yet synced the removal; unreachable machines are named in `still_trusted_by`. Detached background jobs the device started keep running and are listed in `jobs_left_running` (stop them separately with `job.cancel` if needed). Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home; for foreign devices this removes the key without ending sessions tracked under that other home and reports `sessions_not_ended: true`.",
         remove,
     );
     registry.add_fn(
@@ -337,6 +342,8 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let record = InviteRecord {
         id: id.clone(),
         principal: principal.clone(),
+        role: None,
+        device_name: None,
         created,
         expires: expires.clone(),
         fingerprint: ephemeral.fingerprint,
@@ -345,6 +352,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let paths = ctx.paths().clone();
     let id_for_write = id.clone();
     blocking(move || {
+        let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
         verify_owner_matches_euid(
@@ -397,11 +405,17 @@ fn is_false(value: &bool) -> bool {
 /// One paired device listed by `device.list`.
 #[derive(Debug, Serialize)]
 struct ListedDevice {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     name: String,
     principal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
     fingerprint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     added: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paired_on: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     home: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
@@ -431,9 +445,13 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
     let caller = Caller::of(ctx)?;
     let caller_is_owner = caller.is_owner();
     let node_file = ctx.config().get::<NodeFile>()?;
+    let policy = ctx.config().get::<Policy>()?;
+    let node_name = ctx.node_name().to_owned();
     let paths = ctx.paths().clone();
+    let paths_for_sessions = paths.clone();
 
-    let (raw_devices, raw_invites) = blocking(move || {
+    let (raw_devices, raw_invites, removed_stale) = blocking(move || {
+        let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
         let caller_account = caller_account_for_target(&target)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
@@ -445,20 +463,85 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        let (auth_keys, state, state_changed) =
+        let existing_devices = load_devices_raw(&paths)?;
+        let exe = legion_core::current_exe()?;
+        let shell = ForcedCommandShell::host()?;
+
+        let (auth_keys, state, state_changed, devices_file, adopted_new, removed_stale) =
             edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
                 let mut state = load_state(&paths)?;
                 let now = Timestamp::now();
-                let (auth_changed, state_changed) = sweep(&mut auth_keys, &mut state, now);
-                let to_write = auth_changed.then(|| auth_keys.clone());
-                Ok((to_write, (auth_keys, state, state_changed)))
+                let (swept_auth, state_changed) = sweep(&mut auth_keys, &mut state, now);
+
+                let (devices_file, adopted_new) = match &existing_devices {
+                    Some(file) => (file.clone(), false),
+                    None => {
+                        let adopted = adopt_legacy_devices_from_auth_keys(
+                            &paths,
+                            &node_name,
+                            &auth_keys,
+                            &target,
+                            caller_account.as_deref(),
+                            &state,
+                            &policy,
+                        );
+                        let has_any = !adopted.devices.is_empty();
+                        (adopted, has_any)
+                    }
+                };
+
+                let (reconciled_auth, removed_stale) = reconcile_authorized_keys_in_memory(
+                    &mut auth_keys,
+                    &devices_file,
+                    &paths,
+                    &target,
+                    caller_account.as_deref(),
+                    &exe,
+                    shell,
+                )?;
+                let write_auth = (swept_auth || reconciled_auth).then(|| auth_keys.clone());
+                Ok((
+                    write_auth,
+                    (
+                        auth_keys,
+                        state,
+                        state_changed,
+                        devices_file,
+                        adopted_new,
+                        removed_stale,
+                    ),
+                ))
             })?;
+        if adopted_new {
+            save_devices_locked(&paths, &devices_file)?;
+        }
         if state_changed {
             save_state(&paths, &state)?;
         }
         sessions::sweep_stale_sessions(&paths);
 
-        let mut devices = Vec::new();
+        let mut own_devices: Vec<ListedDevice> = devices_file
+            .devices
+            .iter()
+            .map(|(id, entry)| {
+                let effective_role = policy.role_of(&entry.principal).0;
+                ListedDevice {
+                    id: Some(id.clone()),
+                    name: entry.name.clone(),
+                    principal: entry.principal.clone(),
+                    role: Some(effective_role),
+                    fingerprint: DevicesFile::fingerprint_of(entry),
+                    added: Some(entry.paired_at.clone()),
+                    paired_on: Some(entry.paired_on.clone()),
+                    home: None,
+                    foreign: false,
+                    missing_home: false,
+                }
+            })
+            .collect();
+        own_devices.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
+        let mut devices = own_devices;
         let mut invites = Vec::new();
         for line in &auth_keys.lines {
             match &line.kind {
@@ -466,9 +549,9 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     name,
                     key_b64,
                     principal,
+                    pairing_id,
                     home,
                     account,
-                    ..
                 } => {
                     if !line_matches_account(
                         account.as_deref(),
@@ -480,40 +563,25 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     }
                     let is_this_home = line_matches_home(home.as_ref(), &paths)
                         || (home.is_none() && state.devices.contains_key(name));
-                    let missing_home = home.as_ref().is_some_and(|h| !h.config_exists());
-                    if !is_this_home {
-                        if !caller_is_owner {
-                            continue;
-                        }
-                        let fingerprint =
-                            fingerprint_key_b64(key_b64).unwrap_or_else(|| "unknown".to_owned());
-                        devices.push(ListedDevice {
-                            name: name.clone(),
-                            principal: principal.clone(),
-                            fingerprint,
-                            added: None,
-                            home: home.as_ref().map(PinnedHome::display_label),
-                            foreign: true,
-                            missing_home,
-                        });
+                    if is_this_home {
                         continue;
                     }
-                    let meta = state.devices.get(name);
-                    let resolved_principal = meta
-                        .map(|m| m.principal.clone())
-                        .unwrap_or_else(|| principal.clone());
-                    let fingerprint = fingerprint_key_b64(key_b64)
-                        .or_else(|| meta.map(|m| m.fingerprint.clone()))
-                        .unwrap_or_else(|| "unknown".to_owned());
+                    if !caller_is_owner {
+                        continue;
+                    }
+                    let missing_home = home.as_ref().is_some_and(|h| !h.config_exists());
+                    let fingerprint =
+                        fingerprint_key_b64(key_b64).unwrap_or_else(|| "unknown".to_owned());
                     devices.push(ListedDevice {
+                        id: Some(pairing_id.clone()),
                         name: name.clone(),
-                        principal: resolved_principal,
+                        principal: principal.clone(),
+                        role: None,
                         fingerprint,
-                        added: meta.map(|m| m.added.clone()),
-                        home: missing_home
-                            .then(|| home.as_ref().map(PinnedHome::display_label))
-                            .flatten(),
-                        foreign: false,
+                        added: None,
+                        paired_on: None,
+                        home: home.as_ref().map(PinnedHome::display_label),
+                        foreign: true,
                         missing_home,
                     });
                 }
@@ -574,9 +642,18 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                 LineKind::Foreign => {}
             }
         }
-        Ok((devices, invites))
+        Ok((devices, invites, removed_stale))
     })
     .await?;
+
+    for stale_name in removed_stale {
+        let _ = sessions::terminate_device_sessions(
+            &paths_for_sessions,
+            &stale_name,
+            sessions::DEFAULT_TERMINATE_GRACE,
+        )
+        .await;
+    }
 
     let devices = raw_devices
         .into_iter()
@@ -598,7 +675,8 @@ struct RemoveArgs {
     /// Paired device name to remove, as `device.list` shows it. Give `name` or `id`, not both.
     #[serde(default)]
     name: Option<String>,
-    /// Pending invite id to revoke, as `device.list` shows it. Give `name` or `id`, not both.
+    /// Paired device pairing id or pending invite id to remove, as `device.list` shows it. Give
+    /// `name` or `id`, not both.
     #[serde(default)]
     id: Option<String>,
     /// Remove a Legion device or invite line belonging to another or missing Legion home (owner
@@ -636,22 +714,22 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 )
                 .with_hint("Use a device name from `device.list`."));
             }
-            RemoveTarget::Device(name)
+            RemoveTarget::DeviceName(name)
         }
         (None, Some(id)) => {
             validate_invite_id(&id)?;
-            RemoveTarget::Invite(id)
+            RemoveTarget::Id(id)
         }
         (Some(_), Some(_)) => {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                "Give either `name` (a paired device) or `id` (a pending invite), not both.",
+                "Give either `name` (a paired device) or `id` (a pairing id or pending invite), not both.",
             ));
         }
         (None, None) => {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                "Give `name` (a paired device) or `id` (a pending invite) to remove.",
+                "Give `name` (a paired device) or `id` (a pairing id or pending invite) to remove.",
             )
             .with_hint("Run `device.list` to see paired devices and pending invites."));
         }
@@ -667,10 +745,16 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         .with_hint("Run `device.remove` as the owner of this machine."));
     }
     let node_file = ctx.config().get::<NodeFile>()?;
+    let policy = ctx.config().get::<Policy>()?;
+    let node_name = ctx.node_name().to_owned();
+    let valid_node_name = NodeName::try_from(node_name.clone())
+        .map(|n| n.as_str().to_owned())
+        .unwrap_or_else(|_| "node".to_owned());
     let paths = ctx.paths().clone();
     let paths_for_sessions = paths.clone();
 
-    let (mut removed, terminate_device) = blocking(move || {
+    let (mut removed, terminate_device, extra_stale) = blocking(move || {
+        let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
         let caller_account = caller_account_for_target(&target)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
@@ -682,16 +766,286 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        let (outcome, state_to_save) =
+        let existing_devices = load_devices_raw(&paths)?;
+        let exe = legion_core::current_exe()?;
+        let shell = ForcedCommandShell::host()?;
+
+        let (outcome, state_to_save, devices_to_save, extra_stale) =
             edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
                 let mut state = load_state(&paths)?;
                 let now = Timestamp::now();
                 let (swept_auth, swept_state) = sweep(&mut auth_keys, &mut state, now);
 
+                let (mut devices_file, adopted_new) = match &existing_devices {
+                    Some(file) => (file.clone(), false),
+                    None => {
+                        let adopted = adopt_legacy_devices_from_auth_keys(
+                            &paths,
+                            &valid_node_name,
+                            &auth_keys,
+                            &target,
+                            caller_account.as_deref(),
+                            &state,
+                            &policy,
+                        );
+                        let has_any = !adopted.devices.is_empty();
+                        (adopted, has_any)
+                    }
+                };
+
+                // Local paired-device removal by pairing id (when `id` matches a live device).
+                let local_device_match_by_id = if !remove_foreign
+                    && let RemoveTarget::Id(id) = &target_item
+                    && let Some(entry) = devices_file.devices.get(id)
+                    && caller.may_manage(&entry.principal)
+                {
+                    Some(id.clone())
+                } else {
+                    None
+                };
+
+                if let Some(pairing_id) = local_device_match_by_id {
+                    let entry = devices_file.devices.remove(&pairing_id).ok_or_else(|| {
+                        ErrorBody::new(ErrorCode::Internal, "Matched device disappeared.")
+                    })?;
+                    let removed_at = next_updated_timestamp(Some(&entry.updated_at));
+                    devices_file.removed.insert(
+                        pairing_id.clone(),
+                        DeviceTombstone {
+                            name: entry.name.clone(),
+                            principal: entry.principal.clone(),
+                            paired_at: Some(entry.paired_at),
+                            paired_on: Some(entry.paired_on),
+                            removed_at,
+                            removed_on: valid_node_name.clone(),
+                        },
+                    );
+                    let lines_before = auth_keys
+                        .lines
+                        .iter()
+                        .filter(|line| {
+                            matches!(
+                                &line.kind,
+                                LineKind::Device { pairing_id: pid, home, account, .. }
+                                    if pid == &pairing_id
+                                        && line_matches_home(home.as_ref(), &paths)
+                                        && line_matches_account(
+                                            account.as_deref(),
+                                            caller_account.as_deref(),
+                                            target.windows_admin_acl,
+                                            cfg!(windows),
+                                        )
+                            )
+                        })
+                        .count();
+                    let (reconciled_auth, stale_names) = reconcile_authorized_keys_in_memory(
+                        &mut auth_keys,
+                        &devices_file,
+                        &paths,
+                        &target,
+                        caller_account.as_deref(),
+                        &exe,
+                        shell,
+                    )?;
+                    state.devices.remove(&entry.name);
+                    let write_auth = (swept_auth || reconciled_auth).then_some(auth_keys);
+                    return Ok((
+                        write_auth,
+                        (
+                            Ok((
+                                Removed {
+                                    kind: "device",
+                                    name: Some(entry.name.clone()),
+                                    id: Some(pairing_id),
+                                    principal: entry.principal,
+                                    removed: true,
+                                    lines_removed: lines_before,
+                                    sessions_ended: 0,
+                                    sessions_not_ended: false,
+                                    jobs_left_running: Vec::new(),
+                                    hint: None,
+                                },
+                                Some(entry.name),
+                            )),
+                            Some(state),
+                            Some(devices_file),
+                            stale_names,
+                        ),
+                    ));
+                }
+
                 match &target_item {
-                    RemoveTarget::Device(name) => {
+                    RemoveTarget::DeviceName(name) if !remove_foreign => {
+                        let visible_entries: Vec<(&String, &registry::FleetDevice)> = devices_file
+                            .devices
+                            .iter()
+                            .filter(|(_, entry)| caller.may_manage(&entry.principal))
+                            .collect();
+                        let matched: Vec<String> = visible_entries
+                            .iter()
+                            .filter(|(_, entry)| entry.name == *name)
+                            .map(|(id, _)| (*id).clone())
+                            .collect();
+
+                        if matched.len() > 1 {
+                            let err = ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "Multiple paired devices are named {name} (pairing ids: {}).",
+                                    matched.join(", ")
+                                ),
+                            )
+                            .with_hint(
+                                "Pass `id=<pairing_id>` from `device.list` to choose which one to remove.",
+                            );
+                            return Ok((
+                                swept_auth.then_some(auth_keys),
+                                (
+                                    Err(err),
+                                    swept_state.then_some(state),
+                                    adopted_new.then_some(devices_file),
+                                    Vec::new(),
+                                ),
+                            ));
+                        }
+
+                        if let Some(pairing_id) = matched.into_iter().next() {
+                            let entry =
+                                devices_file.devices.remove(&pairing_id).ok_or_else(|| {
+                                    ErrorBody::new(
+                                        ErrorCode::Internal,
+                                        "Matched device disappeared.",
+                                    )
+                                })?;
+                            let removed_at = next_updated_timestamp(Some(&entry.updated_at));
+                            devices_file.removed.insert(
+                                pairing_id.clone(),
+                                DeviceTombstone {
+                                    name: entry.name.clone(),
+                                    principal: entry.principal.clone(),
+                                    paired_at: Some(entry.paired_at),
+                                    paired_on: Some(entry.paired_on),
+                                    removed_at,
+                                    removed_on: valid_node_name.clone(),
+                                },
+                            );
+                            let lines_before = auth_keys
+                                .lines
+                                .iter()
+                                .filter(|line| {
+                                    matches!(
+                                        &line.kind,
+                                        LineKind::Device { pairing_id: pid, home, account, .. }
+                                            if pid == &pairing_id
+                                                && line_matches_home(home.as_ref(), &paths)
+                                                && line_matches_account(
+                                                    account.as_deref(),
+                                                    caller_account.as_deref(),
+                                                    target.windows_admin_acl,
+                                                    cfg!(windows),
+                                                )
+                                    )
+                                })
+                                .count();
+                            let (reconciled_auth, stale_names) =
+                                reconcile_authorized_keys_in_memory(
+                                    &mut auth_keys,
+                                    &devices_file,
+                                    &paths,
+                                    &target,
+                                    caller_account.as_deref(),
+                                    &exe,
+                                    shell,
+                                )?;
+                            state.devices.remove(&entry.name);
+                            let write_auth = (swept_auth || reconciled_auth).then_some(auth_keys);
+                            return Ok((
+                                write_auth,
+                                (
+                                    Ok((
+                                        Removed {
+                                            kind: "device",
+                                            name: Some(entry.name.clone()),
+                                            id: Some(pairing_id),
+                                            principal: entry.principal,
+                                            removed: true,
+                                            lines_removed: lines_before,
+                                            sessions_ended: 0,
+                                            sessions_not_ended: false,
+                                            jobs_left_running: Vec::new(),
+                                            hint: None,
+                                        },
+                                        Some(entry.name),
+                                    )),
+                                    Some(state),
+                                    Some(devices_file),
+                                    stale_names,
+                                ),
+                            ));
+                        }
+
+                        // Not found locally: check whether a foreign home owns a device with this name.
+                        let foreign_match_home = if caller.is_owner() {
+                            auth_keys.lines.iter().find_map(|line| match &line.kind {
+                                LineKind::Device {
+                                    name: line_name,
+                                    home,
+                                    account,
+                                    ..
+                                } if line_name == name
+                                    && line_matches_account(
+                                        account.as_deref(),
+                                        caller_account.as_deref(),
+                                        target.windows_admin_acl,
+                                        cfg!(windows),
+                                    )
+                                    && !line_matches_home(home.as_ref(), &paths) =>
+                                {
+                                    Some(
+                                        home.as_ref()
+                                            .map(PinnedHome::display_label)
+                                            .unwrap_or_else(|| "another home".to_owned()),
+                                    )
+                                }
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        };
+                        let hint = if let Some(other_home) = foreign_match_home {
+                            format!(
+                                "Device {name} belongs to another Legion home ({other_home}); pass `foreign=true` to remove it explicitly."
+                            )
+                        } else if visible_entries.is_empty() {
+                            "There are no paired devices.".to_owned()
+                        } else {
+                            let mut known: Vec<&str> = visible_entries
+                                .iter()
+                                .map(|(_, e)| e.name.as_str())
+                                .collect();
+                            known.sort_unstable();
+                            known.dedup();
+                            format!("The paired devices are {}.", known.join(", "))
+                        };
+                        let err = ErrorBody::new(
+                            ErrorCode::NotFound,
+                            format!("There is no paired device called {name}."),
+                        )
+                        .with_hint(hint);
+                        Ok((
+                            swept_auth.then_some(auth_keys),
+                            (
+                                Err(err),
+                                swept_state.then_some(state),
+                                adopted_new.then_some(devices_file),
+                                Vec::new(),
+                            ),
+                        ))
+                    }
+                    RemoveTarget::DeviceName(name) => {
+                        // `foreign = true` (owner role only): operates directly on foreign lines in
+                        // authorized_keys without touching this home's devices.toml.
                         let mut visible_names: BTreeMap<String, String> = BTreeMap::new();
-                        let mut foreign_match_home: Option<String> = None;
                         let mut matched_principal: Option<String> = None;
                         let mut matched_lines = 0usize;
 
@@ -714,80 +1068,42 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                 }
                                 let is_this_home = line_matches_home(home.as_ref(), &paths)
                                     || (home.is_none() && state.devices.contains_key(line_name));
-                                if remove_foreign {
-                                    if is_this_home {
-                                        continue;
-                                    }
-                                    visible_names
-                                        .entry(line_name.clone())
-                                        .or_insert_with(|| principal.clone());
-                                    if line_name == name {
-                                        matched_principal.get_or_insert_with(|| principal.clone());
-                                        matched_lines += 1;
-                                    }
+                                if is_this_home {
                                     continue;
                                 }
-                                if !is_this_home {
-                                    if caller.is_owner() && line_name == name {
-                                        foreign_match_home.get_or_insert_with(|| {
-                                            home.as_ref()
-                                                .map(PinnedHome::display_label)
-                                                .unwrap_or_else(|| "another home".to_owned())
-                                        });
-                                    }
-                                    continue;
-                                }
-                                let resolved = state
-                                    .devices
-                                    .get(line_name)
-                                    .map(|m| m.principal.clone())
-                                    .unwrap_or_else(|| principal.clone());
-                                if caller.may_manage(&resolved) {
-                                    visible_names
-                                        .entry(line_name.clone())
-                                        .or_insert_with(|| resolved.clone());
-                                    if line_name == name {
-                                        matched_principal.get_or_insert(resolved);
-                                        matched_lines += 1;
-                                    }
+                                visible_names
+                                    .entry(line_name.clone())
+                                    .or_insert_with(|| principal.clone());
+                                if line_name == name {
+                                    matched_principal.get_or_insert_with(|| principal.clone());
+                                    matched_lines += 1;
                                 }
                             }
                         }
 
                         let Some(principal) = matched_principal else {
-                            let hint = if let Some(other_home) = foreign_match_home {
-                                format!(
-                                    "Device {name} belongs to another Legion home ({other_home}); pass `foreign=true` to remove it explicitly."
-                                )
-                            } else if visible_names.is_empty() {
-                                if remove_foreign {
-                                    "There are no paired devices belonging to another or missing Legion home.".to_owned()
-                                } else {
-                                    "There are no paired devices.".to_owned()
-                                }
+                            let hint = if visible_names.is_empty() {
+                                "There are no paired devices belonging to another or missing Legion home.".to_owned()
                             } else {
                                 let known: Vec<&str> =
                                     visible_names.keys().map(String::as_str).collect();
-                                if remove_foreign {
-                                    format!("The foreign paired devices are {}.", known.join(", "))
-                                } else {
-                                    format!("The paired devices are {}.", known.join(", "))
-                                }
+                                format!("The foreign paired devices are {}.", known.join(", "))
                             };
                             let err = ErrorBody::new(
                                 ErrorCode::NotFound,
-                                if remove_foreign {
-                                    format!(
-                                        "There is no paired device called {name} belonging to another or missing Legion home."
-                                    )
-                                } else {
-                                    format!("There is no paired device called {name}.")
-                                },
+                                format!(
+                                    "There is no paired device called {name} belonging to another or missing Legion home."
+                                ),
                             )
                             .with_hint(hint);
                             return Ok((
                                 swept_auth.then_some(auth_keys),
-                                (Err(err), swept_state.then_some(state)),
+                                (
+                                    Err(err),
+                                    swept_state.then_some(state),
+                                    adopted_new.then_some(devices_file),
+                                    Vec::new(),
+                                ),
                             ));
                         };
 
@@ -802,20 +1118,11 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                             target.windows_admin_acl,
                                             cfg!(windows),
                                         )
-                                        && {
-                                            let is_this_home = line_matches_home(home.as_ref(), &paths)
-                                                || (home.is_none()
-                                                    && state.devices.contains_key(line_name));
-                                            if remove_foreign { !is_this_home } else { is_this_home }
-                                        }
+                                        && !(line_matches_home(home.as_ref(), &paths)
+                                            || (home.is_none()
+                                                && state.devices.contains_key(line_name)))
                             )
                         });
-                        let terminate = if remove_foreign {
-                            None
-                        } else {
-                            state.devices.remove(name);
-                            Some(name.clone())
-                        };
                         Ok((
                             Some(auth_keys),
                             (
@@ -828,23 +1135,21 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         removed: true,
                                         lines_removed: matched_lines,
                                         sessions_ended: 0,
-                                        sessions_not_ended: remove_foreign,
+                                        sessions_not_ended: true,
                                         jobs_left_running: Vec::new(),
-                                        hint: remove_foreign.then(|| {
-                                            "Active sessions tracked under another Legion home were not ended; new SSH connections and channels are refused immediately, and if that other home still exists you can run `device.remove` from it or end any open sshd sessions manually.".to_owned()
-                                        }),
+                                        hint: Some(
+                                            "Active sessions tracked under another Legion home were not ended; new SSH connections and channels are refused immediately, and if that other home still exists you can run `device.remove` from it or end any open sshd sessions manually.".to_owned(),
+                                        ),
                                     },
-                                    terminate,
+                                    None,
                                 )),
-                                if remove_foreign {
-                                    swept_state.then_some(state)
-                                } else {
-                                    Some(state)
-                                },
+                                swept_state.then_some(state),
+                                adopted_new.then_some(devices_file),
+                                Vec::new(),
                             ),
                         ))
                     }
-                    RemoveTarget::Invite(id) => {
+                    RemoveTarget::Id(id) => {
                         let mut visible_ids: Vec<String> = Vec::new();
                         let mut foreign_match_home: Option<String> = None;
                         let mut matched_principal: Option<String> = None;
@@ -929,13 +1234,18 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                         "There is no pending invite with id {id} belonging to another or missing Legion home."
                                     )
                                 } else {
-                                    format!("There is no pending invite with id {id}.")
+                                    format!("There is no pending invite or paired device with id {id}.")
                                 },
                             )
                             .with_hint(hint);
                             return Ok((
                                 swept_auth.then_some(auth_keys),
-                                (Err(err), swept_state.then_some(state)),
+                                (
+                                    Err(err),
+                                    swept_state.then_some(state),
+                                    adopted_new.then_some(devices_file),
+                                    Vec::new(),
+                                ),
                             ));
                         };
 
@@ -982,19 +1292,28 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                 } else {
                                     Some(state)
                                 },
+                                adopted_new.then_some(devices_file),
+                                Vec::new(),
                             ),
                         ))
                     }
                 }
             })?;
         match outcome {
-            Ok(result) => {
+            Ok((result, terminate)) => {
+                if let Some(devices) = devices_to_save {
+                    save_devices_locked(&paths, &devices)?;
+                    let _ = reconcile_device_principals_locked(&paths, &devices)?;
+                }
                 if let Some(state) = state_to_save {
                     save_state(&paths, &state)?;
                 }
-                Ok(result)
+                Ok((result, terminate, extra_stale))
             }
             Err(err) => {
+                if let Some(devices) = devices_to_save {
+                    let _ = save_devices_locked(&paths, &devices);
+                }
                 if let Some(state) = state_to_save {
                     let _ = save_state(&paths, &state);
                 }
@@ -1011,6 +1330,16 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
             sessions::DEFAULT_TERMINATE_GRACE,
         )
         .await;
+        for stale in extra_stale {
+            if stale != device_name {
+                let _ = sessions::terminate_device_sessions(
+                    &paths_for_sessions,
+                    &stale,
+                    sessions::DEFAULT_TERMINATE_GRACE,
+                )
+                .await;
+            }
+        }
         let paths_for_jobs = paths_for_sessions.clone();
         let principal_for_jobs = removed.principal.clone();
         removed.jobs_left_running = blocking(move || {
@@ -1132,8 +1461,8 @@ fn resolve_default_ssh_user(
 }
 
 enum RemoveTarget {
-    Device(String),
-    Invite(String),
+    DeviceName(String),
+    Id(String),
 }
 
 fn internal_time(error: impl std::fmt::Display) -> ErrorBody {
@@ -2091,6 +2420,8 @@ role = "owner"
             let record = InviteRecord {
                 id: id.clone(),
                 principal: "phone".to_owned(),
+                role: None,
+                device_name: None,
                 created: format_rfc3339(now),
                 expires: format_rfc3339(exp),
                 fingerprint: eph.fingerprint.clone(),
