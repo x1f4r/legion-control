@@ -32,7 +32,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal"] }
 
 # These re-execute their own binary as the child processes they need, so they cannot use the
 # standard harness, which writes to stdout before any test code runs.

@@ -5,6 +5,10 @@
 //! replacement characters, so the incomplete tail is held back until the next read completes it.
 
 /// Decodes one stream's chunks into text.
+///
+/// Fed a stream in any number of pieces and then finished, it returns exactly what
+/// `String::from_utf8_lossy` returns for the whole stream, which is how the captured output is
+/// decoded, so the events and the result agree.
 #[derive(Debug, Default)]
 pub(super) struct Decoder {
     pending: Vec<u8>,
@@ -12,34 +16,46 @@ pub(super) struct Decoder {
 
 impl Decoder {
     /// The text `bytes` complete, holding back a character cut off at the end. Bytes that are not
-    /// UTF-8 become U+FFFD, as they do in the captured output.
+    /// UTF-8 become U+FFFD.
     pub(super) fn push(&mut self, bytes: &[u8]) -> String {
         self.pending.extend_from_slice(bytes);
-        let keep = incomplete_tail(&self.pending);
-        let complete = self.pending.len() - keep;
-        let text = String::from_utf8_lossy(&self.pending[..complete]).into_owned();
-        self.pending.drain(..complete);
+        let mut text = String::new();
+        let mut rest: &[u8] = &self.pending;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    rest = &[];
+                    break;
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    text.push_str(&String::from_utf8_lossy(valid));
+                    match error.error_len() {
+                        // The input ends part way through a character the next read may finish.
+                        None => {
+                            rest = after;
+                            break;
+                        }
+                        Some(invalid) => {
+                            text.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[invalid..];
+                        }
+                    }
+                }
+            }
+        }
+        self.pending = rest.to_vec();
         text
     }
-}
 
-/// How many bytes at the end of `bytes` begin a character that is not finished yet.
-fn incomplete_tail(bytes: &[u8]) -> usize {
-    // A UTF-8 character is at most four bytes, so only the last three can be an unfinished start.
-    for back in 1..=bytes.len().min(3) {
-        let byte = bytes[bytes.len() - back];
-        if byte & 0b1100_0000 == 0b1000_0000 {
-            continue;
-        }
-        let needed = match byte {
-            0b1100_0000..=0b1101_1111 => 2,
-            0b1110_0000..=0b1110_1111 => 3,
-            0b1111_0000..=0b1111_0111 => 4,
-            _ => return 0,
-        };
-        return if needed > back { back } else { 0 };
+    /// What is still held back once the stream has ended: a character it never finished, as
+    /// U+FFFD.
+    pub(super) fn finish(&mut self) -> String {
+        let text = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        text
     }
-    0
 }
 
 #[cfg(test)]
@@ -66,5 +82,30 @@ mod tests {
             "\u{fffd}".repeat(4)
         );
         assert_eq!(decoder.push(b"x"), "x");
+    }
+
+    #[test]
+    fn a_character_the_stream_never_finishes_is_flushed_at_the_end() {
+        let mut decoder = Decoder::default();
+        assert_eq!(decoder.push(b"ok\xc3"), "ok");
+        assert_eq!(decoder.finish(), "\u{fffd}");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    /// Every way of cutting a stream of awkward bytes decodes as the whole stream does.
+    #[test]
+    fn any_split_decodes_as_the_whole_stream_does() {
+        let bytes: &[u8] = b"a\xc3\xa9\xc0\x80\xe0\x80\x80\xed\xa0\x80\xf0\x9f\x98\x80\xf4\x90\x80\x80\xf5\xff\xe2\x82";
+        let whole = String::from_utf8_lossy(bytes).into_owned();
+        for first in 0..=bytes.len() {
+            for second in first..=bytes.len() {
+                let mut decoder = Decoder::default();
+                let mut text = decoder.push(&bytes[..first]);
+                text.push_str(&decoder.push(&bytes[first..second]));
+                text.push_str(&decoder.push(&bytes[second..]));
+                text.push_str(&decoder.finish());
+                assert_eq!(text, whole, "cut at {first} and {second}");
+            }
+        }
     }
 }

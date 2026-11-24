@@ -1,22 +1,26 @@
 //! `exec`: running a command that finishes, with its output captured and bounded.
 //!
 //! The process runs through `legion-os`, which contains it with everything it starts (a process
-//! group, a job object), so a timeout or a cancel stops the whole tree. The run is spawned onto
-//! the runtime rather than awaited in place: when a caller cancels, the node drops the tool's
-//! future at once, and an awaited run would be dropped with it, killing only the direct child and
-//! leaving its descendants behind. Spawned, the run sees the cancel, stops the tree the patient
-//! way, and only then finishes.
+//! group, a job object), so a timeout or a cancel stops the whole tree. A cancelled call is not
+//! answered until that tree is gone: the run stops it, asking first and forcing after
+//! [`KILL_GRACE`], within the [`CANCEL_GRACE`] the node waits for, and only then does the tool
+//! return. The run is spawned onto the runtime so that a future dropped anyway (the grace ran out,
+//! the session ended) cannot take the run with it half way and leave descendants behind.
+//!
+//! Its result follows the rule `sys` states for both families: a field without a value is left
+//! out, never `null`.
 
 mod text;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind};
-use legion_core::{Access, Ctx, Registry, ToolError};
+use legion_core::{Access, CANCEL_GRACE, CancellationToken, Ctx, Registry, ToolError};
 use legion_os::OsError;
 use legion_os::run::{OutputChunk, OutputStream, RunOptions, RunOutput, run};
 use legion_os::shell::CommandSpec;
@@ -30,7 +34,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "exec.run",
         Effect::Exec,
-        "Run a command that finishes and return its exit code and output. Give `argv` to run a program with exactly these arguments, or `cmd` to hand one line to the platform shell (sh on Linux and macOS, PowerShell on Windows). The command is stopped, with everything it started, when `timeout_s` passes or the call is cancelled; a non-zero exit or a timeout is reported in the result, not as an error. Output is streamed as stdout and stderr events while it runs and capped at `max_output` bytes per stream, keeping the start and the end. Not for anything meant to keep running, such as a server or a watcher: that belongs to job.start.",
+        "Run a command that finishes and return its exit code and output. Give `argv` to run a program with exactly these arguments, or `cmd` to hand one line to the platform shell (sh on Linux and macOS, PowerShell on Windows). The command is stopped, with everything it started, when `timeout_s` passes or the call is cancelled; a non-zero exit or a timeout is reported in the result, not as an error. Output is streamed as stdout and stderr events while it runs and capped at `max_output` bytes per stream, keeping the start and the end. The command gets legion's environment (except legion's own LEGION_* settings) plus `env`, as a command typed by the account would. Not for anything meant to keep running, such as a server or a watcher: that belongs to job.start. A command can do anything the account can, so a role's `paths` decide only the directory it starts in (the first of them when `cwd` is absent), and a role that must stay confined should not be given exec.",
         run_command,
     );
 }
@@ -47,7 +51,8 @@ struct RunArgs {
     /// or `cmd`, not both.
     #[serde(default)]
     argv: Option<Vec<String>>,
-    /// The absolute directory to run in; legion's own when absent.
+    /// The absolute directory to run in. When absent: the first of the role's `paths` if it has
+    /// any, otherwise legion's own.
     #[serde(default)]
     cwd: Option<String>,
     /// Environment variables to set on top of legion's own.
@@ -89,6 +94,11 @@ pub struct Ran {
     pub duration_ms: u64,
 }
 
+/// How long a command asked to stop (on a timeout or a cancel) has before it is forced. Well inside
+/// the node's [`CANCEL_GRACE`], so a cancelled call answers after its tree is gone.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+const _: () = assert!(KILL_GRACE.as_millis() * 2 < CANCEL_GRACE.as_millis());
+
 /// The default and the largest `timeout_s`.
 const TIMEOUT_S: (f64, f64) = (120.0, 3600.0);
 /// The default and the largest `max_output`.
@@ -98,12 +108,11 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
     let (command, program) = command_of(args.cmd, args.argv)?;
     let timeout = timeout_of(args.timeout_s)?;
     let limit = max_output_of(args.max_output)?;
-    let env = env_of(args.env.unwrap_or_default())?;
-    let cwd = args
-        .cwd
-        .as_deref()
-        .map(|cwd| ctx.grant().check_path(cwd, Access::Read))
-        .transpose()?;
+    let env = env_of(
+        args.env.unwrap_or_default(),
+        std::env::vars_os().map(|(name, _)| name),
+    )?;
+    let cwd = start_dir(ctx, args.cwd).await?;
 
     // Each stream is forwarded as events until `limit` bytes have gone out, so a flood of output
     // costs the caller no more than the captured text does.
@@ -124,15 +133,16 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
         })
     };
 
-    // Dropped with this future, whether it finished or the node gave up on it, which cancels the
-    // run and so stops the process tree.
-    let cancel = ctx.cancel_token().child_token();
+    // The run's own token, cancelled when the call is (which the loop below watches for) and when
+    // this future is dropped without having seen it through.
+    let cancel = CancellationToken::new();
     let _stop_on_drop = cancel.clone().drop_guard();
     let mut options = RunOptions::new(command)
         .envs(env)
         .timeout(timeout)
         .capture_limit(limit)
-        .cancel(cancel)
+        .kill_grace(KILL_GRACE)
+        .cancel(cancel.clone())
         .on_output(forward);
     if let Some(cwd) = &cwd {
         options = options.cwd(cwd);
@@ -143,27 +153,34 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
     let mut running = tokio::spawn(run(options));
 
     let mut decoders: [text::Decoder; 2] = Default::default();
-    let mut emit = |chunk: OutputChunk| {
-        let index = stream_index(chunk.stream);
-        let text = decoders[index].push(&chunk.bytes);
+    let kinds = [EventKind::Stdout, EventKind::Stderr];
+    let mut emit = |stream: OutputStream, bytes: Option<&[u8]>| {
+        let index = stream_index(stream);
+        let text = match bytes {
+            Some(bytes) => decoders[index].push(bytes),
+            None => decoders[index].finish(),
+        };
         if !text.is_empty() {
-            let kind = match chunk.stream {
-                OutputStream::Stdout => EventKind::Stdout,
-                OutputStream::Stderr => EventKind::Stderr,
-            };
-            ctx.emit(kind, Value::String(text));
+            ctx.emit(kinds[index], Value::String(text));
         }
     };
+    // On a cancel the run is told to stop the tree, and is still awaited: it returns once the tree
+    // is gone, so nothing the command started outlives the call's answer.
     let finished = loop {
         tokio::select! {
-            Some(chunk) = receiver.recv() => emit(chunk),
+            Some(chunk) = receiver.recv() => emit(chunk.stream, Some(&chunk.bytes)),
             finished = &mut running => break finished,
+            () = ctx.cancelled(), if !cancel.is_cancelled() => cancel.cancel(),
         }
     };
     // Everything read before the run returned is delivered before the result.
     while let Ok(chunk) = receiver.try_recv() {
-        emit(chunk);
+        emit(chunk.stream, Some(&chunk.bytes));
     }
+    // A character the stream never finished is a replacement character in the captured text, and
+    // so in the events too.
+    emit(OutputStream::Stdout, None);
+    emit(OutputStream::Stderr, None);
 
     let output = finished
         .map_err(|error| {
@@ -180,6 +197,30 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
         ));
     }
     Ok(ran(output))
+}
+
+/// Where the command starts: `cwd` when given, checked like any path a tool is handed; otherwise
+/// the first of the role's roots when it has any, and legion's own directory when it has none.
+///
+/// A role's `paths` cannot keep a command inside them, since a command can go anywhere the account
+/// can; starting it in a root keeps a cooperating caller where it was meant to work.
+///
+/// Checking a path resolves every directory on the way, which waits on the file system, so it runs
+/// on the blocking pool.
+async fn start_dir(ctx: &Ctx, cwd: Option<String>) -> Result<Option<PathBuf>, ErrorBody> {
+    let grant = ctx.grant().clone();
+    let first_root = || grant.roots().and_then(|roots| roots.into_iter().next());
+    let Some(dir) = cwd.or_else(first_root) else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || grant.check_path(dir, Access::Read).map(Some))
+        .await
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Checking the working directory stopped unexpectedly: {error}."),
+            )
+        })?
 }
 
 fn ran(output: RunOutput) -> Ran {
@@ -229,6 +270,12 @@ fn command_of(
         (Some(_), Some(_)) => Err(invalid("give `cmd` or `argv`, not both.")),
         (None, None) => Err(invalid("give the command to run, as `cmd` or `argv`.")),
         (Some(cmd), None) if cmd.trim().is_empty() => Err(invalid("`cmd` is empty.")),
+        (Some(cmd), None) if cmd.contains('\0') => Err(invalid(
+            "`cmd` holds a NUL character, which no command line can carry.",
+        )),
+        (None, Some(argv)) if argv.iter().any(|arg| arg.contains('\0')) => Err(invalid(
+            "an argument in `argv` holds a NUL character, which no command line can carry.",
+        )),
         (Some(cmd), None) => {
             let program = cmd.split_whitespace().next().unwrap_or_default().to_owned();
             Ok((CommandSpec::shell(cmd), program))
@@ -278,8 +325,16 @@ fn max_output_of(bytes: Option<u64>) -> Result<usize, ErrorBody> {
     Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
 }
 
-fn env_of(env: BTreeMap<String, String>) -> Result<Vec<(OsString, OsString)>, ErrorBody> {
-    env.into_iter()
+/// The variables the command gets on top of legion's own: the caller's, and an empty value for each
+/// of legion's own `LEGION_*` settings the caller did not set, which are about this node and not
+/// for a command it runs (legion reads an empty one as unset). `inherited` names the variables
+/// legion has.
+fn env_of(
+    env: BTreeMap<String, String>,
+    inherited: impl IntoIterator<Item = OsString>,
+) -> Result<Vec<(OsString, OsString)>, ErrorBody> {
+    let mut vars = env
+        .into_iter()
         .map(|(name, value)| {
             if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
                 Err(ErrorBody::new(
@@ -291,7 +346,14 @@ fn env_of(env: BTreeMap<String, String>) -> Result<Vec<(OsString, OsString)>, Er
                 Ok((OsString::from(name), OsString::from(value)))
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, ErrorBody>>()?;
+    let own: Vec<OsString> = inherited
+        .into_iter()
+        .filter(|name| name.to_string_lossy().starts_with("LEGION_"))
+        .filter(|name| vars.iter().all(|(set, _)| set != name))
+        .collect();
+    vars.extend(own.into_iter().map(|name| (name, OsString::new())));
+    Ok(vars)
 }
 
 /// Why a command did not start, in the closed codes.
@@ -316,6 +378,10 @@ fn run_error(error: OsError, program: &str, cwd: Option<&std::path::Path>) -> Er
             )
             .with_hint("Give a directory as `cwd`.")
         }
+        OsError::Unsupported { detail } => ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("This system cannot run {program}: {detail}."),
+        ),
         OsError::PermissionDenied { detail, .. } => ErrorBody::new(
             ErrorCode::Failed,
             format!("The system refused to run {program}: {detail}."),
@@ -355,6 +421,22 @@ mod tests {
             code(command_of(None, Some(vec![String::new()]))).err(),
             Some(ErrorCode::InvalidArgs)
         );
+        assert_eq!(
+            code(command_of(None, Some(vec!["git".into(), "a\0b".into()]))).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            code(command_of(Some("echo a\0b".into()), None)).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        let unsupported = run_error(
+            OsError::Unsupported {
+                detail: "no shell".into(),
+            },
+            "x",
+            None,
+        );
+        assert_eq!(unsupported.code, ErrorCode::Unsupported);
         let (spec, program) = command_of(None, Some(vec!["git".into(), "a b".into()])).unwrap();
         assert_eq!(spec, CommandSpec::argv("git", ["a b"]));
         assert_eq!(program, "git");
@@ -373,14 +455,29 @@ mod tests {
         assert_eq!(max_output_of(None).unwrap(), 65536);
         assert_eq!(max_output_of(Some(0)).unwrap(), 0);
         assert!(max_output_of(Some(1024 * 1024 + 1)).is_err());
-        assert!(env_of(BTreeMap::from([("A=B".into(), "x".into())])).is_err());
-        assert!(env_of(BTreeMap::from([(String::new(), "x".into())])).is_err());
+        let none = || std::iter::empty::<OsString>();
+        assert!(env_of(BTreeMap::from([("A=B".into(), "x".into())]), none()).is_err());
+        assert!(env_of(BTreeMap::from([(String::new(), "x".into())]), none()).is_err());
         assert_eq!(
-            env_of(BTreeMap::from([("A".into(), "x=y".into())]))
+            env_of(BTreeMap::from([("A".into(), "x=y".into())]), none())
                 .unwrap()
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn legion_own_settings_are_emptied_unless_the_caller_sets_them() {
+        let inherited = ["PATH", "LEGION_HOME", "LEGION_TOKEN"].map(OsString::from);
+        let vars = env_of(
+            BTreeMap::from([("LEGION_HOME".into(), "/home/me/other".into())]),
+            inherited,
+        )
+        .unwrap();
+        let vars: BTreeMap<OsString, OsString> = vars.into_iter().collect();
+        assert_eq!(vars.len(), 2, "{vars:?}");
+        assert_eq!(vars[&OsString::from("LEGION_HOME")], "/home/me/other");
+        assert_eq!(vars[&OsString::from("LEGION_TOKEN")], "");
     }
 
     #[test]
