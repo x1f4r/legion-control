@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic, write_atomic_from_reader};
 use legion_os::detach::{
-    DetachHandle, DetachOptions, detached_active, spawn_detached, stop_detached,
+    DetachHandle, DetachOptions, ScopeProbeOverride, detached_active, spawn_detached,
+    spawn_detached_for_test, stop_detached,
 };
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid::{self, ProcessId};
@@ -524,7 +525,11 @@ fn helper_detach_fd_parent(args: &[String]) -> ExitCode {
     let handle_file = PathBuf::from(&args[0]);
     let report_file = args[1].clone();
     let canary_file = PathBuf::from(&args[2]);
-    let disable_systemd = args.get(3).is_some_and(|s| s == "--no-systemd");
+    let scope_override = match args.get(3).map(String::as_str) {
+        Some("--no-systemd") => ScopeProbeOverride::ForceNoSystemd,
+        Some("--no-linger") => ScopeProbeOverride::ForceLingerDisabled,
+        _ => ScopeProbeOverride::Auto,
+    };
 
     // Verify fd 3 really is open and points to `canary_file` in the parent calling spawn_detached.
     #[cfg(target_os = "linux")]
@@ -545,22 +550,12 @@ fn helper_detach_fd_parent(args: &[String]) -> ExitCode {
         .build()
         .expect("helper tokio runtime");
 
-    let mut opts = DetachOptions::new(CommandSpec::argv(current_exe(), [report_file]))
+    let opts = DetachOptions::new(CommandSpec::argv(current_exe(), [report_file]))
         .name("fd-leak-check")
         .env(HELPER_ENV, "report_open_fds");
-    if disable_systemd {
-        // Point XDG_RUNTIME_DIR at a nonexistent path so `systemd-run --user` is unreachable and
-        // `spawn_detached` exercises the direct `setsid` branch too.
-        opts = opts
-            .env("XDG_RUNTIME_DIR", "/nonexistent-legion-fd-test-dir")
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                "unix:path=/nonexistent-legion-bus",
-            );
-    }
 
     let handle = rt
-        .block_on(spawn_detached(opts))
+        .block_on(spawn_detached_for_test(opts, scope_override))
         .expect("spawn_detached failed inside detach_fd_parent");
 
     let serialized = serde_json::to_string(&handle).expect("failed to serialize DetachHandle");
@@ -612,6 +607,46 @@ async fn wait_for_file(path: &Path, timeout: Duration) -> String {
             "timed out waiting for file {}",
             path.display()
         );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_detached_file(
+    path: &Path,
+    timeout: Duration,
+    handle: &DetachHandle,
+    log_paths: &[&Path],
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(content) = fs::read_to_string(path)
+            && !content.trim().is_empty()
+        {
+            return content;
+        }
+        if Instant::now() >= deadline {
+            let root_alive = procid::is_alive(&handle.process);
+            let active = detached_active(handle).await;
+            let mut logs_summary = String::new();
+            for log_path in log_paths {
+                let tail = match fs::read_to_string(log_path) {
+                    Ok(text) => {
+                        let mut start = text.len().saturating_sub(2048);
+                        while start < text.len() && !text.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        text[start..].to_owned()
+                    }
+                    Err(err) => format!("<unreadable: {err}>"),
+                };
+                logs_summary.push_str(&format!("\n--- log {} ---\n{tail}", log_path.display()));
+            }
+            panic!(
+                "timed out waiting for file {}\nhandle: {handle:?}\nwarnings: {:?}\nroot_alive: {root_alive}\ndetached_active: {active:?}{logs_summary}",
+                path.display(),
+                handle.warnings
+            );
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -1001,13 +1036,28 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
         handle.process
     );
 
-    let subchild_id =
-        parse_procid(&wait_for_file(&subchild_id_file, Duration::from_secs(10)).await);
+    let subchild_id = parse_procid(
+        &wait_for_detached_file(
+            &subchild_id_file,
+            Duration::from_secs(10),
+            &handle,
+            &[&stdout_log, &stderr_log],
+        )
+        .await,
+    );
     assert!(procid::is_alive(&handle.process));
     assert!(procid::is_alive(&subchild_id));
 
     #[cfg(unix)]
-    let setsid_id = parse_procid(&wait_for_file(&setsid_id_file, Duration::from_secs(5)).await);
+    let setsid_id = parse_procid(
+        &wait_for_detached_file(
+            &setsid_id_file,
+            Duration::from_secs(5),
+            &handle,
+            &[&stdout_log, &stderr_log],
+        )
+        .await,
+    );
 
     let out_log = fs::read_to_string(&stdout_log).unwrap();
     let err_log = fs::read_to_string(&stderr_log).unwrap();
@@ -1061,8 +1111,8 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
         .await
         .unwrap();
 
-    let _ = wait_for_file(&id1_file, Duration::from_secs(5)).await;
-    let _ = wait_for_file(&id2_file, Duration::from_secs(5)).await;
+    let _ = wait_for_detached_file(&id1_file, Duration::from_secs(5), &h1, &[]).await;
+    let _ = wait_for_detached_file(&id2_file, Duration::from_secs(5), &h2, &[]).await;
     assert!(procid::is_alive(&h1.process));
     assert!(procid::is_alive(&h2.process));
 
@@ -1078,6 +1128,38 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
         .await
         .unwrap();
     assert_ne!(fast.process, h1.process);
+
+    // Exercise the linger-disabled `setsid` fallback branch in the same test run.
+    #[cfg(target_os = "linux")]
+    {
+        let linger_id_file = dir.path().join("dup-no-linger.pid");
+        let linger_id_str = linger_id_file.to_string_lossy().into_owned();
+        let (linger_spec, linger_env) = helper_spec("sleep", &["30000", &linger_id_str]);
+        let h_no_linger = spawn_detached_for_test(
+            DetachOptions::new(linger_spec).name("dup").envs(linger_env),
+            ScopeProbeOverride::ForceLingerDisabled,
+        )
+        .await
+        .unwrap();
+        assert!(h_no_linger.systemd_unit.is_none());
+        if h1.systemd_unit.is_some() {
+            assert!(
+                h_no_linger
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("loginctl enable-linger")),
+                "expected linger warning when user manager is reachable, got: {:?}",
+                h_no_linger.warnings
+            );
+        }
+        let _ = wait_for_detached_file(&linger_id_file, Duration::from_secs(5), &h_no_linger, &[])
+            .await;
+        let rl = stop_detached(&h_no_linger, Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(rl.all_gone);
+        assert!(!procid::is_alive(&h_no_linger.process));
+    }
 
     // Stopping the second handle must not stop the first.
     let r2 = stop_detached(&h2, Duration::from_millis(300))
@@ -1105,9 +1187,14 @@ async fn test_detach_does_not_inherit_extra_open_file_descriptors() {
         let canary_str = canary.to_string_lossy().into_owned();
         let exe_str = current_exe().to_string_lossy().into_owned();
 
-        // Exercise both the default Linux branch (`systemd-run --user --scope` when available)
-        // and the direct `setsid` fallback branch (`--no-systemd`).
-        for (label, extra_flag) in [("systemd", ""), ("setsid", "--no-systemd")] {
+        // Exercise every Linux branch in one run: default (`systemd-run --user --scope` when
+        // available, else `setsid`), direct `setsid` (`--no-systemd`), and linger-disabled
+        // fallback (`--no-linger`).
+        for (label, extra_flag) in [
+            ("default", ""),
+            ("no-systemd", "--no-systemd"),
+            ("no-linger", "--no-linger"),
+        ] {
             let handle_file = dir.path().join(format!("fd-handle-{label}.json"));
             let report_file = dir.path().join(format!("fd-report-{label}.txt"));
             let handle_str = handle_file.to_string_lossy().into_owned();
@@ -1139,7 +1226,8 @@ async fn test_detach_does_not_inherit_extra_open_file_descriptors() {
 
             let handle_json = wait_for_file(&handle_file, Duration::from_secs(5)).await;
             let handle: DetachHandle = serde_json::from_str(&handle_json).unwrap();
-            let fd_report = wait_for_file(&report_file, Duration::from_secs(5)).await;
+            let fd_report =
+                wait_for_detached_file(&report_file, Duration::from_secs(5), &handle, &[]).await;
 
             assert!(
                 !fd_report.contains("leaked-canary-fd3.txt"),
@@ -1158,38 +1246,36 @@ async fn test_detach_does_not_inherit_extra_open_file_descriptors() {
 async fn test_detach_active_tracks_root_and_surviving_descendants() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Test both the default detach mode (systemd scope on Linux, direct/WMI on Windows) and
-    // the non-scope `setsid` path on Linux.
+    // Test every Linux branch in the same run (systemd scope when available + both setsid
+    // fallbacks), and the default mode on other platforms.
     #[cfg(target_os = "linux")]
-    let modes: &[(&str, bool)] = &[("default", false), ("setsid", true)];
+    let modes: &[(&str, ScopeProbeOverride)] = &[
+        ("default", ScopeProbeOverride::Auto),
+        ("no-systemd", ScopeProbeOverride::ForceNoSystemd),
+        ("no-linger", ScopeProbeOverride::ForceLingerDisabled),
+    ];
     #[cfg(not(target_os = "linux"))]
-    let modes: &[(&str, bool)] = &[("default", false)];
+    let modes: &[(&str, ScopeProbeOverride)] = &[("default", ScopeProbeOverride::Auto)];
 
-    for &(label, disable_systemd) in modes {
+    for &(label, scope_override) in modes {
         let root_id_file = dir.path().join(format!("active-root-{label}.pid"));
         let child_id_file = dir.path().join(format!("active-child-{label}.pid"));
         let root_str = root_id_file.to_string_lossy().into_owned();
         let child_str = child_id_file.to_string_lossy().into_owned();
 
         let (spec, env_vars) = helper_spec("orphan_root_exit", &[&root_str, &child_str]);
-        let mut opts = DetachOptions::new(spec)
+        let opts = DetachOptions::new(spec)
             .name(format!("active-{label}"))
             .envs(env_vars);
-        if disable_systemd {
-            opts = opts
-                .env("XDG_RUNTIME_DIR", "/nonexistent-legion-active-test-dir")
-                .env(
-                    "DBUS_SESSION_BUS_ADDRESS",
-                    "unix:path=/nonexistent-legion-bus",
-                );
-        }
 
-        let handle = spawn_detached(opts).await.unwrap();
-        if disable_systemd {
+        let handle = spawn_detached_for_test(opts, scope_override).await.unwrap();
+        if scope_override != ScopeProbeOverride::Auto {
             assert!(handle.systemd_unit.is_none());
         }
 
-        let child_id = parse_procid(&wait_for_file(&child_id_file, Duration::from_secs(5)).await);
+        let child_id = parse_procid(
+            &wait_for_detached_file(&child_id_file, Duration::from_secs(5), &handle, &[]).await,
+        );
 
         // Wait for the root process to finish exiting while its child keeps running.
         let deadline = Instant::now() + Duration::from_secs(5);

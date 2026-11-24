@@ -21,7 +21,7 @@ use crate::procid::{self, KillTreeReport};
 use crate::shell::{ResolvedCommand, find_executable_in_paths};
 use crate::{OsError, Result};
 
-use super::{DetachHandle, DetachOptions, open_append_stdio};
+use super::{DetachHandle, DetachOptions, ScopeProbeOverride, open_append_stdio};
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_USER_SCOPE_ARGS: &[&str] = &["--user", "--scope", "--quiet", "--collect"];
@@ -87,22 +87,50 @@ impl ScopeStderrCapture<'_> {
     }
 }
 
+/// Build a POSIX-portable `/bin/sh -c` exec shim that redirects fd 2 to `/dev/null` before
+/// `exec`-ing `"$@"` in the same PID.
+///
+/// Avoids `exec --` because POSIX `exec` takes no options and `dash` (Ubuntu's `/bin/sh`) tries
+/// to execute a command literally named `--`. Falls back to `exec env -- "$@"` only when the
+/// executable name itself starts with `-` so `bash` does not parse it as an `exec` flag.
+#[cfg(target_os = "linux")]
+fn scope_null_stderr_shim_script(program: &OsStr) -> &'static str {
+    use std::os::unix::ffi::OsStrExt;
+    if program.as_bytes().starts_with(b"-") {
+        "exec 2>/dev/null; exec env -- \"$@\""
+    } else {
+        "exec 2>/dev/null; exec \"$@\""
+    }
+}
+
 pub(super) async fn spawn_detached(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
+    scope_override: ScopeProbeOverride,
 ) -> Result<DetachHandle> {
     let mut warnings = Vec::new();
-    let use_systemd_scope = if systemd_user_scope_available(options).await {
-        if systemd_linger_enabled().await {
-            true
-        } else {
-            // Without lingering, logind tears down `systemd --user` ~10 s after logout and takes
-            // any transient user scope with it; fall back to `setsid` and warn the caller.
-            warnings.push(super::LINGER_DISABLED_WARNING.to_owned());
+    let use_systemd_scope = match scope_override {
+        ScopeProbeOverride::ForceNoSystemd => false,
+        ScopeProbeOverride::ForceLingerDisabled => {
+            if systemd_user_scope_available(options).await {
+                warnings.push(super::LINGER_DISABLED_WARNING.to_owned());
+            }
             false
         }
-    } else {
-        false
+        ScopeProbeOverride::Auto => {
+            if systemd_user_scope_available(options).await {
+                if systemd_linger_enabled().await {
+                    true
+                } else {
+                    // Without lingering, logind tears down `systemd --user` ~10 s after logout and takes
+                    // any transient user scope with it; fall back to `setsid` and warn the caller.
+                    warnings.push(super::LINGER_DISABLED_WARNING.to_owned());
+                    false
+                }
+            } else {
+                false
+            }
+        }
     };
 
     // `systemd-run` itself exists even when the target executable does not, so validate the
@@ -153,7 +181,8 @@ pub(super) async fn spawn_detached(
                     } else {
                         "sh"
                     };
-                    cmd.args([sh, "-c", "exec 2>/dev/null; exec -- \"$@\"", "_"]);
+                    let shim = scope_null_stderr_shim_script(&resolved.program);
+                    cmd.args([sh, "-c", shim, "_"]);
                 }
                 cmd.arg(&resolved.program);
                 cmd.args(&resolved.args);
@@ -336,23 +365,26 @@ async fn systemd_scope_active(unit: &str, root_process: &ProcessId) -> Result<bo
         }
 
         let uid = nix::unistd::Uid::current().as_raw();
-        let app_slice = Path::new("/sys/fs/cgroup")
+        let user_service = Path::new("/sys/fs/cgroup")
             .join("user.slice")
             .join(format!("user-{uid}.slice"))
-            .join(format!("user@{uid}.service"))
-            .join("app.slice");
+            .join(format!("user@{uid}.service"));
+        let app_slice = user_service.join("app.slice");
 
-        if !app_slice.is_dir() {
+        if !app_slice.is_dir() && !user_service.is_dir() {
             // Non-standard slice or cgroup v1 layout; fall back to `systemctl --user show`.
             return None;
         }
 
-        let scope_dir = app_slice.join(&unit_owned);
-        if !scope_dir.is_dir() {
-            // Standard cgroup v2 user app.slice exists and the transient scope directory is gone
+        let scope_dir = if app_slice.join(&unit_owned).is_dir() {
+            app_slice.join(&unit_owned)
+        } else if user_service.join(&unit_owned).is_dir() {
+            user_service.join(&unit_owned)
+        } else {
+            // Standard cgroup v2 user hierarchy exists and the transient scope directory is gone
             // (and the root process is already dead).
             return Some(false);
-        }
+        };
 
         // Check `cgroup.procs` for any live (non-zombie) process directly inside the scope.
         if let Ok(procs) = std::fs::read_to_string(scope_dir.join("cgroup.procs")) {
@@ -887,6 +919,38 @@ fn ensure_target_exists(program: &OsStr, options: &DetachOptions) -> Result<()> 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_null_stderr_shim_is_posix_portable_and_silences_target_stderr() {
+        let normal = scope_null_stderr_shim_script(OsStr::new("/usr/bin/env"));
+        assert!(
+            !normal.contains("exec --"),
+            "dash rejects `exec --`: {normal}"
+        );
+        assert_eq!(normal, "exec 2>/dev/null; exec \"$@\"");
+
+        let leading_dash = scope_null_stderr_shim_script(OsStr::new("-weird"));
+        assert_eq!(leading_dash, "exec 2>/dev/null; exec env -- \"$@\"");
+
+        let out = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                normal,
+                "_",
+                "/bin/sh",
+                "-c",
+                "echo stdout-ok; echo stderr-hidden >&2",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "shim failed: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "stdout-ok");
+        assert!(
+            out.stderr.is_empty(),
+            "expected empty stderr, got: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     #[test]
     fn parse_fd_name_accepts_non_negative_integers_only() {

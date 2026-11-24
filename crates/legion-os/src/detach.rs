@@ -162,6 +162,21 @@ pub struct DetachHandle {
     pub warnings: Vec<String>,
 }
 
+/// Internal test seam controlling Linux systemd user-scope selection so integration tests can
+/// exercise both the systemd-scope path and the `setsid` fallback paths on any host.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScopeProbeOverride {
+    /// Probe the systemd user manager and lingering state normally.
+    #[default]
+    Auto,
+    /// Behave as if no systemd user manager is reachable (forces direct `setsid`).
+    ForceNoSystemd,
+    /// Probe the systemd user manager normally, but treat lingering as disabled (forces `setsid`
+    /// fallback with the lingering warning when a user manager is reachable).
+    ForceLingerDisabled,
+}
+
 /// Start a detached process that outlives the caller, its terminal, and its SSH session.
 ///
 /// Standard input is always connected to null; standard output and standard error are appended
@@ -169,6 +184,16 @@ pub struct DetachHandle {
 /// [`DetachHandle`] carrying the target's [`ProcessId`], its Linux systemd scope unit name when
 /// a scope was used, and any non-fatal launch warnings.
 pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
+    spawn_detached_for_test(options, ScopeProbeOverride::Auto).await
+}
+
+/// Test-only entry point for [`spawn_detached`] that allows forcing the Linux scope-selection
+/// branch without mutating process-wide environment variables.
+#[doc(hidden)]
+pub async fn spawn_detached_for_test(
+    options: DetachOptions,
+    scope_override: ScopeProbeOverride,
+) -> Result<DetachHandle> {
     let resolved = shell::resolve(&options.command)?;
     validate_scope_name(options.name.as_deref())?;
 
@@ -191,7 +216,7 @@ pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
         }
     }
 
-    spawn_detached_impl(&resolved, &options).await
+    spawn_detached_impl(&resolved, &options, scope_override).await
 }
 
 /// Return `true` while any process started under `handle` is still running—not just the root.
@@ -397,10 +422,20 @@ fn open_append_file(path: &Path) -> Result<std::fs::File> {
         .map_err(|err| OsError::from_io(format!("cannot open log file {}", path.display()), err))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 async fn spawn_detached_impl(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
+    scope_override: ScopeProbeOverride,
+) -> Result<DetachHandle> {
+    platform::spawn_detached(resolved, options, scope_override).await
+}
+
+#[cfg(windows)]
+async fn spawn_detached_impl(
+    resolved: &ResolvedCommand,
+    options: &DetachOptions,
+    _scope_override: ScopeProbeOverride,
 ) -> Result<DetachHandle> {
     platform::spawn_detached(resolved, options).await
 }
@@ -409,6 +444,7 @@ async fn spawn_detached_impl(
 async fn spawn_detached_impl(
     _resolved: &ResolvedCommand,
     _options: &DetachOptions,
+    _scope_override: ScopeProbeOverride,
 ) -> Result<DetachHandle> {
     Err(OsError::Unsupported {
         detail: "detached process launching is not supported on this platform".into(),
