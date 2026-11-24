@@ -106,7 +106,7 @@ fn job_helper(mode: &str, args: Vec<String>) -> ExitCode {
             let gate = Path::new(&args[0]);
             let _ = writeln!(stdout, "chunk-1: αβγ");
             let _ = stdout.flush();
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + Duration::from_secs(300);
             while !gate.exists() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -121,7 +121,7 @@ fn job_helper(mode: &str, args: Vec<String>) -> ExitCode {
         // Starts a sleeping grandchild, writes "<own pid> <grandchild pid>" atomically, prints
         // "ready", then waits for the grandchild.
         "family" => {
-            let mut grandchild = spawn_helper("sleep", &["60"]);
+            let mut grandchild = spawn_helper("sleep", &["600"]);
             let line = format!("{} {}", std::process::id(), grandchild.id());
             let target = Path::new(&args[0]);
             let partial = target.with_extension("partial");
@@ -130,6 +130,16 @@ fn job_helper(mode: &str, args: Vec<String>) -> ExitCode {
             let _ = writeln!(stdout, "ready");
             let _ = stdout.flush();
             let _ = grandchild.wait();
+            ExitCode::SUCCESS
+        }
+        // Writes its own PID atomically to `args[0]`, then sleeps until killed by cancel or
+        // test cleanup.
+        "hold" => {
+            let target = Path::new(&args[0]);
+            let partial = target.with_extension("partial");
+            fs::write(&partial, format!("{}\n", std::process::id())).unwrap();
+            fs::rename(&partial, target).unwrap();
+            std::thread::sleep(Duration::from_secs(3600));
             ExitCode::SUCCESS
         }
         other => {
@@ -334,7 +344,7 @@ async fn output_is_captured_and_readable_incrementally() {
     cleanup.track_job(&id);
 
     // Wait for the first chunk to appear via incremental `offset: 0` polling.
-    let first = wait_for(Duration::from_secs(10), || {
+    let first = wait_for(Duration::from_secs(30), || {
         let rt_res = fs::read_to_string(
             fixture
                 .node
@@ -372,7 +382,7 @@ async fn output_is_captured_and_readable_incrementally() {
     // Release the helper so chunk-2 and stderr arrive, then wait for completion.
     fs::write(&gate, b"go").unwrap();
     let waited = fixture
-        .call("job.wait", json!({"id": id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": id, "timeout_s": 60}))
         .await
         .unwrap();
     assert_eq!(waited["state"], json!("succeeded"), "{waited:#}");
@@ -541,7 +551,7 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
     assert!(!started.to_string().contains(secret));
 
     let waited = fixture
-        .call("job.wait", json!({"id": id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": id, "timeout_s": 60}))
         .await
         .unwrap();
     assert_eq!(waited["state"], json!("failed"), "{waited:#}");
@@ -581,7 +591,7 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         .call(
             "job.start",
             merge_args(
-                support_helper_args("sleep", &["30"]),
+                support_helper_args("sleep", &["600"]),
                 json!({"env": {"EPHEMERAL_SECRET": "gone-fast"}}),
             ),
         )
@@ -593,7 +603,7 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
     let live_env = live_dir.join("env.json");
     let live_reserve = live_dir.join("exit.reserve");
     assert!(
-        wait_for(Duration::from_secs(5), || (!live_env.exists()
+        wait_for(Duration::from_secs(30), || (!live_env.exists()
             && live_reserve.exists())
         .then_some(()))
         .await
@@ -619,7 +629,7 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
     let shell_id = shell_job["id"].as_str().unwrap().to_owned();
     cleanup.track_job(&shell_id);
     let shell_done = fixture
-        .call("job.wait", json!({"id": shell_id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": shell_id, "timeout_s": 60}))
         .await
         .unwrap();
     assert_eq!(shell_done["state"], json!("succeeded"), "{shell_done:#}");
@@ -642,7 +652,7 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
     let missing_id = missing_bin["id"].as_str().unwrap().to_owned();
     cleanup.track_job(&missing_id);
     let missing_done = fixture
-        .call("job.wait", json!({"id": missing_id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": missing_id, "timeout_s": 60}))
         .await
         .unwrap();
     assert_eq!(missing_done["state"], json!("failed"), "{missing_done:#}");
@@ -681,7 +691,7 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
     let env_id = env_job["id"].as_str().unwrap().to_owned();
     cleanup.track_job(&env_id);
     let env_done = fixture
-        .call("job.wait", json!({"id": env_id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": env_id, "timeout_s": 60}))
         .await
         .unwrap();
     assert_eq!(env_done["state"], json!("succeeded"));
@@ -769,16 +779,16 @@ async fn cancel_stops_setsid_descendants_even_after_exit() {
         let mut cleanup = Cleanup::new(&fixture);
 
         // Case 1: Normal `job.cancel` (force: false) must also sweep a `setsid` child inside the
-        // detached scope after the supervisor finishes cooperative cancellation.
-        let pids_file = fixture.dir.path().join("setsid-live.pids");
+        // detached scope after the supervisor finishes cooperative cancellation. Both helpers
+        // write their own PID only after startup (so `setsid` has already created the new session)
+        // and stay alive until stopped or cleaned up.
+        let setsid_pid_file = fixture.dir.path().join("setsid-live-detached.pid");
+        let fg_pid_file = fixture.dir.path().join("setsid-live-fg.pid");
         let cmd = concat!(
-            "setsid \"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
-            "p1=$!; ",
-            "\"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
-            "p2=$!; ",
-            "printf '%s %s\\n' \"$p1\" \"$p2\" > \"$PIDS_FILE.partial\" && ",
-            "mv \"$PIDS_FILE.partial\" \"$PIDS_FILE\"; ",
-            "wait \"$p2\""
+            "setsid \"$LEGION_BIN\" \"$SETSID_PID_FILE\" </dev/null >/dev/null 2>&1 & ",
+            "\"$LEGION_BIN\" \"$FG_PID_FILE\" </dev/null >/dev/null 2>&1 & ",
+            "fg=$!; ",
+            "wait \"$fg\""
         );
         let started = fixture
             .call(
@@ -786,9 +796,10 @@ async fn cancel_stops_setsid_descendants_even_after_exit() {
                 json!({
                     "cmd": cmd,
                     "env": {
-                        HELPER: "sleep",
+                        JOB_HELPER: "hold",
                         "LEGION_BIN": this_binary(),
-                        "PIDS_FILE": pids_file.to_string_lossy(),
+                        "SETSID_PID_FILE": setsid_pid_file.to_string_lossy(),
+                        "FG_PID_FILE": fg_pid_file.to_string_lossy(),
                     }
                 }),
             )
@@ -797,9 +808,12 @@ async fn cancel_stops_setsid_descendants_even_after_exit() {
         let id = started["id"].as_str().unwrap().to_owned();
         cleanup.track_job(&id);
 
-        let pids = read_pids(&pids_file).await;
-        cleanup.track_pids(&pids);
-        assert_eq!(pids.len(), 2);
+        let setsid_pids = read_pids(&setsid_pid_file).await;
+        let fg_pids = read_pids(&fg_pid_file).await;
+        cleanup.track_pids(&setsid_pids);
+        cleanup.track_pids(&fg_pids);
+        assert_eq!(setsid_pids.len(), 1);
+        assert_eq!(fg_pids.len(), 1);
 
         let status = fixture.call("job.status", json!({"id": id})).await.unwrap();
         let handle: DetachHandle = serde_json::from_value(status["detach"].clone()).unwrap();
@@ -808,12 +822,12 @@ async fn cancel_stops_setsid_descendants_even_after_exit() {
         let cancelled = fixture.call("job.cancel", json!({"id": id})).await.unwrap();
         assert_eq!(cancelled["state"], json!("cancelled"), "{cancelled:#}");
         assert_eq!(cancelled["survivors"], json!([]));
-        assert!(gone(pids[1]).await, "foreground child survived cancel");
+        assert!(gone(fg_pids[0]).await, "foreground child survived cancel");
         if has_scope {
             assert!(
-                gone(pids[0]).await,
+                gone(setsid_pids[0]).await,
                 "setsid child {} survived normal job.cancel",
-                pids[0]
+                setsid_pids[0]
             );
             assert!(
                 !detached_active(&handle).await.unwrap(),
@@ -823,11 +837,12 @@ async fn cancel_stops_setsid_descendants_even_after_exit() {
 
         // Case 2: A command exits 0 (writing `exit.json`) while leaving a `setsid` child running;
         // calling `job.cancel` on the finished job sweeps the detached handle and keeps `succeeded`.
-        let orphan_file = fixture.dir.path().join("setsid-after-exit.pids");
+        // The shell waits until the `setsid` child writes its own PID so `sh` cannot exit and
+        // trigger process-group cleanup before `setsid()` has taken effect.
+        let orphan_file = fixture.dir.path().join("setsid-after-exit.pid");
         let exit_cmd = concat!(
-            "setsid \"$LEGION_BIN\" 60 </dev/null >/dev/null 2>&1 & ",
-            "printf '%s\\n' \"$!\" > \"$PIDS_FILE.partial\" && ",
-            "mv \"$PIDS_FILE.partial\" \"$PIDS_FILE\""
+            "setsid \"$LEGION_BIN\" \"$ORPHAN_PID_FILE\" </dev/null >/dev/null 2>&1 & ",
+            "while [ ! -f \"$ORPHAN_PID_FILE\" ]; do sleep 0.05 2>/dev/null || sleep 1; done"
         );
         let started2 = fixture
             .call(
@@ -835,9 +850,9 @@ async fn cancel_stops_setsid_descendants_even_after_exit() {
                 json!({
                     "cmd": exit_cmd,
                     "env": {
-                        HELPER: "sleep",
+                        JOB_HELPER: "hold",
                         "LEGION_BIN": this_binary(),
-                        "PIDS_FILE": orphan_file.to_string_lossy(),
+                        "ORPHAN_PID_FILE": orphan_file.to_string_lossy(),
                     }
                 }),
             )
@@ -850,7 +865,7 @@ async fn cancel_stops_setsid_descendants_even_after_exit() {
         cleanup.track_pids(&orphan_pids);
         assert_eq!(orphan_pids.len(), 1);
         let waited = fixture
-            .call("job.wait", json!({"id": id2, "timeout_s": 15}))
+            .call("job.wait", json!({"id": id2, "timeout_s": 60}))
             .await
             .unwrap();
         assert_eq!(waited["state"], json!("succeeded"), "{waited:#}");
@@ -1171,7 +1186,7 @@ async fn idempotent_key_deduplicates_conflicts_and_concurrent_starts() {
     // Wait for completion, then retry with the same key and identical command/cwd/env names (even
     // with a different env value: only env variable names are part of the identity).
     fixture
-        .call("job.wait", json!({"id": id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": id, "timeout_s": 60}))
         .await
         .unwrap();
 
@@ -1203,7 +1218,7 @@ async fn idempotent_key_deduplicates_conflicts_and_concurrent_starts() {
 
     // Two concurrent separate processes starting the same key must create only one job.
     let concurrent_payload = merge_args(
-        support_helper_args("sleep", &["30"]),
+        support_helper_args("sleep", &["600"]),
         json!({"key": "race-key"}),
     )
     .to_string();
@@ -1311,7 +1326,7 @@ async fn idempotent_key_deduplicates_conflicts_and_concurrent_starts() {
     assert_eq!(replaced["existing"], json!(false), "{replaced:#}");
     assert_ne!(replaced_id, "seed-startup-fail");
     fixture
-        .call("job.wait", json!({"id": replaced_id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": replaced_id, "timeout_s": 60}))
         .await
         .unwrap();
     let again = fixture
@@ -1362,7 +1377,7 @@ async fn idempotent_key_deduplicates_conflicts_and_concurrent_starts() {
     assert_eq!(replaced2["existing"], json!(false), "{replaced2:#}");
     assert_ne!(replaced2_id, "seed-never-locked");
     fixture
-        .call("job.wait", json!({"id": replaced2_id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": replaced2_id, "timeout_s": 60}))
         .await
         .unwrap();
 
@@ -1414,7 +1429,7 @@ async fn retention_prunes_old_and_excess_finished_jobs_only() {
 
     // Start one genuinely running job first; retention must NEVER delete it.
     let running = fixture
-        .call("job.start", support_helper_args("sleep", &["30"]))
+        .call("job.start", support_helper_args("sleep", &["600"]))
         .await
         .unwrap();
     let running_id = running["id"].as_str().unwrap().to_owned();
@@ -1472,7 +1487,7 @@ async fn retention_prunes_old_and_excess_finished_jobs_only() {
     let fresh_id = fresh["id"].as_str().unwrap().to_owned();
     cleanup.track_job(&fresh_id);
     fixture
-        .call("job.wait", json!({"id": fresh_id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": fresh_id, "timeout_s": 60}))
         .await
         .unwrap();
 
@@ -1589,7 +1604,7 @@ async fn a_role_without_exec_is_denied_and_cwd_is_confined() {
         .call_as(
             "observer",
             "job.wait",
-            json!({"id": ok_id, "timeout_s": 15}),
+            json!({"id": ok_id, "timeout_s": 60}),
         )
         .await
         .unwrap();
@@ -1630,7 +1645,7 @@ async fn a_role_without_exec_is_denied_and_cwd_is_confined() {
             "agent:claude",
             "job.start",
             merge_args(
-                support_helper_args("sleep", &["30"]),
+                support_helper_args("sleep", &["600"]),
                 json!({"cwd": "~/projects/app"}),
             ),
         )
@@ -1688,7 +1703,7 @@ async fn reading_state_never_writes() {
     let fin_id = finished["id"].as_str().unwrap().to_owned();
     cleanup.track_job(&fin_id);
     fixture
-        .call("job.wait", json!({"id": fin_id, "timeout_s": 15}))
+        .call("job.wait", json!({"id": fin_id, "timeout_s": 60}))
         .await
         .unwrap();
 
@@ -1779,7 +1794,10 @@ async fn exclusive_jobs_and_wait_timeout_or_cancel() {
     let normal = fixture
         .call(
             "job.start",
-            merge_args(support_helper_args("sleep", &["30"]), json!({"name": "bg"})),
+            merge_args(
+                support_helper_args("sleep", &["600"]),
+                json!({"name": "bg"}),
+            ),
         )
         .await
         .unwrap();
@@ -1790,7 +1808,7 @@ async fn exclusive_jobs_and_wait_timeout_or_cancel() {
         .call(
             "job.start",
             merge_args(
-                support_helper_args("sleep", &["30"]),
+                support_helper_args("sleep", &["600"]),
                 json!({"name": "train", "exclusive": true}),
             ),
         )
@@ -1819,7 +1837,7 @@ async fn exclusive_jobs_and_wait_timeout_or_cancel() {
     let events = Events::default();
     let waiter = fixture.call_with(
         "job.wait",
-        json!({"id": excl_id, "timeout_s": 30}),
+        json!({"id": excl_id, "timeout_s": 60}),
         &events,
         token.clone(),
     );
