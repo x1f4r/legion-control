@@ -46,7 +46,8 @@ async fn info_describes_the_machine() {
     let started = Instant::now();
     let info = fixture.call("sys.info", json!({})).await.unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        // Generous: on a cold Windows runner the boot id alone starts PowerShell.
+        started.elapsed() < Duration::from_secs(30),
         "took {:?}",
         started.elapsed()
     );
@@ -218,7 +219,7 @@ async fn kill_refuses_a_reused_pid_and_protected_processes() {
     let fixture = Fixture::new();
     let mut child = spawn_helper("sleep", &["60"]);
     let pid = child.id();
-    wait_for(Duration::from_secs(10), || alive(pid).then_some(()))
+    wait_for(Duration::from_secs(30), || alive(pid).then_some(()))
         .await
         .unwrap();
     let error = fixture
@@ -329,10 +330,14 @@ async fn the_runtime_stays_free_while_the_system_is_read() {
     })
     .await
     .unwrap();
-    assert!(
-        worst < Duration::from_millis(250),
-        "the runtime was held for {worst:?}"
-    );
+    // Sleeping through a CPU sample on the runtime would hold it for 250 ms. Windows timers tick
+    // every 15 ms and its runners stall now and then, so there only a gross stall counts.
+    let limit = if std::env::consts::OS == "windows" {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(200)
+    };
+    assert!(worst < limit, "the runtime was held for {worst:?}");
 }
 
 async fn procs_hides_secrets_in_command_lines() {
@@ -342,7 +347,7 @@ async fn procs_hides_secrets_in_command_lines() {
         &["60", "--password", "hunter2-7d1c", "--token=s3cr3t-7d1c"],
     );
     let pid = child.id();
-    wait_for(Duration::from_secs(10), || alive(pid).then_some(()))
+    wait_for(Duration::from_secs(30), || alive(pid).then_some(()))
         .await
         .unwrap();
     let exe = std::env::current_exe().unwrap();

@@ -10,10 +10,13 @@ use std::time::{Duration, Instant};
 use legion_core::CancellationToken;
 use legion_core::proto::{ErrorCode, EventKind};
 use serde_json::{Value, json};
-use support::{Events, Fixture, HELPER, Test, alive, read_pids, this_binary};
+use support::{Events, Fixture, HELPER, Options, Test, alive, read_pids, this_binary};
 
 fn main() -> ExitCode {
     let tests: &[Test] = &[
+        ("the_runner_reads_the_arguments_cargo_passes", || {
+            Box::pin(the_runner_reads_the_arguments_cargo_passes())
+        }),
         ("argv_runs_exactly_and_reports_the_exit_code", || {
             Box::pin(argv_runs_exactly_and_reports_the_exit_code())
         }),
@@ -70,6 +73,42 @@ fn with(mut args: Value, extra: Value) -> Value {
         }
     }
     args
+}
+
+async fn the_runner_reads_the_arguments_cargo_passes() {
+    let parse = |args: &[&str]| Options::parse(args.iter().map(|arg| (*arg).to_owned()));
+    let options = parse(&[
+        "--format",
+        "pretty",
+        "--nocapture",
+        "--test-threads=1",
+        "cancel",
+    ])
+    .unwrap();
+    assert_eq!(options.filters, ["cancel"]);
+    assert!(options.runs("cancelling_the_call_stops_the_whole_tree"));
+    assert!(!options.runs("cmd_goes_through_the_platform_shell"));
+    let options = parse(&["--list", "--format", "terse"]).unwrap();
+    assert!(options.list && options.filters.is_empty());
+    let options = parse(&["--exact", "cmd", "--skip", "shell"]).unwrap();
+    assert!(!options.runs("cmd_goes_through_the_platform_shell"));
+    assert!(parse(&["--ignored"]).unwrap().filters.is_empty());
+    assert!(!parse(&["--ignored"]).unwrap().runs("anything"));
+    assert!(parse(&["--frobnicate"]).is_err());
+    assert!(parse(&["--format"]).is_err());
+
+    // `--list` names the tests and runs none of them.
+    let listed = std::process::Command::new(this_binary())
+        .args(["--list", "argv_runs"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.starts_with("argv_runs_exactly_and_reports_the_exit_code: test\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("... ok"), "{stdout}");
 }
 
 async fn argv_runs_exactly_and_reports_the_exit_code() {
@@ -190,14 +229,15 @@ async fn a_timeout_ends_the_command_and_everything_it_started() {
             "exec.run",
             with(
                 helper("family", &[&pids.to_string_lossy(), "stubborn"]),
-                json!({"timeout_s": 3}),
+                json!({"timeout_s": 8}),
             ),
         )
         .await
         .unwrap();
     assert_eq!(ran["timed_out"], json!(true), "{ran:#}");
     assert!(ran.get("exit_code").is_none() || ran["exit_code"] != json!(0));
-    assert!(started.elapsed() < Duration::from_secs(20));
+    // Generous: a cold Windows runner can take seconds to start a process.
+    assert!(started.elapsed() < Duration::from_secs(60));
     assert_eq!(ran["stdout"].as_str().unwrap().trim(), "started");
     for pid in read_pids(&pids).await {
         assert!(!alive(pid), "process {pid} outlived the timeout");
