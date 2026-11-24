@@ -380,9 +380,10 @@ pub fn verify_exe_not_group_or_world_writable(exe: &Path) -> Result<(), ErrorBod
     }
 }
 
-/// Verifies on Unix that the effective user ID (`euid`) owns the existing `authorized_keys` file
-/// (or its parent `.ssh` directory, or `home` when neither exists yet), refusing to rewrite
-/// another user's file (for example when `sudo legion pair` runs as root with a user's `HOME`).
+/// Verifies on Unix that the effective user ID (`euid`) owns every existing path among
+/// `authorized_keys`, its parent directory (and `~/.ssh` plus `home` for the default location),
+/// refusing to rewrite another user's file (for example when `sudo legion pair` runs as root with
+/// a user's `HOME`).
 ///
 /// No-op on non-Unix platforms.
 pub fn verify_owner_matches_euid(
@@ -391,18 +392,34 @@ pub fn verify_owner_matches_euid(
     is_default_home_ssh: bool,
     euid: Option<u32>,
 ) -> Result<(), ErrorBody> {
+    verify_owner_matches_euid_with(write_path, home, is_default_home_ssh, euid, |path| {
+        match legion_os::user::path_owner_uid(path) {
+            Ok(uid) => Ok(uid),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+fn verify_owner_matches_euid_with(
+    write_path: &Path,
+    home: Option<&Path>,
+    is_default_home_ssh: bool,
+    euid: Option<u32>,
+    mut owner_uid_of: impl FnMut(&Path) -> io::Result<Option<u32>>,
+) -> Result<(), ErrorBody> {
     let Some(euid) = euid else {
         return Ok(());
     };
-    let check_path = |path: &Path| -> Result<(), ErrorBody> {
-        let Some(owner_uid) = legion_os::user::path_owner_uid(path).map_err(|error| {
+    let mut check_path = |path: &Path| -> Result<bool, ErrorBody> {
+        let Some(owner_uid) = owner_uid_of(path).map_err(|error| {
             ErrorBody::new(
                 ErrorCode::Failed,
                 format!("{} cannot be inspected: {error}.", path.display()),
             )
         })?
         else {
-            return Ok(());
+            return Ok(false);
         };
         if owner_uid != euid {
             let owner_label = legion_os::user::username_for_uid(owner_uid)
@@ -425,35 +442,39 @@ pub fn verify_owner_matches_euid(
                 "Run legion as {hint_user} (for example `sudo -u {hint_user} legion ...`) so authorized_keys keeps its owner and SSH login stays working, or point `[devices] authorized_keys` at a file owned by this account."
             )));
         }
-        Ok(())
+        Ok(true)
     };
 
-    // Check the nearest existing path along write_path -> parent -> home -> ancestors.
-    let mut checked = false;
-    for candidate in [Some(write_path), write_path.parent(), home]
-        .into_iter()
-        .flatten()
+    // Check every existing path among the file itself, its parent directory, and (for the default
+    // ~/.ssh/authorized_keys) ~/.ssh and home, rather than stopping at the first existing path.
+    let mut candidates: Vec<PathBuf> = vec![write_path.to_path_buf()];
+    if let Some(parent) = write_path.parent()
+        && !candidates.iter().any(|p| p == parent)
     {
-        if candidate.exists() {
-            check_path(candidate)?;
+        candidates.push(parent.to_path_buf());
+    }
+    if is_default_home_ssh && let Some(home) = home {
+        let default_ssh = home.join(".ssh");
+        if !candidates.iter().any(|p| p == &default_ssh) {
+            candidates.push(default_ssh);
+        }
+        if !candidates.iter().any(|p| p == home) {
+            candidates.push(home.to_path_buf());
+        }
+    }
+
+    let mut checked = false;
+    for candidate in &candidates {
+        if check_path(candidate)? {
             checked = true;
-            break;
         }
     }
     if !checked {
         for ancestor in write_path.ancestors().skip(1) {
-            if ancestor.exists() {
-                check_path(ancestor)?;
+            if check_path(ancestor)? {
                 break;
             }
         }
-    }
-    // For the default `~/.ssh/authorized_keys`, also ensure the home directory itself belongs to euid.
-    if is_default_home_ssh
-        && let Some(home) = home
-        && home.exists()
-    {
-        check_path(home)?;
     }
     Ok(())
 }
@@ -1088,6 +1109,11 @@ pub fn read_auth_keys(path: &Path) -> Result<AuthKeysFile, ErrorBody> {
 /// If an out-of-band edit changed `write_path` since it was read, discards the staged temp file
 /// and returns [`WriteOutcome::ConcurrentEdit`] so the caller can re-read and retry without
 /// losing the concurrent edit.
+///
+/// Legion processes serialize their own edits with the sidecar lock file. Because external tools
+/// and hand editors do not acquire that lock, a tiny TOCTOU window remains between the pre-rename
+/// metadata check and the atomic rename itself; this check catches every concurrent edit that
+/// lands before that final syscall.
 pub fn write_auth_keys_if_unchanged(
     target: &AuthKeysTarget,
     write_path: &Path,
@@ -1140,6 +1166,9 @@ pub fn write_auth_keys_if_unchanged(
 ///
 /// The closure receives the freshly read [`AuthKeysFile`] and returns `(Some(updated), value)` to
 /// commit the edit or `(None, value)` when no write is needed.
+///
+/// Note that external editors that do not take Legion's lock still have a tiny TOCTOU window
+/// between the pre-rename metadata stamp check and the atomic rename syscall.
 pub fn edit_auth_keys_with_retry<T>(
     target: &AuthKeysTarget,
     write_path: &Path,
@@ -2301,6 +2330,40 @@ Match Group users
         let err =
             verify_owner_matches_euid(&auth_file, Some(&home), true, Some(wrong_uid)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Denied);
+
+        // 4. Even when authorized_keys itself matches euid, a mismatched owner on ~/.ssh or home
+        //    is still refused (never stops after the first existing path).
+        let err_ssh =
+            verify_owner_matches_euid_with(&auth_file, Some(&home), true, Some(1000), |path| {
+                if path == auth_file || path == home {
+                    Ok(Some(1000))
+                } else if path == ssh_dir {
+                    Ok(Some(0))
+                } else {
+                    Ok(None)
+                }
+            })
+            .unwrap_err();
+        assert_eq!(err_ssh.code, ErrorCode::Denied);
+        assert!(err_ssh.message.contains(".ssh"), "{}", err_ssh.message);
+
+        let err_home =
+            verify_owner_matches_euid_with(&auth_file, Some(&home), true, Some(1000), |path| {
+                if path == auth_file || path == ssh_dir {
+                    Ok(Some(1000))
+                } else if path == home {
+                    Ok(Some(0))
+                } else {
+                    Ok(None)
+                }
+            })
+            .unwrap_err();
+        assert_eq!(err_home.code, ErrorCode::Denied);
+        assert!(
+            err_home.message.contains(&home.display().to_string()),
+            "{}",
+            err_home.message
+        );
     }
 
     #[cfg(unix)]
