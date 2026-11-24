@@ -579,7 +579,7 @@ pub struct Grant {
 /// paths on every call.
 #[derive(Debug)]
 struct CachedProtected {
-    own_dirs: Result<Vec<OwnDir>, (PathBuf, Unresolved)>,
+    own_dirs: Vec<Result<OwnDir, (Place, PathBuf, Unresolved)>>,
     secrets: Vec<SecretPlace>,
     resolved_roots: Vec<Resolved>,
 }
@@ -857,11 +857,10 @@ impl Grant {
             }
         }
         let cache = self.protected_cache();
-        for dir in cache
-            .own_dirs
-            .as_ref()
-            .map_err(|(_, error)| unclear(error.clone()))?
-        {
+        for entry in &cache.own_dirs {
+            let dir = entry
+                .as_ref()
+                .map_err(|(_, _, error)| unclear(error.clone()))?;
             if holds(&dir.resolved) {
                 return Ok(Some(dir.place));
             }
@@ -944,22 +943,28 @@ impl Grant {
         };
         let resolved = resolve_keeping_last(path).map_err(unclear)?;
         let cache = self.protected_cache();
-        let own = cache.own_dirs.as_ref().map_err(|(dir, error)| {
-            let reason = match error {
-                Unresolved::Invalid(error) => error.message.clone(),
-                Unresolved::Unclear(_, reason) => reason.clone(),
-            };
-            ErrorBody::new(
-                ErrorCode::Denied,
-                format!(
-                    "{} may not create or replace {}: Legion's own directory {} cannot be resolved ({reason}).",
-                    self.principal,
-                    path.display(),
-                    dir.display()
-                ),
-            )
-            .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
-        })?;
+        let own: Vec<&OwnDir> = cache
+            .own_dirs
+            .iter()
+            .map(|entry| {
+                entry.as_ref().map_err(|(_, dir, error)| {
+                    let reason = match error {
+                        Unresolved::Invalid(error) => error.message.clone(),
+                        Unresolved::Unclear(_, reason) => reason.clone(),
+                    };
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may not create or replace {}: Legion's own directory {} cannot be resolved ({reason}).",
+                            self.principal,
+                            path.display(),
+                            dir.display()
+                        ),
+                    )
+                    .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let secrets: Vec<&SecretPlace> = cache
             .secrets
             .iter()
@@ -991,7 +996,7 @@ impl Grant {
                 && candidate.missing.is_empty()
                 && candidate.link.is_none();
 
-            for dir in own {
+            for dir in &own {
                 let touches = within_protected(candidate, &dir.resolved, Platform::HOST)
                     || holds(&dir.resolved);
                 if touches && !exempt_existing_home_dir {
@@ -1090,27 +1095,61 @@ impl Grant {
     /// recursive directory walks (`fs.list`, `fs.find`, `fs.grep`, `fs.copy`, `fs.manifest`).
     ///
     /// Returns an empty filter (blocks nothing) for roles that allow `effect:admin`.
+    /// If Legion's own configuration or state directory cannot be resolved, keeps a raw-path
+    /// fallback entry and fails closed so walk entries are never treated as safe when in doubt.
     pub fn protected_filter(&self) -> ProtectedFilter {
         if self.allows_effect(Effect::Admin) {
             return ProtectedFilter::allow_all();
         }
         let cache = self.protected_cache();
         let mut entries = Vec::new();
-        if let Ok(own) = &cache.own_dirs {
-            for dir in own {
-                let reason = format!(
-                    "{}, which only a role that allows effect:admin may read or change",
-                    dir.place.describe()
-                );
-                entries.push(ProtectedEntry {
-                    place: dir.place,
-                    reason,
-                    raw_path: dir.dir.clone(),
-                    resolved: dir.resolved.clone(),
-                    identity: dir.identity.clone(),
-                    #[cfg(unix)]
-                    dev_ino: dir.dev_ino,
-                });
+        let mut fail_closed_reason: Option<(Place, String)> = None;
+        for entry in &cache.own_dirs {
+            match entry {
+                Ok(dir) => {
+                    let reason = format!(
+                        "{}, which only a role that allows effect:admin may read or change",
+                        dir.place.describe()
+                    );
+                    entries.push(ProtectedEntry {
+                        place: dir.place,
+                        reason,
+                        raw_path: dir.dir.clone(),
+                        resolved: dir.resolved.clone(),
+                        identity: dir.identity.clone(),
+                        #[cfg(unix)]
+                        dev_ino: dir.dev_ino,
+                    });
+                }
+                Err((place, dir, error)) => {
+                    let reason = format!(
+                        "{}, which only a role that allows effect:admin may read or change",
+                        place.describe()
+                    );
+                    let detail = match error {
+                        Unresolved::Invalid(err) => err.message.as_str(),
+                        Unresolved::Unclear(_, msg) => msg.as_str(),
+                    };
+                    entries.push(ProtectedEntry {
+                        place: *place,
+                        reason,
+                        raw_path: dir.clone(),
+                        resolved: raw_fallback_resolved(dir),
+                        identity: None,
+                        #[cfg(unix)]
+                        dev_ino: None,
+                    });
+                    if fail_closed_reason.is_none() {
+                        fail_closed_reason = Some((
+                            *place,
+                            format!(
+                                "{} ({}) could not be resolved ({detail}), so paths cannot be told apart from it",
+                                place.describe(),
+                                dir.display()
+                            ),
+                        ));
+                    }
+                }
             }
         }
         for secret in &cache.secrets {
@@ -1161,6 +1200,7 @@ impl Grant {
             entries,
             explicit_roots,
             has_identities,
+            fail_closed_reason,
         }
     }
 
@@ -1179,38 +1219,56 @@ impl Grant {
     }
 
     /// Well-known secret locations under `self.paths.home()`, resolved as far as they exist.
+    ///
+    /// A secret location that cannot be resolved (for example a dangling symlink or an unreadable
+    /// parent) is never silently dropped: it falls back to `resolve_keeping_last` and then to a
+    /// lexical raw path so both `check_path` and directory walks still block it.
     fn compute_secret_locations(&self) -> Vec<SecretPlace> {
         let Some(home) = self.paths.home() else {
             return Vec::new();
         };
+        let home_resolved = resolve(home).ok();
         SECRET_LOCATIONS
             .iter()
-            .filter_map(|rel| {
+            .map(|rel| {
                 let full = rel
                     .split('/')
                     .fold(home.to_path_buf(), |acc, part| acc.join(part));
-                let resolved = resolve(&full).ok()?;
-                let identity = if resolved.missing.is_empty() {
+                let resolved = resolve(&full)
+                    .or_else(|_| resolve_keeping_last(&full))
+                    .unwrap_or_else(|_| match &home_resolved {
+                        Some(base) => {
+                            let mut missing = base.missing.clone();
+                            missing.extend(rel.split('/').map(OsString::from));
+                            Resolved {
+                                existing: base.existing.clone(),
+                                missing,
+                                link: None,
+                            }
+                        }
+                        None => raw_fallback_resolved(&full),
+                    });
+                let identity = if resolved.missing.is_empty() && resolved.link.is_none() {
                     Handle::from_path(&resolved.existing).ok().map(Arc::new)
                 } else {
                     None
                 };
                 #[cfg(unix)]
-                let dev_ino = if resolved.missing.is_empty() {
+                let dev_ino = if resolved.missing.is_empty() && resolved.link.is_none() {
                     std::fs::symlink_metadata(&resolved.existing)
                         .ok()
                         .map(|m| (m.dev(), m.ino()))
                 } else {
                     None
                 };
-                Some(SecretPlace {
+                SecretPlace {
                     rel,
                     raw_path: full,
                     resolved,
                     identity,
                     #[cfg(unix)]
                     dev_ino,
-                })
+                }
             })
             .collect()
     }
@@ -1278,16 +1336,16 @@ impl Grant {
         Ok(())
     }
 
-    /// The node's configuration and state directories, resolved as far as they exist, with the
-    /// identity of each that does.
-    fn compute_own_dirs(&self) -> Result<Vec<OwnDir>, (PathBuf, Unresolved)> {
+    /// The node's configuration and state directories, resolved individually as far as they exist,
+    /// with the identity of each that does.
+    fn compute_own_dirs(&self) -> Vec<Result<OwnDir, (Place, PathBuf, Unresolved)>> {
         [
             (Place::Config, self.paths.config_dir()),
             (Place::State, self.paths.state_dir()),
         ]
         .into_iter()
         .map(|(place, dir)| {
-            let resolved = resolve(dir).map_err(|error| (dir.to_path_buf(), error))?;
+            let resolved = resolve(dir).map_err(|error| (place, dir.to_path_buf(), error))?;
             let identity = if resolved.missing.is_empty() {
                 Handle::from_path(&resolved.existing).ok().map(Arc::new)
             } else {
@@ -1336,21 +1394,24 @@ impl Grant {
                 ),
             )
         };
-        let own = self
+        let own: Vec<&OwnDir> = self
             .protected_cache()
             .own_dirs
-            .as_ref()
-            .map_err(|(dir, error)| {
-                let reason = match error {
-                    Unresolved::Invalid(error) => error.message.clone(),
-                    Unresolved::Unclear(_, reason) => reason.clone(),
-                };
-                refuse(format!(
-                    "Legion's own directory {} cannot be resolved ({reason}), so no path can be told apart from it",
-                    dir.display()
-                ))
-                .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
-            })?;
+            .iter()
+            .map(|entry| {
+                entry.as_ref().map_err(|(_, dir, error)| {
+                    let reason = match error {
+                        Unresolved::Invalid(error) => error.message.clone(),
+                        Unresolved::Unclear(_, reason) => reason.clone(),
+                    };
+                    refuse(format!(
+                        "Legion's own directory {} cannot be resolved ({reason}), so no path can be told apart from it",
+                        dir.display()
+                    ))
+                    .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let mut places = vec![Cow::Borrowed(resolved)];
         if resolved.link.is_some() {
             let target = link_target(resolved).map_err(|_| {
@@ -1364,7 +1425,7 @@ impl Grant {
                 .ancestors()
                 .filter_map(|ancestor| Handle::from_path(ancestor).ok())
                 .collect();
-            for dir in own {
+            for dir in &own {
                 let inside = within_protected(place, &dir.resolved, Platform::HOST)
                     || dir
                         .identity
@@ -1409,6 +1470,14 @@ struct SecretPlace {
     dev_ino: Option<(u64, u64)>,
 }
 
+/// Reason reported in `skipped` when a walk entry cannot be inspected to verify it is not protected.
+const UNINSPECTABLE_PATH_REASON: &str =
+    "path could not be inspected to verify it is not a protected location";
+
+/// Reason reported in `skipped` when a symbolic link's target cannot be resolved during a walk.
+const UNRESOLVABLE_LINK_REASON: &str =
+    "symbolic link target could not be resolved to verify it is not a protected location";
+
 /// Pre-resolved filter built by [`Grant::protected_filter`] so recursive directory walks skip
 /// Legion's own configuration/state directories and secret locations using the exact same rules as
 /// [`Grant::check_path`] and [`Grant::protected`].
@@ -1417,6 +1486,7 @@ pub struct ProtectedFilter {
     entries: Vec<ProtectedEntry>,
     explicit_roots: Vec<ExplicitRoot>,
     has_identities: bool,
+    fail_closed_reason: Option<(Place, String)>,
 }
 
 #[derive(Debug)]
@@ -1445,12 +1515,13 @@ impl ProtectedFilter {
             entries: Vec::new(),
             explicit_roots: Vec::new(),
             has_identities: false,
+            fail_closed_reason: None,
         }
     }
 
-    /// Whether this filter has no protected locations to skip.
+    /// Whether this filter has no protected locations to skip and no fail-closed condition.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.fail_closed_reason.is_none()
     }
 
     /// Returns the matching protected [`Place`] and human-readable reason if `path` (or the target
@@ -1458,7 +1529,8 @@ impl ProtectedFilter {
     ///
     /// Because the walk root already passed [`Grant::check_path`] and every ancestor directory
     /// above `path` was already checked and pruned if blocked, normal entries are checked using
-    /// only their own identity and path without re-resolving or walking ancestors.
+    /// only their own identity and path without re-resolving or walking ancestors. When a path or
+    /// link target cannot be inspected or resolved, this fails closed after checking raw paths.
     pub fn blocked(&self, path: &Path) -> Option<(Place, &str)> {
         let mut ignored = 0usize;
         self.blocked_counting(path, &mut ignored)
@@ -1467,11 +1539,22 @@ impl ProtectedFilter {
     /// Like [`ProtectedFilter::blocked`], counting every filesystem call performed so tests can
     /// verify the per-entry I/O bound deterministically.
     fn blocked_counting(&self, path: &Path, fs_calls: &mut usize) -> Option<(Place, &str)> {
-        if self.entries.is_empty() {
+        if self.is_empty() {
             return None;
         }
         *fs_calls += 1;
-        let meta = std::fs::symlink_metadata(path).ok()?;
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                if let Some(hit) = self.match_path_only(path) {
+                    return Some(hit);
+                }
+                if let Some((place, ref reason)) = self.fail_closed_reason {
+                    return Some((place, reason.as_str()));
+                }
+                return Some((Place::Secret, UNINSPECTABLE_PATH_REASON));
+            }
+        };
 
         if meta.file_type().is_symlink() {
             // Check the symlink path itself first (0 extra FS calls), then follow where it leads.
@@ -1479,13 +1562,27 @@ impl ProtectedFilter {
                 return Some(hit);
             }
             *fs_calls += 1;
-            let raw_target = std::fs::read_link(path).ok()?;
+            let raw_target = match std::fs::read_link(path) {
+                Ok(target) => target,
+                Err(_) => return Some((Place::Secret, UNRESOLVABLE_LINK_REASON)),
+            };
             let joined = match path.parent() {
                 Some(parent) => parent.join(raw_target),
                 None => raw_target,
             };
             *fs_calls += 1;
-            let target = resolve(&joined).ok()?;
+            let target = match resolve(&joined) {
+                Ok(target) => target,
+                Err(_) => {
+                    if let Some(hit) = self.match_path_only(&joined) {
+                        return Some(hit);
+                    }
+                    if let Some((place, ref reason)) = self.fail_closed_reason {
+                        return Some((place, reason.as_str()));
+                    }
+                    return Some((Place::Secret, UNRESOLVABLE_LINK_REASON));
+                }
+            };
             let target_id = if target.missing.is_empty() && self.has_identities {
                 *fs_calls += 1;
                 Handle::from_path(&target.existing).ok()
@@ -1520,6 +1617,9 @@ impl ProtectedFilter {
                     continue;
                 }
                 return Some((entry.place, entry.reason.as_str()));
+            }
+            if let Some((place, ref reason)) = self.fail_closed_reason {
+                return Some((place, reason.as_str()));
             }
             return None;
         }
@@ -1569,6 +1669,9 @@ impl ProtectedFilter {
                 }
             }
             return Some((entry.place, entry.reason.as_str()));
+        }
+        if let Some((place, ref reason)) = self.fail_closed_reason {
+            return Some((place, reason.as_str()));
         }
         None
     }
@@ -1765,6 +1868,27 @@ impl Unresolved {
                 format!("{} cannot be used: {reason}.", given.display()),
             ),
         }
+    }
+}
+
+/// Lexical fallback [`Resolved`] when a path cannot be resolved on disk (for example a dangling
+/// symlink or an unreadable parent), preserving its volume/root prefix and normal components so
+/// raw-path comparisons still work.
+fn raw_fallback_resolved(path: &Path) -> Resolved {
+    let mut existing = PathBuf::new();
+    let mut missing = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(prefix) => existing.push(prefix.as_os_str()),
+            Component::RootDir => existing.push(comp.as_os_str()),
+            Component::Normal(name) => missing.push(name.to_owned()),
+            Component::CurDir | Component::ParentDir => {}
+        }
+    }
+    Resolved {
+        existing,
+        missing,
+        link: None,
     }
 }
 
@@ -3458,5 +3582,97 @@ role = "wide"
             wide.check_path("~/.netrc", Access::Read).unwrap_err().code,
             ErrorCode::Denied
         );
+    }
+
+    #[test]
+    fn walk_helpers_fail_closed_with_raw_path_fallback_when_resolution_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = under(dir.path());
+        let home = paths.home().unwrap();
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        let policy = policy(
+            r#"
+default = "owner"
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+[principals.wide]
+role = "wide"
+"#,
+        );
+
+        // 1. `blocked` fails closed when a path cannot be inspected, falling back to raw-path match first.
+        let wide = policy.grant("wide", &paths);
+        let filter = wide.protected_filter();
+        let missing_secret = home.join(".ssh").join("id_ed25519");
+        let (place, reason) = filter
+            .blocked(&missing_secret)
+            .expect("missing secret path must be blocked by raw fallback");
+        assert_eq!(place, Place::Secret);
+        assert!(reason.contains(".ssh"), "{reason}");
+
+        let missing_normal = home.join("projects").join("vanished.txt");
+        let (_, reason) = filter
+            .blocked(&missing_normal)
+            .expect("uninspectable path must fail closed");
+        assert!(reason.contains("could not be inspected"), "{reason}");
+
+        // 2. Unresolvable symlink loop in walk fails closed; dangling secret location (`~/.ssh`) is NOT dropped.
+        #[cfg(unix)]
+        {
+            let loop_a = home.join("projects").join("loop_a");
+            let loop_b = home.join("projects").join("loop_b");
+            std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+            std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+            let (_, reason) = filter
+                .blocked(&loop_a)
+                .expect("unresolvable symlink loop must fail closed in walk");
+            assert!(reason.contains("could not be resolved"), "{reason}");
+
+            // Make `~/.ssh` itself a dangling symlink so `resolve(&full)` fails: `compute_secret_locations`
+            // must NOT silently drop `~/.ssh`!
+            let ssh_path = home.join(".ssh");
+            std::os::unix::fs::symlink(dir.path().join("missing_ssh_target"), &ssh_path).unwrap();
+            let wide2 = policy.grant("wide", &paths);
+            let filter2 = wide2.protected_filter();
+            let (place, reason) = filter2
+                .blocked(&ssh_path)
+                .expect("dangling ~/.ssh must still be blocked");
+            assert_eq!(place, Place::Secret);
+            assert!(reason.contains(".ssh"), "{reason}");
+
+            // 3. Unresolvable `config_dir` (dangling symlink) must NOT be dropped by `protected_filter`:
+            // raw-path matches `config_dir` directly AND other paths fail closed with a clear reason.
+            let broken_dir = tempfile::tempdir().unwrap();
+            let broken_paths = under(broken_dir.path());
+            let broken_home = broken_paths.home().unwrap();
+            std::fs::create_dir_all(broken_home.join("projects")).unwrap();
+            std::fs::write(broken_home.join("projects").join("ok.txt"), b"ok").unwrap();
+            std::fs::create_dir_all(broken_paths.config_dir().parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(
+                broken_dir.path().join("missing_config_target"),
+                broken_paths.config_dir(),
+            )
+            .unwrap();
+            let broken_grant = policy.grant("wide", &broken_paths);
+            let broken_filter = broken_grant.protected_filter();
+            assert!(!broken_filter.is_empty());
+            let (cfg_place, cfg_reason) = broken_filter
+                .blocked(broken_paths.config_dir())
+                .expect("unresolvable config_dir must still be blocked by raw path");
+            assert_eq!(cfg_place, Place::Config);
+            assert!(cfg_reason.contains("configuration"), "{cfg_reason}");
+
+            let (other_place, other_reason) = broken_filter
+                .blocked(&broken_home.join("projects").join("ok.txt"))
+                .expect("unresolved own_dir must fail closed for walk entries");
+            assert_eq!(other_place, Place::Config);
+            assert!(
+                other_reason.contains("could not be resolved"),
+                "{other_reason}"
+            );
+        }
     }
 }
