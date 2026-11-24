@@ -25,7 +25,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
+    FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -371,6 +371,25 @@ impl Drop for ProcThreadAttrList {
 
 fn to_wide_null(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Atomically rename `from` to `to` without `MOVEFILE_REPLACE_EXISTING` so Windows fails with
+/// `ERROR_ALREADY_EXISTS` / `ERROR_FILE_EXISTS` if `to` already exists.
+pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let from_wide = to_wide_null(from.as_os_str());
+    let to_wide = to_wide_null(to.as_os_str());
+    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that remain valid for the
+    // duration of the `MoveFileExW` call.
+    match unsafe {
+        MoveFileExW(
+            PCWSTR::from_raw(from_wide.as_ptr()),
+            PCWSTR::from_raw(to_wide.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    } {
+        Ok(()) => Ok(()),
+        Err(_) => Err(std::io::Error::last_os_error()),
+    }
 }
 
 fn open_inheritable_nul(access: u32) -> Result<OwnedHandle> {

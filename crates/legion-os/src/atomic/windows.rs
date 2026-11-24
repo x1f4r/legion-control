@@ -6,13 +6,16 @@
 //! without ever deleting the destination first.
 
 use std::fs::{self, File, Metadata, OpenOptions};
+use std::io;
 use std::path::Path;
 
+use crate::win_proc;
 use crate::{OsError, Result};
 
 use super::{
-    WINDOWS_INITIAL_BACKOFF, WINDOWS_MAX_BACKOFF, WINDOWS_REPLACE_TIMEOUT, WriteOptions,
-    is_retryable_windows_replace_error, retry_async_with_backoff, retry_sync_with_backoff,
+    ExclusiveRenameError, WINDOWS_INITIAL_BACKOFF, WINDOWS_MAX_BACKOFF, WINDOWS_REPLACE_TIMEOUT,
+    WriteOptions, is_retryable_windows_replace_error, retry_async_with_backoff,
+    retry_sync_with_backoff,
 };
 
 pub(super) fn configure_temp_open(_open: &mut OpenOptions, _restrictive: bool) {}
@@ -57,6 +60,47 @@ pub(super) async fn replace_file_async(from: &Path, to: &Path) -> Result<()> {
             err,
         )
     })
+}
+
+fn classify_windows_exclusive_error(err: io::Error) -> ExclusiveRenameError {
+    // Win32: ERROR_FILE_EXISTS (80), ERROR_ALREADY_EXISTS (183).
+    if err.kind() == io::ErrorKind::AlreadyExists || matches!(err.raw_os_error(), Some(80 | 183)) {
+        return ExclusiveRenameError::AlreadyExists;
+    }
+    // Win32: ERROR_INVALID_FUNCTION (1), ERROR_NOT_SUPPORTED (50).
+    if err.kind() == io::ErrorKind::Unsupported || matches!(err.raw_os_error(), Some(1 | 50)) {
+        return ExclusiveRenameError::Unsupported;
+    }
+    ExclusiveRenameError::Io(err)
+}
+
+pub(super) fn rename_exclusive(
+    from: &Path,
+    to: &Path,
+) -> std::result::Result<(), ExclusiveRenameError> {
+    retry_sync_with_backoff(
+        || win_proc::move_file_no_replace(from, to),
+        is_retryable_windows_replace_error,
+        WINDOWS_REPLACE_TIMEOUT,
+        WINDOWS_INITIAL_BACKOFF,
+        WINDOWS_MAX_BACKOFF,
+    )
+    .map_err(classify_windows_exclusive_error)
+}
+
+pub(super) async fn rename_exclusive_async(
+    from: &Path,
+    to: &Path,
+) -> std::result::Result<(), ExclusiveRenameError> {
+    retry_async_with_backoff(
+        || win_proc::move_file_no_replace(from, to),
+        is_retryable_windows_replace_error,
+        WINDOWS_REPLACE_TIMEOUT,
+        WINDOWS_INITIAL_BACKOFF,
+        WINDOWS_MAX_BACKOFF,
+    )
+    .await
+    .map_err(classify_windows_exclusive_error)
 }
 
 pub(super) fn sync_parent_dir(_parent: &Path) {}
