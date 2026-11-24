@@ -34,7 +34,11 @@ use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::header::{ALLOW, HeaderValue, WWW_AUTHENTICATE};
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, HeaderValue, ORIGIN, VARY,
+    WWW_AUTHENTICATE,
+};
 use axum::http::{Method, Response, StatusCode};
 use axum::middleware::{self, Next};
 use axum::routing::{any, get, post};
@@ -343,7 +347,10 @@ async fn gate(
         .map(|file| file.serve.clone())
         .unwrap_or_default();
     let mut principal = None;
-    let response = if let Some(problem) = gate::malformed(request.headers(), request.uri()) {
+    // The origin of a page allowed to call, which its responses name so the browser shows them to
+    // it. Only read once the gate has let the origin through.
+    let origin = request.headers().get(ORIGIN).cloned();
+    let mut response = if let Some(problem) = gate::malformed(request.headers(), request.uri()) {
         reply::refusal(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgs, problem)
     } else if !gate::host_allowed(request.headers(), shared.port, &config) {
         reply::refusal(
@@ -357,6 +364,9 @@ async fn gate(
             ErrorCode::Denied,
             "Pages from that origin may not use this server.",
         )
+    } else if method == Method::OPTIONS && request.headers().contains_key(ORIGIN) {
+        // A browser's preflight carries no token; a listed origin is told what it may send.
+        preflight()
     } else if method == Method::GET && path == "/v1/health" {
         next.run(request).await
     } else {
@@ -383,6 +393,21 @@ async fn gate(
             }
         }
     };
+    if let Some(origin) = origin
+        && gate::origin_allowed(&origin_only(&origin), &config)
+        && !matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::MISDIRECTED_REQUEST
+        )
+    {
+        let headers = response.headers_mut();
+        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        headers.insert(
+            ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("Mcp-Session-Id, WWW-Authenticate"),
+        );
+        headers.append(VARY, HeaderValue::from_static("Origin"));
+    }
     log(&format!(
         "{method} {path} {} {} {}ms",
         response.status().as_u16(),
@@ -390,6 +415,34 @@ async fn gate(
         started.elapsed().as_millis()
     ));
     response
+}
+
+/// The answer to a listed origin's preflight: the methods and request headers this API takes.
+/// Never a wildcard, and never credentials: the token travels in `Authorization`, which a page
+/// sets itself, so a browser's cookies have no part in it.
+fn preflight() -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    let headers = response.headers_mut();
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, DELETE"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(
+            "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Last-Event-ID, Legion-Compact",
+        ),
+    );
+    headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
+    response
+}
+
+/// A header map holding only `origin`, to ask the gate about it.
+fn origin_only(origin: &HeaderValue) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(ORIGIN, origin.clone());
+    headers
 }
 
 /// 401, saying a token is needed or that the one given will not do, and never which of the two

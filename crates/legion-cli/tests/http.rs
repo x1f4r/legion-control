@@ -103,6 +103,10 @@ fn main() -> ExitCode {
             "headers_the_gate_decides_by_come_once",
             headers_the_gate_decides_by_come_once,
         ),
+        (
+            "a_listed_origin_can_call_from_a_browser",
+            a_listed_origin_can_call_from_a_browser,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -1509,4 +1513,109 @@ fn headers_the_gate_decides_by_come_once() {
         "GET http://127.0.0.1:{port}/v1/tools HTTP/1.1\r\nConnection: close\r\n{host}{good}\r\n"
     );
     assert_eq!(raw_status(port, here.as_bytes()), 200);
+}
+
+fn a_listed_origin_can_call_from_a_browser() {
+    let fixture = Fixture::new();
+    fixture.home.write_config(
+        "node.toml",
+        "name = \"laptop\"\n\n[serve]\norigins = [\"https://app.example.net\"]\n",
+    );
+    let server = Server::start(&fixture.home);
+    let page = "https://app.example.net".to_owned();
+    let asking = |origin: &str| {
+        vec![
+            ("Origin", origin.to_owned()),
+            ("Access-Control-Request-Method", "POST".to_owned()),
+            (
+                "Access-Control-Request-Headers",
+                "authorization, content-type, mcp-session-id".to_owned(),
+            ),
+        ]
+    };
+
+    // The preflight carries no token and is answered at once.
+    let started = Instant::now();
+    let preflight = http(server.port, "OPTIONS", "/v1/call", &asking(&page), b"");
+    assert_eq!(preflight.status, 204);
+    assert!(started.elapsed() < Duration::from_millis(150));
+    assert_eq!(
+        preflight.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+    let allowed = preflight
+        .header("access-control-allow-headers")
+        .unwrap()
+        .to_ascii_lowercase();
+    for header in [
+        "authorization",
+        "content-type",
+        "accept",
+        "mcp-session-id",
+        "mcp-protocol-version",
+    ] {
+        assert!(allowed.contains(header), "{allowed}");
+    }
+    assert!(
+        preflight
+            .header("access-control-allow-methods")
+            .is_some_and(|methods| methods.contains("POST"))
+    );
+    assert_eq!(preflight.header("access-control-allow-credentials"), None);
+    assert!(
+        preflight
+            .header("vary")
+            .is_some_and(|vary| vary.contains("Origin"))
+    );
+    let mcp = http(server.port, "OPTIONS", "/mcp", &asking(&page), b"");
+    assert_eq!(mcp.status, 204);
+
+    // The call itself, and a refusal, both name the page so it can read them.
+    let mut headers = auth(Some(&fixture.phone));
+    headers.push(("Origin", page.clone()));
+    let called = http(
+        server.port,
+        "POST",
+        "/v1/call",
+        &headers,
+        json!({"tool": "meta.version"}).to_string().as_bytes(),
+    );
+    assert_eq!(called.status, 200);
+    assert_eq!(
+        called.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+    assert!(
+        called
+            .header("vary")
+            .is_some_and(|vary| vary.contains("Origin"))
+    );
+    let refused = http(
+        server.port,
+        "GET",
+        "/v1/tools",
+        &[("Origin", page.clone())],
+        b"",
+    );
+    assert_eq!(refused.status, 401);
+    assert_eq!(
+        refused.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+
+    // Any other page gets nothing it could use.
+    let other = http(
+        server.port,
+        "OPTIONS",
+        "/v1/call",
+        &asking("https://evil.example"),
+        b"",
+    );
+    assert_eq!(other.status, 403);
+    assert_eq!(other.header("access-control-allow-origin"), None);
+    // Without an Origin an OPTIONS is no preflight, and needs a token like anything else.
+    assert_eq!(
+        http(server.port, "OPTIONS", "/v1/call", &[], b"").status,
+        401
+    );
 }
