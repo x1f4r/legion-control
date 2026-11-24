@@ -125,7 +125,7 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(
-        &names[..7],
+        &names[..8],
         &[
             "configuration directory",
             "state directory",
@@ -133,6 +133,7 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
             "policy.toml",
             "projects.toml",
             "tokens.toml",
+            "devices.toml",
             "tools.d"
         ]
     );

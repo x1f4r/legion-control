@@ -62,6 +62,7 @@ where
         pinned,
         Door::Rpc,
         None,
+        None,
         CancellationToken::new(),
     )
     .await
@@ -70,7 +71,8 @@ where
 /// Serves one session until `input` ends, `output` closes, or `shutdown` is cancelled.
 ///
 /// `door` is [`Door::Rpc`] for a standalone `legion rpc` session and [`Door::Ssh`] when served
-/// behind `legion gate --as` (with `device` set whenever `--device` was passed).
+/// behind `legion gate --as` (with `device` and `pairing_id` set whenever `--device` /
+/// `--pairing` were passed).
 ///
 /// When `shutdown` fires, every running call is cancelled, drained within [`SHUTDOWN_GRACE`], and
 /// the router is shut down cleanly before returning.
@@ -83,6 +85,7 @@ pub async fn serve_until<R, W>(
     pinned: Option<String>,
     door: Door,
     device: Option<String>,
+    pairing_id: Option<String>,
     shutdown: CancellationToken,
 ) -> io::Result<()>
 where
@@ -108,6 +111,7 @@ where
         pinned,
         door,
         device,
+        pairing_id,
         out: lines,
         running: Arc::new(Mutex::new(HashMap::new())),
         calls: JoinSet::new(),
@@ -271,6 +275,7 @@ struct Session {
     pinned: Option<String>,
     door: Door,
     device: Option<String>,
+    pairing_id: Option<String>,
     out: Sender<String>,
     running: Arc<Mutex<HashMap<Id, CancellationToken>>>,
     calls: JoinSet<()>,
@@ -483,6 +488,7 @@ impl Session {
             door: self.door,
             pinned: self.pinned.clone(),
             device: self.device.clone(),
+            pairing_id: self.pairing_id.clone(),
             cancel,
             events,
             hops: params.hops,
@@ -899,6 +905,7 @@ mod tests {
             Arc::new(Local),
             None,
             Door::Rpc,
+            None,
             None,
             shutdown.clone(),
         ));

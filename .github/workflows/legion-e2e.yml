@@ -120,6 +120,9 @@ jobs:
           Subsystem sftp internal-sftp
           LogLevel VERBOSE
           EOF
+          if sudo /usr/sbin/sshd -G -f /dev/null -o PerSourcePenalties=no >/dev/null 2>&1; then
+            echo 'PerSourcePenalties no' >> "$keys/sshd_config"
+          fi
           if [ "$RUNNER_OS" = Linux ]; then sudo mkdir -p /run/sshd; fi
           sudo /usr/sbin/sshd -t -f "$keys/sshd_config"
           sudo /usr/sbin/sshd -f "$keys/sshd_config" -E "$e2e/sshd.log"

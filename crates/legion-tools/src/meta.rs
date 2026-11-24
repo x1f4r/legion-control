@@ -5,11 +5,14 @@ mod init;
 
 use std::io;
 use std::path::Path;
+use std::time::Instant;
 
-use legion_core::proto::{Effect, PROTOCOL};
+use legion_core::policy::OWNER;
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, PROTOCOL};
 use legion_core::{BUILD, Ctx, Door, NoArgs, Registry, ToolError, VERSION};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 pub use doctor::{
     FleetPingEntry, check_executable_on_path, check_installation, check_linux_lingering,
@@ -35,7 +38,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. Passing acknowledge=\"devices-rollback\" (owner role only) clears a recorded configuration rollback failure in the state directory and audits who acknowledged it; otherwise it writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
     init::register(registry);
@@ -122,6 +125,11 @@ struct DoctorArgs {
     /// Skip checking whether remote machines in fleet.toml answer.
     #[serde(default)]
     quick: bool,
+    /// Acknowledge and clear a recorded health failure (owner role only). Pass
+    /// `devices-rollback` after verifying policy.toml and devices.toml to clear
+    /// `state/devices-rollback-error.json` and audit who acknowledged it.
+    #[serde(default)]
+    acknowledge: Option<String>,
 }
 
 /// What `meta.doctor` returns.
@@ -131,6 +139,9 @@ pub struct Doctor {
     pub ok: bool,
     /// The node that was checked.
     pub node: String,
+    /// Recorded failure acknowledged during this call, when `acknowledge` was passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acknowledged: Option<String>,
     /// Each check, in the order it ran.
     pub checks: Vec<Check>,
 }
@@ -157,6 +168,46 @@ fn is_false(value: &bool) -> bool {
 }
 
 async fn doctor(ctx: &Ctx, args: DoctorArgs) -> Result<Doctor, ToolError> {
+    let acknowledged = if let Some(target) = args.acknowledge {
+        let started = Instant::now();
+        if ctx.grant().role() != OWNER {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                "Only a caller with the owner role may acknowledge recorded health failures.",
+            )
+            .with_hint(
+                "Run `legion meta.doctor acknowledge=devices-rollback` as the owner of this machine.",
+            ));
+        }
+        if target != "devices-rollback" {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Unsupported acknowledge target {target:?}."),
+            )
+            .with_hint("Supported value: `acknowledge=devices-rollback`."));
+        }
+        let cleared = crate::device::registry::clear_rollback_failures(ctx.paths())?;
+        let audit_args = json!({
+            "acknowledge": "devices-rollback",
+            "cleared_count": cleared,
+        });
+        ctx.node()
+            .record_audit_with_device(
+                ctx.node_name().to_owned(),
+                Some(ctx.principal().to_owned()),
+                ctx.door(),
+                ctx.device().map(str::to_owned),
+                "meta.doctor.acknowledge".to_owned(),
+                &audit_args,
+                started,
+                &Ok(json!({})),
+            )
+            .await;
+        Some("devices-rollback".to_owned())
+    } else {
+        None
+    };
+
     let paths = ctx.paths();
     let mut checks = vec![
         directory_check("configuration directory", paths.config_dir(), Use::Read),
@@ -202,6 +253,7 @@ async fn doctor(ctx: &Ctx, args: DoctorArgs) -> Result<Doctor, ToolError> {
     Ok(Doctor {
         ok: checks.iter().all(|check| check.ok),
         node: ctx.node_name().to_owned(),
+        acknowledged,
         checks,
     })
 }

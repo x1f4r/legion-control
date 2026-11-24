@@ -303,6 +303,17 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
     let principal = Principal::parse(&args.as_principal)?;
     let principal = principal.as_str().to_owned();
     let policy = ctx.config().get::<Policy>()?;
+    if let Some(owner_id) = policy.device_owner(&principal) {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "{principal} is owned by paired device {owner_id}, so an AI agent cannot be registered on it."
+            ),
+        )
+        .with_hint(
+            "Add a dedicated principal for the agent in policy.toml (such as `[principals.\"agent:claude\"]`) and register using that principal instead.",
+        ));
+    }
     // The owner role, not the name: a principal the file gives role = "owner" may do as much.
     if policy.role_of(&principal).0 == OWNER {
         if !args.allow_owner {

@@ -51,6 +51,25 @@ pub struct InviteRecord {
     pub id: String,
     /// Principal the enrolled device will act as.
     pub principal: String,
+    /// Role recorded when the invite was created for a `device:*` principal (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Whether enrolment should create the dedicated `device:<name>` principal in `policy.toml`
+    /// from `role` under the config lock (rather than reusing a pre-existing principal).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_principal: bool,
+    /// Preferred device label when chosen at invite creation time (`--name`, optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    /// Principal that created this invite, recorded in `paired_by` and device-registry push audit logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// Pairing identifier of the device that created this invite, when created by a paired device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_device: Option<String>,
+    /// Name of the paired device that created this invite, when created by a paired device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_device_name: Option<String>,
     /// RFC 3339 UTC creation timestamp.
     pub created: String,
     /// RFC 3339 UTC expiry timestamp.
@@ -412,6 +431,12 @@ mod tests {
                     InviteRecord {
                         id: "invexpired".to_owned(),
                         principal: "phone".to_owned(),
+                        role: None,
+                        create_principal: false,
+                        device_name: None,
+                        created_by: None,
+                        created_by_device: None,
+                        created_by_device_name: None,
                         created: "2026-11-24T11:44:00Z".to_owned(),
                         expires: format_rfc3339(past),
                         fingerprint: key1.fingerprint,
@@ -422,6 +447,12 @@ mod tests {
                     InviteRecord {
                         id: "invvalid".to_owned(),
                         principal: "phone".to_owned(),
+                        role: None,
+                        create_principal: false,
+                        device_name: None,
+                        created_by: None,
+                        created_by_device: None,
+                        created_by_device_name: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: key3.fingerprint,
@@ -432,6 +463,12 @@ mod tests {
                     InviteRecord {
                         id: "invmissingline".to_owned(),
                         principal: "phone".to_owned(),
+                        role: None,
+                        create_principal: false,
+                        device_name: None,
+                        created_by: None,
+                        created_by_device: None,
+                        created_by_device_name: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: "SHA256:abc".to_owned(),

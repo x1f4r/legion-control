@@ -3,6 +3,7 @@
 //! Each check is built around a pure evaluation function over canned inputs so every branch can be
 //! verified deterministically across Linux, macOS, and Windows without depending on host state.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -93,6 +94,14 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     if let Ok(policy) = ctx.config().get::<Policy>() {
         let specs = ctx.tools();
         checks.push(check_policy_exec_roles(&policy, &specs));
+        if let Some(check) = check_policy_unmarked_device_principals(&policy) {
+            checks.push(check);
+        }
+        let principal_conflicts =
+            crate::device::registry::inspect_device_principal_conflicts(ctx.paths(), &policy);
+        if let Some(check) = check_device_principal_conflicts(&principal_conflicts) {
+            checks.push(check);
+        }
     }
 
     let orphans = query_orphaned_device_lines(ctx);
@@ -100,8 +109,37 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check);
     }
 
+    if let Ok(node_file) = ctx.config().get::<NodeFile>() {
+        let conflicts =
+            crate::device::registry::inspect_device_key_conflicts(ctx.paths(), &node_file);
+        checks.extend(check_device_key_conflicts(
+            &conflicts.duplicate_groups,
+            &conflicts.foreign_conflicts,
+        ));
+    }
+
+    let quarantined = crate::device::registry::inspect_quarantined_devices(ctx.paths());
+    if let Some(check) = check_quarantined_devices(&quarantined) {
+        checks.push(check);
+    }
+
+    let immutable_conflicts =
+        crate::device::registry::inspect_immutable_conflict_devices(ctx.paths());
+    if let Some(check) = check_immutable_conflict_devices(&immutable_conflicts) {
+        checks.push(check);
+    }
+
+    let rollback_failures = crate::device::registry::inspect_rollback_failures(ctx.paths());
+    if let Some(check) = check_config_rollback_failures(
+        &rollback_failures,
+        &crate::device::registry::rollback_failure_record_path(ctx.paths()),
+    ) {
+        checks.push(check);
+    }
+
     if !quick
         && let Some(ping_tool) = ctx.node().registry().get("fleet.ping")
+        && ctx.grant().allows(ping_tool.spec())
         && let Ok(value) = ping_tool
             .call(ctx, json!({"timeout_s": FLEET_PING_TIMEOUT_S}))
             .await
@@ -109,6 +147,320 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     {
         checks.extend(fleet_ping_checks(&parsed.results));
     }
+
+    if !quick
+        && let Some(sync_tool) = ctx.node().registry().get("fleet.sync")
+        && ctx.grant().allows(sync_tool.spec())
+        && let Ok(value) = sync_tool
+            .call(
+                ctx,
+                json!({
+                    "direction": "status",
+                    "documents": ["devices.toml"],
+                    "timeout_s": FLEET_PING_TIMEOUT_S,
+                }),
+            )
+            .await
+        && let Ok(parsed) = serde_json::from_value::<FleetDevicesSyncResponse>(value)
+        && let Some(check) = check_fleet_device_drift(&parsed.results)
+    {
+        checks.push(check);
+    }
+}
+
+/// Subset of one peer's `fleet.sync` status outcome for `devices.toml`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FleetDeviceSyncEntry {
+    /// Sync status (`same`, `changed_here`, `changed_there`, `both`, `only_here`, `only_there`, `error`).
+    pub status: String,
+    /// Error body when the peer could not be reached or failed.
+    #[serde(default)]
+    pub error: Option<ErrorBody>,
+}
+
+#[derive(Deserialize)]
+struct FleetDevicesSyncResponse {
+    results: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
+}
+
+/// Builds `meta.doctor` warnings when two live devices in `devices.toml` share a public key or
+/// when a live device's public key sits on a foreign line of `authorized_keys`.
+pub fn check_device_key_conflicts(
+    duplicate_groups: &[Vec<(String, String)>],
+    foreign_conflicts: &[(String, String)],
+) -> Vec<Check> {
+    let mut out = Vec::new();
+    if !duplicate_groups.is_empty() {
+        let rendered: Vec<String> = duplicate_groups
+            .iter()
+            .map(|group| {
+                let members: Vec<String> = group
+                    .iter()
+                    .map(|(name, id)| format!("{name} ({id})"))
+                    .collect();
+                format!("[{}]", members.join(", "))
+            })
+            .collect();
+        out.push(Check {
+            name: "duplicate device keys".to_owned(),
+            ok: true,
+            warning: true,
+            detail: format!(
+                "Live entries in devices.toml share the same SSH public key; no authorized_keys line is active for any of them: {}.",
+                rendered.join("; ")
+            ),
+            hint: Some(
+                "Remove the conflicting entries with `legion device.remove id=<pairing_id>` and pair each device with its own Ed25519 key."
+                    .to_owned(),
+            ),
+        });
+    }
+    if !foreign_conflicts.is_empty() {
+        let rendered: Vec<String> = foreign_conflicts
+            .iter()
+            .map(|(name, id)| format!("{name} ({id})"))
+            .collect();
+        out.push(Check {
+            name: "foreign key collisions".to_owned(),
+            ok: true,
+            warning: true,
+            detail: format!(
+                "Paired device(s) are not active here because their key is already on another line of authorized_keys: {}.",
+                rendered.join(", ")
+            ),
+            hint: Some(
+                "Remove the conflicting line from authorized_keys or re-pair the device with a dedicated Ed25519 key."
+                    .to_owned(),
+            ),
+        });
+    }
+    out
+}
+
+/// Builds a `meta.doctor` warning when one or more live paired devices in `devices.toml` are
+/// quarantined because their creator device was removed at or before they were paired.
+pub fn check_quarantined_devices(quarantined: &[(String, String, String)]) -> Option<Check> {
+    if quarantined.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = quarantined
+        .iter()
+        .map(|(name, id, reason)| format!("{name} ({id}): {reason}"))
+        .collect();
+    Some(Check {
+        name: "quarantined devices".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "{} paired device(s) are quarantined and blocked from connecting: {}.",
+            quarantined.len(),
+            items.join("; ")
+        ),
+        hint: Some(
+            "Inspect with `legion device.list`, then either confirm legitimate devices as owner with `legion device.set id=<pairing_id> confirm=true` or remove them with `legion device.remove id=<pairing_id>`."
+                .to_owned(),
+        ),
+    })
+}
+
+/// Builds a `meta.doctor` warning when one or more live paired devices in `devices.toml` have
+/// conflicting immutable identity or pairing-provenance fields across peers.
+pub fn check_immutable_conflict_devices(conflicts: &[(String, String)]) -> Option<Check> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = conflicts
+        .iter()
+        .map(|(name, id)| format!("{name} ({id})"))
+        .collect();
+    Some(Check {
+        name: "conflicting device entries".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "{} paired device(s) have conflicting immutable identity or pairing provenance across peers and are blocked from connecting: {}.",
+            conflicts.len(),
+            items.join(", ")
+        ),
+        hint: Some(
+            "Inspect with `legion device.list`, remove each conflicted entry with `legion device.remove id=<pairing_id>`, and re-pair if needed."
+                .to_owned(),
+        ),
+    })
+}
+
+/// Builds a failing `meta.doctor` check when a previous `device.enrol` or `device.set` rollback
+/// failed to restore a configuration snapshot (`policy.toml` or `devices.toml`).
+pub fn check_config_rollback_failures(
+    failures: &[crate::device::registry::RollbackFailureRecord],
+    record_path: &Path,
+) -> Option<Check> {
+    if failures.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = failures
+        .iter()
+        .map(|rec| {
+            format!(
+                "{} ({} on {}): {}",
+                rec.operation, rec.time, rec.file, rec.error
+            )
+        })
+        .collect();
+    Some(Check {
+        name: "config rollback failures".to_owned(),
+        ok: false,
+        warning: false,
+        detail: format!(
+            "{} configuration rollback failure(s) recorded — policy.toml and devices.toml may have diverged: {}.",
+            failures.len(),
+            items.join("; ")
+        ),
+        hint: Some(format!(
+            "Inspect policy.toml and devices.toml, run `legion device.list` to verify device principals, then acknowledge and clear this record as owner with `legion meta.doctor acknowledge=devices-rollback` (or delete {} once verified).",
+            record_path.display()
+        )),
+    })
+}
+
+/// Builds a `meta.doctor` warning when `policy.toml` defines any `device:*` principal without a
+/// `device = "<pairing_id>"` ownership marker (which device sync and `device.set` leave untouched).
+pub fn check_policy_unmarked_device_principals(policy: &Policy) -> Option<Check> {
+    let unmarked = policy.unmarked_device_principals();
+    if unmarked.is_empty() {
+        return None;
+    }
+    Some(Check {
+        name: "unmarked device principals".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "policy.toml defines `device:*` principal(s) without a `device = \"<pairing_id>\"` ownership marker: {}. Device reconciliation and `device.set role=` leave them untouched, and any matching device in devices.toml is not activated.",
+            unmarked.join(", ")
+        ),
+        hint: Some(
+            "Rename human-authored principals so they do not start with `device:`, or add `device = \"<pairing_id>\"` if a principal belongs exclusively to one paired device."
+                .to_owned(),
+        ),
+    })
+}
+
+/// Builds a `meta.doctor` warning when one or more live paired devices in `devices.toml` are
+/// blocked from activation because their `device:*` principal is unmarked in `policy.toml`,
+/// marked for a different pairing id, shared/tombstoned, or assigned a different role in
+/// `policy.toml` than recorded in `devices.toml`.
+pub fn check_device_principal_conflicts(conflicts: &[(String, String, String)]) -> Option<Check> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = conflicts
+        .iter()
+        .map(|(name, id, reason)| format!("{name} ({id}): {reason}"))
+        .collect();
+    Some(Check {
+        name: "device principal conflicts".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "{} paired device(s) are not active here because of a `device:*` principal conflict in policy.toml or devices.toml: {}.",
+            conflicts.len(),
+            items.join("; ")
+        ),
+        hint: Some(
+            "Inspect with `legion device.list`, fix or remove the conflicting `device:*` entry in policy.toml, or remove the device with `legion device.remove id=<pairing_id>`."
+                .to_owned(),
+        ),
+    })
+}
+
+/// Builds a `meta.doctor` warning when any reachable fleet peer has a different paired-device list
+/// (`devices.toml`) from this node. Unreachable peers and `Denied` responses (when the caller does
+/// not have admin permission on the peer) are ignored rather than reported as drift.
+pub fn check_fleet_device_drift(
+    results: &BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
+) -> Option<Check> {
+    let mut drifted: Vec<String> = Vec::new();
+    let mut need_push = false;
+    let mut pull_from: Vec<String> = Vec::new();
+    for (machine, docs) in results {
+        let Some(entry) = docs.get("devices.toml") else {
+            continue;
+        };
+        if entry.status == "same" || entry.status == "skipped" {
+            continue;
+        }
+        if entry.status == "error"
+            && (is_unreachable_warning(entry.error.as_ref())
+                || entry
+                    .error
+                    .as_ref()
+                    .is_some_and(|err| err.code == ErrorCode::Denied))
+        {
+            continue;
+        }
+        let label = match entry.status.as_str() {
+            "only_here" => {
+                need_push = true;
+                format!("{machine} (only here)")
+            }
+            "only_there" => {
+                pull_from.push(machine.clone());
+                format!("{machine} (only there)")
+            }
+            "changed_here" => {
+                need_push = true;
+                format!("{machine} (ahead here)")
+            }
+            "changed_there" => {
+                pull_from.push(machine.clone());
+                format!("{machine} (ahead there)")
+            }
+            "both" => {
+                need_push = true;
+                pull_from.push(machine.clone());
+                format!("{machine} (changes on both)")
+            }
+            other => format!("{machine} ({other})"),
+        };
+        drifted.push(label);
+    }
+
+    if drifted.is_empty() {
+        return None;
+    }
+
+    let mut commands = Vec::new();
+    if need_push {
+        commands.push(
+            "push local devices with `legion fleet.sync direction=push documents='[\"devices.toml\"]'`"
+                .to_owned(),
+        );
+    }
+    for peer in &pull_from {
+        commands.push(format!(
+            "pull live devices from {peer} with `legion fleet.sync direction=pull from={peer} documents='[\"devices.toml\"]'`"
+        ));
+    }
+    let hint = if commands.is_empty() {
+        "Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` to push local devices, or `legion fleet.sync direction=pull from=<machine> documents='[\"devices.toml\"]'` to import a peer's live devices."
+            .to_owned()
+    } else {
+        format!(
+            "Push sends local devices (never importing a peer's live entries): {}.",
+            commands.join("; ")
+        )
+    };
+
+    Some(Check {
+        name: "fleet devices".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "Paired device list (devices.toml) differs from reachable peer(s): {}.",
+            drifted.join(", ")
+        ),
+        hint: Some(hint),
+    })
 }
 
 /// One Legion-managed `authorized_keys` line whose pinned Legion home no longer exists on disk.
@@ -1057,6 +1409,80 @@ deny = [\"effect:power\", \"effect:admin\"]
                 .is_some_and(|h| h.contains("foreign=true")),
             "{:?}",
             check.hint
+        );
+    }
+
+    #[test]
+    fn fleet_device_drift_warns_for_drifted_reachable_peers_only() {
+        let mut results: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>> = BTreeMap::new();
+        results.insert(
+            "pi".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "same".to_owned(),
+                    error: None,
+                },
+            )]),
+        );
+        results.insert(
+            "offline".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "error".to_owned(),
+                    error: Some(ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        "offline did not answer.",
+                    )),
+                },
+            )]),
+        );
+        assert!(check_fleet_device_drift(&results).is_none());
+
+        results.insert(
+            "tower".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "both".to_owned(),
+                    error: None,
+                },
+            )]),
+        );
+        let warn = check_fleet_device_drift(&results).unwrap();
+        assert_eq!(warn.name, "fleet devices");
+        assert!(warn.ok && warn.warning);
+        assert!(warn.detail.contains("tower"), "{}", warn.detail);
+        assert!(!warn.detail.contains("offline"), "{}", warn.detail);
+        assert!(!warn.detail.contains("pi"), "{}", warn.detail);
+        assert!(
+            warn.hint.as_deref().is_some_and(
+                |h| h.contains("direction=push") && h.contains("direction=pull from=tower")
+            ),
+            "{:?}",
+            warn.hint
+        );
+
+        // Denied `config.read` must NEVER be reported as drift.
+        let mut denied_only: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>> =
+            BTreeMap::new();
+        denied_only.insert(
+            "secret-box".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "error".to_owned(),
+                    error: Some(ErrorBody::new(
+                        ErrorCode::Denied,
+                        "observer may not use config.read",
+                    )),
+                },
+            )]),
+        );
+        assert!(
+            check_fleet_device_drift(&denied_only).is_none(),
+            "Denied config.read must not be reported as drift"
         );
     }
 }

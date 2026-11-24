@@ -174,13 +174,20 @@ impl ThrowawaySshd {
         }
 
         let supports_no_penalties = Command::new(&sshd_bin)
-            .args(["-T", "-o", "PerSourcePenalties=no", "-h"])
-            .arg(&host_key)
+            .args(["-G", "-f", "/dev/null", "-o", "PerSourcePenalties=no"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|s| s.success());
+            .is_ok_and(|s| s.success())
+            || Command::new(&sshd_bin)
+                .args(["-T", "-f", "/dev/null", "-o", "PerSourcePenalties=no", "-h"])
+                .arg(&host_key)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
 
         for _ in 0..3 {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();

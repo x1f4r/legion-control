@@ -14,8 +14,14 @@ import { routeHref } from '../lib/route.js';
 import { describeRoleAccess } from '../lib/schema.js';
 import {
   ACCENT_SWATCHES,
+  buildDeviceInviteArgs,
+  buildDeviceRemoveArgs,
   describeAppearance,
   describeRefreshing,
+  findIncomingDevice,
+  formatDeviceRemovedNotice,
+  isInviteOwnerStrength,
+  parsePolicyForInvite,
 } from '../lib/settings.js';
 
 export const UI_VERSION = '0.1.0';
@@ -180,8 +186,8 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
   return html`
     <div>
       <p class="lede">
-        On the other machine, create an invite (or run <code>legion pair --as phone</code>), then
-        scan its code or paste the invite below.
+        On the other machine, create an invite (or run <code>legion pair</code>), then scan its
+        code or paste the invite below.
       </p>
       <label class="field">
         <span>Name for this device</span>
@@ -222,18 +228,67 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
   `;
 }
 
-function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
+function InviteDeviceSubpage({ link, tools, allowedSet, nodeInfo, incomingDevices, technical }) {
   const inviteSpec = useMemo(() => (tools || []).find((t) => t.name === 'device.invite'), [tools]);
-  const roleProp = inviteSpec?.input_schema?.properties?.role || null;
+  const inviteProps = inviteSpec?.input_schema?.properties || {};
+  const roleProp = inviteProps.role || null;
+  const hasNameProp = Boolean(inviteProps.name);
+  const hasAllowOwner = Boolean(inviteProps.allow_owner);
   const roleChoices = Array.isArray(roleProp?.enum) ? roleProp.enum : null;
   const defaultIdentity = nodeInfo?.whoami?.principal || 'phone';
+  const canReadPolicy =
+    Boolean((tools || []).find((t) => t.name === 'config.read')) &&
+    (!allowedSet || allowedSet.has('config.read'));
 
   const [principal, setPrincipal] = useState(defaultIdentity);
   const [validMinutes, setValidMinutes] = useState(15);
   const [role, setRole] = useState(roleProp?.default || (roleChoices ? roleChoices[0] : ''));
+  const [allowOwner, setAllowOwner] = useState(false);
+  const [policy, setPolicy] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [inviteRes, setInviteRes] = useState(null);
+
+  useEffect(() => {
+    if (!hasAllowOwner || !canReadPolicy) {
+      setPolicy(null);
+      return;
+    }
+    let alive = true;
+    link
+      .call('config.read', { document: 'policy.toml' })
+      .then((res) => {
+        if (!alive) return;
+        setPolicy(
+          res?.exists && typeof res.content === 'string'
+            ? parsePolicyForInvite(res.content)
+            : null,
+        );
+      })
+      .catch(() => {
+        if (alive) setPolicy(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [link, nodeInfo?.node, hasAllowOwner, canReadPolicy]);
+
+  const usesRoleName = Boolean(hasNameProp && roleProp && role.trim());
+  const wantsOwner = Boolean(
+    hasAllowOwner &&
+      isInviteOwnerStrength({
+        label: principal,
+        role,
+        usesRoleName,
+        policy,
+        whoami: nodeInfo?.whoami,
+        incomingDevices,
+      }),
+  );
+
+  useEffect(() => {
+    if (!wantsOwner) setAllowOwner(false);
+  }, [wantsOwner]);
 
   async function onCreate(e) {
     e.preventDefault();
@@ -242,8 +297,12 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
     setBusy(true);
     setError(null);
     try {
-      const args = { principal: who, valid_minutes: validMinutes };
-      if (roleProp && role) args.role = role;
+      const args = buildDeviceInviteArgs(inviteSpec, {
+        label: who,
+        role,
+        validMinutes,
+        allowOwner: wantsOwner && allowOwner,
+      });
       const res = await link.call('device.invite', args);
       setInviteRes({ ...res, validMinutes });
     } catch (err) {
@@ -262,18 +321,33 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
 
       <form onSubmit=${onCreate}>
         <label class="field">
-          <span>${technical ? 'Principal' : 'Use the identity'}</span>
+          <span>
+            ${usesRoleName
+              ? technical
+                ? 'Device name'
+                : 'Name for this device'
+              : technical
+                ? 'Principal'
+                : 'Use the identity'}
+          </span>
           <input
             type="text"
             value=${principal}
-            onInput=${(e) => setPrincipal(e.target.value)}
+            onInput=${(e) => {
+              setPrincipal(e.target.value);
+              setAllowOwner(false);
+            }}
             placeholder=${defaultIdentity}
             required
           />
           <small>
-            ${technical
-              ? 'Matches a principal in policy.toml (for example phone or tablet).'
-              : 'A name this machine already knows, such as the one this device uses.'}
+            ${usesRoleName
+              ? technical
+                ? 'Creates a dedicated device:<name> principal in policy.toml for this device.'
+                : 'Gives this device its own identity on this machine.'
+              : technical
+                ? 'Matches a principal in policy.toml (for example phone or tablet).'
+                : 'A name this machine already knows, such as the one this device uses.'}
           </small>
         </label>
 
@@ -283,7 +357,13 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
                 <span>Role</span>
                 ${roleChoices
                   ? html`
-                      <select value=${role} onChange=${(e) => setRole(e.target.value)}>
+                      <select
+                        value=${role}
+                        onChange=${(e) => {
+                          setRole(e.target.value);
+                          setAllowOwner(false);
+                        }}
+                      >
                         ${roleChoices.map(
                           (opt) => html`<option key=${opt} value=${opt}>${opt}</option>`,
                         )}
@@ -293,11 +373,45 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
                       <input
                         type="text"
                         value=${role}
-                        onInput=${(e) => setRole(e.target.value)}
-                        placeholder="operator"
+                        onInput=${(e) => {
+                          setRole(e.target.value);
+                          setAllowOwner(false);
+                        }}
+                        placeholder="observer"
                       />
                     `}
+                ${hasNameProp
+                  ? html`
+                      <small>
+                        ${technical
+                          ? 'Leave blank to reuse an existing principal instead of creating device:<name>.'
+                          : 'Leave blank to share an existing identity instead.'}
+                      </small>
+                    `
+                  : null}
               </label>
+            `
+          : null}
+
+        ${wantsOwner
+          ? html`
+              <div class="list spaced">
+                <label class="row switch row-switch">
+                  <span class="body">
+                    <span class="title">Allow full owner access</span>
+                    <span class="sub">
+                      ${technical
+                        ? 'This device will be able to do everything, including changing who may do what (passes allow_owner=true).'
+                        : 'This device will be able to do everything, including changing who may do what.'}
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked=${allowOwner}
+                    onChange=${(e) => setAllowOwner(e.target.checked)}
+                  />
+                </label>
+              </div>
             `
           : null}
 
@@ -324,7 +438,11 @@ function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
         ${error ? html`<${Notice} error=${error} />` : null}
 
         <div class="actions">
-          <button type="submit" class="btn primary full" disabled=${busy || !principal.trim()}>
+          <button
+            type="submit"
+            class="btn primary full"
+            disabled=${busy || !principal.trim() || (wantsOwner && !allowOwner)}
+          >
             ${busy ? 'Making invite…' : inviteRes ? 'Make a new invite' : 'Make invite'}
           </button>
         </div>
@@ -446,15 +564,17 @@ function IncomingDeviceSubpage({
   function askRemove() {
     onRequestConfirm({
       title: `Remove ${device.name}?`,
-      summary: `${device.name} will lose access to this machine right away.`,
+      summary: device.local_only
+        ? `${device.name} is only paired with this machine and will lose access here right away.`
+        : `${device.name} will lose access to this machine right away.`,
       confirmLabel: 'Remove access',
       danger: true,
       async onConfirm() {
         setBusy(true);
         setError(null);
         try {
-          await link.call('device.remove', { name: device.name });
-          onRemoved();
+          const res = await link.call('device.remove', buildDeviceRemoveArgs(device));
+          onRemoved(formatDeviceRemovedNotice(device, res));
         } catch (err) {
           setError(err);
         } finally {
@@ -467,16 +587,29 @@ function IncomingDeviceSubpage({
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${device.status ? html`<${Notice} title=${device.status} kind="warn" />` : null}
       <div class="list">
         <dl class=${technical ? 'kv' : 'kv plain'}>
           <dt>${technical ? 'name' : 'Device'}</dt>
           <dd>${device.name}</dd>
           <dt>${technical ? 'principal' : 'Identity'}</dt>
           <dd>${device.principal || 'Unknown'}</dd>
+          ${device.role
+            ? html`
+                <dt>${technical ? 'role' : 'Access'}</dt>
+                <dd>${technical ? device.role : describeRolePlain(device.role)}</dd>
+              `
+            : null}
           ${device.added
             ? html`
                 <dt>${technical ? 'added' : 'Paired'}</dt>
                 <dd>${formatRelativeTime(device.added)}</dd>
+              `
+            : null}
+          ${technical && device.id
+            ? html`
+                <dt>id</dt>
+                <dd>${device.id}</dd>
               `
             : null}
           ${technical && device.fingerprint
@@ -621,7 +754,9 @@ function ConnectionsPage({
       <${InviteDeviceSubpage}
         link=${link}
         tools=${tools}
+        allowedSet=${allowedSet}
         nodeInfo=${nodeInfo}
+        incomingDevices=${incoming?.devices || []}
         technical=${technical}
       />
     `;
@@ -661,7 +796,7 @@ function ConnectionsPage({
   }
 
   if (route.sub === 'incoming' && route.item) {
-    const dev = (incoming?.devices || []).find((d) => d.name === route.item) || null;
+    const dev = findIncomingDevice(incoming?.devices, route.item);
     return html`
       <${IncomingDeviceSubpage}
         device=${dev}
@@ -670,7 +805,8 @@ function ConnectionsPage({
         technical=${technical}
         link=${link}
         onRequestConfirm=${onRequestConfirm}
-        onRemoved=${() => {
+        onRemoved=${(removedNotice) => {
+          setNotice(removedNotice || null);
           loadIncoming();
           window.location.hash = '#/settings/connections';
         }}
@@ -809,13 +945,13 @@ function ConnectionsPage({
                     ${incomingDevices.map(
                       (dev) => html`
                         <a
-                          key=${dev.name}
+                          key=${dev.id || dev.name}
                           class="row"
                           href=${routeHref({
                             section: 'settings',
                             page: 'connections',
                             sub: 'incoming',
-                            item: dev.name,
+                            item: dev.id || dev.name,
                           })}
                         >
                           <span class="body">

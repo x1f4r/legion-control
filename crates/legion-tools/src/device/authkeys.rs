@@ -1091,6 +1091,19 @@ pub struct AuthKeyLine {
     pub kind: LineKind,
 }
 
+impl AuthKeyLine {
+    /// Returns the UTF-8 line content without trailing `\r` or `\n`, if the line is valid UTF-8.
+    pub fn raw_trimmed_str(&self) -> Option<&str> {
+        let stripped = self
+            .raw
+            .strip_suffix(b"\n")
+            .unwrap_or(&self.raw)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| self.raw.strip_suffix(b"\n").unwrap_or(&self.raw));
+        std::str::from_utf8(stripped).ok()
+    }
+}
+
 /// Parsed representation of an `authorized_keys` file that preserves foreign lines byte for byte.
 #[derive(Clone, Debug)]
 pub struct AuthKeysFile {

@@ -131,10 +131,39 @@ UsePAM no
 Subsystem sftp internal-sftp
 LogLevel VERBOSE
 SSHD_CFG
+if /usr/sbin/sshd -G -f /dev/null -o PerSourcePenalties=no >/dev/null 2>&1; then
+  echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config_legion
+fi
 
 /usr/sbin/sshd -t -f /etc/ssh/sshd_config_legion
 /usr/sbin/sshd -f /etc/ssh/sshd_config_legion -E /tmp/sshd-legion.log
-trap 'cat /tmp/sshd-legion.log >&2 || true' ERR
+trap 'cat /tmp/sshd-legion.log >&2 || true; cat /tmp/sshd-legion-2.log >&2 || true' ERR
+
+# Second independent sshd (distinct host key and authorized_keys) for two-node fleet device tests.
+ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/ssh_host_ed25519_key_box2
+chmod 0644 /etc/ssh/ssh_host_ed25519_key_box2.pub
+cat > /etc/ssh/sshd_config_legion_2 <<'SSHD_CFG2'
+ListenAddress 127.0.0.1
+Port 2223
+HostKey /etc/ssh/ssh_host_ed25519_key_box2
+PidFile /run/sshd-legion-2.pid
+AuthorizedKeysFile .ssh/authorized_keys_box2
+AllowUsers me
+StrictModes yes
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+UsePAM no
+Subsystem sftp internal-sftp
+LogLevel VERBOSE
+SSHD_CFG2
+if /usr/sbin/sshd -G -f /dev/null -o PerSourcePenalties=no >/dev/null 2>&1; then
+  echo 'PerSourcePenalties no' >> /etc/ssh/sshd_config_legion_2
+fi
+
+/usr/sbin/sshd -t -f /etc/ssh/sshd_config_legion_2
+/usr/sbin/sshd -f /etc/ssh/sshd_config_legion_2 -E /tmp/sshd-legion-2.log
 
 cat > /tmp/pairing-user-test.sh <<'USER_EOF'
 set -euo pipefail
@@ -650,6 +679,184 @@ set -e
 [[ "$link_revoked_rc" -eq 1 ]] || { echo "expected revoked legion-link call to exit 1, got $link_revoked_rc: $link_revoked_out" >&2; exit 1; }
 python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["code"]=="denied" and e["details"]["reason"]=="device_removed_or_unknown" and e["details"].get("sent") is False, e' "$link_revoked_out"
 echo "    legion-link revocation verified"
+
+# 10. Fleet-wide paired devices across two nodes (box on 2222, box2 on 2223):
+#     role-based pairing -> automatic fleet push -> device.endpoint --on all -> direct SSH to box2
+#     -> device.set role upgrade -> device.remove with still_trusted_by -> fleet.sync revocation.
+box2_home="$HOME/box2-legion"
+mkdir -p "$box2_home/config" "$box2_home/state" "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+ssh-keygen -q -t ed25519 -N '' -C 'fleet@container' -f "$work/fleet_key"
+fleet_pub="$(cat "$work/fleet_key.pub")"
+box2_hk="$(awk '{print $1 " " $2}' /etc/ssh/ssh_host_ed25519_key_box2.pub)"
+box1_hk="$(awk '{print $1 " " $2}' /etc/ssh/ssh_host_ed25519_key.pub)"
+printf '[127.0.0.1]:2222 %s\n' "$box1_hk" > "$work/fleet_kh_box1"
+printf '[127.0.0.1]:2223 %s\n' "$box2_hk" > "$work/fleet_kh_box2"
+
+# Put foreign fleet-link keys on box and box2 authorized_keys.
+printf 'restrict,command="/usr/local/bin/legion rpc" %s fleet-link\n' "$fleet_pub" >> "$HOME/.ssh/authorized_keys"
+printf 'restrict,command="env LEGION_HOME=%s /usr/local/bin/legion rpc" %s fleet-link\n' "$box2_home" "$fleet_pub" > "$HOME/.ssh/authorized_keys_box2"
+chmod 600 "$HOME/.ssh/authorized_keys_box2"
+
+cat > "$HOME/.config/legion/node.toml" <<NODE1
+name = "box"
+
+[devices]
+hosts = ["127.0.0.1"]
+port = 2222
+user = "me"
+host_keys = ["/etc/ssh/ssh_host_ed25519_key.pub"]
+NODE1
+
+cat > "$box2_home/config/node.toml" <<NODE2
+name = "box2"
+
+[devices]
+authorized_keys = "$HOME/.ssh/authorized_keys_box2"
+hosts = ["127.0.0.1"]
+port = 2223
+user = "me"
+host_keys = ["/etc/ssh/ssh_host_ed25519_key_box2.pub"]
+NODE2
+cp "$HOME/.config/legion/policy.toml" "$box2_home/config/policy.toml"
+
+cat > "$HOME/.config/legion/fleet.toml" <<FLEET1
+[machines.box2]
+command = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=$work/fleet_kh_box2", "-o", "GlobalKnownHostsFile=none", "-o", "ControlMaster=no", "-o", "ConnectTimeout=3", "-o", "LogLevel=ERROR", "-p", "2223", "-i", "$work/fleet_key", "me@127.0.0.1", "legion rpc"]
+FLEET1
+
+cat > "$box2_home/config/fleet.toml" <<FLEET2
+[machines.box]
+command = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=$work/fleet_kh_box1", "-o", "GlobalKnownHostsFile=none", "-o", "ControlMaster=no", "-o", "ConnectTimeout=3", "-o", "LogLevel=ERROR", "-p", "2222", "-i", "$work/fleet_key", "me@127.0.0.1", "legion rpc"]
+FLEET2
+
+fleet_inv_json="$(legion pair --name fleet-phone --role observer --json)"
+printf '%s\n' "$fleet_inv_json" > "$work/fleet_inv.json"
+python3 - "$work/fleet_inv.json" "$work/fleet_temp_key" "$work/fleet_inv_id" <<'PY'
+import base64, json, os, struct, subprocess, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    res = json.load(fh)
+assert res["principal"] == "device:fleet-phone" and res["role"] == "observer", res
+invite = res["invite"]
+raw = invite[len("legion-invite-1."):]
+raw += "=" * ((4 - len(raw) % 4) % 4)
+payload = json.loads(base64.urlsafe_b64decode(raw).decode("utf-8"))
+seed = base64.b64decode(payload["key"])
+pkcs8 = bytes.fromhex("302e020100300506032b657004220420") + seed
+pub32 = subprocess.run(
+    ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+    input=pkcs8, stdout=subprocess.PIPE, check=True,
+).stdout[-32:]
+def ssh_str(data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + data
+pub_blob = ssh_str(b"ssh-ed25519") + ssh_str(pub32)
+priv = b"\x11\x22\x33\x44" * 2 + ssh_str(b"ssh-ed25519") + ssh_str(pub32) + ssh_str(seed + pub32) + ssh_str(b"fleet")
+pad = 1
+while len(priv) % 8 != 0:
+    priv += bytes([pad])
+    pad += 1
+blob = b"openssh-key-v1\x00" + ssh_str(b"none") + ssh_str(b"none") + ssh_str(b"") + struct.pack(">I", 1) + ssh_str(pub_blob) + ssh_str(priv)
+b64 = base64.b64encode(blob).decode("ascii")
+lines = [b64[i:i + 70] for i in range(0, len(b64), 70)]
+pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END OPENSSH PRIVATE KEY-----\n"
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="ascii") as fh:
+    fh.write(pem)
+with open(sys.argv[3], "w", encoding="utf-8") as fh:
+    fh.write(payload["id"])
+PY
+
+ssh-keygen -q -t ed25519 -N '' -C 'fleet-phone@test' -f "$work/fleet_phone_key"
+fleet_phone_pub="$(cat "$work/fleet_phone_key.pub")"
+fleet_req="$(python3 -c 'import json,sys; print(json.dumps({"enrol":1,"id":sys.argv[1],"public_key":sys.argv[2],"name":"ignored"}))' "$(cat "$work/fleet_inv_id")" "$fleet_phone_pub")"
+fleet_enrol="$(printf '%s\n' "$fleet_req" | "${ssh_base[@]}" -i "$work/fleet_temp_key" me@127.0.0.1)"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["ok"] is True and r["principal"]=="device:fleet-phone" and r["role"]=="observer" and r["fleet"]["box2"]["status"]=="synced", r' "$fleet_enrol"
+
+# Ask box for `device.endpoint` with `on: "all"` through fleet-phone, then connect directly to box2.
+ep_out="$(
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"device.endpoint","args":{},"on":"all"}}' \
+  | "${ssh_base[@]}" -i "$work/fleet_phone_key" me@127.0.0.1 'legion rpc'
+)"
+python3 - "$ep_out" "$work/learned_box2_kh" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+res = r["result"]["results"]
+assert res["box"]["ok"]["port"] == 2222, res
+b2 = res["box2"]["ok"]
+assert b2["node"] == "box2" and b2["port"] == 2223 and len(b2["host_keys"]) >= 1, b2
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    for hk in b2["host_keys"]:
+        fh.write(f"[127.0.0.1]:2223 {hk}\n")
+PY
+
+ssh_box2=(
+  ssh -T
+  -o BatchMode=yes
+  -o IdentitiesOnly=yes
+  -o StrictHostKeyChecking=yes
+  -o "UserKnownHostsFile=$work/learned_box2_kh"
+  -o GlobalKnownHostsFile=none
+  -o ControlMaster=no
+  -o ConnectTimeout=10
+  -p 2223
+)
+box2_whoami="$(
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"meta.whoami","args":{}}}' \
+  | "${ssh_box2[@]}" -i "$work/fleet_phone_key" me@127.0.0.1 'legion rpc'
+)"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1])["result"]; assert r["node"]=="box2" and r["principal"]=="device:fleet-phone" and r["role"]=="observer" and r["door"]=="ssh", r' "$box2_whoami"
+
+# Upgrade role via `device.set` on box and confirm it propagates to box2.
+set_out="$(legion device.set name=fleet-phone role=operator --json)"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["role"]=="operator" and r["previous_role"]=="observer" and r["fleet"]["box2"]["status"]=="synced", r' "$set_out"
+box2_exec="$(
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"exec.run","args":{"cmd":"printf upgraded"}}}' \
+  | "${ssh_box2[@]}" -i "$work/fleet_phone_key" me@127.0.0.1 'legion rpc'
+)"
+python3 -c 'import json,sys; msgs=[json.loads(l) for l in sys.argv[1].splitlines() if l.strip()]; r=[m["result"] for m in msgs if m.get("id")==1 and "result" in m][0]; assert r["exit_code"]==0 and r["stdout"]=="upgraded", msgs' "$box2_exec"
+
+# Remove on box2 while box is unreachable -> still_trusted_by names box -> sync revokes on box.
+sed -i 's/"2222"/"2299"/' "$box2_home/config/fleet.toml"
+rm_box2="$(LEGION_HOME="$box2_home" legion device.remove name=fleet-phone --json)"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["removed"] is True and r["still_trusted_by"]==["box"], r' "$rm_box2"
+
+sed -i 's/"2299"/"2222"/' "$box2_home/config/fleet.toml"
+LEGION_HOME="$box2_home" legion fleet.sync direction=push documents='["devices.toml"]' --json >/dev/null
+if "${ssh_base[@]}" -i "$work/fleet_phone_key" me@127.0.0.1 'legion rpc' </dev/null >/dev/null 2>&1; then
+  echo "fleet-phone still authenticated on box after fleet.sync revocation!" >&2
+  exit 1
+fi
+
+# Trust rule check: planting an extra live owner entry on box2 must NOT be imported by box on push.
+ssh-keygen -q -t ed25519 -N '' -C 'planted@box2' -f "$work/planted_key"
+planted_pub="$(awk '{print $1 " " $2}' "$work/planted_key.pub")"
+python3 - "$box2_home/config/devices.toml" "$planted_pub" <<'PY'
+import datetime, sys
+path, pub = sys.argv[1], sys.argv[2]
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(
+        '\n[devices.dddddddddddddddddddddddddddddddd]\n'
+        'name = "planted-owner"\n'
+        f'public_key = "{pub}"\n'
+        'principal = "owner"\n'
+        'role = "owner"\n'
+        f'paired_at = "{now}"\n'
+        'paired_on = "box2"\n'
+        f'updated_at = "{now}"\n'
+        'updated_on = "box2"\n'
+    )
+PY
+legion fleet.sync direction=push documents='["devices.toml"]' --json >/dev/null
+if grep -q 'dddddddddddddddddddddddddddddddd' "$HOME/.config/legion/devices.toml"; then
+  echo "box imported live planted-owner entry from box2 during push!" >&2
+  exit 1
+fi
+if "${ssh_base[@]}" -i "$work/planted_key" me@127.0.0.1 'legion rpc' </dev/null >/dev/null 2>&1; then
+  echo "planted-owner key authenticated on box after push!" >&2
+  exit 1
+fi
+echo "    two-node fleet device pairing, endpoint discovery, device.set, offline revocation sync, and push trust rule verified"
 USER_EOF
 
 chmod 0755 /tmp/pairing-user-test.sh

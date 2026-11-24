@@ -224,8 +224,8 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
               : null}
             <p class="lede">One is enough: through it you reach the others. On that machine, run</p>
             <div class="code">
-              <code>legion pair --as phone</code>
-              <${CopyButton} text="legion pair --as phone" label="Copy command" iconOnly=${true} />
+              <code>legion pair</code>
+              <${CopyButton} text="legion pair" label="Copy command" iconOnly=${true} />
             </div>
             <p class="lede spaced">
               ${canScan

@@ -193,7 +193,16 @@ impl Fleet {
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
         let auth = authorize_principal_for_tool(node, here, principal, tool)?;
-        check_credential_minting_forward(here, tool, ctx.credential_expires())?;
+        check_credential_minting_forward(here, tool, args, ctx.credential_expires())?;
+        check_paired_device_invite_forward(
+            node,
+            here,
+            machine,
+            principal,
+            ctx.device(),
+            ctx.pairing_id(),
+            tool,
+        )?;
         let next_hops = ctx.hops().saturating_add(1);
         if next_hops > MAX_HOPS {
             return Err(ErrorBody::new(
@@ -506,31 +515,43 @@ impl Fleet {
         let tool = call.tool.clone();
         let args = call.args.clone();
         let principal = auth.principal().to_owned();
-        let result = match check_credential_minting_forward(&here, &tool, call.credential_expires)
-            .and_then(|()| {
-                node.config()
-                    .get::<FleetFile>()
-                    .map_err(|err| ensure_machine(err, &here))
-            })
-            .and_then(|fleet_file| {
-                let (direct_machine, direct_entry, relayed) =
-                    resolve_route(&fleet_file, machine, &here)?;
-                Ok((direct_machine.to_owned(), direct_entry.clone(), relayed))
-            }) {
-            Ok((direct_machine, direct_entry, relayed)) => {
-                self.forward_authorized(
-                    node,
-                    machine,
-                    &direct_machine,
-                    &direct_entry,
-                    relayed,
-                    call,
-                    auth,
-                )
-                .await
-            }
-            Err(err) => Err(err),
-        };
+        let result =
+            match check_credential_minting_forward(&here, &tool, &args, call.credential_expires)
+                .and_then(|()| {
+                    check_paired_device_invite_forward(
+                        node,
+                        &here,
+                        machine,
+                        &principal,
+                        call.device.as_deref(),
+                        call.pairing_id.as_deref(),
+                        &tool,
+                    )
+                })
+                .and_then(|()| {
+                    node.config()
+                        .get::<FleetFile>()
+                        .map_err(|err| ensure_machine(err, &here))
+                })
+                .and_then(|fleet_file| {
+                    let (direct_machine, direct_entry, relayed) =
+                        resolve_route(&fleet_file, machine, &here)?;
+                    Ok((direct_machine.to_owned(), direct_entry.clone(), relayed))
+                }) {
+                Ok((direct_machine, direct_entry, relayed)) => {
+                    self.forward_authorized(
+                        node,
+                        machine,
+                        &direct_machine,
+                        &direct_entry,
+                        relayed,
+                        call,
+                        auth,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
         node.record_audit_with_device(
             machine.to_owned(),
             Some(principal),
@@ -1353,6 +1374,7 @@ impl Fleet {
                 door: call.door,
                 pinned: call.pinned.clone(),
                 device: call.device.clone(),
+                pairing_id: call.pairing_id.clone(),
                 cancel: call.cancel.child_token(),
                 events: call.events.for_machine(machine.as_str()),
                 hops: call.hops,
@@ -1402,20 +1424,50 @@ impl ForwardAuth {
     }
 }
 
-/// Tools that mint new credentials and enforce local expiry checks on [`Call::credential_expires`].
-/// Because the JSON-RPC wire format does not carry `credential_expires`, a forwarding node refuses
-/// to forward these tools whenever the caller arrived with an expiring credential.
-const CREDENTIAL_MINTING_TOOLS: &[&str] = &["device.invite", "token.add"];
+/// Tools that mint or escalate permanent credentials and enforce local expiry checks on
+/// [`Call::credential_expires`]. Because the JSON-RPC wire format does not carry
+/// `credential_expires`, a forwarding node refuses to forward these calls whenever the caller
+/// arrived with an expiring credential.
+fn is_credential_minting_forward(tool: &str, args: &Value) -> bool {
+    match tool {
+        "device.invite" | "token.add" | "device.set" => true,
+        "config.write" => match args.get("document").and_then(Value::as_str) {
+            Some("devices.toml") => match args.get("content").and_then(Value::as_str) {
+                Some(content) => match legion_core::config::parse::<
+                    legion_tools::device::registry::DevicesFile,
+                >(
+                    std::path::Path::new("devices.toml"), content.as_bytes()
+                ) {
+                    // Allow tombstone-only `devices.toml` (no live entries, at least one
+                    // tombstone) so a removal made with an expiring credential still reaches peers.
+                    Ok(parsed) => !parsed.devices.is_empty() || parsed.removed.is_empty(),
+                    Err(_) => true,
+                },
+                None => true,
+            },
+            Some("policy.toml") => true,
+            Some(_) => false,
+            None => true,
+        },
+        "fleet.sync" => match args.get("direction") {
+            None => false,
+            Some(Value::String(dir)) if dir == "status" => false,
+            Some(_) => true,
+        },
+        _ => false,
+    }
+}
 
 fn check_credential_minting_forward(
     here: &str,
     tool: &str,
+    args: &Value,
     credential_expires: Option<jiff::Timestamp>,
 ) -> Result<(), ErrorBody> {
     let Some(limit) = credential_expires else {
         return Ok(());
     };
-    if !CREDENTIAL_MINTING_TOOLS.contains(&tool) {
+    if !is_credential_minting_forward(tool, args) {
         return Ok(());
     }
     Err(ErrorBody::new(
@@ -1427,6 +1479,43 @@ fn check_credential_minting_forward(
     )
     .with_hint(format!(
         "Credential expiry is not carried across remote hops; run {tool} directly on the target machine or with a non-expiring credential."
+    ))
+    .with_machine(here))
+}
+
+/// A paired device may create invites only on the machine it is connected to directly, so
+/// `paired_by.device` is always known from the session context.
+fn check_paired_device_invite_forward(
+    node: &Node,
+    here: &str,
+    machine: &str,
+    principal: &str,
+    device: Option<&str>,
+    pairing_id: Option<&str>,
+    tool: &str,
+) -> Result<(), ErrorBody> {
+    if tool != "device.invite" {
+        return Ok(());
+    }
+    let is_paired_device = pairing_id.is_some()
+        || device.is_some()
+        || node
+            .config()
+            .get::<Policy>()
+            .ok()
+            .is_some_and(|p| p.device_owner(principal).is_some())
+        || principal.starts_with(legion_tools::device::registry::DEVICE_PRINCIPAL_PREFIX);
+    if !is_paired_device {
+        return Ok(());
+    }
+    Err(ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "A paired device may create pairing invites only on the machine it is connected to directly, not forwarded from {here} to {machine}."
+        ),
+    )
+    .with_hint(format!(
+        "Connect directly to {machine} over SSH (for example using its endpoint from `device.endpoint`) and run `device.invite` there."
     ))
     .with_machine(here))
 }
@@ -2240,6 +2329,195 @@ mod tests {
         assert!(
             dead_elapsed < Duration::from_millis(2400),
             "dead dual-boot systems were probed serially: {dead_elapsed:?}"
+        );
+
+        fleet.close().await;
+    }
+
+    #[tokio::test]
+    async fn m1_paired_device_cannot_forward_device_invite_to_another_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\ncommand = [\"/nonexistent/legion-missing\"]\n",
+        )
+        .unwrap();
+        let pad_id = "88".repeat(16);
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "\
+default = \"owner\"
+
+[principals.\"device:pad\"]
+role = \"owner\"
+device = \"{pad_id}\"
+"
+            ),
+        )
+        .unwrap();
+
+        let registry = legion_tools::registry();
+        let node = Node::new(paths.clone(), registry);
+        let fleet = Fleet::new(&paths);
+
+        // 1. Paired device with pairing_id/device on `device:pad` forwarding `device.invite` to
+        //    `pi` must be refused with Denied and a hint to connect directly.
+        let mut dev_call = Call::new(
+            Door::Ssh,
+            "device.invite",
+            json!({"name": "child", "role": "observer"}),
+        );
+        dev_call.pinned = Some("device:pad".to_owned());
+        dev_call.device = Some("pad".to_owned());
+        dev_call.pairing_id = Some(pad_id.clone());
+        let err = fleet.call_machine(&node, "pi", dev_call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("pi") && h.to_lowercase().contains("connect")),
+            "expected hint to connect to pi directly: {err:?}"
+        );
+
+        // 2. Paired device pinned to shared `owner` principal (with `pairing_id` set) must also be
+        //    refused when forwarding `device.invite`.
+        let mut shared_dev_call = Call::new(
+            Door::Ssh,
+            "device.invite",
+            json!({"name": "child", "role": "observer"}),
+        );
+        shared_dev_call.pinned = Some("owner".to_owned());
+        shared_dev_call.device = Some("owner-phone".to_owned());
+        shared_dev_call.pairing_id = Some("99".repeat(16));
+        let err2 = fleet
+            .call_machine(&node, "pi", shared_dev_call)
+            .await
+            .unwrap_err();
+        assert_eq!(err2.code, ErrorCode::Denied, "{err2:?}");
+
+        // 3. Local CLI owner (not a paired device) is NOT blocked by the paired-device guard
+        //    (fails reaching missing binary instead of Denied).
+        let cli_call = Call::new(
+            Door::Cli,
+            "device.invite",
+            json!({"name": "child", "role": "observer"}),
+        );
+        let err3 = fleet.call_machine(&node, "pi", cli_call).await.unwrap_err();
+        assert_ne!(
+            err3.code,
+            ErrorCode::Denied,
+            "local CLI owner must not be denied forwarding device.invite: {err3:?}"
+        );
+
+        fleet.close().await;
+    }
+
+    #[tokio::test]
+    async fn s5_expiring_credential_allows_only_tombstone_only_devices_write_forward() {
+        use jiff::{SignedDuration, Timestamp};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, DevicesFile, FleetDevice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\ncommand = [\"/nonexistent/legion-missing\"]\n",
+        )
+        .unwrap();
+
+        let mut registry = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        crate::sync::register(&mut registry, fleet.clone());
+        let node = Node::new(paths.clone(), registry);
+
+        let expires = Some(Timestamp::now() + SignedDuration::from_hours(1));
+        let now = Timestamp::now().to_string();
+
+        // 1. Live entry in devices.toml -> Denied on forwarding node.
+        let mut with_live = DevicesFile::default();
+        with_live.devices.insert(
+            "11".repeat(16),
+            FleetDevice {
+                name: "live".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0x11; 32]),
+                principal: "device:live".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: now.clone(),
+                paired_on: "tower".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: now.clone(),
+                updated_on: "tower".to_owned(),
+                name_updated_at: now.clone(),
+                name_updated_on: "tower".to_owned(),
+                role_updated_at: now.clone(),
+                role_updated_on: "tower".to_owned(),
+                conflict: false,
+            },
+        );
+        let mut live_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": with_live.to_toml_string()}),
+        );
+        live_call.credential_expires = expires;
+        let err_live = fleet
+            .call_machine(&node, "pi", live_call)
+            .await
+            .unwrap_err();
+        assert_eq!(err_live.code, ErrorCode::Denied, "{err_live:?}");
+
+        // 2. Empty / invalid devices.toml -> Denied on forwarding node.
+        for bad in ["", "not = [valid toml"] {
+            let mut bad_call = Call::new(
+                Door::Http,
+                "config.write",
+                json!({"document": "devices.toml", "content": bad}),
+            );
+            bad_call.credential_expires = expires;
+            let err_bad = fleet.call_machine(&node, "pi", bad_call).await.unwrap_err();
+            assert_eq!(err_bad.code, ErrorCode::Denied, "{bad:?}: {err_bad:?}");
+        }
+
+        // 3. Tombstone-only devices.toml (no live entries, >= 1 tombstone) -> passes forwarding
+        //    guard (fails with Unreachable on missing binary rather than Denied).
+        let mut tomb_only = DevicesFile::default();
+        tomb_only.removed.insert(
+            "22".repeat(16),
+            DeviceTombstone {
+                name: "old".to_owned(),
+                principal: "device:old".to_owned(),
+                fingerprint: None,
+                paired_at: None,
+                paired_on: None,
+                paired_by: None,
+                removed_by: None,
+                removed_at: now,
+                removed_on: "tower".to_owned(),
+            },
+        );
+        let mut tomb_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": tomb_only.to_toml_string()}),
+        );
+        tomb_call.credential_expires = expires;
+        let err_tomb = fleet
+            .call_machine(&node, "pi", tomb_call)
+            .await
+            .unwrap_err();
+        assert_ne!(
+            err_tomb.code,
+            ErrorCode::Denied,
+            "tombstone-only devices.toml must pass expiring-credential forward guard: {err_tomb:?}"
         );
 
         fleet.close().await;

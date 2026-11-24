@@ -122,14 +122,7 @@ impl TestSshd {
             .ok_or_else(|| "generated host key pub file lacks key material".to_owned())?;
         let host_key_line = format!("{key_type} {key_b64}");
 
-        let supports_no_penalties = Command::new(&sshd_bin)
-            .args(["-T", "-o", "PerSourcePenalties=no", "-h"])
-            .arg(&host_key)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let supports_no_penalties = sshd_supports_no_penalties(&sshd_bin, &host_key);
 
         let mut last_error = String::new();
         for _ in 0..3 {
@@ -541,4 +534,80 @@ fn wait_for_listen(child: &mut Child, port: u16, timeout: Duration) -> Result<()
     Err(format!(
         "sshd did not listen on 127.0.0.1:{port} within {timeout:?}"
     ))
+}
+
+/// Probes whether `sshd` understands `PerSourcePenalties=no` without loading the host's
+/// `/etc/ssh/sshd_config` (which can fail for unprivileged users on Ubuntu 24.04 when system host
+/// keys or drop-ins are root-only).
+fn sshd_supports_no_penalties(sshd_bin: &Path, host_key: &Path) -> bool {
+    let via_g = Command::new(sshd_bin)
+        .args(["-G", "-f", "/dev/null", "-o", "PerSourcePenalties=no"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if via_g {
+        return true;
+    }
+    Command::new(sshd_bin)
+        .args(["-T", "-f", "/dev/null", "-o", "PerSourcePenalties=no", "-h"])
+        .arg(host_key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_sshd_config_toggles_per_source_penalties() {
+        let with_opt = render_sshd_config(
+            2222,
+            Path::new("/tmp/host"),
+            Path::new("/tmp/auth"),
+            "me",
+            &[],
+            &[],
+            true,
+        );
+        assert!(with_opt.contains("PerSourcePenalties no\n"), "{with_opt}");
+
+        let without_opt = render_sshd_config(
+            2222,
+            Path::new("/tmp/host"),
+            Path::new("/tmp/auth"),
+            "me",
+            &[],
+            &[],
+            false,
+        );
+        assert!(!without_opt.contains("PerSourcePenalties"), "{without_opt}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sshd_penalty_probe_ignores_system_sshd_config() {
+        if !TestSshd::available() {
+            return;
+        }
+        let sshd_bin = find_sshd().unwrap();
+        let ssh_keygen = find_tool("ssh-keygen").unwrap();
+        let dir = TempDir::new().unwrap();
+        let host_key = dir.path().join("host_ed25519");
+        generate_ed25519_keypair(&ssh_keygen, &host_key, "probe-test").unwrap();
+
+        let expected = Command::new(&sshd_bin)
+            .args(["-G", "-f", "/dev/null", "-o", "PerSourcePenalties=no"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        assert_eq!(sshd_supports_no_penalties(&sshd_bin, &host_key), expected);
+    }
 }

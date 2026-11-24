@@ -62,6 +62,7 @@ pub struct Ctx {
     pub(crate) name: String,
     pub(crate) door: Door,
     pub(crate) device: Option<String>,
+    pub(crate) pairing_id: Option<String>,
     pub(crate) grant: Grant,
     pub(crate) cancel: CancellationToken,
     pub(crate) events: EventSink,
@@ -121,6 +122,12 @@ impl Ctx {
     /// The paired device name when the call arrived through `legion gate --as ... --device <name>`.
     pub fn device(&self) -> Option<&str> {
         self.device.as_deref()
+    }
+
+    /// The paired device's 32-hex pairing identifier when the call arrived through
+    /// `legion gate --as ... --pairing <id>`.
+    pub fn pairing_id(&self) -> Option<&str> {
+        self.pairing_id.as_deref()
     }
 
     /// How many nodes have already forwarded the call this tool is running for; `0` when the call

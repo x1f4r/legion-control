@@ -689,10 +689,31 @@ fn legion_pair_prints_summary_qr_invite_and_commands_and_supports_invert_and_jso
             .starts_with("legion-invite-1.")
     );
 
+    // `--name` + `--role` creates `device:<name>` in policy.toml and issues the invite.
+    let role_pair = home.run(&[
+        "pair",
+        "--name",
+        "Work Tablet",
+        "--role",
+        "observer",
+        "--host",
+        "tower.example",
+        "--json",
+    ]);
+    assert_eq!(role_pair.code, 0, "stderr={}", role_pair.stderr);
+    let role_json = role_pair.json();
+    assert_eq!(role_json["principal"], json!("device:work-tablet"));
+    assert_eq!(role_json["role"], json!("observer"));
+
+    // Running plain `legion pair` non-interactively refuses rather than assuming a preset role.
+    let non_tty = home.run(&["pair"]);
+    assert_ne!(non_tty.code, 0);
+
     // `legion help pair` explains pairing in plain words.
     let help = home.run(&["help", "pair"]);
     assert_eq!(help.code, 0);
     assert!(help.stdout.contains("legion pair --as PRINCIPAL"));
+    assert!(help.stdout.contains("--role ROLE"));
     assert!(help.stdout.contains("--invert"));
 }
 
@@ -2103,4 +2124,2609 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
     let status_a = home.run(&["job.status", &format!("id={job_a}")]);
     assert_eq!(status_a.code, 0, "job.status failed: {}", status_a.stderr);
     assert_eq!(status_a.json()["state"], json!("running"));
+}
+
+/// Exercises all fleet-wide paired-device flows across independent nodes backed by real loopback
+/// `sshd` daemons (separate Legion homes, separate `authorized_keys`, connected only through
+/// `fleet.toml` over real SSH):
+///
+/// 1. Role-based pairing on A -> automatic push to B -> `device.endpoint` with `on: "all"` ->
+///    direct SSH connection from the device to B.
+/// 2. B unreachable during pairing -> `fleet.b.status == "not_reached"`, `meta.doctor` warns on
+///    drift once B is reachable -> `fleet.sync` converges -> direct SSH to B succeeds.
+/// 3. `device.remove` on B while A is unreachable -> `still_trusted_by == ["a"]`, honest limit
+///    that A's open `ControlMaster` still answers until sync -> `fleet.sync` immediately tears
+///    down A's `ControlMaster`, removes A's `authorized_keys` line & `device:*` principal, and
+///    refuses both multiplexed and fresh connections.
+/// 4. An `owner`-role paired device calls `device.invite` over SSH on A -> enrolled device works
+///    directly on both A and B.
+/// 5. `device.set` changes role (`observer` -> `editor`) and renames on A -> propagates to B and
+///    takes effect immediately.
+/// 6. Legacy first-run adoption on a third node C (pre-existing `--pairing` line, no `devices.toml`)
+///    merges bidirectionally on `fleet.sync` without dropping either side's devices.
+#[cfg(unix)]
+#[test]
+fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() {
+    if !TestSshd::available() {
+        eprintln!(
+            "skipping real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption: sshd unavailable"
+        );
+        return;
+    }
+
+    let legion_bin = Path::new(env!("CARGO_BIN_EXE_legion"));
+
+    let node_a = Home::new_strict();
+    let node_b = Home::new_strict();
+    let auth_a = node_a.home().join("authorized_keys_a");
+    let auth_b = node_b.home().join("authorized_keys_b");
+
+    let home_a_str = node_a.home().to_string_lossy().into_owned();
+    let home_b_str = node_b.home().to_string_lossy().into_owned();
+    let Some(sshd_a) =
+        TestSshd::start(auth_a.clone(), &[("HOME", &home_a_str)]).expect("sshd_a failed to start")
+    else {
+        return;
+    };
+    let Some(sshd_b) =
+        TestSshd::start(auth_b.clone(), &[("HOME", &home_b_str)]).expect("sshd_b failed to start")
+    else {
+        return;
+    };
+
+    // Shared client/fleet scratch directory (keys and known_hosts only; nodes never share config/state).
+    let client_dir = tempfile::tempdir().unwrap();
+    let fleet_key = client_dir.path().join("fleet_ed25519");
+    let fleet_pub =
+        generate_ed25519_keypair(sshd_a.ssh_keygen_bin(), &fleet_key, "fleet@test").unwrap();
+
+    let fleet_kh_a = client_dir.path().join("fleet_known_hosts_a");
+    write_known_hosts(
+        &fleet_kh_a,
+        "127.0.0.1",
+        sshd_a.port(),
+        &[sshd_a.host_key_line().to_owned()],
+    )
+    .unwrap();
+    let fleet_kh_b = client_dir.path().join("fleet_known_hosts_b");
+    write_known_hosts(
+        &fleet_kh_b,
+        "127.0.0.1",
+        sshd_b.port(),
+        &[sshd_b.host_key_line().to_owned()],
+    )
+    .unwrap();
+
+    // Put a foreign fleet-link key on each node's authorized_keys so `a <-> b` speaks real SSH.
+    let home_a_root = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_root = node_b.state().parent().unwrap().to_path_buf();
+    let fleet_line = |legion_home: &Path| -> String {
+        let q_home = legion_home.display().to_string().replace('\'', "'\\''");
+        let q_bin = legion_bin.display().to_string().replace('\'', "'\\''");
+        let cmd = format!("env LEGION_HOME='{q_home}' '{q_bin}' rpc")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        format!("restrict,command=\"{cmd}\" {fleet_pub} fleet-link\n")
+    };
+    std::fs::write(&auth_a, fleet_line(&home_a_root)).unwrap();
+    std::fs::write(&auth_b, fleet_line(&home_b_root)).unwrap();
+
+    let ssh_cmd_toml = |port: u16, known_hosts: &Path, user: &str| -> String {
+        let argv = vec![
+            sshd_a.ssh_bin().to_string_lossy().into_owned(),
+            "-T".to_owned(),
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            "IdentitiesOnly=yes".to_owned(),
+            "-o".to_owned(),
+            "StrictHostKeyChecking=yes".to_owned(),
+            "-o".to_owned(),
+            format!("UserKnownHostsFile={}", known_hosts.display()),
+            "-o".to_owned(),
+            "GlobalKnownHostsFile=none".to_owned(),
+            "-o".to_owned(),
+            "ControlMaster=no".to_owned(),
+            "-o".to_owned(),
+            "ConnectTimeout=3".to_owned(),
+            "-o".to_owned(),
+            "LogLevel=ERROR".to_owned(),
+            "-p".to_owned(),
+            port.to_string(),
+            "-i".to_owned(),
+            fleet_key.display().to_string(),
+            format!("{user}@127.0.0.1"),
+            "legion rpc".to_owned(),
+        ];
+        let elems: Vec<String> = argv
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', "''")))
+            .collect();
+        format!("[{}]", elems.join(", "))
+    };
+
+    // Allocate an unused loopback port for simulating an unreachable peer quickly (connection refused).
+    let closed_port = {
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        sock.local_addr().unwrap().port()
+    };
+
+    let write_node_cfg = |home: &Home, name: &str, auth: &Path, sshd: &TestSshd| {
+        home.write_config(
+            "node.toml",
+            &format!(
+                "name = \"{name}\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = \"{}\"\n",
+                toml_literal(auth),
+                toml_literal(sshd.host_key_path()),
+                sshd.port(),
+                sshd.user(),
+            ),
+        );
+    };
+    write_node_cfg(&node_a, "a", &auth_a, &sshd_a);
+    write_node_cfg(&node_b, "b", &auth_b, &sshd_b);
+
+    let policy_for = |projects_dir: &Path| -> String {
+        format!(
+            "default = \"owner\"\n\n\
+             [roles.observer]\n\
+             allow = [\"effect:read\"]\n\
+             deny = [\"audit.*\"]\n\
+             paths = [{}]\n\n\
+             [roles.editor]\n\
+             allow = [\"effect:read\", \"effect:write\"]\n\
+             deny = [\"audit.*\"]\n\
+             paths = [{}]\n\n\
+             [principals.legacy_phone]\n\
+             role = \"observer\"\n",
+            toml_literal(projects_dir),
+            toml_literal(projects_dir),
+        )
+    };
+    let projects_a = node_a.home().join("projects");
+    let projects_b = node_b.home().join("projects");
+    std::fs::write(projects_a.join("app").join("note.txt"), "from-a\n").unwrap();
+    std::fs::write(projects_b.join("app").join("note.txt"), "from-b\n").unwrap();
+    node_a.write_config("policy.toml", &policy_for(&projects_a));
+    node_b.write_config("policy.toml", &policy_for(&projects_b));
+
+    let write_fleet_a = |b_port: u16| {
+        node_a.write_config(
+            "fleet.toml",
+            &format!(
+                "[machines.b]\ncommand = {}\n",
+                ssh_cmd_toml(b_port, &fleet_kh_b, sshd_b.user()),
+            ),
+        );
+    };
+    let write_fleet_b = |a_port: u16| {
+        node_b.write_config(
+            "fleet.toml",
+            &format!(
+                "[machines.a]\ncommand = {}\n",
+                ssh_cmd_toml(a_port, &fleet_kh_a, sshd_a.user()),
+            ),
+        );
+    };
+    write_fleet_a(sshd_b.port());
+    write_fleet_b(sshd_a.port());
+
+    let enrol_from_invite = |invite_text: &str,
+                             sshd: &TestSshd,
+                             key_stem: &str,
+                             req_name: &str|
+     -> (std::path::PathBuf, Value) {
+        let payload = InvitePayload::decode(invite_text).unwrap();
+        let temp_key = client_dir.path().join(format!("{key_stem}_temp"));
+        write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), key_stem)
+            .unwrap();
+        let kh = client_dir.path().join(format!("{key_stem}_kh"));
+        write_known_hosts(&kh, &payload.hosts[0], payload.port, &payload.host_keys).unwrap();
+        let dev_key = client_dir.path().join(format!("{key_stem}_key"));
+        let dev_pub = generate_ed25519_keypair(sshd.ssh_keygen_bin(), &dev_key, key_stem).unwrap();
+
+        let mut child = sshd
+            .ssh_command(&temp_key, &kh)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                json!({
+                    "enrol": 1,
+                    "id": payload.id,
+                    "public_key": dev_pub,
+                    "name": req_name,
+                })
+            )
+            .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "enrol {key_stem} failed: stdout={} stderr={}\nsshd:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            sshd.logs(),
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        (dev_key, reply)
+    };
+
+    let rpc_call_direct = |key: &Path,
+                           kh: &Path,
+                           port: u16,
+                           user: &str,
+                           tool: &str,
+                           args: Value,
+                           on: Option<&str>|
+     -> Value {
+        let mut params = json!({"tool": tool, "args": args});
+        if let Some(target) = on {
+            params["on"] = json!(target);
+        }
+        let mut child = std::process::Command::new(sshd_a.ssh_bin())
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                &format!("UserKnownHostsFile={}", kh.display()),
+                "-o",
+                "GlobalKnownHostsFile=none",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "LogLevel=ERROR",
+                "-p",
+                &port.to_string(),
+                "-i",
+            ])
+            .arg(key)
+            .args([&format!("{user}@127.0.0.1"), "legion rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{}", rpc_request(json!(1), "call", params)).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "direct rpc {tool} on port {port} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap()
+    };
+
+    // === Scenario 1: Pair on A with --name/--role -> auto-push -> device.endpoint --on all -> direct SSH to B ===
+    let inv_a = node_a.run(&["pair", "--name", "phone-a", "--role", "observer", "--json"]);
+    assert_eq!(inv_a.code, 0, "pair phone-a failed: {}", inv_a.stderr);
+    let inv_a_json = inv_a.json();
+    assert_eq!(inv_a_json["principal"], json!("device:phone-a"));
+    assert_eq!(inv_a_json["role"], json!("observer"));
+
+    let (phone_a_key, phone_a_enrol) = enrol_from_invite(
+        inv_a_json["invite"].as_str().unwrap(),
+        &sshd_a,
+        "phone_a",
+        "ignored",
+    );
+    assert_eq!(phone_a_enrol["ok"], json!(true));
+    assert_eq!(phone_a_enrol["principal"], json!("device:phone-a"));
+    assert_eq!(phone_a_enrol["role"], json!("observer"));
+    assert_eq!(phone_a_enrol["device"], json!("phone-a"));
+    assert_eq!(
+        phone_a_enrol["fleet"]["b"]["status"],
+        json!("synced"),
+        "expected phone-a enrolment to push to b: {phone_a_enrol}"
+    );
+
+    // Call `device.endpoint` with `on: "all"` as `phone-a` through A to learn B's endpoint and host key.
+    let ep_all = rpc_call_direct(
+        &phone_a_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "device.endpoint",
+        json!({}),
+        Some("all"),
+    );
+    let ep_results = &ep_all["result"]["results"];
+    assert_eq!(ep_results["a"]["ok"]["node"], json!("a"), "{ep_all}");
+    assert_eq!(ep_results["b"]["ok"]["node"], json!("b"), "{ep_all}");
+    let ep_b = &ep_results["b"]["ok"];
+    let ep_b_host = ep_b["hosts"][0].as_str().unwrap();
+    let ep_b_port = ep_b["port"].as_u64().unwrap() as u16;
+    let ep_b_user = ep_b["user"].as_str().unwrap();
+    let ep_b_hks: Vec<String> = ep_b["host_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ep_b_port, sshd_b.port());
+    assert_eq!(ep_b_hks, vec![sshd_b.host_key_line().to_owned()]);
+
+    // Pin B's host key from what A reported and connect directly from phone-a to B!
+    let learned_kh_b = client_dir.path().join("learned_kh_b");
+    write_known_hosts(&learned_kh_b, ep_b_host, ep_b_port, &ep_b_hks).unwrap();
+    let whoami_b = rpc_call_direct(
+        &phone_a_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(whoami_b["result"]["node"], json!("b"), "{whoami_b}");
+    assert_eq!(whoami_b["result"]["principal"], json!("device:phone-a"));
+    assert_eq!(whoami_b["result"]["role"], json!("observer"));
+    assert_eq!(whoami_b["result"]["door"], json!("ssh"));
+
+    let read_b = rpc_call_direct(
+        &phone_a_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.read",
+        json!({"path": projects_b.join("app").join("note.txt").to_string_lossy()}),
+        None,
+    );
+    assert_eq!(read_b["result"]["content"], json!("from-b\n"), "{read_b}");
+    let denied_write_b = rpc_call_direct(
+        &phone_a_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.write",
+        json!({"path": projects_b.join("app").join("nope.txt").to_string_lossy(), "content": "x"}),
+        None,
+    );
+    assert_eq!(denied_write_b["error"]["data"]["code"], json!("denied"));
+
+    // === Scenario 2: B unreachable during pairing -> meta.doctor drift warning -> fleet.sync -> B accepts ===
+    write_fleet_a(closed_port);
+    let inv_off = node_a.run(&[
+        "pair",
+        "--name",
+        "phone-offline",
+        "--role",
+        "observer",
+        "--json",
+    ]);
+    assert_eq!(
+        inv_off.code, 0,
+        "pair phone-offline failed: {}",
+        inv_off.stderr
+    );
+    let (phone_off_key, phone_off_enrol) = enrol_from_invite(
+        inv_off.json()["invite"].as_str().unwrap(),
+        &sshd_a,
+        "phone_off",
+        "ignored",
+    );
+    assert_eq!(phone_off_enrol["ok"], json!(true));
+    assert_eq!(
+        phone_off_enrol["fleet"]["b"]["status"],
+        json!("not_reached"),
+        "expected unreachable b during enrolment: {phone_off_enrol}"
+    );
+    let refused_b_before = sshd_b
+        .ssh_command(&phone_off_key, &learned_kh_b)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !refused_b_before.status.success(),
+        "phone-offline unexpectedly authenticated to B before sync"
+    );
+
+    // Restore reachability and check `meta.doctor` warns about device drift before syncing.
+    write_fleet_a(sshd_b.port());
+    let doc_drifted = node_a.run(&["meta.doctor"]).json();
+    let drift_check = doc_drifted["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == json!("fleet devices"));
+    assert!(
+        drift_check.is_some_and(|c| c["ok"] == json!(true)
+            && c["warning"] == json!(true)
+            && c["detail"].as_str().unwrap_or_default().contains('b')),
+        "expected meta.doctor fleet devices drift warning: {doc_drifted}"
+    );
+
+    let synced_a_to_b = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(
+        synced_a_to_b.code, 0,
+        "fleet.sync push failed: {}",
+        synced_a_to_b.stderr
+    );
+    assert_eq!(
+        synced_a_to_b.json()["results"]["b"]["devices.toml"]["status"],
+        json!("pushed")
+    );
+
+    let whoami_off_b = rpc_call_direct(
+        &phone_off_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(whoami_off_b["result"]["node"], json!("b"));
+    assert_eq!(
+        whoami_off_b["result"]["principal"],
+        json!("device:phone-offline")
+    );
+    assert_eq!(whoami_off_b["result"]["role"], json!("observer"));
+
+    // Once in sync, `meta.doctor` no longer emits the drift warning.
+    let doc_clean = node_a.run(&["meta.doctor"]).json();
+    assert!(
+        !doc_clean["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == json!("fleet devices")),
+        "expected fleet devices warning to clear after sync: {doc_clean}"
+    );
+
+    // === Scenario 3: Remove on B while A is unreachable -> still_trusted_by -> ControlMaster killed on sync ===
+    let ctl_dir = tempfile::Builder::new()
+        .prefix("lg-f-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let ctl_path = ctl_dir.path().join("a.sock");
+    let target_a = format!("{}@127.0.0.1", sshd_a.user());
+    let ctl_start = std::process::Command::new(sshd_a.ssh_bin())
+        .args([
+            "-T",
+            "-f",
+            "-N",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            &format!("UserKnownHostsFile={}", fleet_kh_a.display()),
+            "-o",
+            "GlobalKnownHostsFile=none",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "ControlMaster=yes",
+            "-o",
+            "ControlPersist=yes",
+            "-S",
+        ])
+        .arg(&ctl_path)
+        .args(["-p", &sshd_a.port().to_string(), "-i"])
+        .arg(&phone_a_key)
+        .arg(&target_a)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        ctl_start.status.success(),
+        "ControlMaster start failed: {}",
+        String::from_utf8_lossy(&ctl_start.stderr)
+    );
+
+    struct CleanCtl {
+        ssh: std::path::PathBuf,
+        ctl: std::path::PathBuf,
+        target: String,
+    }
+    impl Drop for CleanCtl {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(&self.ssh)
+                .args(["-S"])
+                .arg(&self.ctl)
+                .args(["-O", "exit", &self.target])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _ctl_guard = CleanCtl {
+        ssh: sshd_a.ssh_bin().to_path_buf(),
+        ctl: ctl_path.clone(),
+        target: target_a.clone(),
+    };
+
+    let ctl_is_alive = || -> bool {
+        std::process::Command::new(sshd_a.ssh_bin())
+            .args(["-S"])
+            .arg(&ctl_path)
+            .args(["-O", "check", &target_a])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let whoami_via_ctl = || -> std::process::Output {
+        let mut child = std::process::Command::new(sshd_a.ssh_bin())
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "LogLevel=ERROR",
+                "-S",
+            ])
+            .arg(&ctl_path)
+            .args([&target_a, "legion rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(
+                stdin,
+                "{}",
+                rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+            )
+            .unwrap();
+        }
+        child.wait_with_output().unwrap()
+    };
+
+    // Prime the ControlMaster so A records its parent sshd session before B revokes phone-a.
+    let before_revoke = whoami_via_ctl();
+    assert!(before_revoke.status.success());
+    assert!(ctl_is_alive());
+
+    // Make A unreachable from B while keeping sshd_a and phone-a's ControlMaster live.
+    write_fleet_b(closed_port);
+    let rm_on_b = node_b.run(&["device.remove", "name=phone-a"]);
+    assert_eq!(rm_on_b.code, 0, "remove phone-a on b: {}", rm_on_b.stderr);
+    let rm_json = rm_on_b.json();
+    assert_eq!(rm_json["removed"], json!(true));
+    assert_eq!(rm_json["still_trusted_by"], json!(["a"]), "{rm_json}");
+    assert_eq!(rm_json["fleet"]["a"]["status"], json!("not_reached"));
+    assert!(
+        rm_json["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains('a') && h.contains("fleet.sync")),
+        "expected still_trusted_by hint: {rm_json}"
+    );
+
+    // Honest limit: B refuses phone-a at once, while A still accepts it until synced.
+    let refused_b_after_rm = sshd_b
+        .ssh_command(&phone_a_key, &learned_kh_b)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!refused_b_after_rm.status.success());
+    let still_ok_on_a = whoami_via_ctl();
+    assert!(
+        still_ok_on_a.status.success(),
+        "expected A to still trust phone-a before syncing"
+    );
+
+    // Restore reachability and sync from B -> A: A's ControlMaster must die immediately!
+    write_fleet_b(sshd_a.port());
+    let sync_revoke = node_b.run(&[
+        "fleet.sync",
+        "direction=push",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(
+        sync_revoke.code, 0,
+        "fleet.sync revocation failed: {}",
+        sync_revoke.stderr
+    );
+    assert_eq!(
+        sync_revoke.json()["results"]["a"]["devices.toml"]["status"],
+        json!("pushed")
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && ctl_is_alive() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ctl_is_alive(),
+        "phone-a ControlMaster on A stayed alive after fleet.sync delivered its tombstone"
+    );
+    assert!(!whoami_via_ctl().status.success());
+    let fresh_a_after_sync = sshd_a
+        .ssh_command(&phone_a_key, &fleet_kh_a)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!fresh_a_after_sync.status.success());
+    let policy_a_after =
+        std::fs::read_to_string(home_a_root.join("config").join("policy.toml")).unwrap();
+    assert!(
+        !policy_a_after.contains("device:phone-a"),
+        "stale device:phone-a principal was not cleaned up from A's policy.toml:\n{policy_a_after}"
+    );
+
+    // === Scenario 4: Owner-role paired device pairs another device over SSH -> works on A and B ===
+    let inv_owner = node_a.run(&[
+        "pair",
+        "--name",
+        "owner-pad",
+        "--role",
+        "owner",
+        "--allow-owner",
+        "--json",
+    ]);
+    assert_eq!(
+        inv_owner.code, 0,
+        "pair owner-pad failed: {}",
+        inv_owner.stderr
+    );
+    let (owner_pad_key, owner_enrol) = enrol_from_invite(
+        inv_owner.json()["invite"].as_str().unwrap(),
+        &sshd_a,
+        "owner_pad",
+        "ignored",
+    );
+    assert_eq!(owner_enrol["ok"], json!(true));
+    assert_eq!(owner_enrol["role"], json!("owner"));
+    assert_eq!(owner_enrol["fleet"]["b"]["status"], json!("synced"));
+
+    // `owner-pad` calls `device.invite` over SSH on A to pair `guest-phone`.
+    let guest_inv_rpc = rpc_call_direct(
+        &owner_pad_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "device.invite",
+        json!({"name": "guest-phone", "role": "observer"}),
+        None,
+    );
+    let guest_invite_str = guest_inv_rpc["result"]["invite"]
+        .as_str()
+        .unwrap_or_else(|| panic!("owner-pad device.invite failed: {guest_inv_rpc}"));
+    let (guest_key, guest_enrol) =
+        enrol_from_invite(guest_invite_str, &sshd_a, "guest_phone", "ignored");
+    assert_eq!(guest_enrol["ok"], json!(true));
+    assert_eq!(guest_enrol["principal"], json!("device:guest-phone"));
+    assert_eq!(guest_enrol["role"], json!("observer"));
+    assert_eq!(
+        guest_enrol["fleet"]["b"]["status"],
+        json!("synced"),
+        "expected owner-pad's invite enrolment to push to b: {guest_enrol}"
+    );
+
+    let guest_on_a = rpc_call_direct(
+        &guest_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(guest_on_a["result"]["node"], json!("a"));
+    assert_eq!(
+        guest_on_a["result"]["principal"],
+        json!("device:guest-phone")
+    );
+    let guest_on_b = rpc_call_direct(
+        &guest_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(guest_on_b["result"]["node"], json!("b"));
+    assert_eq!(
+        guest_on_b["result"]["principal"],
+        json!("device:guest-phone")
+    );
+
+    // === Scenario 5: `device.set` changes role (`observer` -> `editor`) and renames, propagating to B ===
+    let denied_before_set = rpc_call_direct(
+        &phone_off_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.write",
+        json!({"path": projects_b.join("app").join("edited.txt").to_string_lossy(), "content": "ok\n"}),
+        None,
+    );
+    assert_eq!(denied_before_set["error"]["data"]["code"], json!("denied"));
+
+    let set_role = node_a.run(&[
+        "device.set",
+        "name=phone-offline",
+        "role=editor",
+        "rename=field-phone",
+    ]);
+    assert_eq!(set_role.code, 0, "device.set failed: {}", set_role.stderr);
+    let set_json = set_role.json();
+    assert_eq!(set_json["name"], json!("field-phone"));
+    assert_eq!(set_json["previous_name"], json!("phone-offline"));
+    assert_eq!(set_json["role"], json!("editor"));
+    assert_eq!(set_json["previous_role"], json!("observer"));
+    assert_eq!(set_json["fleet"]["b"]["status"], json!("synced"));
+
+    let allowed_after_set = rpc_call_direct(
+        &phone_off_key,
+        &learned_kh_b,
+        ep_b_port,
+        ep_b_user,
+        "fs.write",
+        json!({"path": projects_b.join("app").join("edited.txt").to_string_lossy(), "content": "ok\n"}),
+        None,
+    );
+    assert_eq!(
+        allowed_after_set["result"]["size"],
+        json!(3),
+        "expected fs.write to succeed on B after device.set role=editor: {allowed_after_set}"
+    );
+    let list_b = node_b.run(&["device.list"]).json();
+    assert!(
+        list_b["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == json!("field-phone") && d["role"] == json!("editor")),
+        "expected renamed field-phone (editor) on B: {list_b}"
+    );
+
+    // === Scenario 6: Legacy migration/adoption on node C with pre-existing `--pairing` line and no devices.toml ===
+    let node_c = Home::new_strict();
+    let auth_c = node_c.home().join("authorized_keys_c");
+    let home_c_str = node_c.home().to_string_lossy().into_owned();
+    let Some(sshd_c) =
+        TestSshd::start(auth_c.clone(), &[("HOME", &home_c_str)]).expect("sshd_c failed to start")
+    else {
+        return;
+    };
+    let home_c_root = node_c.state().parent().unwrap().to_path_buf();
+    let projects_c = node_c.home().join("projects");
+    std::fs::create_dir_all(&projects_c).unwrap();
+    write_node_cfg(&node_c, "c", &auth_c, &sshd_c);
+    node_c.write_config("policy.toml", &policy_for(&projects_c));
+
+    let fleet_kh_c = client_dir.path().join("fleet_known_hosts_c");
+    write_known_hosts(
+        &fleet_kh_c,
+        "127.0.0.1",
+        sshd_c.port(),
+        &[sshd_c.host_key_line().to_owned()],
+    )
+    .unwrap();
+
+    // Write two pre-existing legacy `--pairing` lines on C with NO `devices.toml` on disk:
+    // 1. `legacy-phone` WITH a matching `state/devices.json` record (must be adopted).
+    // 2. `untracked-local` WITHOUT a `state/devices.json` record (must stay local-only).
+    let legacy_key = client_dir.path().join("legacy_c_key");
+    let legacy_pub_raw =
+        generate_ed25519_keypair(sshd_c.ssh_keygen_bin(), &legacy_key, "legacy@c").unwrap();
+    let legacy_validated =
+        legion_tools::device::keys::validate_ed25519_public_key(&legacy_pub_raw).unwrap();
+    let legacy_pub = legacy_validated.canonical;
+    let legacy_pairing_id = "cccccccccccccccccccccccccccccccc";
+
+    let local_only_key = client_dir.path().join("local_only_c_key");
+    let local_only_pub_raw =
+        generate_ed25519_keypair(sshd_c.ssh_keygen_bin(), &local_only_key, "local@c").unwrap();
+    let local_only_pub =
+        legion_tools::device::keys::validate_ed25519_public_key(&local_only_pub_raw)
+            .unwrap()
+            .canonical;
+    let local_only_id = "dddddddddddddddddddddddddddddddd";
+
+    let pinned_c = legion_tools::device::authkeys::PinnedHome::Root(home_c_root.clone());
+    let shell = legion_tools::device::authkeys::ForcedCommandShell::host().unwrap();
+    let legacy_line = legion_tools::device::authkeys::format_device_line(
+        legion_bin,
+        "legacy_phone",
+        &legacy_pub,
+        "legacy-phone",
+        legacy_pairing_id,
+        &pinned_c,
+        None,
+        shell,
+    )
+    .unwrap();
+    let local_only_line = legion_tools::device::authkeys::format_device_line(
+        legion_bin,
+        "legacy_phone",
+        &local_only_pub,
+        "untracked-local",
+        local_only_id,
+        &pinned_c,
+        None,
+        shell,
+    )
+    .unwrap();
+    std::fs::write(
+        &auth_c,
+        format!(
+            "{}{legacy_line}\n{local_only_line}\n",
+            fleet_line(&home_c_root)
+        ),
+    )
+    .unwrap();
+    let mut c_state = legion_tools::device::store::DevicesState::default();
+    c_state.devices.insert(
+        "legacy-phone".to_owned(),
+        legion_tools::device::store::DeviceRecord {
+            name: "legacy-phone".to_owned(),
+            principal: "legacy_phone".to_owned(),
+            added: "2026-11-24T10:00:00Z".to_owned(),
+            fingerprint: legacy_validated.fingerprint,
+            pairing_id: Some(legacy_pairing_id.to_owned()),
+        },
+    );
+    let paths_c = legion_core::Paths::under(home_c_root.clone());
+    legion_tools::device::store::save_state(&paths_c, &c_state).unwrap();
+    assert!(!home_c_root.join("config").join("devices.toml").exists());
+
+    // `config.read devices.toml` on C before adoption must report exists=false (never synthesize
+    // an unsaved adopted list). Running `device.list` on C adopts the state-matched line to disk.
+    let c_read_before = node_c.run(&["config.read", "document=devices.toml"]).json();
+    assert_eq!(c_read_before["exists"], json!(false), "{c_read_before}");
+    let list_c_initial = node_c.run(&["device.list"]).json();
+    assert!(
+        list_c_initial["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == json!("untracked-local") && d["local_only"] == json!(true)),
+        "expected untracked-local marked local_only in C's device.list: {list_c_initial}"
+    );
+    assert!(home_c_root.join("config").join("devices.toml").is_file());
+
+    // Wire `c` into A's `fleet.toml`. Under the one-way trust rule:
+    // - `pull from=c` imports C's adopted `legacy-phone` onto A without pushing to C.
+    // - `push machines=["c"]` sends A's `field-phone` onto C without importing live devices back.
+    node_a.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.b]\ncommand = {}\n\n[machines.c]\ncommand = {}\n",
+            ssh_cmd_toml(sshd_b.port(), &fleet_kh_b, sshd_b.user()),
+            ssh_cmd_toml(sshd_c.port(), &fleet_kh_c, sshd_c.user()),
+        ),
+    );
+    let pull_c = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=c",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(pull_c.code, 0, "pull from c failed: {}", pull_c.stderr);
+    assert_eq!(
+        pull_c.json()["results"]["c"]["devices.toml"]["status"],
+        json!("pulled")
+    );
+    let push_c = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"c\"]",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(push_c.code, 0, "push to c failed: {}", push_c.stderr);
+    assert_eq!(
+        push_c.json()["results"]["c"]["devices.toml"]["status"],
+        json!("pushed")
+    );
+
+    // Legacy device from C now works directly against A, and field-phone from A now works against C!
+    let legacy_on_a = rpc_call_direct(
+        &legacy_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(legacy_on_a["result"]["node"], json!("a"), "{legacy_on_a}");
+    assert_eq!(legacy_on_a["result"]["principal"], json!("legacy_phone"));
+    assert_eq!(legacy_on_a["result"]["role"], json!("observer"));
+
+    let field_on_c = rpc_call_direct(
+        &phone_off_key,
+        &fleet_kh_c,
+        sshd_c.port(),
+        sshd_c.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(field_on_c["result"]["node"], json!("c"), "{field_on_c}");
+    assert_eq!(
+        field_on_c["result"]["principal"],
+        json!("device:phone-offline")
+    );
+    assert_eq!(field_on_c["result"]["role"], json!("editor"));
+    // untracked-local stayed local-only on C (working on C, refused on A).
+    let local_on_c = rpc_call_direct(
+        &local_only_key,
+        &fleet_kh_c,
+        sshd_c.port(),
+        sshd_c.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(local_on_c["result"]["node"], json!("c"), "{local_on_c}");
+    let local_refused_on_a = sshd_a
+        .ssh_command(&local_only_key, &fleet_kh_a)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !local_refused_on_a.status.success(),
+        "local-only line from C must never be adopted onto A"
+    );
+
+    // === Scenario 7: Planted-owner trust-rule probe against real sshd ===
+    // Plant a rogue `principal = "owner"` device entry directly on B. Neither manual `push` nor
+    // any automatic push (`pair`/enrol, `device.set`, `device.remove`) from A may EVER import B's
+    // live owner entry onto A, while tombstones from B DO flow back to A on push, `status` reports
+    // the difference without importing, and explicit `pull from=b` DOES import it.
+    let rogue_key = client_dir.path().join("planted_owner_key");
+    let rogue_pub_raw =
+        generate_ed25519_keypair(sshd_b.ssh_keygen_bin(), &rogue_key, "planted@b").unwrap();
+    let rogue_pub = legion_tools::device::keys::validate_ed25519_public_key(&rogue_pub_raw)
+        .unwrap()
+        .canonical;
+    let rogue_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    {
+        let b_devices_path = home_b_root.join("config").join("devices.toml");
+        let mut b_devices: legion_tools::device::registry::DevicesFile =
+            legion_core::config::parse(&b_devices_path, &std::fs::read(&b_devices_path).unwrap())
+                .unwrap();
+        let now_str = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
+        b_devices.devices.insert(
+            rogue_id.to_owned(),
+            legion_tools::device::registry::FleetDevice {
+                name: "planted-owner".to_owned(),
+                public_key: rogue_pub,
+                principal: "owner".to_owned(),
+                role: Some("owner".to_owned()),
+                paired_at: now_str.clone(),
+                paired_on: "b".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: now_str.clone(),
+                updated_on: "b".to_owned(),
+                name_updated_at: now_str.clone(),
+                name_updated_on: "b".to_owned(),
+                role_updated_at: now_str,
+                role_updated_on: "b".to_owned(),
+                conflict: false,
+            },
+        );
+        std::fs::write(&b_devices_path, b_devices.to_toml_string()).unwrap();
+        assert_eq!(node_b.run(&["device.list"]).code, 0);
+    }
+
+    let assert_rogue_refused_on_a = |step: &str| {
+        let a_devices_text =
+            std::fs::read_to_string(home_a_root.join("config").join("devices.toml")).unwrap();
+        assert!(
+            !a_devices_text.contains(rogue_id),
+            "{step}: A imported planted owner entry from B:\n{a_devices_text}"
+        );
+        let refused = sshd_a
+            .ssh_command(&rogue_key, &fleet_kh_a)
+            .arg("legion rpc")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{step}: planted owner key from B unexpectedly authenticated to A"
+        );
+    };
+
+    // 7a. `fleet.sync direction=status` shows difference without importing.
+    let status_ab = node_a
+        .run(&[
+            "fleet.sync",
+            "direction=status",
+            "machines=[\"b\"]",
+            "documents=[\"devices.toml\"]",
+        ])
+        .json();
+    assert_ne!(
+        status_ab["results"]["b"]["devices.toml"]["status"],
+        json!("same"),
+        "{status_ab}"
+    );
+    assert_rogue_refused_on_a("status");
+
+    // 7b. Manual `fleet.sync direction=push` does NOT import B's planted owner entry.
+    let manual_push = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"b\"]",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(manual_push.code, 0, "{}", manual_push.stderr);
+    assert_rogue_refused_on_a("manual push");
+
+    // 7c. Automatic push on `pair` / enrol does NOT import B's planted owner entry.
+    let inv_probe = node_a.run(&[
+        "pair",
+        "--name",
+        "probe-dev",
+        "--role",
+        "observer",
+        "--json",
+    ]);
+    assert_eq!(inv_probe.code, 0, "{}", inv_probe.stderr);
+    let (_probe_key, probe_enrol) = enrol_from_invite(
+        inv_probe.json()["invite"].as_str().unwrap(),
+        &sshd_a,
+        "probe_dev",
+        "ignored",
+    );
+    assert_eq!(probe_enrol["ok"], json!(true));
+    assert_rogue_refused_on_a("auto push after enrol");
+
+    // 7d. Automatic push on `device.set` does NOT import B's planted owner entry.
+    let set_probe = node_a.run(&["device.set", "name=probe-dev", "rename=probe-dev-2"]);
+    assert_eq!(set_probe.code, 0, "{}", set_probe.stderr);
+    assert_rogue_refused_on_a("auto push after device.set");
+
+    // 7e. Automatic push on `device.remove` does NOT import B's planted owner entry.
+    let rem_probe = node_a.run(&["device.remove", "name=probe-dev-2"]);
+    assert_eq!(rem_probe.code, 0, "{}", rem_probe.stderr);
+    assert_rogue_refused_on_a("auto push after device.remove");
+
+    // 7f. Tombstone created on B (while B does NOT push to A) DOES flow back to A during A's
+    //     `fleet.sync direction=push`, while B's planted owner entry is STILL NOT imported onto A.
+    node_b.write_config("fleet.toml", "[machines]\n");
+    let rem_field_on_b = node_b.run(&["device.remove", "name=field-phone"]);
+    assert_eq!(rem_field_on_b.code, 0, "{}", rem_field_on_b.stderr);
+    let push_gets_tomb = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"b\"]",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(push_gets_tomb.code, 0, "{}", push_gets_tomb.stderr);
+    let field_refused_on_a = sshd_a
+        .ssh_command(&phone_off_key, &fleet_kh_a)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !field_refused_on_a.status.success(),
+        "tombstone from B should have flowed back to A during push"
+    );
+    assert_rogue_refused_on_a("push returning tombstone");
+
+    // 7g. Explicit `fleet.sync direction=pull from=b` run by owner on A DOES import B's live entry.
+    let explicit_pull = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=b",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(explicit_pull.code, 0, "{}", explicit_pull.stderr);
+    let rogue_now_on_a = rpc_call_direct(
+        &rogue_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(
+        rogue_now_on_a["result"]["node"],
+        json!("a"),
+        "{rogue_now_on_a}"
+    );
+    assert_eq!(rogue_now_on_a["result"]["principal"], json!("owner"));
+}
+
+#[test]
+fn non_owner_device_remove_pushes_with_node_authority_and_audits_both_sides() {
+    use legion_tools::device::registry::{DeviceTombstone, DevicesFile, FleetDevice};
+
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "\
+default = \"owner\"
+
+[roles.phone_admin]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"phone_admin\"
+";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config("projects.toml", "[projects.demo]\ndescription = \"demo\"\n");
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_a)
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_b)
+        ),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let fleet_entry = |name: &str, extra_args: &[&str]| {
+        if cfg!(windows) {
+            let script = node_b.home().join(format!("run-{name}-rpc.cmd"));
+            let extra = if extra_args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", extra_args.join(" "))
+            };
+            let body = format!(
+                "@echo off\r\n\
+                 set \"LEGION_HOME={}\"\r\n\
+                 set \"HOME={}\"\r\n\
+                 set \"USERPROFILE={}\"\r\n\
+                 set \"XDG_CONFIG_HOME=\"\r\n\
+                 set \"XDG_STATE_HOME=\"\r\n\
+                 \"{}\" rpc{extra}\r\n",
+                home_b_legion.display(),
+                node_b.home().display(),
+                node_b.home().display(),
+                bin,
+            );
+            std::fs::write(&script, body).unwrap();
+            format!(
+                "[machines.{name}]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+                toml_literal(&script),
+            )
+        } else {
+            let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
+            let mut parts = vec![
+                "\"env\"".to_owned(),
+                toml_literal(Path::new(&env_arg)),
+                toml_literal(Path::new(bin)),
+                "\"rpc\"".to_owned(),
+            ];
+            for arg in extra_args {
+                parts.push(format!("\"{arg}\""));
+            }
+            format!("[machines.{name}]\ncommand = [{}]\n", parts.join(", "))
+        }
+    };
+    node_a.write_config("fleet.toml", &fleet_entry("b", &[]));
+
+    let id_owner = "11".repeat(16);
+    let id_tablet = "22".repeat(16);
+    let id_old_owner = "33".repeat(16);
+    let now_str = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
+
+    let mut devices_a = DevicesFile::default();
+    devices_a.devices.insert(
+        id_owner.clone(),
+        FleetDevice {
+            name: "owner-laptop".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0x41; 32]),
+            principal: "owner".to_owned(),
+            role: Some("owner".to_owned()),
+            paired_at: now_str.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: now_str.clone(),
+            updated_on: "a".to_owned(),
+            name_updated_at: now_str.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: now_str.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
+        },
+    );
+    devices_a.devices.insert(
+        id_tablet.clone(),
+        FleetDevice {
+            name: "tablet-dev".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0x42; 32]),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: now_str.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: now_str.clone(),
+            updated_on: "a".to_owned(),
+            name_updated_at: now_str.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: now_str.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
+        },
+    );
+    node_a.write_config("devices.toml", &devices_a.to_toml_string());
+
+    let mut devices_b = DevicesFile::default();
+    devices_b.devices.insert(
+        id_tablet.clone(),
+        FleetDevice {
+            name: "tablet-dev".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0x42; 32]),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: now_str.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: now_str.clone(),
+            updated_on: "a".to_owned(),
+            name_updated_at: now_str.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: now_str.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
+        },
+    );
+    devices_b.removed.insert(
+        id_old_owner.clone(),
+        DeviceTombstone {
+            name: "old-owner".to_owned(),
+            principal: "owner".to_owned(),
+            fingerprint: None,
+            paired_at: None,
+            paired_on: None,
+            paired_by: None,
+            removed_by: None,
+            removed_at: now_str,
+            removed_on: "b".to_owned(),
+        },
+    );
+    node_b.write_config("devices.toml", &devices_b.to_toml_string());
+    assert_eq!(node_a.run(&["device.list"]).code, 0);
+    assert_eq!(node_b.run(&["device.list"]).code, 0);
+    assert!(
+        std::fs::read_to_string(&auth_b)
+            .unwrap()
+            .contains("legion-device:tablet-dev")
+    );
+
+    // 1. Non-owner `tablet` running `fleet.sync direction=push` syncs `projects.toml` and skips
+    //    `devices.toml` with a clear owner-role reason.
+    let sync = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"b\"]",
+        "documents=[\"projects.toml\",\"devices.toml\"]",
+        "--as",
+        "tablet",
+    ]);
+    assert_eq!(sync.code, 0, "non-owner fleet.sync failed: {}", sync.stderr);
+    let sync_json = sync.json();
+    assert_eq!(
+        sync_json["results"]["b"]["projects.toml"]["status"],
+        json!("pushed"),
+        "{sync_json}"
+    );
+    assert_eq!(
+        sync_json["results"]["b"]["devices.toml"]["status"],
+        json!("skipped"),
+        "{sync_json}"
+    );
+    assert!(
+        sync_json["results"]["b"]["devices.toml"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("owner")),
+        "{sync_json}"
+    );
+
+    // 2. Non-owner `tablet` calling `config.write devices.toml` is refused both locally and on `b`.
+    let local_write = node_a.run(&[
+        "config.write",
+        "document=devices.toml",
+        "content=version = 1\n",
+        "--as",
+        "tablet",
+    ]);
+    assert_ne!(local_write.code, 0);
+    let remote_write = node_a.run(&[
+        "config.write",
+        "document=devices.toml",
+        "content=version = 1\n",
+        "--as",
+        "tablet",
+        "--on",
+        "b",
+    ]);
+    assert_ne!(remote_write.code, 0);
+
+    // 3. Non-owner `tablet` runs `device.remove` on A: node A pushes its registry to B with A's
+    //    own owner authority, B tombstones `tablet-dev`, strips its key, and BOTH nodes record
+    //    audit entries naming `device_registry_push` + triggering principal `tablet`.
+    let rm = node_a.run(&["device.remove", "name=tablet-dev", "--as", "tablet"]);
+    assert_eq!(rm.code, 0, "tablet remove failed: {}", rm.stderr);
+    let rm_json = rm.json();
+    assert_eq!(rm_json["removed"], json!(true), "{rm_json}");
+    assert_eq!(
+        rm_json["fleet"]["b"]["status"],
+        json!("synced"),
+        "{rm_json}"
+    );
+    assert!(rm_json.get("still_trusted_by").is_none(), "{rm_json}");
+
+    let b_saved: DevicesFile = legion_core::config::parse(
+        &home_b_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_b_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    assert!(!b_saved.devices.contains_key(&id_tablet), "{b_saved:?}");
+    assert!(b_saved.removed.contains_key(&id_tablet), "{b_saved:?}");
+    assert!(
+        !std::fs::read_to_string(&auth_b)
+            .unwrap()
+            .contains("legion-device:tablet-dev")
+    );
+
+    let audit_a = std::fs::read_to_string(node_a.state().join("audit.jsonl")).unwrap();
+    assert!(
+        audit_a.contains("\"fleet.sync\"")
+            && audit_a.contains("\"device_registry_push\"")
+            && audit_a.contains("\"device.remove\"")
+            && audit_a.contains("\"tablet\""),
+        "expected sender audit record naming device_registry_push and trigger tablet: {audit_a}"
+    );
+    let audit_b = std::fs::read_to_string(node_b.state().join("audit.jsonl")).unwrap();
+    assert!(
+        audit_b.contains("\"config.write\"")
+            && audit_b.contains("\"config.write.applied\"")
+            && audit_b.contains("\"device_registry_push\"")
+            && audit_b.contains("\"device.remove\"")
+            && audit_b.contains("\"tablet\""),
+        "expected receiver audit records naming device_registry_push and trigger tablet: {audit_b}"
+    );
+
+    // 4. When the receiving peer's fleet pipe is pinned to a non-owner (`--as tablet`), the peer
+    //    refuses `config.write devices.toml` and A reports it in `still_trusted_by`.
+    node_a.write_config("fleet.toml", &fleet_entry("b", &["--as", "tablet"]));
+    let rm_owner = node_a.run(&["device.remove", "name=owner-laptop"]);
+    assert_eq!(rm_owner.code, 0, "owner remove failed: {}", rm_owner.stderr);
+    let rm_owner_json = rm_owner.json();
+    assert_eq!(
+        rm_owner_json["still_trusted_by"],
+        json!(["b"]),
+        "{rm_owner_json}"
+    );
+}
+
+#[test]
+fn stamping_records_owner_device_provenance_and_quarantines_backdated_non_owner_child() {
+    use legion_tools::device::registry::{DevicesFile, PairedBy};
+
+    let home = Home::new();
+    let auth = home.home().join("authorized_keys");
+    let host_key_path = home.home().join("host_ed25519.pub");
+    std::fs::write(
+        &host_key_path,
+        format!(
+            "{} host@stamp-box\n",
+            ed25519_public_key_from_seed(&[0x99; 32])
+        ),
+    )
+    .unwrap();
+    let legion_home = home.state().parent().unwrap().to_path_buf();
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"stamp-box\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth),
+            toml_literal(&host_key_path),
+        ),
+    );
+    home.write_config(
+        "policy.toml",
+        "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+",
+    );
+
+    // 1. Seed a paired device holding the `owner` role and an admin-capable non-owner paired device.
+    let id_owner_dev = "a1".repeat(16);
+    let id_non_owner_dev = "b1".repeat(16);
+    let t0 = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
+    let mut initial = DevicesFile::default();
+    initial.devices.insert(
+        id_owner_dev.clone(),
+        legion_tools::device::registry::FleetDevice {
+            name: "owner-phone".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0xa1; 32]),
+            principal: "owner".to_owned(),
+            role: Some("owner".to_owned()),
+            paired_at: t0.clone(),
+            paired_on: "stamp-box".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t0.clone(),
+            updated_on: "stamp-box".to_owned(),
+            name_updated_at: t0.clone(),
+            name_updated_on: "stamp-box".to_owned(),
+            role_updated_at: t0.clone(),
+            role_updated_on: "stamp-box".to_owned(),
+            conflict: false,
+        },
+    );
+    initial.devices.insert(
+        id_non_owner_dev.clone(),
+        legion_tools::device::registry::FleetDevice {
+            name: "tablet-parent".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0xb1; 32]),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0.clone(),
+            paired_on: "stamp-box".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t0.clone(),
+            updated_on: "stamp-box".to_owned(),
+            name_updated_at: t0.clone(),
+            name_updated_on: "stamp-box".to_owned(),
+            role_updated_at: t0,
+            role_updated_on: "stamp-box".to_owned(),
+            conflict: false,
+        },
+    );
+    home.write_config("devices.toml", &initial.to_toml_string());
+    assert_eq!(home.run(&["device.list"]).code, 0);
+
+    // Helper: invoke one RPC call through `legion gate --as <principal> --device <dev> --pairing <id>`.
+    let gate_call =
+        |principal: &str, dev_name: &str, pairing_id: &str, tool: &str, args: serde_json::Value| {
+            let req_hello = rpc_request(
+                json!(1),
+                "hello",
+                json!({"protocol": legion_core::proto::PROTOCOL, "client": "test", "version": "0"}),
+            );
+            let req_call = rpc_request(json!(2), "call", json!({"tool": tool, "args": args}));
+            let input = format!("{req_hello}\n{req_call}\n");
+            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_legion"));
+            cmd.args([
+                "gate",
+                "--home",
+                &legion_home.display().to_string(),
+                "--as",
+                principal,
+                "--device",
+                dev_name,
+                "--pairing",
+                pairing_id,
+            ])
+            .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+            .env("HOME", home.home())
+            .env("USERPROFILE", home.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "gate failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            lines.into_iter().find(|v| v["id"] == json!(2)).unwrap()
+        };
+
+    let run_enrol_gate = |invite_id: &str, name: &str, pub_key: &str| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_legion"));
+        cmd.args([
+            "gate",
+            "--home",
+            &legion_home.display().to_string(),
+            "--enrol",
+            invite_id,
+        ])
+        .env("HOME", home.home())
+        .env("USERPROFILE", home.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let line = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": invite_id, "public_key": pub_key, "name": name})
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "gate --enrol failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        assert_eq!(reply["ok"], json!(true), "enrol rejected: {reply}");
+        reply
+    };
+
+    // 2. Owner-role paired device creates an invite and enrols `owner-child`:
+    //    `paired_by` MUST record `{ principal: "owner", device: Some(id_owner_dev) }` and node-stamped metadata.
+    let inv_owner = gate_call(
+        "owner",
+        "owner-phone",
+        &id_owner_dev,
+        "device.invite",
+        json!({"name": "owner-child", "role": "owner", "allow_owner": true, "host": "127.0.0.1", "port": 22, "user": "tester"}),
+    );
+    let owner_inv_id = inv_owner["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{inv_owner}"))
+        .to_owned();
+    let owner_child_key = ed25519_public_key_from_seed(&[0xa2; 32]);
+    run_enrol_gate(&owner_inv_id, "owner-child", &owner_child_key);
+
+    let after_owner_enrol: DevicesFile = legion_core::config::parse(
+        &legion_home.join("config").join("devices.toml"),
+        &std::fs::read(legion_home.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let owner_child = after_owner_enrol
+        .devices
+        .values()
+        .find(|d| d.name == "owner-child")
+        .expect("owner-child missing");
+    assert_eq!(
+        owner_child.paired_by,
+        Some(PairedBy {
+            principal: "owner".to_owned(),
+            device: Some(id_owner_dev.clone()),
+        }),
+        "owner-role paired device creator must still record paired_by.device"
+    );
+    assert_eq!(owner_child.paired_on, "stamp-box");
+    assert_eq!(owner_child.updated_on, "stamp-box");
+    assert_eq!(owner_child.paired_at, owner_child.updated_at);
+
+    // 3. Reviewer's backdating case: admin-capable non-owner paired device creates a child via
+    //    invite + enrol (any attempt to backdate via config.write is refused). When the parent is
+    //    removed shortly afterwards, the child is quarantined regardless.
+    let inv_child = gate_call(
+        "tablet",
+        "tablet-parent",
+        &id_non_owner_dev,
+        "device.invite",
+        json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
+    );
+    let child_inv_id = inv_child["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{inv_child}"))
+        .to_owned();
+    let child_key = ed25519_public_key_from_seed(&[0xb2; 32]);
+    run_enrol_gate(&child_inv_id, "tablet-child", &child_key);
+
+    let backdate_res = gate_call(
+        "tablet",
+        "tablet-parent",
+        &id_non_owner_dev,
+        "config.write",
+        json!({"document": "devices.toml", "content": "version = 1\n"}),
+    );
+    assert_eq!(
+        backdate_res["error"]["data"]["code"],
+        json!("denied"),
+        "{backdate_res}"
+    );
+
+    let rm_parent = home.run(&["device.remove", "name=tablet-parent"]);
+    assert_eq!(
+        rm_parent.code, 0,
+        "remove tablet-parent failed: {}",
+        rm_parent.stderr
+    );
+
+    let list = home.run(&["device.list"]).json();
+    let child_entry = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == json!("tablet-child"))
+        .expect("tablet-child missing in device.list");
+    assert_eq!(child_entry["quarantined"], json!(true), "{child_entry}");
+    assert!(
+        !std::fs::read_to_string(&auth)
+            .unwrap()
+            .contains("legion-device:tablet-child"),
+        "quarantined child key must be absent from authorized_keys"
+    );
+}
+
+#[test]
+fn nit2_fleet_sync_pull_preserves_local_confirmation_or_clears_and_warns_on_mismatch() {
+    use legion_tools::device::registry::{
+        DeviceTombstone, DevicesFile, FleetDevice, PairedBy, next_updated_timestamp,
+    };
+
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let home_a_legion = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_a)
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_b)
+        ),
+    );
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let fleet_a = if cfg!(windows) {
+        let script = node_b.home().join("run-b-pull.cmd");
+        let body = format!(
+            "@echo off\r\n\
+             set \"LEGION_HOME={}\"\r\n\
+             set \"HOME={}\"\r\n\
+             set \"USERPROFILE={}\"\r\n\
+             set \"XDG_CONFIG_HOME=\"\r\n\
+             set \"XDG_STATE_HOME=\"\r\n\
+             \"{}\" rpc\r\n",
+            home_b_legion.display(),
+            node_b.home().display(),
+            node_b.home().display(),
+            bin,
+        );
+        std::fs::write(&script, body).unwrap();
+        format!(
+            "[machines.b]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+            toml_literal(&script),
+        )
+    } else {
+        let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
+        format!(
+            "[machines.b]\ncommand = [\"env\", {}, {}, \"rpc\"]\n",
+            toml_literal(Path::new(&env_arg)),
+            toml_literal(Path::new(bin)),
+        )
+    };
+    node_a.write_config("fleet.toml", &fleet_a);
+
+    let id_parent = "aa".repeat(16);
+    let id_child = "bb".repeat(16);
+    let t0 = next_updated_timestamp(None).unwrap();
+    let t1 = next_updated_timestamp(Some(&t0)).unwrap();
+    let t2 = next_updated_timestamp(Some(&t1)).unwrap();
+    let t3 = next_updated_timestamp(Some(&t2)).unwrap();
+    let key1 = ed25519_public_key_from_seed(&[0xc1; 32]);
+    let key2 = ed25519_public_key_from_seed(&[0xc2; 32]);
+
+    let tomb_parent = DeviceTombstone {
+        name: "parent".to_owned(),
+        principal: "tablet".to_owned(),
+        fingerprint: None,
+        paired_at: Some(t0.clone()),
+        paired_on: Some("a".to_owned()),
+        paired_by: None,
+        removed_by: None,
+        removed_at: t0.clone(),
+        removed_on: "a".to_owned(),
+    };
+    let mut dev_a = DevicesFile::default();
+    dev_a.removed.insert(id_parent.clone(), tomb_parent.clone());
+    dev_a.devices.insert(
+        id_child.clone(),
+        FleetDevice {
+            name: "child-v1".to_owned(),
+            public_key: key1.clone(),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: Some(id_parent.clone()),
+            }),
+            confirmed_by: Some("owner".to_owned()),
+            confirmed_at: Some(t1.clone()),
+            updated_at: t1.clone(),
+            updated_on: "a".to_owned(),
+            name_updated_at: t0.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: t0.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
+        },
+    );
+    node_a.write_config("devices.toml", &dev_a.to_toml_string());
+
+    // Node B has a newer rename of the same child WITHOUT confirmation (same identity & provenance).
+    let mut dev_b = DevicesFile::default();
+    dev_b.removed.insert(id_parent.clone(), tomb_parent.clone());
+    dev_b.devices.insert(
+        id_child.clone(),
+        FleetDevice {
+            name: "child-renamed".to_owned(),
+            public_key: key1,
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: Some(id_parent.clone()),
+            }),
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t2.clone(),
+            updated_on: "b".to_owned(),
+            name_updated_at: t2,
+            name_updated_on: "b".to_owned(),
+            role_updated_at: t0.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
+        },
+    );
+    node_b.write_config("devices.toml", &dev_b.to_toml_string());
+
+    let pull1 = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=b",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(pull1.code, 0, "pull1 failed: {}", pull1.stderr);
+    let pull1_json = pull1.json();
+    let doc1 = &pull1_json["results"]["b"]["devices.toml"];
+    assert_eq!(doc1["status"], json!("pulled"), "{pull1_json}");
+    assert!(
+        doc1.get("warnings")
+            .and_then(|v| v.as_array())
+            .is_none_or(|w| w.is_empty()),
+        "matching pull must not warn: {pull1_json}"
+    );
+    let a_after1: DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(a_after1.devices[&id_child].name, "child-renamed");
+    assert_eq!(
+        a_after1.devices[&id_child].confirmed_by.as_deref(),
+        Some("owner")
+    );
+    assert_eq!(
+        a_after1.devices[&id_child].confirmed_at.as_deref(),
+        Some(t1.as_str())
+    );
+
+    // Now Node B has a newer edit that changes the child's public key: pull MUST clear
+    // confirmation and include a warning in the fleet.sync result.
+    let mut dev_b2 = DevicesFile::default();
+    dev_b2.removed.insert(id_parent.clone(), tomb_parent);
+    dev_b2.devices.insert(
+        id_child.clone(),
+        FleetDevice {
+            name: "child-renamed".to_owned(),
+            public_key: key2,
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0,
+            paired_on: "a".to_owned(),
+            paired_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: Some(id_parent),
+            }),
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t3.clone(),
+            updated_on: "b".to_owned(),
+            name_updated_at: t3.clone(),
+            name_updated_on: "b".to_owned(),
+            role_updated_at: t3,
+            role_updated_on: "b".to_owned(),
+            conflict: false,
+        },
+    );
+    node_b.write_config("devices.toml", &dev_b2.to_toml_string());
+
+    let pull2 = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=b",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(pull2.code, 0, "pull2 failed: {}", pull2.stderr);
+    let pull2_json = pull2.json();
+    let doc2 = &pull2_json["results"]["b"]["devices.toml"];
+    assert_eq!(doc2["status"], json!("pulled"), "{pull2_json}");
+    let warnings2: Vec<&str> = doc2["warnings"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        warnings2
+            .iter()
+            .any(|w| w.to_ascii_lowercase().contains("confirmation") && w.contains(&id_child)),
+        "mismatching pull must warn that confirmation was cleared: {pull2_json}"
+    );
+    let a_after2: DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    assert!(a_after2.devices[&id_child].conflict);
+    assert_eq!(a_after2.devices[&id_child].confirmed_by, None);
+    assert_eq!(a_after2.devices[&id_child].confirmed_at, None);
+}
+
+#[test]
+fn f1_independent_field_stamps_prevent_stale_rename_raising_role_and_stale_role_undoing_rename() {
+    use legion_tools::device::registry::DevicesFile;
+
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let host_key_a = node_a.home().join("host_a.pub");
+    let host_key_b = node_b.home().join("host_b.pub");
+    std::fs::write(
+        &host_key_a,
+        format!("{} host@a\n", ed25519_public_key_from_seed(&[0x91; 32])),
+    )
+    .unwrap();
+    std::fs::write(
+        &host_key_b,
+        format!("{} host@b\n", ed25519_public_key_from_seed(&[0x92; 32])),
+    )
+    .unwrap();
+    let home_a_legion = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "\
+default = \"owner\"
+
+[roles.admin]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[roles.observer]
+allow = [\"effect:read\"]
+";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_a),
+            toml_literal(&host_key_a),
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_b),
+            toml_literal(&host_key_b),
+        ),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let make_fleet_entry = |peer_name: &str, peer_legion: &Path, peer_home: &Path| {
+        if cfg!(windows) {
+            let script = peer_home.join(format!("run-{peer_name}-f1.cmd"));
+            let body = format!(
+                "@echo off\r\n\
+                 set \"LEGION_HOME={}\"\r\n\
+                 set \"HOME={}\"\r\n\
+                 set \"USERPROFILE={}\"\r\n\
+                 set \"XDG_CONFIG_HOME=\"\r\n\
+                 set \"XDG_STATE_HOME=\"\r\n\
+                 \"{}\" rpc\r\n",
+                peer_legion.display(),
+                peer_home.display(),
+                peer_home.display(),
+                bin,
+            );
+            std::fs::write(&script, body).unwrap();
+            format!(
+                "[machines.{peer_name}]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+                toml_literal(&script),
+            )
+        } else {
+            let env_arg = format!("LEGION_HOME={}", peer_legion.display());
+            format!(
+                "[machines.{peer_name}]\ncommand = [\"env\", {}, {}, \"rpc\"]\n",
+                toml_literal(Path::new(&env_arg)),
+                toml_literal(Path::new(bin)),
+            )
+        }
+    };
+
+    let run_enrol_on =
+        |home: &Home, legion_home: &Path, invite_id: &str, name: &str, pub_key: &str| {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args([
+                "gate",
+                "--home",
+                &legion_home.display().to_string(),
+                "--enrol",
+                invite_id,
+            ])
+            .env("HOME", home.home())
+            .env("USERPROFILE", home.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            let line = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": invite_id, "public_key": pub_key, "name": name})
+            );
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "enrol failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let reply: Value =
+                serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+            assert_eq!(reply["ok"], json!(true), "{reply}");
+        };
+
+    // Direction 1 (reproduced attack):
+    // Enrol X (`role = "admin"`) on A, push to B so both A and B have X as `admin`.
+    node_a.write_config(
+        "fleet.toml",
+        &make_fleet_entry("b", &home_b_legion, &node_b.home()),
+    );
+    let inv_x = node_a.run(&[
+        "device.invite",
+        "name=x",
+        "role=admin",
+        "host=127.0.0.1",
+        "port=22",
+        "user=tester",
+    ]);
+    assert_eq!(inv_x.code, 0, "{}", inv_x.stderr);
+    let inv_x_id = inv_x.json()["id"].as_str().unwrap().to_owned();
+    run_enrol_on(
+        &node_a,
+        &home_a_legion,
+        &inv_x_id,
+        "x",
+        &ed25519_public_key_from_seed(&[0xd1; 32]),
+    );
+
+    // Confirm B has X as `admin`, then lower X to `observer` on B WITHOUT pushing to A (B has no fleet.toml yet).
+    let b_lower = node_b.run(&["device.set", "name=x", "role=observer"]);
+    assert_eq!(b_lower.code, 0, "{}", b_lower.stderr);
+    assert_eq!(b_lower.json()["role"], json!("observer"));
+
+    // On A (which missed B's role downgrade and still thinks X is `admin`), X itself renames
+    // `x` -> `x2`, which pushes with node authority to B.
+    let a_rename = node_a.run(&["device.set", "name=x", "rename=x2", "--as", "device:x"]);
+    assert_eq!(a_rename.code, 0, "rename on A failed: {}", a_rename.stderr);
+    assert_eq!(a_rename.json()["fleet"]["b"]["status"], json!("synced"));
+
+    // B MUST keep `role = "observer"` in BOTH `devices.toml` AND `policy.toml`, while accepting
+    // the newer rename `x2`!
+    let b_devices: DevicesFile = legion_core::config::parse(
+        &home_b_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_b_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let b_x = b_devices
+        .devices
+        .values()
+        .find(|d| d.principal == "device:x")
+        .expect("device:x missing on B");
+    assert_eq!(b_x.name, "x2", "newer rename must apply on B: {b_x:?}");
+    assert_eq!(
+        b_x.role.as_deref(),
+        Some("observer"),
+        "stale rename from A MUST NOT raise role back to admin on B: {b_x:?}"
+    );
+    let b_policy: legion_core::policy::Policy = legion_core::config::parse(
+        &home_b_legion.join("config").join("policy.toml"),
+        &std::fs::read(home_b_legion.join("config").join("policy.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        b_policy.role_of("device:x").0,
+        "observer",
+        "B's policy.toml MUST remain observer after stale rename push from A"
+    );
+
+    // Direction 2 (symmetric):
+    // Enrol Y (`role = "admin"`) on A and sync to B; disconnect A -> B; rename Y -> y2 on A;
+    // then on B (which missed the rename and still calls it `y`), owner lowers Y to `observer`
+    // and pushes B -> A. A MUST keep `name = "y2"` while applying `role = "observer"`!
+    let inv_y = node_a.run(&[
+        "device.invite",
+        "name=y",
+        "role=admin",
+        "host=127.0.0.1",
+        "port=22",
+        "user=tester",
+    ]);
+    assert_eq!(inv_y.code, 0, "{}", inv_y.stderr);
+    let inv_y_id = inv_y.json()["id"].as_str().unwrap().to_owned();
+    run_enrol_on(
+        &node_a,
+        &home_a_legion,
+        &inv_y_id,
+        "y",
+        &ed25519_public_key_from_seed(&[0xd2; 32]),
+    );
+
+    // Detach A from B so A's rename does not reach B yet; attach B -> A.
+    node_a.write_config("fleet.toml", "");
+    let a_rename_y = node_a.run(&["device.set", "name=y", "rename=y2"]);
+    assert_eq!(a_rename_y.code, 0, "{}", a_rename_y.stderr);
+
+    node_b.write_config(
+        "fleet.toml",
+        &make_fleet_entry("a", &home_a_legion, &node_a.home()),
+    );
+    let b_lower_y = node_b.run(&["device.set", "name=y", "role=observer"]);
+    assert_eq!(b_lower_y.code, 0, "{}", b_lower_y.stderr);
+    assert_eq!(b_lower_y.json()["fleet"]["a"]["status"], json!("synced"));
+
+    let a_devices: DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let a_y = a_devices
+        .devices
+        .values()
+        .find(|d| d.principal == "device:y")
+        .expect("device:y missing on A");
+    assert_eq!(
+        a_y.name, "y2",
+        "stale role change from B MUST NOT undo newer rename y2 on A: {a_y:?}"
+    );
+    assert_eq!(
+        a_y.role.as_deref(),
+        Some("observer"),
+        "newer role change from B must apply on A: {a_y:?}"
+    );
+}
+
+#[test]
+fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
+    use legion_tools::device::registry::DevicesFile;
+
+    if !TestSshd::available() {
+        eprintln!(
+            "skipping real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs: sshd/ssh/ssh-keygen unavailable"
+        );
+        return;
+    }
+
+    let home = Home::new_strict();
+    let auth_keys = home.home().join("authorized_keys");
+    std::fs::write(&auth_keys, "").unwrap();
+    let home_dir_str = home.home().to_string_lossy().into_owned();
+    let Some(sshd) = TestSshd::start(auth_keys.clone(), &[("HOME", &home_dir_str)])
+        .expect("throwaway sshd failed to start")
+    else {
+        eprintln!("skipping: throwaway sshd unavailable");
+        return;
+    };
+
+    home.write_config(
+        "policy.toml",
+        "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n",
+    );
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"probe-p5\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\nhosts = [\"127.0.0.1\"]\nport = {}\n",
+            toml_literal(&auth_keys),
+            toml_literal(sshd.host_key_path()),
+            sshd.port(),
+        ),
+    );
+
+    let inv_run = home.run(&["device.invite", "name=pixel", "role=observer"]);
+    assert_eq!(inv_run.code, 0, "{}", inv_run.stderr);
+    let payload = InvitePayload::decode(inv_run.json()["invite"].as_str().unwrap()).unwrap();
+
+    let key_dir = home.home().join("p5_keys");
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let kh = key_dir.join("known_hosts");
+    write_known_hosts(&kh, &payload.hosts[0], sshd.port(), &payload.host_keys).unwrap();
+
+    let temp_key = key_dir.join("temp_key");
+    write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), "temp").unwrap();
+
+    let k1_path = key_dir.join("k1");
+    let k1_pub = generate_ed25519_keypair(sshd.ssh_keygen_bin(), &k1_path, "k1@test").unwrap();
+    let k2_path = key_dir.join("k2");
+    let k2_pub = generate_ed25519_keypair(sshd.ssh_keygen_bin(), &k2_path, "k2@test").unwrap();
+
+    // Enrol pixel with K1 over real sshd.
+    let enrol_line = format!(
+        "{}\n",
+        json!({"enrol": 1, "id": payload.id, "public_key": k1_pub, "name": "pixel"})
+    );
+    let mut child = sshd
+        .ssh_command(&temp_key, &kh)
+        .arg("ignored")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(enrol_line.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let enrol_out = child.wait_with_output().unwrap();
+    assert!(enrol_out.status.success(), "{enrol_out:?}");
+
+    // Update devices.toml to record K2 for the same pairing id while leaving stale K1 in
+    // authorized_keys (simulating a stale authorized_keys file before reconciliation).
+    let devices_path = home
+        .state()
+        .parent()
+        .unwrap()
+        .join("config")
+        .join("devices.toml");
+    let mut devices: DevicesFile =
+        legion_core::config::parse(&devices_path, &std::fs::read(&devices_path).unwrap()).unwrap();
+    let entry = devices.devices.values_mut().next().unwrap();
+    let k2_canonical = legion_tools::device::keys::validate_ed25519_public_key(&k2_pub)
+        .unwrap()
+        .canonical;
+    entry.public_key = k2_canonical;
+    entry.updated_at =
+        legion_tools::device::registry::next_updated_timestamp(Some(&entry.updated_at)).unwrap();
+    std::fs::write(&devices_path, devices.to_toml_string()).unwrap();
+
+    // Connecting with stale K1 MUST be denied by `legion gate` (NOT served!) and reconcile
+    // authorized_keys to K2.
+    let mut k1_rpc = sshd
+        .ssh_command(&k1_path, &kh)
+        .arg("legion rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = k1_rpc.stdin.as_mut().unwrap().write_all(
+        format!(
+            "{}\n",
+            rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+        )
+        .as_bytes(),
+    );
+    drop(k1_rpc.stdin.take());
+    let k1_out = k1_rpc.wait_with_output().unwrap();
+    let k1_stderr = String::from_utf8_lossy(&k1_out.stderr);
+    let k1_stdout = String::from_utf8_lossy(&k1_out.stdout);
+    assert!(
+        !k1_out.status.success(),
+        "stale key K1 must be denied by legion gate! stdout={k1_stdout} stderr={k1_stderr}"
+    );
+    assert!(
+        k1_stderr.contains("does not match the public key")
+            || k1_stderr.contains("stale authorized_keys"),
+        "expected mismatch/stale denial on stderr, got: {k1_stderr}"
+    );
+
+    // K2 now succeeds over real sshd after gate reconciled authorized_keys.
+    let mut k2_rpc = sshd
+        .ssh_command(&k2_path, &kh)
+        .arg("legion rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    k2_rpc
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            format!(
+                "{}\n",
+                rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    drop(k2_rpc.stdin.take());
+    let k2_out = k2_rpc.wait_with_output().unwrap();
+    assert!(k2_out.status.success(), "{k2_out:?}");
+    let k2_stdout = String::from_utf8_lossy(&k2_out.stdout);
+    let reply: Value = serde_json::from_str(k2_stdout.trim()).unwrap();
+    assert_eq!(
+        reply["result"]["principal"],
+        json!("device:pixel"),
+        "{reply}"
+    );
+    assert_eq!(reply["result"]["door"], json!("ssh"), "{reply}");
+}
+
+#[test]
+fn f3_cli_invite_enrol_push_audit_omits_triggering_device_while_paired_device_invite_records_creator()
+ {
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let host_key_a = node_a.home().join("host_a.pub");
+    let host_key_b = node_b.home().join("host_b.pub");
+    std::fs::write(
+        &host_key_a,
+        format!("{} host@a\n", ed25519_public_key_from_seed(&[0x71; 32])),
+    )
+    .unwrap();
+    std::fs::write(
+        &host_key_b,
+        format!("{} host@b\n", ed25519_public_key_from_seed(&[0x72; 32])),
+    )
+    .unwrap();
+    let home_a_legion = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_a),
+            toml_literal(&host_key_a),
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_b),
+            toml_literal(&host_key_b),
+        ),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let fleet_a = if cfg!(windows) {
+        let script = node_b.home().join("run-b-f3.cmd");
+        let body = format!(
+            "@echo off\r\n\
+             set \"LEGION_HOME={}\"\r\n\
+             set \"HOME={}\"\r\n\
+             set \"USERPROFILE={}\"\r\n\
+             set \"XDG_CONFIG_HOME=\"\r\n\
+             set \"XDG_STATE_HOME=\"\r\n\
+             \"{}\" rpc\r\n",
+            home_b_legion.display(),
+            node_b.home().display(),
+            node_b.home().display(),
+            bin,
+        );
+        std::fs::write(&script, body).unwrap();
+        format!(
+            "[machines.b]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+            toml_literal(&script),
+        )
+    } else {
+        let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
+        format!(
+            "[machines.b]\ncommand = [\"env\", {}, {}, \"rpc\"]\n",
+            toml_literal(Path::new(&env_arg)),
+            toml_literal(Path::new(bin)),
+        )
+    };
+    node_a.write_config("fleet.toml", &fleet_a);
+
+    let run_enrol_on_a = |invite_id: &str, name: &str, pub_key: &str| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args([
+            "gate",
+            "--home",
+            &home_a_legion.display().to_string(),
+            "--enrol",
+            invite_id,
+        ])
+        .env("HOME", node_a.home())
+        .env("USERPROFILE", node_a.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let line = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": invite_id, "public_key": pub_key, "name": name})
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "enrol failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+    };
+
+    // 1. CLI owner (no paired device) creates an invite and enrols `fresh-phone`.
+    let inv_cli = node_a.run(&[
+        "device.invite",
+        "name=fresh-phone",
+        "role=owner",
+        "allow_owner=true",
+        "host=127.0.0.1",
+        "port=22",
+        "user=tester",
+    ]);
+    assert_eq!(inv_cli.code, 0, "{}", inv_cli.stderr);
+    let inv_cli_id = inv_cli.json()["id"].as_str().unwrap().to_owned();
+    run_enrol_on_a(
+        &inv_cli_id,
+        "fresh-phone",
+        &ed25519_public_key_from_seed(&[0x73; 32]),
+    );
+
+    let parse_audit = |path: &Path| -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+
+    // Both A (`fleet.sync`) and B (`config.write` + `config.write.applied`) MUST leave
+    // `device_registry_push.device` and `device_registry_push.pairing_id` empty/absent!
+    let audit_a1 = parse_audit(&node_a.state().join("audit.jsonl"));
+    let sync_a1 = audit_a1
+        .iter()
+        .find(|r| {
+            r["tool"] == json!("fleet.sync")
+                && r["args"]["device_registry_push"]["trigger"] == json!("device.enrol")
+        })
+        .unwrap_or_else(|| panic!("missing fleet.sync audit on A: {audit_a1:?}"));
+    let push_a1 = &sync_a1["args"]["device_registry_push"];
+    assert_eq!(push_a1["principal"], json!("owner"), "{push_a1}");
+    assert!(
+        push_a1.get("device").is_none_or(Value::is_null),
+        "CLI invite enrolment push audit on A MUST NOT blame the newly enrolled device: {push_a1}"
+    );
+    assert!(
+        push_a1.get("pairing_id").is_none_or(Value::is_null),
+        "CLI invite enrolment push audit on A MUST NOT record a pairing_id: {push_a1}"
+    );
+    assert!(
+        sync_a1.get("device").is_none_or(Value::is_null),
+        "outer fleet.sync audit record on A MUST NOT claim the newly enrolled device triggered it: {sync_a1}"
+    );
+
+    let audit_b1 = parse_audit(&node_b.state().join("audit.jsonl"));
+    for tool in ["config.write", "config.write.applied"] {
+        let rec = audit_b1
+            .iter()
+            .find(|r| {
+                r["tool"] == json!(tool)
+                    && r["args"]["device_registry_push"]["trigger"] == json!("device.enrol")
+            })
+            .unwrap_or_else(|| panic!("missing {tool} audit on B: {audit_b1:?}"));
+        let push = &rec["args"]["device_registry_push"];
+        assert_eq!(push["principal"], json!("owner"), "{push}");
+        assert!(
+            push.get("device").is_none_or(Value::is_null),
+            "CLI invite enrolment push audit ({tool}) on B MUST leave device empty: {push}"
+        );
+        assert!(
+            push.get("pairing_id").is_none_or(Value::is_null),
+            "CLI invite enrolment push audit ({tool}) on B MUST leave pairing_id empty: {push}"
+        );
+    }
+
+    // 2. Now `fresh-phone` (an actual paired device) creates an invite through `legion gate`
+    //    and enrols `second-phone`: the push audit MUST record `fresh-phone` and its pairing id.
+    let a_devices: legion_tools::device::registry::DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let fresh_id = a_devices
+        .devices
+        .iter()
+        .find(|(_, d)| d.name == "fresh-phone")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+
+    let req_hello = rpc_request(
+        json!(1),
+        "hello",
+        json!({"protocol": legion_core::proto::PROTOCOL, "client": "test", "version": "0"}),
+    );
+    let req_inv = rpc_request(
+        json!(2),
+        "call",
+        json!({
+            "tool": "device.invite",
+            "args": {"name": "second-phone", "role": "observer", "host": "127.0.0.1", "port": 22, "user": "tester"}
+        }),
+    );
+    let mut gate_cmd = std::process::Command::new(bin);
+    gate_cmd
+        .args([
+            "gate",
+            "--home",
+            &home_a_legion.display().to_string(),
+            "--as",
+            "device:fresh-phone",
+            "--device",
+            "fresh-phone",
+            "--pairing",
+            &fresh_id,
+        ])
+        .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+        .env("HOME", node_a.home())
+        .env("USERPROFILE", node_a.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut gate_child = gate_cmd.spawn().unwrap();
+    gate_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{req_hello}\n{req_inv}\n").as_bytes())
+        .unwrap();
+    let gate_out = gate_child.wait_with_output().unwrap();
+    assert!(
+        gate_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gate_out.stderr)
+    );
+    let inv2_reply: Value = String::from_utf8_lossy(&gate_out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["id"] == json!(2))
+        .unwrap();
+    let inv2_id = inv2_reply["result"]["id"].as_str().unwrap().to_owned();
+    run_enrol_on_a(
+        &inv2_id,
+        "second-phone",
+        &ed25519_public_key_from_seed(&[0x74; 32]),
+    );
+
+    let audit_b2 = parse_audit(&node_b.state().join("audit.jsonl"));
+    let second_applied = audit_b2
+        .iter()
+        .rev()
+        .find(|r| {
+            r["tool"] == json!("config.write.applied")
+                && r["args"]["device_registry_push"]["trigger"] == json!("device.enrol")
+        })
+        .unwrap();
+    let push2 = &second_applied["args"]["device_registry_push"];
+    assert_eq!(push2["principal"], json!("device:fresh-phone"), "{push2}");
+    assert_eq!(push2["device"], json!("fresh-phone"), "{push2}");
+    assert_eq!(push2["pairing_id"], json!(fresh_id), "{push2}");
 }

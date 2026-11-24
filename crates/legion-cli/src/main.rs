@@ -208,7 +208,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Rpc { pinned } => {
             let shutdown = install_shutdown_token();
-            serve_rpc(node, router, pinned, Door::Rpc, None, shutdown).await
+            serve_rpc(node, router, pinned, Door::Rpc, None, None, shutdown).await
         }
         Command::Mcp { pinned, compact } => {
             let shutdown = install_shutdown_token();
@@ -258,6 +258,7 @@ async fn serve_rpc(
     pinned: Option<String>,
     door: Door,
     device: Option<String>,
+    pairing_id: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     match rpc::serve_until(
@@ -268,6 +269,7 @@ async fn serve_rpc(
         pinned,
         door,
         device,
+        pairing_id,
         shutdown,
     )
     .await
@@ -359,6 +361,7 @@ async fn gate(
         match legion_tools::device::sessions::DeviceSessionGuard::register(
             node.paths(),
             device_name,
+            pairing.as_deref(),
             &pinned,
         ) {
             Ok(guard) => Some(guard),
@@ -376,8 +379,9 @@ async fn gate(
             .config()
             .get::<legion_core::config::NodeFile>()
             .and_then(|node_file| {
-                legion_tools::device::authkeys::verify_device_authorized(
+                legion_tools::device::registry::verify_gate_device(
                     node.paths(),
+                    &node.name(),
                     &node_file,
                     device_name,
                     pairing_id,
@@ -385,20 +389,60 @@ async fn gate(
                     account.as_deref(),
                 )
             });
-        if let Err(error) = auth_check {
-            err(&format!("legion gate: {}\n", error.message));
-            router.shutdown().await;
-            if error.code == ErrorCode::Denied
-                && let Some(guard) = session.take()
-            {
-                guard.reject_and_terminate_parent().await;
+        match auth_check {
+            Ok(removed_stale) => {
+                let own_stale = removed_stale
+                    .iter()
+                    .any(|t| t.pairing_id.as_deref() == Some(pairing_id));
+                for stale_target in &removed_stale {
+                    let is_self = stale_target.pairing_id.as_deref() == Some(pairing_id);
+                    if !is_self {
+                        let _ =
+                            legion_tools::device::sessions::terminate_device_sessions_for_target(
+                                node.paths(),
+                                stale_target,
+                                legion_tools::device::sessions::DEFAULT_TERMINATE_GRACE,
+                            )
+                            .await;
+                    }
+                }
+                if own_stale {
+                    err(&format!(
+                        "legion gate: Device {device_name} ({pairing_id}) had a stale authorized_keys entry and is no longer authorized on this session.\n"
+                    ));
+                    router.shutdown().await;
+                    if let Some(guard) = session.take() {
+                        guard.reject_and_terminate_parent().await;
+                    }
+                    return ExitCode::from(FAILED);
+                }
             }
-            return ExitCode::from(FAILED);
+            Err(error) => {
+                err(&format!("legion gate: {}\n", error.message));
+                router.shutdown().await;
+                if error.code == ErrorCode::Denied
+                    && let Some(guard) = session.take()
+                {
+                    guard.reject_and_terminate_parent().await;
+                }
+                return ExitCode::from(FAILED);
+            }
         }
     }
     let _session = session;
     match subcommand {
-        Subcommand::Rpc => serve_rpc(node, router, Some(pinned), Door::Ssh, device, shutdown).await,
+        Subcommand::Rpc => {
+            serve_rpc(
+                node,
+                router,
+                Some(pinned),
+                Door::Ssh,
+                device,
+                pairing,
+                shutdown,
+            )
+            .await
+        }
         Subcommand::Stream => {
             let code = serve_stream(&node, Some(pinned), Door::Ssh, device, shutdown).await;
             router.shutdown().await;
