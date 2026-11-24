@@ -808,3 +808,99 @@ fn non_admin_roles_cannot_edit_ssh_or_configured_authorized_keys_via_file_tools(
         assert_eq!(run.json()["code"], json!("denied"));
     }
 }
+
+#[test]
+fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
+    let home = Home::new();
+    let auth_keys = home.home().join("shared_authorized_keys");
+    let me = legion_tools::device::authkeys::current_account_name().unwrap();
+    let other_account = format!("{me}-other");
+
+    let my_pub = ed25519_public_key_from_seed(&[21_u8; 32]);
+    let other_pub = ed25519_public_key_from_seed(&[22_u8; 32]);
+    let exe = Path::new("/usr/local/bin/legion");
+    let my_line = legion_tools::device::authkeys::format_device_line(
+        exe,
+        "phone",
+        &my_pub,
+        "my-phone",
+        Some(home.state().parent().unwrap()),
+        Some(&me),
+        false,
+    )
+    .unwrap();
+    let other_line = legion_tools::device::authkeys::format_device_line(
+        exe,
+        "phone",
+        &other_pub,
+        "other-phone",
+        Some(home.state().parent().unwrap()),
+        Some(&other_account),
+        false,
+    )
+    .unwrap();
+    std::fs::write(&auth_keys, format!("{my_line}\n{other_line}\n")).unwrap();
+
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_keys)
+        ),
+    );
+    home.write_config(
+        "policy.toml",
+        "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.phone]\nrole = \"observer\"\n",
+    );
+
+    // `device.list` only shows devices pinned to this account, not another account's lines.
+    let listed = home.run(&["device.list"]).json();
+    let names: Vec<&str> = listed["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["my-phone"]);
+
+    // `device.remove` refuses to remove another account's device and leaves its line intact.
+    let remove_other = home.run(&["device.remove", "name=other-phone"]);
+    assert_eq!(remove_other.code, 1);
+    assert_eq!(remove_other.json()["code"], json!("not_found"));
+    assert!(
+        std::fs::read_to_string(&auth_keys)
+            .unwrap()
+            .contains("legion-device:other-phone")
+    );
+
+    // `legion gate --as` and `legion gate --enrol` both refuse a mismatched `--account`.
+    let bad_as = home
+        .command(&["gate", "--as", "phone", "--account", &other_account])
+        .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!bad_as.status.success());
+    let bad_as_stderr = String::from_utf8_lossy(&bad_as.stderr);
+    assert!(
+        bad_as_stderr.contains("legion gate:") && bad_as_stderr.contains(&other_account),
+        "stderr={bad_as_stderr:?}"
+    );
+
+    let bad_enrol = home
+        .command(&[
+            "gate",
+            "--enrol",
+            "0123456789abcdef0123456789abcdef",
+            "--account",
+            &other_account,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!bad_enrol.status.success());
+    let enrol_reply: Value =
+        serde_json::from_str(String::from_utf8_lossy(&bad_enrol.stdout).trim()).unwrap();
+    assert_eq!(enrol_reply["ok"], json!(false));
+    assert_eq!(enrol_reply["error"]["code"], json!("denied"));
+}

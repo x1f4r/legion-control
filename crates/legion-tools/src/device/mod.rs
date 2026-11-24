@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use crate::caller::Caller;
 
 use self::authkeys::{
-    LineKind, format_invite_line, line_matches_home, read_auth_keys, resolve_safe_write_path,
-    resolve_target, verify_owner_matches_euid, write_auth_keys,
+    LineKind, format_invite_line, line_matches_account, line_matches_home, read_auth_keys,
+    resolve_safe_write_path, resolve_target, verify_owner_matches_euid, write_auth_keys,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
@@ -194,6 +194,18 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
 
     let hosts = resolve_hosts(args.host, ctx.cancel_token().child_token()).await?;
     let node_file = ctx.config().get::<NodeFile>()?;
+    let target = resolve_target(ctx.paths(), &node_file)?;
+    let pinned_account = if target.windows_admin_acl {
+        let acct = legion_os::user::current_username().map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Cannot pin OS account on shared administrators_authorized_keys: {error}."),
+            )
+        })?;
+        Some(acct)
+    } else {
+        None
+    };
     let host_keys = read_host_keys(&node_file.devices.host_keys, ctx.paths().home())?;
     let exe = legion_core::current_exe()?;
 
@@ -212,6 +224,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         expires_ts,
         &ephemeral.public_key,
         ctx.paths().explicit_home(),
+        pinned_account.as_deref(),
         cfg!(windows),
     )?;
 
@@ -322,6 +335,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
 
     let (raw_devices, raw_invites) = blocking(move || {
         let target = resolve_target(&paths, &node_file)?;
+        let caller_account = caller_account_for_target(&target)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
         verify_owner_matches_euid(
             &write_path,
@@ -352,7 +366,16 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     key_b64,
                     principal,
                     home,
+                    account,
                 } => {
+                    if !line_matches_account(
+                        account.as_deref(),
+                        caller_account.as_deref(),
+                        target.windows_admin_acl,
+                        cfg!(windows),
+                    ) {
+                        continue;
+                    }
                     if !line_matches_home(home.as_deref(), &paths)
                         && !(home.is_none() && state.devices.contains_key(name))
                     {
@@ -372,7 +395,20 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                         meta.map(|m| m.added.clone()),
                     ));
                 }
-                LineKind::Invite { id, key_b64, .. } => {
+                LineKind::Invite {
+                    id,
+                    key_b64,
+                    account,
+                    ..
+                } => {
+                    if !line_matches_account(
+                        account.as_deref(),
+                        caller_account.as_deref(),
+                        target.windows_admin_acl,
+                        cfg!(windows),
+                    ) {
+                        continue;
+                    }
                     let Some(meta) = state.invites.get(id) else {
                         continue;
                     };
@@ -492,6 +528,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
 
     let (mut removed, terminate_device) = blocking(move || {
         let target = resolve_target(&paths, &node_file)?;
+        let caller_account = caller_account_for_target(&target)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
         verify_owner_matches_euid(
             &write_path,
@@ -517,9 +554,18 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                         name: line_name,
                         principal,
                         home,
+                        account,
                         ..
                     } = &line.kind
                     {
+                        if !line_matches_account(
+                            account.as_deref(),
+                            caller_account.as_deref(),
+                            target.windows_admin_acl,
+                            cfg!(windows),
+                        ) {
+                            continue;
+                        }
                         if !line_matches_home(home.as_deref(), &paths)
                             && !(home.is_none() && state.devices.contains_key(line_name))
                         {
@@ -570,8 +616,14 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 auth_keys.retain(|line| {
                     !matches!(
                         &line.kind,
-                        LineKind::Device { name: line_name, home, .. }
+                        LineKind::Device { name: line_name, home, account, .. }
                             if line_name == &name
+                                && line_matches_account(
+                                    account.as_deref(),
+                                    caller_account.as_deref(),
+                                    target.windows_admin_acl,
+                                    cfg!(windows),
+                                )
                                 && (line_matches_home(home.as_deref(), &paths)
                                     || (home.is_none() && state.devices.contains_key(line_name)))
                     )
@@ -599,7 +651,17 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 let mut matched_lines = 0usize;
 
                 for line in &auth_keys.lines {
-                    if let LineKind::Invite { id: line_id, .. } = &line.kind
+                    if let LineKind::Invite {
+                        id: line_id,
+                        account,
+                        ..
+                    } = &line.kind
+                        && line_matches_account(
+                            account.as_deref(),
+                            caller_account.as_deref(),
+                            target.windows_admin_acl,
+                            cfg!(windows),
+                        )
                         && let Some(meta) = state.invites.get(line_id)
                         && caller.may_manage(&meta.principal)
                     {
@@ -633,7 +695,17 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 };
 
                 auth_keys.retain(|line| {
-                    !matches!(&line.kind, LineKind::Invite { id: line_id, .. } if line_id == &id)
+                    !matches!(
+                        &line.kind,
+                        LineKind::Invite { id: line_id, account, .. }
+                            if line_id == &id
+                                && line_matches_account(
+                                    account.as_deref(),
+                                    caller_account.as_deref(),
+                                    target.windows_admin_acl,
+                                    cfg!(windows),
+                                )
+                    )
                 });
                 write_auth_keys(&target, &write_path, &auth_keys.to_bytes())?;
                 state.invites.remove(&id);
@@ -666,6 +738,21 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     }
 
     Ok(removed)
+}
+
+fn caller_account_for_target(
+    target: &self::authkeys::AuthKeysTarget,
+) -> Result<Option<String>, ErrorBody> {
+    match legion_os::user::current_username() {
+        Ok(name) => Ok(Some(name)),
+        Err(error) if target.windows_admin_acl => Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Cannot determine current OS account to scope shared administrators_authorized_keys: {error}."
+            ),
+        )),
+        Err(_) => Ok(None),
+    }
 }
 
 fn resolve_default_ssh_user(

@@ -114,9 +114,10 @@ pub fn is_windows_administrator() -> bool {
     }
 }
 
-/// Applies the ACL that Windows OpenSSH `sshd` demands for `administrators_authorized_keys`:
-/// disables inherited permissions and grants Full Control solely to `BUILTIN\Administrators`
-/// (`S-1-5-32-544`) and `NT AUTHORITY\SYSTEM` (`S-1-5-18`).
+/// Applies the ACL and ownership that Windows OpenSSH `sshd` demands for
+/// `administrators_authorized_keys`: disables inherited permissions, grants Full Control solely to
+/// `BUILTIN\Administrators` (`S-1-5-32-544`) and `NT AUTHORITY\SYSTEM` (`S-1-5-18`), and sets the
+/// file owner to `BUILTIN\Administrators` (`S-1-5-32-544`).
 ///
 /// Uses locale-independent SID strings so non-English Windows installations are handled identically.
 /// No-op on non-Windows platforms.
@@ -237,19 +238,37 @@ mod windows_impl {
             .map(|root| PathBuf::from(root).join("System32").join("icacls.exe"))
             .filter(|candidate| candidate.is_file())
             .unwrap_or_else(|| PathBuf::from("icacls.exe"));
-        let output = Command::new(&icacls)
+        run_icacls(
+            &icacls,
+            path,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-32-544:F",
+                "/grant:r",
+                "*S-1-5-18:F",
+            ],
+            "setting Administrators/SYSTEM ACL",
+        )?;
+        run_icacls(
+            &icacls,
+            path,
+            &["/setowner", "*S-1-5-32-544"],
+            "setting BUILTIN\\Administrators owner",
+        )?;
+        Ok(())
+    }
+
+    fn run_icacls(icacls: &Path, path: &Path, args: &[&str], action: &str) -> Result<()> {
+        let output = Command::new(icacls)
             .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg("*S-1-5-32-544:F")
-            .arg("/grant:r")
-            .arg("*S-1-5-18:F")
+            .args(args)
             .stdin(Stdio::null())
             .output()
             .map_err(|err| {
                 OsError::from_io(
                     format!(
-                        "cannot run {} to set ACL on {}",
+                        "cannot run {} while {action} on {}",
                         icacls.display(),
                         path.display()
                     ),
@@ -267,7 +286,7 @@ mod windows_impl {
             };
             return Err(OsError::Platform {
                 detail: format!(
-                    "icacls failed setting Administrators/SYSTEM ACL on {} (exit {:?}): {detail}",
+                    "icacls failed {action} on {} (exit {:?}): {detail}",
                     path.display(),
                     output.status.code()
                 ),

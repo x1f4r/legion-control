@@ -413,12 +413,39 @@ fn process_enrol_blocking(
         .collect();
     let device_name = unique_device_name(&request.name, &existing_names);
 
+    let pinned_account: Option<String> = auth_keys
+        .lines
+        .iter()
+        .find_map(|line| match &line.kind {
+            LineKind::Invite { id, account, .. } if id == forced_id => account.clone(),
+            _ => None,
+        })
+        .or_else(|| {
+            if target.windows_admin_acl {
+                legion_os::user::current_username().ok()
+            } else {
+                None
+            }
+        });
+    if target.windows_admin_acl && pinned_account.is_none() {
+        persist_sweep(&auth_keys, &state);
+        return (
+            Some(principal),
+            base_args,
+            Err(ErrorBody::new(
+                ErrorCode::Failed,
+                "Cannot pin OS account on shared administrators_authorized_keys because the current account name is unavailable.",
+            )),
+        );
+    }
+
     let permanent_line = match format_device_line(
         &exe,
         &principal,
         &validated_key.canonical,
         &device_name,
         paths.explicit_home(),
+        pinned_account.as_deref(),
         cfg!(windows),
     ) {
         Ok(line) => line,

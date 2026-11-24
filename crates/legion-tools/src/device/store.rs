@@ -369,6 +369,7 @@ mod tests {
             past,
             &key1.public_key,
             None,
+            None,
             false,
         )
         .unwrap();
@@ -378,6 +379,7 @@ mod tests {
             future,
             &key2.public_key,
             Some(Path::new("/home/me/other-legion")),
+            None,
             false,
         )
         .unwrap();
@@ -386,6 +388,7 @@ mod tests {
             "invvalid",
             future,
             &key3.public_key,
+            None,
             None,
             false,
         )

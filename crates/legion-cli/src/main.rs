@@ -193,13 +193,18 @@ async fn run(command: Command) -> ExitCode {
             router.shutdown().await;
             code
         }
-        Command::Gate(GateCommand::As { pinned, device, .. }) => {
+        Command::Gate(GateCommand::As {
+            pinned,
+            device,
+            account,
+            ..
+        }) => {
             let shutdown = install_shutdown_token();
-            gate(node, router, pinned, device, shutdown).await
+            gate(node, router, pinned, device, account, shutdown).await
         }
-        Command::Gate(GateCommand::Enrol { id, .. }) => {
+        Command::Gate(GateCommand::Enrol { id, account, .. }) => {
             let shutdown = install_shutdown_token();
-            enrol(node, router, id, shutdown).await
+            enrol(node, router, id, account, shutdown).await
         }
         Command::Pair(command) => {
             let shutdown = install_shutdown_token();
@@ -289,14 +294,22 @@ async fn serve_stream(
 /// `legion gate`: serves what a key forced to it asked for, when that is exactly `legion rpc` or
 /// `legion stream` as the ssh connector sends them, pinned to the key's principal. The request is
 /// only compared, never run. When `--device` is passed (as on paired-device keys), registers the
-/// live process under `state/device-sessions/` so `device.remove` ends it immediately.
+/// live process under `state/device-sessions/` so `device.remove` ends it immediately. When
+/// `--account` is passed (on Windows's shared `administrators_authorized_keys`), refuses any other
+/// OS account.
 async fn gate(
     node: Node,
     router: Arc<dyn Router>,
     pinned: String,
     device: Option<String>,
+    account: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
+    if let Err(error) = legion_tools::device::authkeys::verify_gate_account(account.as_deref()) {
+        router.shutdown().await;
+        err(&format!("legion gate: {}\n", error.message));
+        return ExitCode::from(FAILED);
+    }
     let requested = std::env::var("SSH_ORIGINAL_COMMAND")
         .ok()
         .and_then(|command| legion_net::gate::requested(&command));
@@ -338,14 +351,21 @@ async fn enrol(
     node: Node,
     router: Arc<dyn Router>,
     id: String,
+    account: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
-    let reply = tokio::select! {
-        reply = legion_tools::device::enrol::run_enrol(&node, &id, tokio::io::stdin()) => reply,
-        () = shutdown.cancelled() => EnrolReply::from_error(ErrorBody::new(
-            ErrorCode::Cancelled,
-            "Device enrolment was cancelled by signal.",
-        )),
+    let reply = if let Err(error) =
+        legion_tools::device::authkeys::verify_gate_account(account.as_deref())
+    {
+        EnrolReply::from_error(error)
+    } else {
+        tokio::select! {
+            reply = legion_tools::device::enrol::run_enrol(&node, &id, tokio::io::stdin()) => reply,
+            () = shutdown.cancelled() => EnrolReply::from_error(ErrorBody::new(
+                ErrorCode::Cancelled,
+                "Device enrolment was cancelled by signal.",
+            )),
+        }
     };
     router.shutdown().await;
     match serde_json::to_string(&reply) {

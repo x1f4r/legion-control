@@ -60,7 +60,8 @@ pub enum Command {
     Version,
 }
 
-/// `legion gate --as P [--device NAME] [--home PATH]` or `legion gate --enrol ID [--home PATH]`.
+/// `legion gate --as P [--device NAME] [--account USER] [--home PATH]` or
+/// `legion gate --enrol ID [--account USER] [--home PATH]`.
 #[derive(Debug, PartialEq)]
 pub enum GateCommand {
     /// Confine an ssh key to `legion rpc` and `legion stream` as `pinned`.
@@ -69,6 +70,8 @@ pub enum GateCommand {
         pinned: String,
         /// Optional paired device name for live-session tracking and immediate revocation.
         device: Option<String>,
+        /// Optional pinned OS account name (used on shared `administrators_authorized_keys`).
+        account: Option<String>,
         /// Optional pinned absolute `LEGION_HOME` path overriding the ssh session environment.
         home: Option<PathBuf>,
     },
@@ -76,6 +79,8 @@ pub enum GateCommand {
     Enrol {
         /// The invite identifier issued by `device.invite`.
         id: String,
+        /// Optional pinned OS account name (used on shared `administrators_authorized_keys`).
+        account: Option<String>,
         /// Optional pinned absolute `LEGION_HOME` path overriding the ssh session environment.
         home: Option<PathBuf>,
     },
@@ -473,10 +478,11 @@ pub fn command_help(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `legion gate --as PRINCIPAL [--device NAME] [--home PATH] | --enrol ID [--home PATH]`.
+/// `legion gate --as PRINCIPAL [--device NAME] [--account USER] [--home PATH] | --enrol ID [--account USER] [--home PATH]`.
 fn gate(rest: &[String]) -> Result<Command, UsageError> {
     let mut pinned = None;
     let mut device = None;
+    let mut account = None;
     let mut enrol_id = None;
     let mut home: Option<PathBuf> = None;
     let mut words = rest.iter();
@@ -513,6 +519,14 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
                     return Err(UsageError("--device is given twice.".to_owned()));
                 }
             }
+            "--account" => {
+                let value = take_value(name)?;
+                legion_tools::device::authkeys::validate_account_name(&value)
+                    .map_err(|error| UsageError(format!("--account: {}", error.message)))?;
+                if account.replace(value).is_some() {
+                    return Err(UsageError("--account is given twice.".to_owned()));
+                }
+            }
             "--enrol" => {
                 let value = take_value(name)?;
                 legion_tools::device::keys::validate_invite_id(&value)
@@ -540,6 +554,7 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
         (Some(pinned), None) => Ok(Command::Gate(GateCommand::As {
             pinned,
             device,
+            account,
             home,
         })),
         (None, Some(id)) => {
@@ -548,7 +563,7 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
                     "--device is only valid with `gate --as`, not `gate --enrol`.".to_owned(),
                 ));
             }
-            Ok(Command::Gate(GateCommand::Enrol { id, home }))
+            Ok(Command::Gate(GateCommand::Enrol { id, account, home }))
         }
         (Some(_), Some(_)) => Err(UsageError(
             "gate takes --as or --enrol, not both.".to_owned(),
@@ -1493,6 +1508,7 @@ mod tests {
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
                 device: None,
+                account: None,
                 home: None,
             }))
         );
@@ -1505,12 +1521,15 @@ mod tests {
                 "agent:example",
                 "--device",
                 "pixel",
+                "--account",
+                "me",
                 "--home",
                 &abs_home_str
             ]),
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
                 device: Some("pixel".into()),
+                account: Some("me".into()),
                 home: Some(abs_home.clone()),
             }))
         );
@@ -1518,6 +1537,7 @@ mod tests {
             run(&["gate", "--enrol", "0123456789abcdef0123456789abcdef"]),
             Ok(Command::Gate(GateCommand::Enrol {
                 id: "0123456789abcdef0123456789abcdef".into(),
+                account: None,
                 home: None,
             }))
         );
@@ -1526,11 +1546,14 @@ mod tests {
                 "gate",
                 "--enrol",
                 "0123456789abcdef0123456789abcdef",
+                "--account",
+                "me",
                 "--home",
                 &abs_home_str,
             ]),
             Ok(Command::Gate(GateCommand::Enrol {
                 id: "0123456789abcdef0123456789abcdef".into(),
+                account: Some("me".into()),
                 home: Some(abs_home),
             }))
         );
@@ -1538,6 +1561,8 @@ mod tests {
             &["gate", "--as", "phone", "--enrol", "0123456789abcdef"][..],
             &["gate", "--as", "phone", "--home", "relative/path"],
             &["gate", "--as", "phone", "--device", "../escape"],
+            &["gate", "--as", "phone", "--account", "-bad"],
+            &["gate", "--as", "phone", "--account", "has space"],
             &[
                 "gate",
                 "--enrol",

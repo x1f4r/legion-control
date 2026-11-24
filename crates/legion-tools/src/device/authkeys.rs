@@ -526,20 +526,87 @@ pub fn format_sshd_expiry(time: Timestamp) -> String {
     rounded.strftime("%Y%m%d%H%M").to_string()
 }
 
+/// Validates an OS account name pinned via `--account` on `legion gate`.
+pub fn validate_account_name(raw: &str) -> Result<(), ErrorBody> {
+    if raw.is_empty()
+        || raw.len() > 128
+        || raw.starts_with('-')
+        || raw.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("{raw:?} is not a valid OS account name."),
+        )
+        .with_hint(
+            "Pass a non-empty OS account name without a leading '-', spaces, or control characters.",
+        ));
+    }
+    Ok(())
+}
+
+/// Compares two OS account names, ignoring ASCII case on Windows and requiring exact match on Unix.
+pub fn account_names_match(a: &str, b: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// Returns the current OS account name via [`legion_os::user::current_username`].
+pub fn current_account_name() -> Result<String, ErrorBody> {
+    legion_os::user::current_username().map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Cannot determine the current OS account name: {error}."),
+        )
+    })
+}
+
+/// Verifies that the OS account running `legion gate` matches the optional `--account` pinned on
+/// the `authorized_keys` line (case-insensitively on Windows, exact on Unix).
+pub fn verify_gate_account(expected: Option<&str>) -> Result<(), ErrorBody> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = legion_os::user::current_username().map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Denied,
+            format!("Cannot verify OS account against pinned account {expected}: {error}."),
+        )
+    })?;
+    if !account_names_match(&actual, expected, cfg!(windows)) {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!("This key is pinned to OS account {expected}, not {actual}."),
+        )
+        .with_hint("Connect using the OS account this device was paired for."));
+    }
+    Ok(())
+}
+
 /// Formats a temporary invite line for `authorized_keys`.
 ///
 /// When `explicit_home` is `Some`, appends `--home <path>` to the forced command so `legion gate
 /// --enrol` always reads the same Legion home that issued the invite regardless of `sshd`'s
-/// session environment.
+/// session environment. When `account` is `Some` (such as on Windows's shared
+/// `administrators_authorized_keys`), appends `--account <name>` so only that OS account may use
+/// the temporary key.
 pub fn format_invite_line(
     exe: &Path,
     id: &str,
     expires: Timestamp,
     pubkey: &str,
     explicit_home: Option<&Path>,
+    account: Option<&str>,
     windows: bool,
 ) -> Result<String, ErrorBody> {
     let mut owned_args = vec!["gate".to_owned(), "--enrol".to_owned(), id.to_owned()];
+    if let Some(acct) = account {
+        validate_account_name(acct)?;
+        owned_args.push("--account".to_owned());
+        owned_args.push(acct.to_owned());
+    }
     if let Some(home) = explicit_home {
         let home_str = home.to_str().ok_or_else(|| {
             ErrorBody::new(
@@ -561,15 +628,18 @@ pub fn format_invite_line(
 /// Formats a permanent paired device line for `authorized_keys`.
 ///
 /// Includes `--device <device_name>` so `legion gate --as` tracks live sessions for immediate
-/// revocation by `device.remove`. When `explicit_home` is `Some`, also appends `--home <path>`
-/// so `legion gate --as` always reads the same Legion home regardless of `sshd`'s session
-/// environment.
+/// revocation by `device.remove`. When `account` is `Some` (such as on Windows's shared
+/// `administrators_authorized_keys`), appends `--account <name>` so no other account on the same
+/// machine can authenticate with this key. When `explicit_home` is `Some`, also appends
+/// `--home <path>` so `legion gate --as` always reads the same Legion home regardless of `sshd`'s
+/// session environment.
 pub fn format_device_line(
     exe: &Path,
     principal: &str,
     pubkey: &str,
     device_name: &str,
     explicit_home: Option<&Path>,
+    account: Option<&str>,
     windows: bool,
 ) -> Result<String, ErrorBody> {
     let mut owned_args = vec![
@@ -579,6 +649,11 @@ pub fn format_device_line(
         "--device".to_owned(),
         device_name.to_owned(),
     ];
+    if let Some(acct) = account {
+        validate_account_name(acct)?;
+        owned_args.push("--account".to_owned());
+        owned_args.push(acct.to_owned());
+    }
     if let Some(home) = explicit_home {
         let home_str = home.to_str().ok_or_else(|| {
             ErrorBody::new(
@@ -611,6 +686,8 @@ pub enum LineKind {
         expiry_time: Option<String>,
         /// Pinned `--home` path extracted from the forced command, when present.
         home: Option<String>,
+        /// Pinned `--account` name extracted from the forced command, when present.
+        account: Option<String>,
     },
     /// Paired device line whose comment starts with `legion-device:`.
     Device {
@@ -622,6 +699,8 @@ pub enum LineKind {
         principal: Option<String>,
         /// Pinned `--home` path extracted from the forced command, when present.
         home: Option<String>,
+        /// Pinned `--account` name extracted from the forced command, when present.
+        account: Option<String>,
     },
 }
 
@@ -864,27 +943,32 @@ fn classify_line(raw: &[u8]) -> LineKind {
         && !id.chars().any(char::is_whitespace)
     {
         let expiry_time = options.and_then(|opts| extract_option_value(opts, "expiry-time"));
-        let home = parsed_cmd.and_then(|flags| flags.home);
+        let (home, account) = match parsed_cmd {
+            Some(flags) => (flags.home, flags.account),
+            None => (None, None),
+        };
         return LineKind::Invite {
             id: id.to_owned(),
             key_b64: key_b64.to_owned(),
             expiry_time,
             home,
+            account,
         };
     }
     if let Some(name) = comment.strip_prefix(DEVICE_COMMENT_PREFIX)
         && !name.is_empty()
         && !name.chars().any(char::is_whitespace)
     {
-        let (principal, home) = match parsed_cmd {
-            Some(flags) => (flags.principal, flags.home),
-            None => (None, None),
+        let (principal, home, account) = match parsed_cmd {
+            Some(flags) => (flags.principal, flags.home, flags.account),
+            None => (None, None, None),
         };
         return LineKind::Device {
             name: name.to_owned(),
             key_b64: key_b64.to_owned(),
             principal,
             home,
+            account,
         };
     }
     LineKind::Foreign
@@ -997,10 +1081,12 @@ fn extract_option_value(options: &str, key: &str) -> Option<String> {
 struct GateCommandFlags {
     principal: Option<String>,
     home: Option<String>,
+    account: Option<String>,
 }
 
-/// Parses `legion gate` flag values (`--as`, `--home`, ...) out of an unescaped forced command
-/// string, handling POSIX single quotes, PowerShell `& '...'` (with `''`), and Windows `"..."`.
+/// Parses `legion gate` flag values (`--as`, `--home`, `--account`, ...) out of an unescaped
+/// forced command string, handling POSIX single quotes, PowerShell `& '...'` (with `''`), and
+/// Windows `"..."`.
 fn parse_gate_command_flags(command: &str) -> GateCommandFlags {
     let tokens = split_forced_command_tokens(command);
     let Some(gate_pos) = tokens.iter().position(|t| t == "gate") else {
@@ -1032,6 +1118,18 @@ fn parse_gate_command_flags(command: &str) -> GateCommandFlags {
                 && !value.is_empty()
             {
                 flags.home = Some(value.clone());
+            }
+            i += 2;
+        } else if let Some(value) = token.strip_prefix("--account=") {
+            if validate_account_name(value).is_ok() {
+                flags.account = Some(value.to_owned());
+            }
+            i += 1;
+        } else if token == "--account" {
+            if let Some(value) = tokens.get(i + 1)
+                && validate_account_name(value).is_ok()
+            {
+                flags.account = Some(value.clone());
             }
             i += 2;
         } else {
@@ -1105,6 +1203,25 @@ fn split_forced_command_tokens(command: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+/// Returns `true` when a line's pinned `--account` matches `caller_account`.
+///
+/// When `require_pinned` is `true` (on Windows's shared `administrators_authorized_keys`), only
+/// lines explicitly pinned to `caller_account` match so one Administrator account cannot list or
+/// remove another Administrator's paired devices or invites. Otherwise, unpinned lines belong to
+/// the file's single user while pinned lines match only the named account.
+pub fn line_matches_account(
+    line_account: Option<&str>,
+    caller_account: Option<&str>,
+    require_pinned: bool,
+    case_insensitive: bool,
+) -> bool {
+    match (line_account, caller_account) {
+        (Some(la), Some(ca)) => account_names_match(la, ca, case_insensitive),
+        (Some(_), None) => false,
+        (None, _) => !require_pinned,
+    }
 }
 
 /// Returns `true` when a line's pinned `--home` matches `paths`'s Legion home.
@@ -1380,6 +1497,7 @@ Match Group users
             ts,
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
             Some(Path::new("/Users/me/My Legion Home")),
+            Some("Alice"),
             false,
         )
         .unwrap();
@@ -1399,14 +1517,38 @@ Match Group users
                 key_b64,
                 expiry_time,
                 home,
+                account,
             } => {
                 assert_eq!(id, "deadbeef01");
                 assert!(key_b64.starts_with("AAAAC3Nza"));
                 assert_eq!(expiry_time.as_deref(), Some("202611250215"));
                 assert_eq!(home.as_deref(), Some("/Users/me/My Legion Home"));
+                assert_eq!(account.as_deref(), Some("Alice"));
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        // Case-insensitive matching for Windows shared administrators_authorized_keys.
+        assert!(line_matches_account(
+            Some("Alice"),
+            Some("alice"),
+            true,
+            true
+        ));
+        assert!(!line_matches_account(
+            Some("Alice"),
+            Some("alice"),
+            true,
+            false
+        ));
+        assert!(!line_matches_account(
+            Some("Alice"),
+            Some("bob"),
+            true,
+            true
+        ));
+        assert!(!line_matches_account(None, Some("alice"), true, true));
+        assert!(line_matches_account(None, Some("alice"), false, false));
     }
 
     #[cfg(unix)]
