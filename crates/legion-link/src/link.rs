@@ -24,8 +24,6 @@ use crate::session::{CallError, Session};
 
 /// Default idle duration after which unused sessions are closed (matches `legion serve`).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Bounded event queue between a session's reader task and a caller's event callback.
-const EVENT_QUEUE: usize = 256;
 
 /// Serializable configuration for [`Link`]: paired or local nodes plus the device's OpenSSH
 /// private key string. The caller persists this JSON document in app storage.
@@ -492,9 +490,13 @@ impl Link {
         cancel: CancellationToken,
         events: &mut impl FnMut(Value),
     ) -> Result<Value, CallError> {
-        let (tx, mut rx) = mpsc::channel::<Event>(EVENT_QUEUE);
+        // An unbounded channel is used deliberately here: `EventSink`'s callback runs synchronously
+        // on the session's shared reader task (blocking there would stall every multiplexed call on
+        // the session), while this loop drains incoming events on every select turn and never drops
+        // output silently.
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
         let sink = EventSink::with_events(move |event| {
-            let _ = tx.try_send(event);
+            let _ = tx.send(event);
         });
         let call_fut = session.call(params, cancel, sink);
         tokio::pin!(call_fut);
@@ -1254,6 +1256,180 @@ mod tests {
 
         // Once no holders remain, `close_idle` reaps the retired session.
         link.close_idle().await;
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn call_delivers_large_event_bursts_without_dropping_and_forwards_principal() {
+        const COUNT: usize = 400;
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(256 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                let (server_r, mut server_w) = tokio::io::split(server);
+                let node_name = entry.node.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let resp = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        } else if req.method == method::CALL {
+                            assert_eq!(req.params["as"], json!("phone"));
+                            let id = req.id.clone().unwrap();
+                            for seq in 0..COUNT {
+                                let ev = Notification::new(
+                                    method::EVENT,
+                                    serde_json::to_value(EventParams {
+                                        id: id.clone(),
+                                        kind: EventKind::Stdout,
+                                        data: json!(seq),
+                                        machine: None,
+                                    })
+                                    .unwrap(),
+                                );
+                                server_w
+                                    .write_all(
+                                        format!("{}\n", serde_json::to_string(&ev).unwrap())
+                                            .as_bytes(),
+                                    )
+                                    .await
+                                    .unwrap();
+                            }
+                            let resp = Response::ok(req.id, json!({"sent": COUNT}));
+                            server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                            server_w.flush().await.unwrap();
+                        }
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let mut node = NodeLink::local("tower", "legion");
+        node.principal = Some("phone".to_owned());
+        let cfg = LinkConfig {
+            device_key: None,
+            nodes: vec![node],
+        };
+        let link = Link::with_opener(cfg, LinkOptions::default(), opener);
+        let mut seen = Vec::new();
+        let res = link
+            .call("tower", "exec.run", json!({}), None, |ev| seen.push(ev))
+            .await
+            .unwrap();
+        assert_eq!(res["sent"], json!(COUNT));
+        assert_eq!(seen.len(), COUNT);
+        for (idx, ev) in seen.iter().enumerate() {
+            assert_eq!(ev["data"], json!(idx));
+        }
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn lost_in_flight_call_is_never_retried() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let calls_seen = Arc::new(AtomicUsize::new(0));
+        let opens_c = Arc::clone(&opens);
+        let calls_c = Arc::clone(&calls_seen);
+
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            opens_c.fetch_add(1, Ordering::SeqCst);
+            let seen = Arc::clone(&calls_c);
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                let (server_r, mut server_w) = tokio::io::split(server);
+                let node_name = entry.node.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(server_r).lines();
+                    let hello_line = lines.next_line().await.unwrap().unwrap();
+                    let hello_req: Request = serde_json::from_str(&hello_line).unwrap();
+                    let resp = Response::ok(
+                        hello_req.id,
+                        serde_json::to_value(HelloResult {
+                            node: node_name,
+                            version: "0.1.0".into(),
+                            build: None,
+                            protocol: PROTOCOL,
+                            os: "linux".into(),
+                            arch: "x86_64".into(),
+                            systems: vec![],
+                            system: None,
+                            boot_id: None,
+                        })
+                        .unwrap(),
+                    );
+                    server_w
+                        .write_all(
+                            format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    server_w.flush().await.unwrap();
+
+                    // Read the call request so bytes definitely reached the server, then drop
+                    // the stream mid-flight without replying.
+                    let _ = lines.next_line().await.unwrap().unwrap();
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    drop(server_w);
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let link = Link::with_opener(test_config("tower"), LinkOptions::default(), opener);
+        let err = link
+            .call("tower", "fs.remove", json!({"path": "/tmp/x"}), None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unreachable);
+        assert!(err.message.contains("unknown"), "{}", err.message);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_seen.load(Ordering::SeqCst), 1);
         link.close().await;
     }
 
