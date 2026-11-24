@@ -219,6 +219,13 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/** A timer to race against, which `clear` stops so it cannot keep the process alive. */
+function timer(ms) {
+  let handle;
+  const promise = new Promise(resolve => { handle = setTimeout(resolve, ms); });
+  return { promise, clear: () => clearTimeout(handle) };
+}
+
 /** Runs a PowerShell script without any quoting through a command line. */
 function powershell(script, env) {
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
@@ -735,16 +742,23 @@ async function mcpSession(messages) {
       child.stdin.write(`${JSON.stringify(message)}\n`);
       if (message.id === undefined) continue;
       if (!answers.has(message.id)) {
-        await Promise.race([
-          new Promise(resolve => waiting.set(message.id, resolve)),
-          sleep(120_000).then(() => { throw new Failure(`legion mcp did not answer ${message.method} in time.\nstderr: ${clip(stderr)}`); }),
-          exited.then(code => { throw new Failure(`legion mcp exited ${code} before answering ${message.method}.\nstderr: ${clip(stderr)}`); }),
-        ]);
+        const limit = timer(120_000);
+        try {
+          await Promise.race([
+            new Promise(resolve => waiting.set(message.id, resolve)),
+            limit.promise.then(() => { throw new Failure(`legion mcp did not answer ${message.method} in time.\nstderr: ${clip(stderr)}`); }),
+            exited.then(code => { throw new Failure(`legion mcp exited ${code} before answering ${message.method}.\nstderr: ${clip(stderr)}`); }),
+          ]);
+        } finally {
+          limit.clear();
+        }
       }
     }
   } finally {
     child.stdin.end();
-    await Promise.race([exited, sleep(10_000)]);
+    const grace = timer(10_000);
+    await Promise.race([exited, grace.promise]);
+    grace.clear();
     if (child.exitCode === null) child.kill();
     record({ program: near, args: ['mcp', '--compact'], stdin: messages.map(m => JSON.stringify(m)).join('\n'), stdout: clip(JSON.stringify([...answers.values()])), stderr: clip(stderr) });
   }
@@ -859,4 +873,12 @@ async function main() {
   console.log(`\nlegion e2e passed: ${steps.length - skipped.length} steps${skipped.length ? `, ${skipped.length} skipped as asked` : ''}.`);
 }
 
-await main();
+// Said outright: a timer or a child left behind by a step would otherwise keep the run, and the
+// runner it holds, waiting after the verdict.
+try {
+  await main();
+  process.exit(0);
+} catch (error) {
+  console.error(`legion e2e: the driver itself failed: ${error.stack}`);
+  process.exit(1);
+}
