@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 
 use legion_core::proto::{ErrorBody, ErrorCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::actuator::Ran;
@@ -63,7 +63,7 @@ impl Platform {
 }
 
 /// What a power call does to the machine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     /// Suspend.
@@ -75,6 +75,15 @@ pub enum Action {
 }
 
 impl Action {
+    /// The action as the result spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Sleep => "sleep",
+            Action::Restart => "restart",
+            Action::Shutdown => "shutdown",
+        }
+    }
+
     /// The action as a phrase: "restart this machine".
     pub fn phrase(self) -> &'static str {
         match self {
@@ -113,9 +122,13 @@ pub enum Timing {
 /// A read-only question to the system: would it let this account carry out the action?
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Check {
-    /// logind's `Can<Verb>` over `busctl`: `yes` allows.
+    /// logind's `Can<Verb>` over `busctl`: whether this account may, and whether an inhibitor
+    /// holds the action back. Asked whatever `[power] sudo` says, because a block inhibitor
+    /// refuses root too.
     Logind(Vec<String>),
-    /// `sudo -n -l <command>`: exit 0 allows.
+    /// `sudo -n -l -l <command>`: the rule that matches the command must let it run without a
+    /// password. A plain `sudo -l` is not enough: with sudoers' default `listpw=any`, any
+    /// unrelated NOPASSWD rule lets the listing succeed for a command that needs a password.
     Sudo(Vec<String>),
     /// `id -u`: `0` allows.
     Root(Vec<String>),
@@ -137,8 +150,10 @@ pub struct ActionPlan {
     pub argv: Vec<String>,
     /// Who waits out the delay.
     pub timing: Timing,
-    /// The question to ask first, when the answer would otherwise never come back.
-    pub check: Option<Check>,
+    /// The questions to ask first, in order, because the answer would otherwise never come back.
+    pub checks: Vec<Check>,
+    /// Whether the command takes the delay itself, so the runner starting it does not wait.
+    pub waits_itself: bool,
 }
 
 /// `["sudo", "-n", …argv]`: a password prompt fails at once instead of hanging the call.
@@ -157,12 +172,14 @@ pub fn maybe_sudo(platform: Platform, sudo: bool, argv: Vec<String>) -> Vec<Stri
     }
 }
 
-/// Builds the plan for `action`. `find` looks a program up on `PATH` (Windows sleep needs one).
+/// Builds the plan for `action`. `ignore_inhibitors` adds systemctl's own `-i`
+/// (`--check-inhibitors=no`). `find` looks a program up on `PATH` (Windows sleep needs one).
 pub fn action_plan(
     platform: Platform,
     action: Action,
     delay_s: u32,
     sudo: bool,
+    ignore_inhibitors: bool,
     sleep_override: Option<&[String]>,
     find: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<ActionPlan, ErrorBody> {
@@ -173,41 +190,49 @@ pub fn action_plan(
         return Ok(ActionPlan {
             argv: argv.to_vec(),
             timing: Timing::Delayed,
-            check: None,
+            checks: Vec::new(),
+            waits_itself: false,
         });
     }
     let delay = delay_s.to_string();
     match platform {
         Platform::Linux => {
-            let plain = strings(&["systemctl", action.systemctl_verb()]);
-            let check = if sudo {
-                Check::Sudo(sudo_check(&plain))
-            } else {
-                Check::Logind(strings(&[
-                    "busctl",
-                    "call",
-                    "org.freedesktop.login1",
-                    "/org/freedesktop/login1",
-                    "org.freedesktop.login1.Manager",
-                    action.logind_method(),
-                ]))
-            };
+            let mut plain = strings(&["systemctl"]);
+            if ignore_inhibitors {
+                plain.push("-i".to_owned());
+            }
+            plain.push(action.systemctl_verb().to_owned());
+            let mut checks = vec![Check::Logind(strings(&[
+                "busctl",
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                action.logind_method(),
+            ]))];
+            if sudo {
+                checks.push(Check::Sudo(sudo_check(&plain)));
+            }
             Ok(ActionPlan {
                 argv: maybe_sudo(platform, sudo, plain),
                 timing: Timing::Delayed,
-                check: Some(check),
+                checks,
+                waits_itself: false,
             })
         }
         Platform::Macos => {
             let plain = match action {
-                Action::Sleep => {
-                    // pmset needs no privilege: it is what the Apple menu does.
+                // pmset needs no privilege from the desktop, where it is what the Apple menu
+                // does, but may over ssh: with [power] sudo it goes through sudo like the rest.
+                Action::Sleep if !sudo => {
                     return Ok(ActionPlan {
                         argv: strings(&["pmset", "sleepnow"]),
                         timing: Timing::Delayed,
-                        check: None,
+                        checks: Vec::new(),
+                        waits_itself: false,
                     });
                 }
+                Action::Sleep => strings(&["pmset", "sleepnow"]),
                 Action::Restart => strings(&["shutdown", "-r", "now"]),
                 Action::Shutdown => strings(&["shutdown", "-h", "now"]),
             };
@@ -219,7 +244,8 @@ pub fn action_plan(
             Ok(ActionPlan {
                 argv: maybe_sudo(platform, sudo, plain),
                 timing: Timing::Delayed,
-                check: Some(check),
+                checks: vec![check],
+                waits_itself: false,
             })
         }
         Platform::Windows => {
@@ -229,13 +255,24 @@ pub fn action_plan(
                         .into_iter()
                         .find_map(find)
                         .ok_or_else(no_psshutdown)?;
-                    vec![
-                        tool.to_string_lossy().into_owned(),
-                        "-d".to_owned(),
-                        "-t".to_owned(),
-                        delay,
-                        "-accepteula".to_owned(),
-                    ]
+                    // psshutdown returns at once and leaves the countdown to a process of its
+                    // own. Started by the node, it would run in the job object `run` contains
+                    // its commands in, which is torn down, that process with it, when psshutdown
+                    // exits; started by the detached runner it is outside any such job. The
+                    // runner does not wait first: psshutdown takes the delay itself, and needs a
+                    // delay, since with -t 0 it never returns in a session without a desktop.
+                    return Ok(ActionPlan {
+                        argv: vec![
+                            tool.to_string_lossy().into_owned(),
+                            "-d".to_owned(),
+                            "-t".to_owned(),
+                            delay,
+                            "-accepteula".to_owned(),
+                        ],
+                        timing: Timing::Delayed,
+                        checks: Vec::new(),
+                        waits_itself: true,
+                    });
                 }
                 Action::Restart => strings(&["shutdown", "/r", "/t", &delay]),
                 Action::Shutdown => strings(&["shutdown", "/s", "/t", &delay]),
@@ -243,16 +280,63 @@ pub fn action_plan(
             Ok(ActionPlan {
                 argv,
                 timing: Timing::SelfTimed,
-                check: None,
+                checks: Vec::new(),
+                waits_itself: false,
             })
         }
     }
 }
 
 fn sudo_check(plain: &[String]) -> Vec<String> {
-    let mut argv = strings(&["sudo", "-n", "-l"]);
+    let mut argv = strings(&["sudo", "-n", "-l", "-l"]);
     argv.extend(plain.iter().cloned());
     argv
+}
+
+/// What sudo's long listing of one command says about its password.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SudoRule {
+    /// The rule that decides lets it run without a password; the text names where it is.
+    NoPassword(String),
+    /// The rule that decides wants a password; the text names where it is.
+    Password(String),
+    /// No rule could be read from the listing.
+    Unreadable,
+}
+
+/// Reads `sudo -l -l <command>`: one entry per matching rule, each opening with `Sudoers entry:`
+/// (or `LDAP Role:`), with an `Options:` line holding `!authenticate` for NOPASSWD. sudoers uses
+/// the last rule that matches, so the last entry decides.
+pub fn parse_sudo_listing(text: &str) -> SudoRule {
+    let mut decided = SudoRule::Unreadable;
+    let mut current: Option<(String, bool)> = None;
+    let settle = |entry: Option<(String, bool)>, decided: &mut SudoRule| {
+        if let Some((source, no_password)) = entry {
+            *decided = if no_password {
+                SudoRule::NoPassword(source)
+            } else {
+                SudoRule::Password(source)
+            };
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let header = trimmed
+            .strip_prefix("Sudoers entry:")
+            .or_else(|| trimmed.strip_prefix("LDAP Role:"));
+        if let Some(source) = header {
+            settle(current.take(), &mut decided);
+            current = Some((source.trim().to_owned(), false));
+        } else if let (Some(options), Some((_, no_password))) =
+            (trimmed.strip_prefix("Options:"), current.as_mut())
+        {
+            *no_password = options
+                .split(',')
+                .any(|option| option.trim() == "!authenticate");
+        }
+    }
+    settle(current, &mut decided);
+    decided
 }
 
 fn no_psshutdown() -> ErrorBody {
@@ -274,6 +358,14 @@ pub enum Answer {
     Refused(String),
     /// The action is not available on this machine at all; the text says why.
     Unavailable(String),
+    /// logind holds the action back for an inhibitor (`inhibited`, `inhibitor-blocked`), or
+    /// for one and authentication besides (`challenge-inhibitor-blocked`).
+    Inhibited {
+        /// What logind answered.
+        said: String,
+        /// Whether this account would also have to authenticate.
+        challenge: bool,
+    },
     /// The question itself could not be asked or answered.
     Unknown(String),
 }
@@ -313,17 +405,30 @@ pub fn read_check(check: &Check, outcome: &Result<Ran, ErrorBody>) -> Answer {
                 "no" | "challenge" => Answer::Refused(format!(
                     "logind answered {said:?}: this account may not do it without authenticating"
                 )),
+                "inhibited" | "inhibitor-blocked" | "challenge-inhibitor-blocked" => {
+                    Answer::Inhibited {
+                        said: said.to_owned(),
+                        challenge: said.starts_with("challenge"),
+                    }
+                }
                 other => Answer::Unknown(format!("logind answered {other:?}")),
             }
         }
         Check::Sudo(_) => {
-            if ran.ok() {
-                Answer::Allowed
-            } else {
-                Answer::Refused(nonempty(
+            if !ran.ok() {
+                return Answer::Refused(nonempty(
                     &ran.said(),
                     "sudo does not allow this command without a password",
-                ))
+                ));
+            }
+            match parse_sudo_listing(&ran.stdout) {
+                SudoRule::NoPassword(_) => Answer::Allowed,
+                SudoRule::Password(source) => Answer::Refused(format!(
+                    "the sudo rule for it ({source}) asks for a password, and a command run after the reply has nobody to type one"
+                )),
+                SudoRule::Unreadable => Answer::Unknown(
+                    "sudo allowed the listing but did not show the rule for the command, so whether it needs a password is unknown".to_owned(),
+                ),
             }
         }
         Check::Root(_) => match ran.stdout.trim() {
@@ -334,6 +439,68 @@ pub fn read_check(check: &Check, outcome: &Result<Ran, ErrorBody>) -> Answer {
             _ => Answer::Unknown(nonempty(ran.first_line(), "id -u failed").to_owned()),
         },
     }
+}
+
+/// One logind inhibitor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Inhibitor {
+    /// What it holds back, such as `shutdown:sleep`.
+    pub what: String,
+    /// Who holds it.
+    pub who: String,
+    /// Why, in its own words.
+    pub why: String,
+    /// `block`, or `delay` (which only postpones).
+    pub mode: String,
+    /// The user it runs as.
+    pub uid: u64,
+    /// Its process.
+    pub pid: u64,
+}
+
+/// The read-only command that lists logind's inhibitors, as JSON.
+pub fn inhibitors_command() -> Vec<String> {
+    strings(&[
+        "busctl",
+        "--json=short",
+        "call",
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+        "ListInhibitors",
+    ])
+}
+
+/// The block inhibitors that hold `action` back, from `busctl --json=short` output of
+/// `ListInhibitors` (`{"type":"a(ssssuu)","data":[[[what, who, why, mode, uid, pid], …]]}`).
+pub fn parse_inhibitors(text: &str, action: Action) -> Vec<Inhibitor> {
+    let category = match action {
+        Action::Sleep => "sleep",
+        Action::Restart | Action::Shutdown => "shutdown",
+    };
+    let parsed: Value = serde_json::from_str(text.trim()).unwrap_or(Value::Null);
+    let rows = parsed["data"]
+        .get(0)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rows.iter()
+        .filter_map(|row| {
+            let field = |index: usize| row.get(index).and_then(Value::as_str).map(str::to_owned);
+            let number = |index: usize| row.get(index).and_then(Value::as_u64).unwrap_or(0);
+            Some(Inhibitor {
+                what: field(0)?,
+                who: field(1)?,
+                why: field(2)?,
+                mode: field(3)?,
+                uid: number(4),
+                pid: number(5),
+            })
+        })
+        .filter(|inhibitor| {
+            inhibitor.mode == "block" && inhibitor.what.split(':').any(|what| what == category)
+        })
+        .collect()
 }
 
 fn nonempty(text: &str, otherwise: &str) -> String {
@@ -459,60 +626,104 @@ mod tests {
     }
 
     fn plan(platform: Platform, action: Action, sudo: bool) -> ActionPlan {
-        action_plan(platform, action, 3, sudo, None, &|name| {
+        action_plan(platform, action, 3, sudo, false, None, &|name| {
             Some(PathBuf::from(format!("C:\\Tools\\{name}")))
         })
         .unwrap()
     }
 
-    #[test]
-    fn linux_uses_systemd_and_asks_logind_or_sudo_first() {
-        let plain = plan(Platform::Linux, Action::Restart, false);
-        assert_eq!(plain.argv, strings(&["systemctl", "reboot"]));
-        assert_eq!(plain.timing, Timing::Delayed);
-        assert_eq!(
-            plain.check,
-            Some(Check::Logind(strings(&[
-                "busctl",
-                "call",
-                "org.freedesktop.login1",
-                "/org/freedesktop/login1",
-                "org.freedesktop.login1.Manager",
-                "CanReboot"
-            ])))
-        );
-        let sudo = plan(Platform::Linux, Action::Shutdown, true);
-        assert_eq!(sudo.argv, strings(&["sudo", "-n", "systemctl", "poweroff"]));
-        assert_eq!(
-            sudo.check,
-            Some(Check::Sudo(strings(&[
-                "sudo",
-                "-n",
-                "-l",
-                "systemctl",
-                "poweroff"
-            ])))
-        );
-        let sleep = plan(Platform::Linux, Action::Sleep, false);
-        assert_eq!(sleep.argv, strings(&["systemctl", "suspend"]));
-        assert!(matches!(&sleep.check, Some(Check::Logind(argv)) if argv[5] == "CanSuspend"));
+    fn logind(method: &str) -> Check {
+        Check::Logind(strings(&[
+            "busctl",
+            "call",
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            method,
+        ]))
     }
 
     #[test]
-    fn macos_sleeps_without_privilege_and_restarts_as_root() {
-        let sleep = plan(Platform::Macos, Action::Sleep, true);
+    fn linux_uses_systemd_and_asks_logind_always_and_sudo_when_set() {
+        let plain = plan(Platform::Linux, Action::Restart, false);
+        assert_eq!(plain.argv, strings(&["systemctl", "reboot"]));
+        assert_eq!(plain.timing, Timing::Delayed);
+        assert_eq!(plain.checks, [logind("CanReboot")]);
+        // A block inhibitor refuses root too, so logind is asked whatever sudo says.
+        let sudo = plan(Platform::Linux, Action::Shutdown, true);
+        assert_eq!(sudo.argv, strings(&["sudo", "-n", "systemctl", "poweroff"]));
+        assert_eq!(
+            sudo.checks,
+            [
+                logind("CanPowerOff"),
+                Check::Sudo(strings(&[
+                    "sudo",
+                    "-n",
+                    "-l",
+                    "-l",
+                    "systemctl",
+                    "poweroff"
+                ]))
+            ]
+        );
+        let sleep = plan(Platform::Linux, Action::Sleep, false);
+        assert_eq!(sleep.argv, strings(&["systemctl", "suspend"]));
+        assert_eq!(sleep.checks, [logind("CanSuspend")]);
+        let past = action_plan(
+            Platform::Linux,
+            Action::Sleep,
+            3,
+            true,
+            true,
+            None,
+            &everything,
+        )
+        .unwrap();
+        assert_eq!(
+            past.argv,
+            strings(&["sudo", "-n", "systemctl", "-i", "suspend"])
+        );
+        assert_eq!(
+            past.checks[1],
+            Check::Sudo(strings(&[
+                "sudo",
+                "-n",
+                "-l",
+                "-l",
+                "systemctl",
+                "-i",
+                "suspend"
+            ]))
+        );
+    }
+
+    #[test]
+    fn macos_sleeps_through_sudo_when_told_and_restarts_as_root() {
+        let sleep = plan(Platform::Macos, Action::Sleep, false);
         assert_eq!(sleep.argv, strings(&["pmset", "sleepnow"]));
-        assert_eq!(sleep.check, None);
+        assert!(sleep.checks.is_empty());
+        // Over ssh pmset may need root: [power] sudo applies, with the same check.
+        let sudo_sleep = plan(Platform::Macos, Action::Sleep, true);
+        assert_eq!(
+            sudo_sleep.argv,
+            strings(&["sudo", "-n", "pmset", "sleepnow"])
+        );
+        assert_eq!(
+            sudo_sleep.checks,
+            [Check::Sudo(strings(&[
+                "sudo", "-n", "-l", "-l", "pmset", "sleepnow"
+            ]))]
+        );
         let restart = plan(Platform::Macos, Action::Restart, false);
         assert_eq!(restart.argv, strings(&["shutdown", "-r", "now"]));
-        assert_eq!(restart.check, Some(Check::Root(strings(&["id", "-u"]))));
+        assert_eq!(restart.checks, [Check::Root(strings(&["id", "-u"]))]);
         let off = plan(Platform::Macos, Action::Shutdown, true);
         assert_eq!(off.argv, strings(&["sudo", "-n", "shutdown", "-h", "now"]));
         assert_eq!(
-            off.check,
-            Some(Check::Sudo(strings(&[
-                "sudo", "-n", "-l", "shutdown", "-h", "now"
-            ])))
+            off.checks,
+            [Check::Sudo(strings(&[
+                "sudo", "-n", "-l", "-l", "shutdown", "-h", "now"
+            ]))]
         );
     }
 
@@ -521,11 +732,12 @@ mod tests {
         let restart = plan(Platform::Windows, Action::Restart, true);
         assert_eq!(restart.argv, strings(&["shutdown", "/r", "/t", "3"]));
         assert_eq!(restart.timing, Timing::SelfTimed);
-        assert_eq!(restart.check, None);
+        assert!(restart.checks.is_empty());
         let off = action_plan(
             Platform::Windows,
             Action::Shutdown,
             10,
+            false,
             false,
             None,
             &everything,
@@ -543,16 +755,26 @@ mod tests {
                 "-accepteula"
             ])
         );
+        // Started by the detached runner, which does not wait first: psshutdown waits itself.
+        assert_eq!(sleep.timing, Timing::Delayed);
+        assert!(sleep.waits_itself);
         // Only the 32-bit one installed.
-        let found = action_plan(Platform::Windows, Action::Sleep, 3, false, None, &|name| {
-            (name == "psshutdown.exe").then(|| PathBuf::from("psshutdown.exe"))
-        })
+        let found = action_plan(
+            Platform::Windows,
+            Action::Sleep,
+            3,
+            false,
+            false,
+            None,
+            &|name| (name == "psshutdown.exe").then(|| PathBuf::from("psshutdown.exe")),
+        )
         .unwrap();
         assert_eq!(found.argv[0], "psshutdown.exe");
         let missing = action_plan(
             Platform::Windows,
             Action::Sleep,
             3,
+            false,
             false,
             None,
             &everything,
@@ -566,12 +788,105 @@ mod tests {
     fn a_sleep_command_from_node_toml_runs_as_written_on_every_platform() {
         let custom = strings(&["systemctl", "hibernate"]);
         for platform in [Platform::Linux, Platform::Macos, Platform::Windows] {
-            let plan =
-                action_plan(platform, Action::Sleep, 3, true, Some(&custom), &everything).unwrap();
+            let plan = action_plan(
+                platform,
+                Action::Sleep,
+                3,
+                true,
+                true,
+                Some(&custom),
+                &everything,
+            )
+            .unwrap();
             assert_eq!(plan.argv, custom);
             assert_eq!(plan.timing, Timing::Delayed);
-            assert_eq!(plan.check, None);
+            assert!(plan.checks.is_empty());
         }
+    }
+
+    /// `sudo -l -l systemctl reboot` where a NOPASSWD rule matches.
+    const NOPASSWD_RULE: &str = "Sudoers entry: /etc/sudoers.d/power\n    RunAsUsers: root\n    Options: !authenticate\n    Commands:\n\t/usr/bin/systemctl reboot\n    Matched: /usr/bin/systemctl reboot\n";
+
+    /// The same where only the group's password rule matches.
+    const PASSWORD_RULE: &str = "Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n    Commands:\n\tALL\n    Matched: /usr/bin/systemctl reboot\n";
+
+    #[test]
+    fn the_rule_that_decides_says_whether_a_password_is_needed() {
+        assert_eq!(
+            parse_sudo_listing(NOPASSWD_RULE),
+            SudoRule::NoPassword("/etc/sudoers.d/power".to_owned())
+        );
+        assert_eq!(
+            parse_sudo_listing(PASSWORD_RULE),
+            SudoRule::Password("/etc/sudoers".to_owned())
+        );
+        // Both match: sudoers uses the last one.
+        assert_eq!(
+            parse_sudo_listing(&format!("{PASSWORD_RULE}\n{NOPASSWD_RULE}")),
+            SudoRule::NoPassword("/etc/sudoers.d/power".to_owned())
+        );
+        assert_eq!(
+            parse_sudo_listing(&format!("{NOPASSWD_RULE}\n{PASSWORD_RULE}")),
+            SudoRule::Password("/etc/sudoers".to_owned())
+        );
+        // Options other than NOPASSWD, or the opposite, do not count.
+        let setenv = NOPASSWD_RULE.replace("!authenticate", "setenv, authenticate");
+        assert_eq!(
+            parse_sudo_listing(&setenv),
+            SudoRule::Password("/etc/sudoers.d/power".to_owned())
+        );
+        let several = NOPASSWD_RULE.replace("!authenticate", "setenv, !authenticate");
+        assert!(matches!(
+            parse_sudo_listing(&several),
+            SudoRule::NoPassword(_)
+        ));
+        // No rule at all.
+        assert_eq!(parse_sudo_listing(""), SudoRule::Unreadable);
+        assert_eq!(
+            parse_sudo_listing("/usr/bin/systemctl reboot\n"),
+            SudoRule::Unreadable
+        );
+    }
+
+    #[test]
+    fn logind_inhibitor_answers_are_told_apart() {
+        let check = logind("CanSuspend");
+        let answer = |said: &str| read_check(&check, &Ok(Ran::exited(0, said)));
+        assert_eq!(
+            answer("s \"inhibitor-blocked\"\n"),
+            Answer::Inhibited {
+                said: "inhibitor-blocked".to_owned(),
+                challenge: false
+            }
+        );
+        assert_eq!(
+            answer("s \"inhibited\"\n"),
+            Answer::Inhibited {
+                said: "inhibited".to_owned(),
+                challenge: false
+            }
+        );
+        assert_eq!(
+            answer("s \"challenge-inhibitor-blocked\"\n"),
+            Answer::Inhibited {
+                said: "challenge-inhibitor-blocked".to_owned(),
+                challenge: true
+            }
+        );
+    }
+
+    #[test]
+    fn only_block_inhibitors_of_the_action_are_named() {
+        let listed = r#"{"type":"a(ssssuu)","data":[[["shutdown:sleep","Updater","Installing packages","block",0,812],["sleep","Media Player","Playing","block",1000,2044],["handle-lid-switch","Desktop","Lid handled","block",1000,1500],["sleep","Network","Bring links down","delay",0,600]]]}"#;
+        let sleep = parse_inhibitors(listed, Action::Sleep);
+        let who: Vec<&str> = sleep.iter().map(|i| i.who.as_str()).collect();
+        assert_eq!(who, ["Updater", "Media Player"]);
+        assert_eq!(sleep[0].pid, 812);
+        let restart = parse_inhibitors(listed, Action::Restart);
+        assert_eq!(restart.len(), 1);
+        assert_eq!(restart[0].why, "Installing packages");
+        assert!(parse_inhibitors("not json", Action::Sleep).is_empty());
+        assert!(parse_inhibitors(r#"{"type":"a(ssssuu)","data":[[]]}"#, Action::Sleep).is_empty());
     }
 
     #[test]
@@ -603,11 +918,21 @@ mod tests {
             Answer::Unknown(_)
         ));
 
-        let sudo = Check::Sudo(strings(&["sudo", "-n", "-l", "systemctl", "reboot"]));
+        let sudo = Check::Sudo(strings(&["sudo", "-n", "-l", "-l", "systemctl", "reboot"]));
         assert_eq!(
-            answer(&sudo, Ran::exited(0, "/usr/bin/systemctl reboot\n")),
+            answer(&sudo, Ran::exited(0, NOPASSWD_RULE)),
             Answer::Allowed
         );
+        assert!(matches!(
+            answer(&sudo, Ran::exited(0, PASSWORD_RULE)),
+            Answer::Refused(said) if said.contains("/etc/sudoers") && said.contains("password")
+        ));
+        // A short listing names the command but not its rule: whether it needs a password is
+        // unknown, which is not the same as no.
+        assert!(matches!(
+            answer(&sudo, Ran::exited(0, "/usr/bin/systemctl reboot\n")),
+            Answer::Unknown(_)
+        ));
         let refused = Ran {
             stderr: "sudo: a password is required\n".to_owned(),
             ..Ran::exited(1, "")

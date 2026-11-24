@@ -63,7 +63,7 @@ fn here() -> Platform {
 
 /// The command this host would carry `action` out with, with `sudo` and nothing found missing.
 fn expected(action: Action, delay_s: u32, sudo: bool) -> (Vec<String>, Timing) {
-    let plan = action_plan(here(), action, delay_s, sudo, None, &|name| {
+    let plan = action_plan(here(), action, delay_s, sudo, false, None, &|name| {
         Some(std::path::PathBuf::from(name))
     })
     .unwrap();
@@ -468,6 +468,316 @@ async fn before_sleep_runs_first_and_a_failure_stops_the_sleep() {
     );
     assert!(failing.fake.schedules().is_empty());
     assert!(!failing.fake.runs().contains(&strings(&["sync"])));
+}
+
+#[tokio::test]
+async fn one_power_action_is_carried_out_at_a_time() {
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new(),
+        "busy = \"none\"\n[power]\nsudo = true\nsleep = [\"go-to-sleep\"]\n[boot.windows]\narm = [\"arm-windows\"]\nverify = [\"verify-windows\"]\n",
+    );
+    let first = fixture.call("power.sleep", json!({})).await.unwrap();
+    assert_eq!(first["scheduled"], json!(true));
+
+    // Its runner has taken over and not run yet: a second sleep would put the machine back to
+    // sleep as it woke, and a restart would re-arm the firmware, so both are refused.
+    let again = fixture.call("power.sleep", json!({})).await.unwrap_err();
+    assert_eq!(again.code, ErrorCode::Conflict);
+    assert!(
+        again.message.starts_with("A sleep handed over at"),
+        "{}",
+        again.message
+    );
+    let restart = fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap_err();
+    assert_eq!(restart.code, ErrorCode::Conflict);
+    assert!(!fixture.fake.runs().contains(&strings(&["arm-windows"])));
+    assert_eq!(fixture.fake.schedules().len(), 1);
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status["pending"]["action"], json!("sleep"), "{status}");
+    assert_eq!(status["pending"]["argv"], json!(["go-to-sleep"]));
+    // Its runner keeps the lock a while after the command, while the machine goes to sleep.
+    assert_eq!(status["pending"]["hold_s"], json!(5));
+
+    // Once it has run, the next one goes ahead.
+    fixture.fake.finish_runners();
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status.get("pending"), None, "{status}");
+    let restart = fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap();
+    assert_eq!(restart["scheduled"], json!(true));
+}
+
+#[tokio::test]
+async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let dir = pending::dir(fixture.node.paths());
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocker = pending::take_runner_lock(&dir, std::time::Duration::from_secs(1)).unwrap();
+    let record = Pending {
+        id: "earlier".to_owned(),
+        action: Action::Sleep,
+        into: None,
+        argv: strings(&["x"]),
+        delay_s: 3,
+        hold_s: 0,
+        since: pending::now(),
+        boot_id: None,
+        runner: true,
+        taken: None,
+        disarm: None,
+        abandoned: false,
+    };
+    pending::write_pending(&dir, &record).unwrap();
+    let error = fixture.call("power.shutdown", json!({})).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+    assert!(fixture.fake.records().is_empty());
+    drop(blocker);
+}
+
+const UPDATER_INHIBITS: &str = r#"{"type":"a(ssssuu)","data":[[["shutdown:sleep","Updater","Installing packages","block",0,812]]]}"#;
+
+/// A fake whose logind holds sleep back for an updater.
+fn inhibited() -> RecordingActuator {
+    RecordingActuator::new()
+        .reply(Reply::new(
+            &["busctl", "call"],
+            0,
+            "s \"inhibitor-blocked\"\n",
+        ))
+        .reply(Reply::new(&["busctl", "--json=short"], 0, UPDATER_INHIBITS))
+}
+
+#[tokio::test]
+async fn an_inhibitor_holds_the_action_back_until_ignored_on_purpose() {
+    if here() != Platform::Linux {
+        return;
+    }
+    let fixture = Fixture::with_node_toml(inhibited(), IDLE_WITH_SUDO);
+    for args in [json!({}), json!({"force": true})] {
+        let error = fixture.call("power.sleep", args.clone()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Busy, "{args}");
+        assert!(
+            error
+                .message
+                .contains("Updater (Installing packages, pid 812)"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error
+                .hint
+                .as_deref()
+                .unwrap()
+                .contains("ignore_inhibitors: true")
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["logind"],
+            json!("inhibitor-blocked")
+        );
+    }
+    assert!(fixture.fake.schedules().is_empty());
+
+    let past = fixture
+        .call("power.sleep", json!({"ignore_inhibitors": true}))
+        .await
+        .unwrap();
+    assert_eq!(past["scheduled"], json!(true));
+    assert_eq!(
+        fixture.fake.schedules(),
+        [(strings(&["sudo", "-n", "systemctl", "-i", "suspend"]), 3)]
+    );
+
+    // Without sudo this account cannot override it, and is told so before anything is handed over.
+    let unprivileged = Fixture::with_node_toml(inhibited(), "busy = \"none\"\n");
+    let error = unprivileged
+        .call("power.sleep", json!({"ignore_inhibitors": true}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied);
+    assert!(
+        error
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("sudo = true under [power]")
+    );
+    assert!(unprivileged.fake.schedules().is_empty());
+}
+
+#[tokio::test]
+async fn logind_is_asked_even_with_sudo_and_root_decides_the_rest() {
+    if here() != Platform::Linux {
+        return;
+    }
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new().reply(Reply::new(&["busctl", "call"], 0, "s \"challenge\"\n")),
+        IDLE_WITH_SUDO,
+    );
+    let done = fixture.call("power.restart", json!({})).await.unwrap();
+    assert_eq!(done["scheduled"], json!(true));
+    let runs = fixture.fake.runs();
+    assert_eq!(runs[0][0], "busctl");
+    assert_eq!(runs[1][..4], strings(&["sudo", "-n", "-l", "-l"]));
+}
+
+#[tokio::test]
+async fn a_dry_run_shows_the_commands_and_what_would_refuse_them() {
+    // Unmonitored: the gate would refuse, and the dry run says so beside the commands.
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), "[power]\nsudo = true\n");
+    let dry = fixture
+        .call("power.restart", json!({"dry_run": true}))
+        .await
+        .unwrap();
+    let (argv, _) = expected(Action::Restart, 3, true);
+    assert_eq!(dry["commands"], json!([argv]));
+    assert_eq!(dry["would_refuse"]["code"], json!("busy"), "{dry}");
+    assert!(
+        dry["would_refuse"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("busy = \"none\"")
+    );
+    assert!(fixture.fake.schedules().is_empty());
+
+    // Nothing refusing: no would_refuse at all.
+    fixture.write("node.toml", IDLE_WITH_SUDO);
+    let clear = fixture
+        .call("power.restart", json!({"dry_run": true}))
+        .await
+        .unwrap();
+    assert_eq!(clear.get("would_refuse"), None, "{clear}");
+
+    if here() == Platform::Linux {
+        let held = Fixture::with_node_toml(inhibited(), IDLE_WITH_SUDO);
+        let dry = held
+            .call("power.sleep", json!({"dry_run": true}))
+            .await
+            .unwrap();
+        assert_eq!(dry["would_refuse"]["code"], json!("busy"));
+        assert!(
+            dry["would_refuse"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Updater")
+        );
+        assert_eq!(
+            dry["commands"],
+            json!([["sudo", "-n", "systemctl", "suspend"]])
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sudo_rule_that_wants_a_password_refuses_before_anything_is_armed() {
+    if here() == Platform::Windows {
+        return;
+    }
+    // An unrelated NOPASSWD rule lets the listing succeed; the rule for the command wants a
+    // password, which nobody can type after the reply.
+    let listing = "Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n    Commands:\n\tALL\n";
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new().reply(Reply::new(&["sudo", "-n", "-l", "-l"], 0, listing)),
+        "busy = \"none\"\n[power]\nsudo = true\n[boot.windows]\narm = [\"arm-windows\"]\nverify = [\"verify-windows\"]\n",
+    );
+    let error = fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+    assert!(
+        error.message.contains("asks for a password"),
+        "{}",
+        error.message
+    );
+    let (argv, _) = expected(Action::Restart, 3, true);
+    assert_eq!(error.details.as_ref().unwrap()["argv"], json!(argv));
+    assert!(!fixture.fake.runs().contains(&strings(&["arm-windows"])));
+    assert!(fixture.fake.schedules().is_empty());
+}
+
+#[tokio::test]
+async fn status_reports_the_last_action_and_how_it_ended() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let outcome = pending::Outcome {
+        id: "a1".to_owned(),
+        action: Action::Restart,
+        into: Some("windows".to_owned()),
+        argv: strings(&["sudo", "-n", "systemctl", "reboot"]),
+        since: "2026-11-24T10:00:00Z".to_owned(),
+        ran_at: "2026-11-24T10:00:03Z".to_owned(),
+        exit_code: Some(1),
+        timed_out: false,
+        said: "sudo: a password is required".to_owned(),
+        disarmed: Some(pending::Disarmed {
+            argv: strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]),
+            exit_code: Some(0),
+            said: String::new(),
+        }),
+    };
+    let dir = pending::dir(fixture.node.paths());
+    std::fs::create_dir_all(&dir).unwrap();
+    pending::write_outcome(&dir, &outcome).unwrap();
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status["last"]["exit_code"], json!(1), "{status}");
+    assert_eq!(status["last"]["into"], json!("windows"));
+    assert_eq!(
+        status["last"]["disarmed"]["argv"],
+        json!(["sudo", "-n", "efibootmgr", "--delete-bootnext"])
+    );
+}
+
+/// efibootmgr on a dual boot machine, before arming and after.
+const EFI_LISTING: &str = "BootCurrent: 0001\nBootOrder: 0001,0000\nBoot0000* Windows Boot Manager\tHD(1,GPT,0f5b7c1e,0x800,0x100000)\nBoot0001* Linux Boot Manager\tHD(1,GPT,0f5b7c1e,0x800,0x100000)\n";
+
+fn efi_armed() -> RecordingActuator {
+    RecordingActuator::new()
+        .reply(Reply::new(&["efibootmgr"], 0, EFI_LISTING))
+        .reply(Reply::new(
+            &["efibootmgr"],
+            0,
+            &format!("BootNext: 0000\n{EFI_LISTING}"),
+        ))
+}
+
+#[tokio::test]
+async fn a_restart_into_another_system_tells_its_runner_how_to_disarm() {
+    if here() != Platform::Linux {
+        return;
+    }
+    let node_toml = "busy = \"none\"\n[power]\nsudo = true\n[boot.windows]\nefi_label = \"Windows Boot Manager\"\n";
+    let fixture = Fixture::with_node_toml(efi_armed(), node_toml);
+    fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap();
+    let record = pending::read_pending(&pending::dir(fixture.node.paths())).unwrap();
+    assert_eq!(
+        record.disarm,
+        Some(strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]))
+    );
+
+    // Handing over fails: the call clears the arming itself and says so.
+    let failing = Fixture::with_node_toml(efi_armed().refusing_schedules(), node_toml);
+    let error = failing
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.ends_with(
+            "The firmware's setting to start windows next was cleared again with `sudo -n efibootmgr --delete-bootnext`."
+        ),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        failing.fake.runs().last(),
+        Some(&strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]))
+    );
 }
 
 #[tokio::test]

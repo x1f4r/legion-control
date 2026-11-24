@@ -40,12 +40,24 @@ fn main() -> ExitCode {
             local_tools_gate_dry_run_policy_and_exclusive_jobs,
         ),
         (
+            "one_power_action_at_a_time_on_a_long_lived_node",
+            one_power_action_at_a_time_on_a_long_lived_node,
+        ),
+        (
             "wake_asks_the_first_helper_that_answers_and_waits_for_the_machine",
             wake_asks_the_first_helper_that_answers_and_waits_for_the_machine,
         ),
         (
             "switch_confirms_a_new_boot_in_the_expected_system",
             switch_confirms_a_new_boot_in_the_expected_system,
+        ),
+        (
+            "switch_reaches_a_machine_through_a_relay",
+            switch_reaches_a_machine_through_a_relay,
+        ),
+        (
+            "switch_looks_at_every_system_however_short_the_wait",
+            switch_looks_at_every_system_however_short_the_wait,
         ),
     ];
     let mut failed = Vec::new();
@@ -83,13 +95,17 @@ fn main() -> ExitCode {
 fn run_helper(args: &[String]) -> ExitCode {
     match args.split_first() {
         // system <legion_home> <user_home> <power_dir> <machine_dir> <system>
-        Some((mode, rest)) if mode == "system" && rest.len() == 5 => run_system(
-            Path::new(&rest[0]),
-            Path::new(&rest[1]),
-            Path::new(&rest[2]),
-            Path::new(&rest[3]),
-            &rest[4],
-        ),
+        // system <legion_home> <user_home> <power_dir> <machine_dir> <system> [hang]
+        Some((mode, rest)) if mode == "system" && (rest.len() == 5 || rest.len() == 6) => {
+            run_system(
+                Path::new(&rest[0]),
+                Path::new(&rest[1]),
+                Path::new(&rest[2]),
+                Path::new(&rest[3]),
+                &rest[4],
+                rest.get(5).map(String::as_str) == Some("hang"),
+            )
+        }
         // sleep <seconds>
         Some((mode, rest)) if mode == "sleep" && rest.len() == 1 => {
             std::thread::sleep(Duration::from_secs(rest[0].parse().unwrap()));
@@ -110,10 +126,22 @@ fn run_system(
     power_dir: &Path,
     machine_dir: &Path,
     system: &str,
+    hang: bool,
 ) -> ExitCode {
     let started_as = read_state(machine_dir);
     if started_as.up != system {
-        eprintln!("ssh: connect to host {system} port 22: No route to host");
+        if hang {
+            // A system half way down: the connection opens and nothing ever answers, until the
+            // caller gives up and closes it.
+            let (done, gone) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+                let _ = done.send(());
+            });
+            let _ = gone.recv_timeout(PATIENCE);
+        } else {
+            eprintln!("ssh: connect to host {system} port 22: No route to host");
+        }
         return ExitCode::from(255);
     }
     let mut child = Command::new(LEGION_BIN)
@@ -205,7 +233,16 @@ impl System {
 
     /// The connector command that reaches this system of `machine` as `name`.
     fn command(&self, machine: &Machine, name: &str) -> String {
-        let argv = [
+        self.connector(machine, name, false)
+    }
+
+    /// The same, for a system that hangs rather than refuses while it is down.
+    fn hanging_command(&self, machine: &Machine, name: &str) -> String {
+        self.connector(machine, name, true)
+    }
+
+    fn connector(&self, machine: &Machine, name: &str, hang: bool) -> String {
+        let mut argv = vec![
             std::env::current_exe()
                 .unwrap()
                 .to_string_lossy()
@@ -218,6 +255,9 @@ impl System {
             machine.path().to_string_lossy().into_owned(),
             name.to_owned(),
         ];
+        if hang {
+            argv.push("hang".to_owned());
+        }
         let quoted: Vec<String> = argv
             .iter()
             .map(|part| serde_json::to_string(part).unwrap())
@@ -401,6 +441,75 @@ fn local_tools_gate_dry_run_policy_and_exclusive_jobs() {
     assert_eq!(denied.json()["code"], json!("denied"), "{}", denied.stdout);
     let looked = laptop.legion(&machine, &["power.status", "--as", "agent:test"]);
     assert_eq!(looked.code, 0, "{}", looked.stderr);
+    assert_eq!(laptop.power_actions().len(), 1);
+}
+
+/// `legion rpc` with a system's fake, answering one call at a time.
+struct Rpc {
+    child: Child,
+    lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+    next: u64,
+}
+
+impl Rpc {
+    fn start(system: &System, machine: &Machine) -> Rpc {
+        let mut child = system
+            .cli(machine, &["rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Rpc {
+            child,
+            lines: std::io::BufRead::lines(std::io::BufReader::new(stdout)),
+            next: 0,
+        }
+    }
+
+    /// Calls `tool` and returns the reply's `result` or `error`.
+    fn call(&mut self, tool: &str, args: Value) -> Value {
+        self.next += 1;
+        let request = json!({"jsonrpc": "2.0", "id": self.next, "method": "call", "params": {"tool": tool, "args": args}});
+        let stdin = self.child.stdin.as_mut().unwrap();
+        std::io::Write::write_all(stdin, format!("{request}\n").as_bytes()).unwrap();
+        loop {
+            let line = self.lines.next().unwrap().unwrap();
+            let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if reply["id"] == json!(self.next) {
+                return reply
+                    .get("result")
+                    .cloned()
+                    .unwrap_or_else(|| reply["error"]["data"].clone());
+            }
+        }
+    }
+}
+
+impl Drop for Rpc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn one_power_action_at_a_time_on_a_long_lived_node() {
+    let machine = Machine::new("laptop", "boot-1");
+    let laptop = System::new(
+        "name = \"laptop\"\nbusy = \"none\"\n[power]\nsudo = true\nsleep = [\"go-to-sleep\"]\n",
+    );
+    let mut node = Rpc::start(&laptop, &machine);
+    let first = node.call("power.sleep", json!({}));
+    assert_eq!(first["scheduled"], json!(true), "{first}");
+    // The runner the fake stands in for has not run: a second sleep would put the machine back
+    // to sleep as it woke.
+    let second = node.call("power.sleep", json!({}));
+    assert_eq!(second["code"], json!("conflict"), "{second}");
+    let status = node.call("power.status", json!({}));
+    assert_eq!(status["pending"]["action"], json!("sleep"), "{status}");
     assert_eq!(laptop.power_actions().len(), 1);
 }
 
@@ -648,4 +757,111 @@ fn switch_confirms_a_new_boot_in_the_expected_system() {
     assert_eq!(stuck["details"]["boot_id"], json!("boot-4"));
     assert_eq!(linux.power_actions().len(), 3);
     assert!(windows.power_actions().is_empty());
+}
+
+const TOWER_LINUX: &str = "name = \"tower\"\nsystem = \"linux\"\nbusy = \"none\"\n[power]\nsudo = true\n[boot.windows]\narm = [\"arm-windows\"]\nverify = [\"verify-windows\"]\n";
+const TOWER_WINDOWS: &str = "name = \"tower\"\nsystem = \"windows\"\nbusy = \"none\"\n[power]\nsudo = true\n[boot.linux]\narm = [\"arm-linux\"]\nverify = [\"verify-linux\"]\n";
+
+fn switch_reaches_a_machine_through_a_relay() {
+    let laptop_machine = Machine::new("laptop", "boot-l");
+    let laptop = System::new("name = \"laptop\"\n");
+    let pi_machine = Machine::new("pi", "boot-p");
+    let pi = System::new("name = \"pi\"\n");
+    let tower = Machine::new("linux", "boot-1");
+    let linux = System::new(TOWER_LINUX);
+    let windows = System::new(TOWER_WINDOWS);
+    // Only the relay can reach tower.
+    pi.home.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.tower]\n\n[[machines.tower.systems]]\nname = \"linux\"\ncommand = {}\n\n[[machines.tower.systems]]\nname = \"windows\"\ncommand = {}\n",
+            linux.command(&tower, "linux"),
+            windows.command(&tower, "windows"),
+        ),
+    );
+    laptop.home.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.tower]\nvia = \"pi\"\n",
+            pi.command(&pi_machine, "pi"),
+        ),
+    );
+
+    let switching = laptop.spawn(
+        &laptop_machine,
+        &["power.switch", "machine=tower", "into=windows", "wait_s=60"],
+    );
+    wait_until("tower's linux hands over the restart", || {
+        linux.power_actions().len() == 1
+    });
+    tower.set("windows", 2, "boot-2");
+    let (code, switched) = finish(switching);
+    assert_eq!(code, 0, "{switched}");
+    assert_eq!(switched["restarted"], json!(true), "{switched}");
+    assert_eq!(switched["from_system"], json!("linux"));
+    assert_eq!(switched["system"], json!("windows"));
+
+    // A refusal on the way keeps its own code: the relay does not know this principal.
+    laptop.home.write_config(
+        "policy.toml",
+        "[principals.\"agent:test\"]\nrole = \"operator\"\n\n[roles.operator]\nallow = [\"effect:read\", \"power.*\"]\n",
+    );
+    let refused = laptop.legion(
+        &laptop_machine,
+        &["power.switch", "machine=tower", "--as", "agent:test"],
+    );
+    assert_eq!(refused.code, 1);
+    assert_eq!(
+        refused.json()["code"],
+        json!("denied"),
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(windows.power_actions().len(), 0);
+}
+
+fn switch_looks_at_every_system_however_short_the_wait() {
+    let laptop_machine = Machine::new("laptop", "boot-l");
+    let laptop = System::new("name = \"laptop\"\n");
+    let tower = Machine::new("linux", "boot-1");
+    let linux = System::new(TOWER_LINUX);
+    let windows = System::new(TOWER_WINDOWS);
+    let fleet = |linux_command: String| {
+        format!(
+            "[machines.tower]\n\n[[machines.tower.systems]]\nname = \"linux\"\ncommand = {linux_command}\n\n[[machines.tower.systems]]\nname = \"windows\"\ncommand = {}\n",
+            windows.command(&tower, "windows"),
+        )
+    };
+    let switch = |wait: &str| {
+        let switching = laptop.spawn(
+            &laptop_machine,
+            &["power.switch", "machine=tower", "into=windows", wait],
+        );
+        let handed = linux.power_actions().len() + 1;
+        wait_until("tower's linux hands over the restart", || {
+            linux.power_actions().len() == handed
+        });
+        switching
+    };
+
+    // A wait shorter than the time between looks still gets one look, at its end.
+    laptop
+        .home
+        .write_config("fleet.toml", &fleet(linux.command(&tower, "linux")));
+    let switching = switch("wait_s=1");
+    tower.set("windows", 2, "boot-2");
+    let (code, switched) = finish(switching);
+    assert_eq!(code, 0, "{switched}");
+    assert_eq!(switched["restarted"], json!(true), "{switched}");
+
+    // linux, tried first, hangs on its way down; windows still gets its share of each look.
+    tower.set("linux", 3, "boot-3");
+    laptop
+        .home
+        .write_config("fleet.toml", &fleet(linux.hanging_command(&tower, "linux")));
+    let switching = switch("wait_s=5");
+    tower.set("windows", 4, "boot-4");
+    let (code, switched) = finish(switching);
+    assert_eq!(code, 0, "{switched}");
+    assert_eq!(switched["system"], json!("windows"), "{switched}");
 }

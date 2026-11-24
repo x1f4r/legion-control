@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use legion_core::config::ConfigStore;
-use legion_core::{Ctx, EventSink, Registry, ToolError};
+use legion_core::{Call, Ctx, EventSink, Registry, ToolError};
 use legion_proto::{Effect, ErrorBody, ErrorCode, HelloResult};
 use legion_tools::power::plan::Platform;
 use legion_tools::power::{Actuator, PowerTool, actuator, wol};
@@ -30,6 +30,8 @@ const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a waking or restarting machine is looked at.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the look taken at the deadline gets, however little of the wait was left.
+const LAST_LOOK: Duration = Duration::from_secs(5);
 /// The longest `power.wake` waits for the machine to answer.
 const LONGEST_WAKE_WAIT_S: u32 = 300;
 /// How long `power.switch` waits when not told, and the longest it will.
@@ -69,7 +71,7 @@ pub fn register_with(registry: &mut Registry, fleet: Fleet, actuator: Arc<dyn Ac
     registry.add(PowerTool::new(
         "power.switch",
         Effect::Power,
-        "Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, and `force`; the machine's own busy gate applies, and a `busy` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. `dry_run: true` returns the machine's own power.restart dry run (`would_run`, with the exact commands) and restarts nothing. Call it from a machine other than the one being restarted.",
+        "Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, `force` and `ignore_inhibitors`; the machine's own busy gate applies, and a `busy` or `conflict` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. `dry_run: true` returns the machine's own power.restart dry run (`would_run`, with the exact commands) and restarts nothing. Call it from a machine other than the one being restarted.",
         hands,
         |hands, ctx, args: SwitchArgs| Box::pin(power_switch(hands, ctx, args)),
     ));
@@ -247,7 +249,7 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
     let mut skipped: Vec<Skipped> = Vec::new();
     let mut sent: Option<(String, Value)> = None;
     if entry.wake_via.is_empty() {
-        let reply = send_here(hands, ctx, &machine, dry_run).await?;
+        let reply = send_here(ctx, &machine, dry_run).await?;
         sent = Some((here.clone(), reply));
     }
     for helper in &entry.wake_via {
@@ -258,7 +260,7 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
             return Err(cancelled("power.wake"));
         }
         if *helper == here {
-            match send_here(hands, ctx, &machine, dry_run).await {
+            match send_here(ctx, &machine, dry_run).await {
                 Ok(reply) => sent = Some((here.clone(), reply)),
                 Err(error) => skipped.push(Skipped {
                     helper: helper.clone(),
@@ -331,10 +333,16 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
             )
             .await?;
             let left = deadline.saturating_duration_since(Instant::now());
+            // However short the wait, the machine is asked once more when it is up.
+            let timeout = if left.is_zero() {
+                LAST_LOOK
+            } else {
+                left.min(PING_TIMEOUT)
+            };
+            awake = answers(hands, ctx, &machine, timeout).await;
             if left.is_zero() {
                 break;
             }
-            awake = answers(hands, ctx, &machine, left.min(PING_TIMEOUT)).await;
         }
     }
     Ok(WakeResult {
@@ -350,27 +358,19 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
 }
 
 /// Sends the packets from this machine, answering as power.wol would.
-async fn send_here(
-    hands: &Hands,
-    ctx: &Ctx,
-    machine: &str,
-    dry_run: bool,
-) -> Result<Value, ErrorBody> {
-    let reply = power_wol(
-        hands,
-        ctx,
-        WolArgs {
-            machine: machine.to_owned(),
-            dry_run,
-        },
-    )
-    .await?;
-    serde_json::to_value(reply).map_err(|error| {
-        ErrorBody::new(
-            ErrorCode::Internal,
-            format!("power.wol's reply cannot be written as JSON: {error}."),
-        )
-    })
+/// Sends the packets from this machine as a call to power.wol on this node, by the same principal
+/// through the same door: its policy decides and its audit log records it, exactly as when a
+/// helper is asked, so a role allowed power.wake but not power.wol cannot send packets here.
+async fn send_here(ctx: &Ctx, machine: &str, dry_run: bool) -> Result<Value, ErrorBody> {
+    let mut call = Call::new(
+        ctx.door(),
+        "power.wol",
+        json!({"machine": machine, "dry_run": dry_run}),
+    );
+    call.pinned = Some(ctx.principal().to_owned());
+    call.cancel = ctx.cancel_token().child_token();
+    call.hops = ctx.hops();
+    ctx.node().call(call).await
 }
 
 fn no_helper(machine: &str, skipped: &[Skipped]) -> ErrorBody {
@@ -427,9 +427,14 @@ struct SwitchArgs {
     #[serde(default)]
     #[schemars(range(min = 0, max = 900))]
     wait_s: Option<u32>,
-    /// Restart even while the machine is busy or unmonitored.
+    /// Restart even while the machine is busy or unmonitored. It does not override a logind
+    /// inhibitor there; `ignore_inhibitors` does.
     #[serde(default)]
     force: bool,
+    /// Restart even while a logind inhibitor holds it back (Linux, with `[power] sudo = true`
+    /// there).
+    #[serde(default)]
+    ignore_inhibitors: bool,
     /// Ask the machine for its power.restart dry run: the exact commands it would run, run nowhere.
     #[serde(default)]
     dry_run: bool,
@@ -489,14 +494,16 @@ async fn power_switch(
         .with_hint("Call power.switch from another machine, or power.restart here."));
     }
     let file = ctx.config().get::<FleetFile>()?;
-    if file.machine(&machine).is_none() {
+    let Some(entry) = file.machine(&machine) else {
         return Err(unknown_machine(&machine, &file, &here));
-    }
+    };
+    // A machine reached through a relay has no session of its own here.
+    let relayed = entry.via.is_some();
 
-    let before = look(hands, ctx, &machine, LOOK_TIMEOUT)
+    let before = look(hands, ctx, &machine, relayed, LOOK_TIMEOUT)
         .await
-        .map_err(|error| {
-            ErrorBody::new(
+        .map_err(|error| match error.code {
+            ErrorCode::Unreachable => ErrorBody::new(
                 ErrorCode::Unreachable,
                 format!(
                     "{machine} does not answer, so it cannot be restarted: {}",
@@ -504,7 +511,10 @@ async fn power_switch(
                 ),
             )
             .with_hint(format!("Wake it first with power.wake machine={machine}."))
-            .with_machine(&machine)
+            .with_machine(&machine),
+            // Denied, unsupported, not found: what it is, not a machine asleep.
+            _ if error.machine.is_some() => error,
+            _ => error.with_machine(&machine),
         })?;
     let Some(boot_before) = before.boot_id.clone() else {
         return Err(ErrorBody::new(
@@ -517,17 +527,20 @@ async fn power_switch(
         .with_machine(&machine));
     };
 
-    let mut restart = json!({"force": args.force, "dry_run": args.dry_run});
+    let mut restart = json!({
+        "force": args.force,
+        "ignore_inhibitors": args.ignore_inhibitors,
+        "dry_run": args.dry_run,
+    });
     if let Some(into) = &args.into {
         restart["into"] = json!(into);
     }
-    let started = Instant::now();
-    let result = |system: Option<String>, restarted| SwitchResult {
+    let result = |system: Option<String>, restarted, waited_s| SwitchResult {
         machine: machine.clone(),
         from_system: before.system.clone(),
         system,
         restarted,
-        waited_s: seconds(started.elapsed()),
+        waited_s,
         would_run: None,
         dry_run: false,
     };
@@ -546,7 +559,7 @@ async fn power_switch(
             return Ok(SwitchResult {
                 would_run: Some(reply),
                 dry_run: true,
-                ..result(None, false)
+                ..result(None, false, 0.0)
             });
         }
         Ok(_) => {}
@@ -555,10 +568,13 @@ async fn power_switch(
         Err(error) => return Err(error),
     }
     if wait_s == 0 {
-        return Ok(result(None, false));
+        return Ok(result(None, false, 0.0));
     }
+    // The wait starts once the machine has taken the restart, not while it was being armed.
+    let started = Instant::now();
     let deadline = started + Duration::from_secs(u64::from(wait_s));
-    let mut last = String::from("it was not looked at");
+    // Every pass looks, so this always says what the last look saw.
+    let mut last: String;
     loop {
         pause(
             ctx,
@@ -566,12 +582,16 @@ async fn power_switch(
         )
         .await?;
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match look(hands, ctx, &machine, left.min(LOOK_TIMEOUT)).await {
+        // However short the wait, the machine is looked at once more when it is up.
+        let at_deadline = left.is_zero();
+        let timeout = if at_deadline {
+            LAST_LOOK
+        } else {
+            left.min(LOOK_TIMEOUT)
+        };
+        match look(hands, ctx, &machine, relayed, timeout).await {
             Ok(seen) if seen.boot_id.is_some() && seen.boot_id.as_deref() != Some(&boot_before) => {
-                let came_back = result(seen.system.clone(), true);
+                let came_back = result(seen.system.clone(), true, seconds(started.elapsed()));
                 return match &args.into {
                     Some(into) if seen.system.as_deref() != Some(into.as_str()) => {
                         Err(wrong_system(&came_back, into))
@@ -593,6 +613,9 @@ async fn power_switch(
                 hands.fleet.evict(&machine).await;
                 last = format!("it did not answer ({})", error.message);
             }
+        }
+        if at_deadline {
+            break;
         }
     }
     let hint = if last.starts_with("it still answered") {
@@ -640,10 +663,36 @@ async fn look(
     hands: &Hands,
     ctx: &Ctx,
     machine: &str,
+    relayed: bool,
     timeout: Duration,
 ) -> Result<Seen, ErrorBody> {
+    if relayed {
+        return look_through_relay(hands, ctx, machine, timeout).await;
+    }
+    let started = Instant::now();
     let cancel = ctx.cancel_token().child_token();
     let config: &ConfigStore = ctx.config();
+    // ping gives each of the machine's systems a share of the timeout, so a system that does not
+    // answer cannot use it all up before the one that does is tried; the session it opens is
+    // pooled for the hello below.
+    let ping = hands
+        .fleet
+        .ping(config, ctx.node_name(), machine, timeout, cancel.clone())
+        .await;
+    if !ping.reachable {
+        return Err(ping.error.unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!(
+                    "{machine} did not answer within {} seconds",
+                    timeout.as_secs()
+                ),
+            )
+        }));
+    }
+    let timeout = timeout
+        .saturating_sub(started.elapsed())
+        .max(Duration::from_secs(1));
     let work = async {
         let session = hands
             .fleet
@@ -669,6 +718,44 @@ async fn look(
                 format!("{machine} did not answer within {} seconds", timeout.as_secs()),
             ))
         }
+    }
+}
+
+/// The boot id and system of a machine reached through a relay, from its own power.status: the
+/// relay forwards the call, and the machine answers it.
+async fn look_through_relay(
+    hands: &Hands,
+    ctx: &Ctx,
+    machine: &str,
+    timeout: Duration,
+) -> Result<Seen, ErrorBody> {
+    let asked = hands.fleet.call_remote(
+        ctx,
+        machine,
+        "power.status",
+        json!({}),
+        EventSink::discard(),
+    );
+    // power.status only reads, so a call given up on here changes nothing there.
+    match tokio::time::timeout(timeout, asked).await {
+        Ok(Ok(status)) => Ok(Seen {
+            boot_id: status
+                .get("boot_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            system: status
+                .get("system")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(ErrorBody::new(
+            ErrorCode::Unreachable,
+            format!(
+                "{machine} did not answer through its relay within {} seconds",
+                timeout.as_secs()
+            ),
+        )),
     }
 }
 
@@ -857,6 +944,54 @@ mod tests {
             .unwrap();
         assert_eq!(itself["awake"], json!(true));
         assert!(fixture.fake.records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn waking_from_here_is_a_power_wol_call_by_the_same_principal() {
+        // tower cannot answer (its command does not exist) and has no helpers, so this node
+        // sends the packets itself.
+        let fixture = Fixture::new(
+            "[machines.tower]\ncommand = [\"legion-test-no-such-program\"]\nmac = \"02:00:00:00:00:01\"\n",
+        );
+        let policy = |allow: &str| {
+            format!(
+                "[principals.\"agent:test\"]\nrole = \"waker\"\n\n[roles.waker]\nallow = [{allow}]\n"
+            )
+        };
+        let wake_as_agent = || {
+            let mut call = Call::new(Door::Mcp, "power.wake", json!({"machine": "tower"}));
+            call.as_principal = Some("agent:test".to_owned());
+            fixture.node.call(call)
+        };
+        let config = fixture.dir.path().join("config");
+        std::fs::write(config.join("policy.toml"), policy("\"power.wake\"")).unwrap();
+        let error = wake_as_agent().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+        assert!(error.message.contains("power.wol"), "{}", error.message);
+        assert!(fixture.datagrams().is_empty());
+
+        std::fs::write(
+            config.join("policy.toml"),
+            policy("\"power.wake\", \"power.wol\""),
+        )
+        .unwrap();
+        let woken = wake_as_agent().await.unwrap();
+        assert_eq!(woken["sent_by"], json!("pi"));
+        assert!(!fixture.datagrams().is_empty());
+        // And the audit log has it, under the caller's principal.
+        let audit =
+            std::fs::read_to_string(fixture.dir.path().join("state").join("audit.jsonl")).unwrap();
+        let wol: Vec<Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|entry| entry["tool"] == json!("power.wol"))
+            .collect();
+        assert_eq!(wol.len(), 2, "{audit}");
+        assert!(
+            wol.iter()
+                .all(|entry| entry["principal"] == json!("agent:test"))
+        );
+        assert_eq!(wol[0]["outcome"], json!("denied"), "{audit}");
     }
 
     #[test]
