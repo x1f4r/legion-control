@@ -534,6 +534,7 @@ async fn clone(ctx: &Ctx, args: CloneArgs) -> Result<Cloned, ToolError> {
         timeout: CLONE_TIMEOUT,
         cancel: &cancel,
         on_output: Some(forward),
+        config: Vec::new(),
     }
     .run();
     tokio::pin!(run);
@@ -648,6 +649,7 @@ async fn pull(ctx: &Ctx, args: PullArgs) -> Result<Pulled, ToolError> {
         timeout: PULL_TIMEOUT,
         cancel: &cancel,
         on_output: None,
+        config: Vec::new(),
     }
     .run()
     .await?;

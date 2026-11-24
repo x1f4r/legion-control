@@ -25,11 +25,20 @@ use support::{Events, Fixture, HELPER, Test, this_binary};
 const HERMETIC: &str = "LEGION_PROJ_TEST_HERMETIC";
 /// The first argument that makes the test binary a task's program.
 const TASK_HELPER: &str = "--proj-helper";
+/// The first argument that makes the test binary leave a marker file at the path after it.
+const MARKER: &str = "--proj-mark";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some(TASK_HELPER) {
         return task_helper(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some(MARKER) {
+        // Run by git as a filter, a monitor or a hook a hostile repository names.
+        if let Some(path) = args.get(1) {
+            let _ = std::fs::write(path, "ran");
+        }
+        return ExitCode::SUCCESS;
     }
     if let Some(code) = legion_tools::job::try_supervise_cli(env::args_os().skip(1)) {
         return code;
@@ -71,6 +80,9 @@ fn main() -> ExitCode {
         }),
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
+        }),
+        ("reading_a_hostile_repository_runs_nothing", || {
+            Box::pin(reading_a_hostile_repository_runs_nothing())
         }),
     ];
     support::main(tests)
@@ -944,4 +956,92 @@ async fn a_role_without_the_effect_is_denied() {
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
     assert!(error.message.contains("job.start"), "{}", error.message);
+}
+
+/// A command line, for git to run through its shell, that leaves a marker file named `name`.
+fn marker_command(dir: &Path, name: &str) -> String {
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    format!(
+        "{} {MARKER} {}",
+        quote(&this_binary()),
+        quote(&dir.join(name).to_string_lossy())
+    )
+}
+
+async fn reading_a_hostile_repository_runs_nothing() {
+    let fixture = tower();
+    let markers = fixture.dir.path().join("markers");
+    std::fs::create_dir_all(&markers).unwrap();
+    let hostile = fixture.home().join("projects").join("hostile");
+    repo(&hostile);
+    std::fs::write(hostile.join(".gitattributes"), "* filter=evil\n").unwrap();
+    std::fs::write(hostile.join("data.txt"), "data\n").unwrap();
+    git(&hostile, &["add", ".gitattributes", "data.txt"]);
+    git(&hostile, &["commit", "--quiet", "-m", "Add data"]);
+    let hooks = fixture.dir.path().join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    for hook in [
+        "post-index-change",
+        "reference-transaction",
+        "post-checkout",
+    ] {
+        std::fs::write(
+            hooks.join(hook),
+            format!("#!/bin/sh\n{}\n", marker_command(&markers, hook)),
+        )
+        .unwrap();
+    }
+    let included = fixture.dir.path().join("included.cfg");
+    std::fs::write(
+        &included,
+        format!(
+            "[filter \"evil\"]\n\tsmudge = {0}\n[core]\n\tfsmonitor = {1}\n",
+            marker_command(&markers, "included")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\""),
+            marker_command(&markers, "included-monitor")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\""),
+        ),
+    )
+    .unwrap();
+    for (key, value) in [
+        ("filter.evil.clean", marker_command(&markers, "clean")),
+        ("filter.evil.process", marker_command(&markers, "process")),
+        ("filter.evil.required", "true".to_owned()),
+        ("core.fsmonitor", marker_command(&markers, "monitor")),
+        ("core.hooksPath", hooks.to_string_lossy().into_owned()),
+        ("core.pager", marker_command(&markers, "pager")),
+        ("include.path", included.to_string_lossy().into_owned()),
+    ] {
+        git(&hostile, &["config", key, &value]);
+    }
+    // A file whose times differ from the index makes status read it again, through its filter.
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    for file in ["data.txt", "README.md"] {
+        std::fs::File::options()
+            .write(true)
+            .open(hostile.join(file))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    fixture.write_config(
+        "projects.toml",
+        "[projects.hostile.on]\ntower = \"~/projects/hostile\"\n",
+    );
+
+    let status = fixture.call("proj.status", json!({})).await.unwrap();
+    let state = &entry(&status, "hostile")["git"];
+    assert_eq!(state["branch"], json!("main"), "{status:#}");
+    let found = fixture
+        .call("proj.discover", json!({"root": "~/projects"}))
+        .await
+        .unwrap();
+    assert_eq!(found["found"][0]["name"], json!("hostile"), "{found:#}");
+    let ran: Vec<String> = std::fs::read_dir(&markers)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(ran.is_empty(), "reading the repository ran {ran:?}");
 }

@@ -2,7 +2,13 @@
 //!
 //! Git runs with an argument vector, never a shell line, in the `C` locale so its messages can be
 //! recognised, and with `GIT_TERMINAL_PROMPT=0` so a repository that wants credentials fails at
-//! once instead of waiting for someone to type them. Read-only commands also set
+//! once instead of waiting for someone to type them.
+//!
+//! A repository is content someone else may have written, and its configuration can name programs
+//! git runs: a filter for every file it reads, a file system monitor, hooks, a pager, a diff
+//! program. Commands that only look are run so that none of those can start: every setting that
+//! names a program is overridden on the command line, which wins over every file, and the filters
+//! the repository defines are listed first and blanked one by one. They also set
 //! `GIT_OPTIONAL_LOCKS=0`, so looking at a repository never takes the index lock from a person
 //! working in it at the same moment.
 
@@ -45,6 +51,8 @@ pub(super) struct Git<'a> {
     pub cancel: &'a CancellationToken,
     /// Receives its output as it is read, for progress.
     pub on_output: Option<ChunkCallback>,
+    /// Settings passed as `-c`, after the ones a read-only command always gets.
+    pub config: Vec<String>,
 }
 
 impl<'a> Git<'a> {
@@ -57,19 +65,31 @@ impl<'a> Git<'a> {
             timeout: READ_TIMEOUT,
             cancel,
             on_output: None,
+            config: Vec::new(),
         }
+    }
+
+    /// The same command with these `-c` settings as well.
+    pub fn with_config(mut self, config: Vec<String>) -> Git<'a> {
+        self.config.extend(config);
+        self
     }
 
     /// Runs it. A command that ran is `Ok` whatever its exit code; `Err` means git could not be
     /// started, ran out of time or was cancelled.
     pub async fn run(self) -> Result<RunOutput, ErrorBody> {
         let program = OsString::from("git");
-        let mut args = self.args;
-        if self.mode == Mode::Read {
-            // A repository's own configuration can name a file system monitor, a program git
-            // starts on `status`; looking at a repository someone else filled must not run it.
-            args.splice(0..0, ["-c", "core.fsmonitor=false"].map(OsString::from));
-        }
+        let mut settings = if self.mode == Mode::Read {
+            read_only_settings()
+        } else {
+            Vec::new()
+        };
+        settings.extend(self.config);
+        let mut args: Vec<OsString> = settings
+            .into_iter()
+            .flat_map(|setting| [OsString::from("-c"), OsString::from(setting)])
+            .collect();
+        args.extend(self.args);
         let mut options = RunOptions::new(CommandSpec::Argv { program, args })
             .c_locale()
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -116,6 +136,92 @@ impl<'a> Git<'a> {
         }
         Ok(output)
     }
+}
+
+/// The settings that keep a command that only looks from running anything the repository names.
+fn read_only_settings() -> Vec<String> {
+    // Nothing can exist below a file, so a hooks directory under the running program is one that
+    // is certainly missing, on every platform.
+    let no_hooks = std::env::current_exe()
+        .map(|exe| exe.join("no-hooks"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/dev/null/no-hooks"));
+    vec![
+        "core.fsmonitor=false".to_owned(),
+        format!("core.hooksPath={}", no_hooks.display()),
+        "protocol.ext.allow=never".to_owned(),
+        "credential.helper=".to_owned(),
+        "core.pager=cat".to_owned(),
+        "diff.external=".to_owned(),
+        "core.sshCommand=".to_owned(),
+    ]
+}
+
+/// Settings that blank every filter the repository's own configuration defines, files it includes
+/// among it, so that reading a file through `.gitattributes` runs nothing.
+///
+/// Includes are followed here because the command the settings are for follows them too; only the
+/// names of the keys are read, never their values. Filters from the user's own and the system's
+/// configuration, such as Git LFS, are the user's programs and stay. When the filters cannot be
+/// listed the repository is not read at all, since a filter left in place would run.
+pub(super) async fn filter_overrides(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<Vec<String>, ErrorBody> {
+    let output = Git::read(
+        path,
+        &[
+            "config",
+            "--includes",
+            "--show-scope",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+        ],
+        cancel,
+    )
+    .run()
+    .await?;
+    // 1 is git's way of saying that nothing matched.
+    match output.exit_code {
+        Some(0) => Ok(blank_filters(&output.stdout.text)),
+        Some(1) if output.stderr.text.trim().is_empty() => Ok(Vec::new()),
+        _ => Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "The filters {} defines could not be listed, so it was not read: {}",
+                path.display(),
+                explanation(&output)
+            ),
+        )
+        .with_hint("Check the repository's configuration with `git config --list --show-origin`.")),
+    }
+}
+
+/// Parses `git config --show-scope --name-only` lines of filter keys into the settings that blank
+/// every driver the repository itself defines.
+fn blank_filters(listing: &str) -> Vec<String> {
+    let mut drivers: Vec<&str> = listing
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(scope, _)| matches!(*scope, "local" | "worktree"))
+        .filter_map(|(_, key)| {
+            let rest = key.strip_prefix("filter.")?;
+            Some(&rest[..rest.rfind('.')?])
+        })
+        .collect();
+    drivers.sort_unstable();
+    drivers.dedup();
+    drivers
+        .into_iter()
+        .flat_map(|driver| {
+            [
+                format!("filter.{driver}.clean="),
+                format!("filter.{driver}.smudge="),
+                format!("filter.{driver}.process="),
+                format!("filter.{driver}.required=false"),
+            ]
+        })
+        .collect()
 }
 
 fn start_error(error: OsError, cwd: Option<&Path>) -> ErrorBody {
@@ -363,8 +469,19 @@ pub(super) async fn repo_state(
     path: &Path,
     cancel: &CancellationToken,
 ) -> Result<Option<RepoState>, String> {
-    let status_args = ["status", "--porcelain=v2", "--branch", "--show-stash", "-z"];
+    let filters = filter_overrides(path, cancel)
+        .await
+        .map_err(|error| error.message)?;
+    let status_args = [
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "--ignore-submodules=all",
+        "--show-stash",
+        "-z",
+    ];
     let mut output = Git::read(path, &status_args, cancel)
+        .with_config(filters.clone())
         .run()
         .await
         .map_err(|error| error.message)?;
@@ -374,7 +491,8 @@ pub(super) async fn repo_state(
     // `--show-stash` is from git 2.35; an older git refuses the option, and is asked without it.
     let old_git = output.exit_code != Some(0) && output.stderr.text.contains("show-stash");
     if old_git {
-        output = Git::read(path, &status_args[..4], cancel)
+        output = Git::read(path, &status_args[..5], cancel)
+            .with_config(filters)
             .run()
             .await
             .map_err(|error| error.message)?;
@@ -612,6 +730,25 @@ mod tests {
         assert!(parse_porcelain(&z(&["x what"])).is_err());
         assert!(parse_porcelain(&z(&["1"])).is_err());
         assert_eq!(parse_porcelain("").unwrap(), Porcelain::default());
+    }
+
+    #[test]
+    fn only_the_repository_s_own_filters_are_blanked() {
+        let listing = "local\tfilter.evil.clean\nlocal\tfilter.evil.process\nworktree\tfilter.a.b.smudge\nglobal\tfilter.lfs.clean\nlocal\tfilter.evil.required\n";
+        assert_eq!(
+            blank_filters(listing),
+            [
+                "filter.a.b.clean=",
+                "filter.a.b.smudge=",
+                "filter.a.b.process=",
+                "filter.a.b.required=false",
+                "filter.evil.clean=",
+                "filter.evil.smudge=",
+                "filter.evil.process=",
+                "filter.evil.required=false",
+            ]
+        );
+        assert!(blank_filters("").is_empty());
     }
 
     #[test]
