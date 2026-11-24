@@ -13,6 +13,7 @@ pub mod connector;
 pub mod pool;
 pub mod session;
 mod state;
+pub mod stream;
 pub mod tools;
 
 pub use config::{

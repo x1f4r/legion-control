@@ -557,6 +557,8 @@ dependencies = [
  "legion-core",
  "legion-os",
  "legion-proto",
+ "legion-tools",
+ "legion-xfer",
  "schemars",
  "serde",
  "serde_json",
