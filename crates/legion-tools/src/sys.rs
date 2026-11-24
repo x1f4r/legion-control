@@ -11,6 +11,7 @@
 
 mod disks;
 mod gpu;
+mod probe;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -418,8 +419,10 @@ pub struct Killed {
 
 async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     let pid = args.pid;
-    if pid == 0 {
-        return Err(protected(pid, procid::is_protected(&ProcessId::new(0, 0))));
+    // What can be refused from the pid alone is, before anything is looked up: a process another
+    // account owns may not even let its identity be read.
+    if let Some(reason) = protected_by_pid(pid, std::process::id(), std::env::consts::OS) {
+        return Err(protected(pid, Some(reason)));
     }
     let expected = args
         .start_time
@@ -435,21 +438,43 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
         })
         .transpose()?;
 
-    let (identity, started, protection) = blocking(move || {
-        Ok(identify(pid)?
-            .map(|(identity, started)| (identity, started, procid::is_protected(&identity))))
+    let outcome = blocking(move || {
+        let lookup = identify(pid)?;
+        let probe = match lookup {
+            Lookup::Missing => probe::probe(pid),
+            Lookup::Found(..) | Lookup::NotPermitted => probe::Probe::Unknown,
+        };
+        let outcome = decide(pid, std::process::id(), std::env::consts::OS, lookup, probe);
+        // The rules that need the identity: the processes legion runs under, and those the system
+        // marks as its own.
+        Ok(match outcome {
+            Outcome::Found(identity, started) => match procid::is_protected(&identity) {
+                Some(reason) => Outcome::Protected(reason),
+                None => Outcome::Found(identity, started),
+            },
+            other => other,
+        })
     })
-    .await?
-    .ok_or_else(|| {
-        ErrorBody::new(
-            ErrorCode::NotFound,
-            format!("There is no process {pid} on this machine."),
-        )
-        .with_hint("It may have exited already; sys.procs lists the processes running now.")
-    })?;
-    if protection.is_some() {
-        return Err(protected(pid, protection));
-    }
+    .await?;
+    let (identity, started) = match outcome {
+        Outcome::Found(identity, started) => (identity, started),
+        Outcome::Protected(reason) => return Err(protected(pid, Some(reason))),
+        Outcome::NotPermitted => {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!("Process {pid} belongs to another user or to the system, which does not let legion look at it, so it was not stopped."),
+            )
+            .with_hint("Stop it as the account it runs as, or as an administrator.")
+            .with_details(json!({"pid": pid})));
+        }
+        Outcome::NotFound => {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("There is no process {pid} on this machine."),
+            )
+            .with_hint("It may have exited already; sys.procs lists the processes running now."));
+        }
+    };
     if let Some(expected) = expected {
         let Some(started) = started else {
             return Err(ErrorBody::new(
@@ -522,18 +547,74 @@ fn protected(pid: u32, reason: Option<&str>) -> ErrorBody {
     .with_details(json!({"pid": pid, "reason": reason}))
 }
 
-/// The identity of a live process and when it started, in seconds since the epoch where the
-/// system says, or `None` when there is no such process.
+/// What reading a process's identity found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lookup {
+    /// The process, and when it started in seconds since the epoch where the system says.
+    Found(ProcessId, Option<u64>),
+    /// Nothing could be read, which is either no process or one that hides itself.
+    Missing,
+    /// The system refused to say anything about it.
+    NotPermitted,
+}
+
+/// What sys.kill does about a pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// Stops this process, once the rules that need its identity have passed.
+    Found(ProcessId, Option<u64>),
+    /// Refuses: the process is protected, for this reason.
+    Protected(&'static str),
+    /// Refuses: the process exists but belongs to another user or the system.
+    NotPermitted,
+    /// There is no such process.
+    NotFound,
+}
+
+/// The processes refused from the pid alone: the kernel's (0), the first process on Unix (1),
+/// the System process on Windows (4), and legion itself.
+fn protected_by_pid(pid: u32, own: u32, os: &str) -> Option<&'static str> {
+    match pid {
+        0 => Some("kernel / idle process (pid 0)"),
+        1 if os != "windows" => Some("init process (pid 1)"),
+        4 if os == "windows" => Some("Windows System process (pid 4)"),
+        _ if pid == own => Some("current process"),
+        _ => None,
+    }
+}
+
+/// What sys.kill does, given the pid, what reading its identity found, and what asking the system
+/// about the pid said. A process whose identity cannot be read is someone else's when the system
+/// says a process is there, and missing only when it says there is none.
+fn decide(pid: u32, own: u32, os: &str, lookup: Lookup, probe: probe::Probe) -> Outcome {
+    if let Some(reason) = protected_by_pid(pid, own, os) {
+        return Outcome::Protected(reason);
+    }
+    match (lookup, probe) {
+        (Lookup::Found(identity, started), _) => Outcome::Found(identity, started),
+        (Lookup::NotPermitted, _)
+        | (Lookup::Missing, probe::Probe::Exists | probe::Probe::NotPermitted) => {
+            Outcome::NotPermitted
+        }
+        (Lookup::Missing, probe::Probe::Missing | probe::Probe::Unknown) => Outcome::NotFound,
+    }
+}
+
+/// The identity of a live process and when it started.
 ///
 /// The seconds are what `sys.procs` reports and a caller passes back; the identity is what
 /// legion-os stops by. Both are read for the same process: the identity is read before and after
 /// the start time, and a process that changed in between counts as gone.
-fn identify(pid: u32) -> Result<Option<(ProcessId, Option<u64>)>, ErrorBody> {
-    let read = || {
-        procid::of_pid(pid).map_err(|error| os_error(pid, &format!("read process {pid}"), error))
+fn identify(pid: u32) -> Result<Lookup, ErrorBody> {
+    let read = || match procid::of_pid(pid) {
+        Err(OsError::PermissionDenied { .. }) => Ok(Err(Lookup::NotPermitted)),
+        Err(error) => Err(os_error(pid, &format!("read process {pid}"), error)),
+        Ok(None) => Ok(Err(Lookup::Missing)),
+        Ok(Some(identity)) => Ok(Ok(identity)),
     };
-    let Some(identity) = read()? else {
-        return Ok(None);
+    let identity = match read()? {
+        Ok(identity) => identity,
+        Err(lookup) => return Ok(lookup),
     };
     let mut system = System::new().map_err(|error| failed("look the process up", &error))?;
     let target = Pid::from_u32(pid);
@@ -542,13 +623,13 @@ fn identify(pid: u32) -> Result<Option<(ProcessId, Option<u64>)>, ErrorBody> {
         true,
         ProcessRefreshKind::nothing(),
     );
-    let Some(process) = system.process(target) else {
-        return Ok(None);
-    };
-    let started = Some(process.start_time()).filter(|&seconds| seconds > 0);
+    let started = system
+        .process(target)
+        .map(sysinfo::Process::start_time)
+        .filter(|&seconds| seconds > 0);
     match read()? {
-        Some(again) if again.matches(&identity) => Ok(Some((identity, started))),
-        _ => Ok(None),
+        Ok(again) if again.matches(&identity) => Ok(Lookup::Found(identity, started)),
+        _ => Ok(Lookup::Missing),
     }
 }
 
@@ -661,6 +742,63 @@ mod tests {
         let cut = cut(&long, 300);
         assert_eq!(cut.chars().count(), 301);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn protection_and_ownership_are_decided_before_absence() {
+        use probe::Probe;
+        let own = 4242;
+        let found = Lookup::Found(ProcessId::new(77, 1), Some(1));
+        // macOS hides root's launchd from other users: pid 1 reads as missing, and is still
+        // protected, not absent.
+        for os in ["macos", "linux"] {
+            assert_eq!(
+                decide(1, own, os, Lookup::Missing, Probe::NotPermitted),
+                Outcome::Protected("init process (pid 1)")
+            );
+        }
+        assert_eq!(
+            decide(4, own, "windows", Lookup::NotPermitted, Probe::Unknown),
+            Outcome::Protected("Windows System process (pid 4)")
+        );
+        assert!(matches!(
+            decide(0, own, "linux", Lookup::Missing, Probe::Missing),
+            Outcome::Protected(_)
+        ));
+        assert!(matches!(
+            decide(own, own, "macos", found, Probe::Exists),
+            Outcome::Protected(_)
+        ));
+        // Another user's process whose identity cannot be read is theirs, never missing.
+        assert_eq!(
+            decide(500, own, "macos", Lookup::Missing, Probe::NotPermitted),
+            Outcome::NotPermitted
+        );
+        assert_eq!(
+            decide(500, own, "macos", Lookup::Missing, Probe::Exists),
+            Outcome::NotPermitted
+        );
+        assert_eq!(
+            decide(500, own, "windows", Lookup::NotPermitted, Probe::Unknown),
+            Outcome::NotPermitted
+        );
+        assert_eq!(
+            decide(500, own, "linux", Lookup::Missing, Probe::Missing),
+            Outcome::NotFound
+        );
+        assert_eq!(
+            decide(77, own, "linux", found, Probe::Unknown),
+            Outcome::Found(ProcessId::new(77, 1), Some(1))
+        );
+        // Pid 1 and 4 are ordinary on the other family.
+        assert_eq!(
+            decide(1, own, "windows", Lookup::Missing, Probe::Missing),
+            Outcome::NotFound
+        );
+        assert_eq!(
+            decide(4, own, "linux", Lookup::Missing, Probe::Missing),
+            Outcome::NotFound
+        );
     }
 
     #[test]

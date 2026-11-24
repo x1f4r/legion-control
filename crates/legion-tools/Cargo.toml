@@ -31,6 +31,10 @@ sysinfo.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
 
+# sys.kill asks a Unix kernel whether a pid exists with signal 0, through nix's safe wrapper.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "signal"] }
 
