@@ -536,14 +536,21 @@ pub(super) struct Layout {
     pub common_dir: PathBuf,
 }
 
-/// The git directories of the repository `path` is in: `Ok(None)` when it is in none.
+/// The git directories of the repository whose working tree `path` is: `Ok(None)` when it is not
+/// the top of a working tree. A directory inside another repository's tree is not a repository of
+/// its own, and reporting the enclosing one would describe a different project.
 pub(super) async fn layout(
     path: &Path,
     cancel: &CancellationToken,
 ) -> Result<Option<Layout>, ErrorBody> {
     let output = Git::read(
         path,
-        &["rev-parse", "--absolute-git-dir", "--git-common-dir"],
+        &[
+            "rev-parse",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--show-toplevel",
+        ],
         cancel,
     )
     .run()
@@ -552,12 +559,17 @@ pub(super) async fn layout(
         return Ok(None);
     }
     let mut lines = output.stdout.text.lines();
-    match (output.exit_code, lines.next(), lines.next()) {
-        (Some(0), Some(git_dir), Some(common_dir)) => Ok(Some(Layout {
-            git_dir: PathBuf::from(git_dir),
-            // A relative common directory is relative to where git ran.
-            common_dir: path.join(common_dir),
-        })),
+    match (output.exit_code, lines.next(), lines.next(), lines.next()) {
+        (Some(0), Some(git_dir), Some(common_dir), Some(top)) => {
+            if !same_dir(Path::new(top), path) {
+                return Ok(None);
+            }
+            Ok(Some(Layout {
+                git_dir: PathBuf::from(git_dir),
+                // A relative common directory is relative to where git ran.
+                common_dir: path.join(common_dir),
+            }))
+        }
         _ => Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
@@ -566,6 +578,15 @@ pub(super) async fn layout(
                 explanation(&output)
             ),
         )),
+    }
+}
+
+/// Whether two paths name the same directory, however each is spelt (git writes `C:/Users/…` on
+/// Windows, and resolves symbolic links).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 

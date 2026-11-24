@@ -88,7 +88,12 @@ fn main() -> ExitCode {
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
-        ("untracked_files_count_whatever_the_repository_says", || Box::pin(untracked_files_count_whatever_the_repository_says())),
+        ("a_directory_inside_another_repository_is_not_one", || {
+            Box::pin(a_directory_inside_another_repository_is_not_one())
+        }),
+        ("untracked_files_count_whatever_the_repository_says", || {
+            Box::pin(untracked_files_count_whatever_the_repository_says())
+        }),
         ("remote_git_never_prompts_and_stops_when_cancelled", || {
             Box::pin(remote_git_never_prompts_and_stops_when_cancelled())
         }),
@@ -1404,4 +1409,34 @@ async fn untracked_files_count_whatever_the_repository_says() {
     let state = &entry(&status, "app")["git"];
     assert_eq!(state["dirty"]["untracked"], json!(1), "{status:#}");
     assert_eq!(state["clean"], json!(false), "{status:#}");
+}
+
+async fn a_directory_inside_another_repository_is_not_one() {
+    let fixture = tower();
+    let mono = fixture.home().join("mono");
+    repo(&mono);
+    let sub = mono.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(mono.join("dirty.txt"), "untracked in the parent\n").unwrap();
+    fixture.write_config(
+        "projects.toml",
+        "[projects.sub.on]\ntower = \"~/mono/sub\"\n[projects.mono.on]\ntower = \"~/mono\"\n",
+    );
+    let status = fixture.call("proj.status", json!({})).await.unwrap();
+    let sub_entry = entry(&status, "sub");
+    assert_eq!(sub_entry["present"], json!(true));
+    assert_eq!(sub_entry.get("git"), None, "{status:#}");
+    assert_eq!(sub_entry.get("error"), None, "{status:#}");
+    assert_eq!(
+        entry(&status, "mono")["git"]["dirty"]["untracked"],
+        json!(1)
+    );
+    let pulled = fixture
+        .call("proj.pull", json!({"project": "sub"}))
+        .await
+        .unwrap_err();
+    assert!(
+        pulled.message.contains("not a git repository"),
+        "{pulled:?}"
+    );
 }
