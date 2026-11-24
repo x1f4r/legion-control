@@ -28,6 +28,9 @@ tempfile = "3.27.0"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
+legion-os = { path = "crates/legion-os" }
+# Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.
+sysinfo = { version = "0.40.4", default-features = false, features = ["system", "disk", "user"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

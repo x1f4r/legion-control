@@ -19,11 +19,24 @@ legion-proto.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "time", "macros", "sync"] }
+legion-os.workspace = true
+sysinfo.workspace = true
+jiff.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+# These re-execute their own binary as the child processes they need, so they cannot use the
+# standard harness, which writes to stdout before any test code runs.
+[[test]]
+name = "exec"
+harness = false
+
+[[test]]
+name = "sys"
+harness = false
 
 [lints]
 workspace = true
