@@ -1,0 +1,21 @@
+# Example extension tool using a shell command (`cmd`) with validated parameters and JSON output.
+# Caller arguments arrive as LEGION_ARG_<NAME> environment variables and as JSON on stdin.
+# Place under <config_dir>/tools.d/ops.greet.toml.
+
+name = "ops.greet"
+description = "Return a JSON greeting for the given name."
+effect = "read"
+cmd = 'printf "{\"greeting\":\"%s, %s\"}\n" "$LEGION_ARG_STYLE" "$LEGION_ARG_WHO"'
+timeout_s = 10
+cwd = "~"
+
+[params.who]
+type = "string"
+description = "Name to greet."
+required = true
+
+[params.style]
+type = "string"
+description = "Greeting word."
+enum = ["hello", "hi"]
+default = "hello"

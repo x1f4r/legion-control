@@ -84,20 +84,23 @@ struct Ran {
 
 impl Ran {
     /// The output's first line, as JSON, and what follows it.
+    /// What follows the line every stream opens with, which says the protocol it speaks.
+    fn replies(&self) -> &[u8] {
+        after_protocol(&self.output)
+    }
+
+    /// The first reply, as JSON, and what follows it.
     fn first(&self) -> (Value, &[u8]) {
-        let end = self
-            .output
-            .iter()
-            .position(|b| *b == b'\n')
-            .expect("a line");
+        let replies = self.replies();
+        let end = replies.iter().position(|b| *b == b'\n').expect("a line");
         (
-            serde_json::from_slice(&self.output[..end]).unwrap(),
-            &self.output[end + 1..],
+            serde_json::from_slice(&replies[..end]).unwrap(),
+            &replies[end + 1..],
         )
     }
 
     fn lines(&self) -> Vec<Value> {
-        self.output
+        self.replies()
             .lines()
             .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
             .collect()
@@ -122,6 +125,14 @@ impl Ran {
         assert_eq!(line["error"]["code"], json!(code.as_str()), "{line}");
         line["error"].clone()
     }
+}
+
+/// A stream's output after its first line, which must say the protocol it speaks.
+fn after_protocol(output: &[u8]) -> &[u8] {
+    let end = output.iter().position(|b| *b == b'\n').expect("a line");
+    let opening: Value = serde_json::from_slice(&output[..end]).unwrap();
+    assert_eq!(opening, json!({"protocol": STREAM_PROTOCOL}));
+    &output[end + 1..]
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -211,7 +222,6 @@ fn stat_tells_whether_a_directory_ignores_letter_case_without_writing() {
     let dir = node.home().join("projects");
     fs::write(dir.join("Probe.txt"), b"").unwrap();
     let ignores_case = dir.join("probe.txt").exists();
-    fs::remove_file(dir.join("Probe.txt")).unwrap();
     let before: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -231,6 +241,51 @@ fn stat_tells_whether_a_directory_ignores_letter_case_without_writing() {
         .map(|e| e.unwrap().path())
         .collect();
     assert_eq!(before, after);
+
+    // An empty directory says nothing about its own file system: one mounted there may differ
+    // from the one its name is in. It is left unsaid, which a transfer takes as ignoring case.
+    let ran = node.run(None, &json!({"op": "stat", "path": "~/other"}), b"");
+    let (line, _) = ran.ok().first();
+    assert_eq!(line["kind"], "dir");
+    assert!(line.get("case_insensitive").is_none(), "{line}");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_line_that_ends_a_listing_stays_short_however_much_could_not_be_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let node = Node::new();
+    let root = node.home().join("projects/locked");
+    fs::create_dir_all(&root).unwrap();
+    let probe = root.join("probe");
+    fs::create_dir(&probe).unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o000)).unwrap();
+    let reads_anything = fs::read_dir(&probe).is_ok();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir(&probe).unwrap();
+    if reads_anything {
+        return;
+    }
+    let names: Vec<_> = (0..3000)
+        .map(|at| root.join(format!("an-unreadable-directory-with-a-long-name-{at:05}")))
+        .collect();
+    for dir in &names {
+        fs::create_dir(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let ran = node.run(
+        None,
+        &json!({"op": "manifest", "root": "~/projects/locked"}),
+        b"",
+    );
+    for dir in &names {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let done = ran.ok().lines().pop().unwrap();
+    assert_eq!(done["skipped_total"], 3000);
+    let kept = done["skipped"].as_array().unwrap().len();
+    assert!(kept > 0 && kept < 3000, "{kept}");
+    assert!(done.to_string().len() < 512 * 1024);
 }
 
 #[test]
@@ -390,7 +445,7 @@ fn manifest_of_a_home_leaves_out_legions_own_files_for_a_role_without_admin() {
             &mut output,
         )
         .unwrap();
-        output
+        after_protocol(&output)
             .lines()
             .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
             .collect::<Vec<_>>()
@@ -437,7 +492,12 @@ fn pack_names_what_it_leaves_out_then_unpack_writes_the_tree() {
 
     let ran = node.run(
         None,
-        &json!({"op": "unpack", "root": "~/projects/dst", "names": ["nested", "nested/a.txt", "nested/empty", "odd name #1.txt"]}),
+        &json!({"op": "unpack", "root": "~/projects/dst", "entries": [
+            {"path": "nested", "kind": "dir"},
+            {"path": "nested/a.txt", "kind": "file", "size": 5},
+            {"path": "nested/empty", "kind": "dir"},
+            {"path": "odd name #1.txt", "kind": "file", "size": 3},
+        ]}),
         &archive,
     );
     let lines = ran.ok().lines();
@@ -480,13 +540,18 @@ fn unpack_checks_where_each_entry_lands_and_leaves_legions_own_files_alone() {
     let archive = tar_of(staging.path(), &[".legion/config/policy.toml", "fine.txt"]);
 
     let mut input =
-        b"{\"op\":\"unpack\",\"root\":\"~\",\"names\":[\".legion/config/policy.toml\",\"fine.txt\"],\"protocol\":1}\n"
+        b"{\"op\":\"unpack\",\"root\":\"~\",\"entries\":[{\"path\":\".legion/config/policy.toml\",\"kind\":\"file\",\"size\":19},{\"path\":\"fine.txt\",\"kind\":\"file\",\"size\":4}],\"protocol\":1}\n"
             .to_vec();
     input.extend_from_slice(&archive);
     let mut output = Vec::new();
     serve(&host, Some("writer"), Cursor::new(input), &mut output).unwrap();
-    let done: Value =
-        serde_json::from_slice(output.split(|b| *b == b'\n').nth(1).unwrap()).unwrap();
+    let done: Value = serde_json::from_slice(
+        after_protocol(&output)
+            .split(|b| *b == b'\n')
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(done["files"], 1, "{done}");
     let skipped = done["skipped"].to_string();
     assert!(
@@ -673,7 +738,7 @@ fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     );
     node.run(
         Some("reader"),
-        &json!({"op": "unpack", "root": "~/projects/x", "names": []}),
+        &json!({"op": "unpack", "root": "~/projects/x", "entries": []}),
         b"",
     )
     .refused(ErrorCode::Denied);
@@ -740,7 +805,7 @@ fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     );
     node.run(
         Some("writer"),
-        &json!({"op": "unpack", "root": node.config(), "names": []}),
+        &json!({"op": "unpack", "root": node.config(), "entries": []}),
         b"",
     )
     .refused(ErrorCode::Denied);
@@ -803,8 +868,14 @@ fn a_header_that_cannot_be_read_is_refused_on_the_first_line() {
         let mut output = Vec::new();
         let error = serve(&node.host, None, Cursor::new(input.to_vec()), &mut output).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgs, "{input:?}");
-        let line: Value =
-            serde_json::from_slice(output.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        // Even a header that cannot be read is answered after the line saying the protocol.
+        let line: Value = serde_json::from_slice(
+            after_protocol(&output)
+                .split(|b| *b == b'\n')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(line["error"]["code"], "invalid_args");
     }
     let relative = node.run(None, &json!({"op": "stat", "path": "relative/path"}), b"");
@@ -850,30 +921,134 @@ fn a_header_in_another_protocol_or_with_an_unknown_operation_is_unsupported() {
     }
 }
 
+/// Two archives run together, so every entry in them comes twice.
+fn twice(archive: &[u8]) -> Vec<u8> {
+    let mut first = archive.to_vec();
+    while first.len() >= 512 && first[first.len() - 512..].iter().all(|b| *b == 0) {
+        first.truncate(first.len() - 512);
+    }
+    first.extend_from_slice(archive);
+    first
+}
+
 #[test]
-fn unpack_takes_only_the_planned_entries_and_the_directories_on_their_way() {
-    let node = Node::new();
+fn unpack_takes_each_planned_entry_once_as_planned_and_nothing_else() {
     let staging = tempfile::tempdir().unwrap();
-    fs::create_dir_all(staging.path().join("a/b")).unwrap();
-    fs::create_dir_all(staging.path().join("stray")).unwrap();
-    fs::write(staging.path().join("a/b/wanted.txt"), b"w").unwrap();
-    fs::write(staging.path().join(".env"), b"SECRET").unwrap();
-    let archive = tar_of(
-        staging.path(),
-        &["a", "a/b", "a/b/wanted.txt", ".env", "stray"],
-    );
-    let ran = node.run(
-        None,
-        &json!({"op": "unpack", "root": "~/projects/dst", "names": ["a/b/wanted.txt"]}),
-        &archive,
-    );
-    let done = &ran.ok().lines()[1];
-    assert_eq!(done["files"], 1, "{done}");
-    assert_eq!(done["unplanned"], json!([".env", "stray"]), "{done}");
-    let dst = node.home().join("projects/dst");
-    assert!(dst.join("a/b/wanted.txt").exists());
-    assert!(!dst.join(".env").exists());
-    assert!(!dst.join("stray").exists());
+    let stage = staging.path();
+    fs::create_dir_all(stage.join("dir")).unwrap();
+    fs::write(stage.join("dir/wanted.txt"), b"wanted").unwrap();
+    fs::write(stage.join(".env"), b"SECRET").unwrap();
+    let wanted = || json!({"path": "dir/wanted.txt", "kind": "file", "size": 6});
+    let dir = || json!({"path": "dir", "kind": "dir"});
+    let tar = |names: &[&str]| tar_of(stage, names);
+    // Windows cannot make the links the last two cases need.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut cases = vec![
+        // Something never planned stops the unpack at once.
+        (
+            "unplanned",
+            json!([dir(), wanted()]),
+            tar(&["dir", "dir/wanted.txt", ".env"]),
+            ".env",
+            "not among",
+        ),
+        // A file of another size than listed.
+        (
+            "size",
+            json!([dir(), {"path": "dir/wanted.txt", "kind": "file", "size": 5}]),
+            tar(&["dir", "dir/wanted.txt"]),
+            "dir/wanted.txt",
+            "planned with 5 bytes",
+        ),
+        // A directory where a file was planned.
+        (
+            "kind",
+            json!([{"path": "dir", "kind": "file", "size": 1}]),
+            tar(&["dir"]),
+            "dir",
+            "planned as a file",
+        ),
+        // The same entry twice.
+        (
+            "twice",
+            json!([dir(), wanted()]),
+            twice(&tar(&["dir", "dir/wanted.txt"])),
+            "dir",
+            "second time",
+        ),
+        // A planned entry that never comes.
+        (
+            "missing",
+            json!([dir(), wanted(), {"path": "gone.txt", "kind": "file", "size": 1}]),
+            tar(&["dir", "dir/wanted.txt"]),
+            "gone.txt",
+            "never came",
+        ),
+        // Content other than the hash the source listed.
+        (
+            "hash",
+            json!([dir(), {"path": "dir/wanted.txt", "kind": "file", "size": 6, "hash": hash(b"WANTED")}]),
+            tar(&["dir", "dir/wanted.txt"]),
+            "dir/wanted.txt",
+            "hash differs",
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/etc/passwd", stage.join("link")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", stage.join("other")).unwrap();
+        // A link where a file was planned.
+        cases.push((
+            "symlink",
+            json!([{"path": "link", "kind": "file", "size": 6}]),
+            tar(&["link"]),
+            "link",
+            "planned as a file and came as a symbolic link",
+        ));
+        // A link to somewhere other than listed.
+        cases.push((
+            "target",
+            json!([{"path": "other", "kind": "symlink", "target": "planned"}]),
+            tar(&["other"]),
+            "other",
+            "link to planned",
+        ));
+    }
+    for (case, entries, archive, path, says) in cases {
+        let node = Node::new();
+        let dst = node.home().join("projects/dst");
+        fs::create_dir_all(dst.join("dir")).unwrap();
+        fs::write(dst.join("dir/wanted.txt"), b"before").unwrap();
+        let ran = node.run(
+            None,
+            &json!({"op": "unpack", "root": "~/projects/dst", "entries": entries}),
+            &archive,
+        );
+        let error = ran.result.as_ref().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Failed, "{case}: {error:?}");
+        let violation = &error.details.as_ref().unwrap()["violation"];
+        assert_eq!(violation["path"], path, "{case}: {error:?}");
+        assert!(
+            violation["reason"].as_str().unwrap().contains(says),
+            "{case}: {error:?}"
+        );
+        assert!(!dst.join(".env").exists(), "{case}");
+        assert!(fs::symlink_metadata(dst.join("link")).is_err(), "{case}");
+        // A file refused for its size or hash never replaced what was there.
+        if matches!(case, "size" | "hash") {
+            assert_eq!(
+                fs::read(dst.join("dir/wanted.txt")).unwrap(),
+                b"before",
+                "{case}"
+            );
+        }
+        let temporaries: Vec<_> = fs::read_dir(dst.join("dir"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(temporaries.is_empty(), "{case}: {temporaries:?}");
+    }
 }
 
 #[test]
@@ -881,7 +1056,7 @@ fn a_refused_unpack_reads_nothing_of_what_follows() {
     let node = Node::new();
     node.policy(CONFINED);
     let mut input =
-        b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"names\":[],\"protocol\":1}\n".to_vec();
+        b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"entries\":[],\"protocol\":1}\n".to_vec();
     input.extend(std::iter::repeat_n(0u8, 1 << 20));
     let mut cursor = Cursor::new(input);
     let mut output = Vec::new();

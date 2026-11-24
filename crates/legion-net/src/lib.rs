@@ -11,6 +11,7 @@
 pub mod config;
 pub mod connector;
 pub mod gate;
+mod guard;
 pub mod install;
 pub mod pool;
 pub mod power;

@@ -144,9 +144,16 @@ pub struct Ctx {
     pub(crate) cancel: CancellationToken,
     pub(crate) events: EventSink,
     pub(crate) hops: u32,
+    pub(crate) credential_expires: Option<jiff::Timestamp>,
 }
 
 impl Ctx {
+    /// When the credential the call arrived with stops working, when it does: what the call makes
+    /// for the caller, such as a token, may not outlive it.
+    pub fn credential_expires(&self) -> Option<jiff::Timestamp> {
+        self.credential_expires
+    }
+
     /// The node running this call, for tools that authorise or audit forwarded operations against
     /// this node's live policy and audit log.
     pub fn node(&self) -> &Node {

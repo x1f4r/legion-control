@@ -383,3 +383,72 @@ fn every_call_is_audited_with_contents_and_secrets_replaced_by_their_size() {
     assert_eq!(tail["entries"].as_array().unwrap().len(), 1);
     assert_eq!(tail["entries"][0]["tool"], json!("test.write_path"));
 }
+
+#[test]
+fn every_example_config_and_extension_loads_with_real_loaders() {
+    use std::path::Path;
+
+    use legion_core::config::{NodeFile, parse};
+    use legion_core::policy::Policy;
+    use legion_core::tokens::Tokens;
+    use legion_net::config::FleetFile;
+    use legion_tools::ext::def::parse_toml;
+    use legion_tools::proj::ProjectsFile;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples")
+        .join("legion");
+
+    let load = |name: &str| {
+        let path = root.join(name);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        (path, bytes)
+    };
+
+    let (path, bytes) = load("node.toml");
+    let node = parse::<NodeFile>(&path, &bytes).unwrap();
+    assert_eq!(node.name_or_host().as_str(), "tower");
+
+    let (path, bytes) = load("policy.toml");
+    let policy = parse::<Policy>(&path, &bytes).unwrap();
+    assert!(!policy.roles.is_empty());
+
+    let (path, bytes) = load("fleet.toml");
+    let fleet = parse::<FleetFile>(&path, &bytes).unwrap();
+    assert!(fleet.machine("pi").is_some());
+    assert!(fleet.machine("tower").is_some());
+    assert!(fleet.machine("shed").is_some());
+    assert!(fleet.machine("studio").is_some());
+
+    let (path, bytes) = load("projects.toml");
+    let projects = parse::<ProjectsFile>(&path, &bytes).unwrap();
+    assert!(projects.projects.contains_key("site"));
+
+    let (path, bytes) = load("tokens.toml");
+    let tokens = parse::<Tokens>(&path, &bytes).unwrap();
+    assert!(!tokens.tokens.is_empty());
+
+    let registry = legion_tools::registry();
+    let is_builtin = |name: &str| registry.get(name).is_some();
+    let tools_dir = root.join("tools.d");
+    let mut ext_count = 0usize;
+    for entry in std::fs::read_dir(&tools_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let def = parse_toml(&bytes, &is_builtin)
+            .unwrap_or_else(|error| panic!("{} failed to load: {}", path.display(), error.reason));
+        assert!(!def.name.is_empty());
+        ext_count += 1;
+    }
+    assert!(
+        ext_count >= 2,
+        "expected at least two example files in {}",
+        tools_dir.display()
+    );
+}

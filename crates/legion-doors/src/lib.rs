@@ -24,6 +24,8 @@ pub(crate) struct Authenticated {
     pub(crate) token: String,
     /// The token's stored hash, which tells a token apart from a later one given the same name.
     pub(crate) hash: String,
+    /// When the token stops working, if it does.
+    pub(crate) expires: Option<jiff::Timestamp>,
 }
 
 /// What a caller pinned to `pinned` (or the policy's default when nothing pinned it) may use, or

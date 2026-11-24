@@ -6,8 +6,9 @@
 //! or wake anything real. A build with the `testing` feature (every test build of the binary) uses
 //! the fake whatever its environment says; see [`actuator`].
 
+use std::ffi::OsString;
 use std::net::{SocketAddrV4, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use serde_json::json;
 
-use super::delay::DELAY_MODE;
+use super::delay::{DELAY_MODE, log_path};
 
 /// How much of a command's output is kept: enough for any listing the power tools parse.
 const CAPTURE_LIMIT: usize = 1024 * 1024;
@@ -89,21 +90,30 @@ pub trait Actuator: Send + Sync + 'static {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Ran, ErrorBody>>;
 
-    /// Starts a process that outlives this one, waits `delay` and then runs `argv`, appending what
-    /// it prints to `log`. Returns once that process has started, with any warnings about how
+    /// Starts the delayed runner for an action recorded in `job.dir`: a process that outlives
+    /// this one, takes the runner lock, waits `job.delay` and then runs `job.argv` (see
+    /// [`super::pending`]). Returns once that process has started, with any warnings about how
     /// well it is detached.
-    fn schedule<'a>(
-        &'a self,
-        argv: &'a [String],
-        delay: Duration,
-        log: Option<&'a Path>,
-    ) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>>;
+    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>>;
 
     /// Sends one UDP datagram, broadcast allowed, from an unbound socket.
     fn send_datagram(&self, payload: &[u8], to: SocketAddrV4) -> Result<(), String>;
 
     /// Where a program of this name is on `PATH`, if anywhere.
     fn find_program(&self, name: &str) -> Option<PathBuf>;
+}
+
+/// An action handed to the delayed runner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scheduled {
+    /// The command it runs.
+    pub argv: Vec<String>,
+    /// How long it waits first.
+    pub delay: Duration,
+    /// `state/power`, where its record, its locks and its log are.
+    pub dir: PathBuf,
+    /// The id of its record.
+    pub id: String,
 }
 
 /// The actuator the registered power tools use: the machine itself in a release build, and a
@@ -158,35 +168,21 @@ impl Actuator for SystemActuator {
         })
     }
 
-    fn schedule<'a>(
-        &'a self,
-        argv: &'a [String],
-        delay: Duration,
-        log: Option<&'a Path>,
-    ) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
+    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
         Box::pin(async move {
-            let exe = std::env::current_exe().map_err(|error| {
-                ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("legion cannot find its own program to schedule the action: {error}."),
-                )
-            })?;
-            let mut args = vec![
-                DELAY_MODE.to_owned(),
-                delay.as_secs().to_string(),
-                "--".to_owned(),
+            let exe = legion_core::current_exe()?;
+            let args: Vec<OsString> = vec![
+                DELAY_MODE.into(),
+                job.dir.clone().into_os_string(),
+                job.id.clone().into(),
             ];
-            args.extend(argv.iter().cloned());
-            let mut options = DetachOptions::new(CommandSpec::argv(exe, args)).name("power");
-            if let Some(log) = log {
-                if let Some(dir) = log.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                options = options.output_path(log);
-            }
+            let _ = std::fs::create_dir_all(&job.dir);
+            let options = DetachOptions::new(CommandSpec::argv(exe, args))
+                .name("power")
+                .output_path(log_path(&job.dir));
             let handle = spawn_detached(options)
                 .await
-                .map_err(|error| os_error(error, argv))?;
+                .map_err(|error| os_error(error, &job.argv))?;
             Ok(handle.warnings)
         })
     }

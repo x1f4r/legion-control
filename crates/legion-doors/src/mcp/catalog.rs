@@ -124,11 +124,18 @@ impl Catalog {
     }
 }
 
+struct CachedCatalog {
+    specs: Vec<ToolSpec>,
+    catalog: Arc<Catalog>,
+    version: u64,
+}
+
 /// Keeps an MCP [`Catalog`] in step with [`Node::specs`] so long-lived MCP sessions pick up
-/// extensions added, changed or removed on disk without a restart.
+/// extensions added, changed or removed on disk without a restart, and bumps its version whenever
+/// the catalog's tool specs actually change.
 pub(crate) struct CatalogCache {
     full: bool,
-    cached: Mutex<(Vec<ToolSpec>, Arc<Catalog>)>,
+    cached: Mutex<CachedCatalog>,
 }
 
 impl CatalogCache {
@@ -144,25 +151,41 @@ impl CatalogCache {
         ));
         Ok(Arc::new(CatalogCache {
             full,
-            cached: Mutex::new((specs, catalog)),
+            cached: Mutex::new(CachedCatalog {
+                specs,
+                catalog,
+                version: 0,
+            }),
         }))
     }
 
-    /// The catalog for `node`'s current specs, rebuilt only when `node.specs()` changed.
-    pub(crate) fn current(&self, node: &Node) -> Arc<Catalog> {
+    /// The catalog for `node`'s current specs and its monotonic version, rebuilt only when
+    /// `node.specs()` changed.
+    pub(crate) fn current_with_version(&self, node: &Node) -> (Arc<Catalog>, u64) {
         let specs = node.specs();
         let mut guard = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.0 == specs {
-            return Arc::clone(&guard.1);
+        if guard.specs == specs {
+            return (Arc::clone(&guard.catalog), guard.version);
         }
         let catalog = Arc::new(Catalog::from_specs_lenient(
             node.registry(),
             specs.clone(),
             self.full,
         ));
-        guard.0 = specs;
-        guard.1 = Arc::clone(&catalog);
-        catalog
+        guard.specs = specs;
+        guard.catalog = Arc::clone(&catalog);
+        guard.version = guard.version.saturating_add(1);
+        (catalog, guard.version)
+    }
+
+    /// The catalog for `node`'s current specs, rebuilt only when `node.specs()` changed.
+    pub(crate) fn current(&self, node: &Node) -> Arc<Catalog> {
+        self.current_with_version(node).0
+    }
+
+    /// The catalog's current version, refreshed against `node.specs()`.
+    pub(crate) fn version(&self, node: &Node) -> u64 {
+        self.current_with_version(node).1
     }
 }
 

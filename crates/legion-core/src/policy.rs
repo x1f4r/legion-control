@@ -46,6 +46,78 @@ pub const OWNER: &str = "owner";
 /// The role that may do nothing, given to every principal the policy does not name.
 pub const NOBODY: &str = "nobody";
 
+/// Well-known secret locations relative to the home directory (or Windows user profile).
+///
+/// File tools refuse reading or writing any of these — and recursive walks skip them — for every
+/// role without `effect:admin`, unless that role's `paths` explicitly names the location or a path
+/// inside it (a broad root such as `~/**` does not count). This is a guard rail for file tools; it
+/// does not bind a role that allows `effect:exec`.
+///
+/// | Path (relative to `~`) | What lives there |
+/// | --- | --- |
+/// | `.ssh` | SSH private keys and client configuration |
+/// | `.gnupg` | GPG private keyrings |
+/// | `.aws` | AWS credentials and configuration |
+/// | `.azure` | Azure CLI tokens and credentials |
+/// | `.kube` | Kubernetes client certificates and tokens |
+/// | `.docker/config.json` | Container registry credentials |
+/// | `.netrc` | Plaintext remote login credentials |
+/// | `.git-credentials` | Git credential-store tokens |
+/// | `.config/gh` | GitHub CLI authentication tokens |
+/// | `.config/gcloud` | Google Cloud SDK credentials |
+/// | `.password-store` | `pass` encrypted password store |
+/// | `.local/share/keyrings` | Linux desktop keyrings |
+/// | `Library/Keychains` | macOS Keychain databases |
+/// | `.claude.json` | Claude Code account state and OAuth metadata |
+/// | `.claude/.credentials.json` | Claude Code OAuth credentials |
+/// | `.codex/auth.json` | Codex CLI authentication tokens |
+/// | `.gemini/oauth_creds.json` | Gemini CLI OAuth credentials |
+/// | `.gemini/google_accounts.json` | Gemini CLI account credentials |
+/// | `.config/opencode/service.json` | OpenCode local service credentials |
+/// | `.local/share/opencode/auth.json` | OpenCode authentication tokens |
+/// | `.config/github-copilot` | GitHub Copilot CLI tokens |
+/// | `.mozilla` | Firefox browser profiles (Linux) |
+/// | `.config/google-chrome` | Google Chrome profiles (Linux) |
+/// | `.config/chromium` | Chromium profiles (Linux) |
+/// | `.config/BraveSoftware/Brave-Browser` | Brave browser profiles (Linux) |
+/// | `Library/Application Support/Google/Chrome` | Google Chrome profiles (macOS) |
+/// | `Library/Application Support/Firefox` | Firefox profiles (macOS) |
+/// | `AppData/Local/Google/Chrome/User Data` | Google Chrome profiles (Windows) |
+/// | `AppData/Local/Microsoft/Edge/User Data` | Microsoft Edge profiles (Windows) |
+/// | `AppData/Roaming/Mozilla/Firefox` | Firefox profiles (Windows) |
+pub const SECRET_LOCATIONS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker/config.json",
+    ".netrc",
+    ".git-credentials",
+    ".config/gh",
+    ".config/gcloud",
+    ".password-store",
+    ".local/share/keyrings",
+    "Library/Keychains",
+    ".claude.json",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+    ".gemini/oauth_creds.json",
+    ".gemini/google_accounts.json",
+    ".config/opencode/service.json",
+    ".local/share/opencode/auth.json",
+    ".config/github-copilot",
+    ".mozilla",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/BraveSoftware/Brave-Browser",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Firefox",
+    "AppData/Local/Google/Chrome/User Data",
+    "AppData/Local/Microsoft/Edge/User Data",
+    "AppData/Roaming/Mozilla/Firefox",
+];
+
 /// `policy.toml`.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +154,9 @@ pub struct Role {
     /// When present, the only directories the file tools may touch.
     #[serde(default)]
     pub paths: Option<Vec<PathRoot>>,
-    /// Whether a caller with this role may act as another principal.
+    /// Whether a caller with this role may act as another principal. Only the built-in owner role
+    /// does: a role that could act as anyone would be the owner under another name, so a file
+    /// that sets it on a role of its own is refused.
     #[serde(default)]
     pub delegate: bool,
 }
@@ -248,6 +322,11 @@ impl Document for Policy {
                     .to_owned(),
             );
         }
+        if let Some((name, _)) = self.roles.iter().find(|(_, role)| role.delegate) {
+            return Err(format!(
+                "[roles.{name}] sets delegate = true, but acting as another principal is the owner's alone: a role that could act as anyone would be the owner under another name; give the principal role = \"owner\" if that is what is meant"
+            ));
+        }
         for (principal, entry) in &self.principals {
             let known =
                 entry.role == OWNER || entry.role == NOBODY || self.roles.contains_key(&entry.role);
@@ -328,9 +407,7 @@ impl Policy {
                 ErrorCode::Denied,
                 format!("{caller} may not act as {requested}: its role {role} does not delegate."),
             )
-            .with_hint(
-                "Call without --as, or give the caller's role delegate = true in policy.toml.",
-            ))
+            .with_hint("Call without --as: only the owner role may act as another principal."))
         }
     }
 
@@ -514,6 +591,8 @@ pub enum Place {
     Config,
     /// The node's state directory: the audit log and, later, jobs.
     State,
+    /// A well-known secret location under the home directory (see [`SECRET_LOCATIONS`]).
+    Secret,
 }
 
 impl Place {
@@ -523,6 +602,7 @@ impl Place {
             Place::Home => "the home directory",
             Place::Config => "Legion's own configuration",
             Place::State => "Legion's own state",
+            Place::Secret => "a secret location",
         }
     }
 }
@@ -632,6 +712,7 @@ impl Grant {
             let resolved =
                 resolve_keeping_last(&expanded).map_err(|error| error.unconfined(given))?;
             self.keep_out_of_own_dirs(&resolved, given, access)?;
+            self.keep_out_of_secret_locations(&resolved, given, access, &[])?;
             return Ok(resolved.path());
         };
         let denied = |reason: &str| {
@@ -694,12 +775,14 @@ impl Grant {
             }
         }
         self.keep_out_of_own_dirs(&resolved, given, access)?;
+        self.keep_out_of_secret_locations(&resolved, given, access, &resolved_roots)?;
         Ok(resolved.path())
     }
 
     /// Whether a path is one of the places a tool must not remove, move or replace as a whole, or a
     /// directory that holds one: the root of a file system, the home directory, the node's
-    /// configuration or its state directory, named in that order of precedence.
+    /// configuration or state directory, or (for roles without `effect:admin` that did not opt in
+    /// through `paths`) a well-known secret location, named in that order of precedence.
     ///
     /// `path` is one [`Grant::check_path`] returned. A last part that is a symbolic link is never
     /// one of them, since acting on it acts on the link. Names are compared as the file system
@@ -746,17 +829,31 @@ impl Grant {
                 return Ok(Some(dir.place));
             }
         }
+        if !self.allows_effect(Effect::Admin) {
+            let resolved_roots = self.resolved_roots_best_effort();
+            for secret in self.secret_locations() {
+                if secret_explicitly_opted_in_whole(&secret, &resolved_roots) {
+                    continue;
+                }
+                if holds(&secret.resolved) {
+                    return Ok(Some(Place::Secret));
+                }
+            }
+        }
         Ok(None)
     }
 
     /// Checks a path a tool is about to remove, move or replace with everything under it, after
     /// [`Grant::check_path`] has: the root of a file system and the home directory are refused to
-    /// every role, and a directory holding the node's configuration or state to a role that does
-    /// not allow `effect:admin`.
+    /// every role, a directory holding the node's configuration or state to a role that does not
+    /// allow `effect:admin`, and a secret location (or an ancestor holding one) to a role without
+    /// `effect:admin` that did not explicitly opt in via `paths`.
     pub fn check_tree(&self, path: &Path) -> Result<(), ErrorBody> {
         let place = match self.protected(path)? {
             None => return Ok(()),
-            Some(Place::Config | Place::State) if self.allows_effect(Effect::Admin) => {
+            Some(Place::Config | Place::State | Place::Secret)
+                if self.allows_effect(Effect::Admin) =>
+            {
                 return Ok(());
             }
             Some(place) => place,
@@ -767,6 +864,9 @@ impl Grant {
             }
             Place::Config | Place::State => {
                 "Only a role that allows effect:admin may change Legion's own files; ask the owner of this machine."
+            }
+            Place::Secret => {
+                "Only a role that allows effect:admin, or one whose `paths` names the secret location explicitly, may remove, move or replace it."
             }
         };
         Err(ErrorBody::new(
@@ -780,6 +880,165 @@ impl Grant {
         )
         .with_hint(hint)
         .with_details(json!({"path": path, "place": format!("{place:?}").to_lowercase()})))
+    }
+
+    /// Pre-resolved filter over Legion's own directories and well-known secret locations for
+    /// recursive directory walks (`fs.list`, `fs.find`, `fs.grep`, `fs.copy`, `fs.manifest`).
+    ///
+    /// Returns an empty filter (blocks nothing) for roles that allow `effect:admin`.
+    pub fn protected_filter(&self) -> ProtectedFilter {
+        if self.allows_effect(Effect::Admin) {
+            return ProtectedFilter::allow_all();
+        }
+        let mut entries = Vec::new();
+        if let Ok(own) = self.own_dirs() {
+            for dir in own {
+                let reason = format!(
+                    "{}, which only a role that allows effect:admin may read or change",
+                    dir.place.describe()
+                );
+                entries.push(ProtectedEntry {
+                    place: dir.place,
+                    reason,
+                    resolved: dir.resolved,
+                    identity: dir.identity,
+                });
+            }
+        }
+        let resolved_roots = self.resolved_roots_best_effort();
+        for secret in self.secret_locations() {
+            if secret_explicitly_opted_in_whole(&secret, &resolved_roots) {
+                continue;
+            }
+            let reason = format!(
+                "~/{} is on Legion's list of secret locations; name it explicitly in the role's `paths` to allow access",
+                secret.rel
+            );
+            entries.push(ProtectedEntry {
+                place: Place::Secret,
+                reason,
+                resolved: secret.resolved,
+                identity: secret.identity,
+            });
+        }
+        let explicit_roots = resolved_roots
+            .into_iter()
+            .map(|root| {
+                let id = if root.missing.is_empty() {
+                    Handle::from_path(&root.existing).ok()
+                } else {
+                    None
+                };
+                (root, id)
+            })
+            .collect();
+        ProtectedFilter {
+            entries,
+            explicit_roots,
+        }
+    }
+
+    /// Best-effort resolution of this role's configured `paths` roots.
+    fn resolved_roots_best_effort(&self) -> Vec<Resolved> {
+        let Some(roots) = &self.rules.paths else {
+            return Vec::new();
+        };
+        roots
+            .iter()
+            .filter_map(|root| {
+                let expanded = expand_tilde(Path::new(root.as_str()), self.paths.home()).ok()?;
+                resolve(&expanded).ok()
+            })
+            .collect()
+    }
+
+    /// Well-known secret locations under `self.paths.home()`, resolved as far as they exist.
+    fn secret_locations(&self) -> Vec<SecretPlace> {
+        let Some(home) = self.paths.home() else {
+            return Vec::new();
+        };
+        SECRET_LOCATIONS
+            .iter()
+            .filter_map(|rel| {
+                let full = rel
+                    .split('/')
+                    .fold(home.to_path_buf(), |acc, part| acc.join(part));
+                let resolved = resolve(&full).ok()?;
+                let identity = if resolved.missing.is_empty() {
+                    Handle::from_path(&resolved.existing).ok()
+                } else {
+                    None
+                };
+                Some(SecretPlace {
+                    rel,
+                    resolved,
+                    identity,
+                })
+            })
+            .collect()
+    }
+
+    /// Refuses access to well-known secret locations for roles without `effect:admin`, unless the
+    /// role's `paths` explicitly names the secret location or a subpath covering `place`.
+    fn keep_out_of_secret_locations(
+        &self,
+        resolved: &Resolved,
+        given: &Path,
+        access: Access,
+        resolved_roots: &[Resolved],
+    ) -> Result<(), ErrorBody> {
+        if self.allows_effect(Effect::Admin) {
+            return Ok(());
+        }
+        let secrets = self.secret_locations();
+        if secrets.is_empty() {
+            return Ok(());
+        }
+        let mut places = vec![Cow::Borrowed(resolved)];
+        if resolved.link.is_some()
+            && let Ok(target) = link_target(resolved)
+        {
+            places.push(Cow::Owned(target));
+        }
+        for place in &places {
+            let ancestors: Vec<Handle> = place
+                .existing
+                .ancestors()
+                .filter_map(|ancestor| Handle::from_path(ancestor).ok())
+                .collect();
+            for secret in &secrets {
+                let inside_secret = within(place, &secret.resolved, Platform::HOST)
+                    || secret
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| ancestors.contains(identity));
+                if !inside_secret {
+                    continue;
+                }
+                if secret_explicitly_opted_in_for_place(secret, place, &ancestors, resolved_roots) {
+                    continue;
+                }
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "{} may not {} {}: ~/{} is on Legion's list of secret locations.",
+                        self.principal,
+                        access.verb(),
+                        given.display(),
+                        secret.rel
+                    ),
+                )
+                .with_hint(format!(
+                    "Only roles with effect:admin may touch secret locations by default. To allow this role, the owner can name ~/{} (or a path inside it) explicitly in the role's `paths` in policy.toml.",
+                    secret.rel
+                ))
+                .with_details(json!({
+                    "path": resolved.path(),
+                    "secret": format!("~/{}", secret.rel),
+                })));
+            }
+        }
+        Ok(())
     }
 
     /// The node's configuration and state directories, resolved as far as they exist, with the
@@ -883,6 +1142,156 @@ struct OwnDir {
     resolved: Resolved,
     /// Which directory it is, when it exists, so a second name for it is known for what it is.
     identity: Option<Handle>,
+}
+
+/// One well-known secret location resolved against the node's home directory.
+struct SecretPlace {
+    rel: &'static str,
+    resolved: Resolved,
+    identity: Option<Handle>,
+}
+
+/// Pre-resolved filter built by [`Grant::protected_filter`] so recursive directory walks skip
+/// Legion's own configuration/state directories and secret locations using the exact same rules as
+/// [`Grant::check_path`] and [`Grant::protected`].
+#[derive(Debug)]
+pub struct ProtectedFilter {
+    entries: Vec<ProtectedEntry>,
+    explicit_roots: Vec<(Resolved, Option<Handle>)>,
+}
+
+#[derive(Debug)]
+struct ProtectedEntry {
+    place: Place,
+    reason: String,
+    resolved: Resolved,
+    identity: Option<Handle>,
+}
+
+impl ProtectedFilter {
+    /// A filter that blocks nothing (used for roles with `effect:admin` and unit tests).
+    pub fn allow_all() -> ProtectedFilter {
+        ProtectedFilter {
+            entries: Vec::new(),
+            explicit_roots: Vec::new(),
+        }
+    }
+
+    /// Whether this filter has no protected locations to skip.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the matching protected [`Place`] and human-readable reason if `path` (or the target
+    /// of `path` when it is a symbolic link) must be skipped during a directory walk.
+    pub fn blocked(&self, path: &Path) -> Option<(Place, &str)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let resolved = resolve_keeping_last(path).ok()?;
+        let mut candidates = vec![Cow::Borrowed(&resolved)];
+        if resolved.link.is_some()
+            && let Ok(target) = link_target(&resolved)
+        {
+            candidates.push(Cow::Owned(target));
+        }
+        for candidate in &candidates {
+            let candidate_id = if candidate.missing.is_empty() {
+                Handle::from_path(&candidate.existing).ok()
+            } else {
+                None
+            };
+            for entry in &self.entries {
+                let matches_entry = within(candidate, &entry.resolved, Platform::HOST)
+                    || (candidate_id.is_some() && candidate_id == entry.identity)
+                    || entry.identity.as_ref().is_some_and(|id| {
+                        candidate
+                            .existing
+                            .ancestors()
+                            .any(|anc| Handle::from_path(anc).is_ok_and(|h| h == *id))
+                    });
+                if !matches_entry {
+                    continue;
+                }
+                if entry.place == Place::Secret {
+                    let opted_in = self.explicit_roots.iter().any(|(root, root_id)| {
+                        let root_inside_secret =
+                            root_is_within_secret(root, &entry.resolved, entry.identity.as_ref());
+                        if !root_inside_secret {
+                            return false;
+                        }
+                        within(candidate, root, Platform::HOST)
+                            || root_id.as_ref().is_some_and(|rid| {
+                                candidate_id.as_ref() == Some(rid)
+                                    || candidate
+                                        .existing
+                                        .ancestors()
+                                        .any(|anc| Handle::from_path(anc).is_ok_and(|h| h == *rid))
+                            })
+                    });
+                    if opted_in {
+                        continue;
+                    }
+                }
+                return Some((entry.place, entry.reason.as_str()));
+            }
+        }
+        None
+    }
+
+    /// Convenience wrapper returning whether `path` is blocked.
+    pub fn is_blocked(&self, path: &Path) -> bool {
+        self.blocked(path).is_some()
+    }
+}
+
+/// Whether `root` names `secret` itself or a path strictly inside `secret` (a broad ancestor such
+/// as `~/**` returns `false`).
+fn root_is_within_secret(
+    root: &Resolved,
+    secret_resolved: &Resolved,
+    secret_identity: Option<&Handle>,
+) -> bool {
+    if within(root, secret_resolved, Platform::HOST) {
+        return true;
+    }
+    secret_identity.is_some_and(|id| {
+        root.existing
+            .ancestors()
+            .any(|ancestor| Handle::from_path(ancestor).is_ok_and(|h| h == *id))
+    })
+}
+
+/// Whether any configured root explicitly names the entire `secret` location itself.
+fn secret_explicitly_opted_in_whole(secret: &SecretPlace, resolved_roots: &[Resolved]) -> bool {
+    resolved_roots.iter().any(|root| {
+        let same_path = within(root, &secret.resolved, Platform::HOST)
+            && within(&secret.resolved, root, Platform::HOST);
+        let same_handle = secret.identity.as_ref().is_some_and(|sid| {
+            root.missing.is_empty() && Handle::from_path(&root.existing).ok().as_ref() == Some(sid)
+        });
+        same_path || same_handle
+    })
+}
+
+/// Whether any configured root both explicitly names `secret` (or a subpath inside it) AND covers
+/// `place`.
+fn secret_explicitly_opted_in_for_place(
+    secret: &SecretPlace,
+    place: &Resolved,
+    place_ancestors: &[Handle],
+    resolved_roots: &[Resolved],
+) -> bool {
+    resolved_roots.iter().any(|root| {
+        if !root_is_within_secret(root, &secret.resolved, secret.identity.as_ref()) {
+            return false;
+        }
+        within(place, root, Platform::HOST)
+            || (root.missing.is_empty()
+                && Handle::from_path(&root.existing)
+                    .ok()
+                    .is_some_and(|rid| place_ancestors.contains(&rid)))
+    })
 }
 
 /// Where a last part that is a symbolic link leads, resolved as far as that exists.
@@ -1394,12 +1803,24 @@ paths = ["~/projects/**"]
     }
 
     #[test]
-    fn a_role_that_delegates_is_set_in_the_file() {
+    fn only_the_owner_role_delegates() {
+        let error = parse::<Policy>(
+            Path::new("policy.toml"),
+            b"[principals.laptop]\nrole = \"admin\"\n[roles.admin]\nallow = [\"*\"]\ndelegate = true\n",
+        )
+        .unwrap_err()
+        .message;
+        assert!(error.contains("[roles.admin]"), "{error}");
+        assert!(error.contains("the owner's alone"), "{error}");
         let policy = policy(
-            "[principals.laptop]\nrole = \"admin\"\n[roles.admin]\nallow = [\"*\"]\ndelegate = true\n",
+            "[principals.laptop]\nrole = \"owner\"\n[principals.phone]\nrole = \"admin\"\n[roles.admin]\nallow = [\"*\"]\ndelegate = false\n",
         );
         assert_eq!(
             policy.resolve(Some("phone"), Some("laptop")).unwrap(),
+            "phone"
+        );
+        assert_eq!(
+            policy.resolve(Some("owner"), Some("phone")).unwrap(),
             "phone"
         );
     }
@@ -2077,5 +2498,188 @@ deny = ["effect:admin"]
             grant.check_path("relative", Access::Read).unwrap_err().code,
             ErrorCode::InvalidArgs
         );
+    }
+
+    #[test]
+    fn secret_locations_are_refused_without_admin_unless_explicitly_named_in_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh").join("allowed")).unwrap();
+        std::fs::write(home.join(".ssh").join("id_ed25519"), "PRIVATE KEY").unwrap();
+        std::fs::write(home.join(".ssh").join("allowed").join("note.txt"), "ok").unwrap();
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::write(home.join(".aws").join("credentials"), "secret").unwrap();
+        std::fs::create_dir_all(home.join(".docker")).unwrap();
+        std::fs::write(home.join(".docker").join("config.json"), "{}").unwrap();
+        std::fs::write(home.join(".claude.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.join(".config").join("gh")).unwrap();
+        std::fs::write(home.join(".config").join("gh").join("hosts.yml"), "tok").unwrap();
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(home.join("projects").join("readme.md"), "hi").unwrap();
+
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        let policy = crate::config::parse::<Policy>(
+            Path::new("policy.toml"),
+            br#"
+[roles.wide_reader]
+allow = ["effect:read", "effect:write"]
+
+[roles.home_reader]
+allow = ["effect:read"]
+paths = ["~/**"]
+
+[roles.ssh_optin]
+allow = ["effect:read"]
+paths = ["~/.ssh/**"]
+
+[roles.partial_optin]
+allow = ["effect:read"]
+paths = ["~/**", "~/.ssh/allowed/**"]
+
+[principals.wide]
+role = "wide_reader"
+
+[principals.homey]
+role = "home_reader"
+
+[principals.sshuser]
+role = "ssh_optin"
+
+[principals.partial]
+role = "partial_optin"
+"#,
+        )
+        .unwrap();
+
+        // Unconfined non-admin is refused secret locations for both Read and Write, but can read normal files.
+        let wide = policy.grant("wide", &paths);
+        assert!(
+            wide.check_path("~/projects/readme.md", Access::Read)
+                .is_ok()
+        );
+        for secret in [
+            "~/.ssh/id_ed25519",
+            "~/.aws/credentials",
+            "~/.docker/config.json",
+            "~/.claude.json",
+            "~/.config/gh/hosts.yml",
+        ] {
+            let err_r = wide.check_path(secret, Access::Read).unwrap_err();
+            assert_eq!(err_r.code, ErrorCode::Denied, "{secret}");
+            assert!(
+                err_r.message.contains("secret locations"),
+                "{secret}: {}",
+                err_r.message
+            );
+            assert!(
+                err_r.hint.as_deref().is_some_and(|h| h.contains("paths")),
+                "{secret}: {:?}",
+                err_r.hint
+            );
+            let err_w = wide.check_path(secret, Access::Write).unwrap_err();
+            assert_eq!(err_w.code, ErrorCode::Denied, "write {secret}");
+        }
+
+        // Broad `~/**` confinement does NOT count as explicitly naming a secret location.
+        let homey = policy.grant("homey", &paths);
+        assert!(
+            homey
+                .check_path("~/projects/readme.md", Access::Read)
+                .is_ok()
+        );
+        assert_eq!(
+            homey
+                .check_path("~/.ssh/id_ed25519", Access::Read)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            homey
+                .check_path("~/.claude.json", Access::Read)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+
+        // Explicitly naming `~/.ssh/**` opts in for `.ssh`, while other secrets stay refused.
+        let sshuser = policy.grant("sshuser", &paths);
+        assert!(
+            sshuser
+                .check_path("~/.ssh/id_ed25519", Access::Read)
+                .is_ok()
+        );
+        assert_eq!(
+            sshuser
+                .check_path("~/.aws/credentials", Access::Read)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+
+        // Naming a subpath `~/.ssh/allowed/**` alongside `~/**` allows only that subpath, not sibling keys.
+        let partial = policy.grant("partial", &paths);
+        assert!(
+            partial
+                .check_path("~/.ssh/allowed/note.txt", Access::Read)
+                .is_ok()
+        );
+        assert_eq!(
+            partial
+                .check_path("~/.ssh/id_ed25519", Access::Read)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+
+        // Owner (admin) can access every secret location.
+        let owner = policy.grant("owner", &paths);
+        assert!(owner.check_path("~/.ssh/id_ed25519", Access::Read).is_ok());
+        assert!(owner.check_path("~/.claude.json", Access::Write).is_ok());
+
+        // `protected` and `check_tree` treat secret locations and ancestors holding them as Place::Secret.
+        assert_eq!(
+            wide.protected(&home.join(".ssh")).unwrap(),
+            Some(Place::Secret)
+        );
+        assert_eq!(
+            wide.protected(&home.join(".config")).unwrap(),
+            Some(Place::Secret)
+        );
+        assert!(wide.check_tree(&home.join(".config")).is_err());
+        assert_eq!(sshuser.protected(&home.join(".ssh")).unwrap(), None);
+        assert_eq!(owner.protected(&home.join(".ssh")).unwrap(), None);
+
+        // Symlinks into secret locations are also refused.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                home.join(".ssh").join("id_ed25519"),
+                home.join("projects").join("keylink"),
+            )
+            .unwrap();
+            let err = wide
+                .check_path("~/projects/keylink", Access::Read)
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied);
+            assert!(err.message.contains("secret locations"), "{}", err.message);
+        }
+
+        // ProtectedFilter blocks secret locations for non-admin and skips nothing for owner.
+        let filter = wide.protected_filter();
+        assert_eq!(
+            filter.blocked(&home.join(".ssh")).map(|(p, _)| p),
+            Some(Place::Secret)
+        );
+        assert_eq!(
+            filter.blocked(&home.join(".claude.json")).map(|(p, _)| p),
+            Some(Place::Secret)
+        );
+        assert!(
+            filter
+                .blocked(&home.join("projects").join("readme.md"))
+                .is_none()
+        );
+        assert!(owner.protected_filter().is_empty());
     }
 }

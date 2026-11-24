@@ -14,10 +14,12 @@
 [CmdletBinding()]
 param(
     [string] $Version = '',
-    [string] $From = ''
+    [string] $From = '',
+    [switch] $InsecureSkipVerify
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 # Windows PowerShell 5.1 defaults to TLS 1.0/1.1, which GitHub rejects.
 if ($PSVersionTable.PSVersion.Major -lt 6) {
@@ -26,6 +28,13 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 
 $RepoUrl = 'https://github.com/x1f4r/legion-control'
 $RepoSlug = $RepoUrl -replace '^https://github\.com/', ''
+
+# Pinned Ed25519 public key from contract/release-public-key.pem (same key pinned in legion).
+$ReleasePublicKeyPem = @"
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAB8q1DNamFF0ShMi6Wzps/0UIGEkLmHDDvQqOvuv98zg=
+-----END PUBLIC KEY-----
+"@
 
 function Get-TargetTriple {
     $arch = ''
@@ -41,7 +50,8 @@ function Get-TargetTriple {
         'X64'   { return 'x86_64-pc-windows-msvc' }
         'AMD64' { return 'x86_64-pc-windows-msvc' }
         'ARM64' {
-            throw 'Native Windows ARM64 binaries are not published yet; pass -From with a local binary or use the x86_64 build under emulation.'
+            Write-Warning 'Windows ARM64 detected: using x86_64-pc-windows-msvc under x64 emulation because native Windows ARM64 release binaries are not published yet.'
+            return 'x86_64-pc-windows-msvc'
         }
         default {
             throw "Unsupported Windows architecture '$arch' (supported: x86_64)."
@@ -152,6 +162,57 @@ try {
         if ($actualHash -ne $expectedHash) {
             throw "Checksum mismatch for $asset (expected $expectedHash, got $actualHash)."
         }
+
+        if ($InsecureSkipVerify) {
+            Write-Warning 'Skipping release provenance/signature verification (-InsecureSkipVerify); SHA-256 was still verified.'
+        } elseif ($null -ne (Get-Command -Name 'gh' -ErrorAction SilentlyContinue)) {
+            & gh attestation verify $downloadedBin `
+                --repo $RepoSlug `
+                --signer-workflow "$RepoSlug/.github/workflows/legion-release.yml" `
+                --source-ref "refs/tags/$tag" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw "GitHub build provenance verification failed for $tag; refusing to install."
+            }
+        } else {
+            $opensslCmd = Get-Command -Name 'openssl' -ErrorAction SilentlyContinue
+            $verifiedWithOpenSsl = $false
+            if ($null -ne $opensslCmd) {
+                $pubPemPath = Join-Path -Path $tempDir -ChildPath 'release-public-key.pem'
+                [System.IO.File]::WriteAllText($pubPemPath, ($ReleasePublicKeyPem + "`n"), [System.Text.Encoding]::ASCII)
+                $verLine = (& $opensslCmd.Source version 2>$null | Out-String).Trim()
+                $pkeyCheck = & $opensslCmd.Source pkey -pubin -in $pubPemPath -noout 2>$null
+                $pkeyOk = ($LASTEXITCODE -eq 0)
+                $null = $pkeyCheck
+                $helpText = (& $opensslCmd.Source pkeyutl -help 2>&1 | Out-String)
+                if ($verLine.StartsWith('OpenSSL') -and $pkeyOk -and $helpText.Contains('-rawin')) {
+                    $sigB64Path = Join-Path -Path $tempDir -ChildPath 'SHA256SUMS.sig'
+                    Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS.sig" -OutFile $sigB64Path -Headers $headers -UseBasicParsing
+                    $sigText = ([System.IO.File]::ReadAllText($sigB64Path)).Trim()
+                    $sigBytes = [System.Convert]::FromBase64String($sigText)
+                    if ($sigBytes.Length -ne 64) {
+                        throw 'SHA256SUMS.sig did not decode to a 64-byte Ed25519 signature.'
+                    }
+                    $sigRawPath = Join-Path -Path $tempDir -ChildPath 'SHA256SUMS.sig.bin'
+                    [System.IO.File]::WriteAllBytes($sigRawPath, $sigBytes)
+                    & $opensslCmd.Source pkeyutl -verify -pubin -inkey $pubPemPath -rawin -in $sumsPath -sigfile $sigRawPath 2>$null | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Ed25519 signature verification failed for $tag; refusing to install."
+                    }
+                    $verifiedWithOpenSsl = $true
+                }
+            }
+            if (-not $verifiedWithOpenSsl) {
+                throw @"
+Cannot verify who published ${tag}: neither 'gh' (for attestation verification) nor OpenSSL with Ed25519 -rawin support is installed.
+
+Verify manually before installing:
+  1. Install GitHub CLI (gh) and re-run this script, or run:
+       gh attestation verify <file> --repo $RepoSlug --signer-workflow $RepoSlug/.github/workflows/legion-release.yml --source-ref refs/tags/$tag
+  2. Or ensure OpenSSL 3 (for example from Git for Windows) is on PATH to verify SHA256SUMS.sig against contract/release-public-key.pem.
+  3. Or re-run with -InsecureSkipVerify to install with SHA-256 verification only.
+"@
+            }
+        }
         $sourceBin = $downloadedBin
     }
 
@@ -189,29 +250,48 @@ try {
         $stagedPath = $null
     }
 
-    # Add %LOCALAPPDATA%\legion to the user PATH once, comparing case-insensitively without trailing
-    # backslashes so repeated runs never duplicate entries.
+    # Add %LOCALAPPDATA%\legion to HKCU\Environment\Path without expanding existing %VAR% entries
+    # or changing REG_EXPAND_SZ to REG_SZ.
     $normalizedInstall = $installDir.TrimEnd('\')
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $entries = @()
-    if (-not [string]::IsNullOrEmpty($userPath)) {
-        $entries = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    }
     $alreadyOnPath = $false
-    foreach ($entry in $entries) {
-        if ($entry.Trim().TrimEnd('\').Equals($normalizedInstall, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $alreadyOnPath = $true
-            break
-        }
+    $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    if ($null -eq $envKey) {
+        $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
     }
-    if (-not $alreadyOnPath) {
-        $updatedEntries = @($entries) + @($installDir)
-        $newUserPath = $updatedEntries -join ';'
-        [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
-        if ([string]::IsNullOrEmpty($env:Path)) {
-            $env:Path = $installDir
-        } else {
-            $env:Path = "$env:Path;$installDir"
+    try {
+        $existingVal = $envKey.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $valueKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        $rawPath = ''
+        if ($null -ne $existingVal) {
+            $valueKind = $envKey.GetValueKind('Path')
+            $rawPath = [string] $existingVal
+        }
+        $entries = @()
+        if (-not [string]::IsNullOrEmpty($rawPath)) {
+            $entries = @($rawPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        foreach ($entry in $entries) {
+            $rawNorm = $entry.Trim().TrimEnd('\')
+            $expNorm = [Environment]::ExpandEnvironmentVariables($entry).Trim().TrimEnd('\')
+            if ($rawNorm.Equals($normalizedInstall, [System.StringComparison]::OrdinalIgnoreCase) -or
+                $expNorm.Equals($normalizedInstall, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $alreadyOnPath = $true
+                break
+            }
+        }
+        if (-not $alreadyOnPath) {
+            $updatedEntries = @($entries) + @($installDir)
+            $newUserPath = $updatedEntries -join ';'
+            $envKey.SetValue('Path', $newUserPath, $valueKind)
+            if ([string]::IsNullOrEmpty($env:Path)) {
+                $env:Path = $installDir
+            } else {
+                $env:Path = "$env:Path;$installDir"
+            }
+        }
+    } finally {
+        if ($null -ne $envKey) {
+            $envKey.Close()
         }
     }
 

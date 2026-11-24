@@ -14,9 +14,11 @@ use std::time::Duration;
 
 use legion_core::proto::ErrorBody;
 use legion_core::{BoxFuture, CancellationToken};
+use legion_os::lock::FileLock;
 use serde::{Deserialize, Serialize};
 
-use super::actuator::{Actuator, Ran};
+use super::actuator::{Actuator, Ran, Scheduled};
+use super::pending;
 
 /// The environment variable naming the directory a test binary's fake reads and writes.
 pub const TEST_POWER_DIR: &str = "LEGION_TEST_POWER";
@@ -96,8 +98,9 @@ impl Reply {
     }
 }
 
-/// The recording fake. A command no reply matches exits 0 and prints nothing; every program is
-/// found unless [`RecordingActuator::without_program`] says otherwise.
+/// The recording fake. A command no reply matches gets what a permissive machine would answer (see
+/// [`permissive`]); every program is found unless [`RecordingActuator::without_program`] says
+/// otherwise.
 #[derive(Debug, Default)]
 pub struct RecordingActuator {
     /// Replies, most specific wins; a prefix with several replies gives them in turn and then
@@ -108,6 +111,7 @@ pub struct RecordingActuator {
     file: Option<PathBuf>,
     refuse_datagrams: bool,
     refuse_schedules: bool,
+    runners: Mutex<Vec<FileLock>>,
 }
 
 impl RecordingActuator {
@@ -161,6 +165,18 @@ impl RecordingActuator {
         self
     }
 
+    /// Lets every runner this fake stands in for finish: their locks go, and so does the record of
+    /// what they were to run.
+    pub fn finish_runners(&self) {
+        let finished: Vec<FileLock> = lock(&self.runners).drain(..).collect();
+        for held in finished {
+            if let Some(dir) = held.path().parent() {
+                pending::clear_pending(dir);
+            }
+            drop(held);
+        }
+    }
+
     /// Everything recorded so far, in order.
     pub fn records(&self) -> Vec<Record> {
         lock(&self.records).clone()
@@ -203,7 +219,7 @@ impl RecordingActuator {
             .map(|(reply, _)| reply.argv.len())
             .max();
         let Some(longest) = longest else {
-            return Ok(Ran::exited(0, ""));
+            return Ok(permissive(argv));
         };
         let mut matching: Vec<&mut (Reply, usize)> = replies
             .iter_mut()
@@ -234,27 +250,25 @@ impl Actuator for RecordingActuator {
         Box::pin(async move { outcome })
     }
 
-    fn schedule<'a>(
-        &'a self,
-        argv: &'a [String],
-        delay: Duration,
-        _log: Option<&'a Path>,
-    ) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
+    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
         self.record(Record::Schedule {
-            argv: argv.to_vec(),
-            delay_s: delay.as_secs(),
+            argv: job.argv.clone(),
+            delay_s: job.delay.as_secs(),
         });
-        let refused = self.refuse_schedules;
-        Box::pin(async move {
-            if refused {
-                Err(ErrorBody::new(
-                    legion_core::proto::ErrorCode::Failed,
-                    "The detached runner could not be started.",
-                ))
-            } else {
-                Ok(Vec::new())
+        let outcome = if self.refuse_schedules {
+            Err(ErrorBody::new(
+                legion_core::proto::ErrorCode::Failed,
+                "The detached runner could not be started.",
+            ))
+        } else {
+            // Stands in for a runner that has taken over and not run yet: it holds the runner
+            // lock until finish_runners, or until this process ends.
+            if let Some(held) = pending::take_runner_lock(&job.dir, Duration::from_secs(5)) {
+                lock(&self.runners).push(held);
             }
-        })
+            Ok(Vec::new())
+        };
+        Box::pin(async move { outcome })
     }
 
     fn send_datagram(&self, payload: &[u8], to: SocketAddrV4) -> Result<(), String> {
@@ -274,6 +288,29 @@ impl Actuator for RecordingActuator {
         } else {
             Some(PathBuf::from(name))
         }
+    }
+}
+
+/// What a machine that allows everything and holds nothing back answers: logind says `yes` and
+/// lists no inhibitors, sudo shows a NOPASSWD rule for any command; any other command exits 0
+/// and prints nothing.
+pub fn permissive(argv: &[String]) -> Ran {
+    if argv.len() > 4 && argv[..4] == ["sudo", "-n", "-l", "-l"] {
+        let command = argv[4..].join(" ");
+        return Ran::exited(
+            0,
+            format!(
+                "Sudoers entry: /etc/sudoers.d/power\n    RunAsUsers: root\n    Options: !authenticate\n    Commands:\n\t{command}\n    Matched: {command}\n"
+            ),
+        );
+    }
+    let asks_logind = argv.first().is_some_and(|program| program == "busctl");
+    match argv.last().map(String::as_str) {
+        Some(method) if asks_logind && method.starts_with("Can") => Ran::exited(0, "s \"yes\"\n"),
+        Some("ListInhibitors") if asks_logind => {
+            Ran::exited(0, "{\"type\":\"a(ssssuu)\",\"data\":[[]]}\n")
+        }
+        _ => Ran::exited(0, ""),
     }
 }
 
@@ -333,13 +370,18 @@ mod tests {
         );
         assert_eq!(special.exit_code, Some(2));
         assert_eq!(other, Ran::exited(0, ""));
-        fake.schedule(
-            &argv(&["systemctl", "reboot"]),
-            Duration::from_secs(3),
-            None,
-        )
-        .await
-        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let job = Scheduled {
+            argv: argv(&["systemctl", "reboot"]),
+            delay: Duration::from_secs(3),
+            dir: dir.path().to_path_buf(),
+            id: "a1".to_owned(),
+        };
+        fake.schedule(&job).await.unwrap();
+        // It stands in for a runner that has taken over, until told it finished.
+        assert!(pending::runner_holds(dir.path()));
+        fake.finish_runners();
+        assert!(!pending::runner_holds(dir.path()));
         fake.send_datagram(&[0xff, 0x02], "192.0.2.255:9".parse().unwrap())
             .unwrap();
         assert_eq!(fake.runs().len(), 5);

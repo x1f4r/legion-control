@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -43,12 +44,53 @@ struct Binding {
     owner: Authenticated,
     compact: bool,
     last_used: Instant,
+    /// A place held for a session being opened, which has no id yet.
+    pending: bool,
 }
 
 /// Every live session and the token that opened it.
 #[derive(Default)]
 pub(crate) struct Sessions {
     bound: Mutex<HashMap<String, Binding>>,
+    /// Numbers the places held for sessions being opened.
+    reservations: AtomicU64,
+}
+
+/// A place held for a session while it is being opened, so a burst of `initialize` requests
+/// cannot open more than the limits allow between checking for room and taking it. Dropped
+/// without [`Reservation::bind`], when opening failed, it gives the place back.
+pub(crate) struct Reservation<'a> {
+    sessions: &'a Sessions,
+    key: String,
+    owner: Option<Authenticated>,
+    compact: bool,
+}
+
+impl Reservation<'_> {
+    /// Records the session opened in the place held, under the id the SDK gave it.
+    pub(crate) fn bind(mut self, id: String) {
+        let mut bound = self.sessions.lock();
+        bound.remove(&self.key);
+        if let Some(owner) = self.owner.take() {
+            bound.insert(
+                id,
+                Binding {
+                    owner,
+                    compact: self.compact,
+                    last_used: Instant::now(),
+                    pending: false,
+                },
+            );
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.owner.is_some() {
+            self.sessions.lock().remove(&self.key);
+        }
+    }
 }
 
 impl Sessions {
@@ -58,7 +100,8 @@ impl Sessions {
         let mut bound = self.lock();
         match bound.get_mut(id) {
             Some(binding)
-                if binding.owner == *who
+                if !binding.pending
+                    && binding.owner == *who
                     && binding.compact == compact
                     && binding.last_used.elapsed() < IDLE =>
             {
@@ -69,49 +112,70 @@ impl Sessions {
         }
     }
 
-    /// Makes room for one more session of `who`'s: the sessions to end so the token stays within
-    /// [`PER_TOKEN`], or `None` when the server already holds [`TOTAL`] and nothing can be ended.
-    /// The sessions returned are forgotten already; the caller closes them.
-    pub(crate) fn make_room(&self, who: &Authenticated) -> Option<Vec<SessionRef>> {
+    /// Holds a place for one more session of `who`'s, and returns it with the sessions to end so
+    /// the token stays within [`PER_TOKEN`] (its least recently used, already forgotten here; the
+    /// caller closes them). `None` when there is no room: the server holds [`TOTAL`] already, or
+    /// the token's places are all taken by sessions still being opened.
+    ///
+    /// Room is found and taken under one lock, so requests racing each other are counted.
+    pub(crate) fn reserve(
+        &self,
+        who: &Authenticated,
+        compact: bool,
+    ) -> Option<(Reservation<'_>, Vec<SessionRef>)> {
         let mut bound = self.lock();
-        let mut own: Vec<(&String, Instant)> = bound
+        let mut own: Vec<(&String, Instant, bool)> = bound
             .iter()
             .filter(|(_, binding)| binding.owner == *who)
-            .map(|(id, binding)| (id, binding.last_used))
+            .map(|(id, binding)| (id, binding.last_used, binding.pending))
             .collect();
-        own.sort_by_key(|(_, last_used)| *last_used);
         let surplus = (own.len() + 1).saturating_sub(PER_TOKEN);
+        own.retain(|(_, _, pending)| !pending);
+        own.sort_by_key(|(_, last_used, _)| *last_used);
+        if own.len() < surplus {
+            return None;
+        }
         let evicted: Vec<String> = own
             .into_iter()
             .take(surplus)
-            .map(|(id, _)| id.clone())
+            .map(|(id, _, _)| id.clone())
             .collect();
         if bound.len() - evicted.len() >= TOTAL {
             return None;
         }
-        Some(
-            evicted
-                .into_iter()
-                .filter_map(|id| {
-                    bound.remove(&id).map(|binding| SessionRef {
-                        id,
-                        compact: binding.compact,
-                    })
+        let ended = evicted
+            .into_iter()
+            .filter_map(|id| {
+                bound.remove(&id).map(|binding| SessionRef {
+                    id,
+                    compact: binding.compact,
                 })
-                .collect(),
-        )
-    }
-
-    /// Records that `who` opened the session `id`.
-    pub(crate) fn bind(&self, id: String, who: Authenticated, compact: bool) {
-        self.lock().insert(
-            id,
+            })
+            .collect();
+        // No header value can hold a NUL, so no client can name this key as its session.
+        let key = format!(
+            "\0reserved-{}",
+            self.reservations.fetch_add(1, Ordering::Relaxed)
+        );
+        bound.insert(
+            key.clone(),
             Binding {
-                owner: who,
+                owner: who.clone(),
                 compact,
                 last_used: Instant::now(),
+                pending: true,
             },
         );
+        drop(bound);
+        Some((
+            Reservation {
+                sessions: self,
+                key,
+                owner: Some(who.clone()),
+                compact,
+            },
+            ended,
+        ))
     }
 
     /// Forgets a session its client ended.
@@ -142,10 +206,13 @@ impl Sessions {
         ended
             .into_iter()
             .filter_map(|id| {
-                bound.remove(&id).map(|binding| SessionRef {
-                    id,
-                    compact: binding.compact,
-                })
+                bound
+                    .remove(&id)
+                    .filter(|binding| !binding.pending)
+                    .map(|binding| SessionRef {
+                        id,
+                        compact: binding.compact,
+                    })
             })
             .collect()
     }
@@ -185,7 +252,9 @@ impl<B: Body + Unpin> Body for Abandonable<B> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<B::Data>, B::Error>>> {
         let polled = Pin::new(&mut self.inner).poll_frame(cx);
-        if matches!(polled, Poll::Ready(None)) {
+        // A server stops polling a body that says it has ended, and drops it: that is not
+        // abandoning it.
+        if matches!(polled, Poll::Ready(None)) || self.inner.is_end_stream() {
             self.on_abandon = None;
         }
         polled
@@ -217,14 +286,21 @@ mod tests {
             principal: principal.to_owned(),
             token: token.to_owned(),
             hash: legion_core::tokens::hash(token),
+            expires: None,
         }
+    }
+
+    fn open(sessions: &Sessions, id: &str, owner: &Authenticated) -> Vec<SessionRef> {
+        let (place, ended) = sessions.reserve(owner, false).unwrap();
+        place.bind(id.to_owned());
+        ended
     }
 
     #[test]
     fn a_session_is_its_tokens_alone() {
         let sessions = Sessions::default();
         let phone = who("phone", "phone");
-        sessions.bind("s1".to_owned(), phone.clone(), false);
+        open(&sessions, "s1", &phone);
         assert!(sessions.admit("s1", &phone, false));
         assert!(!sessions.admit("s1", &who("admin", "admin"), false));
         assert!(!sessions.admit("s1", &who("phone2", "phone"), false));
@@ -239,25 +315,40 @@ mod tests {
         let sessions = Sessions::default();
         let phone = who("phone", "phone");
         for n in 0..PER_TOKEN {
-            assert_eq!(sessions.make_room(&phone), Some(Vec::new()));
-            sessions.bind(format!("s{n}"), phone.clone(), false);
+            assert_eq!(open(&sessions, &format!("s{n}"), &phone), Vec::new());
         }
         assert!(sessions.admit("s0", &phone, false));
         // s0 was just used, so another is the least recently used.
-        let ended = sessions.make_room(&phone).unwrap();
+        let ended = open(&sessions, "late", &phone);
         assert_eq!(ended.len(), 1);
         assert_ne!(ended[0].id, "s0");
         assert!(!sessions.admit(&ended[0].id, &phone, false));
         assert!(sessions.admit("s0", &phone, false));
+        assert!(sessions.admit("late", &phone, false));
+    }
+
+    #[test]
+    fn places_being_opened_count_and_are_given_back() {
+        let sessions = Sessions::default();
+        let phone = who("phone", "phone");
+        let held: Vec<_> = (0..PER_TOKEN)
+            .map(|_| sessions.reserve(&phone, false).unwrap().0)
+            .collect();
+        // Every place is being opened, and none can be ended to make room.
+        assert!(sessions.reserve(&phone, false).is_none());
+        assert!(!sessions.admit("\0reserved-0", &phone, false));
+        drop(held);
+        assert!(sessions.reserve(&phone, false).is_some());
+        assert!(sessions.lock().is_empty());
     }
 
     #[test]
     fn the_server_holds_only_so_many() {
         let sessions = Sessions::default();
         for n in 0..TOTAL {
-            sessions.bind(format!("s{n}"), who(&format!("t{n}"), "p"), false);
+            open(&sessions, &format!("s{n}"), &who(&format!("t{n}"), "p"));
         }
-        assert_eq!(sessions.make_room(&who("late", "p")), None);
+        assert!(sessions.reserve(&who("late", "p"), false).is_none());
         // A token at its own limit still makes room by ending its own oldest.
         let crowded = Sessions::default();
         let phone = who("phone", "phone");
@@ -267,8 +358,11 @@ mod tests {
             } else {
                 who(&format!("t{n}"), "p")
             };
-            crowded.bind(format!("s{n}"), owner, false);
+            open(&crowded, &format!("s{n}"), &owner);
         }
-        assert_eq!(crowded.make_room(&phone).map(|ended| ended.len()), Some(1));
+        assert_eq!(
+            crowded.reserve(&phone, false).map(|(_, ended)| ended.len()),
+            Some(1)
+        );
     }
 }

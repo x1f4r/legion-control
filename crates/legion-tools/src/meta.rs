@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use doctor::{
-    FleetPingEntry, check_executable_on_path, check_linux_lingering, check_policy_exec_paths,
+    FleetPingEntry, check_executable_on_path, check_linux_lingering, check_policy_exec_roles,
     check_ssh_on_path, extract_login_path, fleet_ping_checks, parse_linger_output,
 };
 pub use init::{InitResult, render_node_toml, render_policy_toml};
@@ -34,7 +34,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, roles do not silently combine paths with exec, and each machine in fleet.toml answers (unless quick=true). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml answers (unless quick=true). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
     init::register(registry);

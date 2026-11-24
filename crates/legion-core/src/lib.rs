@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod config;
 mod ctx;
+pub mod exe;
 mod glob;
 mod node;
 pub mod paths;
@@ -20,9 +21,10 @@ mod tool;
 
 pub use config::{ConfigStore, Document};
 pub use ctx::{Ctx, Door, Event, EventSink};
+pub use exe::{current_exe, record_current_exe, validate_recorded_exe};
 pub use node::{CANCEL_GRACE, Call, Node, VERSION};
 pub use paths::Paths;
-pub use policy::{Access, Grant, Place, Policy};
+pub use policy::{Access, Grant, Place, Policy, ProtectedFilter, SECRET_LOCATIONS};
 pub use registry::{DocumentInfo, Registry, SourceCheck, ToolSource, is_tool_name};
 pub use route::{Local, RouteOutcome, Router};
 pub use tool::{BoxFuture, Handler, NoArgs, Tool, ToolError, input_schema, parse_args};

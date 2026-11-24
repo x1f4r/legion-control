@@ -640,6 +640,10 @@ fn copy_path(
             if cancel.is_cancelled() {
                 return Err(cancelled_error(opts.tool));
             }
+            if opts.own_dirs.is_blocked(&child_from) {
+                totals.skipped.push(path_to_string(&child_from));
+                continue;
+            }
             let child_meta = fs::symlink_metadata(&child_from)
                 .map_err(|error| map_io_error("inspect", &child_from, error))?;
             if child_meta.is_dir() && !(opts.same_device)(&child_from, &child_meta) {

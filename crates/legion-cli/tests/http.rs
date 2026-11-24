@@ -27,14 +27,10 @@ const POLICY: &str = "\
 role = \"observer\"
 
 [principals.admin]
-role = \"admin\"
+role = \"owner\"
 
 [roles.observer]
 allow = [\"effect:read\"]
-
-[roles.admin]
-allow = [\"*\"]
-delegate = true
 ";
 
 type Test = (&'static str, fn());
@@ -94,6 +90,18 @@ fn main() -> ExitCode {
         (
             "a_token_gives_no_one_more_than_they_have",
             a_token_gives_no_one_more_than_they_have,
+        ),
+        (
+            "only_the_owner_role_acts_as_others",
+            only_the_owner_role_acts_as_others,
+        ),
+        (
+            "a_burst_of_sessions_stays_within_the_cap",
+            a_burst_of_sessions_stays_within_the_cap,
+        ),
+        (
+            "only_a_dropped_stream_cancels_its_call",
+            only_a_dropped_stream_cancels_its_call,
         ),
         (
             "an_mcp_session_belongs_to_its_token",
@@ -187,7 +195,7 @@ impl Fixture {
         home.write_config("node.toml", "name = \"laptop\"\n");
         home.write_config("policy.toml", POLICY);
         let phone = make_token(&home, &["phone", "phone"]);
-        let admin = make_token(&home, &["admin", "admin"]);
+        let admin = make_token(&home, &["admin", "admin", "allow_owner=true"]);
         Fixture { home, phone, admin }
     }
 }
@@ -478,21 +486,32 @@ impl Events {
         }
     }
 
-    /// The next event's name and data, or `None` once the stream has ended.
+    /// The next event's name and data, or `None` once the stream has ended. Comments, which keep
+    /// a quiet stream alive, are skipped.
     fn next(&mut self) -> Option<(String, Value)> {
         loop {
-            if let Some(end) = self.buffered.find("\n\n") {
-                let event: String = self.buffered.drain(..end + 2).collect();
-                let mut name = String::new();
-                let mut data = String::new();
-                for line in event.lines() {
-                    if let Some(value) = line.strip_prefix("event:") {
-                        name = value.trim().to_owned();
-                    } else if let Some(value) = line.strip_prefix("data:") {
-                        data.push_str(value.trim());
-                    }
+            let event = self.next_block()?;
+            if event.lines().all(|line| line.starts_with(':')) {
+                continue;
+            }
+            let mut name = String::new();
+            let mut data = String::new();
+            for line in event.lines() {
+                if let Some(value) = line.strip_prefix("event:") {
+                    name = value.trim().to_owned();
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data.push_str(value.trim());
                 }
-                return Some((name, serde_json::from_str(&data).unwrap()));
+            }
+            return Some((name, serde_json::from_str(&data).unwrap()));
+        }
+    }
+
+    /// The next block of the stream as it was sent, comments included.
+    fn next_block(&mut self) -> Option<String> {
+        loop {
+            if let Some(end) = self.buffered.find("\n\n") {
+                return Some(self.buffered.drain(..end + 2).collect());
             }
             let mut size = String::new();
             if self.reader.read_line(&mut size).ok()? == 0 {
@@ -1331,23 +1350,11 @@ fn a_token_gives_no_one_more_than_they_have() {
             "--as",
             "keeper",
         ],
-        "only owner may",
+        "only a caller with the owner role",
     );
     refused(
         &["token", "add", "x", "phone", "--as", "keeper"],
-        "unless the caller's role, keeper, delegates",
-    );
-    refused(
-        &[
-            "token",
-            "add",
-            "x",
-            "owner",
-            "allow_owner=true",
-            "--as",
-            "admin",
-        ],
-        "only owner may",
+        "unless the caller has the owner role",
     );
     let keeper = make_token(&home, &["keeper", "keeper", "--as", "keeper"]);
     make_token(&home, &["phone", "phone", "--as", "admin"]);
@@ -1366,10 +1373,10 @@ fn a_token_gives_no_one_more_than_they_have() {
     assert_eq!(names(&["token", "list", "--as", "keeper"]), ["keeper"]);
     assert_eq!(
         names(&["token", "list", "--as", "admin"]),
-        ["keeper", "phone"]
+        ["keeper", "phone", "root"]
     );
     assert_eq!(names(&["token", "list"]), ["keeper", "phone", "root"]);
-    for (name, caller) in [("phone", "keeper"), ("root", "admin")] {
+    for (name, caller) in [("phone", "keeper"), ("root", "keeper")] {
         let removed = home.run(&["token", "remove", name, "--as", caller, "--json"]);
         assert_eq!(
             removed.json()["code"],
@@ -1635,6 +1642,36 @@ fn a_listed_origin_can_call_from_a_browser() {
         Some(page.as_str())
     );
 
+    // Errors too, whatever their status, so the page can read what went wrong.
+    for body in [
+        json!({"tool": "test.sleep", "args": {"secs": 1}}),
+        json!({"tool": "fs.frobnicate"}),
+        json!({"tool": "test.fail", "args": {"code": "busy"}}),
+    ] {
+        let failed = http(
+            server.port,
+            "POST",
+            "/v1/call",
+            &headers,
+            body.to_string().as_bytes(),
+        );
+        assert!(failed.status >= 400, "{body}");
+        assert_eq!(
+            failed.header("access-control-allow-origin"),
+            Some(page.as_str()),
+            "{} {body}",
+            failed.status
+        );
+    }
+    let mut malformed = headers.clone();
+    malformed.push(("Content-Type", "application/json".to_owned()));
+    let not_json = http(server.port, "POST", "/v1/call", &malformed, b"not json");
+    assert_eq!(not_json.status, 400);
+    assert_eq!(
+        not_json.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+
     // Any other page gets nothing it could use.
     let other = http(
         server.port,
@@ -1712,4 +1749,228 @@ fn mcp_takes_post_and_delete() {
         assert_eq!(reply.status, 405, "{method}");
         assert_eq!(reply.header("allow"), Some("POST, DELETE"), "{method}");
     }
+}
+
+fn only_the_owner_role_acts_as_others() {
+    let home = Home::new();
+    let roles = "\n[principals.boss]\nrole = \"owner\"\n\n[principals.deputy]\nrole = \"deputy\"\n\n[roles.deputy]\nallow = [\"*\"]\n";
+    home.write_config("policy.toml", &format!("{POLICY}{roles}"));
+    let deputy = make_token(&home, &["deputy", "deputy"]);
+    let run = |line: &[&str]| {
+        let mut line = line.to_vec();
+        line.push("--json");
+        home.run(&line)
+    };
+
+    // A principal the file gives the owner role is as much the owner as owner is.
+    let boss = run(&["token", "add", "b", "boss"]);
+    assert_eq!(boss.json()["code"], json!("denied"), "{}", boss.stdout);
+    assert!(boss.stdout.contains("owner role"), "{}", boss.stdout);
+    let agent = run(&["agent.add", "agent=claude", "as=boss", "dry_run=true"]);
+    assert_eq!(agent.json()["code"], json!("denied"), "{}", agent.stdout);
+    let agent = run(&["agent.add", "agent=claude", "as=phone", "dry_run=true"]);
+    assert_eq!(agent.code, 0, "{}", agent.stdout);
+    let refused = run(&[
+        "token",
+        "add",
+        "b",
+        "boss",
+        "allow_owner=true",
+        "--as",
+        "deputy",
+    ]);
+    assert_eq!(refused.json()["code"], json!("denied"));
+
+    // A token made through an expiring token expires no later.
+    let lasting = make_token(
+        &home,
+        &["lasting", "boss", "allow_owner=true", "expires_days=30"],
+    );
+    let server = Server::start(&home);
+    for (days, status) in [(None, 403), (Some(60), 403), (Some(10), 200)] {
+        let mut args = json!({"name": format!("p{}", days.unwrap_or(0)), "principal": "phone"});
+        if let Some(days) = days {
+            args["expires_days"] = json!(days);
+        }
+        let made = server.call(&lasting, json!({"tool": "token.add", "args": args}));
+        assert_eq!(made.status, status, "{days:?}: {}", made.text());
+    }
+
+    // Acting as another principal is the owner role's alone: a file that gives it to a role of
+    // its own is refused, so the deputy cannot become owner by asking.
+    home.write_config("policy.toml", &format!("{POLICY}{roles}delegate = true\n"));
+    let refused = run(&["meta.whoami"]);
+    assert_eq!(refused.code, 1);
+    assert!(
+        refused.stdout.contains("the owner's alone"),
+        "{}",
+        refused.stdout
+    );
+    let minted = server.call(
+        &deputy,
+        json!({"tool": "token.add", "as": "owner", "args": {"name": "x", "principal": "owner", "allow_owner": true}}),
+    );
+    assert_ne!(minted.status, 200, "{}", minted.text());
+    assert!(!minted.text().contains("lgn_"));
+}
+
+fn a_burst_of_sessions_stays_within_the_cap() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let port = server.port;
+    let burst = 24;
+    let start = Arc::new(std::sync::Barrier::new(burst));
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }
+    })
+    .to_string();
+    let threads: Vec<_> = (0..burst)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            let token = fixture.phone.clone();
+            let body = initialize.clone();
+            std::thread::spawn(move || {
+                let headers = vec![
+                    ("Authorization", format!("Bearer {token}")),
+                    ("Accept", "application/json, text/event-stream".to_owned()),
+                    ("Content-Type", "application/json".to_owned()),
+                ];
+                start.wait();
+                let reply = http(port, "POST", "/mcp", &headers, body.as_bytes());
+                (
+                    reply.status,
+                    reply.header("mcp-session-id").map(str::to_owned),
+                )
+            })
+        })
+        .collect();
+    let opened: Vec<(u16, Option<String>)> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    for (status, _) in &opened {
+        assert!(*status == 200 || *status == 503, "{status}");
+    }
+    let usable = opened
+        .iter()
+        .filter_map(|(_, session)| session.as_deref())
+        .filter(|session| in_session(&server, &fixture.phone, session, "POST").status == 200)
+        .count();
+    assert!(usable <= 16, "{usable} sessions are open for one token");
+    assert!(usable > 0);
+
+    // Ending a session with a body still forgets it, so it no longer counts.
+    let session = open_session(&server, &fixture.admin);
+    let mcp = Mcp {
+        server: &server,
+        token: &fixture.admin,
+        path: "/mcp",
+        session: Some(session.clone()),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/list", None);
+    let body = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}});
+    let ended = http(
+        port,
+        "DELETE",
+        "/mcp",
+        &headers,
+        body.to_string().as_bytes(),
+    );
+    assert!((200..300).contains(&ended.status), "{}", ended.status);
+    assert_eq!(
+        in_session(&server, &fixture.admin, &session, "POST").status,
+        404
+    );
+}
+
+fn only_a_dropped_stream_cancels_its_call() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let session = open_session(&server, &fixture.phone);
+    let mcp = Mcp {
+        server: &server,
+        token: &fixture.phone,
+        path: "/mcp",
+        session: Some(session),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/call", Some("test_sleep"));
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"_meta": {"progressToken": "p"}, "name": "test_sleep", "arguments": {"seconds": 60}}
+    });
+    let stream = send(
+        server.port,
+        "POST",
+        "/mcp",
+        &headers,
+        call.to_string().as_bytes(),
+    );
+    let mut reader = BufReader::new(stream);
+    assert_eq!(read_head(&mut reader).0, 200);
+    let mut progress = || loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "the call's stream ended"
+        );
+        assert!(!line.contains("\"result\""), "the call ended: {line}");
+        if line.contains("notifications/progress") {
+            return;
+        }
+    };
+    progress();
+
+    // A request that reuses the running call's id, refused for asking for JSON alone.
+    let mut refused = headers.clone();
+    refused.retain(|(name, _)| *name != "Accept");
+    refused.push(("Accept", "application/json".to_owned()));
+    let reply = http(
+        server.port,
+        "POST",
+        "/mcp",
+        &refused,
+        call.to_string().as_bytes(),
+    );
+    assert_eq!(reply.status, 406, "{}", reply.text());
+    // The call goes on: two seconds more of progress, and no result.
+    for _ in 0..40 {
+        progress();
+    }
+    drop(reader);
+    let line = audited(&fixture.home, |line| line["tool"] == json!("test.sleep"));
+    assert_eq!(line["outcome"], json!("cancelled"));
+
+    // The JSON API's stream says something every few seconds while its call is quiet, so a
+    // client that vanished is noticed.
+    let marker = fixture.home.home().join("quiet-started");
+    let argv = [
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        HELPER_FLAG.to_owned(),
+        "wait".to_owned(),
+        marker.to_string_lossy().into_owned(),
+    ];
+    let mut events = Events::open(
+        server.port,
+        &fixture.admin,
+        &json!({"tool": "exec.run", "args": {"argv": argv}}),
+    );
+    assert_eq!(events.status, 200);
+    let block = events.next_block().expect("the quiet stream said nothing");
+    assert!(block.starts_with(':'), "{block}");
 }

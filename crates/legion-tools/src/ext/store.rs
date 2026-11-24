@@ -1,20 +1,30 @@
 //! Reloadable store over `tools.d/*.toml`, implementing [`legion_core::ToolSource`].
 //!
-//! Comparing the directory's `.toml` file bytes (as [`legion_core::ConfigStore`] does for single
-//! documents) ensures edits, additions and deletions within the same second are picked up on the
-//! very next list or call without restarting long-lived doors. Broken files are skipped and
-//! recorded for `ext.list` and `meta.doctor`, never fatal.
+//! Re-reading file contents is gated on directory and file metadata (entry names, directory
+//! modification time, file lengths, modification times, and on Unix inode and status-change
+//! timestamps), so repeated lookups and listings do not read `.toml` files while nothing on disk
+//! changed. Additions, removals, atomic replacements (`ext.define`), and edits whose size or
+//! timestamp changes are picked up on the very next call without restarting long-lived doors.
+//!
+//! The one change metadata cannot catch is an in-place overwrite (not an atomic rename) of the
+//! exact same byte length within the filesystem's timestamp granularity. Broken files are skipped
+//! and recorded for `ext.list` and `meta.doctor`, never fatal.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
 
 use legion_core::proto::ToolSpec;
 use legion_core::{Paths, Registry, SourceCheck, Tool, ToolSource};
 
-use super::def::{ExtensionDef, parse_toml};
+use super::def::{ExtensionDef, parse_toml_with_reserved};
 use super::run::ExtensionTool;
 
 /// One valid extension tool loaded from disk.
@@ -50,16 +60,46 @@ pub struct Snapshot {
     pub dir_error: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-enum DirFingerprint {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileMeta {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl FileMeta {
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+            #[cfg(unix)]
+            ctime: meta.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: meta.ctime_nsec(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirMeta {
     Missing,
     Error(String),
-    Files(BTreeMap<OsString, Result<Vec<u8>, String>>),
+    Present {
+        dir_modified: Option<SystemTime>,
+        files: BTreeMap<OsString, Result<FileMeta, String>>,
+    },
 }
 
 struct Cached {
     dir: PathBuf,
-    fingerprint: DirFingerprint,
+    meta: DirMeta,
     snapshot: Arc<Snapshot>,
 }
 
@@ -67,6 +107,8 @@ struct Cached {
 #[derive(Default)]
 pub struct ExtensionStore {
     cached: Mutex<Option<Cached>>,
+    #[cfg(test)]
+    file_reads: AtomicUsize,
 }
 
 impl ExtensionStore {
@@ -75,21 +117,30 @@ impl ExtensionStore {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn file_reads(&self) -> usize {
+        self.file_reads.load(Ordering::Relaxed)
+    }
+
     fn snapshot(&self, paths: &Paths, builtins: &Registry) -> Arc<Snapshot> {
         let dir = paths.tools_dir();
-        let fingerprint = fingerprint_dir(&dir);
+        let meta = scan_dir_meta(&dir);
         let mut guard = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(cached) = guard.as_ref()
             && cached.dir == dir
-            && cached.fingerprint == fingerprint
+            && cached.meta == meta
         {
             return Arc::clone(&cached.snapshot);
         }
         let is_builtin = |name: &str| builtins.get(name).is_some();
-        let snapshot = Arc::new(build_snapshot(&dir, &fingerprint, &is_builtin));
+        let is_reserved_family = |family: &str| builtins.has_family(family);
+        let (snapshot, _reads) = build_snapshot(&dir, &meta, &is_builtin, &is_reserved_family);
+        #[cfg(test)]
+        self.file_reads.fetch_add(_reads, Ordering::Relaxed);
+        let snapshot = Arc::new(snapshot);
         *guard = Some(Cached {
             dir,
-            fingerprint,
+            meta,
             snapshot: Arc::clone(&snapshot),
         });
         snapshot
@@ -177,17 +228,23 @@ impl ToolSource for ExtensionStore {
 }
 
 /// Reads a fresh [`Snapshot`] directly from `tools_dir` without caching (used by `ext.*` tools).
-pub fn load_snapshot(tools_dir: &Path, is_builtin: &dyn Fn(&str) -> bool) -> Snapshot {
-    let fingerprint = fingerprint_dir(tools_dir);
-    build_snapshot(tools_dir, &fingerprint, is_builtin)
+pub fn load_snapshot(
+    tools_dir: &Path,
+    is_builtin: &dyn Fn(&str) -> bool,
+    is_reserved_family: &dyn Fn(&str) -> bool,
+) -> Snapshot {
+    let meta = scan_dir_meta(tools_dir);
+    let (snapshot, _) = build_snapshot(tools_dir, &meta, is_builtin, is_reserved_family);
+    snapshot
 }
 
-fn fingerprint_dir(dir: &Path) -> DirFingerprint {
+fn scan_dir_meta(dir: &Path) -> DirMeta {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return DirFingerprint::Missing,
-        Err(error) => return DirFingerprint::Error(error.to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return DirMeta::Missing,
+        Err(error) => return DirMeta::Error(error.to_string()),
     };
+    let dir_modified = std::fs::metadata(dir).ok().and_then(|m| m.modified().ok());
     let mut files = BTreeMap::new();
     for entry in entries {
         let Ok(entry) = entry else {
@@ -198,40 +255,62 @@ fn fingerprint_dir(dir: &Path) -> DirFingerprint {
         if lossy.starts_with('.') || !lossy.ends_with(".toml") {
             continue;
         }
-        let content = std::fs::read(entry.path()).map_err(|error| error.to_string());
-        files.insert(file_name, content);
+        let meta = std::fs::metadata(entry.path())
+            .map(|m| FileMeta::from_metadata(&m))
+            .map_err(|error| error.to_string());
+        files.insert(file_name, meta);
     }
-    DirFingerprint::Files(files)
+    DirMeta::Present {
+        dir_modified,
+        files,
+    }
 }
 
 fn build_snapshot(
     dir: &Path,
-    fingerprint: &DirFingerprint,
+    meta: &DirMeta,
     is_builtin: &dyn Fn(&str) -> bool,
-) -> Snapshot {
-    match fingerprint {
-        DirFingerprint::Missing => Snapshot {
-            tools: BTreeMap::new(),
-            broken: Vec::new(),
-            dir_exists: false,
-            dir_error: None,
-        },
-        DirFingerprint::Error(error) => Snapshot {
-            tools: BTreeMap::new(),
-            broken: vec![BrokenFile {
-                file: dir.to_path_buf(),
-                reason: format!("cannot be read: {error}"),
-                line: None,
-            }],
-            dir_exists: true,
-            dir_error: Some(error.clone()),
-        },
-        DirFingerprint::Files(files) => {
+    is_reserved_family: &dyn Fn(&str) -> bool,
+) -> (Snapshot, usize) {
+    match meta {
+        DirMeta::Missing => (
+            Snapshot {
+                tools: BTreeMap::new(),
+                broken: Vec::new(),
+                dir_exists: false,
+                dir_error: None,
+            },
+            0,
+        ),
+        DirMeta::Error(error) => (
+            Snapshot {
+                tools: BTreeMap::new(),
+                broken: vec![BrokenFile {
+                    file: dir.to_path_buf(),
+                    reason: format!("cannot be read: {error}"),
+                    line: None,
+                }],
+                dir_exists: true,
+                dir_error: Some(error.clone()),
+            },
+            0,
+        ),
+        DirMeta::Present { files, .. } => {
             let mut tools: BTreeMap<String, LoadedTool> = BTreeMap::new();
             let mut broken = Vec::new();
-            for (file_name, content) in files {
+            let mut reads = 0usize;
+            for (file_name, file_meta) in files {
                 let path = dir.join(file_name);
-                let bytes = match content {
+                if let Err(error) = file_meta {
+                    broken.push(BrokenFile {
+                        file: path,
+                        reason: format!("cannot be read: {error}"),
+                        line: None,
+                    });
+                    continue;
+                }
+                reads += 1;
+                let bytes = match std::fs::read(&path) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         broken.push(BrokenFile {
@@ -242,7 +321,7 @@ fn build_snapshot(
                         continue;
                     }
                 };
-                match parse_toml(bytes, is_builtin) {
+                match parse_toml_with_reserved(&bytes, is_builtin, is_reserved_family) {
                     Ok(def) => {
                         if let Some(existing) = tools.get(&def.name) {
                             broken.push(BrokenFile {
@@ -276,12 +355,82 @@ fn build_snapshot(
                     }
                 }
             }
-            Snapshot {
-                tools,
-                broken,
-                dir_exists: true,
-                dir_error: None,
-            }
+            (
+                Snapshot {
+                    tools,
+                    broken,
+                    dir_exists: true,
+                    dir_error: None,
+                },
+                reads,
+            )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_ext(path: &Path, description: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "name = \"meta_gate.ping\"\ndescription = \"{description}\"\neffect = \"read\"\nrun = [\"echo\", \"ok\"]\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unchanged_directory_does_not_reread_files_and_same_second_size_change_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let builtins = Registry::new();
+        let store = ExtensionStore::new();
+
+        // Missing directory: zero file reads, repeated lookups stay at zero.
+        assert!(store.specs(&paths, &builtins).is_empty());
+        assert!(store.get(&paths, &builtins, "meta_gate.ping").is_none());
+        assert_eq!(store.file_reads(), 0);
+
+        let tools_d = paths.tools_dir();
+        std::fs::create_dir_all(&tools_d).unwrap();
+        let file = tools_d.join("meta_gate.ping.toml");
+        write_ext(&file, "V1.");
+
+        // First lookup reads the one file.
+        let specs = store.specs(&paths, &builtins);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].description, "V1.");
+        assert_eq!(store.file_reads(), 1);
+
+        // Repeated lookups, listings, and doctor checks perform zero additional file reads.
+        for _ in 0..5 {
+            assert!(store.get(&paths, &builtins, "meta_gate.ping").is_some());
+            assert_eq!(store.specs(&paths, &builtins).len(), 1);
+            assert!(store.checks(&paths, &builtins)[0].ok);
+        }
+        assert_eq!(store.file_reads(), 1);
+
+        // Two writes within the same second of different sizes are seen immediately.
+        write_ext(&file, "V2 with a longer description.");
+        let specs = store.specs(&paths, &builtins);
+        assert_eq!(specs[0].description, "V2 with a longer description.");
+        assert_eq!(store.file_reads(), 2);
+
+        write_ext(&file, "V3.");
+        let specs = store.specs(&paths, &builtins);
+        assert_eq!(specs[0].description, "V3.");
+        assert_eq!(store.file_reads(), 3);
+
+        // Again, no extra reads while unchanged.
+        assert_eq!(store.specs(&paths, &builtins)[0].description, "V3.");
+        assert_eq!(store.file_reads(), 3);
+
+        // Removal is picked up immediately without reading any file.
+        std::fs::remove_file(&file).unwrap();
+        assert!(store.specs(&paths, &builtins).is_empty());
+        assert_eq!(store.file_reads(), 3);
     }
 }

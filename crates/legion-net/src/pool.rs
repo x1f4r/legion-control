@@ -1256,6 +1256,7 @@ impl Fleet {
                 cancel: call.cancel.child_token(),
                 events: call.events.for_machine(machine.as_str()),
                 hops: call.hops,
+                credential_expires: call.credential_expires,
             };
             set.spawn(async move {
                 let outcome = if machine == here {

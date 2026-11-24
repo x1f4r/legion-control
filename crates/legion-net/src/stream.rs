@@ -6,15 +6,18 @@
 //! every path and value rides inside the header, so nothing a caller supplies is ever quoted for a
 //! remote shell.
 //!
-//! Every header carries `protocol`, the version of this exchange it speaks. A node that does not
-//! speak that version, or does not know the operation, answers `unsupported` and names what it
-//! speaks, so two nodes of different ages fail plainly rather than misread each other.
+//! Every header carries `protocol`, the version of this exchange it speaks, and a node's first
+//! line, before any reply or refusal, is `{"protocol": N}`, the version it speaks. A node that
+//! does not speak a header's version, or does not know the operation, answers `unsupported` and
+//! names what it speaks; a reader refuses a node whose first line does not say, before it sends
+//! anything that relies on the node holding to this version. Two nodes of different ages fail
+//! plainly rather than misread each other.
 //!
-//! Every reply starts with one JSON line, so a client can skip a login banner before it and tell a
-//! refusal (`{"error": …}`) from data. While an operation works on something long (hashing a
-//! large file, listing a large tree, verifying what it received), it writes `{"busy": true}` every
-//! [`HEARTBEAT`] where a line is awaited, so a reader can give up on silence without giving up on
-//! work:
+//! After that line every reply starts with one JSON line, so a client can skip a login banner
+//! before it and tell a refusal (`{"error": …}`) from data. While an operation works on something
+//! long (hashing a large file, listing a large tree, verifying what it received), it writes
+//! `{"busy": true}` every [`HEARTBEAT`] where a line is awaited, so a reader can give up on
+//! silence without giving up on work:
 //!
 //! | `op` | Header | Reply |
 //! | --- | --- | --- |
@@ -23,7 +26,7 @@
 //! | `get` | `{path, offset?}` | `{size}`, then the bytes from `offset` to the end |
 //! | `put` | `{path, size, hash, offset?, mode?, mtime?}` | `{offset}`; reads the rest; `{ok, size, hash}` |
 //! | `pack` | `{root, names}` | `{ready, skipped}`, then a tar stream of those names |
-//! | `unpack` | `{root, names, hash?}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
+//! | `unpack` | `{root, entries}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
 //! | `delete` | `{root, names}` | `{removed, skipped}` |
 //!
 //! Each operation is authorised as the file tool it amounts to would be (`fs.read` for the first
@@ -36,13 +39,16 @@
 //! ends and the reason goes to stderr. A receiver that refuses replies and returns at once, which
 //! closes its input, so a sender writing to it is never left blocked.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, FileTimes};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::guard::{Expected, Guarded, Watch};
 use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
@@ -154,13 +160,11 @@ pub(crate) enum Op {
     },
     /// `names` are the entries planned for this archive; anything else in it is refused, so a
     /// source can only deliver what the destination agreed to take.
-    /// With `hash`, the files written are hashed once they are in place and the hashes sent
-    /// back, so the sender can check they are what it listed.
+    /// `entries` are what the destination agreed to take, as the source listed them; the
+    /// archive must carry each of them once, as listed, and nothing else.
     Unpack {
         root: String,
-        names: Vec<String>,
-        #[serde(default)]
-        hash: bool,
+        entries: Vec<Planned>,
     },
     Delete {
         root: String,
@@ -197,6 +201,20 @@ pub(crate) fn op_tool(op: &str) -> Option<(&'static str, Effect)> {
     }
 }
 
+/// One entry an `unpack` agrees to take: its name and kind, a file's size and, with `checksum`,
+/// its hash, a link's target.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct Planned {
+    pub path: String,
+    pub kind: EntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<Hash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
 /// What `stat` says about a path.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct StatReply {
@@ -229,6 +247,9 @@ pub(crate) struct ManifestDone {
     pub entries: u64,
     #[serde(default)]
     pub skipped: Vec<SkippedEntry>,
+    /// How many entries could not be read, when `skipped` names only the first of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_total: Option<u64>,
 }
 
 /// The line that answers a `get` before its bytes.
@@ -275,16 +296,9 @@ pub(crate) struct UnpackDone {
     pub bytes: u64,
     #[serde(default)]
     pub skipped: Vec<SkippedEntry>,
-    /// Entries the archive carried that were not planned, refused and drained unread.
-    #[serde(default)]
-    pub unplanned: Vec<String>,
     /// Entries of the archive whose names differ only in letter case.
     #[serde(default)]
     pub case_collisions: Vec<CaseCollision>,
-    /// When asked for, each file written and its hash as it now is on disk, or nothing when it
-    /// could not be read back.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub hashes: BTreeMap<String, Option<Hash>>,
 }
 
 /// The line that ends a `delete`.
@@ -323,6 +337,10 @@ pub fn serve<R: Read, W: Write>(
     let started = Instant::now();
     let mut input = BufReader::new(input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
+    // Said before anything else, refusals included, so a reader can tell this node's replies
+    // from those of one too old to hold to what it asks.
+    let _ =
+        line(&mut output, &json!({ "protocol": STREAM_PROTOCOL })).and_then(|()| output.flush());
     let (header, recorded) = match read_header(&mut input) {
         Ok(read) => read,
         Err(error) => {
@@ -550,7 +568,7 @@ fn run<R: BufRead, W: Write>(
             mtime,
         } => put(grant, &path, size, &hash, mode, mtime, input, output),
         Op::Pack { root, names } => pack(grant, &root, &names, output),
-        Op::Unpack { root, names, hash } => unpack(grant, &root, &names, hash, input, output),
+        Op::Unpack { root, entries } => unpack(grant, &root, &entries, input, output),
         Op::Delete { root, names } => delete(grant, &root, &names, output),
     }
 }
@@ -593,20 +611,35 @@ fn list<W: Write>(
         .map_err(|error| Failure::Raw(gone(&error)))
 }
 
+/// How much of the line that ends a listing may go to naming what could not be read, so the line
+/// stays well inside what a reader takes.
+const MOST_SKIPPED_BYTES: usize = 256 * 1024;
+
 fn write_listing<W: Write>(
     output: &mut W,
     entries: Vec<Entry>,
-    skipped: Vec<SkippedEntry>,
+    mut skipped: Vec<SkippedEntry>,
 ) -> io::Result<()> {
     for entry in &entries {
         line(output, entry)?;
     }
+    let total = skipped.len();
+    let mut used = 0;
+    let kept = skipped
+        .iter()
+        .take_while(|entry| {
+            used += entry.path.len() + entry.reason.len() + 32;
+            used <= MOST_SKIPPED_BYTES
+        })
+        .count();
+    skipped.truncate(kept);
     line(
         output,
         &ManifestDone {
             done: true,
             entries: entries.len() as u64,
             skipped,
+            skipped_total: (kept < total).then_some(total as u64),
         },
     )?;
     output.flush()
@@ -685,9 +718,13 @@ fn stat<W: Write>(
 }
 
 /// Whether the file system holding `path`, or the nearest directory above it that exists,
-/// ignores letter case, told without writing anything: a name there, one of its entries or of the
-/// directories above it, is looked up again with the case of its letters flipped, and the two are
-/// the same file only where case is ignored. `None` when no name nearby has a letter to flip.
+/// ignores letter case, told without writing anything: a name in that directory is looked up again
+/// with the case of its letters flipped, and the two are the same file only where case is ignored.
+///
+/// Only names inside the directory are on its file system: the directory's own name, and those
+/// above it, are in the directory that holds it, which a mount point's is not. `None` when the
+/// directory holds no name with a letter to flip, which a transfer takes as ignoring case, since
+/// that only holds back names that would collide.
 fn case_insensitive(path: &Path) -> Option<bool> {
     let dir = path
         .ancestors()
@@ -698,8 +735,7 @@ fn case_insensitive(path: &Path) -> Option<bool> {
         .take(64)
         .filter_map(Result::ok)
         .map(|entry| entry.path());
-    let above = dir.ancestors().map(Path::to_path_buf);
-    for candidate in inside.chain(above) {
+    for candidate in inside {
         // A link and what it leads to are the same file whatever their names.
         if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
             continue;
@@ -856,22 +892,34 @@ fn pack<W: Write>(
 fn unpack<R: BufRead, W: Write>(
     grant: &Grant,
     root: &str,
-    names: &[String],
-    hash: bool,
+    entries: &[Planned],
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Write)?;
-    let mut planned = HashSet::with_capacity(names.len());
-    let mut ancestors = HashSet::new();
-    for name in names {
-        let name = legion_xfer::validate_relative_path(name).map_err(xfer_error)?;
-        let mut parent = name.as_str();
-        while let Some((above, _)) = parent.rsplit_once('/') {
-            ancestors.insert(above.to_owned());
-            parent = above;
+    let mut plan = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let name = legion_xfer::validate_relative_path(&entry.path).map_err(xfer_error)?;
+        let incomplete = match entry.kind {
+            EntryKind::File => entry.size.is_none(),
+            EntryKind::Symlink => entry.target.is_none(),
+            EntryKind::Dir => false,
+        };
+        let expected = Expected {
+            kind: entry.kind,
+            size: entry.size,
+            hash: entry.hash,
+            target: entry.target.clone(),
+        };
+        if incomplete || plan.insert(name, expected).is_some() {
+            return Err(Failure::Reply(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "The unpack's plan lists {} twice, or without its size or link target.",
+                    entry.path
+                ),
+            )));
         }
-        planned.insert(name);
     }
     if fs::metadata(&root).is_ok_and(|meta| !meta.is_dir()) {
         return Err(Failure::Reply(
@@ -886,56 +934,56 @@ fn unpack<R: BufRead, W: Write>(
         ));
     }
     reply(output, &UnpackReady { ready: true })?;
-    let (report, mut refused, unplanned, hashes) = feed(input, None, output, |fed| {
-        let mut refused: Vec<SkippedEntry> = Vec::new();
-        let mut unplanned: Vec<String> = Vec::new();
-        let report = legion_xfer::unpack_filtered(&root, fed, |rel, kind| {
-            // A directory on the way to a planned entry may come along; nothing else may.
-            let expected =
-                planned.contains(rel) || (kind == EntryKind::Dir && ancestors.contains(rel));
-            if !expected {
-                unplanned.push(rel.to_owned());
-                refused.push(SkippedEntry {
-                    path: rel.to_owned(),
-                    reason: "it was not among the entries planned for this transfer".to_owned(),
-                });
+    let (report, mut refused, violation) = feed(input, None, output, |fed| {
+        let watch = Rc::new(RefCell::new(Watch::new(plan)));
+        let mut refused: HashMap<String, String> = HashMap::new();
+        let guarded = Guarded::new(fed, Rc::clone(&watch));
+        let report = legion_xfer::unpack_filtered(&root, guarded, |rel, kind| {
+            let mut watch = watch.borrow_mut();
+            // The entry the unpack is about to write must be the one whose header was checked.
+            let checked_entry = watch.current.take();
+            if checked_entry.is_none_or(|(name, checked_kind)| name != rel || checked_kind != kind)
+            {
+                let _ = watch.refuse(rel, "is not the entry whose header was checked".to_owned());
                 return false;
             }
+            drop(watch);
             match checked(grant, &root, rel, Access::Write) {
                 Ok(_) => true,
                 Err(error) => {
-                    refused.push(SkippedEntry {
-                        path: rel.to_owned(),
-                        reason: error.message,
-                    });
+                    refused.insert(rel.to_owned(), error.message);
                     false
                 }
             }
         });
-        // Read back what was written, now it is in place, for the sender to compare.
-        let mut hashes = BTreeMap::new();
-        if hash && let Ok(report) = &report {
-            for rel in &report.files {
-                let read = resolve_relative_path(&root, rel)
-                    .and_then(|path| legion_xfer::hash::hash_file(&path))
-                    .ok();
-                hashes.insert(rel.clone(), read);
-            }
+        let watch = watch.borrow();
+        let mut violation = watch.refused.clone();
+        if violation.is_none()
+            && let Ok(report) = &report
+        {
+            violation = unaccounted(&watch, report);
         }
-        (report, refused, unplanned, hashes)
+        (report, refused, violation)
     })?;
+    if let Some((name, reason)) = violation {
+        return Err(Failure::Reply(
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("The archive's entry {name} {reason}, so the unpack stopped there."),
+            )
+            .with_details(json!({"violation": {"path": name, "reason": reason}})),
+        ));
+    }
     let report = report.map_err(xfer_error)?;
     let mut skipped: Vec<SkippedEntry> = report
         .skipped
         .into_iter()
-        .map(|entry| {
-            match refused
-                .iter()
-                .position(|refusal| refusal.path == entry.path)
-            {
-                Some(at) => refused.swap_remove(at),
-                None => entry,
-            }
+        .map(|entry| match refused.remove(&entry.path) {
+            Some(reason) => SkippedEntry {
+                path: entry.path,
+                reason,
+            },
+            None => entry,
         })
         .collect();
     skipped.sort();
@@ -948,11 +996,44 @@ fn unpack<R: BufRead, W: Write>(
             symlinks: report.symlinks.len() as u64,
             bytes: report.bytes,
             skipped,
-            unplanned,
             case_collisions: report.case_collisions,
-            hashes,
         },
     )
+}
+
+/// The first planned entry an archive that ended well never accounted for: neither written nor
+/// left out for a reason the unpack gave, and whether what was written adds up to the plan.
+fn unaccounted(watch: &Watch, report: &legion_xfer::UnpackReport) -> Option<(String, String)> {
+    let accounted: HashSet<&str> = report
+        .files
+        .iter()
+        .chain(&report.dirs)
+        .chain(&report.symlinks)
+        .map(String::as_str)
+        .chain(report.skipped.iter().map(|entry| entry.path.as_str()))
+        .collect();
+    let mut missing: Vec<&String> = watch
+        .planned()
+        .filter(|name| !accounted.contains(name.as_str()))
+        .collect();
+    missing.sort();
+    if let Some(name) = missing.first() {
+        return Some(((*name).clone(), "was planned and never came".to_owned()));
+    }
+    let planned_bytes: u64 = report
+        .files
+        .iter()
+        .filter_map(|name| watch.expected(name).and_then(|expected| expected.size))
+        .sum();
+    (planned_bytes != report.bytes).then(|| {
+        (
+            "the archive".to_owned(),
+            format!(
+                "carried {} bytes of files planned at {planned_bytes}",
+                report.bytes
+            ),
+        )
+    })
 }
 
 fn delete<W: Write>(

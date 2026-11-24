@@ -279,8 +279,7 @@ async fn extension_tool_is_visible_and_callable_through_mcp_without_restart() {
         .write_all(format!("{list_req}\n").as_bytes())
         .await
         .unwrap();
-    let list_reply: Value =
-        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let (list_reply, _) = read_response(&mut lines, json!(2)).await;
     let names: Vec<&str> = list_reply["result"]["tools"]
         .as_array()
         .unwrap()
@@ -299,8 +298,7 @@ async fn extension_tool_is_visible_and_callable_through_mcp_without_restart() {
         .write_all(format!("{call_req}\n").as_bytes())
         .await
         .unwrap();
-    let call_reply: Value =
-        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let (call_reply, _) = read_response(&mut lines, json!(3)).await;
     assert_eq!(
         call_reply["result"]["isError"],
         json!(false),
@@ -309,6 +307,212 @@ async fn extension_tool_is_visible_and_callable_through_mcp_without_restart() {
     let body: Value =
         serde_json::from_str(call_reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body, json!({"who": "observer", "arg": "mcp-live"}));
+
+    client_out.shutdown().await.unwrap();
+    serving.await.unwrap().unwrap();
+}
+
+/// Reads lines until the response matching `id` arrives, returning it alongside any server
+/// notifications received beforehand.
+async fn read_response<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut tokio::io::Lines<R>,
+    id: Value,
+) -> (Value, Vec<Value>) {
+    let mut notifications = Vec::new();
+    loop {
+        let line = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("stream closed before response arrived");
+        let message: Value = serde_json::from_str(&line).unwrap();
+        if message["id"] == id {
+            return (message, notifications);
+        }
+        notifications.push(message);
+    }
+}
+
+#[tokio::test]
+async fn full_mode_advertises_list_changed_and_notifies_only_when_catalog_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::new(Paths::under(dir.path()), legion_tools::registry());
+    let door = McpDoor::new(
+        node.clone(),
+        Arc::new(legion_core::Local),
+        Options::default(),
+    )
+    .unwrap();
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (server_in, server_out) = tokio::io::split(server);
+    let serving = tokio::spawn(door.serve(server_in, server_out));
+    let (client_in, mut client_out) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_in).lines();
+
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"}
+    }});
+    client_out
+        .write_all(format!("{init}\n").as_bytes())
+        .await
+        .unwrap();
+    let (init_reply, _) = read_response(&mut lines, json!(1)).await;
+    assert_eq!(
+        init_reply["result"]["capabilities"]["tools"]["listChanged"],
+        json!(true),
+        "{init_reply}"
+    );
+
+    client_out
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+
+    // Unchanged calls and idle ticks emit no notifications/tools/list_changed.
+    let ping = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+        "name": "meta_version"
+    }});
+    client_out
+        .write_all(format!("{ping}\n").as_bytes())
+        .await
+        .unwrap();
+    let (_, notifs) = read_response(&mut lines, json!(2)).await;
+    assert!(notifs.is_empty(), "unexpected notifications: {notifs:?}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    let ping2 = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "meta_version"
+    }});
+    client_out
+        .write_all(format!("{ping2}\n").as_bytes())
+        .await
+        .unwrap();
+    let (_, notifs) = read_response(&mut lines, json!(3)).await;
+    assert!(
+        notifs.is_empty(),
+        "no list_changed should be sent when nothing changed: {notifs:?}"
+    );
+
+    // Defining an extension via ext_define emits notifications/tools/list_changed once.
+    let define = json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+        "name": "ext_define",
+        "arguments": {
+            "name": "live.one",
+            "description": "First extension.",
+            "effect": "read",
+            "cmd": "echo ok"
+        }
+    }});
+    client_out
+        .write_all(format!("{define}\n").as_bytes())
+        .await
+        .unwrap();
+    let (define_reply, notifs) = read_response(&mut lines, json!(4)).await;
+    assert_eq!(
+        define_reply["result"]["isError"],
+        json!(false),
+        "{define_reply}"
+    );
+    let list_changed: Vec<&Value> = notifs
+        .iter()
+        .filter(|m| m["method"] == json!("notifications/tools/list_changed"))
+        .collect();
+    assert_eq!(list_changed.len(), 1, "{notifs:?}");
+
+    // Another unchanged call after the change emits nothing more.
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    let ping3 = json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+        "name": "meta_version"
+    }});
+    client_out
+        .write_all(format!("{ping3}\n").as_bytes())
+        .await
+        .unwrap();
+    let (_, notifs) = read_response(&mut lines, json!(5)).await;
+    assert!(notifs.is_empty(), "duplicate notification sent: {notifs:?}");
+
+    // Adding a second extension directly on disk while idle pushes list_changed via the watcher.
+    let tools_d = node.paths().tools_dir();
+    std::fs::write(
+        tools_d.join("live.two.toml"),
+        "name = \"live.two\"\ndescription = \"Second extension.\"\neffect = \"read\"\ncmd = \"echo two\"\n",
+    )
+    .unwrap();
+    let pushed = tokio::time::timeout(std::time::Duration::from_secs(3), lines.next_line())
+        .await
+        .expect("timed out waiting for notifications/tools/list_changed")
+        .unwrap()
+        .unwrap();
+    let pushed: Value = serde_json::from_str(&pushed).unwrap();
+    assert_eq!(
+        pushed["method"],
+        json!("notifications/tools/list_changed"),
+        "{pushed}"
+    );
+
+    client_out.shutdown().await.unwrap();
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn compact_mode_does_not_advertise_list_changed_or_notify() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::new(Paths::under(dir.path()), legion_tools::registry());
+    let door = McpDoor::new(
+        node.clone(),
+        Arc::new(legion_core::Local),
+        Options {
+            pinned: None,
+            compact: true,
+        },
+    )
+    .unwrap();
+
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (server_in, server_out) = tokio::io::split(server);
+    let serving = tokio::spawn(door.serve(server_in, server_out));
+    let (client_in, mut client_out) = tokio::io::split(client);
+    let mut lines = BufReader::new(client_in).lines();
+
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"}
+    }});
+    client_out
+        .write_all(format!("{init}\n").as_bytes())
+        .await
+        .unwrap();
+    let (init_reply, _) = read_response(&mut lines, json!(1)).await;
+    assert_ne!(
+        init_reply["result"]["capabilities"]["tools"]["listChanged"],
+        json!(true),
+        "{init_reply}"
+    );
+    client_out
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+
+    let tools_d = node.paths().tools_dir();
+    std::fs::create_dir_all(&tools_d).unwrap();
+    std::fs::write(
+        tools_d.join("compact.one.toml"),
+        "name = \"compact.one\"\ndescription = \"Added.\"\neffect = \"read\"\ncmd = \"echo ok\"\n",
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    let list_req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+    client_out
+        .write_all(format!("{list_req}\n").as_bytes())
+        .await
+        .unwrap();
+    let (_, notifs) = read_response(&mut lines, json!(2)).await;
+    assert!(
+        notifs.is_empty(),
+        "compact mode should not notify: {notifs:?}"
+    );
 
     client_out.shutdown().await.unwrap();
     serving.await.unwrap().unwrap();

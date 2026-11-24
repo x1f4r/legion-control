@@ -21,15 +21,18 @@ use legion_os::OsError;
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_tools::binfmt::verify_binary_matches_target;
+use legion_tools::floor::{SemVer, check_version_transition, commit_floor, machine_floor_path};
+use legion_tools::trust::RELEASE_PUBLIC_KEY;
 use legion_tools::update::{
     ReleaseFetcher, SystemFetcher, artifact_url, dist_cache_binary, normalize_version, random_hex,
-    resolve_release_binary, target_triple_for,
+    resolve_release_binary_with_key, resolve_target_for,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{FleetFile, RemoteOs, Transport, validate_ssh_target};
+use crate::config::{FleetFile, RemoteOs, Transport, validate_program, validate_ssh_target};
 use crate::connector::ssh_args;
 use crate::pool::Fleet;
 
@@ -39,8 +42,8 @@ const SSH_CMD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Timeout for copying the `legion` binary over `scp`.
 const SCP_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Fixed remote Unix command to detect OS and architecture.
-pub const UNIX_PROBE_COMMAND: &str = "uname -sm";
+/// Fixed remote Unix command to detect OS, architecture, and macOS Rosetta 2 translation.
+pub const UNIX_PROBE_COMMAND: &str = "sh -c 's=$(uname -s); m=$(uname -m); if [ \"$s\" = Darwin ] && [ \"$m\" = x86_64 ] && [ \"$(sysctl -in sysctl.proc_translated 2>/dev/null || true)\" = 1 ]; then printf \"%s %s translated=1\\n\" \"$s\" \"$m\"; else printf \"%s %s\\n\" \"$s\" \"$m\"; fi'";
 
 /// Fixed remote Unix command to ensure `$HOME/.local/bin` exists before `scp`.
 pub const UNIX_PREPARE_DIR_COMMAND: &str = "sh -c 'mkdir -p \"$HOME/.local/bin\"'";
@@ -66,7 +69,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(InstallTool {
         spec: ToolSpec {
             name: "fleet.install".to_owned(),
-            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, fetches and verifies the matching release artifact against SHA256SUMS (or uses a cached copy or a local file passed via `from`), copies it atomically into place, and opens a normal session to verify the installed version.".to_owned(),
+            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.".to_owned(),
             effect: Effect::Admin,
             input_schema: input_schema::<InstallArgs>(),
         },
@@ -133,6 +136,9 @@ pub struct InstallArgs {
     /// Probe the remote machine and report what would be copied where without modifying it.
     #[serde(default)]
     pub dry_run: bool,
+    /// Permit installing a version older than the machine's current version or recorded version floor.
+    #[serde(default)]
+    pub allow_downgrade: bool,
 }
 
 /// Result of `fleet.install`.
@@ -159,6 +165,9 @@ pub struct InstallResult {
     /// Whether this call was a dry run that left the remote machine untouched.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+    /// Optional platform note (for example Rosetta 2 native selection or Windows ARM64 emulation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Remote operating system, architecture, and release target detected over SSH.
@@ -172,6 +181,8 @@ pub struct DetectedPlatform {
     pub target: &'static str,
     /// Remote shell family used for install commands.
     pub remote_os: RemoteOs,
+    /// Optional explanation when selecting a native or emulated build (Rosetta 2 / Windows ARM64).
+    pub note: Option<&'static str>,
 }
 
 /// Result of parsing `uname -sm` (or `uname -srm` / `uname -a`) output.
@@ -489,13 +500,195 @@ pub fn scp_remote_path(remote_os: RemoteOs, temp: &TempName) -> String {
     }
 }
 
-/// Fixed remote Unix command that marks `temp` executable and renames it atomically onto
-/// `$HOME/.local/bin/legion`.
-pub fn unix_finalize_command(temp: &TempName) -> String {
+fn is_explicit_program_path(program: &str) -> bool {
+    program.contains('/')
+        || program.contains('\\')
+        || program.contains(':')
+        || program.starts_with('~')
+}
+
+fn unix_dest_assignment(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok(
+            "p=$(command -v legion 2>/dev/null || true); d=\"${p:-$HOME/.local/bin/legion}\""
+                .to_owned(),
+        ),
+        Some(prog) => {
+            validate_program(prog).map_err(|reason| {
+                ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}."))
+                    .with_hint("Use a program path with no spaces or shell metacharacters.")
+            })?;
+            if let Some(rest) = prog.strip_prefix("~/") {
+                Ok(format!("d=\"$HOME/{rest}\""))
+            } else if is_explicit_program_path(prog) {
+                Ok(format!("d=\"{prog}\""))
+            } else {
+                Ok(format!(
+                    "p=$(command -v {prog} 2>/dev/null || true); d=\"${{p:-$HOME/.local/bin/{prog}}}\""
+                ))
+            }
+        }
+    }
+}
+
+fn windows_dest_assignment(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok("$c = Get-Command 'legion' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source; if ($c) { $dest = $c } else { $dest = Join-Path (Join-Path $env:LOCALAPPDATA 'legion') 'legion.exe' }".to_owned()),
+        Some(prog) => {
+            validate_program(prog).map_err(|reason| {
+                ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}."))
+                    .with_hint("Use a program path with no spaces or shell metacharacters.")
+            })?;
+            if is_explicit_program_path(prog) {
+                Ok(format!("$dest = '{prog}'"))
+            } else {
+                Ok(format!(
+                    "$c = Get-Command '{prog}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source; if ($c) {{ $dest = $c }} else {{ $dest = Join-Path (Join-Path $env:LOCALAPPDATA 'legion') '{prog}' }}"
+                ))
+            }
+        }
+    }
+}
+
+/// Fixed remote Unix command that resolves which `legion` path a session will execute (honoring
+/// `PATH` and any configured `program`) and checks whether that destination is writable.
+pub fn unix_resolve_dest_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    let assign = unix_dest_assignment(program)?;
+    Ok(format!(
+        "sh -c '{assign}; printf \"LEGION_DEST=%s\\n\" \"$d\"; \
+if [ -d \"$d\" ]; then printf \"LEGION_WRITABLE=dir\\n\"; exit 0; fi; \
+pdir=$(dirname \"$d\"); while [ ! -e \"$pdir\" ] && [ \"$pdir\" != \"/\" ] && [ \"$pdir\" != \".\" ]; do pdir=$(dirname \"$pdir\"); done; \
+if [ -w \"$pdir\" ] && ( [ ! -e \"$d\" ] || [ -w \"$d\" ] || [ -w \"$(dirname \"$d\")\" ] ); then printf \"LEGION_WRITABLE=yes\\n\"; else printf \"LEGION_WRITABLE=no\\n\"; fi'"
+    ))
+}
+
+/// Fixed remote Windows command that resolves which `legion` path a session will execute (honoring
+/// `PATH` and any configured `program`) and checks whether that destination is writable.
+pub fn windows_resolve_dest_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    let assign = windows_dest_assignment(program)?;
+    let script = format!(
+        "{assign}; Write-Output ('LEGION_DEST=' + $dest); \
+if (Test-Path -LiteralPath $dest -PathType Container) {{ Write-Output 'LEGION_WRITABLE=dir'; exit 0 }}; \
+$pdir = Split-Path -Parent $dest; \
+while ($pdir -and -not (Test-Path -LiteralPath $pdir)) {{ $next = Split-Path -Parent $pdir; if ($next -eq $pdir) {{ break }}; $pdir = $next }}; \
+$w = 'no'; \
+if ($pdir -and (Test-Path -LiteralPath $pdir -PathType Container)) {{ \
+  $probe = Join-Path $pdir ('.legion-probe-' + [Guid]::NewGuid().ToString('N')); \
+  try {{ [System.IO.File]::WriteAllBytes($probe, @()); Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue; $w = 'yes' }} catch {{ $w = 'no' }} \
+}}; \
+Write-Output ('LEGION_WRITABLE=' + $w)"
+    );
+    Ok(encode_powershell_command(&script))
+}
+
+/// Fixed remote Unix command to probe the currently installed version of `program` (or `legion`).
+pub fn unix_version_probe_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok(UNIX_VERSION_PROBE_COMMAND.to_owned()),
+        Some(prog) => {
+            validate_program(prog)
+                .map_err(|reason| ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}.")))?;
+            if let Some(rest) = prog.strip_prefix("~/") {
+                Ok(format!(
+                    "sh -c 'if [ -x \"$HOME/{rest}\" ]; then \"$HOME/{rest}\" --version; fi'"
+                ))
+            } else if is_explicit_program_path(prog) {
+                Ok(format!(
+                    "sh -c 'if [ -x \"{prog}\" ]; then \"{prog}\" --version; fi'"
+                ))
+            } else {
+                Ok(format!(
+                    "sh -c 'if command -v {prog} >/dev/null 2>&1; then {prog} --version; elif [ -x \"$HOME/.local/bin/{prog}\" ]; then \"$HOME/.local/bin/{prog}\" --version; fi'"
+                ))
+            }
+        }
+    }
+}
+
+/// Fixed remote Windows command to probe the currently installed version of `program` (or `legion`).
+pub fn windows_version_probe_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok(WINDOWS_VERSION_PROBE_COMMAND.to_owned()),
+        Some(prog) => {
+            validate_program(prog)
+                .map_err(|reason| ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}.")))?;
+            Ok(format!("{prog} --version"))
+        }
+    }
+}
+
+/// Resolved remote destination path and writability returned by the remote destination probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedDestination {
+    /// Concrete path on the remote machine that a session will execute.
+    pub path: String,
+    /// Whether the destination directory is writable by the SSH account.
+    pub writable: bool,
+    /// Whether the destination path currently names a directory instead of a file.
+    pub is_dir: bool,
+}
+
+/// Parses the output of [`unix_resolve_dest_command`] or [`windows_resolve_dest_command`].
+pub fn parse_remote_dest_probe(output: &str) -> Option<ResolvedDestination> {
+    let mut path = None;
+    let mut writable = None;
+    for line in output.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("LEGION_DEST=")
+            && !rest.is_empty()
+        {
+            path = Some(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix("LEGION_WRITABLE=") {
+            writable = Some(rest.to_owned());
+        }
+    }
+    let path = path?;
+    let w = writable.as_deref().unwrap_or("yes");
+    Some(ResolvedDestination {
+        path,
+        writable: w == "yes",
+        is_dir: w == "dir",
+    })
+}
+
+/// Fixed remote Unix command that marks `temp` executable and runs it with `--version` before
+/// replacing the live binary.
+pub fn unix_staged_version_command(temp: &TempName) -> String {
     let name = temp.as_str();
     format!(
-        "sh -c 'chmod 0755 \"$HOME/.local/bin/{name}\" && mv -f \"$HOME/.local/bin/{name}\" \"$HOME/.local/bin/legion\"'"
+        "sh -c 'chmod 0755 \"$HOME/.local/bin/{name}\" && \"$HOME/.local/bin/{name}\" --version'"
     )
+}
+
+/// Fixed remote Windows command that runs `temp` with `--version` before replacing the live binary.
+pub fn windows_staged_version_command(temp: &TempName) -> String {
+    let name = temp.as_str();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; $p = Join-Path (Join-Path $env:USERPROFILE 'AppData\\Local\\legion') '{name}'; & $p --version; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}"
+    );
+    encode_powershell_command(&script)
+}
+
+/// Fixed remote Unix command that backs up the existing binary to `<dest>.prev` (one generation),
+/// marks `temp` executable, and renames it atomically onto the resolved destination.
+pub fn unix_finalize_command(temp: &TempName, program: Option<&str>) -> Result<String, ErrorBody> {
+    let name = temp.as_str();
+    let assign = unix_dest_assignment(program)?;
+    Ok(format!(
+        "sh -c 'set -eu; {assign}; ddir=$(dirname \"$d\"); mkdir -p \"$ddir\" 2>/dev/null || true; \
+if [ ! -w \"$ddir\" ]; then printf \"LEGION_DENIED:%s\\n\" \"$d\" >&2; exit 13; fi; \
+src=\"$HOME/.local/bin/{name}\"; staged=\"$ddir/{name}\"; \
+if [ \"$src\" != \"$staged\" ]; then cp \"$src\" \"$staged\" && rm -f \"$src\"; fi; \
+if [ -f \"$d\" ]; then cp -p \"$d\" \"$d.prev.tmp.$$\" && mv -f \"$d.prev.tmp.$$\" \"$d.prev\"; fi; \
+chmod 0755 \"$staged\" && mv -f \"$staged\" \"$d\"'"
+    ))
+}
+
+/// Fixed remote Unix command that restores `<dest>.prev` over `<dest>` after a failed verification.
+pub fn unix_rollback_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    let assign = unix_dest_assignment(program)?;
+    Ok(format!(
+        "sh -c 'set -eu; {assign}; [ -f \"$d.prev\" ] && mv -f \"$d.prev\" \"$d\"'"
+    ))
 }
 
 /// Fixed remote Unix command that removes a staged temp file after a failed install.
@@ -504,18 +697,23 @@ pub fn unix_cleanup_command(temp: &TempName) -> String {
     format!("sh -c 'rm -f \"$HOME/.local/bin/{name}\"'")
 }
 
-/// Fixed remote Windows command that moves `temp` into `%LOCALAPPDATA%\legion\legion.exe`
-/// (renaming any running previous binary aside first and rolling back on error) and ensures
-/// `%LOCALAPPDATA%\legion` is on the user's `PATH` without duplicates.
-pub fn windows_finalize_command(temp: &TempName) -> String {
+/// Fixed remote Windows command that saves one generation `<dest>.prev`, moves `temp` into the
+/// resolved destination (renaming any running previous binary aside first and rolling back on
+/// error), and ensures the destination directory is on the user's `PATH` without duplicates.
+pub fn windows_finalize_command(
+    temp: &TempName,
+    program: Option<&str>,
+) -> Result<String, ErrorBody> {
     let name = temp.as_str();
+    let assign = windows_dest_assignment(program)?;
     let script = format!(
         "$ErrorActionPreference = 'Stop'; \
-$dir = Join-Path $env:LOCALAPPDATA 'legion'; \
-$dest = Join-Path $dir 'legion.exe'; \
+{assign}; \
+$dir = Split-Path -Parent $dest; \
 $src = Join-Path (Join-Path $env:USERPROFILE 'AppData\\Local\\legion') '{name}'; \
 New-Item -ItemType Directory -Path $dir -Force | Out-Null; \
 if (Test-Path -LiteralPath $dest) {{ \
+  Copy-Item -LiteralPath $dest -Destination ($dest + '.prev') -Force; \
   $backup = Join-Path $dir ('legion.exe.old.' + [Guid]::NewGuid().ToString('N')); \
   [System.IO.File]::Move($dest, $backup); \
   try {{ [System.IO.File]::Move($src, $dest) }} catch {{ if (Test-Path -LiteralPath $backup) {{ [System.IO.File]::Move($backup, $dest) }}; throw }}; \
@@ -524,14 +722,45 @@ if (Test-Path -LiteralPath $dest) {{ \
   [System.IO.File]::Move($src, $dest) \
 }}; \
 $norm = $dir.TrimEnd('\\'); \
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User'); \
-$entries = @(); \
-if (-not [string]::IsNullOrEmpty($userPath)) {{ $entries = @($userPath -split ';' | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}) }}; \
-$found = $false; \
-foreach ($e in $entries) {{ if ($e.Trim().TrimEnd('\\').Equals($norm, [System.StringComparison]::OrdinalIgnoreCase)) {{ $found = $true; break }} }}; \
-if (-not $found) {{ [Environment]::SetEnvironmentVariable('Path', (($entries + @($dir)) -join ';'), 'User') }}"
+$envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true); \
+if ($null -eq $envKey) {{ $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment') }}; \
+try {{ \
+  $existingVal = $envKey.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); \
+  $valueKind = [Microsoft.Win32.RegistryValueKind]::ExpandString; \
+  $rawPath = ''; \
+  if ($null -ne $existingVal) {{ $valueKind = $envKey.GetValueKind('Path'); $rawPath = [string] $existingVal }}; \
+  $entries = @(); \
+  if (-not [string]::IsNullOrEmpty($rawPath)) {{ $entries = @($rawPath -split ';' | Where-Object {{ -not [string]::IsNullOrWhiteSpace($_) }}) }}; \
+  $found = $false; \
+  foreach ($e in $entries) {{ \
+    $rn = $e.Trim().TrimEnd('\\'); \
+    $en = [Environment]::ExpandEnvironmentVariables($e).Trim().TrimEnd('\\'); \
+    if ($rn.Equals($norm, [System.StringComparison]::OrdinalIgnoreCase) -or $en.Equals($norm, [System.StringComparison]::OrdinalIgnoreCase)) {{ $found = $true; break }} \
+  }}; \
+  if (-not $found) {{ $envKey.SetValue('Path', (($entries + @($dir)) -join ';'), $valueKind) }} \
+}} finally {{ if ($null -ne $envKey) {{ $envKey.Close() }} }}"
     );
-    encode_powershell_command(&script)
+    Ok(encode_powershell_command(&script))
+}
+
+/// Fixed remote Windows command that restores `<dest>.prev` over `<dest>` after a failed check.
+pub fn windows_rollback_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    let assign = windows_dest_assignment(program)?;
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+{assign}; \
+$prev = $dest + '.prev'; \
+if (-not (Test-Path -LiteralPath $prev)) {{ exit 1 }}; \
+if (Test-Path -LiteralPath $dest) {{ \
+  $old = $dest + '.old.' + [Guid]::NewGuid().ToString('N'); \
+  [System.IO.File]::Move($dest, $old); \
+  try {{ [System.IO.File]::Move($prev, $dest) }} catch {{ if (Test-Path -LiteralPath $old) {{ [System.IO.File]::Move($old, $dest) }}; throw }}; \
+  try {{ Remove-Item -LiteralPath $old -Force -ErrorAction Stop }} catch {{ $null = $_ }} \
+}} else {{ \
+  [System.IO.File]::Move($prev, $dest) \
+}}"
+    );
+    Ok(encode_powershell_command(&script))
 }
 
 /// Fixed remote Windows command that removes a staged temp file after a failed install.
@@ -590,8 +819,14 @@ pub fn parse_uname_output(output: &str) -> Result<UnameProbe, ErrorBody> {
     }
 
     // `uname -sm` yields `<sysname> <machine>`; `uname -srm` (including WSL kernels such as
-    // `Linux 5.15.153.1-microsoft-standard-WSL2 x86_64`) also puts `<machine>` last.
-    let arch_raw = tokens[tokens.len() - 1];
+    // `Linux 5.15.153.1-microsoft-standard-WSL2 x86_64`) also puts `<machine>` last; our probe
+    // appends `translated=1` on macOS running under Rosetta 2.
+    let (macos_translated, arch_raw) =
+        if tokens.len() >= 3 && tokens[tokens.len() - 1] == "translated=1" {
+            (true, tokens[tokens.len() - 2])
+        } else {
+            (false, tokens[tokens.len() - 1])
+        };
     let os = match sysname {
         "Linux" => "linux",
         "Darwin" => "macos",
@@ -605,12 +840,13 @@ pub fn parse_uname_output(output: &str) -> Result<UnameProbe, ErrorBody> {
     };
 
     let arch = normalize_unix_arch(arch_raw, os)?;
-    let target = target_triple_for(os, arch)?;
+    let resolved = resolve_target_for(os, arch, macos_translated)?;
     Ok(UnameProbe::Detected(DetectedPlatform {
         os,
-        arch,
-        target,
+        arch: resolved.arch,
+        target: resolved.target,
         remote_os: RemoteOs::Unix,
+        note: resolved.note,
     }))
 }
 
@@ -687,12 +923,13 @@ pub fn parse_powershell_probe(output: &str) -> Result<DetectedPlatform, ErrorBod
         }
     };
 
-    let target = target_triple_for("windows", arch)?;
+    let resolved = resolve_target_for("windows", arch, false)?;
     Ok(DetectedPlatform {
         os: "windows",
-        arch,
-        target,
+        arch: resolved.arch,
+        target: resolved.target,
         remote_os: RemoteOs::Windows,
+        note: resolved.note,
     })
 }
 
@@ -711,12 +948,34 @@ pub fn parse_version_output(output: &str) -> Option<String> {
 }
 
 /// Core implementation of `fleet.install`, parameterized over [`InstallBackend`] so tests run
-/// completely offline against a fake.
+/// completely offline against a fake. Always verifies release manifests against the compiled-in
+/// [`RELEASE_PUBLIC_KEY`].
 pub async fn run_fleet_install(
     paths: &Paths,
     fleet_file: &FleetFile,
     here: &str,
     backend: &dyn InstallBackend,
+    args: InstallArgs,
+    cancel: CancellationToken,
+) -> Result<InstallResult, ErrorBody> {
+    run_fleet_install_with_key(
+        paths,
+        fleet_file,
+        here,
+        backend,
+        &RELEASE_PUBLIC_KEY,
+        args,
+        cancel,
+    )
+    .await
+}
+
+async fn run_fleet_install_with_key(
+    paths: &Paths,
+    fleet_file: &FleetFile,
+    here: &str,
+    backend: &dyn InstallBackend,
+    public_key: &[u8; 32],
     args: InstallArgs,
     cancel: CancellationToken,
 ) -> Result<InstallResult, ErrorBody> {
@@ -765,11 +1024,15 @@ pub async fn run_fleet_install(
         .with_machine(args.machine.clone()));
     }
 
-    let ssh_systems: Vec<(String, Option<RemoteOs>)> = entry
+    let ssh_systems: Vec<(String, Option<String>, Option<RemoteOs>)> = entry
         .resolved_systems()
         .into_iter()
         .filter_map(|sys| match sys.transport {
-            Transport::Ssh { target, os, .. } => Some((target, os)),
+            Transport::Ssh {
+                target,
+                program,
+                os,
+            } => Some((target, program, os)),
             Transport::Command { .. } => None,
         })
         .collect();
@@ -788,16 +1051,34 @@ pub async fn run_fleet_install(
         .with_machine(args.machine.clone()));
     }
 
-    let (ssh_target, platform) =
+    let (ssh_target, program, platform) =
         detect_active_system(&args.machine, &ssh_systems, backend, cancel.clone()).await?;
 
-    let previous_version =
-        probe_previous_version(&ssh_target, platform.remote_os, backend, cancel.clone()).await;
+    let resolved_dest = resolve_remote_destination(
+        &args.machine,
+        &ssh_target,
+        platform.remote_os,
+        program.as_deref(),
+        backend,
+        cancel.clone(),
+    )
+    .await?;
 
-    let remote_display_path = match platform.remote_os {
-        RemoteOs::Unix => "~/.local/bin/legion".to_owned(),
-        RemoteOs::Windows => r"%LOCALAPPDATA%\legion\legion.exe".to_owned(),
-    };
+    let remote_display_path = resolved_dest.path.clone();
+
+    let previous_version = probe_previous_version(
+        &ssh_target,
+        platform.remote_os,
+        program.as_deref(),
+        backend,
+        cancel.clone(),
+    )
+    .await;
+
+    let floor_path = machine_floor_path(paths, &args.machine);
+    let previous_semver = previous_version
+        .as_deref()
+        .and_then(|v| SemVer::parse(v).ok());
 
     if args.dry_run {
         let (planned_version, source_desc) = match &args.from {
@@ -810,6 +1091,14 @@ pub async fn run_fleet_install(
                     Some(raw) => normalize_version(raw)?,
                     None => backend.latest_version(cancel).await?,
                 };
+                let target_semver = SemVer::parse(&version)?;
+                check_version_transition(
+                    &target_semver,
+                    previous_semver.as_ref(),
+                    &floor_path,
+                    args.allow_downgrade,
+                )
+                .map_err(|err| err.with_machine(args.machine.clone()))?;
                 let cached = dist_cache_binary(paths, &version, platform.target);
                 let source = if cached.is_file() {
                     cached.display().to_string()
@@ -829,21 +1118,67 @@ pub async fn run_fleet_install(
             path: remote_display_path,
             source: Some(source_desc),
             dry_run: true,
+            note: platform.note.map(str::to_owned),
         });
     }
 
-    let local_binary = match &args.from {
-        Some(from_raw) => resolve_local_binary(paths, from_raw)?,
+    let (local_binary, expected_version) = match &args.from {
+        Some(from_raw) => (resolve_local_binary(paths, from_raw)?, None),
         None => {
             let version = match &args.version {
                 Some(raw) => normalize_version(raw)?,
                 None => backend.latest_version(cancel.clone()).await?,
             };
+            let target_semver = SemVer::parse(&version)?;
+            check_version_transition(
+                &target_semver,
+                previous_semver.as_ref(),
+                &floor_path,
+                args.allow_downgrade,
+            )
+            .map_err(|err| err.with_machine(args.machine.clone()))?;
             let fetcher = BackendFetcher(backend);
-            resolve_release_binary(paths, &fetcher, &version, platform.target, cancel.clone())
-                .await?
+            let bin = resolve_release_binary_with_key(
+                paths,
+                &fetcher,
+                &version,
+                platform.target,
+                public_key,
+                cancel.clone(),
+            )
+            .await?;
+            (bin, Some(version))
         }
     };
+
+    if resolved_dest.is_dir {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Cannot install legion on {}: destination {} is a directory.",
+                args.machine, resolved_dest.path
+            ),
+        )
+        .with_hint("Move or remove that directory, or set `program` in fleet.toml to a file path.")
+        .with_machine(args.machine.clone()));
+    }
+    if !resolved_dest.writable {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Cannot install legion on {}: resolved destination {} is not writable by the SSH account.",
+                args.machine, resolved_dest.path
+            ),
+        )
+        .with_hint(
+            "Make that path writable, remove the older shadowing binary from PATH so ~/.local/bin/legion is used, or set `program` in fleet.toml.",
+        )
+        .with_machine(args.machine.clone()));
+    }
+
+    // Inspect ELF/Mach-O/PE header locally before sending a single byte over scp.
+    verify_binary_matches_target(&local_binary, platform.target)
+        .map_err(|err| err.with_machine(args.machine.clone()))?;
 
     let prepare_cmd = match platform.remote_os {
         RemoteOs::Unix => UNIX_PREPARE_DIR_COMMAND.to_owned(),
@@ -880,9 +1215,75 @@ pub async fn run_fleet_install(
         .await
         .map_err(|err| err.with_machine(args.machine.clone()))?;
 
+    // Run `--version` on the staged remote binary BEFORE replacing the live binary.
+    let staged_ver_cmd = match platform.remote_os {
+        RemoteOs::Unix => unix_staged_version_command(&temp_name),
+        RemoteOs::Windows => windows_staged_version_command(&temp_name),
+    };
+    let staged_check = async {
+        let out = backend
+            .ssh_exec(&ssh_target, &staged_ver_cmd, SSH_CMD_TIMEOUT, cancel.clone())
+            .await
+            .map_err(|err| err.with_machine(args.machine.clone()))?;
+        if !out.success {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Staged binary failed `--version` preflight on {}: {}",
+                    args.machine,
+                    first_diagnostic(&out)
+                ),
+            )
+            .with_hint("The binary could not run on the target machine; the previous installation was left untouched.")
+            .with_machine(args.machine.clone()));
+        }
+        let staged_ver = parse_version_output(&out.stdout).ok_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Staged binary on {} did not print a valid `legion <version>` line on `--version`.",
+                    args.machine
+                ),
+            )
+            .with_hint("The previous installation was left untouched.")
+            .with_machine(args.machine.clone())
+        })?;
+        if let Some(exp) = &expected_version {
+            if !versions_match(&staged_ver, exp) {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Staged binary on {} reported version {staged_ver}, expected {exp}.",
+                        args.machine
+                    ),
+                )
+                .with_hint("Nothing was replaced on the remote machine.")
+                .with_machine(args.machine.clone()));
+            }
+        } else if let Ok(staged_semver) = SemVer::parse(&staged_ver) {
+            check_version_transition(
+                &staged_semver,
+                previous_semver.as_ref(),
+                &floor_path,
+                args.allow_downgrade,
+            )
+            .map_err(|err| err.with_machine(args.machine.clone()))?;
+        }
+        Ok(staged_ver)
+    }
+    .await;
+
+    let verified_expected_version = match staged_check {
+        Ok(ver) => ver,
+        Err(err) => {
+            cleanup_remote_temp(backend, &ssh_target, platform.remote_os, &temp_name).await;
+            return Err(err);
+        }
+    };
+
     let finalize_cmd = match platform.remote_os {
-        RemoteOs::Unix => unix_finalize_command(&temp_name),
-        RemoteOs::Windows => windows_finalize_command(&temp_name),
+        RemoteOs::Unix => unix_finalize_command(&temp_name, program.as_deref())?,
+        RemoteOs::Windows => windows_finalize_command(&temp_name, program.as_deref())?,
     };
     let finalized = backend
         .ssh_exec(&ssh_target, &finalize_cmd, SSH_CMD_TIMEOUT, cancel.clone())
@@ -890,51 +1291,95 @@ pub async fn run_fleet_install(
 
     let finalize_ok = match finalized {
         Ok(out) if out.success => Ok(()),
-        Ok(out) => Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "Could not move the staged legion binary into place on {}: {}",
-                args.machine,
-                first_diagnostic(&out)
-            ),
-        )
-        .with_hint("Check permissions on the remote install directory; any previous installation was left untouched.")
-        .with_machine(args.machine.clone())),
+        Ok(out) => {
+            if let Some(denied_path) = out
+                .stderr
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("LEGION_DENIED:"))
+            {
+                Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Cannot install legion on {}: destination {} is not writable by the SSH account.",
+                        args.machine, denied_path
+                    ),
+                )
+                .with_hint(
+                    "Make that path writable, remove the shadowing binary from PATH, or set `program` in fleet.toml.",
+                )
+                .with_machine(args.machine.clone()))
+            } else {
+                Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Could not move the staged legion binary into place on {}: {}",
+                        args.machine,
+                        first_diagnostic(&out)
+                    ),
+                )
+                .with_hint("Check permissions on the remote install directory; any previous installation was left untouched.")
+                .with_machine(args.machine.clone()))
+            }
+        }
         Err(err) => Err(err.with_machine(args.machine.clone())),
     };
 
     if let Err(err) = finalize_ok {
-        let cleanup_cmd = match platform.remote_os {
-            RemoteOs::Unix => unix_cleanup_command(&temp_name),
-            RemoteOs::Windows => windows_cleanup_command(&temp_name),
-        };
-        let _ = backend
-            .ssh_exec(
-                &ssh_target,
-                &cleanup_cmd,
-                SSH_CMD_TIMEOUT,
-                CancellationToken::new(),
-            )
-            .await;
+        cleanup_remote_temp(backend, &ssh_target, platform.remote_os, &temp_name).await;
         return Err(err);
     }
 
-    let installed_version = backend
-        .verify_session_version(&args.machine, cancel)
-        .await
-        .map_err(|err| {
-            ErrorBody::new(
+    let installed_version = match backend.verify_session_version(&args.machine, cancel).await {
+        Ok(ver) if versions_match(&ver, &verified_expected_version) => ver,
+        Ok(ver) => {
+            let rollback_note = attempt_remote_rollback(
+                backend,
+                &ssh_target,
+                platform.remote_os,
+                program.as_deref(),
+                previous_version.is_some(),
+                &remote_display_path,
+            )
+            .await;
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Installed legion {verified_expected_version} to {remote_display_path} on {}, but a new session answered with version {ver}.{rollback_note}",
+                    args.machine
+                ),
+            )
+            .with_hint(
+                "Another legion binary earlier on the remote PATH may be shadowing the installed copy; check `command -v legion` or set `program` in fleet.toml.",
+            )
+            .with_machine(args.machine.clone()));
+        }
+        Err(err) => {
+            let rollback_note = attempt_remote_rollback(
+                backend,
+                &ssh_target,
+                platform.remote_os,
+                program.as_deref(),
+                previous_version.is_some(),
+                &remote_display_path,
+            )
+            .await;
+            return Err(ErrorBody::new(
                 err.code,
                 format!(
-                    "Installed legion on {}, but opening a verification session failed: {}",
+                    "Installed legion on {}, but opening a verification session failed: {}{rollback_note}",
                     args.machine, err.message
                 ),
             )
             .with_hint(
-                "Verify that the binary architecture matches the target machine and that `~/.local/bin` (Unix) or `%LOCALAPPDATA%\\legion` (Windows) is executable.",
+                "Verify that the binary matches the target machine and that the resolved install path is executable.",
             )
-            .with_machine(args.machine.clone())
-        })?;
+            .with_machine(args.machine.clone()));
+        }
+    };
+
+    if let Ok(installed_semver) = SemVer::parse(&installed_version) {
+        commit_floor(&floor_path, &installed_semver, args.allow_downgrade)?;
+    }
 
     Ok(InstallResult {
         machine: args.machine,
@@ -946,19 +1391,118 @@ pub async fn run_fleet_install(
         path: remote_display_path,
         source: None,
         dry_run: false,
+        note: platform.note.map(str::to_owned),
+    })
+}
+
+async fn cleanup_remote_temp(
+    backend: &dyn InstallBackend,
+    ssh_target: &str,
+    remote_os: RemoteOs,
+    temp_name: &TempName,
+) {
+    let cleanup_cmd = match remote_os {
+        RemoteOs::Unix => unix_cleanup_command(temp_name),
+        RemoteOs::Windows => windows_cleanup_command(temp_name),
+    };
+    let _ = backend
+        .ssh_exec(
+            ssh_target,
+            &cleanup_cmd,
+            SSH_CMD_TIMEOUT,
+            CancellationToken::new(),
+        )
+        .await;
+}
+
+async fn attempt_remote_rollback(
+    backend: &dyn InstallBackend,
+    ssh_target: &str,
+    remote_os: RemoteOs,
+    program: Option<&str>,
+    had_previous: bool,
+    display_path: &str,
+) -> String {
+    if !had_previous {
+        return String::new();
+    }
+    let rollback_cmd = match remote_os {
+        RemoteOs::Unix => unix_rollback_command(program),
+        RemoteOs::Windows => windows_rollback_command(program),
+    };
+    let Ok(cmd) = rollback_cmd else {
+        return String::new();
+    };
+    match backend
+        .ssh_exec(ssh_target, &cmd, SSH_CMD_TIMEOUT, CancellationToken::new())
+        .await
+    {
+        Ok(out) if out.success => {
+            format!(" The previous binary was automatically restored from {display_path}.prev.")
+        }
+        Ok(out) => format!(
+            " Automatic rollback from {display_path}.prev failed: {}.",
+            first_diagnostic(&out)
+        ),
+        Err(err) => format!(
+            " Automatic rollback from {display_path}.prev failed: {}.",
+            err.message
+        ),
+    }
+}
+
+fn versions_match(actual: &str, expected: &str) -> bool {
+    match (SemVer::parse(actual), SemVer::parse(expected)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => actual.trim() == expected.trim(),
+    }
+}
+
+async fn resolve_remote_destination(
+    machine: &str,
+    ssh_target: &str,
+    remote_os: RemoteOs,
+    program: Option<&str>,
+    backend: &dyn InstallBackend,
+    cancel: CancellationToken,
+) -> Result<ResolvedDestination, ErrorBody> {
+    let cmd = match remote_os {
+        RemoteOs::Unix => unix_resolve_dest_command(program)?,
+        RemoteOs::Windows => windows_resolve_dest_command(program)?,
+    };
+    let output = backend
+        .ssh_exec(ssh_target, &cmd, SSH_CMD_TIMEOUT, cancel)
+        .await
+        .map_err(|err| err.with_machine(machine.to_owned()))?;
+    if output.success
+        && let Some(resolved) = parse_remote_dest_probe(&output.stdout)
+    {
+        return Ok(resolved);
+    }
+    let fallback = match (remote_os, program) {
+        (RemoteOs::Unix, Some(prog)) if is_explicit_program_path(prog) => prog.to_owned(),
+        (RemoteOs::Unix, Some(prog)) => format!("~/.local/bin/{prog}"),
+        (RemoteOs::Unix, None) => "~/.local/bin/legion".to_owned(),
+        (RemoteOs::Windows, Some(prog)) => prog.to_owned(),
+        (RemoteOs::Windows, None) => r"%LOCALAPPDATA%\legion\legion.exe".to_owned(),
+    };
+    Ok(ResolvedDestination {
+        path: fallback,
+        writable: true,
+        is_dir: false,
     })
 }
 
 async fn detect_active_system(
     machine: &str,
-    ssh_systems: &[(String, Option<RemoteOs>)],
+    ssh_systems: &[(String, Option<String>, Option<RemoteOs>)],
     backend: &dyn InstallBackend,
     cancel: CancellationToken,
-) -> Result<(String, DetectedPlatform), ErrorBody> {
+) -> Result<(String, Option<String>, DetectedPlatform), ErrorBody> {
     let mut last_error: Option<ErrorBody> = None;
-    for (ssh_target, os_hint) in ssh_systems {
+    for (ssh_target, program, os_hint) in ssh_systems {
         match probe_remote_platform(ssh_target, *os_hint, backend, cancel.clone()).await {
-            Ok(platform) => return Ok((ssh_target.clone(), platform)),
+            Ok(platform) => return Ok((ssh_target.clone(), program.clone(), platform)),
             Err(err) => {
                 // Unsupported architecture/OS errors came from a live host: stop immediately
                 // rather than masking the clear refusal behind another system's connection failure.
@@ -1046,15 +1590,16 @@ async fn probe_remote_platform(
 async fn probe_previous_version(
     ssh_target: &str,
     remote_os: RemoteOs,
+    program: Option<&str>,
     backend: &dyn InstallBackend,
     cancel: CancellationToken,
 ) -> Option<String> {
     let cmd = match remote_os {
-        RemoteOs::Unix => UNIX_VERSION_PROBE_COMMAND,
-        RemoteOs::Windows => WINDOWS_VERSION_PROBE_COMMAND,
+        RemoteOs::Unix => unix_version_probe_command(program).ok()?,
+        RemoteOs::Windows => windows_version_probe_command(program).ok()?,
     };
     let output = backend
-        .ssh_exec(ssh_target, cmd, SSH_CMD_TIMEOUT, cancel)
+        .ssh_exec(ssh_target, &cmd, SSH_CMD_TIMEOUT, cancel)
         .await
         .ok()?;
     if !output.success {
@@ -1139,8 +1684,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    use ed25519_dalek::{Signer, SigningKey};
     use legion_core::config::parse;
-    use legion_tools::update::{artifact_filename, checksums_url, sha256_file};
+    use legion_tools::update::{artifact_filename, checksums_sig_url, checksums_url, sha256_file};
     use tempfile::tempdir;
 
     use super::*;
@@ -1165,6 +1711,7 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         assert_eq!(
@@ -1174,6 +1721,7 @@ mod tests {
                 arch: "aarch64",
                 target: "aarch64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         // Apple Silicon macOS
@@ -1184,6 +1732,7 @@ mod tests {
                 arch: "aarch64",
                 target: "aarch64-apple-darwin",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         // Intel macOS
@@ -1194,8 +1743,19 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-apple-darwin",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
+        // Apple Silicon macOS under Rosetta 2 selects native aarch64 with an explicit note
+        let rosetta = match parse_uname_output("Darwin x86_64 translated=1\n").unwrap() {
+            UnameProbe::Detected(p) => p,
+            UnameProbe::WindowsShellLayer => panic!("expected Darwin"),
+        };
+        assert_eq!(rosetta.os, "macos");
+        assert_eq!(rosetta.arch, "aarch64");
+        assert_eq!(rosetta.target, "aarch64-apple-darwin");
+        assert!(rosetta.note.unwrap().contains("Rosetta 2"));
+        assert!(UNIX_PROBE_COMMAND.contains("sysctl.proc_translated"));
         // WSL2 outputs Linux x86_64 / Linux <microsoft-standard-WSL2> x86_64
         assert_eq!(
             parse_uname_output("Linux 5.15.153.1-microsoft-standard-WSL2 x86_64\n").unwrap(),
@@ -1204,6 +1764,7 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         assert_eq!(
@@ -1213,6 +1774,7 @@ mod tests {
                 arch: "aarch64",
                 target: "aarch64-unknown-linux-musl",
                 remote_os: RemoteOs::Unix,
+                note: None,
             })
         );
         // Git Bash / MSYS2 / Cygwin on Windows triggers PowerShell fallback
@@ -1238,6 +1800,7 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-pc-windows-msvc",
                 remote_os: RemoteOs::Windows,
+                note: None,
             }
         );
         assert_eq!(
@@ -1247,11 +1810,15 @@ mod tests {
                 arch: "x86_64",
                 target: "x86_64-pc-windows-msvc",
                 remote_os: RemoteOs::Windows,
+                note: None,
             }
         );
-        let arm64 = parse_powershell_probe("LEGION_OS=windows Arm64\r\n").unwrap_err();
-        assert_eq!(arm64.code, ErrorCode::Unsupported);
-        assert!(arm64.message.contains("ARM64"), "{}", arm64.message);
+        // Windows ARM64 honestly selects x86_64 under emulation with an explicit note.
+        let arm64 = parse_powershell_probe("LEGION_OS=windows Arm64\r\n").unwrap();
+        assert_eq!(arm64.os, "windows");
+        assert_eq!(arm64.arch, "x86_64");
+        assert_eq!(arm64.target, "x86_64-pc-windows-msvc");
+        assert!(arm64.note.unwrap().contains("emulation"));
 
         let x86 = parse_powershell_probe("LEGION_OS=windows X86\r\n").unwrap_err();
         assert_eq!(x86.code, ErrorCode::Unsupported);
@@ -1267,7 +1834,10 @@ mod tests {
             UNIX_PROBE_COMMAND.to_owned(),
             UNIX_PREPARE_DIR_COMMAND.to_owned(),
             UNIX_VERSION_PROBE_COMMAND.to_owned(),
-            unix_finalize_command(&temp_unix),
+            unix_resolve_dest_command(None).unwrap(),
+            unix_staged_version_command(&temp_unix),
+            unix_finalize_command(&temp_unix, None).unwrap(),
+            unix_rollback_command(None).unwrap(),
             unix_cleanup_command(&temp_unix),
         ];
         for cmd in &unix_cmds {
@@ -1275,9 +1845,12 @@ mod tests {
             assert!(!cmd.contains("0.9.9"));
             assert!(!cmd.contains("/home/me"));
         }
-        assert!(unix_finalize_command(&temp_unix).contains(".legion-install-0123456789abcdef"));
-        assert!(unix_finalize_command(&temp_unix).contains("chmod 0755"));
-        assert!(unix_finalize_command(&temp_unix).contains("mv -f"));
+        let unix_fin = unix_finalize_command(&temp_unix, None).unwrap();
+        assert!(unix_fin.contains(".legion-install-0123456789abcdef"));
+        assert!(unix_fin.contains("chmod 0755"));
+        assert!(unix_fin.contains("cp -p"));
+        assert!(unix_fin.contains(".prev"));
+        assert!(unix_fin.contains("mv -f"));
 
         // Windows commands are encoded PowerShell containing only fixed code and the generated temp name.
         let win_probe = decode_powershell_command(&windows_probe_command());
@@ -1287,13 +1860,31 @@ mod tests {
         let win_prep = decode_powershell_command(&windows_prepare_dir_command());
         assert!(win_prep.contains("LOCALAPPDATA"));
 
-        let win_fin = decode_powershell_command(&windows_finalize_command(&temp_win));
+        let win_stage = decode_powershell_command(&windows_staged_version_command(&temp_win));
+        assert!(win_stage.contains(".legion-install-fedcba9876543210.exe"));
+        assert!(win_stage.contains("--version"));
+
+        let win_fin =
+            decode_powershell_command(&windows_finalize_command(&temp_win, None).unwrap());
         assert!(win_fin.contains(".legion-install-fedcba9876543210.exe"));
         assert!(win_fin.contains("legion.exe.old."));
-        assert!(win_fin.contains("SetEnvironmentVariable('Path'"));
+        assert!(win_fin.contains("($dest + '.prev')"));
+        assert!(win_fin.contains("DoNotExpandEnvironmentNames"));
+        assert!(win_fin.contains("GetValueKind('Path')"));
+        assert!(win_fin.contains("SetValue('Path'"));
+        assert!(!win_fin.contains("SetEnvironmentVariable('Path'"));
+
+        let win_roll = decode_powershell_command(&windows_rollback_command(None).unwrap());
+        assert!(win_roll.contains("$prev = $dest + '.prev'"));
 
         let win_clean = decode_powershell_command(&windows_cleanup_command(&temp_win));
         assert!(win_clean.contains(".legion-install-fedcba9876543210.exe"));
+    }
+
+    fn fake_binary(target: &str, tag: &[u8]) -> Vec<u8> {
+        let mut bytes = legion_tools::binfmt::synthetic_header_for_target(target);
+        bytes.extend_from_slice(tag);
+        bytes
     }
 
     struct FakeInstallBackend {
@@ -1301,9 +1892,12 @@ mod tests {
         files: HashMap<String, Vec<u8>>,
         uname_output: Option<RemoteCommandOutput>,
         ps_probe_output: Option<RemoteCommandOutput>,
+        dest_probe_output: Option<RemoteCommandOutput>,
         previous_version_output: Option<String>,
+        staged_version_output: Option<RemoteCommandOutput>,
         session_version_after_install: String,
         fail_finalize: bool,
+        fail_session: bool,
         ssh_log: Mutex<Vec<(String, String)>>,
         scp_log: Mutex<Vec<(PathBuf, String, String)>>,
         download_log: Mutex<Vec<String>>,
@@ -1321,9 +1915,16 @@ mod tests {
                     stderr: String::new(),
                 }),
                 ps_probe_output: None,
+                dest_probe_output: Some(RemoteCommandOutput {
+                    success: true,
+                    stdout: "LEGION_DEST=~/.local/bin/legion\nLEGION_WRITABLE=yes\n".to_owned(),
+                    stderr: String::new(),
+                }),
                 previous_version_output: previous.map(|v| format!("legion {v}\n")),
+                staged_version_output: None,
                 session_version_after_install: session_after.to_owned(),
                 fail_finalize: false,
+                fail_session: false,
                 ssh_log: Mutex::new(Vec::new()),
                 scp_log: Mutex::new(Vec::new()),
                 download_log: Mutex::new(Vec::new()),
@@ -1345,9 +1946,18 @@ mod tests {
                     stdout: "LEGION_OS=windows X64\r\n".to_owned(),
                     stderr: String::new(),
                 }),
+                dest_probe_output: Some(RemoteCommandOutput {
+                    success: true,
+                    stdout:
+                        "LEGION_DEST=%LOCALAPPDATA%\\legion\\legion.exe\r\nLEGION_WRITABLE=yes\r\n"
+                            .to_owned(),
+                    stderr: String::new(),
+                }),
                 previous_version_output: previous.map(|v| format!("legion {v}\r\n")),
+                staged_version_output: None,
                 session_version_after_install: session_after.to_owned(),
                 fail_finalize: false,
+                fail_session: false,
                 ssh_log: Mutex::new(Vec::new()),
                 scp_log: Mutex::new(Vec::new()),
                 download_log: Mutex::new(Vec::new()),
@@ -1355,13 +1965,25 @@ mod tests {
             }
         }
 
-        fn with_release(mut self, version: &str, target: &str, payload: &[u8]) -> Self {
+        fn with_release(
+            mut self,
+            version: &str,
+            target: &str,
+            payload: &[u8],
+            signing_key: Option<&SigningKey>,
+        ) -> Self {
             let dir = tempdir().unwrap();
             let tmp = dir.path().join("bin");
             fs::write(&tmp, payload).unwrap();
             let hash = sha256_file(&tmp).unwrap();
             let asset = artifact_filename(version, target);
             let sums = format!("{hash}  {asset}\n");
+            if let Some(key) = signing_key {
+                let sig = key.sign(sums.as_bytes());
+                let sig_text = format!("{}\n", BASE64.encode(sig.to_bytes()));
+                self.files
+                    .insert(checksums_sig_url(version), sig_text.into_bytes());
+            }
             self.files.insert(checksums_url(version), sums.into_bytes());
             self.files
                 .insert(artifact_url(version, target), payload.to_vec());
@@ -1418,9 +2040,35 @@ mod tests {
                         stderr: "powershell not found".to_owned(),
                     }));
                 }
-                if remote_cmd == UNIX_VERSION_PROBE_COMMAND
-                    || remote_cmd == WINDOWS_VERSION_PROBE_COMMAND
+                if remote_cmd.contains("LEGION_DEST=")
+                    || (remote_cmd.contains("-EncodedCommand")
+                        && decode_powershell_command(remote_cmd).contains("LEGION_DEST="))
                 {
+                    return Ok(self
+                        .dest_probe_output
+                        .clone()
+                        .unwrap_or(RemoteCommandOutput {
+                            success: false,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        }));
+                }
+                if (remote_cmd.contains(".legion-install-") && remote_cmd.contains("--version"))
+                    || (remote_cmd.contains("-EncodedCommand") && {
+                        let dec = decode_powershell_command(remote_cmd);
+                        dec.contains(".legion-install-") && dec.contains("--version")
+                    })
+                {
+                    return Ok(self
+                        .staged_version_output
+                        .clone()
+                        .unwrap_or(RemoteCommandOutput {
+                            success: true,
+                            stdout: format!("legion {}\n", self.latest),
+                            stderr: String::new(),
+                        }));
+                }
+                if remote_cmd.contains("--version") {
                     return Ok(match &self.previous_version_output {
                         Some(out) => RemoteCommandOutput {
                             success: true,
@@ -1435,11 +2083,9 @@ mod tests {
                     });
                 }
                 if self.fail_finalize
-                    && (remote_cmd.contains("mv -f")
+                    && ((remote_cmd.contains(".legion-install-") && remote_cmd.contains("mv -f"))
                         || (remote_cmd.contains("-EncodedCommand")
-                            && remote_cmd != windows_probe_command()
-                            && remote_cmd != windows_prepare_dir_command()
-                            && !decode_powershell_command(remote_cmd).contains("SilentlyContinue")))
+                            && decode_powershell_command(remote_cmd).contains("legion.exe.old.")))
                 {
                     return Ok(RemoteCommandOutput {
                         success: false,
@@ -1480,6 +2126,12 @@ mod tests {
         ) -> BoxFuture<'a, Result<String, ErrorBody>> {
             Box::pin(async move {
                 self.session_checks.lock().unwrap().push(machine.to_owned());
+                if self.fail_session {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("Remote legion session failed to start on {machine}"),
+                    ));
+                }
                 Ok(self.session_version_after_install.clone())
             })
         }
@@ -1510,22 +2162,28 @@ via = "tower"
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x31; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let payload = fake_binary("x86_64-unknown-linux-musl", b"fake-elf-binary");
         let backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
             "0.2.0",
             "x86_64-unknown-linux-musl",
-            b"fake-elf-binary",
+            &payload,
+            Some(&signing),
         );
 
-        let res = run_fleet_install(
+        let res = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1540,7 +2198,7 @@ via = "tower"
         assert_eq!(res.previous_version, None);
         assert_eq!(res.path, "~/.local/bin/legion");
         assert!(!res.dry_run);
-        assert_eq!(backend.download_log.lock().unwrap().len(), 2);
+        assert_eq!(backend.download_log.lock().unwrap().len(), 3);
         assert_eq!(backend.scp_log.lock().unwrap().len(), 1);
         assert_eq!(
             backend.session_checks.lock().unwrap().as_slice(),
@@ -1559,19 +2217,29 @@ via = "tower"
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x32; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let payload = fake_binary("x86_64-unknown-linux-musl", b"legion-0.3.0");
         let backend = FakeInstallBackend::linux_x86_64("0.3.0", Some("0.1.0"), "0.3.0")
-            .with_release("0.3.0", "x86_64-unknown-linux-musl", b"legion-0.3.0");
+            .with_release(
+                "0.3.0",
+                "x86_64-unknown-linux-musl",
+                &payload,
+                Some(&signing),
+            );
 
-        let first = run_fleet_install(
+        let first = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: Some("legion-v0.3.0".to_owned()),
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1579,26 +2247,61 @@ via = "tower"
         .unwrap();
         assert_eq!(first.previous_version.as_deref(), Some("0.1.0"));
         assert_eq!(first.installed_version, "0.3.0");
-        assert_eq!(backend.download_log.lock().unwrap().len(), 2);
+        assert_eq!(backend.download_log.lock().unwrap().len(), 3);
 
         // Second run hits `<state>/dist/0.3.0/x86_64-unknown-linux-musl/` with zero downloads.
-        let second = run_fleet_install(
+        let second = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: Some("0.3.0".to_owned()),
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
         .await
         .unwrap();
         assert_eq!(second.installed_version, "0.3.0");
-        assert_eq!(backend.download_log.lock().unwrap().len(), 2);
+        assert_eq!(backend.download_log.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn unsigned_release_is_denied_without_copying_anything() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let payload = fake_binary("x86_64-unknown-linux-musl", b"unsigned-elf");
+        let backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
+            "0.2.0",
+            "x86_64-unknown-linux-musl",
+            &payload,
+            None,
+        );
+
+        let err = run_fleet_install(
+            &paths,
+            &fleet,
+            "laptop",
+            &backend,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: None,
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(backend.scp_log.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1607,9 +2310,14 @@ via = "tower"
         let paths = Paths::under(dir.path());
         let fleet = sample_fleet();
         let local_bin = dir.path().join("legion-custom.exe");
-        fs::write(&local_bin, b"custom-windows-pe").unwrap();
+        fs::write(
+            &local_bin,
+            fake_binary("x86_64-pc-windows-msvc", b"custom-windows-pe"),
+        )
+        .unwrap();
 
-        let backend = FakeInstallBackend::windows_x86_64("0.2.0", Some("0.1.0"), "0.2.0-local");
+        let backend =
+            FakeInstallBackend::windows_x86_64("0.2.0-local", Some("0.1.0"), "0.2.0-local");
         let res = run_fleet_install(
             &paths,
             &fleet,
@@ -1620,6 +2328,7 @@ via = "tower"
                 version: None,
                 from: Some(local_bin.display().to_string()),
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1656,6 +2365,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1674,6 +2384,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1700,6 +2411,7 @@ via = "tower"
                 version: None,
                 from: None,
                 dry_run: true,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1724,23 +2436,29 @@ via = "tower"
         let dir = tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x33; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let payload = fake_binary("x86_64-unknown-linux-musl", b"fake-elf");
         let mut backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
             "0.2.0",
             "x86_64-unknown-linux-musl",
-            b"fake-elf",
+            &payload,
+            Some(&signing),
         );
         backend.fail_finalize = true;
 
-        let err = run_fleet_install(
+        let err = run_fleet_install_with_key(
             &paths,
             &fleet,
             "laptop",
             &backend,
+            &pubkey,
             InstallArgs {
                 machine: "tower".to_owned(),
                 version: None,
                 from: None,
                 dry_run: false,
+                allow_downgrade: false,
             },
             CancellationToken::new(),
         )
@@ -1754,6 +2472,364 @@ via = "tower"
                 .unwrap()
                 .iter()
                 .any(|(_, cmd)| cmd.contains("rm -f \"$HOME/.local/bin/.legion-install-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_install_refuses_downgrade_below_live_or_floor_unless_allowed() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x34; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+
+        // Install 0.3.0 first, raising the floor for `tower` to 0.3.0.
+        let payload_030 = fake_binary("x86_64-unknown-linux-musl", b"legion-0.3.0");
+        let up = FakeInstallBackend::linux_x86_64("0.3.0", Some("0.1.0"), "0.3.0").with_release(
+            "0.3.0",
+            "x86_64-unknown-linux-musl",
+            &payload_030,
+            Some(&signing),
+        );
+        run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &up,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.3.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // Attempting to install 0.2.0 fails even if remote reports no live version (floor blocks it).
+        let payload_020 = fake_binary("x86_64-unknown-linux-musl", b"legion-0.2.0");
+        let down = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0").with_release(
+            "0.2.0",
+            "x86_64-unknown-linux-musl",
+            &payload_020,
+            Some(&signing),
+        );
+        let err = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &down,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(down.scp_log.lock().unwrap().is_empty());
+
+        // With allow_downgrade = true it succeeds and lowers the machine floor to 0.2.0.
+        let ok = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &down,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: true,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.installed_version, "0.2.0");
+    }
+
+    #[tokio::test]
+    async fn resolves_path_destination_honors_program_denies_unwritable_and_checks_answering_version()
+     {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = parse::<FleetFile>(
+            Path::new("fleet.toml"),
+            br#"
+[machines.tower]
+ssh = "tower"
+
+[machines.custom]
+ssh = "custom-host"
+program = "/opt/legion/legion"
+"#,
+        )
+        .unwrap();
+        let signing = SigningKey::from_bytes(&[0x35; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let payload = fake_binary("x86_64-unknown-linux-musl", b"legion-0.2.0");
+
+        // 1. Unwritable resolved PATH destination fails with Denied naming that path.
+        let mut unwritable = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.2.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                &payload,
+                Some(&signing),
+            );
+        unwritable.dest_probe_output = Some(RemoteCommandOutput {
+            success: true,
+            stdout: "LEGION_DEST=/usr/local/bin/legion\nLEGION_WRITABLE=no\n".to_owned(),
+            stderr: String::new(),
+        });
+        let denied = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &unwritable,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Denied);
+        assert!(
+            denied.message.contains("/usr/local/bin/legion"),
+            "{}",
+            denied.message
+        );
+        assert!(unwritable.scp_log.lock().unwrap().is_empty());
+
+        // 2. Configured `program` is honored in remote probe, version check, and finalize commands.
+        let mut custom = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.2.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                &payload,
+                Some(&signing),
+            );
+        custom.dest_probe_output = Some(RemoteCommandOutput {
+            success: true,
+            stdout: "LEGION_DEST=/opt/legion/legion\nLEGION_WRITABLE=yes\n".to_owned(),
+            stderr: String::new(),
+        });
+        let custom_res = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &custom,
+            &pubkey,
+            InstallArgs {
+                machine: "custom".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(custom_res.path, "/opt/legion/legion");
+        assert!(
+            custom
+                .ssh_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, cmd)| cmd.contains("/opt/legion/legion") && cmd.contains("mv -f"))
+        );
+
+        // 3. If a session still answers with the old version after install, fail clearly and roll back.
+        let mismatched = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.1.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                &payload,
+                Some(&signing),
+            );
+        let mismatch_err = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &mismatched,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch_err.code, ErrorCode::Failed);
+        assert!(
+            mismatch_err.message.contains("0.1.0") && mismatch_err.message.contains("0.2.0"),
+            "{}",
+            mismatch_err.message
+        );
+        assert!(
+            mismatch_err.message.contains("restored"),
+            "{}",
+            mismatch_err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_arch_binary_is_refused_before_scp() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let wrong_bin = dir.path().join("legion-arm64");
+        fs::write(
+            &wrong_bin,
+            fake_binary("aarch64-unknown-linux-musl", b"wrong-arch"),
+        )
+        .unwrap();
+        let backend = FakeInstallBackend::linux_x86_64("0.2.0", None, "0.2.0");
+
+        let err = run_fleet_install(
+            &paths,
+            &fleet,
+            "laptop",
+            &backend,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: None,
+                from: Some(wrong_bin.display().to_string()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("aarch64"), "{}", err.message);
+        assert!(backend.scp_log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failing_staged_version_aborts_and_cleans_up_remote_temp() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x36; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let payload = fake_binary("x86_64-unknown-linux-musl", b"broken-exec");
+        let mut backend = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.2.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                &payload,
+                Some(&signing),
+            );
+        backend.staged_version_output = Some(RemoteCommandOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "Exec format error".to_owned(),
+        });
+
+        let err = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &backend,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(err.message.contains("--version"), "{}", err.message);
+        let ssh_cmds = backend.ssh_log.lock().unwrap();
+        assert!(
+            ssh_cmds
+                .iter()
+                .any(|(_, cmd)| cmd.contains("rm -f \"$HOME/.local/bin/.legion-install-")),
+            "expected remote temp cleanup"
+        );
+        assert!(
+            !ssh_cmds.iter().any(|(_, cmd)| cmd.contains("mv -f")),
+            "finalize move must not run when staged --version fails"
+        );
+        assert!(backend.session_checks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_install_session_failure_rolls_back_from_prev_and_reports_restoration() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let signing = SigningKey::from_bytes(&[0x37; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let payload = fake_binary("x86_64-unknown-linux-musl", b"bad-session");
+        let mut backend = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.2.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                &payload,
+                Some(&signing),
+            );
+        backend.fail_session = true;
+
+        let err = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &backend,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.contains("restored") && err.message.contains(".prev"),
+            "{}",
+            err.message
+        );
+        assert!(
+            backend
+                .ssh_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, cmd)| cmd.contains("mv -f \"$d.prev\" \"$d\"")),
+            "expected remote rollback from .prev"
         );
     }
 }

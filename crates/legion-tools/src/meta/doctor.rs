@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use legion_core::Ctx;
-use legion_core::policy::{Policy, Role};
+use legion_core::policy::{OWNER, Policy, Role};
 use legion_core::proto::{Effect, ErrorBody, ToolSpec};
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
@@ -55,7 +55,7 @@ struct FleetPingResponse {
 
 /// Runs the extra environment, policy, and (unless `quick` is set) fleet checks and appends them.
 pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec<Check>) {
-    let exe_dir = std::env::current_exe()
+    let exe_dir = legion_core::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
     let login_path = query_login_shell_path(ctx).await;
@@ -75,7 +75,7 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     checks.push(check_ssh_on_path(ssh_path.as_deref()));
 
     if let Ok(policy) = ctx.config().get::<Policy>() {
-        checks.push(check_policy_exec_paths(&policy));
+        checks.push(check_policy_exec_roles(&policy));
     }
 
     if !quick
@@ -357,36 +357,34 @@ pub fn check_ssh_on_path(found: Option<&Path>) -> Check {
     }
 }
 
-/// Checks whether any custom role in `policy.toml` combines `paths` confinement with the `exec` effect.
-pub fn check_policy_exec_paths(policy: &Policy) -> Check {
+/// Checks whether any role other than `owner` in `policy.toml` allows the `exec` effect.
+pub fn check_policy_exec_roles(policy: &Policy) -> Check {
     let flagged: Vec<&str> = policy
         .roles
         .iter()
-        .filter(|(_, role)| {
-            role.paths.as_ref().is_some_and(|roots| !roots.is_empty()) && role_allows_exec(role)
-        })
+        .filter(|(name, role)| name.as_str() != OWNER && role_allows_exec(role))
         .map(|(name, _)| name.as_str())
         .collect();
 
     if flagged.is_empty() {
         Check {
-            name: "policy exec with paths".to_owned(),
+            name: "policy exec roles".to_owned(),
             ok: true,
             warning: false,
-            detail: "No role combines `paths` with the `exec` effect.".to_owned(),
+            detail: "No non-owner role allows the `exec` effect.".to_owned(),
             hint: None,
         }
     } else {
         Check {
-            name: "policy exec with paths".to_owned(),
+            name: "policy exec roles".to_owned(),
             ok: true,
             warning: true,
             detail: format!(
-                "Role(s) {} combine `paths` with the `exec` effect. `exec` is as strong as the account: a command can read, write and start anything the operating system lets the user do, so `paths` does not contain it — it only chooses where a command starts. A role that needs a real boundary does not get `exec`.",
+                "Role(s) {} allow the `exec` effect. Any role with `exec` is as strong as the account, admin included: a command can read, write, and start anything the operating system lets the user do, and neither `paths` nor denying `effect:admin` contains it.",
                 flagged.join(", ")
             ),
             hint: Some(
-                "Remove `effect:exec` (and exec/job tools) from any role that requires a real path boundary, or keep `paths` as a guard rail only."
+                "Only assign roles with `exec` to principals you trust with the whole account. A role that needs a real boundary must omit `exec` (for example, `observer` or `editor`)."
                     .to_owned(),
             ),
         }
@@ -409,6 +407,12 @@ fn role_allows_exec(role: &Role) -> bool {
         },
         ToolSpec {
             name: "proj.run".to_owned(),
+            description: String::new(),
+            effect: Effect::Exec,
+            input_schema: json!({"type": "object"}),
+        },
+        ToolSpec {
+            name: "ext.exec".to_owned(),
             description: String::new(),
             effect: Effect::Exec,
             input_schema: json!({"type": "object"}),
@@ -554,25 +558,45 @@ mod tests {
     }
 
     #[test]
-    fn policy_exec_paths_warns_quoting_design_rule_only_when_combined() {
+    fn policy_exec_roles_warns_for_every_non_owner_role_allowing_exec() {
         let safe = parse::<Policy>(
             Path::new("policy.toml"),
             b"[roles.writer]\nallow = [\"effect:read\", \"effect:write\"]\npaths = [\"~/projects/**\"]\n",
         )
         .unwrap();
-        let safe_check = check_policy_exec_paths(&safe);
+        let safe_check = check_policy_exec_roles(&safe);
         assert!(safe_check.ok && !safe_check.warning && safe_check.hint.is_none());
 
-        let combined = parse::<Policy>(
+        // Built-in owner alone never triggers a warning.
+        let owner_only = Policy::default();
+        let owner_check = check_policy_exec_roles(&owner_only);
+        assert!(owner_check.ok && !owner_check.warning && owner_check.hint.is_none());
+
+        // An exec role WITHOUT `paths` and denying `effect:admin` still triggers a warning.
+        let unconfined_exec = parse::<Policy>(
             Path::new("policy.toml"),
-            b"[roles.operator]\nallow = [\"effect:read\", \"effect:write\", \"effect:exec\"]\npaths = [\"~/projects/**\"]\n",
+            b"[roles.operator]\nallow = [\"effect:read\", \"effect:write\", \"effect:exec\", \"effect:destroy\"]\ndeny = [\"effect:power\", \"effect:admin\"]\n",
         )
         .unwrap();
-        let warn = check_policy_exec_paths(&combined);
+        let warn = check_policy_exec_roles(&unconfined_exec);
         assert!(warn.ok && warn.warning);
         assert!(warn.detail.contains("operator"));
-        assert!(warn.detail.contains("as strong as the account"));
+        assert!(
+            warn.detail
+                .contains("as strong as the account, admin included")
+        );
         assert!(warn.hint.is_some());
+
+        // A role combining `paths` with `exec` is also named alongside any unconfined exec role.
+        let both = parse::<Policy>(
+            Path::new("policy.toml"),
+            b"[roles.operator]\nallow = [\"effect:exec\"]\n[roles.runner]\nallow = [\"exec.run\"]\npaths = [\"~/projects/**\"]\n",
+        )
+        .unwrap();
+        let both_warn = check_policy_exec_roles(&both);
+        assert!(both_warn.ok && both_warn.warning);
+        assert!(both_warn.detail.contains("operator"));
+        assert!(both_warn.detail.contains("runner"));
     }
 
     #[test]

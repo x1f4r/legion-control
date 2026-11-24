@@ -60,4 +60,5 @@ if [[ "$component" == all || "$component" == rust ]]; then
   cargo fmt --all --check
   cargo clippy --workspace --all-targets --locked -- -D warnings
   cargo test --workspace --locked
+  node scripts/legion-tools-doc.mjs --bin target/debug/legion --check
 fi

@@ -33,7 +33,7 @@ struct InitArgs {
     /// Node name to write into node.toml when creating it; defaults to the name derived from this machine's host name.
     #[serde(default)]
     name: Option<String>,
-    /// Create policy.toml with ready-made observer, operator and maintainer roles when missing.
+    /// Create policy.toml with ready-made observer, editor and operator roles when missing.
     #[serde(default = "default_true")]
     roles: bool,
     /// Report what would be created or kept without writing any files.
@@ -242,29 +242,34 @@ pub fn render_policy_toml() -> &'static str {
 # Keeping default = \"owner\" preserves local shell behaviour until you assign narrower principals.
 default = \"owner\"
 
-# Observer: may inspect the machine and read files (effect:read),
-# but cannot read Legion's audit log or change anything.
+# Observer: may look without changing anything (system facts, job and service status, project
+# status, and files under `paths`; never Legion's audit log). This is a real boundary when the
+# caller arrives through a door that pins its principal (an ssh key forced to `legion gate`, or
+# an HTTP token).
 [roles.observer]
 allow = [\"effect:read\"]
 deny = [\"audit.*\"]
-
-# Operator: may look, change files, and run commands inside the directories listed under `paths`,
-# but never power or admin tools. Note that `exec` is as strong as the OS account: `paths` confines
-# file tools and chooses where commands start, not what a command can reach.
-[roles.operator]
-allow = [\"effect:read\", \"effect:write\", \"effect:exec\"]
-deny = [\"power.*\", \"effect:power\", \"effect:admin\"]
 paths = [\"~/projects/**\"]
 
-# Maintainer: may do everything except administrative changes (cannot edit policy, tokens,
-# fleet membership, extensions, or sync configuration).
-[roles.maintainer]
-allow = [\"*\"]
-deny = [\"effect:admin\"]
+# Editor: may read and change files inside `paths`, and nothing else that changes the machine.
+# This is a real boundary through the same pinned doors (`legion gate` or an HTTP token); because
+# it has no `exec`, it cannot run commands, project tasks, or tests.
+[roles.editor]
+allow = [\"effect:read\", \"effect:write\"]
+paths = [\"~/projects/**\"]
+
+# Operator: may do everything except power and administration.
+# Because it can run commands (`effect:exec`), it is as strong as your account and could change
+# Legion's own files (including policy.toml and tools.d/) through a shell; the denials are a guard
+# rail for a cooperating agent and a clear audit trail, not a wall. Give it only to agents you
+# would hand a terminal.
+[roles.operator]
+allow = [\"effect:read\", \"effect:write\", \"effect:exec\", \"effect:destroy\"]
+deny = [\"effect:power\", \"effect:admin\"]
 
 # Assign principals to roles. Uncomment and adjust before registering an agent or issuing a token:
 # [principals.\"agent:claude\"]
-# role = \"operator\"
+# role = \"editor\"
 #
 # [principals.phone]
 # role = \"observer\"
@@ -273,7 +278,7 @@ deny = [\"effect:admin\"]
 
 fn next_steps() -> Vec<String> {
     vec![
-        "Edit policy.toml to uncomment or add a [principals.<name>] entry for each AI agent or device you plan to connect.".to_owned(),
+        "Edit policy.toml to assign principals to a role (`observer`, `editor`, or `operator`) before connecting an AI agent or remote device.".to_owned(),
         "Add your other machines to fleet.toml with `legion fleet.discover` (or `legion fleet.discover add=true`, or `legion fleet.add`).".to_owned(),
         "Register an AI coding agent with `legion agents add claude --as agent:claude` (also supports codex, antigravity, and opencode).".to_owned(),
         "Check that everything is configured and reachable with `legion meta.doctor`.".to_owned(),
@@ -307,11 +312,22 @@ mod tests {
         let base_policy =
             parse::<Policy>(Path::new("policy.toml"), policy_text.as_bytes()).unwrap();
         assert_eq!(base_policy.default_principal(), "owner");
+        assert!(base_policy.roles.contains_key("observer"));
+        assert!(base_policy.roles.contains_key("editor"));
+        assert!(base_policy.roles.contains_key("operator"));
+        assert!(
+            !base_policy.roles.contains_key("maintainer"),
+            "maintainer role must not be generated"
+        );
+        assert!(
+            policy_text.contains("as strong as your account") && policy_text.contains("not a wall"),
+            "operator comment must state plainly that exec is as strong as the account"
+        );
 
         policy_text.push_str(
             "\n[principals.viewer]\nrole = \"observer\"\n\
-             [principals.bot]\nrole = \"operator\"\n\
-             [principals.ops]\nrole = \"maintainer\"\n",
+             [principals.writer]\nrole = \"editor\"\n\
+             [principals.bot]\nrole = \"operator\"\n",
         );
         let policy = parse::<Policy>(Path::new("policy.toml"), policy_text.as_bytes()).unwrap();
 
@@ -321,11 +337,20 @@ mod tests {
         std::fs::create_dir_all(home.join("private")).unwrap();
         let paths = Paths::under(dir.path().join("legion")).with_home(&home);
 
-        // Observer: reads allowed, audit log and writes denied.
+        // Observer: reads allowed and confined to ~/projects/**, audit log and writes denied.
+        let obs_grant = policy
+            .authorize("viewer", &spec("fs.read", Effect::Read), &paths)
+            .unwrap();
         assert!(
-            policy
-                .authorize("viewer", &spec("fs.read", Effect::Read), &paths)
+            obs_grant
+                .check_path("~/projects/demo/a.txt", Access::Read)
                 .is_ok()
+        );
+        assert!(
+            obs_grant
+                .check_path("~/private/secret.txt", Access::Read)
+                .is_err(),
+            "observer must be confined to ~/projects/**"
         );
         assert!(
             policy
@@ -338,25 +363,47 @@ mod tests {
                 .is_err()
         );
 
-        // Operator: read/write/exec allowed, confined to ~/projects/**, power & admin denied.
-        let op_grant = policy
-            .authorize("bot", &spec("fs.write", Effect::Write), &paths)
+        // Editor: read and write confined to ~/projects/**, no exec, destroy, power, or admin.
+        let ed_grant = policy
+            .authorize("writer", &spec("fs.write", Effect::Write), &paths)
             .unwrap();
         assert!(
-            op_grant
+            ed_grant
                 .check_path("~/projects/demo/a.txt", Access::Write)
                 .is_ok()
         );
         assert!(
-            op_grant
+            ed_grant
                 .check_path("~/private/secret.txt", Access::Read)
                 .is_err()
         );
-        assert!(
-            policy
-                .authorize("bot", &spec("exec.run", Effect::Exec), &paths)
-                .is_ok()
-        );
+        for (name, effect) in [
+            ("exec.run", Effect::Exec),
+            ("fs.remove", Effect::Destroy),
+            ("power.reboot", Effect::Power),
+            ("token.add", Effect::Admin),
+        ] {
+            assert!(
+                policy
+                    .authorize("writer", &spec(name, effect), &paths)
+                    .is_err(),
+                "editor must deny {name}"
+            );
+        }
+
+        // Operator: read/write/exec/destroy allowed, power and admin denied.
+        for (name, effect) in [
+            ("fs.read", Effect::Read),
+            ("fs.write", Effect::Write),
+            ("exec.run", Effect::Exec),
+            ("fs.remove", Effect::Destroy),
+            ("audit.tail", Effect::Read),
+        ] {
+            assert!(
+                policy.authorize("bot", &spec(name, effect), &paths).is_ok(),
+                "operator should allow {name}"
+            );
+        }
         assert!(
             policy
                 .authorize("bot", &spec("power.reboot", Effect::Power), &paths)
@@ -367,29 +414,9 @@ mod tests {
                 .authorize("bot", &spec("token.add", Effect::Admin), &paths)
                 .is_err()
         );
-
-        // Maintainer: read/write/exec/destroy/power allowed, admin denied.
-        for (name, effect) in [
-            ("fs.read", Effect::Read),
-            ("fs.write", Effect::Write),
-            ("exec.run", Effect::Exec),
-            ("fs.remove", Effect::Destroy),
-            ("power.reboot", Effect::Power),
-            ("audit.tail", Effect::Read),
-        ] {
-            assert!(
-                policy.authorize("ops", &spec(name, effect), &paths).is_ok(),
-                "maintainer should allow {name}"
-            );
-        }
         assert!(
             policy
-                .authorize("ops", &spec("token.add", Effect::Admin), &paths)
-                .is_err()
-        );
-        assert!(
-            policy
-                .authorize("ops", &spec("fleet.sync", Effect::Admin), &paths)
+                .authorize("bot", &spec("fleet.sync", Effect::Admin), &paths)
                 .is_err()
         );
     }

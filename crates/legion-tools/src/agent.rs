@@ -97,7 +97,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "agent.add",
         Effect::Admin,
-        "Register this `legion` binary as an MCP server named `legion` with an AI coding agent using the agent's own CLI command, never by editing its configuration files directly. `compact` defaults to true because every registered tool schema costs the agent context on every conversation; pass `compact=false` to expose every tool individually. A named, limited principal from policy.toml (such as `agent:claude` with the `operator` or `observer` role) is safer than `owner` because it narrows what the agent may do and identifies its calls in the audit log; registering as `owner` requires `allow_owner=true`.",
+        "Register this `legion` binary as an MCP server named `legion` with an AI coding agent using the agent's own CLI command, never by editing its configuration files directly. `compact` defaults to true because every registered tool schema costs the agent context on every conversation; pass `compact=false` to expose every tool individually. A named, limited principal from policy.toml (such as `agent:claude` with the `editor` or `observer` role) is safer than `owner` because it narrows what the agent may do and identifies its calls in the audit log; registering as `owner` requires `allow_owner=true`.",
         add,
     );
     registry.add_fn(
@@ -302,18 +302,19 @@ pub struct AddResult {
 async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
     let principal = Principal::parse(&args.as_principal)?;
     let principal = principal.as_str().to_owned();
-    if principal == OWNER {
+    let policy = ctx.config().get::<Policy>()?;
+    // The owner role, not the name: a principal the file gives role = "owner" may do as much.
+    if policy.role_of(&principal).0 == OWNER {
         if !args.allow_owner {
             return Err(ErrorBody::new(
                 ErrorCode::Denied,
-                "Registering an AI agent as `owner` gives it unrestricted access to everything this account can do, so it is refused unless `allow_owner=true`.",
+                format!("{principal} has the owner role: registering an AI agent as it gives the agent unrestricted access to everything this account can do, so it is refused unless `allow_owner=true`."),
             )
             .with_hint(
-                "Add a named principal with a narrower role in policy.toml (such as `[principals.\"agent:claude\"]` with `role = \"operator\"`), or pass `allow_owner=true` if you really want unrestricted access.",
+                "Add a named principal with a narrower role in policy.toml (such as `[principals.\"agent:claude\"]` with `role = \"editor\"`), or pass `allow_owner=true` if you really want unrestricted access.",
             ));
         }
     } else {
-        let policy = ctx.config().get::<Policy>()?;
         if !policy
             .principals
             .keys()
@@ -558,12 +559,7 @@ fn looks_like_already_exists(output: &str) -> bool {
 /// Resolves the absolute path of the running `legion` binary so registered MCP configs remain
 /// valid even when the agent spawns subprocesses with a minimal `PATH`.
 fn current_legion_exe() -> Result<String, ErrorBody> {
-    let exe = std::env::current_exe().map_err(|error| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Cannot determine the path of the running legion executable: {error}."),
-        )
-    })?;
+    let exe = legion_core::current_exe()?;
     let resolved = dunce::canonicalize(&exe).unwrap_or(exe);
     resolved.into_os_string().into_string().map_err(|path| {
         ErrorBody::new(

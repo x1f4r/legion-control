@@ -6,7 +6,7 @@
 //! way a transfer sees it. Keeping that here keeps the two from drifting apart.
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, Ctx, Grant, Paths, Registry, ToolError};
@@ -139,61 +139,30 @@ pub fn resolve_root(grant: &Grant, path: &str, access: Access) -> Result<PathBuf
 /// file tool refuses them one by one.
 pub fn manifest(
     grant: &Grant,
-    paths: &Paths,
+    _paths: &Paths,
     root: &Path,
     options: &ManifestOptions,
 ) -> Result<Manifest, ErrorBody> {
     if grant.allows_effect(Effect::Admin) {
         return legion_xfer::manifest::build(root, options).map_err(error);
     }
-    let own: Vec<(PathBuf, &str)> = [
-        (paths.config_dir(), "Legion's own configuration"),
-        (paths.state_dir(), "Legion's own state"),
-    ]
-    .into_iter()
-    .filter_map(|(dir, what)| dunce::canonicalize(dir).ok().map(|dir| (dir, what)))
-    .collect();
-    let prune = |dir: &Path| {
-        // Only a directory with the same name can be one of them; only those are resolved.
-        own.iter()
-            .find(|(own, _)| {
-                own.file_name() == dir.file_name()
-                    && dunce::canonicalize(dir).is_ok_and(|dir| dir == *own)
-            })
-            .map(|(_, what)| {
-                format!("{what}, which only a role that allows effect:admin may read or change")
-            })
+    let filter = grant.protected_filter();
+    if filter.is_empty() {
+        return legion_xfer::manifest::build(root, options).map_err(error);
+    }
+    let prune = |entry_path: &Path| {
+        filter
+            .blocked(entry_path)
+            .map(|(_, reason)| reason.to_owned())
     };
     let mut manifest = legion_xfer::manifest::build_pruned(root, options, prune).map_err(error)?;
-    // Whatever names the walk still reported from inside them, which it should not have, is
-    // dropped as well.
+    // Belt-and-suspenders: strip any entry under a protected path if a walk still produced one.
     if let Ok(canonical_root) = dunce::canonicalize(root) {
-        for (dir, _) in &own {
-            if let Some(rel) = relative_name(&canonical_root, dir) {
-                let below = format!("{rel}/");
-                manifest
-                    .entries
-                    .retain(|entry| entry.path != rel && !entry.path.starts_with(&below));
-                manifest
-                    .skipped
-                    .retain(|entry| !entry.path.starts_with(&below));
-            }
-        }
+        manifest
+            .entries
+            .retain(|entry| !filter.is_blocked(&canonical_root.join(&entry.path)));
     }
     Ok(manifest)
-}
-
-/// `path` relative to `root` in a manifest's spelling (`a/b`), when it lies strictly inside it.
-fn relative_name(root: &Path, path: &Path) -> Option<String> {
-    let rest = path.strip_prefix(root).ok()?;
-    let mut parts = Vec::new();
-    for component in rest.components() {
-        match component {
-            Component::Normal(part) => parts.push(part.to_str()?.to_owned()),
-            _ => return None,
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// The transfer engine's error as a caller reads it: the closed code an agent branches on and a
@@ -264,21 +233,5 @@ pub fn error(error: legion_xfer::Error) -> ErrorBody {
                 None => format!("The transfer stream failed: {source}."),
             },
         ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relative_names_are_slash_separated_and_strictly_inside() {
-        let root = Path::new("/home/me");
-        assert_eq!(
-            relative_name(root, Path::new("/home/me/.config/legion")).as_deref(),
-            Some(".config/legion")
-        );
-        assert_eq!(relative_name(root, root), None);
-        assert_eq!(relative_name(root, Path::new("/srv/data")), None);
     }
 }

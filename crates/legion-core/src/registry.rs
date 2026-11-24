@@ -186,6 +186,13 @@ impl Registry {
         self.tools.get(name)
     }
 
+    /// Whether any registered built-in tool belongs to `family` (the segment before the first `.`).
+    pub fn has_family(&self, family: &str) -> bool {
+        self.tools
+            .keys()
+            .any(|name| name.split('.').next() == Some(family))
+    }
+
     /// Every tool's spec, sorted by name.
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools

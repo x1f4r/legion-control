@@ -16,11 +16,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind};
+use legion_core::proto::{ErrorBody, ErrorCode, EventKind};
 use legion_core::{Access, CancellationToken, Ctx, Grant, Place, Registry, ToolError};
 use legion_os::OsError;
 use legion_os::lock::FileLock;
-use same_file::Handle;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -320,6 +319,10 @@ pub(crate) fn check_not_protected_tree(grant: &Grant, path: &Path) -> Result<(),
             "Legion's state directory",
             "Legion's state directory holds the audit log and runtime state and cannot be removed, moved or replaced as a whole.",
         ),
+        Place::Secret => (
+            "a secret location",
+            "Only a role with effect:admin, or one whose `paths` names the secret location explicitly, may remove, move or replace it.",
+        ),
     };
     Err(ErrorBody::new(
         ErrorCode::Denied,
@@ -332,53 +335,31 @@ pub(crate) fn check_not_protected_tree(grant: &Grant, path: &Path) -> Result<(),
     .with_details(json!({"path": path, "place": format!("{place:?}").to_lowercase()})))
 }
 
-/// Identifies Legion's own configuration and state directories during recursive directory walks
-/// so roles without `effect:admin` cannot read or copy them by starting at an ancestor such as `~`.
+/// Identifies Legion's own configuration/state directories and well-known secret locations during
+/// recursive directory walks, backed directly by [`legion_core::ProtectedFilter`].
 #[derive(Debug)]
 pub(crate) struct OwnDirFilter {
-    handles: Vec<Handle>,
-    paths: Vec<PathBuf>,
+    inner: legion_core::ProtectedFilter,
 }
 
 impl OwnDirFilter {
     /// Builds a filter for `ctx`: empty for roles with `effect:admin`, and matching Legion's
-    /// configuration and state directories (by file identity and resolved path) otherwise.
+    /// configuration/state directories plus secret locations not explicitly opted into via `paths`.
     pub(crate) fn for_ctx(ctx: &Ctx) -> OwnDirFilter {
-        if ctx.grant().allows_effect(Effect::Admin) {
-            return OwnDirFilter {
-                handles: Vec::new(),
-                paths: Vec::new(),
-            };
+        OwnDirFilter {
+            inner: ctx.grant().protected_filter(),
         }
-        let mut handles = Vec::new();
-        let mut paths = Vec::new();
-        for dir in [ctx.paths().config_dir(), ctx.paths().state_dir()] {
-            if let Ok(handle) = Handle::from_path(dir) {
-                handles.push(handle);
-            }
-            paths.push(dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
-        }
-        OwnDirFilter { handles, paths }
     }
 
-    /// Whether `path` refers to Legion's configuration or state directory.
+    /// Whether `path` refers to Legion's own directories or a refused secret location.
     pub(crate) fn is_blocked(&self, path: &Path) -> bool {
-        if self.handles.is_empty() && self.paths.is_empty() {
-            return false;
-        }
-        if let Ok(handle) = Handle::from_path(path)
-            && self.handles.contains(&handle)
-        {
-            return true;
-        }
-        self.paths.iter().any(|own| paths_equal(path, own))
+        self.inner.is_blocked(path)
     }
 
     #[cfg(test)]
     pub(crate) fn allow_all_for_test() -> OwnDirFilter {
         OwnDirFilter {
-            handles: Vec::new(),
-            paths: Vec::new(),
+            inner: legion_core::ProtectedFilter::allow_all(),
         }
     }
 }

@@ -473,6 +473,7 @@ impl Session {
             cancel,
             events,
             hops: params.hops,
+            credential_expires: None,
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);

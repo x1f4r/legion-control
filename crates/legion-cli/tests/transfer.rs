@@ -91,6 +91,10 @@ fn main() -> ExitCode {
             an_end_that_is_stopped_is_given_time_to_clean_up,
         ),
         (
+            "the_destination_takes_only_what_was_planned_as_it_was_planned",
+            the_destination_takes_only_what_was_planned_as_it_was_planned,
+        ),
+        (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
             gate_serves_only_the_connectors_commands_pinned_to_its_principal,
         ),
@@ -222,6 +226,30 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
         ("oversized", "pack") => header["names"] = json!(["readme.txt", "big.bin"]),
         // Its file is edited in place after it was listed and before it is packed.
         ("mutate", "pack") => fs::write(home.join("export/readme.txt"), b"READ ME").unwrap(),
+        // Its file grows after it was listed.
+        ("grow", "pack") => {
+            fs::write(home.join("export/readme.txt"), b"read me, and more").unwrap();
+        }
+        // Its file is listed as a file and packed as a link to somewhere else.
+        #[cfg(unix)]
+        ("to-symlink", "pack") => {
+            let file = home.join("export/readme.txt");
+            fs::remove_file(&file).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", &file).unwrap();
+        }
+        // Leaves out one of the entries it was asked for, and does not say so.
+        ("omit", "pack") => {
+            let names: Vec<Value> = header["names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|name| *name != "steady.txt")
+                .cloned()
+                .collect();
+            header["names"] = json!(names);
+        }
+        // Sends every entry twice, as two archives run together.
+        ("twice", "pack") => return twice(header, command),
         // An unpack that, like a real one, has a temporary file to remove once its input ends,
         // and takes a moment to do it: killed at once, it leaves the file behind.
         ("slow-cleanup", "unpack") => {
@@ -229,6 +257,7 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
             fs::create_dir_all(&root).unwrap();
             let temporary = root.join(".legion-unpack-1-0.tmp");
             fs::write(&temporary, b"half").unwrap();
+            println!("{}", json!({"protocol": 1}));
             println!("{}", json!({"ready": true}));
             std::io::stdout().flush().unwrap();
             let _ = std::io::copy(&mut input, &mut std::io::sink());
@@ -240,6 +269,7 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
         ("fail-pack", "pack") => {
             let error =
                 json!({"code": "failed", "message": "The disk went away.", "machine": "broken"});
+            println!("{}", json!({"protocol": 1}));
             println!("{}", json!({ "error": error }));
             return ExitCode::from(1);
         }
@@ -263,7 +293,8 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
             let mut kept = 0;
             for line in replies.lines() {
                 let mut reply: Value = serde_json::from_str(&line.unwrap()).unwrap();
-                if reply.get("done").is_some() {
+                if reply.get("protocol").is_some() {
+                } else if reply.get("done").is_some() {
                     reply["entries"] = json!(kept);
                 } else if reply["path"] != "readme.txt" {
                     continue;
@@ -273,7 +304,7 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
                 writeln!(out, "{reply}").unwrap();
             }
         }
-        // Speaks an older protocol, whose archive came without a line before it.
+        // Speaks the protocol before this one, which did not open by saying which it speaks.
         ("old", "pack") => {
             let mut line = String::new();
             replies.read_line(&mut line).unwrap();
@@ -281,14 +312,13 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
         }
         // Says its file system ignores letter case, as macOS and Windows usually do.
         ("caseless", "stat") => {
-            let mut line = String::new();
-            replies.read_line(&mut line).unwrap();
-            let mut reply: Value = serde_json::from_str(&line).unwrap();
-            if reply.get("kind").is_some() {
-                reply["case_insensitive"] = json!(true);
+            for line in replies.lines() {
+                let mut reply: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if reply.get("kind").is_some() {
+                    reply["case_insensitive"] = json!(true);
+                }
+                writeln!(out, "{reply}").unwrap();
             }
-            writeln!(out, "{reply}").unwrap();
-            std::io::copy(&mut replies, &mut out).unwrap();
         }
         // Stops half way through its archive and fails.
         ("truncate", "pack") => {
@@ -314,6 +344,57 @@ fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
     }
     out.flush().unwrap();
     exit_of(child.wait().unwrap())
+}
+
+/// Packs the same names twice and sends one archive holding both, each entry appearing twice.
+fn twice(header: Value, mut command: Command) -> ExitCode {
+    let mut archives = Vec::new();
+    for _ in 0..2 {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{header}").unwrap();
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut output)
+            .unwrap();
+        child.wait().unwrap();
+        archives.push(output);
+    }
+    // The lines before each archive, then the archive; the first loses its closing blocks.
+    let split = |output: &[u8]| {
+        let mut at = 0;
+        while output.get(at) == Some(&b'{') {
+            at += output[at..].iter().position(|b| *b == b'\n').unwrap() + 1;
+        }
+        at
+    };
+    let (lines, first) = archives[0].split_at(split(&archives[0]));
+    let mut first = first.to_vec();
+    while first.len() >= 512 && first[first.len() - 512..].iter().all(|b| *b == 0) {
+        first.truncate(first.len() - 512);
+    }
+    let second = &archives[1][split(&archives[1])..];
+    let mut out = std::io::stdout().lock();
+    out.write_all(lines).unwrap();
+    out.write_all(&first).unwrap();
+    out.write_all(second).unwrap();
+    out.flush().unwrap();
+    ExitCode::SUCCESS
+}
+
+/// The first reply on a stream's output, after the line that opens every stream and says which
+/// protocol it speaks.
+fn first_reply(stdout: &[u8]) -> Value {
+    let mut lines = stdout.split(|b| *b == b'\n');
+    let opening: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
+    assert_eq!(opening, json!({"protocol": 1}));
+    serde_json::from_slice(lines.next().unwrap()).unwrap()
 }
 
 fn exit_of(status: std::process::ExitStatus) -> ExitCode {
@@ -1100,7 +1181,7 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
     // A receiver that refuses answers and exits while the sender still has megabytes to send.
     for header in [
         json!({"op": "put", "path": "~/projects/x.bin", "size": 64 << 20, "hash": format!("blake3:{}", "0".repeat(64)), "as": "reader", "protocol": 1}),
-        json!({"op": "unpack", "root": "~/projects/x", "names": [], "as": "reader", "protocol": 1}),
+        json!({"op": "unpack", "root": "~/projects/x", "entries": [], "as": "reader", "protocol": 1}),
     ] {
         let mut child = pi
             .command(&["stream"])
@@ -1124,8 +1205,7 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
         let output = child.wait_with_output().unwrap();
         assert!(started.elapsed() < PATIENCE);
         assert_eq!(output.status.code(), Some(1));
-        let reply: Value =
-            serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let reply: Value = first_reply(&output.stdout);
         assert_eq!(reply["error"]["code"], "denied", "{reply}");
         assert_eq!(reply["error"]["machine"], "pi");
         assert!(String::from_utf8_lossy(&output.stderr).contains("legion stream:"));
@@ -1282,8 +1362,7 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
-        let reply: Value =
-            serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+        let reply: Value = first_reply(&output.stdout);
         if outcome == "ok" {
             assert_eq!(reply["kind"], "file", "{reply}");
         } else {
@@ -1365,7 +1444,8 @@ fn a_source_cannot_send_what_was_not_planned() {
         (Some("failed"), Some("evil")),
         "{error}"
     );
-    assert!(error.to_string().contains("other.txt"), "{error}");
+    // The unpack stops at the first entry that was not planned.
+    assert_eq!(error["details"]["violation"]["path"], ".env", "{error}");
     assert_eq!(fs::read(work.join(".env")).unwrap(), b"SECRET=mine");
     assert!(!work.join("other.txt").exists());
     assert_eq!(fs::read(work.join("readme.txt")).unwrap(), b"read me");
@@ -1569,8 +1649,7 @@ fn an_end_that_speaks_another_protocol_is_told_apart_from_a_banner() {
     .unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(1));
-    let reply: Value =
-        serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    let reply: Value = first_reply(&output.stdout);
     assert_eq!(reply["error"]["code"], "unsupported", "{reply}");
     assert_eq!(reply["error"]["details"]["protocol"], json!([1]), "{reply}");
 }
@@ -1840,4 +1919,60 @@ fn relayed_machine_refuses_transfer_with_relay_hint() {
         cp["hint"].as_str().unwrap_or("").contains("--on pi"),
         "{cp}"
     );
+}
+
+fn the_destination_takes_only_what_was_planned_as_it_was_planned() {
+    let laptop = node("laptop");
+    // Each source misbehaves in its own way; `true` where the planned file itself is what is
+    // wrong, so the destination's must stay as it was.
+    let mut machines = vec![
+        ("edited", "mutate", true),
+        ("grown", "grow", true),
+        ("omitting", "omit", false),
+        ("doubled", "twice", false),
+    ];
+    if cfg!(unix) {
+        machines.push(("symlinked", "to-symlink", true));
+    }
+    let homes: Vec<Home> = machines.iter().map(|(name, _, _)| node(name)).collect();
+    let entries: Vec<(&str, &Home, &str, Vec<String>)> = machines
+        .iter()
+        .zip(&homes)
+        .map(|((name, behaviour, _), home)| (*name, home, "evil", vec![(*behaviour).to_owned()]))
+        .collect();
+    fleet(&laptop, &entries);
+    for ((name, behaviour, untouched), home) in machines.iter().zip(&homes) {
+        let export = home.home().join("export");
+        fs::create_dir_all(&export).unwrap();
+        fs::write(export.join("readme.txt"), b"read me").unwrap();
+        fs::write(export.join("steady.txt"), b"steady").unwrap();
+        // What the destination already has, which a refused transfer must leave as it was.
+        let dest = laptop.home().join(name);
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("readme.txt"), b"OLD ME!").unwrap();
+
+        let error = refused(&transfer(
+            &laptop,
+            json!({"from": format!("{name}:~/export"), "to": format!("~/{name}"), "checksum": true}),
+            &[],
+        ));
+        assert_eq!(
+            (error["code"].as_str(), error["machine"].as_str()),
+            (Some("failed"), Some(*name)),
+            "{behaviour}: {error}"
+        );
+        assert!(
+            fs::symlink_metadata(dest.join("readme.txt"))
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "{behaviour}"
+        );
+        let now = fs::read(dest.join("readme.txt")).unwrap();
+        if *untouched {
+            assert_eq!(now, b"OLD ME!", "{behaviour}");
+        } else {
+            assert!(now == b"OLD ME!" || now == b"read me", "{behaviour}");
+        }
+    }
 }
