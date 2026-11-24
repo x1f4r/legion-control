@@ -620,6 +620,9 @@ fn configure_common_cmd(
     for key in &resolved.env_remove {
         cmd.env_remove(key);
     }
+    for key in &options.env_remove {
+        cmd.env_remove(key);
+    }
     for (key, value) in &options.env {
         cmd.env(key, value);
     }
@@ -815,9 +818,13 @@ async fn systemd_user_scope_available(options: &DetachOptions) -> bool {
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    // Respect any session-bus environment overrides provided by the caller.
+    // Respect any session-bus environment removals or overrides provided by the caller.
     for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
-        if let Some(val) = options.env.get(OsStr::new(key)) {
+        let os_key = OsStr::new(key);
+        if options.env_remove.iter().any(|k| k.as_os_str() == os_key) {
+            probe.env_remove(key);
+        }
+        if let Some(val) = options.env.get(os_key) {
             probe.env(key, val);
         }
     }
@@ -902,11 +909,13 @@ fn ensure_target_exists(program: &OsStr, options: &DetachOptions) -> Result<()> 
         return Ok(());
     }
 
+    let path_key = OsStr::new("PATH");
+    let path_removed = options.env_remove.iter().any(|k| k.as_os_str() == path_key);
     let path_var: Option<OsString> = options
         .env
-        .get(OsStr::new("PATH"))
+        .get(path_key)
         .cloned()
-        .or_else(|| std::env::var_os("PATH"));
+        .or_else(|| (!path_removed).then(|| std::env::var_os("PATH")).flatten());
     let name = program.to_string_lossy();
     if find_executable_in_paths(&name, path_var.as_deref(), &[]).is_none() {
         return Err(OsError::ProgramNotFound {

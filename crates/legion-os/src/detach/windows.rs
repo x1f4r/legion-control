@@ -73,8 +73,9 @@ pub(super) async fn spawn_detached(
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let env_remove_str: Vec<String> = resolved
-        .env_remove
+    let mut combined_env_remove_os = resolved.env_remove.clone();
+    combined_env_remove_os.extend(options.env_remove.iter().cloned());
+    let env_remove_str: Vec<String> = combined_env_remove_os
         .iter()
         .map(|key| key.to_string_lossy().into_owned())
         .collect();
@@ -99,7 +100,7 @@ pub(super) async fn spawn_detached(
         &program_display,
         &command_line,
         options.cwd.as_deref(),
-        &resolved.env_remove,
+        &combined_env_remove_os,
         &options.env,
         options.stdout_path.as_deref(),
         options.stderr_path.as_deref(),
@@ -178,6 +179,7 @@ async fn spawn_via_wmi(
     let env_remove: Vec<String> = resolved
         .env_remove
         .iter()
+        .chain(options.env_remove.iter())
         .map(|key| key.to_string_lossy().into_owned())
         .collect();
     let overrides: Vec<(String, String)> = options

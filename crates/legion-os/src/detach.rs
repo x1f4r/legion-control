@@ -74,6 +74,8 @@ pub struct DetachOptions {
     pub cwd: Option<PathBuf>,
     /// Extra environment variables overlaid on the inherited environment.
     pub env: BTreeMap<OsString, OsString>,
+    /// Inherited environment variable names to drop before applying explicit [`Self::env`] entries.
+    pub env_remove: Vec<OsString>,
     /// File path to append standard output to; redirected to null when `None`.
     pub stdout_path: Option<PathBuf>,
     /// File path to append standard error to; redirected to null when `None`.
@@ -88,6 +90,7 @@ impl DetachOptions {
             name: None,
             cwd: None,
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
             stdout_path: None,
             stderr_path: None,
         }
@@ -121,6 +124,22 @@ impl DetachOptions {
         for (k, v) in vars {
             self.env.insert(k.into(), v.into());
         }
+        self
+    }
+
+    /// Remove an inherited environment variable before explicit [`Self::env`] entries are applied.
+    pub fn env_remove(mut self, key: impl Into<OsString>) -> Self {
+        self.env_remove.push(key.into());
+        self
+    }
+
+    /// Remove multiple inherited environment variables before explicit [`Self::env`] entries are applied.
+    pub fn env_removes<I, K>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<OsString>,
+    {
+        self.env_remove.extend(keys.into_iter().map(Into::into));
         self
     }
 

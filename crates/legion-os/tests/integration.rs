@@ -47,6 +47,9 @@ fn main() -> ExitCode {
         ("run_argv_echo_env_cwd_stdin_and_exit_code", || {
             Box::pin(test_run_argv_echo_env_cwd_stdin_and_exit_code())
         }),
+        ("env_remove_drops_inherited_vars_in_run_and_detach", || {
+            Box::pin(test_env_remove_drops_inherited_vars_in_run_and_detach())
+        }),
         ("run_shell_string_works_on_platform_shell", || {
             Box::pin(test_run_shell_string_works_on_platform_shell())
         }),
@@ -197,6 +200,8 @@ fn run_helper(mode: &str) -> ExitCode {
         "orphan_root_exit" => helper_orphan_root_exit(&args),
         "detach_fd_parent" => helper_detach_fd_parent(&args),
         "report_open_fds" => helper_report_open_fds(&args),
+        "env_remove_driver" => helper_env_remove_driver(&args),
+        "dump_env_vars" => helper_dump_env_vars(&args),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -590,6 +595,83 @@ fn helper_report_open_fds(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn helper_env_remove_driver(args: &[String]) -> ExitCode {
+    let detach_out = PathBuf::from(&args[0]);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("helper tokio runtime");
+
+    // 1. Verify RunOptions::env_remove drops inherited vars and lets explicit `env` win.
+    let (spec, helper_env) = helper_spec("dump_env_vars", &[]);
+    let run_out = rt
+        .block_on(run(RunOptions::new(spec)
+            .envs(helper_env)
+            .env_remove("LEGION_DROP_ME")
+            .env_removes(["LEGION_DROP_TOO", "LEGION_RESET_ME"])
+            .env("LEGION_RESET_ME", "fresh-value")
+            .timeout(Duration::from_secs(10))))
+        .expect("run with env_remove failed");
+    assert!(run_out.success());
+    let text = run_out.stdout.text;
+    assert!(text.contains("LEGION_DROP_ME=<unset>"), "got: {text}");
+    assert!(text.contains("LEGION_DROP_TOO=<unset>"), "got: {text}");
+    assert!(text.contains("LEGION_KEEP_ME=keep-val"), "got: {text}");
+    assert!(text.contains("LEGION_RESET_ME=fresh-value"), "got: {text}");
+
+    // 2. Verify DetachOptions::env_remove drops inherited vars and lets explicit `env` win.
+    let (dspec, denv) = helper_spec("dump_env_vars", &[]);
+    let handle = rt
+        .block_on(spawn_detached(
+            DetachOptions::new(dspec)
+                .name("env-remove")
+                .envs(denv)
+                .env_remove("LEGION_DROP_ME")
+                .env_removes(["LEGION_DROP_TOO", "LEGION_RESET_ME"])
+                .env("LEGION_RESET_ME", "detached-fresh")
+                .stdout_path(&detach_out),
+        ))
+        .expect("spawn_detached with env_remove failed");
+
+    let detach_text = rt.block_on(wait_for_detached_file(
+        &detach_out,
+        Duration::from_secs(5),
+        &handle,
+        &[&detach_out],
+    ));
+    assert!(
+        detach_text.contains("LEGION_DROP_ME=<unset>"),
+        "got: {detach_text}"
+    );
+    assert!(
+        detach_text.contains("LEGION_DROP_TOO=<unset>"),
+        "got: {detach_text}"
+    );
+    assert!(
+        detach_text.contains("LEGION_KEEP_ME=keep-val"),
+        "got: {detach_text}"
+    );
+    assert!(
+        detach_text.contains("LEGION_RESET_ME=detached-fresh"),
+        "got: {detach_text}"
+    );
+    ExitCode::SUCCESS
+}
+
+fn helper_dump_env_vars(_args: &[String]) -> ExitCode {
+    for key in [
+        "LEGION_DROP_ME",
+        "LEGION_DROP_TOO",
+        "LEGION_KEEP_ME",
+        "LEGION_RESET_ME",
+    ] {
+        let val = env::var(key).unwrap_or_else(|_| "<unset>".to_owned());
+        println!("{key}={val}");
+    }
+    let _ = io::stdout().flush();
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests
 // ---------------------------------------------------------------------------
@@ -694,6 +776,31 @@ async fn test_run_argv_echo_env_cwd_stdin_and_exit_code() {
     .unwrap();
     assert!(!fail.success());
     assert_eq!(fail.exit_code, Some(42));
+}
+
+async fn test_env_remove_drops_inherited_vars_in_run_and_detach() {
+    let dir = tempfile::tempdir().unwrap();
+    let detach_out = dir.path().join("detach-env.txt");
+    let detach_out_str = detach_out.to_string_lossy().into_owned();
+
+    // Launch a helper process with inherited LEGION_* variables so we never mutate this test
+    // runner's own environment.
+    let (spec, helper_env) = helper_spec("env_remove_driver", &[&detach_out_str]);
+    let res = run(RunOptions::new(spec)
+        .envs(helper_env)
+        .env("LEGION_DROP_ME", "secret-1")
+        .env("LEGION_DROP_TOO", "secret-2")
+        .env("LEGION_KEEP_ME", "keep-val")
+        .env("LEGION_RESET_ME", "old-val")
+        .timeout(Duration::from_secs(15)))
+    .await
+    .unwrap();
+    assert!(
+        res.success(),
+        "env_remove_driver failed: stdout={} stderr={}",
+        res.stdout.text,
+        res.stderr.text
+    );
 }
 
 async fn test_run_shell_string_works_on_platform_shell() {
