@@ -59,9 +59,11 @@ sudo apt-get remove legion
 
 Two variants live under `packaging/arch/`:
 
-- `packaging/arch/PKGBUILD` (`legion`) — builds from source at a `legion-v<version>` release tag.
-  Requires Rust matching `rust-toolchain.toml` (`1.100.0` or newer, for example through `rustup` or
-  Arch's `rust` package once updated).
+- `packaging/arch/PKGBUILD` (`legion`) — builds from source at a `legion-v<version>` release tag,
+  records the tag's commit in `LEGION_BUILD_REV` (from the tag archive header or remote tag), and
+  remaps build paths out of the binary with `--remap-path-prefix`. Requires Rust matching
+  `rust-toolchain.toml` (`1.100.0` or newer, for example through `rustup` or Arch's `rust` package
+  once updated).
 - `packaging/arch/legion-bin/PKGBUILD` (`legion-bin`) — installs the released static musl binary
   and provides/conflicts with `legion`.
 

@@ -168,16 +168,23 @@ jobs:
           LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          workspace="$(pwd -P)"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${HOME}=/build/home --remap-path-prefix=${cargo_home}=/cargo --remap-path-prefix=${workspace}=/build"
           cargo zigbuild --release --locked --target "${{ matrix.target }}" -p legion-cli
       - name: Build release binary (Windows static CRT)
         if: runner.os == 'Windows'
         shell: bash
         env:
-          # Statically link the MSVC C runtime so target Windows machines need no VC++ redistributable.
-          RUSTFLAGS: -C target-feature=+crt-static
           LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
+          win_home="$(cygpath -w "${USERPROFILE:-$HOME}")"
+          win_cargo_home="$(cygpath -w "${CARGO_HOME:-${win_home}\\.cargo}")"
+          win_workspace="$(cygpath -w "$PWD")"
+          # Statically link the MSVC C runtime so target Windows machines need no VC++ redistributable,
+          # and remap build host paths out of the shipped binary.
+          export RUSTFLAGS="-C target-feature=+crt-static --remap-path-prefix=${win_home}=/build/home --remap-path-prefix=${win_cargo_home}=/cargo --remap-path-prefix=${win_workspace}=/build"
           cargo build --release --locked --target "${{ matrix.target }}" -p legion-cli
       - name: Build release binary (native)
         if: ${{ !matrix.use_zigbuild && runner.os != 'Windows' }}
@@ -187,6 +194,9 @@ jobs:
           LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          workspace="$(pwd -P)"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${HOME}=/build/home --remap-path-prefix=${cargo_home}=/cargo --remap-path-prefix=${workspace}=/build"
           cargo build --release --locked --target "${{ matrix.target }}" -p legion-cli
       - name: Stage artifact
         shell: bash
@@ -197,6 +207,7 @@ jobs:
           dest="dist/legion-${{ needs.prepare.outputs.version }}-${{ matrix.target }}${{ matrix.ext }}"
           cp "$src" "$dest"
           test -s "$dest"
+          node scripts/check-binary-paths.mjs "$dest"
           ls -lh "$dest"
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             file "$dest"

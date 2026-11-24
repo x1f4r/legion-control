@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createSigningKey } from '../scripts/release-integrity.mjs';
+import { checkBinaryPaths } from '../scripts/check-binary-paths.mjs';
 import { parseSha256Sums, signLegionRelease, signSha256SumsBytes } from '../scripts/sign-legion-release.mjs';
 
 const repoFile = (rel) => fileURLToPath(new URL(`../${rel}`, import.meta.url));
@@ -108,10 +109,85 @@ test('legion release workflow enforces main ancestry, --latest=false, and --prer
   assert.doesNotMatch(workflow, /actions\/cache/);
   const buildRevMatches = workflow.match(/LEGION_BUILD_REV:\s*\$\{\{\s*github\.sha\s*\}\}/g) ?? [];
   assert.equal(buildRevMatches.length, 3, 'every release build step must set LEGION_BUILD_REV from github.sha');
+  const remapMatches = workflow.match(/--remap-path-prefix=/g) ?? [];
+  assert.ok(remapMatches.length >= 9, 'every release build step must remap home, cargo, and workspace paths');
+  assert.match(workflow, /node scripts\/check-binary-paths\.mjs "\$dest"/);
   assert.match(workflow, /deb_arch:\s*amd64/);
   assert.match(workflow, /deb_arch:\s*arm64/);
   assert.match(workflow, /bash packaging\/deb\/build-deb\.sh/);
   assert.match(workflow, /sha256sum legion-\* legion_\*\.deb > SHA256SUMS/);
+});
+
+test('check-binary-paths rejects binaries containing build host workspace, home, or cargo paths', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-bin-paths-test-'));
+  try {
+    const cleanBin = path.join(dir, 'legion-clean');
+    fs.writeFileSync(
+      cleanBin,
+      Buffer.concat([
+        Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00]),
+        Buffer.from('/build/crates/legion-cli/src/main.rs\0/cargo/registry/src/crate/lib.rs\0', 'utf8'),
+      ]),
+    );
+    const clean = checkBinaryPaths(cleanBin, [
+      { label: 'HOME', path: '/home/runner' },
+      { label: 'CARGO_HOME', path: '/home/runner/.cargo' },
+      { label: 'GITHUB_WORKSPACE', path: '/home/runner/work/legion-control/legion-control' },
+    ]);
+    assert.equal(clean.ok, true);
+    assert.deepEqual(clean.matches, []);
+
+    const leakedUnix = path.join(dir, 'legion-leaked-unix');
+    fs.writeFileSync(
+      leakedUnix,
+      Buffer.concat([
+        Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00]),
+        Buffer.from('/home/runner/.cargo/registry/src/tokio/lib.rs\0', 'utf8'),
+      ]),
+    );
+    const unixResult = checkBinaryPaths(leakedUnix, [
+      { label: 'HOME', path: '/home/runner' },
+      { label: 'CARGO_HOME', path: '/home/runner/.cargo' },
+      { label: 'GITHUB_WORKSPACE', path: '/home/runner/work/legion-control/legion-control' },
+    ]);
+    assert.equal(unixResult.ok, false);
+    assert.ok(unixResult.matches.some((m) => m.label === 'CARGO_HOME'));
+
+    const leakedWin = path.join(dir, 'legion-leaked-win.exe');
+    fs.writeFileSync(
+      leakedWin,
+      Buffer.concat([
+        Buffer.from('MZ\0\0', 'ascii'),
+        Buffer.from('D:\\a\\legion-control\\legion-control\\crates\\legion-cli\\src\\main.rs\0', 'utf8'),
+        Buffer.from('C:\\Users\\runneradmin\\.cargo\\registry\\src\\lib.rs\0', 'utf16le'),
+      ]),
+    );
+    const winResult = checkBinaryPaths(leakedWin, [
+      { label: 'USERPROFILE', path: 'C:\\Users\\runneradmin' },
+      { label: 'GITHUB_WORKSPACE', path: 'D:\\a\\legion-control\\legion-control' },
+    ]);
+    assert.equal(winResult.ok, false);
+    assert.ok(winResult.matches.some((m) => m.label === 'GITHUB_WORKSPACE' && m.encoding === 'utf8'));
+    assert.ok(winResult.matches.some((m) => m.label === 'USERPROFILE' && m.encoding === 'utf16le'));
+
+    // CLI invocation exits non-zero when a forbidden path is present and zero when clean.
+    const cliFail = spawnSync(
+      process.execPath,
+      [repoFile('scripts/check-binary-paths.mjs'), leakedUnix, '--no-defaults', '--forbid', '/home/runner/.cargo'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(cliFail.status, 1);
+    assert.match(cliFail.stderr, /Build host path leaked/);
+
+    const cliOk = spawnSync(
+      process.execPath,
+      [repoFile('scripts/check-binary-paths.mjs'), cleanBin, '--no-defaults', '--forbid', '/home/runner/.cargo'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(cliOk.status, 0, cliOk.stderr);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('install scripts enforce HTTPS-only TLS 1.2 downloads and silent PowerShell progress', () => {

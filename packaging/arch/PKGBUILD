@@ -20,12 +20,50 @@ prepare() {
   cd "${srcdir}/legion-control-legion-v${pkgver}"
   export CARGO_HOME="${CARGO_HOME:-${srcdir}/.cargo}"
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+
+  # Record the packaged commit for `legion --version` and `meta.version`: prefer an explicit
+  # LEGION_BUILD_REV, then the 40-char commit stored in the GitHub tag archive's PAX global header,
+  # and fall back to querying the tag commit remotely when git is available.
+  local build_rev="${LEGION_BUILD_REV:-}"
+  local tarball="${srcdir}/${pkgname}-${pkgver}.tar.gz"
+  if [[ -z "$build_rev" && -f "$tarball" ]]; then
+    build_rev="$({ gzip -dc "$tarball" 2>/dev/null || true; } | head -c 1024 | LC_ALL=C grep -aoE 'comment=[0-9a-f]{40}' | head -n 1 | cut -d= -f2 || true)"
+  fi
+  if [[ -z "$build_rev" ]] && command -v git >/dev/null 2>&1; then
+    build_rev="$(git ls-remote "${url}.git" "refs/tags/legion-v${pkgver}^{}" "refs/tags/legion-v${pkgver}" 2>/dev/null | awk '
+      /\^\{\}$/ { peeled = $1 }
+      !/\^\{\}$/ && !plain { plain = $1 }
+      END { print (peeled ? peeled : plain) }
+    ' || true)"
+  fi
+  if [[ -n "$build_rev" ]]; then
+    printf '%s\n' "$build_rev" > "${srcdir}/.legion-build-rev"
+  fi
 }
 
 build() {
   cd "${srcdir}/legion-control-legion-v${pkgver}"
   export CARGO_HOME="${CARGO_HOME:-${srcdir}/.cargo}"
   export CARGO_TARGET_DIR="${srcdir}/target"
+
+  if [[ -z "${LEGION_BUILD_REV:-}" && -s "${srcdir}/.legion-build-rev" ]]; then
+    LEGION_BUILD_REV="$(<"${srcdir}/.legion-build-rev")"
+    export LEGION_BUILD_REV
+  elif [[ -z "${LEGION_BUILD_REV:-}" && -f "${srcdir}/${pkgname}-${pkgver}.tar.gz" ]]; then
+    local pax_rev
+    pax_rev="$({ gzip -dc "${srcdir}/${pkgname}-${pkgver}.tar.gz" 2>/dev/null || true; } | head -c 1024 | LC_ALL=C grep -aoE 'comment=[0-9a-f]{40}' | head -n 1 | cut -d= -f2 || true)"
+    if [[ -n "$pax_rev" ]]; then
+      export LEGION_BUILD_REV="$pax_rev"
+    fi
+  fi
+
+  local remap_flags=""
+  if [[ -n "${HOME:-}" ]]; then
+    remap_flags+="--remap-path-prefix=${HOME}=/build/home "
+  fi
+  remap_flags+="--remap-path-prefix=${CARGO_HOME}=/cargo --remap-path-prefix=${srcdir}=/build"
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }${remap_flags}"
+
   cargo build --frozen --release -p legion-cli
 }
 
