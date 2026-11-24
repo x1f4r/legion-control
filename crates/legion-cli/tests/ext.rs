@@ -264,4 +264,22 @@ fn cli_tools_and_help_include_extension_tools() {
     assert_eq!(help.code, 0, "stderr={}", help.stderr);
     assert_eq!(help.json()["name"], json!("lab.check"));
     assert_eq!(help.json()["input_schema"]["required"], json!(["sensor"]));
+
+    // Every built-in family in the full binary (including config, agent, fleet) is refused.
+    for reserved in ["config.dump", "agent.custom", "fleet.custom"] {
+        let denied = home.run(&[
+            "ext.define",
+            "--args",
+            &json!({
+                "name": reserved,
+                "description": "Should fail.",
+                "effect": "read",
+                "run": ext_argv,
+            })
+            .to_string(),
+            "--json",
+        ]);
+        assert_ne!(denied.code, 0, "{reserved} should be refused");
+        assert_eq!(denied.json()["code"], json!("invalid_args"), "{reserved}");
+    }
 }

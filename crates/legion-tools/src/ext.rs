@@ -22,7 +22,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use self::def::{ExtensionDef, ParamDef, ParamType, ParamValue, TimeoutSeconds, parse_toml};
+use self::def::{
+    ExtensionDef, ParamDef, ParamType, ParamValue, TimeoutSeconds, parse_toml_with_reserved,
+};
 use self::store::{ExtensionStore, load_snapshot};
 
 /// How long `ext.define` or `ext.remove` waits for a concurrent write to finish.
@@ -114,8 +116,10 @@ struct ListedBroken {
 
 async fn list(ctx: &Ctx, _args: NoArgs) -> Result<Listing, ToolError> {
     let dir = ctx.paths().tools_dir();
-    let is_builtin = |name: &str| ctx.has_builtin(name);
-    let snapshot = load_snapshot(&dir, &is_builtin);
+    let registry = ctx.node().registry();
+    let is_builtin = |name: &str| registry.get(name).is_some();
+    let is_reserved_family = |family: &str| registry.has_family(family);
+    let snapshot = load_snapshot(&dir, &is_builtin, &is_reserved_family);
     let tools = snapshot
         .tools
         .into_values()
@@ -167,8 +171,10 @@ struct Shown {
 
 async fn show(ctx: &Ctx, args: ShowArgs) -> Result<Shown, ToolError> {
     let dir = ctx.paths().tools_dir();
-    let is_builtin = |name: &str| ctx.has_builtin(name);
-    let snapshot = load_snapshot(&dir, &is_builtin);
+    let registry = ctx.node().registry();
+    let is_builtin = |name: &str| registry.get(name).is_some();
+    let is_reserved_family = |family: &str| registry.has_family(family);
+    let snapshot = load_snapshot(&dir, &is_builtin, &is_reserved_family);
     let Some(loaded) = snapshot.tools.get(&args.name) else {
         return Err(not_found_extension(
             &args.name,
@@ -292,27 +298,35 @@ async fn define(ctx: &Ctx, args: DefineArgs) -> Result<Defined, ToolError> {
         params,
     };
 
-    let builtin_names: Vec<String> = ctx
-        .tools()
-        .into_iter()
-        .filter(|spec| ctx.has_builtin(&spec.name))
-        .map(|spec| spec.name)
-        .collect();
+    let registry = ctx.node().registry();
+    let builtin_names: Vec<String> = registry.names().map(str::to_owned).collect();
+    let builtin_families: Vec<String> = {
+        let mut families: Vec<String> = builtin_names
+            .iter()
+            .filter_map(|name| name.split('.').next().map(str::to_owned))
+            .collect();
+        families.sort();
+        families.dedup();
+        families
+    };
     let is_builtin = |name: &str| builtin_names.iter().any(|b| b == name);
-    def.validate(&is_builtin)
+    let is_reserved_family = |family: &str| builtin_families.iter().any(|f| f == family);
+    def.validate_with_reserved(&is_builtin, &is_reserved_family)
         .map_err(def::ValidationError::into_error_body)?;
 
     let toml_text = def.to_toml();
     // Guarantee the rendered TOML parses and validates identically before touching disk.
-    parse_toml(toml_text.as_bytes(), &is_builtin).map_err(|failure| {
-        ErrorBody::new(
-            ErrorCode::Internal,
-            format!(
-                "Rendered extension definition for {} failed verification: {}.",
-                def.name, failure.reason
-            ),
-        )
-    })?;
+    parse_toml_with_reserved(toml_text.as_bytes(), &is_builtin, &is_reserved_family).map_err(
+        |failure| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!(
+                    "Rendered extension definition for {} failed verification: {}.",
+                    def.name, failure.reason
+                ),
+            )
+        },
+    )?;
 
     let dir = ctx.paths().tools_dir();
     let lock = lock_path(ctx);
@@ -321,7 +335,9 @@ async fn define(ctx: &Ctx, args: DefineArgs) -> Result<Defined, ToolError> {
     let (file, replaced) = blocking(move || {
         let _held = acquire_lock(&lock)?;
         let target = dir.join(format!("{name}.toml"));
-        let snapshot = load_snapshot(&dir, &|n| builtin_names.iter().any(|b| b == n));
+        let snapshot = load_snapshot(&dir, &|n| builtin_names.iter().any(|b| b == n), &|f| {
+            builtin_families.iter().any(|fam| fam == f)
+        });
         let existing_file = snapshot
             .tools
             .get(&name)
@@ -392,15 +408,22 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     let lock = lock_path(ctx);
     let name = args.name.clone();
     let is_named_builtin = ctx.has_builtin(&name);
-    let builtin_names: Vec<String> = ctx
-        .tools()
-        .into_iter()
-        .filter(|spec| ctx.has_builtin(&spec.name))
-        .map(|spec| spec.name)
-        .collect();
+    let registry = ctx.node().registry();
+    let builtin_names: Vec<String> = registry.names().map(str::to_owned).collect();
+    let builtin_families: Vec<String> = {
+        let mut families: Vec<String> = builtin_names
+            .iter()
+            .filter_map(|name| name.split('.').next().map(str::to_owned))
+            .collect();
+        families.sort();
+        families.dedup();
+        families
+    };
     blocking(move || {
         let _held = acquire_lock(&lock)?;
-        let snapshot = load_snapshot(&dir, &|n| builtin_names.iter().any(|b| b == n));
+        let snapshot = load_snapshot(&dir, &|n| builtin_names.iter().any(|b| b == n), &|f| {
+            builtin_families.iter().any(|fam| fam == f)
+        });
         let Some(loaded) = snapshot.tools.get(&name) else {
             return Err(not_found_extension(
                 &name,

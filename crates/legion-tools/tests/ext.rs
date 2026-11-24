@@ -61,6 +61,10 @@ fn main() -> ExitCode {
             Box::pin(builtin_name_and_reserved_families_are_refused())
         }),
         (
+            "every_builtin_registry_family_is_dynamically_reserved",
+            || Box::pin(every_builtin_registry_family_is_dynamically_reserved()),
+        ),
+        (
             "broken_file_is_skipped_and_reported_while_others_work",
             || Box::pin(broken_file_is_skipped_and_reported_while_others_work()),
         ),
@@ -818,6 +822,80 @@ async fn builtin_name_and_reserved_families_are_refused() {
     let listed = fixture.call("ext.list", json!({})).await.unwrap();
     assert_eq!(listed["tools"], json!([]));
     assert_eq!(listed["broken"].as_array().unwrap().len(), 2);
+}
+
+async fn every_builtin_registry_family_is_dynamically_reserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = legion_tools::registry();
+    // Register a synthetic built-in family not in the static RESERVED_FAMILIES list to prove the
+    // reserved set is derived dynamically from the built-in registry.
+    registry.add_fn(
+        "synth.ping",
+        legion_core::proto::Effect::Read,
+        "Synthetic built-in.",
+        |_ctx: &legion_core::Ctx, _args: legion_core::NoArgs| async { Ok(json!({"ok": true})) },
+    );
+    let mut families: Vec<String> = registry
+        .names()
+        .filter_map(|name| name.split('.').next().map(str::to_owned))
+        .collect();
+    families.push("config".to_owned());
+    families.sort();
+    families.dedup();
+
+    let node = legion_core::Node::new(legion_core::Paths::under(dir.path()), registry);
+
+    // Every family present in the built-in registry (including agent, config, and synth) is
+    // refused by ext.define.
+    for family in &families {
+        let candidate = format!("{family}.custom_ext");
+        let err = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "ext.define",
+                json!({
+                    "name": candidate,
+                    "description": "Should be refused.",
+                    "effect": "read",
+                    "run": helper_argv("print", &["{}"])
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{candidate}: {err:?}");
+        assert!(
+            err.message.contains("reserved"),
+            "{candidate}: {}",
+            err.message
+        );
+    }
+
+    // Hand-written file under tools.d using the dynamically registered family `synth` is also
+    // refused at load time and reported broken.
+    let tools_d = node.paths().tools_dir();
+    std::fs::create_dir_all(&tools_d).unwrap();
+    std::fs::write(
+        tools_d.join("synth.custom.toml"),
+        "name = \"synth.custom\"\ndescription = \"Dynamic shadow.\"\neffect = \"read\"\nrun = [\"echo\"]\n",
+    )
+    .unwrap();
+    assert!(node.spec("synth.custom").is_err());
+    let listed = node
+        .call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "ext.list",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed["tools"], json!([]));
+    assert_eq!(listed["broken"].as_array().unwrap().len(), 1);
+    assert!(
+        listed["broken"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reserved")
+    );
 }
 
 async fn broken_file_is_skipped_and_reported_while_others_work() {

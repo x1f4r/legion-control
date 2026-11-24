@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use legion_core::proto::ToolSpec;
 use legion_core::{Paths, Registry, SourceCheck, Tool, ToolSource};
 
-use super::def::{ExtensionDef, parse_toml};
+use super::def::{ExtensionDef, parse_toml_with_reserved};
 use super::run::ExtensionTool;
 
 /// One valid extension tool loaded from disk.
@@ -86,7 +86,13 @@ impl ExtensionStore {
             return Arc::clone(&cached.snapshot);
         }
         let is_builtin = |name: &str| builtins.get(name).is_some();
-        let snapshot = Arc::new(build_snapshot(&dir, &fingerprint, &is_builtin));
+        let is_reserved_family = |family: &str| builtins.has_family(family);
+        let snapshot = Arc::new(build_snapshot(
+            &dir,
+            &fingerprint,
+            &is_builtin,
+            &is_reserved_family,
+        ));
         *guard = Some(Cached {
             dir,
             fingerprint,
@@ -177,9 +183,13 @@ impl ToolSource for ExtensionStore {
 }
 
 /// Reads a fresh [`Snapshot`] directly from `tools_dir` without caching (used by `ext.*` tools).
-pub fn load_snapshot(tools_dir: &Path, is_builtin: &dyn Fn(&str) -> bool) -> Snapshot {
+pub fn load_snapshot(
+    tools_dir: &Path,
+    is_builtin: &dyn Fn(&str) -> bool,
+    is_reserved_family: &dyn Fn(&str) -> bool,
+) -> Snapshot {
     let fingerprint = fingerprint_dir(tools_dir);
-    build_snapshot(tools_dir, &fingerprint, is_builtin)
+    build_snapshot(tools_dir, &fingerprint, is_builtin, is_reserved_family)
 }
 
 fn fingerprint_dir(dir: &Path) -> DirFingerprint {
@@ -208,6 +218,7 @@ fn build_snapshot(
     dir: &Path,
     fingerprint: &DirFingerprint,
     is_builtin: &dyn Fn(&str) -> bool,
+    is_reserved_family: &dyn Fn(&str) -> bool,
 ) -> Snapshot {
     match fingerprint {
         DirFingerprint::Missing => Snapshot {
@@ -242,7 +253,7 @@ fn build_snapshot(
                         continue;
                     }
                 };
-                match parse_toml(bytes, is_builtin) {
+                match parse_toml_with_reserved(bytes, is_builtin, is_reserved_family) {
                     Ok(def) => {
                         if let Some(existing) = tools.get(&def.name) {
                             broken.push(BrokenFile {

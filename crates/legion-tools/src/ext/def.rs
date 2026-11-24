@@ -11,9 +11,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 use toml_edit::{Array, DocumentMut, Item, Table};
 
-/// Built-in family namespaces reserved for Legion; extensions may never register under them.
-pub const RESERVED_FAMILIES: [&str; 12] = [
-    "meta", "audit", "fs", "sys", "exec", "job", "proj", "svc", "power", "fleet", "ext", "token",
+/// Static family namespaces reserved for Legion (core families plus names kept for Legion's own
+/// future use). At load and define time, every family present in the node's built-in registry is
+/// also reserved dynamically so newly added built-in families can never be shadowed.
+pub const RESERVED_FAMILIES: [&str; 15] = [
+    "agent", "audit", "config", "exec", "ext", "fleet", "fs", "job", "legion", "meta", "power",
+    "proj", "svc", "sys", "token",
 ];
 
 /// Default command timeout in seconds when `timeout_s` is omitted.
@@ -247,6 +250,16 @@ pub fn parse_toml(
     bytes: &[u8],
     is_builtin: &dyn Fn(&str) -> bool,
 ) -> Result<ExtensionDef, ParseFailure> {
+    parse_toml_with_reserved(bytes, is_builtin, &|_| false)
+}
+
+/// Parses and validates an extension TOML file, also refusing any family for which
+/// `is_reserved_family` returns `true` (typically families present in the built-in registry).
+pub fn parse_toml_with_reserved(
+    bytes: &[u8],
+    is_builtin: &dyn Fn(&str) -> bool,
+    is_reserved_family: &dyn Fn(&str) -> bool,
+) -> Result<ExtensionDef, ParseFailure> {
     let def: ExtensionDef =
         legion_core::config::parse_toml_bytes(bytes).map_err(|(message, line)| {
             let reason = match line {
@@ -256,7 +269,7 @@ pub fn parse_toml(
             ParseFailure { reason, line }
         })?;
     let text = std::str::from_utf8(bytes).unwrap_or_default();
-    if let Err(error) = def.validate(is_builtin) {
+    if let Err(error) = def.validate_with_reserved(is_builtin, is_reserved_family) {
         let line = find_field_line(text, &error.field);
         let reason = match line {
             Some(line) => format!("line {line}: {}", error.message),
@@ -268,8 +281,19 @@ pub fn parse_toml(
 }
 
 impl ExtensionDef {
-    /// Validates every field of the definition.
+    /// Validates every field of the definition against built-in tool names and
+    /// [`RESERVED_FAMILIES`].
     pub fn validate(&self, is_builtin: &dyn Fn(&str) -> bool) -> Result<(), ValidationError> {
+        self.validate_with_reserved(is_builtin, &|_| false)
+    }
+
+    /// Validates every field of the definition, also refusing families reported by
+    /// `is_reserved_family` (such as every family registered in the node's built-in registry).
+    pub fn validate_with_reserved(
+        &self,
+        is_builtin: &dyn Fn(&str) -> bool,
+        is_reserved_family: &dyn Fn(&str) -> bool,
+    ) -> Result<(), ValidationError> {
         if !is_tool_name(&self.name) {
             return Err(ValidationError::new(
                 "name",
@@ -280,7 +304,7 @@ impl ExtensionDef {
             ));
         }
         let family = self.name.split('.').next().unwrap_or_default();
-        if RESERVED_FAMILIES.contains(&family) {
+        if RESERVED_FAMILIES.contains(&family) || is_reserved_family(family) {
             return Err(ValidationError::new(
                 "name",
                 format!(
