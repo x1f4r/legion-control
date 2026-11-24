@@ -94,6 +94,9 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
     if let Ok(policy) = ctx.config().get::<Policy>() {
         let specs = ctx.tools();
         checks.push(check_policy_exec_roles(&policy, &specs));
+        if let Some(check) = check_policy_unmarked_device_principals(&policy) {
+            checks.push(check);
+        }
     }
 
     let orphans = query_orphaned_device_lines(ctx);
@@ -143,6 +146,28 @@ pub struct FleetDeviceSyncEntry {
 #[derive(Deserialize)]
 struct FleetDevicesSyncResponse {
     results: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
+}
+
+/// Builds a `meta.doctor` warning when `policy.toml` defines any `device:*` principal without a
+/// `device = "<pairing_id>"` ownership marker (which device sync and `device.set` leave untouched).
+pub fn check_policy_unmarked_device_principals(policy: &Policy) -> Option<Check> {
+    let unmarked = policy.unmarked_device_principals();
+    if unmarked.is_empty() {
+        return None;
+    }
+    Some(Check {
+        name: "unmarked device principals".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "policy.toml defines `device:*` principal(s) without a `device = \"<pairing_id>\"` ownership marker: {}. Device reconciliation and `device.set role=` leave them untouched.",
+            unmarked.join(", ")
+        ),
+        hint: Some(
+            "Rename human-authored principals so they do not start with `device:`, or add `device = \"<pairing_id>\"` if a principal belongs exclusively to one paired device."
+                .to_owned(),
+        ),
+    })
 }
 
 /// Builds a `meta.doctor` warning when any reachable fleet peer has a different paired-device list

@@ -81,7 +81,7 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add_fn(
         "config.write",
         Effect::Admin,
-        "Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml merges incoming entries with local paired devices (tombstones always win), reconciles device:* principals in policy.toml without escalation, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
+        "Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml merges incoming entries with local paired devices (tombstones always win), reconciles registry-owned device:* principals (marked with `device = \"<pairing id>\"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
         config_write,
     );
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
@@ -627,6 +627,7 @@ struct WriteOutcome {
     hash_after: String,
     backup: Option<String>,
     canonical_content: Option<String>,
+    warnings: Vec<String>,
 }
 
 /// Precondition on the existing target document before `config.write` replaces it.
@@ -763,6 +764,7 @@ fn write_local_document_blocking(
         hash_after,
         backup,
         canonical_content: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -1010,6 +1012,7 @@ async fn apply_local_write(
             hash_after,
             backup: merge_outcome.backup,
             canonical_content: Some(merge_outcome.canonical_toml),
+            warnings: merge_outcome.warnings,
         });
     }
 
@@ -1129,6 +1132,8 @@ struct ConfigWriteResult {
     hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     backup: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 async fn config_write(ctx: &Ctx, args: ConfigWriteArgs) -> Result<ConfigWriteResult, ToolError> {
@@ -1139,6 +1144,7 @@ async fn config_write(ctx: &Ctx, args: ConfigWriteArgs) -> Result<ConfigWriteRes
         document: outcome.document,
         hash: outcome.hash_after,
         backup: outcome.backup,
+        warnings: outcome.warnings,
     })
 }
 
@@ -1229,6 +1235,8 @@ struct DocSyncOutcome {
     backup: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ErrorBody>,
 }
@@ -1675,6 +1683,7 @@ async fn sync_one_document(
                 last_synced_hash,
                 backup: None,
                 detail: None,
+                warnings: Vec::new(),
                 error: None,
             }
         }
@@ -1685,6 +1694,7 @@ async fn sync_one_document(
             last_synced_hash,
             backup: None,
             detail: reason,
+            warnings: Vec::new(),
             error: None,
         },
         SyncDecision::Conflict(reason) => DocSyncOutcome {
@@ -1694,6 +1704,7 @@ async fn sync_one_document(
             last_synced_hash,
             backup: None,
             detail: Some(reason),
+            warnings: Vec::new(),
             error: None,
         },
         SyncDecision::Push => {
@@ -1705,6 +1716,7 @@ async fn sync_one_document(
                     last_synced_hash,
                     backup: None,
                     detail: Some("Document does not exist locally.".to_owned()),
+                    warnings: Vec::new(),
                     error: None,
                 };
             };
@@ -1722,6 +1734,7 @@ async fn sync_one_document(
                     last_synced_hash,
                     backup: None,
                     detail: Some("Would push to remote (dry_run).".to_owned()),
+                    warnings: Vec::new(),
                     error: None,
                 };
             }
@@ -1773,6 +1786,7 @@ async fn sync_one_document(
                         last_synced_hash: Some(written.hash),
                         backup: written.backup,
                         detail: None,
+                        warnings: written.warnings,
                         error: None,
                     }
                 }
@@ -1783,6 +1797,7 @@ async fn sync_one_document(
                     last_synced_hash,
                     backup: None,
                     detail: Some(error.message.clone()),
+                    warnings: Vec::new(),
                     error: Some(error),
                 },
                 Err(error) => DocSyncOutcome {
@@ -1792,6 +1807,7 @@ async fn sync_one_document(
                     last_synced_hash,
                     backup: None,
                     detail: None,
+                    warnings: Vec::new(),
                     error: Some(error),
                 },
             }
@@ -1820,6 +1836,7 @@ async fn sync_one_document(
                         last_synced_hash,
                         backup: None,
                         detail: None,
+                        warnings: Vec::new(),
                         error: Some(error),
                     };
                 }
@@ -1830,6 +1847,7 @@ async fn sync_one_document(
                     last_synced_hash,
                     backup: None,
                     detail: Some("Would pull from remote (dry_run).".to_owned()),
+                    warnings: Vec::new(),
                     error: None,
                 };
             }
@@ -1857,6 +1875,7 @@ async fn sync_one_document(
                         last_synced_hash: Some(written.hash_after),
                         backup: written.backup,
                         detail: None,
+                        warnings: written.warnings,
                         error: None,
                     }
                 }
@@ -1867,6 +1886,7 @@ async fn sync_one_document(
                     last_synced_hash,
                     backup: None,
                     detail: Some(error.message.clone()),
+                    warnings: Vec::new(),
                     error: Some(error),
                 },
                 Err(error) => DocSyncOutcome {
@@ -1876,6 +1896,7 @@ async fn sync_one_document(
                     last_synced_hash,
                     backup: None,
                     detail: None,
+                    warnings: Vec::new(),
                     error: Some(error),
                 },
             }
@@ -1974,6 +1995,7 @@ async fn sync_devices_document(
             last_synced_hash,
             backup: None,
             detail,
+            warnings: Vec::new(),
             error: None,
         };
     }
@@ -1993,6 +2015,7 @@ async fn sync_devices_document(
             last_synced_hash,
             backup: None,
             detail: None,
+            warnings: Vec::new(),
             error: None,
         };
     }
@@ -2011,6 +2034,7 @@ async fn sync_devices_document(
             last_synced_hash,
             backup: None,
             detail: Some("Would merge devices.toml on both machines (dry_run).".to_owned()),
+            warnings: Vec::new(),
             error: None,
         };
     }
@@ -2018,6 +2042,7 @@ async fn sync_devices_document(
     let mut current_toml = merged_toml;
     let mut current_hash = merged_hash.clone();
     let mut local_backup = None;
+    let mut warnings = Vec::new();
 
     if !local_up_to_date {
         match apply_local_write(
@@ -2032,6 +2057,7 @@ async fn sync_devices_document(
             Ok(written) => {
                 local_backup = written.backup;
                 current_hash = written.hash_after;
+                warnings.extend(written.warnings);
                 if let Some(canonical) = written.canonical_content {
                     current_toml = canonical;
                 }
@@ -2044,6 +2070,7 @@ async fn sync_devices_document(
                     last_synced_hash,
                     backup: None,
                     detail: None,
+                    warnings: Vec::new(),
                     error: Some(error),
                 };
             }
@@ -2077,6 +2104,7 @@ async fn sync_devices_document(
                     }
                 };
                 final_remote_hash = Some(written.hash.clone());
+                warnings.extend(written.warnings);
                 // If the remote concurrently merged another change while accepting our write,
                 // pull the remote's merged state once more so both machines converge identically.
                 if written.hash != current_hash
@@ -2096,6 +2124,7 @@ async fn sync_devices_document(
                             .await
                 {
                     current_hash = final_local.hash_after;
+                    warnings.extend(final_local.warnings);
                 }
             }
             Err(error) => {
@@ -2106,6 +2135,7 @@ async fn sync_devices_document(
                     last_synced_hash,
                     backup: local_backup,
                     detail: None,
+                    warnings,
                     error: Some(error),
                 };
             }
@@ -2123,6 +2153,7 @@ async fn sync_devices_document(
         last_synced_hash: Some(current_hash),
         backup: local_backup,
         detail: None,
+        warnings,
         error: None,
     }
 }
@@ -2183,6 +2214,7 @@ fn error_outcome(error: ErrorBody) -> DocSyncOutcome {
         last_synced_hash: None,
         backup: None,
         detail: None,
+        warnings: Vec::new(),
         error: Some(error),
     }
 }

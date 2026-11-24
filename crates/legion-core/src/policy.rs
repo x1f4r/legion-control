@@ -183,6 +183,12 @@ pub struct Policy {
 pub struct PrincipalEntry {
     /// The role it has.
     pub role: String,
+    /// Pairing identifier (32 lowercase hex characters) of the single paired device that owns
+    /// this `device:*` principal, when created and managed by the device registry (`devices.toml`).
+    /// Absent for human-authored and shared principals, which device reconciliation and
+    /// `device.set` never modify.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 /// A named set of rules.
@@ -371,6 +377,7 @@ impl Document for Policy {
                 "[roles.{name}] sets delegate = true, but acting as another principal is the owner's alone: a role that could act as anyone would be the owner under another name; give the principal role = \"owner\" if that is what is meant"
             ));
         }
+        let mut device_owners = std::collections::BTreeMap::<&str, &str>::new();
         for (principal, entry) in &self.principals {
             let known =
                 entry.role == OWNER || entry.role == NOBODY || self.roles.contains_key(&entry.role);
@@ -379,6 +386,28 @@ impl Document for Policy {
                     "principal {principal:?} has the role {:?}, which is neither built in nor defined under [roles]",
                     entry.role
                 ));
+            }
+            if let Some(ref device_id) = entry.device {
+                if !principal.as_str().starts_with("device:") {
+                    return Err(format!(
+                        "principal {principal:?} sets device = {device_id:?}, but `device` ownership markers are only valid on `device:*` principals"
+                    ));
+                }
+                let valid_hex = device_id.len() == 32
+                    && device_id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                if !valid_hex {
+                    return Err(format!(
+                        "principal {principal:?} has invalid device pairing id {device_id:?}: expected 32 lowercase hex characters"
+                    ));
+                }
+                if let Some(previous) = device_owners.insert(device_id.as_str(), principal.as_str())
+                {
+                    return Err(format!(
+                        "principals {previous:?} and {principal:?} both claim device pairing id {device_id:?}"
+                    ));
+                }
             }
         }
         if let Some(default) = &self.default
@@ -397,6 +426,25 @@ impl Policy {
     /// The principal of a caller who names none.
     pub fn default_principal(&self) -> &str {
         self.default.as_ref().map_or(OWNER, Principal::as_str)
+    }
+
+    /// The pairing identifier that exclusively owns `principal` when `policy.toml` marks it with
+    /// `device = "<pairing_id>"`, or `None` for human-authored / shared principals.
+    pub fn device_owner(&self, principal: &str) -> Option<&str> {
+        self.principals
+            .iter()
+            .find(|(name, _)| name.as_str() == principal)
+            .and_then(|(_, entry)| entry.device.as_deref())
+    }
+
+    /// Sorted names of `device:*` principals in `policy.toml` that do not carry a
+    /// `device = "<pairing_id>"` ownership marker.
+    pub fn unmarked_device_principals(&self) -> Vec<String> {
+        self.principals
+            .iter()
+            .filter(|(name, entry)| name.as_str().starts_with("device:") && entry.device.is_none())
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect()
     }
 
     /// The name of a principal's role and its rules: `nobody` for a principal the file does not
@@ -4353,5 +4401,83 @@ role = "home_writer"
         }
         // Unrelated files in the same dotfiles directory remain writable by home_writer.
         assert!(helper.check_path(&other_dotfile, Access::Write).is_ok());
+    }
+
+    #[test]
+    fn policy_validates_device_principal_ownership_markers() {
+        let valid = policy(
+            r#"
+[roles.observer]
+allow = ["effect:read"]
+
+[principals."device:pixel"]
+role = "observer"
+device = "0123456789abcdef0123456789abcdef"
+
+[principals."device:legacy"]
+role = "observer"
+"#,
+        );
+        assert_eq!(
+            valid.device_owner("device:pixel"),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(valid.device_owner("device:legacy"), None);
+        assert_eq!(
+            valid.unmarked_device_principals(),
+            vec!["device:legacy".to_owned()]
+        );
+
+        let non_device_marker = parse::<Policy>(
+            Path::new("policy.toml"),
+            br#"
+[roles.observer]
+allow = ["effect:read"]
+
+[principals.tablet]
+role = "observer"
+device = "0123456789abcdef0123456789abcdef"
+"#,
+        );
+        assert!(
+            non_device_marker.is_err(),
+            "device marker must be rejected on non-device:* principals"
+        );
+
+        let bad_hex = parse::<Policy>(
+            Path::new("policy.toml"),
+            br#"
+[roles.observer]
+allow = ["effect:read"]
+
+[principals."device:pixel"]
+role = "observer"
+device = "not-a-hex-id"
+"#,
+        );
+        assert!(
+            bad_hex.is_err(),
+            "non-hex device marker must be rejected"
+        );
+
+        let duplicate_owner = parse::<Policy>(
+            Path::new("policy.toml"),
+            br#"
+[roles.observer]
+allow = ["effect:read"]
+
+[principals."device:a"]
+role = "observer"
+device = "0123456789abcdef0123456789abcdef"
+
+[principals."device:b"]
+role = "observer"
+device = "0123456789abcdef0123456789abcdef"
+"#,
+        );
+        assert!(
+            duplicate_owner.is_err(),
+            "two principals claiming the same pairing id must be rejected"
+        );
     }
 }

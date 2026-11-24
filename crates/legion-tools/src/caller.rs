@@ -67,6 +67,18 @@ impl Caller {
         owner_message: String,
         owner_hint: &str,
     ) -> Result<String, ErrorBody> {
+        if let Some(owner_id) = self.policy.device_owner(principal) {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "{principal} is owned by paired device {owner_id}, so {noun} cannot be created on it."
+                ),
+            )
+            .with_hint(
+                "Create a separate principal in policy.toml for shared tokens or `--as` pairings, or pair a new device with `legion pair --name ... --role ...`.",
+            ));
+        }
+
         if !self.may_manage(principal) {
             let message = if self.has_owner_role(principal) {
                 format!(

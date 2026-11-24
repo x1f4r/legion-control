@@ -598,22 +598,33 @@ pub struct PolicyEditOutcome {
     pub previous_role: Option<String>,
 }
 
-/// Inserts or updates `[principals."<principal>"] role = "<role>"` in `policy.toml`, preserving
-/// existing comments and layout, validating with `parse::<Policy>` before writing, backing up the
-/// previous file, and replacing it atomically. Caller must hold [`lock_config`].
-pub fn upsert_policy_principal_locked(
+/// Inserts or updates a registry-owned `[principals."device:..."]` entry carrying
+/// `role = "<role>"` and `device = "<pairing_id>"` in `policy.toml`, preserving existing comments
+/// and layout, validating with `parse::<Policy>` before writing, backing up the previous file, and
+/// replacing it atomically.
+///
+/// Refuses to create or modify any principal that is not a `device:*` principal or that already
+/// exists in `policy.toml` without a matching `device = "<pairing_id>"` ownership marker.
+/// Caller must hold [`lock_config`].
+pub fn upsert_device_principal_locked(
     paths: &Paths,
     principal: &str,
     role: &str,
+    pairing_id: &str,
 ) -> Result<PolicyEditOutcome, ErrorBody> {
     Principal::parse(principal)?;
     validate_role_name(role)?;
-    if principal == OWNER {
+    validate_pairing_id(pairing_id)?;
+    if principal == OWNER || !principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
         return Err(ErrorBody::new(
-            ErrorCode::InvalidArgs,
-            "Built-in principal `owner` cannot be edited in policy.toml.",
+            ErrorCode::Denied,
+            format!(
+                "Principal {principal} is not a registry-owned `device:*` principal and cannot be modified by device tools."
+            ),
         )
-        .with_hint("Give the device its own principal (for example `device:<name>`)."));
+        .with_hint(format!(
+            "Edit [principals.\"{principal}\"] in policy.toml directly if you want to change its role."
+        )));
     }
 
     let path = paths.config_file(Policy::FILE);
@@ -652,13 +663,46 @@ pub fn upsert_policy_principal_locked(
         }
     };
 
-    let previous_role = previous_policy
+    let existing_entry = previous_policy
         .principals
         .iter()
         .find(|(p, _)| p.as_str() == principal)
-        .map(|(_, entry)| entry.role.clone());
+        .map(|(_, entry)| entry);
 
-    if previous_role.as_deref() == Some(role) && existing_bytes.is_some() {
+    if let Some(entry) = existing_entry {
+        match entry.device.as_deref() {
+            Some(owner_id) if owner_id == pairing_id => {}
+            Some(other_id) => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Principal {principal} in policy.toml is owned by pairing {other_id}, not {pairing_id}."
+                    ),
+                )
+                .with_hint(format!(
+                    "Edit [principals.\"{principal}\"] in policy.toml directly or remove the conflicting pairing."
+                )));
+            }
+            None => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Principal {principal} in policy.toml has no `device = \"{pairing_id}\"` ownership marker and will not be modified automatically."
+                    ),
+                )
+                .with_hint(format!(
+                    "Edit [principals.\"{principal}\"] in policy.toml directly to change its role, or pair this device with `legion pair --name ... --role ...`."
+                )));
+            }
+        }
+    }
+
+    let previous_role = existing_entry.map(|entry| entry.role.clone());
+
+    if previous_role.as_deref() == Some(role)
+        && existing_entry.and_then(|e| e.device.as_deref()) == Some(pairing_id)
+        && existing_bytes.is_some()
+    {
         return Ok(PolicyEditOutcome {
             changed: false,
             previous_role,
@@ -690,6 +734,7 @@ pub fn upsert_policy_principal_locked(
 
     let mut entry = Table::new();
     entry["role"] = value(role);
+    entry["device"] = value(pairing_id);
     principals_table.insert(principal, Item::Table(entry));
 
     let mut updated_text = doc.to_string();
@@ -707,10 +752,15 @@ pub fn upsert_policy_principal_locked(
     })
 }
 
-/// Removes `[principals."<principal>"]` from `policy.toml` if present, keeping all other entries
-/// and comments intact. Caller must hold [`lock_config`].
-pub fn remove_policy_principal_locked(paths: &Paths, principal: &str) -> Result<bool, ErrorBody> {
-    if principal == OWNER {
+/// Removes `[principals."<principal>"]` from `policy.toml` ONLY when it carries a matching
+/// `device = "<pairing_id>"` ownership marker and is not `policy.default`, keeping all other
+/// entries and comments intact. Caller must hold [`lock_config`].
+pub fn remove_device_principal_locked(
+    paths: &Paths,
+    principal: &str,
+    pairing_id: &str,
+) -> Result<bool, ErrorBody> {
+    if principal == OWNER || !principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
         return Ok(false);
     }
     let path = paths.config_file(Policy::FILE);
@@ -732,11 +782,7 @@ pub fn remove_policy_principal_locked(paths: &Paths, principal: &str) -> Result<
     {
         return Ok(false);
     }
-    if !parsed
-        .principals
-        .keys()
-        .any(|known| known.as_str() == principal)
-    {
+    if parsed.device_owner(principal) != Some(pairing_id) {
         return Ok(false);
     }
     let text = std::str::from_utf8(&existing_bytes).map_err(|error| {
@@ -806,36 +852,39 @@ fn write_policy_with_backup(
     })
 }
 
-/// Reconciles `device:*` principals in `policy.toml` to match the live entries in `devices`.
+/// Reconciles registry-owned `device:*` principals in `policy.toml` to match `devices`.
 ///
 /// Security invariants:
-/// 1. Only principals starting with `device:` are ever touched; non-device principals are never
-///    created, changed, or removed here.
-/// 2. Every live `device:*` entry that carries a recorded `role` sets `[principals."device:..."]`
-///    to that exact role (never leaving a stale wider role on the receiver, and never elevating).
-/// 3. If a recorded role is not defined in this node's `policy.toml` (and is not `owner` or
-///    `nobody`), or if two live devices collide on the same `device:*` principal with different
-///    recorded roles, the principal fails closed to `nobody`.
-/// 4. An entry with `role: None` (such as an adopted legacy line without a recorded role) never
+/// 1. Only principals starting with `device:` that either do not yet exist in `policy.toml` or
+///    carry a matching `device = "<pairing_id>"` ownership marker are ever touched. Non-device
+///    principals and human-authored (unmarked) `device:*` principals are never created, elevated,
+///    modified, or removed; unmarked `device:*` principals emit a warning.
+/// 2. Tombstoned registry-owned `device:*` principals (matching `device = "<tombstone_id>"` and
+///    not referenced by any token) are removed first so a new device later paired under the same
+///    name can cleanly take ownership.
+/// 3. Every single live `device:*` entry that carries a recorded `role` sets its owned
+///    `[principals."device:..."]` entry to that exact role with `device = "<pairing_id>"`.
+/// 4. If a recorded role is not defined in this node's `policy.toml` (and is not `owner` or
+///    `nobody`), the owned principal fails closed to `nobody` with a warning.
+/// 5. If two live devices collide on the same `device:*` principal, any matching registry-owned
+///    entry fails closed to `nobody` (an absent or unmarked entry is left untouched) with a warning.
+/// 6. An entry with `role: None` (such as an adopted legacy line without a recorded role) never
 ///    creates or elevates a principal.
-/// 5. A tombstoned `device:*` principal not referenced by any live device or active token is
-///    removed from `policy.toml`.
 ///
-/// Caller must hold [`lock_config`]. Returns any warnings (for example unknown roles set to
-/// `nobody`).
+/// Caller must hold [`lock_config`]. Returns any warnings.
 pub fn reconcile_device_principals_locked(
     paths: &Paths,
     devices: &DevicesFile,
 ) -> Result<Vec<String>, ErrorBody> {
     let policy_path = paths.config_file(Policy::FILE);
-    let policy = match std::fs::read(&policy_path) {
-        Ok(bytes) => parse::<Policy>(&policy_path, &bytes)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
-        Err(error) => {
-            return Err(ErrorBody::new(
+    let read_policy = || -> Result<Policy, ErrorBody> {
+        match std::fs::read(&policy_path) {
+            Ok(bytes) => parse::<Policy>(&policy_path, &bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Policy::default()),
+            Err(error) => Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!("{} cannot be read: {error}.", policy_path.display()),
-            ));
+            )),
         }
     };
 
@@ -847,55 +896,96 @@ pub fn reconcile_device_principals_locked(
         Err(_) => HashSet::new(),
     };
 
-    // Group live `device:*` entries by principal to detect conflicting offline role assignments.
-    let mut live_by_principal: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
-    for entry in devices.devices.values() {
+    // 1. Clean up tombstoned registry-owned `device:*` principals first (only when `policy.toml`
+    //    marks `device = "<tombstone_id>"` and no HTTP token uses the principal).
+    let mut policy = read_policy()?;
+    let mut removed_any = false;
+    for (tomb_id, tomb) in &devices.removed {
+        if tomb.principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
+            && policy.device_owner(&tomb.principal) == Some(tomb_id.as_str())
+            && !token_principals.contains(&tomb.principal)
+            && remove_device_principal_locked(paths, &tomb.principal, tomb_id)?
+        {
+            removed_any = true;
+        }
+    }
+    if removed_any {
+        policy = read_policy()?;
+    }
+
+    // 2. Group live `device:*` entries by principal to detect collisions and check ownership.
+    let mut live_by_principal: BTreeMap<&str, Vec<(&str, Option<&str>)>> = BTreeMap::new();
+    for (id, entry) in &devices.devices {
         if entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
             live_by_principal
                 .entry(entry.principal.as_str())
                 .or_default()
-                .push(entry.role.as_deref());
+                .push((id.as_str(), entry.role.as_deref()));
         }
     }
 
     let mut warnings = Vec::new();
-    for (principal, roles) in &live_by_principal {
-        let non_none: BTreeSet<&str> = roles.iter().copied().flatten().collect();
-        if non_none.is_empty() {
-            // Adopted legacy entry without a recorded role: never invent or elevate a principal.
+    for (principal, entries) in &live_by_principal {
+        let existing_entry = policy
+            .principals
+            .iter()
+            .find(|(p, _)| p.as_str() == *principal)
+            .map(|(_, entry)| entry);
+
+        // An existing `device:*` principal without a `device = "<pairing_id>"` marker is human-
+        // authored (possibly shared with a token or agent): never touch it, and warn loudly.
+        if let Some(existing) = existing_entry
+            && existing.device.is_none()
+        {
+            warnings.push(format!(
+                "Principal {principal} in policy.toml has no `device = \"<pairing_id>\"` ownership marker and was left untouched (role: {}).",
+                existing.role
+            ));
             continue;
         }
-        let target_role = if non_none.len() > 1 || roles.iter().any(Option::is_none) {
+
+        if entries.len() > 1 {
+            let ids: Vec<&str> = entries.iter().map(|(id, _)| *id).collect();
             warnings.push(format!(
-                "Principal {principal} is shared by live devices with conflicting roles; setting it to `nobody` until disambiguated."
+                "Principal {principal} is claimed by multiple live devices ({}); leaving it restricted to `nobody` until disambiguated.",
+                ids.join(", ")
             ));
-            NOBODY
-        } else if let Some(&recorded) = non_none.iter().next() {
-            let known =
-                recorded == OWNER || recorded == NOBODY || policy.roles.contains_key(recorded);
-            if known {
-                recorded
-            } else {
-                warnings.push(format!(
-                    "Role {recorded:?} for {principal} is not defined in this node's policy.toml; setting {principal} to `nobody`."
-                ));
-                NOBODY
+            if let Some(existing) = existing_entry
+                && let Some(owner_id) = existing.device.as_deref()
+                && ids.contains(&owner_id)
+            {
+                upsert_device_principal_locked(paths, principal, NOBODY, owner_id)?;
             }
-        } else {
+            continue;
+        }
+
+        let (pairing_id, recorded_role) = entries[0];
+        if let Some(existing) = existing_entry
+            && existing.device.as_deref() != Some(pairing_id)
+        {
+            let other = existing.device.as_deref().unwrap_or("unknown");
+            warnings.push(format!(
+                "Principal {principal} in policy.toml is owned by pairing {other}, not {pairing_id}; leaving it untouched."
+            ));
+            continue;
+        }
+
+        let Some(recorded) = recorded_role else {
+            // Adopted legacy entry without a recorded role: never invent or elevate a principal.
             continue;
         };
 
-        upsert_policy_principal_locked(paths, principal, target_role)?;
-    }
+        let known = recorded == OWNER || recorded == NOBODY || policy.roles.contains_key(recorded);
+        let target_role = if known {
+            recorded
+        } else {
+            warnings.push(format!(
+                "Role {recorded:?} for {principal} is not defined in this node's policy.toml; setting {principal} to `nobody`."
+            ));
+            NOBODY
+        };
 
-    // Clean up tombstoned `device:*` principals not referenced by any live device or HTTP token.
-    for tomb in devices.removed.values() {
-        if tomb.principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
-            && !live_by_principal.contains_key(tomb.principal.as_str())
-            && !token_principals.contains(&tomb.principal)
-        {
-            let _ = remove_policy_principal_locked(paths, &tomb.principal)?;
-        }
+        upsert_device_principal_locked(paths, principal, target_role, pairing_id)?;
     }
 
     Ok(warnings)
@@ -1899,9 +1989,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().join("legion"));
         std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let pixel_id = sample_id(1);
         std::fs::write(
             paths.config_file("policy.toml"),
-            "\
+            format!(
+                "\
 default = \"owner\"
 
 [roles.observer]
@@ -1910,14 +2002,16 @@ allow = [\"effect:read\"]
 [roles.editor]
 allow = [\"effect:read\", \"effect:write\"]
 
-# Stale leftover owner entry for device:pixel must be downgraded when syncing an observer device!
+# Stale leftover owner entry owned by device:pixel's pairing id must be downgraded when syncing an observer device!
 [principals.\"device:pixel\"]
 role = \"owner\"
+device = \"{pixel_id}\"
 
 # Custom non-device principal must never be touched by device reconciliation.
 [principals.phone]
 role = \"editor\"
-",
+"
+            ),
         )
         .unwrap();
 
@@ -2172,5 +2266,47 @@ role = "editor"
         let next = next_updated_timestamp_at(Some(prev), prev_ts).unwrap();
         let next_ts: Timestamp = next.parse().unwrap();
         assert!(next_ts > prev_ts);
+    }
+
+    #[test]
+    fn unmarked_device_principal_is_left_untouched_with_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("legion"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[principals.\"device:legacy\"]
+role = \"observer\"
+",
+        )
+        .unwrap();
+
+        let mut devices = DevicesFile::default();
+        let mut dev = sample_device(1, "legacy", Some("owner"), "2026-11-24T10:00:00Z", "pi");
+        dev.principal = "device:legacy".to_owned();
+        devices.devices.insert(sample_id(1), dev);
+
+        let _lock = lock_config(&paths).unwrap();
+        let warnings = reconcile_device_principals_locked(&paths, &devices).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("device:legacy")),
+            "expected warning for unmarked device:legacy, got {warnings:?}"
+        );
+        let policy = parse::<Policy>(
+            &paths.config_file("policy.toml"),
+            &std::fs::read(paths.config_file("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.role_of("device:legacy").0,
+            "observer",
+            "unmarked pre-existing device:legacy principal must not be raised to owner"
+        );
     }
 }

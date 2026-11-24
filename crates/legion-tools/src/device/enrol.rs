@@ -25,10 +25,10 @@ use super::authkeys::{
 };
 use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
 use super::registry::{
-    DEVICE_PRINCIPAL_PREFIX, DevicesFile, FleetDevice, FleetPushOutcome,
-    adopt_legacy_devices_from_auth_keys, format_precise_rfc3339, load_devices_raw, lock_config,
-    push_devices_to_fleet, reconcile_authorized_keys_in_memory, remove_policy_principal_locked,
-    save_devices_locked, upsert_policy_principal_locked,
+    DevicesFile, FleetDevice, FleetPushOutcome, adopt_legacy_devices_from_auth_keys,
+    format_precise_rfc3339, load_devices_raw, lock_config, push_devices_to_fleet,
+    reconcile_authorized_keys_in_memory, remove_device_principal_locked, save_devices_locked,
+    upsert_device_principal_locked,
 };
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
@@ -307,6 +307,7 @@ fn process_enrol_blocking(
 
     enum EnrolAttempt {
         Succeeded {
+            pairing_id: String,
             principal: String,
             created_by: Option<String>,
             role: String,
@@ -431,6 +432,20 @@ fn process_enrol_blocking(
             }
             invite_role.to_owned()
         } else {
+            if let Some(owner_id) = policy.device_owner(&principal) {
+                return fail_with_sweep(
+                    Some(principal.clone()),
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{principal} is owned by paired device {owner_id}, so another device cannot enrol under it."
+                        ),
+                    )
+                    .with_hint("Pair the new device with `legion pair --name ... --role ...` or under a shared principal."),
+                    auth_keys,
+                    state,
+                );
+            }
             let (resolved_role, _) = policy.role_of(&principal);
             if resolved_role != OWNER && !principal_exists_in_policy {
                 return fail_with_sweep(
@@ -601,8 +616,6 @@ fn process_enrol_blocking(
         let precise_now = format_precise_rfc3339(now);
         let recorded_role = if invite.create_principal {
             Some(role.clone())
-        } else if principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
-            invite.role.clone().or_else(|| Some(role.clone()))
         } else {
             None
         };
@@ -646,13 +659,14 @@ fn process_enrol_blocking(
                 principal: principal.clone(),
                 added,
                 fingerprint: validated_key.fingerprint.clone(),
-                pairing_id: Some(pairing_id),
+                pairing_id: Some(pairing_id.clone()),
             },
         );
 
         Ok((
             Some(auth_keys),
             EnrolAttempt::Succeeded {
+                pairing_id,
                 principal,
                 created_by: invite.created_by,
                 role,
@@ -668,48 +682,59 @@ fn process_enrol_blocking(
         Err(error) => return (None, None, base_args, Err(error)),
     };
 
-    let (principal, created_by, role, create_principal, device_name, fingerprint, state, devices) =
-        match attempt {
-            EnrolAttempt::Succeeded {
-                principal,
-                created_by,
-                role,
-                create_principal,
-                device_name,
-                fingerprint,
-                state,
-                devices,
-            } => (
-                principal,
-                created_by,
-                role,
-                create_principal,
-                device_name,
-                fingerprint,
-                state,
-                devices,
-            ),
-            EnrolAttempt::Failed {
-                principal,
-                error,
-                swept_state,
-            } => {
-                if let Some(state) = swept_state {
-                    let _ = save_state(paths, &state);
-                }
-                return (principal, None, base_args, Err(error));
+    let (
+        pairing_id,
+        principal,
+        created_by,
+        role,
+        create_principal,
+        device_name,
+        fingerprint,
+        state,
+        devices,
+    ) = match attempt {
+        EnrolAttempt::Succeeded {
+            pairing_id,
+            principal,
+            created_by,
+            role,
+            create_principal,
+            device_name,
+            fingerprint,
+            state,
+            devices,
+        } => (
+            pairing_id,
+            principal,
+            created_by,
+            role,
+            create_principal,
+            device_name,
+            fingerprint,
+            state,
+            devices,
+        ),
+        EnrolAttempt::Failed {
+            principal,
+            error,
+            swept_state,
+        } => {
+            if let Some(state) = swept_state {
+                let _ = save_state(paths, &state);
             }
-        };
+            return (principal, None, base_args, Err(error));
+        }
+    };
 
     if create_principal
-        && let Err(error) = upsert_policy_principal_locked(paths, &principal, &role)
+        && let Err(error) = upsert_device_principal_locked(paths, &principal, &role, &pairing_id)
     {
         return (Some(principal), created_by, base_args, Err(error));
     }
 
     if let Err(error) = save_devices_locked(paths, &devices) {
         if create_principal {
-            let _ = remove_policy_principal_locked(paths, &principal);
+            let _ = remove_device_principal_locked(paths, &principal, &pairing_id);
         }
         return (Some(principal), created_by, base_args, Err(error));
     }

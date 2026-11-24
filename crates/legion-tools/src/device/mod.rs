@@ -42,7 +42,7 @@ use self::registry::{
     DEVICE_PRINCIPAL_PREFIX, DeviceTombstone, DevicesFile, FleetPushOutcome,
     adopt_legacy_devices_from_auth_keys, load_devices_raw, lock_config, next_updated_timestamp,
     push_devices_to_fleet, reconcile_authorized_keys_in_memory, reconcile_device_principals_locked,
-    save_devices_locked, upsert_policy_principal_locked, validate_role_name,
+    save_devices_locked, upsert_device_principal_locked, validate_role_name,
 };
 use self::store::{
     InviteRecord, format_rfc3339, load_state, lock_auth_keys, sanitise_device_name, save_state,
@@ -80,7 +80,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.set",
         Effect::Admin,
-        "Change a paired device's role (editing its principal in policy.toml) or rename it in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. Changing a role requires the owner role (plus allow_owner=true for the owner role) and is refused through an expiring credential.",
+        "Change a paired device's role (only for a dedicated `device:*` principal marked with `device = \"<pairing_id>\"` in policy.toml; refuses shared or unmarked principals) or rename it in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. Changing a role requires the owner role (plus allow_owner=true for the owner role) and is refused through an expiring credential.",
         set_device,
     );
     registry.add_fn(
@@ -307,9 +307,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                 ),
                 "Give the device a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want.",
             )?;
-            let recorded_role = principal
-                .starts_with(DEVICE_PRINCIPAL_PREFIX)
-                .then(|| role.clone());
+            let recorded_role = None;
             (principal, role, recorded_role, None, false)
         }
         (None, Some(raw_role), Some(raw_name)) => {
@@ -817,10 +815,23 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         let final_role = if let Some(ref target_role) = new_role {
             if current_entry.principal == OWNER {
                 return Err(ErrorBody::new(
-                    ErrorCode::InvalidArgs,
+                    ErrorCode::Denied,
                     "This device is pinned to the built-in `owner` principal, whose role cannot be changed.",
                 )
-                .with_hint("Pair the device with `legion pair --role ...` so it gets its own `device:<name>` principal."));
+                .with_hint("Pair the device with `legion pair --name ... --role ...` so it gets its own registry-owned `device:<name>` principal."));
+            }
+            if policy.device_owner(&current_entry.principal) != Some(pairing_id.as_str()) {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Principal {} is not owned exclusively by device {} ({pairing_id}), so `device.set role=` refuses to modify it.",
+                        current_entry.principal, current_entry.name
+                    ),
+                )
+                .with_hint(format!(
+                    "Edit [principals.\"{}\"] in policy.toml directly to change the role for every credential using it, or pair this device with `legion pair --name ... --role ...` so it gets its own principal.",
+                    current_entry.principal
+                )));
             }
             let known_role = target_role == OWNER
                 || target_role == NOBODY
@@ -837,7 +848,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                     available.join(", ")
                 )));
             }
-            upsert_policy_principal_locked(&paths, &current_entry.principal, target_role)?;
+            upsert_device_principal_locked(&paths, &current_entry.principal, target_role, &pairing_id)?;
             target_role.clone()
         } else {
             previous_role_effective.clone()
@@ -3337,6 +3348,114 @@ role = "owner"
         assert_eq!(
             h.node.config().get::<Policy>().unwrap().role_of("device:raced").0,
             "owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_set_role_refuses_shared_principal_and_credentials_refuse_registry_owned_principal()
+    {
+        let h = Harness::new();
+
+        // 1. Pair a device under shared principal `tablet` via `--as` (`principal`).
+        let shared_inv = h
+            .call(
+                "device.invite",
+                json!({"principal": "tablet", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let shared_id = shared_inv["id"].as_str().unwrap();
+        let shared_key = generate_ephemeral_ed25519().unwrap();
+        let shared_req = format!(
+            "{{\"enrol\":1,\"id\":\"{shared_id}\",\"public_key\":\"{}\",\"name\":\"shared-tab\"}}\n",
+            shared_key.public_key
+        );
+        assert!(run_enrol(&h.node, shared_id, shared_req.as_bytes()).await.is_ok());
+
+        // `device.set role=` on a shared principal must be refused with a policy.toml hint.
+        let shared_err = h
+            .call(
+                "device.set",
+                json!({"name": "shared-tab", "role": "observer"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(shared_err.code, ErrorCode::Denied, "{shared_err:?}");
+        assert!(
+            shared_err
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("policy.toml")),
+            "{shared_err:?}"
+        );
+        assert_eq!(
+            h.node.config().get::<Policy>().unwrap().role_of("tablet").0,
+            "phone_admin"
+        );
+
+        // 2. Pair a device with `role` + `name`, creating a registry-owned `device:owned-pad` principal.
+        let owned_inv = h
+            .call(
+                "device.invite",
+                json!({"name": "owned-pad", "role": "observer", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let owned_inv_id = owned_inv["id"].as_str().unwrap();
+        let owned_key = generate_ephemeral_ed25519().unwrap();
+        let owned_req = format!(
+            "{{\"enrol\":1,\"id\":\"{owned_inv_id}\",\"public_key\":\"{}\",\"name\":\"ignored\"}}\n",
+            owned_key.public_key
+        );
+        assert!(run_enrol(&h.node, owned_inv_id, owned_req.as_bytes()).await.is_ok());
+
+        let policy_text =
+            std::fs::read_to_string(h.node.paths().config_file("policy.toml")).unwrap();
+        assert!(
+            policy_text.contains("device = "),
+            "registry-owned principal must carry a device ownership marker in policy.toml:\n{policy_text}"
+        );
+
+        // 3. Tokens, agents, and `--as` pairings on a registry-owned principal must be refused.
+        let tok_err = h
+            .call(
+                "token.add",
+                json!({"name": "badtok", "principal": "device:owned-pad"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(tok_err.code, ErrorCode::Denied, "{tok_err:?}");
+
+        let agent_err = h
+            .call(
+                "agent.add",
+                json!({"agent": "claude", "as": "device:owned-pad", "dry_run": true}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(agent_err.code, ErrorCode::Denied, "{agent_err:?}");
+
+        let pair_as_err = h
+            .call(
+                "device.invite",
+                json!({"principal": "device:owned-pad", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(pair_as_err.code, ErrorCode::Denied, "{pair_as_err:?}");
+
+        // 4. Unmarked `device:legacy` in policy.toml triggers a warning in `meta.doctor`.
+        let mut text = std::fs::read_to_string(h.node.paths().config_file("policy.toml")).unwrap();
+        text.push_str("\n[principals.\"device:legacy\"]\nrole = \"observer\"\n");
+        std::fs::write(h.node.paths().config_file("policy.toml"), &text).unwrap();
+        let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        let checks = doctor["checks"].as_array().unwrap();
+        assert!(
+            checks.iter().any(|c| c["warning"] == json!(true)
+                && c["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("device:legacy"))),
+            "expected meta.doctor warning for unmarked device:legacy: {doctor}"
         );
     }
 }
