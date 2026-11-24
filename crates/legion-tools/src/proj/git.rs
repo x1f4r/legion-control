@@ -594,15 +594,7 @@ pub(super) async fn repo_state(
     };
     layout.check(grant, Access::Read)?;
     let filters = filter_overrides(path, cancel).await?;
-    let status_args = [
-        "status",
-        "--porcelain=v2",
-        "--branch",
-        "--ignore-submodules=all",
-        "--show-stash",
-        "-z",
-    ];
-    let mut output = Git::read(path, &status_args, cancel)
+    let mut output = Git::read(path, &status_args(true), cancel)
         .with_config(filters.clone())
         .run()
         .await?;
@@ -612,7 +604,7 @@ pub(super) async fn repo_state(
     // `--show-stash` is from git 2.35; an older git refuses the option, and is asked without it.
     let old_git = output.exit_code != Some(0) && output.stderr.text.contains("show-stash");
     if old_git {
-        output = Git::read(path, &status_args[..5], cancel)
+        output = Git::read(path, &status_args(false), cancel)
             .with_config(filters)
             .run()
             .await?;
@@ -639,6 +631,22 @@ pub(super) async fn repo_state(
         None => None,
     };
     Ok(Some(RepoState::new(status, last_commit)))
+}
+
+/// The arguments of the `git status` that [`parse_porcelain`] reads; `--show-stash` only for a git
+/// that knows it (2.35 and later).
+fn status_args(show_stash: bool) -> Vec<&'static str> {
+    let mut args = vec![
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "--ignore-submodules=all",
+    ];
+    if show_stash {
+        args.push("--show-stash");
+    }
+    args.push("-z");
+    args
 }
 
 /// The stash's size from its reflog, for a git too old to report it with `status`. No stash is
@@ -884,6 +892,26 @@ mod tests {
             "file:/home/me/.gitconfig\tssh -i ~/.ssh/work\ncommand line:\t\n"
         ));
         assert!(!ssh_configured("file:.git/config\t\n"));
+    }
+
+    #[test]
+    fn an_older_git_is_asked_the_same_without_the_stash() {
+        let current = status_args(true);
+        let older = status_args(false);
+        assert!(current.contains(&"--show-stash"));
+        assert!(!older.contains(&"--show-stash"), "{older:?}");
+        assert_eq!(
+            older,
+            current
+                .iter()
+                .copied()
+                .filter(|arg| *arg != "--show-stash")
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            older.contains(&"-z") && older.contains(&"--porcelain=v2"),
+            "{older:?}"
+        );
     }
 
     #[test]
