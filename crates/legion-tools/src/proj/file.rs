@@ -393,7 +393,12 @@ fn apply_one(doc: &mut DocumentMut, edit: &Edit) -> Result<(), String> {
 /// the file or what comes before, not the project, so it moves to the next table, or to the end of
 /// the file when none follows.
 fn keep_leading_comments(doc: &mut DocumentMut, removed: &Table) {
-    let Some(prefix) = removed.decor().prefix().and_then(|prefix| prefix.as_str()) else {
+    // A project written only as `[projects.site.on]` has no header of its own; the comments above
+    // it hang on the first of its tables the file spells out.
+    let Some(first) = first_written(removed) else {
+        return;
+    };
+    let Some(prefix) = first.decor().prefix().and_then(|prefix| prefix.as_str()) else {
         return;
     };
     let lines: Vec<&str> = prefix.split_inclusive('\n').collect();
@@ -404,7 +409,7 @@ fn keep_leading_comments(doc: &mut DocumentMut, removed: &Table) {
     if !kept.contains('#') {
         return;
     }
-    let next = removed
+    let next = first
         .position()
         .and_then(|after| next_position(doc.as_table(), after));
     match next.and_then(|position| table_at(doc.as_table_mut(), position)) {
@@ -422,6 +427,19 @@ fn keep_leading_comments(doc: &mut DocumentMut, removed: &Table) {
             doc.set_trailing(format!("{trailing}{kept}"));
         }
     }
+}
+
+/// The table among `table` and those under it whose header comes first in the file, leaving out
+/// the ones only implied by a longer header.
+fn first_written(table: &Table) -> Option<&Table> {
+    let own = (!table.is_implicit() && table.position().is_some()).then_some(table);
+    let children = table
+        .iter()
+        .filter_map(|(_, item)| item.as_table())
+        .filter_map(first_written);
+    own.into_iter()
+        .chain(children)
+        .min_by_key(|table| table.position())
 }
 
 /// The position of the first table written after `after`.
@@ -776,6 +794,34 @@ on = { pi = "/home/me/notes" }
         )
         .unwrap();
         assert!(parse(&dotted).unwrap().projects.is_empty(), "{dotted}");
+    }
+
+    #[test]
+    fn forgetting_a_project_written_only_through_its_subtables_keeps_the_header() {
+        let file = Path::new("projects.toml");
+        let text = "# Header.\n\n# About site.\n[projects.site.on]\ntower = \"/x\"\n\n[projects.site.tasks]\nt = \"x\"\n\n# Other.\n[projects.other.on]\npi = \"/y\"\n";
+        let gone = apply(
+            file,
+            text,
+            &[Edit::Forget {
+                name: "site".into(),
+            }],
+        )
+        .unwrap();
+        assert!(gone.starts_with("# Header.\n"), "{gone}");
+        assert!(!gone.contains("About site"), "{gone}");
+        assert!(gone.contains("# Other."), "{gone}");
+        assert!(!parse(&gone).unwrap().projects.contains_key("site"));
+        let alone = apply(
+            file,
+            "# Header.\n\n[projects.site.on]\ntower = \"/x\"\n",
+            &[Edit::Forget {
+                name: "site".into(),
+            }],
+        )
+        .unwrap();
+        assert!(alone.contains("# Header."), "{alone}");
+        assert!(parse(&alone).unwrap().projects.is_empty(), "{alone}");
     }
 
     #[test]
