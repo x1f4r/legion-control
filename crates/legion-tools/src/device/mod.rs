@@ -496,6 +496,8 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let id_for_write = id.clone();
     let principal_for_write = principal.clone();
     let node_name_for_write = ctx.node_name().to_owned();
+    let caller_is_owner = caller.is_owner();
+    let caller_principal_for_cap = ctx.principal().to_owned();
     let final_principal = blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
@@ -512,6 +514,28 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         let resolve_record = |auth_keys: &self::authkeys::AuthKeysFile,
                               state: &store::DevicesState|
          -> Result<InviteRecord, ErrorBody> {
+            if !caller_is_owner {
+                let pending = state
+                    .invites
+                    .values()
+                    .filter(|inv| {
+                        inv.created_by.as_deref() == Some(caller_principal_for_cap.as_str())
+                            || inv.principal == caller_principal_for_cap
+                    })
+                    .count();
+                if pending >= registry::MAX_NON_OWNER_PENDING_INVITES {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Principal {caller_principal_for_cap} already has {pending} pending pairing invites (the limit for non-owner callers is {}).",
+                            registry::MAX_NON_OWNER_PENDING_INVITES
+                        ),
+                    )
+                    .with_hint(
+                        "Wait for existing invites to expire or remove unused ones with `legion device.remove id=<invite_id>` before creating another.",
+                    ));
+                }
+            }
             let mut record = base_record.clone();
             if !create_device_principal {
                 return Ok(record);
@@ -1730,6 +1754,23 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     },
                 );
                 let quarantined_after = registry::quarantined_devices(&devices_file);
+
+                let resulting_bytes = devices_file.to_toml_string().len();
+                if resulting_bytes > registry::MAX_DEVICES_TOML_BYTES {
+                    return Err(RemoveBlockingError::BeforeSave(
+                        registry::devices_size_limit_error(resulting_bytes),
+                    ));
+                }
+                if !caller.is_owner()
+                    && resulting_bytes > registry::NON_OWNER_DEVICES_TOML_LIMIT_BYTES
+                {
+                    return Err(RemoveBlockingError::BeforeSave(
+                        registry::non_owner_devices_half_limit_error(
+                            "remove a device",
+                            resulting_bytes,
+                        ),
+                    ));
+                }
 
                 // 1. Write the tombstone to `devices.toml` FIRST.
                 save_devices_locked(&paths, &devices_file)
@@ -5279,5 +5320,276 @@ host = "pi.example"
             removed_id.get("hint").is_none(),
             "local-only removal by id must not emit a fleet sync hint: {removed_id}"
         );
+    }
+
+    #[tokio::test]
+    async fn size_limits_cap_non_owner_pending_invites_and_stop_create_remove_growth_at_half_limit()
+    {
+        use crate::device::enrol::run_enrol;
+        use crate::device::keys::ed25519_public_key_from_seed;
+        use crate::device::registry::{DeviceTombstone, DevicesFile, PairedBy};
+
+        let h = Harness::new();
+        std::fs::write(
+            h.node.paths().config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+",
+        )
+        .unwrap();
+
+        // 1. Non-owner (`tablet`) can hold at most 32 pending invites; 33rd is refused with Denied.
+        let mut created_ids = Vec::new();
+        for i in 0..32 {
+            let mut call = Call::new(
+                Door::Cli,
+                "device.invite",
+                json!({
+                    "principal": "tablet",
+                    "host": "127.0.0.1",
+                    "port": 22,
+                    "user": "tester"
+                }),
+            );
+            call.pinned = Some("tablet".to_owned());
+            let res = h
+                .node
+                .call(call)
+                .await
+                .unwrap_or_else(|e| panic!("invite #{i} should succeed: {e:?}"));
+            created_ids.push(res["id"].as_str().unwrap().to_owned());
+        }
+        let mut call_33 = Call::new(
+            Door::Cli,
+            "device.invite",
+            json!({
+                "principal": "tablet",
+                "host": "127.0.0.1",
+                "port": 22,
+                "user": "tester"
+            }),
+        );
+        call_33.pinned = Some("tablet".to_owned());
+        let err_33 = h
+            .node
+            .call(call_33)
+            .await
+            .expect_err("33rd pending invite for non-owner must be refused");
+        assert_eq!(err_33.code, ErrorCode::Denied, "{err_33:?}");
+
+        // Owner is NOT blocked by tablet's 32 pending invites.
+        let owner_inv = h
+            .call(
+                "device.invite",
+                json!({
+                    "principal": "tablet",
+                    "host": "127.0.0.1",
+                    "port": 22,
+                    "user": "tester"
+                }),
+            )
+            .await
+            .expect("owner invite should succeed even when tablet has 32 pending");
+        let owner_inv_id = owner_inv["id"].as_str().unwrap().to_owned();
+
+        // Clear all pending invites before testing create-then-remove growth.
+        for id in created_ids.into_iter().chain(std::iter::once(owner_inv_id)) {
+            h.call("device.remove", json!({"id": id})).await.unwrap();
+        }
+
+        // 2. Reviewer's create-then-remove loop as non-owner: seed devices.toml just below 512 KiB,
+        //    then loop invite -> enrol -> remove as `tablet`. Once the file crosses 512 KiB, both
+        //    non-owner enrolment AND non-owner removal are refused with Denied + owner-tidy hint.
+        let half_limit: usize = 512 * 1024;
+        let now_str = registry::format_precise_rfc3339(Timestamp::now());
+        let make_tomb = |idx: u32| DeviceTombstone {
+            name: format!("past-device-{idx:04}"),
+            principal: "tablet".to_owned(),
+            fingerprint: Some("SHA256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()),
+            paired_at: Some(now_str.clone()),
+            paired_on: Some("tower".to_owned()),
+            paired_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: None,
+            }),
+            removed_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: None,
+            }),
+            removed_at: now_str.clone(),
+            removed_on: "tower".to_owned(),
+        };
+        let mut sample = DevicesFile::default();
+        sample
+            .removed
+            .insert(format!("f{:031x}", 0u32), make_tomb(0));
+        let per_entry = sample
+            .to_toml_string()
+            .len()
+            .saturating_sub("version = 1\n".len())
+            .max(1);
+        let initial_count = ((half_limit.saturating_sub(1000)) / per_entry) as u32;
+        let mut near_half = DevicesFile::default();
+        for seed_idx in 0..initial_count {
+            near_half
+                .removed
+                .insert(format!("f{seed_idx:031x}"), make_tomb(seed_idx));
+        }
+        let mut seed_idx = initial_count;
+        while near_half.to_toml_string().len() + 600 < half_limit {
+            near_half
+                .removed
+                .insert(format!("f{seed_idx:031x}"), make_tomb(seed_idx));
+            seed_idx += 1;
+        }
+        std::fs::write(
+            h.node.paths().config_file(DevicesFile::FILE),
+            near_half.to_toml_string(),
+        )
+        .unwrap();
+
+        let mut hit_enrol_cap = false;
+        let mut hit_remove_cap = false;
+        let mut last_live_name: Option<String> = None;
+        for round in 1u8..=20 {
+            let mut inv_call = Call::new(
+                Door::Cli,
+                "device.invite",
+                json!({
+                    "principal": "tablet",
+                    "host": "127.0.0.1",
+                    "port": 22,
+                    "user": "tester"
+                }),
+            );
+            inv_call.pinned = Some("tablet".to_owned());
+            let inv = h.node.call(inv_call).await.unwrap();
+            let inv_id = inv["id"].as_str().unwrap().to_owned();
+            let dev_name = format!("loop-dev-{round}");
+            let pub_key = ed25519_public_key_from_seed(&[round; 32]);
+            let req = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": inv_id, "public_key": pub_key, "name": dev_name})
+            );
+            let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
+            match reply {
+                crate::device::enrol::EnrolReply::Err { error, .. } => {
+                    assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+                    assert!(
+                        error
+                            .hint
+                            .as_deref()
+                            .is_some_and(|hint| hint.to_ascii_lowercase().contains("owner")),
+                        "expected hint mentioning owner tidy-up: {error:?}"
+                    );
+                    hit_enrol_cap = true;
+                    break;
+                }
+                crate::device::enrol::EnrolReply::Ok { device, .. } => {
+                    last_live_name = Some(device.clone());
+                    let mut rm_call =
+                        Call::new(Door::Cli, "device.remove", json!({"name": device}));
+                    rm_call.pinned = Some("tablet".to_owned());
+                    if let Err(err) = h.node.call(rm_call).await {
+                        assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+                        assert!(
+                            err.hint
+                                .as_deref()
+                                .is_some_and(|hint| hint.to_ascii_lowercase().contains("owner")),
+                            "expected hint mentioning owner tidy-up: {err:?}"
+                        );
+                        hit_remove_cap = true;
+                        break;
+                    }
+                    last_live_name = None;
+                }
+            }
+        }
+        assert!(
+            hit_enrol_cap || hit_remove_cap,
+            "create-then-remove loop must stop at the 512 KiB non-owner half-limit"
+        );
+
+        // Ensure BOTH non-owner enrolment AND non-owner removal are refused once past 512 KiB,
+        // while owner can still enrol and remove cleanly!
+        if let Some(ref live) = last_live_name {
+            // File is right at half-limit: verify non-owner enrolment is ALSO refused.
+            let mut inv_call = Call::new(
+                Door::Cli,
+                "device.invite",
+                json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
+            );
+            inv_call.pinned = Some("tablet".to_owned());
+            let inv = h.node.call(inv_call).await.unwrap();
+            let inv_id = inv["id"].as_str().unwrap().to_owned();
+            let req = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[0xee; 32]), "name": "blocked-enrol"})
+            );
+            let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
+            assert!(
+                !reply.is_ok(),
+                "non-owner enrol past 512 KiB must fail: {reply:?}"
+            );
+
+            // Owner CAN still remove `live` cleanly.
+            let owner_rm = h
+                .call("device.remove", json!({"name": live}))
+                .await
+                .unwrap();
+            assert_eq!(owner_rm["removed"], json!(true));
+        } else {
+            // Enrol was refused first: enrol one as owner, then verify non-owner remove is refused
+            // while owner remove succeeds.
+            let inv = h
+                .call(
+                    "device.invite",
+                    json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
+                )
+                .await
+                .unwrap();
+            let inv_id = inv["id"].as_str().unwrap().to_owned();
+            let req = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[0xef; 32]), "name": "owner-seeded-tablet"})
+            );
+            let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
+            assert!(
+                reply.is_ok(),
+                "owner enrol past 512 KiB must still succeed: {reply:?}"
+            );
+
+            let mut rm_call = Call::new(
+                Door::Cli,
+                "device.remove",
+                json!({"name": "owner-seeded-tablet"}),
+            );
+            rm_call.pinned = Some("tablet".to_owned());
+            let rm_err = h
+                .node
+                .call(rm_call)
+                .await
+                .expect_err("non-owner remove past 512 KiB must be refused");
+            assert_eq!(rm_err.code, ErrorCode::Denied, "{rm_err:?}");
+            assert!(
+                rm_err
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.to_ascii_lowercase().contains("owner")),
+                "expected hint mentioning owner tidy-up: {rm_err:?}"
+            );
+
+            let owner_rm = h
+                .call("device.remove", json!({"name": "owner-seeded-tablet"}))
+                .await
+                .unwrap();
+            assert_eq!(owner_rm["removed"], json!(true));
+        }
     }
 }

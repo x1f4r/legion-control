@@ -25,10 +25,11 @@ use super::authkeys::{
 };
 use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
 use super::registry::{
-    DeviceRegistryPushAudit, DevicesFile, FleetDevice, FleetPushOutcome, PairedBy,
-    adopt_legacy_devices_from_auth_keys, format_precise_rfc3339, load_devices_raw, lock_config,
-    push_devices_to_fleet, reconcile_authorized_keys_in_memory, save_devices_locked,
-    upsert_device_principal_locked,
+    DeviceRegistryPushAudit, DevicesFile, FleetDevice, FleetPushOutcome, MAX_DEVICES_TOML_BYTES,
+    NON_OWNER_DEVICES_TOML_LIMIT_BYTES, PairedBy, adopt_legacy_devices_from_auth_keys,
+    devices_size_limit_error, format_precise_rfc3339, load_devices_raw, lock_config,
+    non_owner_devices_half_limit_error, push_devices_to_fleet, reconcile_authorized_keys_in_memory,
+    save_devices_locked, upsert_device_principal_locked,
 };
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
@@ -663,6 +664,21 @@ fn process_enrol_blocking(
             updated_on: valid_node_name.clone(),
         },
     );
+
+    let resulting_bytes = devices.to_toml_string().len();
+    if resulting_bytes > MAX_DEVICES_TOML_BYTES {
+        return fail_with_sweep(Some(principal), devices_size_limit_error(resulting_bytes));
+    }
+    let creator_is_owner = match invite.created_by.as_deref() {
+        Some(creator) => policy.role_of(creator).0 == OWNER,
+        None => true,
+    };
+    if !creator_is_owner && resulting_bytes > NON_OWNER_DEVICES_TOML_LIMIT_BYTES {
+        return fail_with_sweep(
+            Some(principal),
+            non_owner_devices_half_limit_error("enrol a new device", resulting_bytes),
+        );
+    }
 
     let added = Timestamp::from_second(now.as_second())
         .map(format_rfc3339)

@@ -52,6 +52,45 @@ const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// refused so a peer cannot pin an entry with a far-future timestamp that defeats later edits.
 pub const MAX_FUTURE_SKEW: SignedDuration = SignedDuration::from_mins(10);
 
+/// Hard byte limit for `devices.toml` (matches `config.write`'s 1 MiB document cap). Any change
+/// whose serialized `devices.toml` would exceed this is refused BEFORE saving so a node never
+/// writes a file that can no longer be pushed across the fleet.
+pub const MAX_DEVICES_TOML_BYTES: usize = 1024 * 1024;
+
+/// Half of [`MAX_DEVICES_TOML_BYTES`] (512 KiB). Once `devices.toml` would exceed this size,
+/// non-owner callers cannot enrol or remove devices until an owner tidies up.
+pub const NON_OWNER_DEVICES_TOML_LIMIT_BYTES: usize = MAX_DEVICES_TOML_BYTES / 2;
+
+/// Maximum number of concurrent pending pairing invites a non-owner principal may hold.
+pub const MAX_NON_OWNER_PENDING_INVITES: usize = 32;
+
+/// Error returned when a change would make `devices.toml` exceed [`MAX_DEVICES_TOML_BYTES`].
+pub fn devices_size_limit_error(bytes: usize) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::InvalidArgs,
+        format!(
+            "devices.toml would be {bytes} bytes, exceeding the {MAX_DEVICES_TOML_BYTES}-byte (1 MiB) configuration limit."
+        ),
+    )
+    .with_hint(
+        "Tombstones in devices.toml are permanent so removed devices cannot return and quarantine cannot be lifted; keep the fleet registry below 1 MiB or tidy obsolete entries as owner.",
+    )
+}
+
+/// Error returned when a non-owner operation would leave `devices.toml` past
+/// [`NON_OWNER_DEVICES_TOML_LIMIT_BYTES`].
+pub fn non_owner_devices_half_limit_error(action: &str, bytes: usize) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "Cannot {action}: devices.toml would be {bytes} bytes, past the {NON_OWNER_DEVICES_TOML_LIMIT_BYTES}-byte (512 KiB) non-owner limit."
+        ),
+    )
+    .with_hint(
+        "An owner must tidy up devices.toml before non-owner callers can enrol or remove devices.",
+    )
+}
+
 /// Fleet-wide paired device registry (`devices.toml`), stored beside `policy.toml`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -849,6 +888,9 @@ pub fn load_devices_raw(paths: &Paths) -> Result<Option<DevicesFile>, ErrorBody>
 pub fn save_devices_locked(paths: &Paths, devices: &DevicesFile) -> Result<String, ErrorBody> {
     let target = paths.config_file(DevicesFile::FILE);
     let text = devices.to_toml_string();
+    if text.len() > MAX_DEVICES_TOML_BYTES {
+        return Err(devices_size_limit_error(text.len()));
+    }
     parse::<DevicesFile>(&target, text.as_bytes())?;
 
     if let Ok(existing) = std::fs::read(&target) {
@@ -3881,5 +3923,60 @@ device = \"{id_victim}\"
             None,
         )
         .expect("victim must still be accepted by gate");
+    }
+
+    #[test]
+    fn save_devices_locked_refuses_file_exceeding_one_mib_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+
+        let original = "version = 1\n";
+        std::fs::write(paths.config_file(DevicesFile::FILE), original).unwrap();
+
+        let now_str = format_precise_rfc3339(Timestamp::now());
+        let mut oversized = DevicesFile::default();
+        // ~200 bytes per tombstone -> 6000 tombstones easily exceeds 1 MiB.
+        for idx in 0..6000u32 {
+            let id = format!("{idx:032x}");
+            oversized.removed.insert(
+                id,
+                DeviceTombstone {
+                    name: format!("old-device-{idx:04}"),
+                    principal: "tablet".to_owned(),
+                    fingerprint: Some(
+                        "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    ),
+                    paired_at: Some(now_str.clone()),
+                    paired_on: Some("tower".to_owned()),
+                    paired_by: Some(PairedBy {
+                        principal: "tablet".to_owned(),
+                        device: None,
+                    }),
+                    removed_by: Some(PairedBy {
+                        principal: "tablet".to_owned(),
+                        device: None,
+                    }),
+                    removed_at: now_str.clone(),
+                    removed_on: "tower".to_owned(),
+                },
+            );
+        }
+        assert!(oversized.to_toml_string().len() > 1024 * 1024);
+
+        let _lock = lock_config(&paths).unwrap();
+        let err = save_devices_locked(&paths, &oversized)
+            .expect_err("saving >1 MiB devices.toml must be refused before writing");
+        assert!(
+            err.message.contains("1048576") || err.message.contains("1 MiB"),
+            "expected clear 1 MiB error: {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file(DevicesFile::FILE)).unwrap(),
+            original,
+            "existing devices.toml on disk must stay untouched when >1 MiB save is refused"
+        );
     }
 }
