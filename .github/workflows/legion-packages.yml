@@ -13,6 +13,7 @@ on:
       - crates/**
       - apps/ui/**
       - packaging/**
+      - scripts/check-binary-paths.mjs
       - scripts/legion-distro-test.sh
       - .github/workflows/legion-packages.yml
   pull_request:
@@ -24,6 +25,7 @@ on:
       - crates/**
       - apps/ui/**
       - packaging/**
+      - scripts/check-binary-paths.mjs
       - scripts/legion-distro-test.sh
       - .github/workflows/legion-packages.yml
   workflow_dispatch:
@@ -70,7 +72,11 @@ jobs:
           LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          workspace="$(pwd -P)"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${HOME}=/build/home --remap-path-prefix=${cargo_home}=/cargo --remap-path-prefix=${workspace}=/build"
           cargo build --release --locked --target x86_64-unknown-linux-musl -p legion-cli
+          node scripts/check-binary-paths.mjs target/x86_64-unknown-linux-musl/release/legion
           file target/x86_64-unknown-linux-musl/release/legion
       - name: Build amd64 .deb
         shell: bash
@@ -177,7 +183,11 @@ jobs:
           LEGION_BUILD_REV: ${{ github.sha }}
         run: |
           set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          workspace="$(pwd -P)"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${HOME}=/build/home --remap-path-prefix=${cargo_home}=/cargo --remap-path-prefix=${workspace}=/build"
           cargo build --release --locked --target aarch64-unknown-linux-musl -p legion-cli
+          node scripts/check-binary-paths.mjs target/aarch64-unknown-linux-musl/release/legion
           file target/aarch64-unknown-linux-musl/release/legion
           version="$(awk '
             /^\[workspace\.package\]/ { in_section = 1; next }
