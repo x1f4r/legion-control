@@ -5,6 +5,7 @@
 //! node's name, reachable hosts, SSH port, account, pinned host keys, a 32-byte temporary Ed25519
 //! seed, the principal being paired, and an expiry timestamp.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -299,7 +300,7 @@ impl Invite {
     }
 }
 
-fn validate_token_field(field: &str, value: &str) -> Result<(), ErrorBody> {
+pub(crate) fn validate_token_field(field: &str, value: &str) -> Result<(), ErrorBody> {
     if value.is_empty() {
         return Err(missing_field(field));
     }
@@ -330,7 +331,7 @@ fn validate_token_field(field: &str, value: &str) -> Result<(), ErrorBody> {
     Ok(())
 }
 
-fn validate_openssh_public_key_line(index: usize, line: &str) -> Result<(), ErrorBody> {
+pub(crate) fn validate_openssh_public_key_line(index: usize, line: &str) -> Result<(), ErrorBody> {
     if line.len() > MAX_HOST_KEY_LEN {
         return Err(ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -410,6 +411,17 @@ fn missing_field(field: &str) -> ErrorBody {
     .with_hint("Generate a fresh invite with `legion pair`.")
 }
 
+/// Per-machine sync outcome returned in the enrolment reply's `fleet` map.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetPushOutcome {
+    /// `"synced"` when the peer accepted the new device, or `"not_reached"` when it could not be
+    /// reached or returned an error.
+    pub status: String,
+    /// Human-readable reason when `status` is `"not_reached"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Information returned by a node when enrolment succeeds, carrying everything needed to reconnect
 /// later using the permanent device key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +436,15 @@ pub struct Enrolled {
     pub role: String,
     /// Device name as stored by the node.
     pub device: String,
+    /// Per-machine sync outcome when the node pushed this device to peers in `fleet.toml`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fleet: BTreeMap<String, FleetPushOutcome>,
+    /// Fleet machines that did not receive this device yet during enrolment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_synced_to: Vec<String>,
+    /// Exact sync command reported by the node when `not_synced_to` is non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_command: Option<String>,
 }
 
 #[cfg(feature = "ssh")]
@@ -471,6 +492,12 @@ mod enrol_client {
         role: Option<String>,
         #[serde(default)]
         device: Option<String>,
+        #[serde(default)]
+        fleet: std::collections::BTreeMap<String, super::FleetPushOutcome>,
+        #[serde(default)]
+        not_synced_to: Vec<String>,
+        #[serde(default)]
+        sync_command: Option<String>,
         #[serde(default)]
         error: Option<Value>,
     }
@@ -716,6 +743,9 @@ mod enrol_client {
                 principal,
                 role,
                 device,
+                fleet: resp.fleet,
+                not_synced_to: resp.not_synced_to,
+                sync_command: resp.sync_command,
             });
         }
 
@@ -995,6 +1025,56 @@ mod tests {
         assert_eq!(enrolled.role, "observer");
         assert_eq!(enrolled.device, "phone-1");
         assert_eq!(enrolled.target, invite.target());
+        assert!(enrolled.fleet.is_empty());
+        assert!(enrolled.not_synced_to.is_empty());
+        assert!(enrolled.sync_command.is_none());
+
+        // 1b. ok: true carrying fleet push outcomes parses synced and not_reached peers.
+        let (client, server) = tokio::io::duplex(4 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await;
+            let reply = serde_json::json!({
+                "ok": true,
+                "node": "tower",
+                "principal": "device:phone",
+                "role": "owner",
+                "device": "phone",
+                "fleet": {
+                    "pi": { "status": "synced" },
+                    "studio": { "status": "not_reached", "reason": "connection refused" }
+                },
+                "not_synced_to": ["studio"],
+                "sync_command": "legion fleet.sync direction=push documents='[\"devices.toml\"]'"
+            });
+            let _ = server_w.write_all(format!("{reply}\n").as_bytes()).await;
+            let _ = server_w.flush().await;
+        });
+        let fleet_enrolled = enrol_client::enrol_exchange(
+            client_r,
+            client_w,
+            None,
+            None,
+            &invite,
+            &pub_line,
+            "phone",
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fleet_enrolled.fleet.len(), 2);
+        assert_eq!(fleet_enrolled.fleet["pi"].status, "synced");
+        assert_eq!(fleet_enrolled.fleet["pi"].reason, None);
+        assert_eq!(fleet_enrolled.fleet["studio"].status, "not_reached");
+        assert_eq!(
+            fleet_enrolled.fleet["studio"].reason.as_deref(),
+            Some("connection refused")
+        );
+        assert_eq!(fleet_enrolled.not_synced_to, vec!["studio".to_owned()]);
+        assert!(fleet_enrolled.sync_command.is_some());
 
         // 2. ok: true missing `node` or `principal` is rejected.
         for incomplete in [
