@@ -285,8 +285,9 @@ pub(crate) fn parse_list_unit_files(text: &str) -> Vec<UnitFileEntry> {
         let (Some(name), Some(state)) = (parts.next(), parts.next()) else {
             continue;
         };
-        // Template definitions (`foo@.service`) cannot be started without an instance name.
-        if name.ends_with("@.service") {
+        // Template definitions (`foo@.service`) cannot be started without an instance name, and
+        // `alias` unit files are symlinks to another unit that already appears under its real name.
+        if name.ends_with("@.service") || state == "alias" {
             continue;
         }
         out.push(UnitFileEntry {
@@ -765,7 +766,7 @@ ghost.service                          not-found inactive dead ghost.service
     }
 
     #[test]
-    fn merge_list_combines_unit_files_and_skips_templates() {
+    fn merge_list_combines_unit_files_and_skips_templates_and_aliases() {
         let units = parse_list_units(
             "dbus-broker.service loaded active running D-Bus User Message Bus\n",
             Scope::User,
@@ -775,6 +776,8 @@ ghost.service                          not-found inactive dead ghost.service
 dbus-broker.service   enabled  enabled
 offline-job.service   disabled disabled
 getty@.service        static   -
+display-manager.service alias  -
+dbus-org.freedesktop.import1.service alias -
 ",
         );
         let merged = merge_list(units, files, Scope::User);
