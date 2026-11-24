@@ -184,6 +184,9 @@ pub struct NodeLink {
     pub role: String,
     /// Transport used to reach the node (`ssh` or `local`).
     pub via: String,
+    /// Canonical path to the local `legion` binary when `via == "local"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// True when this node is only acting as a temporary in-memory failover link (not persisted
     /// as the user's chosen default node).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -405,6 +408,7 @@ mod tests {
                 principal: "phone".to_owned(),
                 role: "operator".to_owned(),
                 via: "ssh".to_owned(),
+                path: None,
                 temporary: false,
             }],
             needs: None,

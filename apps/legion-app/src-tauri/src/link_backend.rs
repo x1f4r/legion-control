@@ -630,12 +630,15 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
     let mut nodes: Vec<NodeLink> = Vec::new();
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    if state.local_program.is_some() && state.data.link.node(LOCAL_NODE_ID).is_none() {
+    if let Some(local_path) = state.local_program.as_ref()
+        && state.data.link.node(LOCAL_NODE_ID).is_none()
+    {
         nodes.push(NodeLink {
             node: LOCAL_NODE_ID.to_owned(),
             principal: "local".to_owned(),
             role: "owner".to_owned(),
             via: "local".to_owned(),
+            path: Some(local_path.clone()),
             temporary: state.temporary_failover
                 && state.active_node.as_deref() == Some(LOCAL_NODE_ID),
         });
@@ -643,10 +646,10 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
 
     for entry in &state.data.link.nodes {
         let meta = state.data.meta(&entry.node);
-        let via = if entry.local_program.is_some() {
-            "local"
+        let (via, path) = if let Some(program) = &entry.local_program {
+            ("local", Some(program.clone()))
         } else {
-            "ssh"
+            ("ssh", None)
         };
         let temporary =
             state.temporary_failover && state.active_node.as_deref() == Some(entry.node.as_str());
@@ -660,6 +663,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
                 .and_then(|m| m.role.clone())
                 .unwrap_or_else(|| "unknown".to_owned()),
             via: via.to_owned(),
+            path,
             temporary,
         });
     }
@@ -683,10 +687,44 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
     }
 }
 
-/// Discovers an installed `legion` binary on desktop hosts (PATH first, then conventional paths).
+/// Discovers an installed `legion` binary on desktop hosts (absolute `PATH` entries first, then
+/// conventional install locations) and returns its canonical filesystem path.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn discover_local_legion() -> Option<String> {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
+
+    let mut conventional: Vec<PathBuf> = Vec::new();
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home_dir = PathBuf::from(home);
+            if home_dir.is_absolute() {
+                conventional.push(home_dir.join(".local/bin/legion"));
+            }
+        }
+        conventional.push(PathBuf::from("/usr/bin/legion"));
+        conventional.push(PathBuf::from("/usr/local/bin/legion"));
+        conventional.push(PathBuf::from("/opt/homebrew/bin/legion"));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let base = PathBuf::from(local_app_data);
+            if base.is_absolute() {
+                conventional.push(base.join("legion").join("legion.exe"));
+            }
+        }
+    }
+
+    discover_local_legion_from(std::env::var_os("PATH").as_deref(), &conventional)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn discover_local_legion_from(
+    path_var: Option<&std::ffi::OsStr>,
+    conventional: &[std::path::PathBuf],
+) -> Option<String> {
+    use std::path::Path;
 
     #[cfg(windows)]
     const BIN_NAME: &str = "legion.exe";
@@ -711,35 +749,40 @@ pub fn discover_local_legion() -> Option<String> {
         }
     }
 
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
+    fn resolve_candidate(candidate: &Path) -> Option<String> {
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        if !is_executable_file(&canonical) {
+            return None;
+        }
+        let raw = canonical.to_string_lossy();
+        #[cfg(windows)]
+        if let Some(stripped) = raw.strip_prefix(r"\\?\")
+            && stripped.as_bytes().get(1) == Some(&b':')
+        {
+            return Some(stripped.to_owned());
+        }
+        Some(raw.into_owned())
+    }
+
+    if let Some(path_var) = path_var {
+        for dir in std::env::split_paths(path_var) {
+            // Never execute a relative `PATH` entry (such as `.` or empty `::`).
+            if !dir.is_absolute() {
+                continue;
+            }
             let candidate = dir.join(BIN_NAME);
-            if is_executable_file(&candidate) {
-                return Some(candidate.to_string_lossy().into_owned());
+            if let Some(resolved) = resolve_candidate(&candidate) {
+                return Some(resolved);
             }
         }
     }
 
-    let mut conventional: Vec<PathBuf> = Vec::new();
-    #[cfg(not(windows))]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            conventional.push(PathBuf::from(home).join(".local/bin/legion"));
-        }
-        conventional.push(PathBuf::from("/usr/bin/legion"));
-        conventional.push(PathBuf::from("/usr/local/bin/legion"));
-        conventional.push(PathBuf::from("/opt/homebrew/bin/legion"));
-    }
-    #[cfg(windows)]
-    {
-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            conventional.push(PathBuf::from(local_app_data).join("legion").join(BIN_NAME));
-        }
-    }
-
     for candidate in conventional {
-        if is_executable_file(&candidate) {
-            return Some(candidate.to_string_lossy().into_owned());
+        if !candidate.is_absolute() {
+            continue;
+        }
+        if let Some(resolved) = resolve_candidate(candidate) {
+            return Some(resolved);
         }
     }
 
@@ -801,6 +844,7 @@ mod tests {
         assert_eq!(st.nodes.len(), 1);
         assert_eq!(st.nodes[0].node, "local");
         assert_eq!(st.nodes[0].via, "local");
+        assert_eq!(st.nodes[0].path.as_deref(), Some("/usr/bin/legion"));
 
         let err = backend
             .unpair("local".to_owned())
@@ -1396,6 +1440,38 @@ mod tests {
         let reset = backend.select_node("tower".to_owned()).await?;
         assert_eq!(reset.nodes[0].node, "tower");
         assert!(!reset.nodes[0].temporary);
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    #[test]
+    fn discover_local_legion_skips_relative_path_and_canonicalizes_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir()?;
+        let real_dir = dir.path().join("real");
+        let link_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&real_dir)?;
+        std::fs::create_dir_all(&link_dir)?;
+
+        let real_bin = real_dir.join("legion-actual");
+        std::fs::write(&real_bin, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o755))?;
+
+        let link_bin = link_dir.join("legion");
+        symlink(&real_bin, &link_bin)?;
+
+        // Relative PATH entries (including `.` and empty segments) must be skipped.
+        let relative_only =
+            std::env::join_paths([std::path::PathBuf::from("."), std::path::PathBuf::from("")])?;
+        assert_eq!(discover_local_legion_from(Some(&relative_only), &[]), None);
+
+        // An absolute PATH entry pointing through a symlink resolves to the canonical real file.
+        let mixed_path = std::env::join_paths([std::path::PathBuf::from("."), link_dir])?;
+        let found = discover_local_legion_from(Some(&mixed_path), &[])
+            .ok_or("expected canonical legion binary")?;
+        assert_eq!(found, std::fs::canonicalize(&real_bin)?.to_string_lossy());
         Ok(())
     }
 }
