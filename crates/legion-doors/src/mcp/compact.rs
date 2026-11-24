@@ -1,4 +1,4 @@
-//! Compact mode: three tools that list, describe and call the others, for agents that should not
+//! Compact mode: four tools that list, describe and run the others, for agents that should not
 //! carry every tool's schema in their context.
 
 use legion_core::proto::ErrorBody;
@@ -12,15 +12,22 @@ use super::catalog::on_schema;
 pub(crate) const TOOLS: &str = "legion_tools";
 /// Describes one tool.
 pub(crate) const DESCRIBE: &str = "legion_describe";
+/// Runs one tool whose effect is read, and no other.
+pub(crate) const READ: &str = "legion_read";
 /// Calls one tool.
 pub(crate) const CALL: &str = "legion_call";
 
-/// The three tools, as `tools/list` shows them.
+/// The four tools, as `tools/list` shows them.
+///
+/// `legion_read` and `legion_call` take the same arguments and differ in one promise:
+/// `legion_read` runs only a tool whose effect is read, so it may say it changes nothing, and a
+/// client that runs read-only tools without asking can use it where it would stop at
+/// `legion_call`.
 pub(crate) fn tools() -> Vec<Tool> {
     vec![
         Tool::new(
             TOOLS,
-            "List the Legion tools you may use on this machine: each one's name, effect and what it does. Give family, such as fs or meta, to list only that family.",
+            "List the Legion tools you may use on this machine: each one's name, effect and what it does. Give family, such as fs or meta, to list only that family. Run a tool whose effect is read with legion_read, and any other with legion_call.",
             schema(json!({
                 "family": {
                     "type": "string",
@@ -32,7 +39,7 @@ pub(crate) fn tools() -> Vec<Tool> {
         .with_annotations(ToolAnnotations::with_title("List Legion tools").read_only(true)),
         Tool::new(
             DESCRIBE,
-            "Describe one Legion tool: what it does, its effect, and the JSON Schema of the arguments legion_call takes for it.",
+            "Describe one Legion tool: what it does, its effect, and the JSON Schema of the arguments legion_read and legion_call take for it. A tool whose effect is read runs with legion_read; any other needs legion_call.",
             schema(json!({
                 "tool": {
                     "type": "string",
@@ -43,19 +50,21 @@ pub(crate) fn tools() -> Vec<Tool> {
         .with_title("Describe a Legion tool")
         .with_annotations(ToolAnnotations::with_title("Describe a Legion tool").read_only(true)),
         Tool::new(
+            READ,
+            "Run one Legion tool whose effect is read, here or on the machines on names. A tool with any other effect is refused without running: use legion_call for tools that change things. Read tools change nothing, which is why this one is marked read-only; for an extension tool, its effect is the promise of the machine's owner, who declared it. Returns the tool's JSON result, or an error object whose code says what went wrong and whose hint says what to do.",
+            run_schema(),
+        )
+        .with_title("Run a Legion read tool")
+        .with_annotations(
+            ToolAnnotations::with_title("Run a Legion read tool")
+                .read_only(true)
+                .destructive(false)
+                .idempotent(true),
+        ),
+        Tool::new(
             CALL,
             "Run one Legion tool with its arguments, here or on the machines on names. Returns the tool's JSON result, or an error object whose code says what went wrong and whose hint says what to do.",
-            schema(json!({
-                "tool": {
-                    "type": "string",
-                    "description": "The tool's name, as legion_tools lists it, such as meta.whoami."
-                },
-                "args": {
-                    "type": "object",
-                    "description": "The tool's arguments, as legion_describe shows them. Leave it out for a tool that takes none."
-                },
-                "on": on_schema()
-            }), &["tool"]),
+            run_schema(),
         )
         .with_title("Run a Legion tool")
         // It may run any tool, including the ones that remove things or restart the machine.
@@ -65,6 +74,24 @@ pub(crate) fn tools() -> Vec<Tool> {
                 .destructive(true),
         ),
     ]
+}
+
+/// What `legion_read` and `legion_call` take.
+fn run_schema() -> JsonObject {
+    schema(
+        json!({
+            "tool": {
+                "type": "string",
+                "description": "The tool's name, as legion_tools lists it, such as meta.whoami."
+            },
+            "args": {
+                "type": "object",
+                "description": "The tool's arguments, as legion_describe shows them. Leave it out for a tool that takes none."
+            },
+            "on": on_schema()
+        }),
+        &["tool"],
+    )
 }
 
 fn schema(properties: Value, required: &[&str]) -> JsonObject {
@@ -95,7 +122,7 @@ pub(crate) struct DescribeArgs {
     pub(crate) tool: String,
 }
 
-/// `legion_call` arguments.
+/// `legion_read` and `legion_call` arguments.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CallArgs {
@@ -140,18 +167,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn three_tools_with_closed_object_schemas() {
+    fn four_tools_with_closed_object_schemas() {
         let tools = tools();
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(names, [TOOLS, DESCRIBE, CALL]);
+        assert_eq!(names, [TOOLS, DESCRIBE, READ, CALL]);
         for tool in &tools {
             assert_eq!(tool.input_schema["type"], json!("object"));
             assert_eq!(tool.input_schema["additionalProperties"], json!(false));
             let schema = Value::Object((*tool.input_schema).clone());
             assert_eq!(legion_core::schema::problems(&schema), Vec::<String>::new());
         }
-        assert_eq!(tools[2].input_schema["required"], json!(["tool"]));
-        assert_eq!(tools[2].input_schema["properties"]["on"], on_schema());
+        for run in &tools[2..] {
+            assert_eq!(run.input_schema["required"], json!(["tool"]));
+            assert_eq!(run.input_schema["properties"]["on"], on_schema());
+        }
+        assert_eq!(tools[2].input_schema, tools[3].input_schema);
+    }
+
+    #[test]
+    fn only_legion_call_may_change_anything() {
+        let hints: Vec<(Option<bool>, Option<bool>, Option<bool>)> = tools()
+            .iter()
+            .map(|tool| {
+                let a = tool.annotations.clone().unwrap();
+                (a.read_only_hint, a.destructive_hint, a.idempotent_hint)
+            })
+            .collect();
+        assert_eq!(
+            hints,
+            [
+                (Some(true), None, None),
+                (Some(true), None, None),
+                (Some(true), Some(false), Some(true)),
+                (Some(false), Some(true), None),
+            ]
+        );
     }
 
     #[test]

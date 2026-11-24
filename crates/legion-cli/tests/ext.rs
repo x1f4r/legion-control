@@ -6,13 +6,14 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 
-use common::Home;
+use common::{Home, PATIENCE};
 use serde_json::{Value, json};
 
 const LEGION_BIN: &str = env!("CARGO_BIN_EXE_legion");
@@ -37,6 +38,10 @@ fn main() -> ExitCode {
         (
             "cli_tools_and_help_include_extension_tools",
             cli_tools_and_help_include_extension_tools,
+        ),
+        (
+            "legion_read_runs_extensions_declared_read_here_and_on_another_machine",
+            legion_read_runs_extensions_declared_read_here_and_on_another_machine,
         ),
     ];
     let mut failed = Vec::new();
@@ -282,4 +287,196 @@ fn cli_tools_and_help_include_extension_tools() {
         assert_ne!(denied.code, 0, "{reserved} should be refused");
         assert_eq!(denied.json()["code"], json!("invalid_args"), "{reserved}");
     }
+}
+
+/// `legion mcp --compact`, spoken to just enough to call its tools.
+struct Compact {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    lines: Receiver<String>,
+    next_id: u64,
+}
+
+impl Compact {
+    fn start(home: &Home) -> Compact {
+        let mut child = home
+            .command(&["mcp", "--compact"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut mcp = Compact {
+            child,
+            stdin,
+            lines,
+            next_id: 0,
+        };
+        mcp.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }),
+        );
+        mcp.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        mcp
+    }
+
+    fn send(&mut self, message: &Value) {
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = json!(self.next_id);
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        loop {
+            let line = self.lines.recv_timeout(PATIENCE).unwrap();
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message.get("id") == Some(&id) && message.get("method").is_none() {
+                assert!(message.get("error").is_none(), "{message}");
+                return message["result"].clone();
+            }
+        }
+    }
+
+    /// `legion_read`'s result: whether it failed, and the object it carries.
+    fn read(&mut self, arguments: Value) -> (bool, Value) {
+        let result = self.request(
+            "tools/call",
+            json!({"name": "legion_read", "arguments": arguments}),
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        (
+            result["isError"] == json!(true),
+            serde_json::from_str(text).unwrap(),
+        )
+    }
+
+    fn finish(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Compact {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn define(home: &Home, name: &str, effect: &str) {
+    let ext_argv = [this_binary(), HELPER_FLAG.to_owned(), "echo-ext".to_owned()];
+    let defined = home.run(&[
+        "ext.define",
+        "--args",
+        &json!({
+            "name": name,
+            "description": "Lab tool.",
+            "effect": effect,
+            "run": ext_argv,
+        })
+        .to_string(),
+    ]);
+    assert_eq!(defined.code, 0, "stderr: {}", defined.stderr);
+}
+
+fn legion_read_runs_extensions_declared_read_here_and_on_another_machine() {
+    let tower = Home::new();
+    let pi = Home::new();
+    tower.write_config("node.toml", "name = \"tower\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n",
+            serde_json::to_string(&[
+                this_binary(),
+                HELPER_FLAG.to_owned(),
+                "rpc".to_owned(),
+                legion_home_dir(&pi).to_string_lossy().into_owned(),
+                pi.home().to_string_lossy().into_owned(),
+            ])
+            .unwrap()
+        ),
+    );
+    // On tower, and only on pi: one declared read and one declared exec each.
+    define(&tower, "lab.check", "read");
+    define(&tower, "lab.flash", "exec");
+    define(&pi, "gpu.probe", "read");
+    define(&pi, "gpu.reset", "exec");
+
+    let mut mcp = Compact::start(&tower);
+    let (failed, here) = mcp.read(json!({"tool": "lab.check"}));
+    assert!(!failed, "{here}");
+    assert_eq!(here["env"]["LEGION_NODE"], json!("tower"));
+    assert_eq!(here["env"]["LEGION_TOOL"], json!("lab.check"));
+
+    // tower does not have gpu.probe: pi says what its effect is, as it does for the router.
+    let (failed, there) = mcp.read(json!({"tool": "gpu.probe", "on": "pi"}));
+    assert!(!failed, "{there}");
+    assert_eq!(there["env"]["LEGION_NODE"], json!("pi"));
+    assert_eq!(there["env"]["LEGION_TOOL"], json!("gpu.probe"));
+
+    // A built-in tool takes its effect from tower's own spec, here and on every machine.
+    let (failed, everywhere) = mcp.read(json!({"tool": "meta.version", "on": "all"}));
+    assert!(!failed, "{everywhere}");
+    assert_eq!(
+        everywhere["results"]["pi"]["ok"]["node"],
+        json!("pi"),
+        "{everywhere}"
+    );
+    assert_eq!(
+        everywhere["results"]["tower"]["ok"]["node"],
+        json!("tower"),
+        "{everywhere}"
+    );
+
+    for (arguments, machine) in [
+        (json!({"tool": "lab.flash"}), "tower"),
+        (json!({"tool": "gpu.reset", "on": "pi"}), "pi"),
+    ] {
+        let (failed, refused) = mcp.read(arguments.clone());
+        assert!(failed, "{refused}");
+        assert_eq!(refused["code"], json!("denied"), "{refused}");
+        assert_eq!(refused["details"]["effect"], json!("exec"), "{refused}");
+        assert_eq!(refused["details"]["machine"], json!(machine), "{refused}");
+        assert_eq!(refused["details"]["tool"], arguments["tool"], "{refused}");
+    }
+    // A machine that does not have the tool is asked for it; the call fails as it would.
+    let (failed, missing) = mcp.read(json!({"tool": "gpu.probe", "on": "tower,pi"}));
+    assert!(failed, "{missing}");
+    assert_eq!(missing["code"], json!("unknown_tool"), "{missing}");
+    mcp.finish();
+
+    for home in [&tower, &pi] {
+        let audit = home.audit();
+        for refused in ["lab.flash", "gpu.reset"] {
+            assert!(
+                !audit.iter().any(|line| line["tool"] == json!(refused)),
+                "{refused} reached an audit log"
+            );
+        }
+    }
+    assert!(
+        pi.audit()
+            .iter()
+            .any(|line| line["tool"] == json!("gpu.probe") && line["outcome"] == json!("ok"))
+    );
 }

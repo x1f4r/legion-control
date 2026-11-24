@@ -264,7 +264,7 @@ struct AddArgs {
     /// role and clearly identified in the audit log.
     #[serde(rename = "as")]
     as_principal: String,
-    /// Pass `--compact` to `legion mcp` (exposes three meta-tools instead of one per registered
+    /// Pass `--compact` to `legion mcp` (exposes four meta-tools instead of one per registered
     /// tool). Defaults to true because every registered tool schema costs context on every
     /// conversation.
     #[serde(default = "default_true")]

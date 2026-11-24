@@ -1189,10 +1189,36 @@ fn mcp_over_http_in_both_revisions() {
     };
     let mut names = compact.tool_names();
     names.sort();
-    assert_eq!(names, ["legion_call", "legion_describe", "legion_tools"]);
+    assert_eq!(
+        names,
+        [
+            "legion_call",
+            "legion_describe",
+            "legion_read",
+            "legion_tools"
+        ]
+    );
     let called = compact.call("legion_call", json!({"tool": "meta.whoami"}));
     let text: Value = serde_json::from_str(called["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(text["principal"], json!("phone"));
+    let read = compact.call("legion_read", json!({"tool": "meta.whoami"}));
+    assert_eq!(read["isError"], json!(false), "{read}");
+    let text: Value = serde_json::from_str(read["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["principal"], json!("phone"));
+    assert_eq!(text["door"], json!("http"));
+    let refused = compact.call(
+        "legion_read",
+        json!({"tool": "test.write_path", "args": {"path": "~/projects/x"}}),
+    );
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    let text: Value =
+        serde_json::from_str(refused["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["code"], json!("denied"));
+    assert_eq!(text["details"]["effect"], json!("write"));
+    assert!(
+        text["hint"].as_str().unwrap().contains("legion_call"),
+        "{text}"
+    );
     let mut headers = Mcp {
         server: &server,
         token: &fixture.phone,
@@ -1217,11 +1243,31 @@ fn mcp_over_http_in_both_revisions() {
         .as_bytes(),
     );
     let tools = &listed.messages()[0]["result"]["tools"];
-    assert_eq!(tools.as_array().unwrap().len(), 3, "{tools}");
+    assert_eq!(tools.as_array().unwrap().len(), 4, "{tools}");
+    let read = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == json!("legion_read"))
+        .unwrap();
+    assert_eq!(read["annotations"]["readOnlyHint"], json!(true), "{read}");
+    assert_eq!(
+        read["annotations"]["destructiveHint"],
+        json!(false),
+        "{read}"
+    );
 
     let line = audited(&fixture.home, |line| line["tool"] == json!("test.fail"));
     assert_eq!(line["door"], json!("http"));
     assert_eq!(line["principal"], json!("phone"));
+    // legion_read refused test.write_path before anything reached the node.
+    assert!(
+        !fixture
+            .home
+            .audit()
+            .iter()
+            .any(|line| line["tool"] == json!("test.write_path"))
+    );
 }
 
 fn the_token_never_reaches_a_log() {
