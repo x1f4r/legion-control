@@ -10,7 +10,7 @@
 //! Its result follows the rule `sys` states for both families: a field without a value is left
 //! out, never `null`.
 
-mod text;
+pub(crate) mod text;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
