@@ -1,9 +1,11 @@
-//! Where a call runs. The fleet milestone replaces [`Local`] with a router that reaches other
-//! machines; the command line and the rpc session only ever see the [`Router`] trait.
+//! Where a call runs. Every door hands its calls to a [`Router`], so the fleet milestone replaces
+//! [`Local`] with a router that reaches other machines for all of them at once.
 
-use legion_core::proto::{ErrorBody, ErrorCode, Target};
-use legion_core::{BoxFuture, Call, Node};
+use legion_proto::{ErrorBody, ErrorCode, Target};
 use serde_json::Value;
+
+use crate::node::{Call, Node};
+use crate::tool::BoxFuture;
 
 /// Runs a call on the machine or machines its `on` names.
 pub trait Router: Send + Sync + 'static {
@@ -37,7 +39,7 @@ impl Router for Local {
                     format!("{target} cannot be reached from {here}: this build of legion runs calls only on the node it runs on."),
                 )
                 .with_hint(format!(
-                    "Routing calls to other machines arrives in a later milestone. Until then, leave out --on, or name this node ({here})."
+                    "Routing calls to other machines arrives in a later milestone. Until then, leave out on (--on on the command line), or name this node ({here})."
                 ))
                 .with_machine(here)),
             }

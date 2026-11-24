@@ -26,9 +26,14 @@ pub type ToolError = ErrorBody;
 /// [`Registry::add_fn`](crate::Registry::add_fn), which implements this trait for them. Implement it
 /// by hand only for a tool whose schema is not known at compile time, such as one a user defines.
 ///
-/// When a call is cancelled its future is dropped, so a tool that starts something outside the
-/// process (a child process, a temporary file) cleans it up in a `Drop` guard, or watches
-/// [`Ctx::cancelled`] to finish early on its own terms.
+/// When a call is cancelled the node cancels the tool's context and gives it
+/// [`CANCEL_GRACE`](crate::CANCEL_GRACE) to return on its own; whatever it returns by then is the
+/// call's result, and only after that is its future dropped. So a tool that runs for long, or
+/// starts something that outlives a dropped future (a child process tree, a forwarded call), waits
+/// on [`Ctx::cancelled`] alongside its work, stops that work, cleans up and returns. Work handed to
+/// `spawn_blocking` cannot be stopped from outside at all: it checks a clone of
+/// [`Ctx::cancel_token`] between steps itself. A `Drop` guard remains the last line for whatever a
+/// tool still holds when the grace runs out.
 pub trait Tool: Send + Sync + 'static {
     /// How the tool describes itself.
     fn spec(&self) -> &ToolSpec;
@@ -198,9 +203,9 @@ fn into_object<O: Serialize>(tool: &str, out: &O) -> Result<Value, ErrorBody> {
 }
 
 /// The JSON Schema of a tool's argument type: inlined, without the meta-schema, the Rust type's
-/// name or its doc comment (the tool's description says what it does), and with every object that
+/// name or its doc comment (the tool's description says what it does), with every object that
 /// lists its properties closed to others, which is what [`parse_args`] enforces whether or not the
-/// type says so.
+/// type says so, and in the plain form strict clients accept (see [`crate::schema::normalise`]).
 pub fn input_schema<A: JsonSchema>() -> Value {
     let generator = SchemaSettings::draft2020_12()
         .with(|settings| {
@@ -214,6 +219,7 @@ pub fn input_schema<A: JsonSchema>() -> Value {
         root.remove("description");
     }
     close_objects(&mut schema);
+    crate::schema::normalise(&mut schema);
     schema
 }
 
@@ -322,6 +328,78 @@ mod tests {
             input_schema::<NoArgs>()["additionalProperties"],
             json!(false)
         );
+    }
+
+    /// How a tool's arguments usually look: optional fields, a documented enum, a sized number.
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct Find {
+        /// Only names this glob matches.
+        #[serde(default)]
+        glob: Option<String>,
+        /// Only entries of this kind.
+        #[serde(default)]
+        kind: Option<Kind>,
+        /// Which order.
+        #[serde(default)]
+        order: Order,
+        /// At most this many.
+        #[serde(default)]
+        limit: Option<u32>,
+    }
+
+    /// A kind of entry.
+    #[derive(Debug, PartialEq, Deserialize, JsonSchema)]
+    #[serde(rename_all = "lowercase")]
+    enum Kind {
+        /// A regular file.
+        File,
+        /// A directory.
+        Dir,
+    }
+
+    #[derive(Debug, Default, PartialEq, Deserialize, JsonSchema)]
+    #[serde(rename_all = "lowercase")]
+    enum Order {
+        #[default]
+        Name,
+        Size,
+    }
+
+    #[test]
+    fn the_schema_is_in_the_plain_form_strict_clients_accept() {
+        let schema = input_schema::<Find>();
+        assert_eq!(crate::schema::problems(&schema), Vec::<String>::new());
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["glob"],
+            json!({"type": "string", "description": "Only names this glob matches."})
+        );
+        assert_eq!(
+            properties["kind"],
+            json!({
+                "type": "string",
+                "enum": ["file", "dir"],
+                "description": "Only entries of this kind.\n`file`: A regular file.\n`dir`: A directory."
+            })
+        );
+        assert_eq!(properties["order"]["enum"], json!(["name", "size"]));
+        assert_eq!(properties["limit"]["type"], json!("integer"));
+        assert_eq!(properties["limit"].get("format"), None);
+        assert_eq!(properties["limit"]["minimum"], json!(0));
+        assert_eq!(schema.get("required"), None);
+    }
+
+    #[test]
+    fn an_optional_field_still_takes_an_explicit_null() {
+        let find: Find = parse_args(
+            "fs.find",
+            json!({"glob": null, "kind": null, "limit": null}),
+        )
+        .unwrap();
+        assert_eq!((find.glob, find.kind, find.limit), (None, None, None));
+        assert_eq!(find.order, Order::Name);
+        let find: Find = parse_args("fs.find", json!({"kind": "dir"})).unwrap();
+        assert_eq!(find.kind, Some(Kind::Dir));
     }
 
     #[test]

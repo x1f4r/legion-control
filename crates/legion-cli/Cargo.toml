@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 legion-core.workspace = true
+legion-doors.workspace = true
 legion-proto.workspace = true
 legion-tools.workspace = true
 serde.workspace = true
@@ -22,6 +23,7 @@ tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi
 [dev-dependencies]
 legion-tools = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
