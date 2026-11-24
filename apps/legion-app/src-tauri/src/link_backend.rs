@@ -713,19 +713,20 @@ fn build_pair_summary(enrolled: &legion_link::Enrolled) -> PairSummary {
 
 /// Filters the implicit desktop `local` pipe out of `live_cfg` before persisting to `AppStore`
 /// unless the user explicitly persisted a node with that name.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn persisted_link_config(live_cfg: &LinkConfig, previous_persisted: &LinkConfig) -> LinkConfig {
     let mut out = live_cfg.clone();
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        let had_persisted_local = previous_persisted.node(LOCAL_NODE_ID).is_some();
-        if !had_persisted_local {
-            out.nodes
-                .retain(|n| !(n.node == LOCAL_NODE_ID && n.target.is_none()));
-        }
+    let had_persisted_local = previous_persisted.node(LOCAL_NODE_ID).is_some();
+    if !had_persisted_local {
+        out.nodes
+            .retain(|n| !(n.node == LOCAL_NODE_ID && n.target.is_none()));
     }
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    let _ = previous_persisted;
     out
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn persisted_link_config(live_cfg: &LinkConfig, _previous_persisted: &LinkConfig) -> LinkConfig {
+    live_cfg.clone()
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
