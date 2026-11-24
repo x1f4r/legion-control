@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
 use legion_xfer::{
-    CaseCollision, Entry, EntryKind, Hash, Manifest, Plan, PlanConflict, PlanOptions, SkippedEntry,
+    CaseCollision, Entry, EntryKind, Manifest, Plan, PlanConflict, PlanOptions, SkippedEntry,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -498,15 +498,11 @@ impl Transfer<'_> {
             report.would_send = Some(vec![target.path.clone()]);
             return Ok(report);
         }
-        let (resumed, sent) = match self
-            .send_file(from, &target, size, hash, source.mode, partial)
-            .await
-        {
+        let (resumed, sent) = match self.send_file(from, &target, source, partial).await {
             Err(error) if partial.is_some() && error.code == ErrorCode::Conflict => {
                 // What an earlier attempt left was not a prefix of this file (it changed since):
                 // the destination dropped it when the hash did not match, so start over once.
-                self.send_file(from, &target, size, hash, source.mode, None)
-                    .await?
+                self.send_file(from, &target, source, None).await?
             }
             other => other?,
         };
@@ -521,11 +517,13 @@ impl Transfer<'_> {
         &self,
         from: &End,
         to: &End,
-        size: u64,
-        hash: Hash,
-        mode: Option<u32>,
+        source_file: &StatReply,
         hint: Option<u64>,
     ) -> Result<(u64, u64), ErrorBody> {
+        let size = source_file.size;
+        let Some(hash) = source_file.hash else {
+            return Err(changed(from));
+        };
         let mut offset = hint.unwrap_or(0);
         // The source first: a source that refuses leaves nothing behind at the destination.
         let (mut source, ready) = self.get(from, offset).await?;
@@ -535,8 +533,11 @@ impl Transfer<'_> {
         }
         let mut header =
             json!({"op": "put", "path": to.path, "size": size, "hash": hash, "offset": offset});
-        if let Some(mode) = mode {
+        if let Some(mode) = source_file.mode {
             header["mode"] = json!(mode);
+        }
+        if let Some(mtime) = source_file.mtime {
+            header["mtime"] = json!(mtime);
         }
         let mut dest = self.open(to, header).await?;
         let started: PutReady = match dest.first().await {
@@ -701,7 +702,17 @@ impl Transfer<'_> {
         for names in rounds {
             let budget = archive_budget(names, &listed);
             let done = self
-                .pack_unpack(from, to, names, budget, &mut meter, &mut skipped)
+                .pack_unpack(
+                    from,
+                    to,
+                    Round {
+                        names,
+                        budget,
+                        expected: args.checksum.then_some(&listed),
+                    },
+                    &mut meter,
+                    &mut skipped,
+                )
                 .await
                 .map_err(|error| left_in_place(error, extras.len(), &to.machine))?;
             report.files_sent += done.files;
@@ -742,11 +753,15 @@ impl Transfer<'_> {
         &self,
         from: &End,
         to: &End,
-        names: &[String],
-        budget: u64,
+        round: Round<'_>,
         meter: &mut Meter<'_>,
         skipped: &mut Vec<SkippedEntry>,
     ) -> Result<UnpackDone, ErrorBody> {
+        let Round {
+            names,
+            budget,
+            expected,
+        } = round;
         let mut source = self
             .open(
                 from,
@@ -762,7 +777,10 @@ impl Transfer<'_> {
         };
         skipped.extend(on(&from.machine, ready.skipped));
         let mut dest = match self
-            .open(to, json!({"op": "unpack", "root": to.path, "names": names}))
+            .open(
+                to,
+                json!({"op": "unpack", "root": to.path, "names": names, "hash": expected.is_some()}),
+            )
             .await
         {
             Ok(dest) => dest,
@@ -806,6 +824,35 @@ impl Transfer<'_> {
             ))
             .with_details(json!({"unplanned": shown, "files_sent": done.files}))
             .with_machine(from.machine.clone()));
+        }
+        if let Some(expected) = expected {
+            // What arrived must be what the source listed: a file edited in place while it was
+            // packed arrives whole and well formed, and only its hash tells.
+            let mismatched: Vec<&String> = done
+                .hashes
+                .iter()
+                .filter(|(path, arrived)| {
+                    let listed = expected.get(path.as_str()).and_then(|entry| entry.hash);
+                    listed.is_none() || **arrived != listed
+                })
+                .map(|(path, _)| path)
+                .collect();
+            if !mismatched.is_empty() {
+                let shown: Vec<&String> = mismatched.iter().copied().take(MOST_LISTED).collect();
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "{} files that arrived on {} are not what {} listed: {}.",
+                        mismatched.len(),
+                        to.machine,
+                        from.machine,
+                        shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                )
+                .with_hint("They probably changed while they were sent; run the transfer again once they stop changing.")
+                .with_details(json!({"mismatched": shown}))
+                .with_machine(from.machine.clone()));
+            }
         }
         Ok(done)
     }
@@ -940,6 +987,14 @@ fn left_in_place(error: ErrorBody, extras: usize, machine: &str) -> ErrorBody {
     let mut error = error.with_hint(hint);
     error.details = Some(Value::Object(details));
     error
+}
+
+/// One archive's worth of a tree: its names, the most bytes the archive may take, and, with
+/// `checksum`, what the source listed, to check what arrives against.
+struct Round<'a> {
+    names: &'a [String],
+    budget: u64,
+    expected: Option<&'a HashMap<&'a str, &'a Entry>>,
 }
 
 fn changed(from: &End) -> ErrorBody {

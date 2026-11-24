@@ -83,6 +83,10 @@ fn main() -> ExitCode {
             an_end_that_speaks_another_protocol_is_told_apart_from_a_banner,
         ),
         (
+            "what_arrives_is_checked_and_a_file_keeps_its_time",
+            what_arrives_is_checked_and_a_file_keeps_its_time,
+        ),
+        (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
             gate_serves_only_the_connectors_commands_pinned_to_its_principal,
         ),
@@ -183,7 +187,7 @@ fn helper(args: &[String]) -> ExitCode {
             exit_of(child.wait().unwrap())
         }
         // A source that does not keep to the protocol, in the way `extra[0]` names.
-        "evil" if subcommand == "stream" => evil(&extra[0], command),
+        "evil" if subcommand == "stream" => evil(&extra[0], Path::new(home), command),
         "cut" | "slow" | "evil" => exit_of(command.status().unwrap()),
         other => {
             eprintln!("unknown helper mode {other}");
@@ -194,7 +198,7 @@ fn helper(args: &[String]) -> ExitCode {
 
 /// Runs `legion stream` behind a source that misbehaves: it rewrites the header it passes on and
 /// the replies it passes back.
-fn evil(behaviour: &str, mut command: Command) -> ExitCode {
+fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
     let mut input = BufReader::new(std::io::stdin());
     let mut line = String::new();
     input.read_line(&mut line).unwrap();
@@ -204,6 +208,8 @@ fn evil(behaviour: &str, mut command: Command) -> ExitCode {
         // Packs more than it was asked for: files it never listed.
         ("extra-entries", "pack") => header["names"] = json!(["readme.txt", ".env", "other.txt"]),
         ("oversized", "pack") => header["names"] = json!(["readme.txt", "big.bin"]),
+        // Its file is edited in place after it was listed and before it is packed.
+        ("mutate", "pack") => fs::write(home.join("export/readme.txt"), b"READ ME").unwrap(),
         // Fails as soon as it is asked for an archive.
         ("fail-pack", "pack") => {
             let error =
@@ -1516,4 +1522,67 @@ fn an_end_that_speaks_another_protocol_is_told_apart_from_a_banner() {
         serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
     assert_eq!(reply["error"]["code"], "unsupported", "{reply}");
     assert_eq!(reply["error"]["details"]["protocol"], json!([1]), "{reply}");
+}
+
+fn what_arrives_is_checked_and_a_file_keeps_its_time() {
+    let laptop = node("laptop");
+    let edited = node("edited");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("edited", &edited, "evil", vec!["mutate".to_owned()]),
+            ("pi", &pi, "node", vec![]),
+        ],
+    );
+    let export = edited.home().join("export");
+    fs::create_dir_all(&export).unwrap();
+    fs::write(export.join("readme.txt"), b"read me").unwrap();
+    fs::write(export.join("steady.txt"), b"steady").unwrap();
+
+    // With checksum, a file that changed between its listing and its packing is caught.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "edited:~/export", "to": "~/export", "checksum": true}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("edited")),
+        "{error}"
+    );
+    assert!(error.to_string().contains("readme.txt"), "{error}");
+    assert!(!error.to_string().contains("steady.txt"), "{error}");
+
+    // A file sent on its own keeps its time, so a tree that holds it later finds it unchanged.
+    let dir = laptop.home().join("dir");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"alpha").unwrap();
+    fs::write(dir.join("b.txt"), b"beta").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    fs::File::options()
+        .write(true)
+        .open(dir.join("a.txt"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    ok(&transfer(
+        &laptop,
+        json!({"from": "~/dir/a.txt", "to": "pi:~/dir/a.txt"}),
+        &[],
+    ));
+    assert_eq!(
+        fs::metadata(pi.home().join("dir/a.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        old
+    );
+    let tree = ok(&transfer(
+        &laptop,
+        json!({"from": "~/dir", "to": "pi:~/dir"}),
+        &[],
+    ));
+    assert_eq!(tree["files_sent"], 1, "{tree}");
+    assert_eq!(tree["files_unchanged"], 1, "{tree}");
 }

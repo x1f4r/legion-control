@@ -19,11 +19,11 @@
 //! | `op` | Header | Reply |
 //! | --- | --- | --- |
 //! | `manifest` | `{root, checksum?, exclude?}` | one line per entry, then `{done, entries, skipped}` |
-//! | `stat` | `{path, checksum?, if_size?}` | `{kind, size, mode?, hash?, partial?}` |
+//! | `stat` | `{path, checksum?, if_size?}` | `{kind, size, mode?, hash?, mtime?, partial?, …}` |
 //! | `get` | `{path, offset?}` | `{size}`, then the bytes from `offset` to the end |
-//! | `put` | `{path, size, hash, offset?, mode?}` | `{offset}`; reads the rest; `{ok, size, hash}` |
+//! | `put` | `{path, size, hash, offset?, mode?, mtime?}` | `{offset}`; reads the rest; `{ok, size, hash}` |
 //! | `pack` | `{root, names}` | `{ready, skipped}`, then a tar stream of those names |
-//! | `unpack` | `{root, names}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
+//! | `unpack` | `{root, names, hash?}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
 //! | `delete` | `{root, names}` | `{removed, skipped}` |
 //!
 //! Each operation is authorised as the file tool it amounts to would be (`fs.read` for the first
@@ -36,12 +36,12 @@
 //! ends and the reason goes to stderr. A receiver that refuses replies and returns at once, which
 //! closes its input, so a sender writing to it is never left blocked.
 
-use std::collections::HashSet;
-use std::fs;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, FileTimes};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
@@ -50,7 +50,8 @@ use legion_core::{Access, Door, Grant, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
 use legion_xfer::{
-    CaseCollision, Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, resolve_relative_path,
+    CaseCollision, Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, Timestamp,
+    resolve_relative_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -135,13 +136,17 @@ pub(crate) enum Op {
         #[serde(default)]
         offset: u64,
     },
-    /// A sender's `offset` is not read: what is on disk decides where it starts.
+    /// A sender's `offset` is not read: what is on disk decides where it starts. `mtime`, the
+    /// source's modification time, is given to the file once it is in place, so a tree that holds
+    /// it later finds it unchanged.
     Put {
         path: String,
         size: u64,
         hash: String,
         #[serde(default)]
         mode: Option<u32>,
+        #[serde(default)]
+        mtime: Option<Timestamp>,
     },
     Pack {
         root: String,
@@ -149,9 +154,13 @@ pub(crate) enum Op {
     },
     /// `names` are the entries planned for this archive; anything else in it is refused, so a
     /// source can only deliver what the destination agreed to take.
+    /// With `hash`, the files written are hashed once they are in place and the hashes sent
+    /// back, so the sender can check they are what it listed.
     Unpack {
         root: String,
         names: Vec<String>,
+        #[serde(default)]
+        hash: bool,
     },
     Delete {
         root: String,
@@ -196,6 +205,9 @@ pub(crate) struct StatReply {
     pub mode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<Hash>,
+    /// A file's modification time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<Timestamp>,
     /// The length of a partial file a `put` left beside it, which the next one continues from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<u64>,
@@ -265,6 +277,10 @@ pub(crate) struct UnpackDone {
     /// Entries of the archive whose names differ only in letter case.
     #[serde(default)]
     pub case_collisions: Vec<CaseCollision>,
+    /// When asked for, each file written and its hash as it now is on disk, or nothing when it
+    /// could not be read back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hashes: BTreeMap<String, Option<Hash>>,
 }
 
 /// The line that ends a `delete`.
@@ -527,9 +543,10 @@ fn run<R: BufRead, W: Write>(
             size,
             hash,
             mode,
-        } => put(grant, &path, size, &hash, mode, input, output),
+            mtime,
+        } => put(grant, &path, size, &hash, mode, mtime, input, output),
         Op::Pack { root, names } => pack(grant, &root, &names, output),
-        Op::Unpack { root, names } => unpack(grant, &root, &names, input, output),
+        Op::Unpack { root, names, hash } => unpack(grant, &root, &names, hash, input, output),
         Op::Delete { root, names } => delete(grant, &root, &names, output),
     }
 }
@@ -644,6 +661,7 @@ fn stat<W: Write>(
             kind: "file".to_owned(),
             size: entry.as_ref().map_or(found.len(), |entry| entry.size),
             mode: entry.as_ref().and_then(|entry| entry.mode),
+            mtime: entry.as_ref().map(|entry| entry.mtime),
             hash: entry.and_then(|entry| entry.hash),
             partial: partial(),
             case_insensitive: None,
@@ -725,12 +743,14 @@ fn get<W: Write>(grant: &Grant, path: &str, offset: u64, output: &mut W) -> Resu
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn put<R: BufRead, W: Write>(
     grant: &Grant,
     path: &str,
     size: u64,
     hash: &str,
     mode: Option<u32>,
+    mtime: Option<Timestamp>,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
@@ -769,6 +789,11 @@ fn put<R: BufRead, W: Write>(
         legion_xfer::put(&target, size, hash, offset, fed, mode)
     })?
     .map_err(xfer_error)?;
+    // The file is whole and in place; a time that cannot be set leaves it as it is, and a later
+    // listing just sees it as changed.
+    if let Some(time) = mtime.and_then(system_time) {
+        let _ = fs::set_times(&target, FileTimes::new().set_modified(time));
+    }
     reply(
         output,
         &PutDone {
@@ -828,6 +853,7 @@ fn unpack<R: BufRead, W: Write>(
     grant: &Grant,
     root: &str,
     names: &[String],
+    hash: bool,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
@@ -856,7 +882,7 @@ fn unpack<R: BufRead, W: Write>(
         ));
     }
     reply(output, &UnpackReady { ready: true })?;
-    let (report, mut refused, unplanned) = feed(input, None, output, |fed| {
+    let (report, mut refused, unplanned, hashes) = feed(input, None, output, |fed| {
         let mut refused: Vec<SkippedEntry> = Vec::new();
         let mut unplanned: Vec<String> = Vec::new();
         let report = legion_xfer::unpack_filtered(&root, fed, |rel, kind| {
@@ -882,7 +908,17 @@ fn unpack<R: BufRead, W: Write>(
                 }
             }
         });
-        (report, refused, unplanned)
+        // Read back what was written, now it is in place, for the sender to compare.
+        let mut hashes = BTreeMap::new();
+        if hash && let Ok(report) = &report {
+            for rel in &report.files {
+                let read = resolve_relative_path(&root, rel)
+                    .and_then(|path| legion_xfer::hash::hash_file(&path))
+                    .ok();
+                hashes.insert(rel.clone(), read);
+            }
+        }
+        (report, refused, unplanned, hashes)
     })?;
     let report = report.map_err(xfer_error)?;
     let mut skipped: Vec<SkippedEntry> = report
@@ -910,6 +946,7 @@ fn unpack<R: BufRead, W: Write>(
             skipped,
             unplanned,
             case_collisions: report.case_collisions,
+            hashes,
         },
     )
 }
@@ -1082,6 +1119,20 @@ impl Read for Fed {
         buf[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
         self.at += n;
         Ok(n)
+    }
+}
+
+/// A manifest's time as the system's, or nothing for one it cannot hold.
+fn system_time(time: Timestamp) -> Option<SystemTime> {
+    let nanos = Duration::from_nanos(u64::from(time.nanos));
+    if time.secs >= 0 {
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(time.secs.unsigned_abs()))?
+            .checked_add(nanos)
+    } else {
+        UNIX_EPOCH
+            .checked_sub(Duration::from_secs(time.secs.unsigned_abs()))?
+            .checked_add(nanos)
     }
 }
 
