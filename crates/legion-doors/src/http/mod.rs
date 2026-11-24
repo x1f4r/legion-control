@@ -48,6 +48,7 @@ use legion_core::config::NodeFile;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
 use legion_core::{CANCEL_GRACE, Node, Router};
+use rmcp::model::ClientJsonRpcMessage;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::session::{SessionId, SessionManager};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -57,7 +58,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use self::gate::Refusal;
-use self::sessions::{SessionRef, Sessions};
+use self::sessions::{Abandonable, SessionRef, Sessions};
 use crate::Authenticated;
 use crate::mcp::{HttpLink, McpDoor};
 
@@ -523,6 +524,7 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
             }
         }
     }
+    let request_id = session.as_ref().and_then(|_| request_id(&bytes));
     let request = Request::from_parts(parts, Body::from(bytes));
     let service = if compact {
         &shared.mcp_compact
@@ -530,6 +532,29 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
         &shared.mcp_full
     };
     let response = service.handle(request).await;
+    if let (Some(id), Some(request_id)) = (&session, request_id) {
+        // A client that goes away while a request in its session is answered has cancelled it.
+        let manager = Arc::clone(&shared.managers[usize::from(compact)]);
+        let id: SessionId = id.as_str().into();
+        return response.map(|body| {
+            Body::new(Abandonable::new(body, move || {
+                let cancel = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": request_id, "reason": "The client went away."}
+                });
+                let (Ok(handle), Ok(cancel)) = (
+                    tokio::runtime::Handle::try_current(),
+                    serde_json::from_value::<ClientJsonRpcMessage>(cancel),
+                ) else {
+                    return;
+                };
+                handle.spawn(async move {
+                    let _ = manager.accept_message(&id, cancel).await;
+                });
+            }))
+        });
+    }
     match &session {
         None => {
             if let Some(id) = response
@@ -552,6 +577,13 @@ fn session_not_found() -> Response<Body> {
     let mut response = Response::new(Body::from("Not Found: Session not found"));
     *response.status_mut() = StatusCode::NOT_FOUND;
     response
+}
+
+/// The id of a request, when the message is one rather than a notification or a reply.
+fn request_id(body: &[u8]) -> Option<serde_json::Value> {
+    let message = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    message.get("method")?;
+    message.get("id").cloned()
 }
 
 /// Whether a message opens a session: an `initialize` request.

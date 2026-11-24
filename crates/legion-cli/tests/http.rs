@@ -107,6 +107,10 @@ fn main() -> ExitCode {
             "a_listed_origin_can_call_from_a_browser",
             a_listed_origin_can_call_from_a_browser,
         ),
+        (
+            "leaving_an_mcp_session_call_cancels_it",
+            leaving_an_mcp_session_call_cancels_it,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -1618,4 +1622,50 @@ fn a_listed_origin_can_call_from_a_browser() {
         http(server.port, "OPTIONS", "/v1/call", &[], b"").status,
         401
     );
+}
+
+fn leaving_an_mcp_session_call_cancels_it() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let session = open_session(&server, &fixture.phone);
+    let mcp = Mcp {
+        server: &server,
+        token: &fixture.phone,
+        path: "/mcp",
+        session: Some(session),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/call", Some("test_sleep"));
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"_meta": {"progressToken": "p"}, "name": "test_sleep", "arguments": {"seconds": 60}}
+    });
+    let stream = send(
+        server.port,
+        "POST",
+        "/mcp",
+        &headers,
+        call.to_string().as_bytes(),
+    );
+    let mut reader = BufReader::new(stream);
+    let (status, _) = read_head(&mut reader);
+    assert_eq!(status, 200);
+    // The call is running once it reports progress; then the client goes.
+    let mut line = String::new();
+    while !line.contains("notifications/progress") {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "the stream ended first"
+        );
+    }
+    let started = Instant::now();
+    drop(reader);
+    let line = audited(&fixture.home, |line| line["tool"] == json!("test.sleep"));
+    assert_eq!(line["outcome"], json!("cancelled"));
+    assert_eq!(line["door"], json!("http"));
+    assert!(started.elapsed() < Duration::from_secs(20));
 }

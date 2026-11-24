@@ -9,8 +9,12 @@
 //! may hold only so many at once.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use http_body::{Body, Frame, SizeHint};
 
 use legion_core::tokens::Tokens;
 
@@ -149,6 +153,58 @@ impl Sessions {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Binding>> {
         // The map stays consistent whatever panicked while holding it.
         self.bound.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A response body that runs `on_abandon` when it is dropped before it ended: what happens when
+/// the client goes away while its request is still being answered.
+///
+/// The SDK cancels a call when a stateless request's stream is dropped, but not when one inside a
+/// session is; the door uses this to tell the session the request was cancelled, as the client
+/// would have, so the call stops and gives back its slot.
+pub(crate) struct Abandonable<B> {
+    inner: B,
+    on_abandon: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl<B> Abandonable<B> {
+    pub(crate) fn new(inner: B, on_abandon: impl FnOnce() + Send + 'static) -> Abandonable<B> {
+        Abandonable {
+            inner,
+            on_abandon: Some(Box::new(on_abandon)),
+        }
+    }
+}
+
+impl<B: Body + Unpin> Body for Abandonable<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<B::Data>, B::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(polled, Poll::Ready(None)) {
+            self.on_abandon = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl<B> Drop for Abandonable<B> {
+    fn drop(&mut self) {
+        if let Some(on_abandon) = self.on_abandon.take() {
+            on_abandon();
+        }
     }
 }
 
