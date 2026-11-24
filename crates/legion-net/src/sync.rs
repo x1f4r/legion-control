@@ -860,6 +860,7 @@ async fn apply_local_write(
         let caller_is_owner = ctx.grant().role() == OWNER;
         let caller_principal = ctx.principal().to_owned();
         let caller_role = ctx.grant().role().to_owned();
+        let credential_expires = ctx.credential_expires();
 
         let merge_outcome = tokio::task::spawn_blocking(move || {
             let check_precondition = |bytes_before: Option<&[u8]>| -> Result<(), ErrorBody> {
@@ -903,6 +904,20 @@ async fn apply_local_write(
                 Ok(())
             };
             let authorize_change = |change: MergeChange<'_>| -> Result<(), ErrorBody> {
+                if let Some(limit) = credential_expires
+                    && matches!(change, MergeChange::Live { .. })
+                {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "The credential this call came with expires at {}, so it cannot add or change live paired devices in devices.toml.",
+                            limit.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        ),
+                    )
+                    .with_hint(
+                        "Use a local shell or a non-expiring credential to add or change paired devices. Removing (tombstoning) devices is still allowed.",
+                    ));
+                }
                 if caller_is_owner {
                     return Ok(());
                 }
@@ -2932,5 +2947,131 @@ role = \"phone_admin\"
         revoke_call.pinned = Some("tablet".to_owned());
         let err2 = node.call(revoke_call).await.unwrap_err();
         assert_eq!(err2.code, ErrorCode::Denied);
+    }
+
+    #[tokio::test]
+    async fn expiring_credential_cannot_add_or_change_live_devices_but_may_tombstone() {
+        use jiff::SignedDuration;
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, FleetDevice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[principals.\"device:pixel\"]
+role = \"observer\"
+device = \"11111111111111111111111111111111\"
+",
+        )
+        .unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let id_existing = "11".repeat(16);
+        let mut initial = DevicesFile::default();
+        initial.devices.insert(
+            id_existing.clone(),
+            FleetDevice {
+                name: "pixel".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[11u8; 32]),
+                principal: "device:pixel".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: "2026-11-24T10:00:00Z".to_owned(),
+                paired_on: "box-a".to_owned(),
+                updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
+
+        let expires = Some(Timestamp::now() + SignedDuration::from_hours(1));
+
+        // 1. Adding a new live device through an expiring credential is refused.
+        let mut add_live = initial.clone();
+        add_live.devices.insert(
+            "22".repeat(16),
+            FleetDevice {
+                name: "backdoor".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[22u8; 32]),
+                principal: "owner".to_owned(),
+                role: Some("owner".to_owned()),
+                paired_at: "2026-11-24T10:05:00Z".to_owned(),
+                paired_on: "box-a".to_owned(),
+                updated_at: "2026-11-24T10:05:00Z".to_owned(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        let mut add_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": add_live.to_toml_string()}),
+        );
+        add_call.credential_expires = expires;
+        let err = node.call(add_call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+
+        // 2. Changing an existing live device's role/name through an expiring credential is refused.
+        let mut raise_role = initial.clone();
+        let entry = raise_role.devices.get_mut(&id_existing).unwrap();
+        entry.role = Some("owner".to_owned());
+        entry.updated_at = "2026-11-24T10:06:00Z".to_owned();
+        let mut change_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": raise_role.to_toml_string()}),
+        );
+        change_call.credential_expires = expires;
+        let err2 = node.call(change_call).await.unwrap_err();
+        assert_eq!(err2.code, ErrorCode::Denied, "{err2:?}");
+
+        // 3. Tombstoning an existing device through an expiring credential is allowed.
+        let mut revoke = DevicesFile::default();
+        revoke.removed.insert(
+            id_existing.clone(),
+            DeviceTombstone {
+                name: "pixel".to_owned(),
+                principal: "device:pixel".to_owned(),
+                paired_at: Some("2026-11-24T10:00:00Z".to_owned()),
+                paired_on: Some("box-a".to_owned()),
+                removed_at: "2026-11-24T10:07:00Z".to_owned(),
+                removed_on: "box-a".to_owned(),
+            },
+        );
+        let mut tomb_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": revoke.to_toml_string()}),
+        );
+        tomb_call.credential_expires = expires;
+        node.call(tomb_call).await.expect("tombstone should be allowed with expiring credential");
+
+        let saved: DevicesFile = parse(
+            &paths.config_file("devices.toml"),
+            &std::fs::read(paths.config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.devices.is_empty());
+        assert!(saved.removed.contains_key(&id_existing));
     }
 }

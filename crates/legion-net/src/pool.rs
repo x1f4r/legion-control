@@ -193,7 +193,7 @@ impl Fleet {
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
         let auth = authorize_principal_for_tool(node, here, principal, tool)?;
-        check_credential_minting_forward(here, tool, ctx.credential_expires())?;
+        check_credential_minting_forward(here, tool, args, ctx.credential_expires())?;
         let next_hops = ctx.hops().saturating_add(1);
         if next_hops > MAX_HOPS {
             return Err(ErrorBody::new(
@@ -506,8 +506,9 @@ impl Fleet {
         let tool = call.tool.clone();
         let args = call.args.clone();
         let principal = auth.principal().to_owned();
-        let result = match check_credential_minting_forward(&here, &tool, call.credential_expires)
-            .and_then(|()| {
+        let result =
+            match check_credential_minting_forward(&here, &tool, &args, call.credential_expires)
+                .and_then(|()| {
                 node.config()
                     .get::<FleetFile>()
                     .map_err(|err| ensure_machine(err, &here))
@@ -1402,20 +1403,37 @@ impl ForwardAuth {
     }
 }
 
-/// Tools that mint new credentials and enforce local expiry checks on [`Call::credential_expires`].
-/// Because the JSON-RPC wire format does not carry `credential_expires`, a forwarding node refuses
-/// to forward these tools whenever the caller arrived with an expiring credential.
-const CREDENTIAL_MINTING_TOOLS: &[&str] = &["device.invite", "token.add"];
+/// Tools that mint or escalate permanent credentials and enforce local expiry checks on
+/// [`Call::credential_expires`]. Because the JSON-RPC wire format does not carry
+/// `credential_expires`, a forwarding node refuses to forward these calls whenever the caller
+/// arrived with an expiring credential.
+fn is_credential_minting_forward(tool: &str, args: &Value) -> bool {
+    match tool {
+        "device.invite" | "token.add" | "device.set" => true,
+        "config.write" => match args.get("document").and_then(Value::as_str) {
+            Some("devices.toml" | "policy.toml") => true,
+            Some(_) => false,
+            None => true,
+        },
+        "fleet.sync" => match args.get("direction") {
+            None => false,
+            Some(Value::String(dir)) if dir == "status" => false,
+            Some(_) => true,
+        },
+        _ => false,
+    }
+}
 
 fn check_credential_minting_forward(
     here: &str,
     tool: &str,
+    args: &Value,
     credential_expires: Option<jiff::Timestamp>,
 ) -> Result<(), ErrorBody> {
     let Some(limit) = credential_expires else {
         return Ok(());
     };
-    if !CREDENTIAL_MINTING_TOOLS.contains(&tool) {
+    if !is_credential_minting_forward(tool, args) {
         return Ok(());
     }
     Err(ErrorBody::new(

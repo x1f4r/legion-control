@@ -2112,6 +2112,37 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
         assert_eq!(reply.json()["code"], json!("denied"));
         assert_eq!(reply.json()["machine"], json!("laptop"));
     }
+
+    // Forwarding device.set, config.write (devices.toml / policy.toml), and fleet.sync push/pull
+    // must also be refused by `laptop` when the caller arrived with an expiring credential.
+    for (tool, args) in [
+        ("device.set", json!({"name": "phone", "role": "owner", "allow_owner": true})),
+        ("device.set", json!({"name": "phone", "rename": "phone2"})),
+        ("config.write", json!({"document": "devices.toml", "content": ""})),
+        ("config.write", json!({"document": "policy.toml", "content": POLICY})),
+        ("fleet.sync", json!({"direction": "push", "documents": ["devices.toml"]})),
+        ("fleet.sync", json!({"direction": "pull", "from": "laptop", "documents": ["devices.toml"]})),
+    ] {
+        let reply = server.call(
+            &expiring_admin,
+            json!({"tool": tool, "on": "pi", "args": args}),
+        );
+        assert_eq!(reply.status, 403, "{tool} {args}: {}", reply.text());
+        assert_eq!(reply.json()["code"], json!("denied"), "{tool} {args}");
+        assert_eq!(reply.json()["machine"], json!("laptop"), "{tool} {args}");
+    }
+
+    // Read-only fleet.sync status and non-credential config.write (projects.toml) are not blocked.
+    let status_reply = server.call(
+        &expiring_admin,
+        json!({"tool": "fleet.sync", "on": "pi", "args": {"direction": "status"}}),
+    );
+    assert_eq!(status_reply.status, 200, "{}", status_reply.text());
+    let proj_reply = server.call(
+        &expiring_admin,
+        json!({"tool": "config.write", "on": "pi", "args": {"document": "projects.toml", "content": "[projects]\n"}}),
+    );
+    assert_eq!(proj_reply.status, 200, "{}", proj_reply.text());
     let pi_tokens = pi
         .state()
         .parent()

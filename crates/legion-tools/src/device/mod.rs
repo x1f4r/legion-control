@@ -662,6 +662,16 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
     }
 
     let caller = Caller::of(ctx)?;
+    if let Some(limit) = ctx.credential_expires() {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "The credential this call came with expires at {}, so it may not modify live paired devices.",
+                format_rfc3339(limit)
+            ),
+        )
+        .with_hint("Run `device.set` from a local shell or a non-expiring credential."));
+    }
     if let Some(ref new_role) = args.role {
         validate_role_name(new_role)?;
         if !caller.is_owner() {
@@ -670,16 +680,6 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                 "Only a caller with the owner role may change a paired device's role.",
             )
             .with_hint("Run `device.set` as the owner of this machine."));
-        }
-        if let Some(limit) = ctx.credential_expires() {
-            return Err(ErrorBody::new(
-                ErrorCode::Denied,
-                format!(
-                    "The credential this call came with expires at {}, so it may not change a paired device's role.",
-                    format_rfc3339(limit)
-                ),
-            )
-            .with_hint("Run `device.set` from a local shell or a non-expiring owner credential."));
         }
         if new_role == OWNER && !args.allow_owner {
             return Err(ErrorBody::new(
@@ -3457,5 +3457,48 @@ role = "owner"
                     .is_some_and(|d| d.contains("device:legacy"))),
             "expected meta.doctor warning for unmarked device:legacy: {doctor}"
         );
+    }
+
+    #[tokio::test]
+    async fn expiring_credential_is_refused_by_device_set_for_role_and_rename() {
+        let h = Harness::new();
+        std::fs::write(
+            h.node.paths().config_file("policy.toml"),
+            r#"
+default = "owner"
+
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.operator]
+allow = ["effect:read", "effect:write"]
+"#,
+        )
+        .unwrap();
+        let inv = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "tablet", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id = inv["id"].as_str().unwrap();
+        let key = generate_ephemeral_ed25519().unwrap();
+        let req = format!(
+            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{}\",\"name\":\"tablet\"}}\n",
+            key.public_key
+        );
+        assert!(run_enrol(&h.node, id, req.as_bytes()).await.is_ok());
+
+        let expires = Some(Timestamp::now() + SignedDuration::from_hours(1));
+        for args in [
+            json!({"name": "tablet", "role": "operator"}),
+            json!({"name": "tablet", "rename": "tablet-2"}),
+        ] {
+            let mut call = Call::new(Door::Http, "device.set", args.clone());
+            call.credential_expires = expires;
+            let err = h.node.call(call).await.unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{args}: {err:?}");
+        }
     }
 }

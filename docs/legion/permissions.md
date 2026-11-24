@@ -226,14 +226,22 @@ Creating, listing, updating, or removing invites and paired devices (`device.inv
 `device.list`, `device.set`, `device.remove`) requires `effect:admin` (`device.endpoint` is
 `effect:read` so paired controllers can discover fleet endpoints). Device management follows the
 same caller-scoping and `allow_owner` rules as `token.*`: creating a `device:<name>` principal or
-changing a device's role with `device.set` requires the `owner` role, refuses expiring credentials
-(both locally and across remote hops), and requires `allow_owner=true` to grant `owner`. Syncing
-`devices.toml` via `fleet.sync` or `config.write` always merges with the local file (tombstones
-always win and can never be dropped), restricts non-owner admins to devices pinned to their own
-principal without role changes, and reconciles `device:*` principals in `policy.toml` to the exact
-recorded role — never touching non-device principals and failing closed to `nobody` when a role is
-undefined on the receiving node or two live devices collide on one `device:*` principal with
-conflicting roles.
+changing a device's role with `device.set` requires the `owner` role and `allow_owner=true` to
+grant `owner`. Expiring credentials (such as expiring HTTP bearer tokens) cannot mint or modify
+permanent device access: locally, `device.invite`, `device.set`, and any `devices.toml` merge that
+adds or changes a live entry are refused (pure tombstones are still allowed locally so an expiring
+credential can revoke a device); across remote hops (`on`), forwarding `device.invite`,
+`token.add`, `device.set`, `config.write` for `devices.toml` or `policy.toml`, and `fleet.sync`
+`push`/`pull` is refused by the forwarding node because credential expiry is not carried over RPC.
+The registry owns only `device:*` principals it created for one pairing id — marked with
+`device = "<pairing id>"` in `policy.toml` — and refuses creating tokens, agents, or `--as`
+pairings on a registry-owned principal. Syncing `devices.toml` via `fleet.sync` or `config.write`
+always merges with the local file (tombstones always win and can never be dropped), restricts
+non-owner admins to devices pinned to their own principal without role changes, and reconciles only
+registry-owned `device:*` principals in `policy.toml` to the exact recorded role — leaving shared
+and unmarked `device:*` principals untouched (with a warning in the result and `meta.doctor`) and
+failing closed to `nobody` when a role is undefined on the receiving node or two live devices
+collide on one `device:*` principal.
 
 Removing a device with `legion device.remove` writes a tombstone to `devices.toml`, removes its
 unused `device:*` principal and `authorized_keys` line, immediately terminates any live gate
