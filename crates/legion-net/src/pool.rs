@@ -190,6 +190,7 @@ impl Fleet {
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
         let auth = authorize_principal_for_tool(node, here, principal, tool)?;
+        check_credential_minting_forward(here, tool, ctx.credential_expires())?;
         let next_hops = ctx.hops().saturating_add(1);
         if next_hops > MAX_HOPS {
             return Err(ErrorBody::new(
@@ -499,10 +500,12 @@ impl Fleet {
         let tool = call.tool.clone();
         let args = call.args.clone();
         let principal = auth.principal().to_owned();
-        let result = match node
-            .config()
-            .get::<FleetFile>()
-            .map_err(|err| ensure_machine(err, &here))
+        let result = match check_credential_minting_forward(&here, &tool, call.credential_expires)
+            .and_then(|()| {
+                node.config()
+                    .get::<FleetFile>()
+                    .map_err(|err| ensure_machine(err, &here))
+            })
             .and_then(|fleet_file| {
                 let (direct_machine, direct_entry, relayed) =
                     resolve_route(&fleet_file, machine, &here)?;
@@ -1301,6 +1304,35 @@ impl ForwardAuth {
             | ForwardAuth::NeedsRemoteEffect { principal, .. } => principal,
         }
     }
+}
+
+/// Tools that mint new credentials and enforce local expiry checks on [`Call::credential_expires`].
+/// Because the JSON-RPC wire format does not carry `credential_expires`, a forwarding node refuses
+/// to forward these tools whenever the caller arrived with an expiring credential.
+const CREDENTIAL_MINTING_TOOLS: &[&str] = &["device.invite", "token.add"];
+
+fn check_credential_minting_forward(
+    here: &str,
+    tool: &str,
+    credential_expires: Option<jiff::Timestamp>,
+) -> Result<(), ErrorBody> {
+    let Some(limit) = credential_expires else {
+        return Ok(());
+    };
+    if !CREDENTIAL_MINTING_TOOLS.contains(&tool) {
+        return Ok(());
+    }
+    Err(ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "The credential this call came with expires at {}, so {here} refuses to forward {tool} to another machine.",
+            limit.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ),
+    )
+    .with_hint(format!(
+        "Credential expiry is not carried across remote hops; run {tool} directly on the target machine or with a non-expiring credential."
+    ))
+    .with_machine(here))
 }
 
 fn authorize_for_forward(

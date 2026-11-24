@@ -120,6 +120,10 @@ fn main() -> ExitCode {
             leaving_an_mcp_session_call_cancels_it,
         ),
         ("mcp_takes_post_and_delete", mcp_takes_post_and_delete),
+        (
+            "expiring_token_cannot_forward_credential_minting_tools",
+            expiring_token_cannot_forward_credential_minting_tools,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -2019,4 +2023,124 @@ fn only_a_dropped_stream_cancels_its_call() {
     assert_eq!(events.status, 200);
     let block = events.next_block().expect("the quiet stream said nothing");
     assert!(block.starts_with(':'), "{block}");
+}
+
+fn expiring_token_cannot_forward_credential_minting_tools() {
+    let fixture = Fixture::new();
+    let pi = Home::new();
+    let pi_auth_keys = pi.home().join("pi_authorized_keys");
+    let pi_host_key = pi.home().join("ssh_host_ed25519_key.pub");
+    std::fs::write(
+        &pi_host_key,
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 root@pi\n",
+    )
+    .unwrap();
+    let auth_literal = format!(
+        "'{}'",
+        pi_auth_keys.display().to_string().replace('\'', "''")
+    );
+    let host_literal = format!(
+        "'{}'",
+        pi_host_key.display().to_string().replace('\'', "''")
+    );
+    pi.write_config(
+        "node.toml",
+        &format!(
+            "name = \"pi\"\n\n[devices]\nauthorized_keys = {auth_literal}\nhost_keys = [{host_literal}]\n"
+        ),
+    );
+    pi.write_config("policy.toml", POLICY);
+
+    let pi_home = pi.state().parent().unwrap().to_path_buf();
+    let helper = vec![
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        HELPER_FLAG.to_owned(),
+        "rpc".to_owned(),
+        pi_home.to_string_lossy().into_owned(),
+        pi.home().to_string_lossy().into_owned(),
+    ];
+    fixture.home.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n",
+            serde_json::to_string(&helper).unwrap()
+        ),
+    );
+
+    let expiring_admin = make_token(
+        &fixture.home,
+        &["temp-admin", "admin", "allow_owner=true", "expires_days=7"],
+    );
+    let server = Server::start(&fixture.home);
+
+    // Sanity check: ordinary tools forward cleanly with the expiring token.
+    let ver = server.call(&expiring_admin, json!({"tool": "meta.version", "on": "pi"}));
+    assert_eq!(ver.status, 200, "{}", ver.text());
+    assert_eq!(ver.json()["node"], json!("pi"));
+
+    // Forwarding device.invite to `pi` must be refused by `laptop` without touching `pi`.
+    let inv = server.call(
+        &expiring_admin,
+        json!({
+            "tool": "device.invite",
+            "on": "pi",
+            "args": {"principal": "phone", "host": "127.0.0.1", "user": "me"}
+        }),
+    );
+    assert_eq!(inv.status, 403, "{}", inv.text());
+    assert_eq!(inv.json()["code"], json!("denied"));
+    assert_eq!(inv.json()["machine"], json!("laptop"));
+    assert!(!pi_auth_keys.exists());
+
+    // Forwarding token.add to `pi` (both non-expiring and short-lived) must be refused by `laptop`.
+    for args in [
+        json!({"name": "forever", "principal": "phone"}),
+        json!({"name": "short", "principal": "phone", "expires_days": 1}),
+    ] {
+        let reply = server.call(
+            &expiring_admin,
+            json!({"tool": "token.add", "on": "pi", "args": args}),
+        );
+        assert_eq!(reply.status, 403, "{}", reply.text());
+        assert_eq!(reply.json()["code"], json!("denied"));
+        assert_eq!(reply.json()["machine"], json!("laptop"));
+    }
+    let pi_tokens = pi
+        .state()
+        .parent()
+        .unwrap()
+        .join("config")
+        .join("tokens.toml");
+    assert!(!pi_tokens.exists());
+
+    // Fan-out across local + remote refuses the remote leg while still allowing the local shorter token.
+    let fan = server.call(
+        &expiring_admin,
+        json!({
+            "tool": "token.add",
+            "on": ["laptop", "pi"],
+            "args": {"name": "fan-short", "principal": "phone", "expires_days": 1}
+        }),
+    );
+    assert_eq!(fan.status, 200, "{}", fan.text());
+    let results = &fan.json()["results"];
+    assert_eq!(results["laptop"]["ok"]["name"], json!("fan-short"));
+    assert_eq!(results["pi"]["error"]["code"], json!("denied"));
+    assert_eq!(results["pi"]["error"]["machine"], json!("laptop"));
+    assert!(!pi_tokens.exists());
+
+    // A non-expiring admin token can still forward token.add to `pi`.
+    let allowed = server.call(
+        &fixture.admin,
+        json!({
+            "tool": "token.add",
+            "on": "pi",
+            "args": {"name": "remote-phone", "principal": "phone"}
+        }),
+    );
+    assert_eq!(allowed.status, 200, "{}", allowed.text());
+    assert_eq!(allowed.json()["name"], json!("remote-phone"));
 }
