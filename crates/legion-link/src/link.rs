@@ -29,6 +29,22 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// to a relay without retrying direct SSH auth on every call).
 pub const DEFAULT_UNSYNCED_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
+/// Maximum number of configured nodes (paired plus learned) and machines accepted from a single
+/// `device.endpoint` answer.
+pub const MAX_CONFIGURED_NODES: usize = 64;
+
+/// Maximum number of candidate hosts accepted per learned machine.
+pub const MAX_ENDPOINT_HOSTS: usize = 8;
+
+/// Maximum number of pinned host keys accepted per learned machine.
+pub const MAX_ENDPOINT_HOST_KEYS: usize = 8;
+
+/// Maximum byte length of a learned `node`, `user`, or `host` field.
+pub const MAX_ENDPOINT_FIELD_LEN: usize = 255;
+
+/// Maximum byte length of a single learned OpenSSH host key line.
+pub const MAX_ENDPOINT_HOST_KEY_LEN: usize = 4096;
+
 /// How a routed [`Link::call_machine`] call reached its target machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -270,6 +286,11 @@ pub struct LinkOptions {
     /// How long to remember a learned node whose direct auth failed with
     /// `device_removed_or_unknown` before trying direct SSH again.
     pub unsynced_backoff: Duration,
+    /// Whether `learn` accepts loopback hosts (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`).
+    ///
+    /// Defaults to `false` so a remote node cannot redirect a controller to a local service;
+    /// intended only for tests and debug-only loopback harnesses.
+    pub allow_loopback_endpoints: bool,
 }
 
 impl Default for LinkOptions {
@@ -278,6 +299,7 @@ impl Default for LinkOptions {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             ssh_timeouts: SshTimeouts::default(),
             unsynced_backoff: DEFAULT_UNSYNCED_BACKOFF,
+            allow_loopback_endpoints: false,
         }
     }
 }
@@ -732,7 +754,7 @@ impl Link {
             ..LearnReport::default()
         };
 
-        let entries: Vec<(String, Value)> =
+        let mut entries: Vec<(String, Value)> =
             if let Some(results) = value.get("results").and_then(Value::as_object) {
                 results
                     .iter()
@@ -743,9 +765,15 @@ impl Link {
             } else {
                 return report;
             };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let allow_loopback = self.inner.options.allow_loopback_endpoints;
         let mut validated: Vec<(String, SshTarget)> = Vec::new();
-        for (machine_key, item) in entries {
+        for (idx, (machine_key, item)) in entries.into_iter().enumerate() {
+            if idx >= MAX_CONFIGURED_NODES {
+                report.rejected.push(machine_key);
+                continue;
+            }
             if item.get("error").is_some() {
                 report.unreachable.push(machine_key);
                 continue;
@@ -754,7 +782,7 @@ impl Link {
                 report.rejected.push(machine_key);
                 continue;
             };
-            match parse_and_validate_endpoint(&machine_key, ok_val) {
+            match parse_and_validate_endpoint(&machine_key, ok_val, allow_loopback) {
                 Ok(target) => validated.push((machine_key, target)),
                 Err(()) => report.rejected.push(machine_key),
             }
@@ -829,6 +857,10 @@ impl Link {
                     report.updated.push(machine);
                 }
             } else {
+                if cfg.nodes.len() >= MAX_CONFIGURED_NODES {
+                    report.rejected.push(machine);
+                    continue;
+                }
                 cfg.nodes.push(NodeLink::learned(
                     machine.clone(),
                     new_target,
@@ -2247,23 +2279,39 @@ struct EndpointAnswer {
     host_keys: Vec<String>,
 }
 
-fn parse_and_validate_endpoint(expected_machine: &str, value: &Value) -> Result<SshTarget, ()> {
+fn parse_and_validate_endpoint(
+    expected_machine: &str,
+    value: &Value,
+    allow_loopback: bool,
+) -> Result<SshTarget, ()> {
     let ep: EndpointAnswer = serde_json::from_value(value.clone()).map_err(|_| ())?;
     if ep.node != expected_machine {
         return Err(());
     }
+    if ep.node.len() > MAX_ENDPOINT_FIELD_LEN || ep.user.len() > MAX_ENDPOINT_FIELD_LEN {
+        return Err(());
+    }
     crate::invite::validate_token_field("node", &ep.node).map_err(|_| ())?;
     crate::invite::validate_token_field("user", &ep.user).map_err(|_| ())?;
-    if ep.port == 0 || ep.hosts.is_empty() || ep.hosts.len() > 32 {
+    if ep.port == 0 || ep.hosts.is_empty() || ep.hosts.len() > MAX_ENDPOINT_HOSTS {
         return Err(());
     }
     for host in &ep.hosts {
+        if host.len() > MAX_ENDPOINT_FIELD_LEN {
+            return Err(());
+        }
         crate::invite::validate_token_field("hosts", host).map_err(|_| ())?;
+        if !is_allowed_endpoint_host(host, allow_loopback) {
+            return Err(());
+        }
     }
-    if ep.host_keys.is_empty() || ep.host_keys.len() > 32 {
+    if ep.host_keys.is_empty() || ep.host_keys.len() > MAX_ENDPOINT_HOST_KEYS {
         return Err(());
     }
     for (idx, line) in ep.host_keys.iter().enumerate() {
+        if line.len() > MAX_ENDPOINT_HOST_KEY_LEN {
+            return Err(());
+        }
         crate::invite::validate_openssh_public_key_line(idx, line).map_err(|_| ())?;
     }
     Ok(SshTarget {
@@ -2272,6 +2320,56 @@ fn parse_and_validate_endpoint(expected_machine: &str, value: &Value) -> Result<
         user: ep.user,
         host_keys: ep.host_keys,
     })
+}
+
+fn is_allowed_ipv4(ip: std::net::Ipv4Addr, allow_loopback: bool) -> bool {
+    if ip.is_unspecified() || ip.is_link_local() || ip.is_multicast() || ip.is_broadcast() {
+        return false;
+    }
+    if ip.is_loopback() && !allow_loopback {
+        return false;
+    }
+    true
+}
+
+fn is_allowed_endpoint_host(raw: &str, allow_loopback: bool) -> bool {
+    let stripped = raw
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw);
+    // Scoped IPv6 literals (e.g. `fe80::1%eth0`) are link-local and rejected.
+    if let Some((addr_part, _zone)) = stripped.split_once('%') {
+        if addr_part.parse::<std::net::Ipv6Addr>().is_ok() {
+            return false;
+        }
+        return false;
+    }
+    if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_allowed_ipv4(v4, allow_loopback),
+            std::net::IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return is_allowed_ipv4(v4, allow_loopback);
+                }
+                let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+                if v6.is_unspecified() || is_link_local || v6.is_multicast() {
+                    return false;
+                }
+                if v6.is_loopback() && !allow_loopback {
+                    return false;
+                }
+                true
+            }
+        };
+    }
+    let lowered = stripped.trim_end_matches('.').to_ascii_lowercase();
+    if lowered.is_empty() {
+        return false;
+    }
+    if !allow_loopback && (lowered == "localhost" || lowered.ends_with(".localhost")) {
+        return false;
+    }
+    true
 }
 
 /// Canonicalizes a list of OpenSSH public key lines to a sorted set of `"<algo> <base64>"` pairs
@@ -4544,5 +4642,233 @@ mod tests {
         assert!(report.added.is_empty());
         assert!(link.config().node("spoof").is_none());
         link.close().await;
+    }
+
+    #[tokio::test]
+    async fn learn_bounds_counts_string_lengths_and_rejects_disallowed_addresses() {
+        let key_tower = test_host_key(30);
+        let payload = Arc::new(Mutex::new(Value::Null));
+        let payload_c = Arc::clone(&payload);
+
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let payload_c = Arc::clone(&payload_c);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let resp = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        } else if req.method == method::CALL {
+                            let body = payload_c.lock().unwrap().clone();
+                            let resp = Response::ok(req.id, body);
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        }
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let bad_hosts = [
+            ("h_localhost", "localhost"),
+            ("h_sub_localhost", "foo.localhost"),
+            ("h_sub_dot", "foo.localhost."),
+            ("h_v4_loop", "127.0.0.1"),
+            ("h_v4_loop_hi", "127.0.0.42"),
+            ("h_v6_loop", "::1"),
+            ("h_v4_mapped_loop", "::ffff:127.0.0.1"),
+            ("h_unspec4", "0.0.0.0"),
+            ("h_unspec6", "::"),
+            ("h_ll4", "169.254.1.1"),
+            ("h_ll6", "fe80::1"),
+            ("h_mcast4", "224.0.0.1"),
+            ("h_mcast6", "ff02::1"),
+            ("h_bcast", "255.255.255.255"),
+        ];
+
+        let mut results = serde_json::Map::new();
+        for (idx, (name, host)) in bad_hosts.iter().enumerate() {
+            results.insert(
+                (*name).to_owned(),
+                json!({
+                    "ok": {
+                        "node": name,
+                        "hosts": [host],
+                        "port": 22,
+                        "user": "me",
+                        "host_keys": [test_host_key(40 + idx as u8)],
+                    }
+                }),
+            );
+        }
+        // Too many hosts (9 > 8), too many keys (9 > 8), port 0, and good host.
+        results.insert(
+            "too_many_hosts".to_owned(),
+            json!({
+                "ok": {
+                    "node": "too_many_hosts",
+                    "hosts": (0..9).map(|i| format!("h{i}.example.net")).collect::<Vec<_>>(),
+                    "port": 22,
+                    "user": "me",
+                    "host_keys": [test_host_key(80)],
+                }
+            }),
+        );
+        results.insert(
+            "too_many_keys".to_owned(),
+            json!({
+                "ok": {
+                    "node": "too_many_keys",
+                    "hosts": ["keys.example.net"],
+                    "port": 22,
+                    "user": "me",
+                    "host_keys": (0..9).map(|i| test_host_key(90 + i)).collect::<Vec<_>>(),
+                }
+            }),
+        );
+        results.insert(
+            "port_zero".to_owned(),
+            json!({
+                "ok": {
+                    "node": "port_zero",
+                    "hosts": ["zero.example.net"],
+                    "port": 0,
+                    "user": "me",
+                    "host_keys": [test_host_key(105)],
+                }
+            }),
+        );
+        results.insert(
+            "good_peer".to_owned(),
+            json!({
+                "ok": {
+                    "node": "good_peer",
+                    "hosts": ["good.example.net", "10.0.2.2"],
+                    "port": 22,
+                    "user": "me",
+                    "host_keys": [test_host_key(106)],
+                }
+            }),
+        );
+        *payload.lock().unwrap() = json!({ "results": results });
+
+        let cfg = LinkConfig {
+            device_key: Some("dummy".to_owned()),
+            nodes: vec![NodeLink::ssh(
+                "tower",
+                SshTarget {
+                    hosts: vec!["tower.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![key_tower.clone()],
+                },
+                Some("device:pixel".to_owned()),
+            )],
+        };
+        let link = Link::with_opener(cfg.clone(), LinkOptions::default(), Arc::clone(&opener));
+        let report = link.learn().await.unwrap();
+        assert_eq!(report.added, vec!["good_peer".to_owned()]);
+        for (name, _) in &bad_hosts {
+            assert!(
+                report.rejected.contains(&(*name).to_owned()),
+                "expected {name} to be rejected by default"
+            );
+        }
+        assert!(report.rejected.contains(&"too_many_hosts".to_owned()));
+        assert!(report.rejected.contains(&"too_many_keys".to_owned()));
+        assert!(report.rejected.contains(&"port_zero".to_owned()));
+        link.close().await;
+
+        // With allow_loopback_endpoints: true, loopback hosts are accepted while unspecified,
+        // link-local, multicast, broadcast, and port 0 remain rejected.
+        let link_loop = Link::with_opener(
+            cfg.clone(),
+            LinkOptions {
+                allow_loopback_endpoints: true,
+                ..LinkOptions::default()
+            },
+            Arc::clone(&opener),
+        );
+        let report_loop = link_loop.learn().await.unwrap();
+        assert!(report_loop.added.contains(&"h_v4_loop".to_owned()));
+        assert!(report_loop.added.contains(&"h_v6_loop".to_owned()));
+        assert!(report_loop.added.contains(&"h_localhost".to_owned()));
+        assert!(report_loop.rejected.contains(&"h_unspec4".to_owned()));
+        assert!(report_loop.rejected.contains(&"h_ll6".to_owned()));
+        assert!(report_loop.rejected.contains(&"h_mcast4".to_owned()));
+        assert!(report_loop.rejected.contains(&"h_bcast".to_owned()));
+        assert!(report_loop.rejected.contains(&"port_zero".to_owned()));
+        link_loop.close().await;
+
+        // Cap machines per answer & total configured nodes at 64.
+        let mut flood = serde_json::Map::new();
+        for i in 0..70u8 {
+            let name = format!("peer-{i:02}");
+            flood.insert(
+                name.clone(),
+                json!({
+                    "ok": {
+                        "node": name,
+                        "hosts": [format!("p{i}.example.net")],
+                        "port": 22,
+                        "user": "me",
+                        "host_keys": [test_host_key(120 + i)],
+                    }
+                }),
+            );
+        }
+        *payload.lock().unwrap() = json!({ "results": flood });
+        let link_cap = Link::with_opener(cfg, LinkOptions::default(), opener);
+        let report_cap = link_cap.learn().await.unwrap();
+        assert!(
+            link_cap.config().nodes.len() <= 64,
+            "total configured nodes must be capped at 64, got {}",
+            link_cap.config().nodes.len()
+        );
+        assert!(
+            !report_cap.rejected.is_empty(),
+            "excess machines beyond cap must be rejected"
+        );
+        link_cap.close().await;
     }
 }

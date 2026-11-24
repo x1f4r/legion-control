@@ -338,8 +338,9 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
         return;
     }
     let Some(legion_bin) = find_legion_bin() else {
-        eprintln!("skipping two-sshd fleet test: built `legion` binary not found");
-        return;
+        panic!(
+            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
+        );
     };
 
     let root = strict_tempdir();
@@ -442,6 +443,7 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
         LinkConfig::default(),
         LinkOptions {
             unsynced_backoff: Duration::from_secs(60),
+            allow_loopback_endpoints: true,
             ..LinkOptions::default()
         },
     );
@@ -539,7 +541,13 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
         &user_a,
         &["device.invite", "principal=phone"],
     );
-    let shared_link = Link::new(LinkConfig::default());
+    let shared_link = Link::with_options(
+        LinkConfig::default(),
+        LinkOptions {
+            allow_loopback_endpoints: true,
+            ..LinkOptions::default()
+        },
+    );
     shared_link
         .pair(invite_shared["invite"].as_str().unwrap(), "tablet")
         .await
