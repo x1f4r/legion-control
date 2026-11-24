@@ -148,8 +148,10 @@ impl LinkConfig {
     }
 
     /// Forgets `node`, records it in [`LinkConfig::forgotten_nodes`] so `learn` will not re-add it
-    /// automatically, and drops any learned entries whose `learned_from` was `node` (without
-    /// marking those dependents forgotten so another paired introducer may re-learn them).
+    /// automatically, drops any learned entries whose `learned_from` was `node` (without marking
+    /// those dependents forgotten so another paired introducer may re-learn them), and strips any
+    /// pending identity changes or conflicts that `node` reported on remaining paired or learned
+    /// entries (promoting a remaining conflict from another introducer or clearing the change).
     ///
     /// Returns every node name removed from [`LinkConfig::nodes`] (`node` first when present, then
     /// any dropped learned dependents).
@@ -169,6 +171,24 @@ impl LinkConfig {
                 !(n.origin == NodeOrigin::Learned && n.learned_from.as_deref() == Some(node))
             });
             removed.extend(dependents);
+        }
+        for entry in &mut self.nodes {
+            let Some(mut pending) = entry.identity_changed.take() else {
+                continue;
+            };
+            pending.conflicts.retain(|c| c.reported_by != node);
+            if pending.reported_by == node {
+                if !pending.conflicts.is_empty() {
+                    let promoted = pending.conflicts.remove(0);
+                    entry.identity_changed = Some(PendingIdentityChange {
+                        target: promoted.target,
+                        reported_by: promoted.reported_by,
+                        conflicts: pending.conflicts,
+                    });
+                }
+            } else {
+                entry.identity_changed = Some(pending);
+            }
         }
         if !node.is_empty() && !self.forgotten_nodes.iter().any(|n| n == node) {
             self.forgotten_nodes.push(node.to_owned());
@@ -800,6 +820,16 @@ impl Link {
             self.clear_route_state(node);
             self.evict(node).await;
         }
+        self.inner
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, status| {
+                !matches!(
+                    status,
+                    MachineRouteStatus::IdentityChanged { reported_by } if reported_by == node
+                )
+            });
         removed_self
     }
 
@@ -6065,5 +6095,119 @@ mod tests {
                 "expected legitimate host {host:?} to be allowed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn forget_clears_or_promotes_pending_identity_changes_and_conflicts_reported_by_node() {
+        let key_a = test_host_key(101);
+        let key_b = test_host_key(102);
+        let key_c = test_host_key(103);
+        let key_c_new = test_host_key(104);
+        let key_d = test_host_key(105);
+        let key_d_b = test_host_key(106);
+        let key_d_e = test_host_key(107);
+        let key_e = test_host_key(108);
+        let key_f = test_host_key(109);
+        let key_f_e = test_host_key(110);
+        let key_f_b = test_host_key(111);
+
+        let target_for = |host: &str, key: &str| SshTarget {
+            hosts: vec![host.to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![key.to_owned()],
+        };
+
+        let mut node_a = NodeLink::ssh("a", target_for("a.example.net", &key_a), None);
+        node_a.identity_changed = Some(PendingIdentityChange {
+            target: target_for("a-evil.example.net", &key_c_new),
+            reported_by: "b".to_owned(),
+            conflicts: Vec::new(),
+        });
+
+        let node_b = NodeLink::ssh("b", target_for("b.example.net", &key_b), None);
+        let node_e = NodeLink::ssh("e", target_for("e.example.net", &key_e), None);
+
+        let mut node_c = NodeLink::learned("c", target_for("c.example.net", &key_c), None, "a");
+        node_c.identity_changed = Some(PendingIdentityChange {
+            target: target_for("c-new.example.net", &key_c_new),
+            reported_by: "b".to_owned(),
+            conflicts: Vec::new(),
+        });
+
+        let mut node_d = NodeLink::learned("d", target_for("d.example.net", &key_d), None, "a");
+        node_d.identity_changed = Some(PendingIdentityChange {
+            target: target_for("d-from-b.example.net", &key_d_b),
+            reported_by: "b".to_owned(),
+            conflicts: vec![ConflictingIdentityReport {
+                target: target_for("d-from-e.example.net", &key_d_e),
+                reported_by: "e".to_owned(),
+            }],
+        });
+
+        let mut node_f = NodeLink::learned("f", target_for("f.example.net", &key_f), None, "a");
+        node_f.identity_changed = Some(PendingIdentityChange {
+            target: target_for("f-from-e.example.net", &key_f_e),
+            reported_by: "e".to_owned(),
+            conflicts: vec![ConflictingIdentityReport {
+                target: target_for("f-from-b.example.net", &key_f_b),
+                reported_by: "b".to_owned(),
+            }],
+        });
+
+        let link = Link::new(LinkConfig {
+            device_key: None,
+            nodes: vec![node_a, node_b, node_e, node_c, node_d, node_f],
+            forgotten_nodes: Vec::new(),
+        });
+
+        link.forget("b").await;
+        let cfg = link.config();
+
+        // 1. Single-reporter pending changes on both paired (`a`) and learned (`c`) are cleared.
+        assert!(
+            cfg.node("a").unwrap().identity_changed.is_none(),
+            "forgetting b must clear informational warning b reported on paired node a"
+        );
+        assert!(
+            cfg.node("c").unwrap().identity_changed.is_none(),
+            "forgetting b must clear pending identity change b reported on learned node c"
+        );
+        let fp_c_new = public_key_fingerprint(&key_c_new).unwrap();
+        let err = link
+            .accept_identity_change("c", std::slice::from_ref(&fp_c_new))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+
+        // 2. When b was primary reporter on `d` and `e` was a conflict, `e` is promoted cleanly.
+        let d_pending = cfg
+            .node("d")
+            .unwrap()
+            .identity_changed
+            .as_ref()
+            .expect("e's remaining report on d should be promoted");
+        assert_eq!(d_pending.reported_by, "e");
+        assert_eq!(d_pending.target.hosts, vec!["d-from-e.example.net"]);
+        assert!(d_pending.conflicts.is_empty());
+
+        // 3. When b was in `conflicts` on `f`, b's conflict is removed leaving `e` clean.
+        let f_pending = cfg
+            .node("f")
+            .unwrap()
+            .identity_changed
+            .as_ref()
+            .expect("e's primary report on f should stay");
+        assert_eq!(f_pending.reported_by, "e");
+        assert!(f_pending.conflicts.is_empty());
+
+        // 4. Route status for `c` no longer reports IdentityChanged from `b`.
+        let routes = link.route_status();
+        assert_eq!(routes.get("c"), Some(&MachineRouteStatus::Direct));
+        assert_eq!(
+            routes.get("d"),
+            Some(&MachineRouteStatus::IdentityChanged {
+                reported_by: "e".to_owned()
+            })
+        );
     }
 }
