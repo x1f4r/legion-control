@@ -26,7 +26,7 @@ pub use node::{CANCEL_GRACE, Call, Node, VERSION};
 pub use paths::Paths;
 pub use policy::{Access, CreateKind, Grant, Place, Policy, ProtectedFilter, SECRET_LOCATIONS};
 pub use registry::{DocumentInfo, Registry, SourceCheck, ToolSource, is_tool_name};
-pub use route::{Local, RouteOutcome, Router};
+pub use route::{Local, MachineEffects, RouteOutcome, Router};
 pub use tool::{BoxFuture, Handler, NoArgs, Tool, ToolError, input_schema, parse_args};
 
 /// The wire types, so a tool family needs only this crate.
