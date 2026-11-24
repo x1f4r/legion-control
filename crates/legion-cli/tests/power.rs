@@ -454,6 +454,19 @@ fn wake_asks_the_first_helper_that_answers_and_waits_for_the_machine() {
     assert!(shed.actions().is_empty());
     assert!(laptop.datagrams().is_empty());
 
+    // A dry run picks the same sender and says where its packets would go, sending none.
+    let dry = laptop
+        .legion(
+            &laptop_machine,
+            &["power.wake", "machine=tower", "dry_run=true"],
+        )
+        .json();
+    assert_eq!(dry["sent_by"], json!("pi"), "{dry}");
+    assert_eq!(dry["packets"], json!(0));
+    assert_eq!(dry["dry_run"], json!(true));
+    assert_eq!(dry["would_send"]["mac"], json!("02:00:00:00:00:02"));
+    assert_eq!(pi.datagrams().len(), sent.len());
+
     // A helper takes the address from its own fleet.toml, never from the call.
     let forged = laptop.legion(
         &laptop_machine,
@@ -541,6 +554,30 @@ fn switch_confirms_a_new_boot_in_the_expected_system() {
             linux.command(&tower, "linux"),
             windows.command(&tower, "windows"),
         ),
+    );
+
+    // A dry run asks the machine for its own dry run, and nothing is armed or restarted.
+    let dry = laptop.legion(
+        &laptop_machine,
+        &[
+            "power.switch",
+            "machine=tower",
+            "into=windows",
+            "dry_run=true",
+        ],
+    );
+    assert_eq!(dry.code, 0, "{}\n{}", dry.stdout, dry.stderr);
+    let dry = dry.json();
+    assert_eq!(dry["dry_run"], json!(true), "{dry}");
+    assert_eq!(dry["restarted"], json!(false));
+    assert_eq!(dry["from_system"], json!("linux"));
+    assert_eq!(dry["would_run"]["commands"][0], json!(["arm-windows"]));
+    assert!(linux.power_actions().is_empty());
+    assert!(
+        !linux
+            .actions()
+            .iter()
+            .any(|action| action["argv"] == json!(["arm-windows"]))
     );
 
     // It restarts, the link drops, and windows answers with a new boot id.

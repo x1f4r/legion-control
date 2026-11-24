@@ -62,14 +62,14 @@ pub fn register_with(registry: &mut Registry, fleet: Fleet, actuator: Arc<dyn Ac
     registry.add(PowerTool::new(
         "power.wake",
         Effect::Power,
-        "Wake a machine from fleet.toml. If it already answers, nothing is sent and `awake` is true. Otherwise each machine in its `wake_via` list is tried in order, but only one that answers right now: a helper that does not answer is skipped and never woken itself. The first that answers is asked to run power.wol for the machine, using the hardware address in the helper's own fleet.toml; with no wake_via, this machine sends the packet itself. `sent_by` names who sent it. With `wait_s` (0 to 300, default 0) the call then waits for the machine itself to answer, and `awake` is true only once it has. A packet sent is not a machine awake.",
+        "Wake a machine from fleet.toml. If it already answers, nothing is sent and `awake` is true. Otherwise each machine in its `wake_via` list is tried in order, but only one that answers right now: a helper that does not answer is skipped and never woken itself. The first that answers is asked to run power.wol for the machine, using the hardware address in the helper's own fleet.toml; with no wake_via, this machine sends the packet itself. `sent_by` names who sent it. With `wait_s` (0 to 300, default 0) the call then waits for the machine itself to answer, and `awake` is true only once it has. A packet sent is not a machine awake. `dry_run: true` chooses the sender the same way and returns where its packets would go (`would_send`) without sending any.",
         hands.clone(),
         |hands, ctx, args: WakeArgs| Box::pin(power_wake(hands, ctx, args)),
     ));
     registry.add(PowerTool::new(
         "power.switch",
         Effect::Power,
-        "Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, and `force`; the machine's own busy gate applies, and a `busy` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. Call it from a machine other than the one being restarted.",
+        "Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, and `force`; the machine's own busy gate applies, and a `busy` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. `dry_run: true` returns the machine's own power.restart dry run (`would_run`, with the exact commands) and restarts nothing. Call it from a machine other than the one being restarted.",
         hands,
         |hands, ctx, args: SwitchArgs| Box::pin(power_switch(hands, ctx, args)),
     ));
@@ -171,6 +171,10 @@ struct WakeArgs {
     #[serde(default)]
     #[schemars(range(min = 0, max = 300))]
     wait_s: u32,
+    /// Choose the sender as a real call would, and return where its packets would go without
+    /// sending any.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 /// What `power.wake` returns.
@@ -189,6 +193,12 @@ struct WakeResult {
     /// Helpers passed over before one sent the packet, and why.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skipped: Vec<Skipped>,
+    /// On a dry run, the sender's power.wol dry run: the address and where the packets would go.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_send: Option<Value>,
+    /// Whether this was a dry run.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dry_run: bool,
 }
 
 /// A wake helper that did not send the packet, and why.
@@ -219,6 +229,8 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
         awake: true,
         waited_s: 0.0,
         skipped: Vec::new(),
+        would_send: None,
+        dry_run: args.dry_run,
     };
     if machine == here {
         return Ok(awake_already(None));
@@ -231,11 +243,12 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
         return Ok(awake_already(None));
     }
 
+    let dry_run = args.dry_run;
     let mut skipped: Vec<Skipped> = Vec::new();
-    let mut sent: Option<(String, u64)> = None;
+    let mut sent: Option<(String, Value)> = None;
     if entry.wake_via.is_empty() {
-        let packets = send_here(hands, ctx, &machine).await?;
-        sent = Some((here.clone(), packets));
+        let reply = send_here(hands, ctx, &machine, dry_run).await?;
+        sent = Some((here.clone(), reply));
     }
     for helper in &entry.wake_via {
         if sent.is_some() {
@@ -245,8 +258,8 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
             return Err(cancelled("power.wake"));
         }
         if *helper == here {
-            match send_here(hands, ctx, &machine).await {
-                Ok(packets) => sent = Some((here.clone(), packets)),
+            match send_here(hands, ctx, &machine, dry_run).await {
+                Ok(reply) => sent = Some((here.clone(), reply)),
                 Err(error) => skipped.push(Skipped {
                     helper: helper.clone(),
                     reason: error.message,
@@ -289,15 +302,12 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
                 ctx,
                 helper,
                 "power.wol",
-                json!({"machine": machine}),
+                json!({"machine": machine, "dry_run": dry_run}),
                 EventSink::discard(),
             )
             .await
         {
-            Ok(reply) => {
-                let packets = reply.get("packets").and_then(Value::as_u64).unwrap_or(0);
-                sent = Some((helper.clone(), packets));
-            }
+            Ok(reply) => sent = Some((helper.clone(), reply)),
             Err(error) => skipped.push(Skipped {
                 helper: helper.clone(),
                 reason: format!("its power.wol failed: {}", error.message),
@@ -305,13 +315,14 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
             }),
         }
     }
-    let Some((sent_by, packets)) = sent else {
+    let Some((sent_by, reply)) = sent else {
         return Err(no_helper(&machine, &skipped));
     };
+    let packets = reply.get("packets").and_then(Value::as_u64).unwrap_or(0);
 
     let started = Instant::now();
     let mut awake = false;
-    if args.wait_s > 0 {
+    if args.wait_s > 0 && !dry_run {
         let deadline = started + Duration::from_secs(u64::from(args.wait_s));
         while !awake {
             pause(
@@ -333,21 +344,33 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
         awake,
         waited_s: seconds(started.elapsed()),
         skipped,
+        would_send: dry_run.then_some(reply),
+        dry_run,
     })
 }
 
-async fn send_here(hands: &Hands, ctx: &Ctx, machine: &str) -> Result<u64, ErrorBody> {
-    let platform = Platform::of(ctx.os())?;
-    let mac = mac_of(ctx, machine)?;
-    let sent = wol::send(
-        hands.actuator.as_ref(),
-        ctx.cancel_token(),
-        platform,
-        &mac,
-        false,
+/// Sends the packets from this machine, answering as power.wol would.
+async fn send_here(
+    hands: &Hands,
+    ctx: &Ctx,
+    machine: &str,
+    dry_run: bool,
+) -> Result<Value, ErrorBody> {
+    let reply = power_wol(
+        hands,
+        ctx,
+        WolArgs {
+            machine: machine.to_owned(),
+            dry_run,
+        },
     )
     .await?;
-    Ok(u64::try_from(sent.packets).unwrap_or(u64::MAX))
+    serde_json::to_value(reply).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("power.wol's reply cannot be written as JSON: {error}."),
+        )
+    })
 }
 
 fn no_helper(machine: &str, skipped: &[Skipped]) -> ErrorBody {
@@ -407,6 +430,9 @@ struct SwitchArgs {
     /// Restart even while the machine is busy or unmonitored.
     #[serde(default)]
     force: bool,
+    /// Ask the machine for its power.restart dry run: the exact commands it would run, run nowhere.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 /// What `power.switch` returns.
@@ -424,6 +450,12 @@ struct SwitchResult {
     restarted: bool,
     /// Seconds spent waiting for it.
     waited_s: f64,
+    /// On a dry run, the machine's power.restart dry run, with the commands it would run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_run: Option<Value>,
+    /// Whether this was a dry run.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dry_run: bool,
 }
 
 /// What one look at a machine saw.
@@ -485,10 +517,20 @@ async fn power_switch(
         .with_machine(&machine));
     };
 
-    let mut restart = json!({"force": args.force});
+    let mut restart = json!({"force": args.force, "dry_run": args.dry_run});
     if let Some(into) = &args.into {
         restart["into"] = json!(into);
     }
+    let started = Instant::now();
+    let result = |system: Option<String>, restarted| SwitchResult {
+        machine: machine.clone(),
+        from_system: before.system.clone(),
+        system,
+        restarted,
+        waited_s: seconds(started.elapsed()),
+        would_run: None,
+        dry_run: false,
+    };
     match hands
         .fleet
         .call_remote(
@@ -500,20 +542,18 @@ async fn power_switch(
         )
         .await
     {
+        Ok(reply) if args.dry_run => {
+            return Ok(SwitchResult {
+                would_run: Some(reply),
+                dry_run: true,
+                ..result(None, false)
+            });
+        }
         Ok(_) => {}
         // The link went while the reply was on its way: only the boot id can say what happened.
-        Err(error) if error.code == ErrorCode::Unreachable => {}
+        Err(error) if error.code == ErrorCode::Unreachable && !args.dry_run => {}
         Err(error) => return Err(error),
     }
-
-    let started = Instant::now();
-    let result = |system: Option<String>, restarted| SwitchResult {
-        machine: machine.clone(),
-        from_system: before.system.clone(),
-        system,
-        restarted,
-        waited_s: seconds(started.elapsed()),
-    };
     if wait_s == 0 {
         return Ok(result(None, false));
     }
