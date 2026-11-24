@@ -921,18 +921,26 @@ pub fn read_auth_keys(path: &Path) -> Result<AuthKeysFile, ErrorBody> {
     }
 }
 
-/// Writes `bytes` atomically to `write_path`, ensuring Unix directory/file modes (`0o700` /
-/// `0o600`) and Windows `administrators_authorized_keys` ACLs.
+/// Writes `bytes` atomically to `write_path`, ensuring safe Unix directory/file modes and
+/// Windows `administrators_authorized_keys` ACLs and ownership.
+///
+/// On Unix:
+/// - Only creates or tightens `~/.ssh` itself (`0o700`), never `chmod`ing the directory of a
+///   symlink target outside `~/.ssh`.
+/// - Tightens permissive file modes (e.g. `0o644` -> `0o600`) while preserving stricter existing
+///   owner modes (e.g. `0o400` stays `0o400`).
 pub fn write_auth_keys(
     target: &AuthKeysTarget,
     write_path: &Path,
     bytes: &[u8],
 ) -> Result<(), ErrorBody> {
     if let Some(parent) = write_path.parent() {
-        ensure_parent_dir(parent, target.is_default_home_ssh)?;
+        let is_own_ssh_dir = target.is_default_home_ssh && target.path.parent() == Some(parent);
+        ensure_parent_dir(parent, is_own_ssh_dir)?;
     }
 
-    let options = WriteOptions::with_mode(0o600).force_mode(true);
+    let mode = desired_auth_keys_mode(write_path);
+    let options = WriteOptions::with_mode(mode).force_mode(true);
     let need_win_acl = target.windows_admin_acl;
     write_atomic_prepared(write_path, bytes, options, move |temp_path| {
         if need_win_acl {
@@ -952,6 +960,24 @@ pub fn write_auth_keys(
         }
         body
     })
+}
+
+fn desired_auth_keys_mode(write_path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(write_path) {
+            let tightened = meta.permissions().mode() & 0o600;
+            if tightened & 0o400 != 0 {
+                return tightened;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = write_path;
+    }
+    0o600
 }
 
 pub(crate) fn ensure_parent_dir(dir: &Path, is_default_ssh_dir: bool) -> Result<(), ErrorBody> {
@@ -1658,6 +1684,35 @@ Match Group users
         assert_eq!(
             std::fs::metadata(&auth_file).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+
+        // Keeps stricter existing file mode (0400 stays 0400, never loosened to 0600).
+        std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        write_auth_keys(&target, &auth_file, b"# readonly\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&auth_file).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+
+        // Does NOT chmod the parent directory of a symlink target outside ~/.ssh.
+        let dotfiles = home.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let linked_target = dotfiles.join("authorized_keys");
+        std::fs::write(&linked_target, "# dotfiles\n").unwrap();
+        std::fs::set_permissions(&linked_target, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::remove_file(&auth_file).unwrap();
+        std::os::unix::fs::symlink(&linked_target, &auth_file).unwrap();
+
+        let resolved = resolve_safe_write_path(&target, Some(&home)).unwrap();
+        write_auth_keys(&target, &resolved, b"# dotfiles updated\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(&dotfiles).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777,
+            0o400
         );
     }
 
