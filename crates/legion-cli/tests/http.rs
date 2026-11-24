@@ -96,6 +96,10 @@ fn main() -> ExitCode {
             only_the_owner_role_acts_as_others,
         ),
         (
+            "a_burst_of_sessions_stays_within_the_cap",
+            a_burst_of_sessions_stays_within_the_cap,
+        ),
+        (
             "an_mcp_session_belongs_to_its_token",
             an_mcp_session_belongs_to_its_token,
         ),
@@ -1763,4 +1767,82 @@ fn only_the_owner_role_acts_as_others() {
     );
     assert_ne!(minted.status, 200, "{}", minted.text());
     assert!(!minted.text().contains("lgn_"));
+}
+
+fn a_burst_of_sessions_stays_within_the_cap() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let port = server.port;
+    let burst = 24;
+    let start = Arc::new(std::sync::Barrier::new(burst));
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }
+    })
+    .to_string();
+    let threads: Vec<_> = (0..burst)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            let token = fixture.phone.clone();
+            let body = initialize.clone();
+            std::thread::spawn(move || {
+                let headers = vec![
+                    ("Authorization", format!("Bearer {token}")),
+                    ("Accept", "application/json, text/event-stream".to_owned()),
+                    ("Content-Type", "application/json".to_owned()),
+                ];
+                start.wait();
+                let reply = http(port, "POST", "/mcp", &headers, body.as_bytes());
+                (
+                    reply.status,
+                    reply.header("mcp-session-id").map(str::to_owned),
+                )
+            })
+        })
+        .collect();
+    let opened: Vec<(u16, Option<String>)> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    for (status, _) in &opened {
+        assert!(*status == 200 || *status == 503, "{status}");
+    }
+    let usable = opened
+        .iter()
+        .filter_map(|(_, session)| session.as_deref())
+        .filter(|session| in_session(&server, &fixture.phone, session, "POST").status == 200)
+        .count();
+    assert!(usable <= 16, "{usable} sessions are open for one token");
+    assert!(usable > 0);
+
+    // Ending a session with a body still forgets it, so it no longer counts.
+    let session = open_session(&server, &fixture.admin);
+    let mcp = Mcp {
+        server: &server,
+        token: &fixture.admin,
+        path: "/mcp",
+        session: Some(session.clone()),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/list", None);
+    let body = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}});
+    let ended = http(
+        port,
+        "DELETE",
+        "/mcp",
+        &headers,
+        body.to_string().as_bytes(),
+    );
+    assert!((200..300).contains(&ended.status), "{}", ended.status);
+    assert_eq!(
+        in_session(&server, &fixture.admin, &session, "POST").status,
+        404
+    );
 }

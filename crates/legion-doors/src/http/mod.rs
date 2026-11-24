@@ -508,9 +508,13 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
         Ok(bytes) => bytes,
         Err(response) => return *response,
     };
+    let mut reservation = None;
     if session.is_none() && opens_session(&bytes) {
-        match shared.sessions.make_room(&who) {
-            Some(ended) => shared.close(ended).await,
+        match shared.sessions.reserve(&who, compact) {
+            Some((place, ended)) => {
+                reservation = Some(place);
+                shared.close(ended).await;
+            }
             None => {
                 return reply::json(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -525,7 +529,12 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
             }
         }
     }
-    let request_id = session.as_ref().and_then(|_| request_id(&bytes));
+    // Only a request posted inside a session can be cancelled by leaving it; a DELETE ends the
+    // session whatever its body says.
+    let request_id = session
+        .as_ref()
+        .filter(|_| !deleting)
+        .and_then(|_| request_id(&bytes));
     let request = Request::from_parts(parts, Body::from(bytes));
     let service = if compact {
         &shared.mcp_compact
@@ -558,12 +567,15 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
     }
     match &session {
         None => {
-            if let Some(id) = response
-                .headers()
-                .get(SESSION_HEADER)
-                .and_then(|id| id.to_str().ok())
-            {
-                shared.sessions.bind(id.to_owned(), who, compact);
+            // A failed handshake opened nothing, and dropping the reservation gives its place back.
+            if let (Some(place), Some(id)) = (
+                reservation,
+                response
+                    .headers()
+                    .get(SESSION_HEADER)
+                    .and_then(|id| id.to_str().ok()),
+            ) {
+                place.bind(id.to_owned());
             }
         }
         Some(id) if deleting && response.status().is_success() => shared.sessions.forget(id),
