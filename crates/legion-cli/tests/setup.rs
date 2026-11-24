@@ -65,6 +65,10 @@ fn main() -> ExitCode {
             "fleet_sync_expect_absent_race_directional_status_and_only_one_side",
             fleet_sync_expect_absent_race_directional_status_and_only_one_side,
         ),
+        (
+            "non_admin_cannot_create_or_link_secret_ancestors_in_any_tool",
+            non_admin_cannot_create_or_link_secret_ancestors_in_any_tool,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -1536,4 +1540,140 @@ fn fleet_sync_expect_absent_race_directional_status_and_only_one_side() {
         desc.contains("only_here") && desc.contains("only_there"),
         "{desc}"
     );
+}
+
+fn non_admin_cannot_create_or_link_secret_ancestors_in_any_tool() {
+    let home = Home::new();
+    let user_home = home.home();
+
+    home.write_config(
+        "policy.toml",
+        "\
+default = \"owner\"
+
+[roles.wide]
+allow = [\"effect:read\", \"effect:write\", \"effect:destroy\"]
+
+[principals.wide]
+role = \"wide\"
+",
+    );
+
+    let fake = user_home.join("projects").join("fake");
+    let src = user_home.join("projects").join("src");
+    let src_file = user_home.join("projects").join("payload.txt");
+    let src_dir = user_home.join("projects").join("plain_dir");
+    fs::create_dir_all(&fake).unwrap();
+    fs::create_dir_all(src.join(".gemini")).unwrap();
+    fs::create_dir_all(src.join(".local").join("share")).unwrap();
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(&src_file, "payload").unwrap();
+    fs::write(src.join(".docker"), "not-a-dir").unwrap();
+    fs::write(src.join(".local").join("share").join("note.txt"), "hi").unwrap();
+    fs::write(src.join("ok.txt"), "allowed").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&fake, src.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(&fake, user_home.join("projects").join("codex_link")).unwrap();
+    }
+
+    // 1. unpack (`fs.transfer` directory into `~/`): refuses `.codex` symlink, `.gemini` dir,
+    // `.docker` file, and `.local/share/note.txt` (missing parent `.local/share`), while still
+    // transferring benign `ok.txt`.
+    let xfer_dir = home.run(&[
+        "fs.transfer",
+        "from=~/projects/src/",
+        "to=~/",
+        "--as",
+        "wide",
+    ]);
+    assert_eq!(xfer_dir.code, 0, "{}", xfer_dir.stdout);
+    assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    assert!(fs::symlink_metadata(user_home.join(".gemini")).is_err());
+    assert!(fs::symlink_metadata(user_home.join(".docker")).is_err());
+    assert!(fs::symlink_metadata(user_home.join(".local")).is_err());
+    assert_eq!(
+        fs::read_to_string(user_home.join("ok.txt")).unwrap(),
+        "allowed"
+    );
+
+    // 2. put (`fs.transfer` single file to `~/.codex` and `~/.codex/note.txt`): refused.
+    for target in ["~/.codex", "~/.codex/note.txt"] {
+        let put_res = home.run(&[
+            "fs.transfer",
+            "from=~/projects/payload.txt",
+            &format!("to={target}"),
+            "--as",
+            "wide",
+        ]);
+        assert_eq!(put_res.code, 1, "put {target}: {}", put_res.stdout);
+        assert_eq!(put_res.json()["code"], json!("denied"), "put {target}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 3. fs.write with parents=true to `~/.codex/note.txt` and direct file `~/.codex`: refused.
+    for args in [
+        vec![
+            "fs.write",
+            "path=~/.codex/note.txt",
+            "content=hi",
+            "parents=true",
+            "--as",
+            "wide",
+        ],
+        vec!["fs.write", "path=~/.codex", "content=hi", "--as", "wide"],
+    ] {
+        let res = home.run(&args);
+        assert_eq!(res.code, 1, "{args:?}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "{args:?}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 4. fs.mkdir on `~/.codex` and `~/.codex/sub` (parents=true): refused.
+    for target in ["~/.codex", "~/.codex/sub"] {
+        let res = home.run(&[
+            "fs.mkdir",
+            &format!("path={target}"),
+            "parents=true",
+            "--as",
+            "wide",
+        ]);
+        assert_eq!(res.code, 1, "mkdir {target}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "mkdir {target}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 5. fs.copy file, directory, and symlink to `~/.codex`: all refused.
+    let mut copy_sources = vec![
+        ("file", "~/projects/payload.txt", false),
+        ("dir", "~/projects/plain_dir", true),
+    ];
+    #[cfg(unix)]
+    copy_sources.push(("symlink", "~/projects/codex_link", false));
+    for (label, from, recursive) in copy_sources {
+        let from_arg = format!("from={from}");
+        let mut args = vec!["fs.copy", &from_arg, "to=~/.codex", "--as", "wide"];
+        if recursive {
+            args.push("recursive=true");
+        }
+        let res = home.run(&args);
+        assert_eq!(res.code, 1, "copy {label}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "copy {label}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
+
+    // 6. fs.move file, directory, and symlink to `~/.codex`: all refused.
+    let mut move_sources = vec![
+        ("file", "~/projects/payload.txt"),
+        ("dir", "~/projects/plain_dir"),
+    ];
+    #[cfg(unix)]
+    move_sources.push(("symlink", "~/projects/codex_link"));
+    for (label, from) in move_sources {
+        let from_arg = format!("from={from}");
+        let res = home.run(&["fs.move", &from_arg, "to=~/.codex", "--as", "wide"]);
+        assert_eq!(res.code, 1, "move {label}: {}", res.stdout);
+        assert_eq!(res.json()["code"], json!("denied"), "move {label}");
+        assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
+    }
 }

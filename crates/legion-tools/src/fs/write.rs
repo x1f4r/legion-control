@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Access, CancellationToken, Ctx, Grant, Registry, ToolError};
+use legion_core::{Access, CancellationToken, CreateKind, Ctx, Grant, Registry, ToolError};
 use legion_os::atomic::{WriteOptions, write_atomic_from_reader};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,8 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
     };
 
     let checked = check_fs_path(ctx.grant(), &args.path, Access::Write)?;
+    ctx.grant()
+        .check_create(&checked, CreateKind::File, args.parents)?;
     let grant = ctx.grant().clone();
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let mode = args.mode;
@@ -351,6 +353,8 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
         ));
     }
     let checked = check_fs_path(ctx.grant(), &args.path, Access::Write)?;
+    ctx.grant()
+        .check_create(&checked, CreateKind::File, false)?;
     let grant = ctx.grant().clone();
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let old = args.old;
@@ -509,6 +513,8 @@ struct MkdirResult {
 
 async fn mkdir(ctx: &Ctx, args: MkdirArgs) -> Result<MkdirResult, ToolError> {
     let path = check_fs_path(ctx.grant(), &args.path, Access::Write)?;
+    ctx.grant()
+        .check_create(&path, CreateKind::Dir, args.parents)?;
     let parents = args.parents;
 
     run_blocking(ctx, "fs.mkdir", move |_cancel, _progress| {
@@ -607,7 +613,9 @@ fn resolve_write_target(
             if platform::IS_WINDOWS {
                 validate_windows_path(&path_to_string(&target))?;
             }
-            grant.check_path(&target, Access::Write)
+            let resolved = grant.check_path(&target, Access::Write)?;
+            grant.check_create(&resolved, CreateKind::File, false)?;
+            Ok(resolved)
         }
         Ok(_) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),

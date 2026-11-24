@@ -580,6 +580,17 @@ pub enum Access {
     Write,
 }
 
+/// Kind of filesystem entry a tool is about to create, replace, or link at a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+    /// A symbolic link (regardless of what it points to).
+    Symlink,
+}
+
 /// A place a tool that acts on a whole tree treats with care, as [`Grant::protected`] names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
@@ -880,6 +891,164 @@ impl Grant {
         )
         .with_hint(hint)
         .with_details(json!({"path": path, "place": format!("{place:?}").to_lowercase()})))
+    }
+
+    /// Refuses creating, replacing, or linking any path that is — or holds — Legion's own
+    /// configuration/state directories or a non-opted-in secret location, for roles without
+    /// `effect:admin`.
+    ///
+    /// Unlike [`Grant::protected`], this never exempts a symbolic link at the target path: a
+    /// symlink may never be created at a secret location or any proper ancestor of one, whatever
+    /// it points to. When `create_parents` is `true`, every missing parent directory that would be
+    /// created is checked with the same rule.
+    pub fn check_create(
+        &self,
+        path: &Path,
+        kind: CreateKind,
+        create_parents: bool,
+    ) -> Result<(), ErrorBody> {
+        if self.allows_effect(Effect::Admin) {
+            return Ok(());
+        }
+        let unclear = |error: Unresolved| match error {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(code, reason) => ErrorBody::new(
+                code,
+                format!("{} cannot be checked: {reason}.", path.display()),
+            ),
+        };
+        let resolved = resolve_keeping_last(path).map_err(unclear)?;
+        let own = self.own_dirs().map_err(|(dir, error)| {
+            let reason = match error {
+                Unresolved::Invalid(error) => error.message,
+                Unresolved::Unclear(_, reason) => reason,
+            };
+            ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "{} may not create or replace {}: Legion's own directory {} cannot be resolved ({reason}).",
+                    self.principal,
+                    path.display(),
+                    dir.display()
+                ),
+            )
+            .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
+        })?;
+        let resolved_roots = self.resolved_roots_best_effort();
+        let secrets: Vec<SecretPlace> = self
+            .secret_locations()
+            .into_iter()
+            .filter(|secret| !secret_explicitly_opted_in_whole(secret, &resolved_roots))
+            .collect();
+        let home_resolved = self.paths.home().and_then(|home| resolve(home).ok());
+
+        let check_one = |candidate: &Resolved,
+                         candidate_kind: CreateKind,
+                         is_parent: bool|
+         -> Result<(), ErrorBody> {
+            let identity = if candidate.missing.is_empty() && candidate.link.is_none() {
+                Handle::from_path(&candidate.existing).ok()
+            } else {
+                None
+            };
+            let holds = |place: &Resolved| {
+                within(place, candidate, Platform::HOST)
+                    || identity.as_ref().is_some_and(|id| {
+                        place
+                            .existing
+                            .ancestors()
+                            .any(|anc| Handle::from_path(anc).is_ok_and(|h| h == *id))
+                    })
+            };
+            let at_or_above_home = home_resolved.as_ref().is_some_and(&holds);
+            let exempt_existing_home_dir = candidate_kind != CreateKind::Symlink
+                && at_or_above_home
+                && candidate.missing.is_empty()
+                && candidate.link.is_none();
+
+            for dir in &own {
+                let touches =
+                    within(candidate, &dir.resolved, Platform::HOST) || holds(&dir.resolved);
+                if touches && !exempt_existing_home_dir {
+                    let what = if is_parent {
+                        format!(
+                            "creating missing parent {} would create an ancestor of {}",
+                            candidate.path().display(),
+                            dir.place.describe()
+                        )
+                    } else {
+                        format!("it is or holds {}", dir.place.describe())
+                    };
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may not create or replace {}: {what}.",
+                            self.principal,
+                            path.display()
+                        ),
+                    )
+                    .with_hint("Only a role that allows effect:admin may change Legion's own files or their ancestors.")
+                    .with_details(json!({
+                        "path": path,
+                        "place": format!("{:?}", dir.place).to_lowercase(),
+                    })));
+                }
+            }
+
+            for secret in &secrets {
+                let touches =
+                    within(candidate, &secret.resolved, Platform::HOST) || holds(&secret.resolved);
+                if touches && !exempt_existing_home_dir {
+                    let what = if candidate_kind == CreateKind::Symlink {
+                        format!(
+                            "a symbolic link may not be placed at or above secret location ~/{}",
+                            secret.rel
+                        )
+                    } else if is_parent {
+                        format!(
+                            "creating missing parent {} would create an ancestor of secret location ~/{}",
+                            candidate.path().display(),
+                            secret.rel
+                        )
+                    } else {
+                        format!("it is or holds secret location ~/{}", secret.rel)
+                    };
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may not create or replace {}: {what}.",
+                            self.principal,
+                            path.display()
+                        ),
+                    )
+                    .with_hint(format!(
+                        "Only roles with effect:admin, or roles whose `paths` explicitly names ~/{}, may create or replace it or its missing parents.",
+                        secret.rel
+                    ))
+                    .with_details(json!({
+                        "path": path,
+                        "place": "secret",
+                        "secret": format!("~/{}", secret.rel),
+                    })));
+                }
+            }
+            Ok(())
+        };
+
+        check_one(&resolved, kind, false)?;
+
+        if create_parents && resolved.missing.len() > 1 {
+            for prefix_len in 1..resolved.missing.len() {
+                let parent_resolved = Resolved {
+                    existing: resolved.existing.clone(),
+                    missing: resolved.missing[..prefix_len].to_vec(),
+                    link: None,
+                };
+                check_one(&parent_resolved, CreateKind::Dir, true)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Pre-resolved filter over Legion's own directories and well-known secret locations for
@@ -2681,5 +2850,84 @@ role = "partial_optin"
                 .is_none()
         );
         assert!(owner.protected_filter().is_empty());
+    }
+
+    #[test]
+    fn check_create_refuses_symlinks_entries_and_missing_parents_of_secret_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = under(dir.path());
+        let home = paths.home().unwrap();
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+
+        let policy = policy(
+            r#"
+default = "owner"
+
+[roles.wide]
+allow = ["effect:read", "effect:write", "effect:destroy"]
+
+[principals.wide]
+role = "wide"
+"#,
+        );
+        let wide = policy.grant("wide", &paths);
+        let owner = policy.grant("owner", &paths);
+
+        // `~/.codex` is absent, and is the proper ancestor of secret `~/.codex/auth.json`.
+        // Every entry kind (symlink, dir, file) at `~/.codex` is refused.
+        for kind in [CreateKind::Symlink, CreateKind::Dir, CreateKind::File] {
+            let err = wide
+                .check_create(&home.join(".codex"), kind, false)
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{kind:?}");
+            assert!(err.message.contains(".codex/auth.json"), "{}", err.message);
+        }
+
+        // Creating a file or directory under missing `~/.codex` with create_parents=true is refused.
+        let err = wide
+            .check_create(
+                &home.join(".codex").join("other.txt"),
+                CreateKind::File,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        let err = wide
+            .check_create(&home.join(".codex").join("sub"), CreateKind::Dir, true)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // A symlink at existing `~/.config` (ancestor of `~/.config/gh`) is refused.
+        assert_eq!(
+            wide.check_create(&home.join(".config"), CreateKind::Symlink, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        // Creating a sibling file inside ALREADY-EXISTING `~/.config` is allowed.
+        assert!(
+            wide.check_create(
+                &home.join(".config").join("myapp").join("settings.toml"),
+                CreateKind::File,
+                true,
+            )
+            .is_ok()
+        );
+        // Normal files under `~/projects` are allowed.
+        assert!(
+            wide.check_create(
+                &home.join("projects").join("sub").join("a.txt"),
+                CreateKind::File,
+                true,
+            )
+            .is_ok()
+        );
+        // Admin (owner) is allowed.
+        assert!(
+            owner
+                .check_create(&home.join(".codex"), CreateKind::Symlink, false)
+                .is_ok()
+        );
     }
 }
