@@ -223,8 +223,11 @@ invokes `device.invite`, the live invite enters the agent's transcript, so run `
 your own terminal when you want to keep it out of agent transcripts.
 
 Creating, listing, updating, or removing invites and paired devices (`device.invite`,
-`device.list`, `device.set`, `device.remove`) requires `effect:admin` (`device.endpoint` is
-`effect:read` so paired controllers can discover fleet endpoints). Device management follows the
+`device.list`, `device.set`, `device.remove`) requires `effect:admin`. `device.endpoint` is
+`effect:read` so paired controllers can discover fleet endpoints: any role with `read` learns the
+node name, candidate host names / Tailscale addresses, SSH port, OS account name, and public sshd
+host keys (with auto-discovered host-key scans cached briefly per node, and without exposing how
+host keys were resolved). Device management follows the
 same caller-scoping and `allow_owner` rules as `token.*`: creating a `device:<name>` principal or
 changing a device's role with `device.set` requires the `owner` role and `allow_owner=true` to
 grant `owner`. Expiring credentials (such as expiring HTTP bearer tokens) cannot mint or modify

@@ -1,8 +1,9 @@
 //! Cryptographic keys, OpenSSH wire formats, fingerprints, invite tokens, and sshd host keys.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
@@ -17,6 +18,10 @@ use sha2::{Digest, Sha256};
 
 /// Timeout for one `ssh-keyscan` probe against local `sshd`.
 const KEYSCAN_TIMEOUT: Duration = Duration::from_secs(7);
+
+/// How long `device.endpoint` caches an auto-discovered host-key scan per `(node, port)` so
+/// repeated read-only endpoint discovery calls do not repeatedly run `ssh-keyscan`.
+pub const HOST_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Prefix of every Legion v1 pairing invite string.
 pub const INVITE_PREFIX: &str = "legion-invite-1.";
@@ -400,6 +405,80 @@ pub struct ResolvedHostKeys {
     pub keys: Vec<String>,
     /// Source label: `"configured"`, `"ssh-keyscan+files"`, `"ssh-keyscan only"`, or `"files"`.
     pub source: String,
+}
+
+/// Per-node in-memory cache of auto-discovered sshd public host keys, keyed by
+/// `(node_config_dir, port)` with a [`HOST_KEY_CACHE_TTL`] expiry.
+#[derive(Debug, Default)]
+pub(crate) struct HostKeyScanCache {
+    entries: Mutex<HashMap<(PathBuf, u16), (Instant, ResolvedHostKeys)>>,
+}
+
+impl HostKeyScanCache {
+    pub(crate) fn get_at(
+        &self,
+        node_key: &Path,
+        port: u16,
+        now: Instant,
+    ) -> Option<ResolvedHostKeys> {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (node_key.to_path_buf(), port);
+        if let Some((stored_at, resolved)) = guard.get(&key) {
+            if now.saturating_duration_since(*stored_at) < HOST_KEY_CACHE_TTL {
+                return Some(resolved.clone());
+            }
+            guard.remove(&key);
+        }
+        None
+    }
+
+    pub(crate) fn insert_at(
+        &self,
+        node_key: &Path,
+        port: u16,
+        now: Instant,
+        resolved: ResolvedHostKeys,
+    ) {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|_, (stored_at, _)| {
+            now.saturating_duration_since(*stored_at) < HOST_KEY_CACHE_TTL
+        });
+        guard.insert((node_key.to_path_buf(), port), (now, resolved));
+    }
+}
+
+fn global_host_key_cache() -> &'static HostKeyScanCache {
+    static CACHE: OnceLock<HostKeyScanCache> = OnceLock::new();
+    CACHE.get_or_init(HostKeyScanCache::default)
+}
+
+/// Like [`resolve_host_keys`], but caches auto-discovered (`ssh-keyscan` / default-file) results
+/// per `(node_key, port)` for [`HOST_KEY_CACHE_TTL`] so repeated read-only `device.endpoint` calls
+/// do not repeatedly invoke `ssh-keyscan`. Configured `.pub` files are always read directly.
+pub async fn resolve_host_keys_cached(
+    node_key: &Path,
+    configured: &[String],
+    home: Option<&Path>,
+    port: u16,
+    cancel: CancellationToken,
+) -> Result<ResolvedHostKeys, ErrorBody> {
+    if !configured.is_empty() {
+        return resolve_host_keys(configured, home, port, cancel).await;
+    }
+    let cache = global_host_key_cache();
+    let now = Instant::now();
+    if let Some(cached) = cache.get_at(node_key, port, now) {
+        return Ok(cached);
+    }
+    let resolved = resolve_host_keys(configured, home, port, cancel).await?;
+    cache.insert_at(node_key, port, Instant::now(), resolved.clone());
+    Ok(resolved)
 }
 
 /// Resolves this node's sshd public host keys for an invite on `port`.
@@ -964,5 +1043,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn host_key_scan_cache_reuses_entries_within_ttl_and_expires_after_one_minute() {
+        let cache = HostKeyScanCache::default();
+        let node_a = Path::new("/tmp/node-a/config");
+        let node_b = Path::new("/tmp/node-b/config");
+        let t0 = Instant::now();
+        let resolved_a = ResolvedHostKeys {
+            keys: vec![ed25519_public_key_from_seed(&[1u8; 32])],
+            source: "ssh-keyscan+files".to_owned(),
+        };
+        let resolved_b = ResolvedHostKeys {
+            keys: vec![ed25519_public_key_from_seed(&[2u8; 32])],
+            source: "files".to_owned(),
+        };
+
+        assert!(cache.get_at(node_a, 22, t0).is_none());
+        cache.insert_at(node_a, 22, t0, resolved_a.clone());
+        cache.insert_at(node_b, 22, t0, resolved_b.clone());
+
+        // Within the 1-minute TTL, same (node, port) hits; different port misses; nodes are isolated.
+        let t_hit = t0 + Duration::from_secs(59);
+        assert_eq!(cache.get_at(node_a, 22, t_hit), Some(resolved_a));
+        assert_eq!(cache.get_at(node_b, 22, t_hit), Some(resolved_b));
+        assert!(cache.get_at(node_a, 2222, t_hit).is_none());
+
+        // At/after HOST_KEY_CACHE_TTL (60 seconds), the cached scan expires.
+        let t_expired = t0 + HOST_KEY_CACHE_TTL;
+        assert!(cache.get_at(node_a, 22, t_expired).is_none());
+        assert!(cache.get_at(node_b, 22, t_expired).is_none());
     }
 }

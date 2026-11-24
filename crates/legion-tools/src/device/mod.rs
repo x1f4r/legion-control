@@ -36,7 +36,7 @@ use self::authkeys::{
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
     InvitePayload, fingerprint_key_b64, generate_ephemeral_ed25519, generate_invite_id,
-    resolve_host_keys, validate_invite_id, validate_pairing_id,
+    resolve_host_keys, resolve_host_keys_cached, validate_invite_id, validate_pairing_id,
 };
 use self::registry::{
     DEVICE_PRINCIPAL_PREFIX, DeviceTombstone, DevicesFile, FleetPushOutcome,
@@ -92,7 +92,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.endpoint",
         Effect::Read,
-        "Return how a paired device reaches this node over SSH: node name, candidate host names or Tailscale addresses, SSH port, OS account name, and pinned sshd public host keys with their source. Uses the same detection as device.invite (honouring any [devices] settings in node.toml). Call with on=\"all\" through any node to learn every machine's direct SSH endpoint.",
+        "Return how a paired device reaches this node over SSH: node name, candidate host names or Tailscale addresses, SSH port, OS account name, and pinned sshd public host keys. Uses the same detection as device.invite (honouring any [devices] settings in node.toml, caching auto-discovered host-key scans briefly per node). Call with on=\"all\" through any node to learn every machine's direct SSH endpoint.",
         endpoint,
     );
 }
@@ -153,14 +153,17 @@ pub struct EndpointResult {
     pub user: String,
     /// Pinned SSH public host keys (`"<type> <base64>"`, without comments).
     pub host_keys: Vec<String>,
-    /// Where the pinned host keys came from (`configured`, `ssh-keyscan+files`, `ssh-keyscan only`,
-    /// or `files`).
-    pub host_keys_source: String,
+}
+
+struct DetectedEndpoint {
+    endpoint: EndpointResult,
+    host_keys_source: String,
 }
 
 async fn endpoint(ctx: &Ctx, _args: NoArgs) -> Result<EndpointResult, ToolError> {
     let node_file = ctx.config().get::<NodeFile>()?;
-    detect_endpoint(ctx, &node_file, None, None, None).await
+    let detected = detect_endpoint(ctx, &node_file, None, None, None, true).await?;
+    Ok(detected.endpoint)
 }
 
 async fn detect_endpoint(
@@ -169,7 +172,8 @@ async fn detect_endpoint(
     host_override: Option<HostArg>,
     port_override: Option<u16>,
     user_override: Option<String>,
-) -> Result<EndpointResult, ErrorBody> {
+    use_host_key_cache: bool,
+) -> Result<DetectedEndpoint, ErrorBody> {
     let port = port_override
         .or(node_file.devices.port)
         .unwrap_or(DEFAULT_SSH_PORT);
@@ -222,20 +226,33 @@ async fn detect_endpoint(
             .then(|| HostArg::Many(node_file.devices.hosts.clone()))
     });
     let hosts = resolve_hosts(host_arg, ctx.cancel_token().child_token()).await?;
-    let resolved_host_keys = resolve_host_keys(
-        &node_file.devices.host_keys,
-        ctx.paths().home(),
-        port,
-        ctx.cancel_token().child_token(),
-    )
-    .await?;
+    let resolved_host_keys = if use_host_key_cache {
+        resolve_host_keys_cached(
+            ctx.paths().config_dir(),
+            &node_file.devices.host_keys,
+            ctx.paths().home(),
+            port,
+            ctx.cancel_token().child_token(),
+        )
+        .await?
+    } else {
+        resolve_host_keys(
+            &node_file.devices.host_keys,
+            ctx.paths().home(),
+            port,
+            ctx.cancel_token().child_token(),
+        )
+        .await?
+    };
 
-    Ok(EndpointResult {
-        node: ctx.node_name().to_owned(),
-        hosts,
-        port,
-        user,
-        host_keys: resolved_host_keys.keys,
+    Ok(DetectedEndpoint {
+        endpoint: EndpointResult {
+            node: ctx.node_name().to_owned(),
+            hosts,
+            port,
+            user,
+            host_keys: resolved_host_keys.keys,
+        },
         host_keys_source: resolved_host_keys.source,
     })
 }
@@ -391,12 +408,12 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     };
 
     let node_file = ctx.config().get::<NodeFile>()?;
-    let endpoint = detect_endpoint(ctx, &node_file, args.host, args.port, args.user).await?;
-    let hosts = endpoint.hosts;
-    let port = endpoint.port;
-    let user = endpoint.user;
-    let host_keys = endpoint.host_keys;
-    let host_keys_source = endpoint.host_keys_source;
+    let detected = detect_endpoint(ctx, &node_file, args.host, args.port, args.user, false).await?;
+    let hosts = detected.endpoint.hosts;
+    let port = detected.endpoint.port;
+    let user = detected.endpoint.user;
+    let host_keys = detected.endpoint.host_keys;
+    let host_keys_source = detected.host_keys_source;
     let target = resolve_target(ctx.paths(), &node_file)?;
     let pinned_account = if target.windows_admin_acl {
         let acct = legion_os::user::current_username().map_err(|error| {
@@ -3577,6 +3594,7 @@ role = "owner"
         .unwrap();
 
         // Observer (`phone`) has only effect:read and can call device.endpoint.
+        // Only the minimal fields a client needs are returned (no `host_keys_source`).
         let ep = h
             .call_as("device.endpoint", "phone", json!({}))
             .await
@@ -3586,9 +3604,21 @@ role = "owner"
         assert_eq!(ep["port"], json!(2222));
         assert_eq!(ep["user"], json!("me"));
         assert_eq!(ep["host_keys"], json!([h.host_key]));
-        assert_eq!(ep["host_keys_source"], json!("configured"));
+        assert!(
+            ep.get("host_keys_source").is_none(),
+            "device.endpoint must not expose host_keys_source: {ep}"
+        );
+        let mut keys: Vec<&str> = ep
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["host_keys", "hosts", "node", "port", "user"]);
 
-        // device.invite without explicit host/port/user uses the exact same endpoint settings.
+        // device.invite without explicit host/port/user uses the exact same endpoint settings
+        // and still reports host_keys_source for admin callers / `legion pair` warnings.
         let inv = h
             .call("device.invite", json!({"principal": "phone"}))
             .await
@@ -3597,7 +3627,7 @@ role = "owner"
         assert_eq!(inv["port"], ep["port"]);
         assert_eq!(inv["user"], ep["user"]);
         assert_eq!(inv["host_keys"], ep["host_keys"]);
-        assert_eq!(inv["host_keys_source"], ep["host_keys_source"]);
+        assert_eq!(inv["host_keys_source"], json!("configured"));
     }
 
     #[tokio::test]

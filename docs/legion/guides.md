@@ -761,8 +761,9 @@ byte.
   it, updating `policy.toml`, `devices.toml`, and `authorized_keys`, then pushing `devices.toml`
   to reachable fleet peers.
 - **Discover endpoints**: `legion device.endpoint` (`effect: read`) returns this node's SSH
-  connection details (`node`, `hosts`, `port`, `user`, `host_keys`, `host_keys_source`) using the
-  same detection as `device.invite`. Controllers call `device.endpoint` with `on: "all"` through
+  connection details (`node`, `hosts`, `port`, `user`, `host_keys`) using the same detection as
+  `device.invite` (caching auto-discovered host-key scans briefly per node). Controllers call
+  `device.endpoint` with `on: "all"` through
   any reachable node to learn every machine's direct SSH address and pinned host keys.
 - **Remove a device**: `legion device.remove` accepts `name=<device>` or `id=<pairing-or-invite-id>`,
   writes a tombstone to `devices.toml`, cleans up its unused `device:*` principal in `policy.toml`,
