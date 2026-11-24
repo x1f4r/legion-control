@@ -1072,7 +1072,22 @@ async fn ask(
     let outcome = actuator
         .run(check.argv(), CHECK_TIMEOUT, ctx.cancel_token())
         .await;
-    match plan::read_check(check, &outcome) {
+    let mut answer = plan::read_check(check, &outcome);
+    // sudo-rs lists only the command it matched, not the rule that decides it: ask for the rules.
+    if let (Check::Sudo(_), Answer::Unknown(_), Ok(ran)) = (check, &answer, &outcome)
+        && ran.ok()
+        && let Some(matched) = plan::matched_command(&ran.stdout)
+    {
+        let rules = actuator
+            .run(
+                &plan::sudo_rules_command(),
+                CHECK_TIMEOUT,
+                ctx.cancel_token(),
+            )
+            .await;
+        answer = plan::read_rules(&rules, &matched);
+    }
+    match answer {
         Answer::Allowed => Ok(()),
         // Root may where this account may not; sudo is asked next.
         Answer::Refused(_) if sudo && matches!(check, Check::Logind(_)) => Ok(()),

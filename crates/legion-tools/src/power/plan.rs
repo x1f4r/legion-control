@@ -339,6 +339,174 @@ pub fn parse_sudo_listing(text: &str) -> SudoRule {
     decided
 }
 
+/// The command a `sudo -l -l <command>` listing names when it shows only that, as sudo-rs (the
+/// `sudo` of Ubuntu 26.04 and later) does: its full path and arguments on one line, where the
+/// original sudo prints the rule that matched.
+pub fn matched_command(listing: &str) -> Option<String> {
+    let line = listing
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    (line.starts_with('/') && !line.contains(':')).then(|| line.to_owned())
+}
+
+/// `sudo -n -l -l` with no command: every rule this account has, in the long format.
+pub fn sudo_rules_command() -> Vec<String> {
+    strings(&["sudo", "-n", "-l", "-l"])
+}
+
+/// Reads the whole long listing for the rule that decides `matched` (a full path and its
+/// arguments): sudoers uses the last rule that matches, and a rule matches when its commands hold
+/// `ALL`, the command line itself, or its program alone, which allows any arguments, and it runs
+/// commands as root. A rule this does not read for certain (a wildcard, a negation, an alias) that
+/// could be about this program makes the answer unreadable rather than a guess.
+pub fn rule_for(listing: &str, matched: &str) -> SudoRule {
+    let program = matched.split_whitespace().next().unwrap_or(matched);
+    let mut decided = SudoRule::Unreadable;
+    let mut entry: Option<RuleEntry> = None;
+    let mut in_commands = false;
+    let settle = |entry: Option<RuleEntry>, decided: &mut SudoRule| -> bool {
+        let Some(entry) = entry else { return true };
+        if entry.unsure {
+            *decided = SudoRule::Unreadable;
+            return false;
+        }
+        if let Some(no_password) = entry.matched
+            && entry.as_root
+        {
+            *decided = if no_password {
+                SudoRule::NoPassword(entry.source)
+            } else {
+                SudoRule::Password(entry.source)
+            };
+        }
+        true
+    };
+    for line in listing.lines() {
+        let trimmed = line.trim();
+        let header = trimmed
+            .strip_prefix("Sudoers entry:")
+            .or_else(|| trimmed.strip_prefix("LDAP Role:"));
+        if let Some(source) = header {
+            if !settle(entry.take(), &mut decided) {
+                return SudoRule::Unreadable;
+            }
+            entry = Some(RuleEntry {
+                source: source.trim().to_owned(),
+                ..RuleEntry::default()
+            });
+            in_commands = false;
+            continue;
+        }
+        let Some(current) = entry.as_mut() else {
+            continue;
+        };
+        if let Some(options) = trimmed.strip_prefix("Options:") {
+            current.no_password = options
+                .split(',')
+                .any(|option| option.trim() == "!authenticate");
+        } else if let Some(users) = trimmed.strip_prefix("RunAsUsers:") {
+            current.as_root = users
+                .split(',')
+                .any(|user| matches!(user.trim(), "ALL" | "root"));
+        } else if trimmed == "Commands:" {
+            in_commands = true;
+        } else if in_commands && !trimmed.is_empty() && !trimmed.ends_with(':') {
+            let (tag, command) = match trimmed.split_once(": ") {
+                Some((tag @ ("NOPASSWD" | "PASSWD"), rest)) => (Some(tag), rest.trim()),
+                _ => (None, trimmed),
+            };
+            let no_password = match tag {
+                Some("NOPASSWD") => true,
+                Some(_) => false,
+                None => current.no_password,
+            };
+            match command_matches(command, matched, program) {
+                Some(true) => current.matched = Some(no_password),
+                Some(false) => {}
+                None => current.unsure = true,
+            }
+        } else if !trimmed.is_empty() {
+            in_commands = false;
+        }
+    }
+    if !settle(entry, &mut decided) {
+        return SudoRule::Unreadable;
+    }
+    decided
+}
+
+/// Whether one command of a sudo rule allows `matched` (`program` and its arguments): `Some` when
+/// that is certain, `None` for a negation, a wildcard or an alias that could be about it.
+fn command_matches(command: &str, matched: &str, program: &str) -> Option<bool> {
+    let negated = command.starts_with('!');
+    let body = command.trim_start_matches('!').trim();
+    let first = body.split_whitespace().next().unwrap_or(body);
+    let plain = first.starts_with('/') && !body.contains(['*', '?', '[', '\\']);
+    if negated || !(plain || body == "ALL") {
+        // Not something read here for certain: about this program, or anything at all, it decides
+        // nothing that can be trusted; about another program, it does not matter.
+        let other = first.starts_with('/') && !first.contains(['*', '?', '[']) && first != program;
+        return if other { Some(false) } else { None };
+    }
+    Some(body == "ALL" || body == matched || body == program)
+}
+
+/// One rule of a long sudo listing, as [`rule_for`] reads it.
+#[derive(Debug)]
+struct RuleEntry {
+    source: String,
+    /// Whether its options say no password (`!authenticate`).
+    no_password: bool,
+    /// Whether it runs commands as root; true until its RunAsUsers says otherwise.
+    as_root: bool,
+    /// Whether one of its commands matched, and if so whether without a password.
+    matched: Option<bool>,
+    /// Whether it says something about the program this cannot read for certain.
+    unsure: bool,
+}
+
+impl Default for RuleEntry {
+    fn default() -> Self {
+        RuleEntry {
+            source: String::new(),
+            no_password: false,
+            as_root: true,
+            matched: None,
+            unsure: false,
+        }
+    }
+}
+
+/// The answer the whole listing gives for `matched`, after the listing for the command itself
+/// named only the command.
+pub fn read_rules(listed: &Result<Ran, ErrorBody>, matched: &str) -> Answer {
+    let ran = match listed {
+        Ok(ran) if ran.ok() => ran,
+        Ok(ran) => {
+            return Answer::Unknown(format!(
+                "sudo listed the command but not its rules: {}",
+                nonempty(ran.first_line(), "sudo -l -l failed")
+            ));
+        }
+        Err(error) => return Answer::Unknown(error.message.clone()),
+    };
+    match rule_for(&ran.stdout, matched) {
+        SudoRule::NoPassword(_) => Answer::Allowed,
+        SudoRule::Password(source) => Answer::Refused(format!(
+            "the sudo rule for it{} asks for a password, and a command run after the reply has nobody to type one",
+            if source.is_empty() {
+                String::new()
+            } else {
+                format!(" ({source})")
+            }
+        )),
+        SudoRule::Unreadable => Answer::Unknown(format!(
+            "sudo allows {matched}, but which of its rules decides whether that needs a password could not be read for certain"
+        )),
+    }
+}
+
 fn no_psshutdown() -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Unsupported,
@@ -846,6 +1014,75 @@ mod tests {
             parse_sudo_listing("/usr/bin/systemctl reboot\n"),
             SudoRule::Unreadable
         );
+    }
+
+    /// What sudo-rs 0.2 prints for `sudo -n -l -l` and `sudo -n -l -l <command>` on Ubuntu 26.04.
+    const SUDO_RS_ALL: &str = "User runner may run the following commands on host:\n\nSudoers entry:\n    RunAsUsers: ALL\n    Options: !authenticate\n    Commands:\n\tALL\n";
+
+    #[test]
+    fn a_listing_that_names_only_the_command_is_read_from_the_rules() {
+        assert_eq!(
+            matched_command("/usr/bin/systemctl reboot\n").as_deref(),
+            Some("/usr/bin/systemctl reboot")
+        );
+        assert_eq!(matched_command("Sudoers entry: /etc/sudoers\n"), None);
+        assert_eq!(matched_command(""), None);
+        let matched = "/usr/bin/systemctl reboot";
+        assert!(matches!(
+            rule_for(SUDO_RS_ALL, matched),
+            SudoRule::NoPassword(_)
+        ));
+        // The last rule that matches decides, a narrow one included.
+        let narrow = "Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n    Commands:\n\tALL\n\nSudoers entry: /etc/sudoers.d/power\n    RunAsUsers: root\n    Options: !authenticate\n    Commands:\n\t/usr/bin/systemctl reboot\n\t/usr/bin/systemctl poweroff\n";
+        assert_eq!(
+            rule_for(narrow, matched),
+            SudoRule::NoPassword("/etc/sudoers.d/power".to_owned())
+        );
+        assert_eq!(
+            rule_for(narrow, "/usr/bin/systemctl suspend"),
+            SudoRule::Password("/etc/sudoers".to_owned())
+        );
+        // The program alone allows any arguments; a rule for another program is beside the point.
+        let program = "Sudoers entry:\n    RunAsUsers: ALL\n    Options: !authenticate\n    Commands:\n\t/usr/bin/systemctl\n\t/usr/sbin/shutdown -h now\n";
+        assert!(matches!(
+            rule_for(program, matched),
+            SudoRule::NoPassword(_)
+        ));
+        // A rule for another user does not run the command as root.
+        let other_user = "Sudoers entry:\n    RunAsUsers: backup\n    Options: !authenticate\n    Commands:\n\tALL\n";
+        assert_eq!(rule_for(other_user, matched), SudoRule::Unreadable);
+        // A wildcard, negation or alias about it is not guessed at.
+        for unsure in [
+            "\t/usr/bin/systemctl *\n",
+            "\t!/usr/bin/systemctl reboot\n",
+            "\tPOWER_COMMANDS\n",
+        ] {
+            let listing = format!(
+                "{SUDO_RS_ALL}\nSudoers entry:\n    RunAsUsers: ALL\n    Options: !authenticate\n    Commands:\n{unsure}"
+            );
+            assert_eq!(
+                rule_for(&listing, matched),
+                SudoRule::Unreadable,
+                "{unsure}"
+            );
+        }
+        let password = SUDO_RS_ALL.replace("    Options: !authenticate\n", "");
+        assert!(matches!(
+            rule_for(&password, matched),
+            SudoRule::Password(_)
+        ));
+        assert_eq!(
+            read_rules(&Ok(Ran::exited(0, SUDO_RS_ALL)), matched),
+            Answer::Allowed
+        );
+        assert!(matches!(
+            read_rules(&Ok(Ran::exited(0, &password)), matched),
+            Answer::Refused(_)
+        ));
+        assert!(matches!(
+            read_rules(&Ok(Ran::exited(1, "")), matched),
+            Answer::Unknown(_)
+        ));
     }
 
     #[test]

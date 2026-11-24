@@ -1093,3 +1093,48 @@ async fn a_runner_that_cannot_be_stopped_is_still_called_off() {
     fixture.fake.finish_runners();
     assert!(fixture.call("power.restart", json!({})).await.is_ok());
 }
+
+#[tokio::test]
+async fn sudo_that_lists_only_the_command_is_asked_for_its_rules() {
+    if here() == Platform::Windows {
+        return;
+    }
+    // sudo-rs, as on Ubuntu 26.04: the listing for the command names only the command.
+    let (argv, _) = expected(Action::Restart, 600, true);
+    let plain: Vec<&str> = argv[2..].iter().map(String::as_str).collect();
+    let mut asked = vec!["sudo", "-n", "-l", "-l"];
+    asked.extend(&plain);
+    let rules = "User runner may run the following commands on host:\n\nSudoers entry:\n    RunAsUsers: ALL\n    Options: !authenticate\n    Commands:\n\tALL\n";
+    let sudo_rs = |rules: &str| {
+        RecordingActuator::new()
+            .reply(Reply::new(
+                &asked,
+                0,
+                &format!("/usr/bin/{}\n", plain.join(" ")),
+            ))
+            .reply(Reply::new(&["sudo", "-n", "-l", "-l"], 0, rules))
+    };
+    let allowed = Fixture::with_node_toml(sudo_rs(rules), IDLE_WITH_SUDO);
+    let done = allowed
+        .call("power.restart", json!({"delay_s": 600}))
+        .await
+        .unwrap();
+    assert_eq!(done["scheduled"], json!(true), "{done}");
+    assert!(
+        allowed
+            .fake
+            .runs()
+            .contains(&strings(&["sudo", "-n", "-l", "-l"]))
+    );
+
+    let password = Fixture::with_node_toml(
+        sudo_rs(&rules.replace("    Options: !authenticate\n", "")),
+        IDLE_WITH_SUDO,
+    );
+    let error = password
+        .call("power.restart", json!({"delay_s": 600}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+    assert!(password.fake.schedules().is_empty());
+}
