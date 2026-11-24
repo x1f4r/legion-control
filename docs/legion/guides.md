@@ -675,6 +675,64 @@ that `would_refuse` is absent:
      then run one supervised `power.wake machine=<name> wait_s=90` while the target is asleep to
      confirm BIOS/NIC Wake-on-LAN and LAN broadcast delivery.
 
+## Pair a phone or tablet (`legion pair`)
+
+A phone, tablet, or other controller pairs with a node once and afterwards connects over SSH,
+confined to one principal by `legion gate --as <principal>`.
+
+First make sure the principal exists in `policy.toml` with the role you want (for example
+`[principals.phone]` with `role = "observer"`), then run `legion pair`:
+
+```sh
+legion pair --as phone
+```
+
+`legion pair` calls `device.invite`, prints who the device will act as and when the invite expires,
+draws the invite as a terminal QR code, prints the invite text on one line (for copying and pasting
+when a camera is inconvenient), and prints the commands to list and remove devices. Pass `--invert`
+if your light-background terminal needs inverted QR polarity, `--valid 1h` (up to `24h`) to change
+the 15-minute default, `--host`, `--port`, or `--user` to override detected connection details, or
+`--json` for the raw `device.invite` output.
+
+What happens during pairing:
+
+1. `device.invite` generates a fresh single-use Ed25519 key pair and appends one line to
+   `authorized_keys` carrying `restrict`, sshd's `expiry-time`, and
+   `command="<legion> gate --enrol <id>"`. The invite carries the node's detected Tailscale MagicDNS
+   name and Tailscale addresses (or the system hostname when Tailscale is absent), the account and
+   port, the node's sshd public host keys (pinned — invites without a readable host key are
+   refused), and the temporary key. Neither the invite text nor the temporary key is logged or
+   audited.
+2. The device scans the QR code or pastes the invite, connects over SSH verifying the pinned host
+   key, and sends its own newly generated Ed25519 public key and name.
+3. `legion gate --enrol <id>` validates the invite and public key under a file lock, replaces the
+   temporary `authorized_keys` line with a permanent `restrict,command="<legion> gate --as phone"`
+   line, records the device in `state/devices.json`, and writes an audit record (`door: "ssh"`,
+   `tool: "device.enrol"`). The temporary key immediately stops working.
+
+Inspect paired devices and pending invites, or revoke one at once:
+
+```sh
+legion device.list
+legion device.remove name=my-phone
+legion device.remove id=<invite-id>
+```
+
+### Overriding `authorized_keys` and host keys (`[devices]`)
+
+By default Legion edits `~/.ssh/authorized_keys` (on Windows, when the account is in the
+`Administrators` group and `sshd_config` uses `administrators_authorized_keys`, it edits
+`%ProgramData%\ssh\administrators_authorized_keys` with the `Administrators` and `SYSTEM` ACL sshd
+requires) and reads sshd's public host keys from `/etc/ssh/ssh_host_*_key.pub` (or
+`%ProgramData%\ssh\ssh_host_*_key.pub` on Windows). To override either path for a custom sshd setup,
+set `[devices]` in `node.toml`:
+
+```toml
+[devices]
+authorized_keys = "/home/me/.ssh/authorized_keys"
+host_keys = ["/etc/ssh/ssh_host_ed25519_key.pub"]
+```
+
 ## The HTTP door (`legion serve`)
 
 `legion serve` exposes the node's tools over HTTP for phones, scripts, and remote MCP clients. It
@@ -851,8 +909,9 @@ How arguments and output work:
 - Use `run = ["prog", "arg1"]` (no shell) whenever possible instead of `cmd`.
 - Always declare `effect` honestly (`read`, `write`, `exec`, `destroy`, `power`, `admin`): a role
   permitted that effect can invoke the tool. Built-in names and every family registered in the
-  built-in registry (plus reserved families `agent`, `audit`, `config`, `exec`, `ext`, `fleet`,
-  `fs`, `job`, `legion`, `meta`, `power`, `proj`, `svc`, `sys`, `token`) cannot be shadowed.
+  built-in registry (plus reserved families `agent`, `audit`, `config`, `device`, `exec`, `ext`,
+  `fleet`, `fs`, `job`, `legion`, `meta`, `power`, `proj`, `svc`, `sys`, `token`) cannot be
+  shadowed.
 - Full-mode MCP sessions receive `notifications/tools/list_changed` when `tools.d/` changes.
 
 Inspect or remove extensions with `ext.list`, `ext.show`, and `ext.remove`. `ext.list` prints an

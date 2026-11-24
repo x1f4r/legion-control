@@ -53,3 +53,10 @@ disarm = ["sudo", "-n", "grub-editenv", "-", "unset", "next_entry"]
 [serve]
 hosts = ["tower.example.ts.net"]
 origins = ["https://app.example.net"]
+
+# Optional overrides for device pairing (`legion pair` / `device.*`).
+# When omitted, Legion edits ~/.ssh/authorized_keys (or %ProgramData%\ssh\administrators_authorized_keys
+# on Windows administrator accounts) and reads sshd's public host keys from /etc/ssh (or %ProgramData%\ssh).
+# [devices]
+# authorized_keys = "/home/me/.ssh/authorized_keys"
+# host_keys = ["/etc/ssh/ssh_host_ed25519_key.pub"]

@@ -64,7 +64,7 @@ next
   - Check that everything is configured and reachable with `legion meta.doctor`.
 ```
 
-List the tools built into the binary (72 tools across 14 families, plus any local extensions):
+List the tools built into the binary (75 tools across 15 families, plus any local extensions):
 
 ```sh
 legion tools
@@ -199,6 +199,7 @@ PowerShell as sshd's shell), so a Linux node driving a Windows one, or any other
 covered. That run installs with the install script and covers `fleet.install`, routed calls with
 awkward arguments, file transfer, jobs started with an argument list and with a shell command that
 outlive their session, policy and both audit logs across the hop, a key forced to `legion gate`,
+device pairing (`device.invite`, `legion gate --enrol`, `device.list`, `device.remove`),
 services, MCP, and an extension tool; it does not cover `via` relays or the HTTP door. Of power,
 that run schedules a real restart and a real shutdown on every leg, ten minutes out, calls each
 off with `power.cancel` and waits past the time to see the same boot: on Windows the operating
@@ -218,7 +219,7 @@ accounts.
 | [Getting started](getting-started.md) | Installing on Linux, macOS, and Windows; first run; file locations (`LEGION_HOME`); adding machines, dual-boot systems, and `via` relays; troubleshooting real errors. |
 | [Permissions](permissions.md) | Principals, roles, rules, effects, `paths`, protected secret locations, how each door pins a principal, audit logging and redaction, and worked `policy.toml` recipes. |
 | [AI agents](agents.md) | `legion mcp` (compact and full mode), `legion agents add`, operating rules for agents, the 13 error codes, and adding extension tools safely. |
-| [Guides](guides.md) | Task walk-throughs: file transfer, long jobs, projects, services, power and wake, the HTTP door, extension tools, configuration sync, and updates. |
+| [Guides](guides.md) | Task walk-throughs: file transfer, long jobs, projects, services, power and wake, device pairing, the HTTP door, extension tools, configuration sync, and updates. |
 | [Tool reference](tools.md) | Generated reference of every built-in tool, its effect, and its input schema. |
 | [Design](design.md) | Architecture, workspace crates, wire and stream protocols, platform rules, and milestones. |
 | [`examples/legion/`](../../examples/legion/) | Validated, commented example files for `node.toml`, `policy.toml`, `fleet.toml`, `projects.toml`, `tokens.toml`, and `tools.d/`. |

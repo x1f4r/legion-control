@@ -64,7 +64,7 @@ Every tool declares one of six effects:
 | `destroy` | `fs.remove`, `sys.kill` | Removes files or directories or terminates processes. Replacing a whole directory counts as destroying it. |
 | `exec` | `exec.run`, `job.start`, `job.cancel`, `svc.start`, `svc.stop`, `svc.restart`, `proj.run`, `proj.clone`, `proj.pull` | Runs programs on the machine. **`exec` is as strong as the account**: `paths` does not contain what a command reads, writes, or launches. |
 | `power` | `power.sleep`, `power.restart`, `power.shutdown`, `power.cancel`, `power.wol`, `power.wake`, `power.switch` | Changes machine power state, calls a pending change off, or sends Wake-on-LAN packets. |
-| `admin` | `meta.init`, `meta.update`, `fleet.add`, `fleet.remove`, `fleet.install`, `fleet.sync`, `config.*`, `token.*`, `ext.define`, `ext.remove`, `agent.*` | Changes Legion itself: policy, tokens, fleet membership, extensions, synced config, agent registrations, and the binary. |
+| `admin` | `meta.init`, `meta.update`, `fleet.add`, `fleet.remove`, `fleet.install`, `fleet.sync`, `config.*`, `token.*`, `device.*`, `ext.define`, `ext.remove`, `agent.*` | Changes Legion itself: policy, tokens, paired devices, fleet membership, extensions, synced config, agent registrations, and the binary. |
 
 ### Legion's own files belong to `admin`
 
@@ -100,7 +100,7 @@ Even when a role has broad or unconfined `paths`, Legion refuses file-tool acces
 and directory transfers) — for a built-in list of well-known secret locations under `~` for every
 role that does not allow `effect:admin`:
 
-- **SSH and GPG**: `~/.ssh`, `~/.gnupg`.
+- **SSH and GPG**: `~/.ssh`, `~/.gnupg` (plus `%ProgramData%\ssh` on Windows and any path configured in `[devices] authorized_keys` in `node.toml`).
 - **Cloud, container, and git credentials**: `~/.aws`, `~/.azure`, `~/.kube`,
   `~/.docker/config.json`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/gcloud`.
 - **Password stores and keyrings**: `~/.password-store`, `~/.local/share/keyrings`,
@@ -184,6 +184,23 @@ forwarding, and PTY allocation. Whatever command the SSH client asks for, `sshd`
 never invokes a shell and never executes `SSH_ORIGINAL_COMMAND`: it compares it byte-for-byte
 against the exact command shapes Legion's SSH connector sends for `legion rpc` and `legion stream`,
 serves the session directly pinned to `<principal>`, and refuses anything else with exit code 1.
+
+### Paired devices
+
+A device paired with `legion pair` (`device.invite`) receives its own `authorized_keys` line forced
+through `legion gate --as <principal>` with `restrict`. Once paired, it can only speak `legion rpc`
+and `legion stream` pinned to `<principal>` — never an interactive shell, arbitrary command, PTY,
+or forwarding — and may do only what `<principal>`'s role in `policy.toml` allows (a real wall for
+roles without `exec`, and still as strong as the OS account if given `exec`). Requests naming a
+different `as` are ignored, and calls forwarded to other nodes with `on` are re-checked by each
+target node's own `policy.toml`.
+
+During pairing itself, the temporary key in the invite is single-use, carries sshd's `expiry-time`,
+is forced to `legion gate --enrol <id>` (ignoring `SSH_ORIGINAL_COMMAND`), and is removed as soon as
+enrolment completes or expires. Creating, listing, or removing invites and paired devices
+(`device.*`) requires `effect:admin`, follows the same caller-scoping and `allow_owner` rules as
+`token.*`, and refuses creating a permanent SSH key from an expiring HTTP bearer token. Removing a
+device with `legion device.remove` removes its `authorized_keys` line at once.
 
 ### HTTP bearer tokens and MCP sessions
 

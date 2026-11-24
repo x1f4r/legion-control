@@ -183,7 +183,7 @@ Setting `LEGION_HOME` overrides both directories with `$LEGION_HOME/config` and
 Files inside the configuration directory (all strict TOML — unknown keys are rejected):
 
 - `node.toml` — this machine's name, system name, busy probes, `[power]`, `[boot.<name>]`, `[svc]`,
-  and `[serve]`. Machine-local; never synced.
+  `[serve]`, and `[devices]`. Machine-local; never synced.
 - `fleet.toml` — other machines this node can reach.
 - `policy.toml` — principals, roles, allow/deny rules, and path confinement.
 - `projects.toml` — named projects, their per-machine directories, and tasks.
@@ -193,6 +193,7 @@ Files inside the configuration directory (all strict TOML — unknown keys are r
 Files inside the state directory:
 
 - `audit.jsonl` (and `audit.lock`) — append-only JSONL audit log of every call.
+- `devices.json` (and `devices.lock`) — non-secret metadata for paired devices and pending pairing invites.
 - `jobs/<id>/` — records, logs, and locks for detached background jobs.
 - `sync/sidecars/` and `sync/backups/` — BLAKE3 sync history and backups written by `fleet.sync`
   and `config.write`.
