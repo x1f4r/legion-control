@@ -158,11 +158,18 @@ less-trusted or compromised peer cannot inject keys onto the pushing node. Impor
 paired on another machine requires an explicit `fleet.sync direction=pull from=<peer>
 documents='["devices.toml"]'` as owner (while `fleet.sync direction=status`, `device.list`, and
 `meta.doctor` show which peers are out of date). At every merge, `name` and `role` merge
-independently by their own stamps so a stale rename never raises a lowered role, while disagreement
+independently by their own stamps so a stale rename never raises a lowered role (incoming pushes
+refuse older single-stamp entries and non-canonical timestamps; an equal-stamp, equal-origin role
+tie marks `role_conflict = true` and stays inactive until an owner resolves it with `device.set
+role=<role>`), while disagreement
 on immutable identity or provenance fields is flagged as a conflict (no `authorized_keys` line,
 warning, never newest-wins), incoming tombstones matching a local entry take their identity fields
 from that local entry, and local confirmations are preserved when a newer edit keeps the same
-identity and pairing provenance (or cleared with a warning otherwise). Pure tombstone saves and
+identity and pairing provenance (or cleared with a warning otherwise). Whenever live entries in a
+merge or push are refused for any reason (size reserve, principal or key collision, expiring
+credential, or old single-stamp format), the receiver still applies and reconciles any tombstones
+in that push (never refused for size) and reports the peer as `partial` (removals delivered, live
+changes refused, and why). Pure tombstone saves and
 merges are never refused for size; any change adding or altering a live entry must fit under 1 MiB
 with every live entry counted at its worst-case tombstone size (1,049 bytes, guaranteeing at least
 999 lifetime fleet devices even at maximum field lengths so removing every device always fits),

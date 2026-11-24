@@ -129,6 +129,11 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check);
     }
 
+    let role_conflicts = crate::device::registry::inspect_role_conflict_devices(ctx.paths());
+    if let Some(check) = check_role_conflict_devices(&role_conflicts) {
+        checks.push(check);
+    }
+
     let rollback_failures = crate::device::registry::inspect_rollback_failures(ctx.paths());
     if let Some(check) = check_config_rollback_failures(
         &rollback_failures,
@@ -284,6 +289,33 @@ pub fn check_immutable_conflict_devices(conflicts: &[(String, String)]) -> Optio
         ),
         hint: Some(
             "Inspect with `legion device.list`, remove each conflicted entry with `legion device.remove id=<pairing_id>`, and re-pair if needed."
+                .to_owned(),
+        ),
+    })
+}
+
+/// Builds a `meta.doctor` warning when one or more live paired devices in `devices.toml` have a
+/// role tie-break conflict (equal `(role_updated_at, role_updated_on)` with differing roles across
+/// peers).
+pub fn check_role_conflict_devices(conflicts: &[(String, String)]) -> Option<Check> {
+    if conflicts.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = conflicts
+        .iter()
+        .map(|(name, id)| format!("{name} ({id})"))
+        .collect();
+    Some(Check {
+        name: "role-conflicting device entries".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "{} paired device(s) have conflicting role updates with equal stamp and origin across peers and are blocked from connecting: {}.",
+            conflicts.len(),
+            items.join(", ")
+        ),
+        hint: Some(
+            "Inspect with `legion device.list`, then resolve each entry as owner with `legion device.set id=<pairing_id> role=<role>` or remove it with `legion device.remove id=<pairing_id>`."
                 .to_owned(),
         ),
     })

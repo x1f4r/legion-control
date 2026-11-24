@@ -2461,6 +2461,7 @@ device = \"{pad_id}\"
                 role_updated_at: now.clone(),
                 role_updated_on: "tower".to_owned(),
                 conflict: false,
+                role_conflict: false,
             },
         );
         let mut live_call = Call::new(

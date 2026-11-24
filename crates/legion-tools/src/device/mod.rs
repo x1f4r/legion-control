@@ -1002,6 +1002,19 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             )));
         }
 
+        if current_entry.role_conflict && new_role.is_none() {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "Device {} ({pairing_id}) has conflicting role updates with equal stamp and origin across peers; resolve the role conflict by passing `role=<role>` as owner.",
+                    current_entry.name
+                ),
+            )
+            .with_hint(format!(
+                "Resolve as owner with `legion device.set id={pairing_id} role=<role>`, or remove with `legion device.remove id={pairing_id}`."
+            )));
+        }
+
         let quarantine_removed_ts = if confirm {
             let quarantined_map = registry::quarantined_devices_with_timestamps(&devices_file);
             match quarantined_map.get(&pairing_id) {
@@ -1063,7 +1076,22 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                 )
                 .with_hint("Pair the device with `legion pair --name ... --role ...` so it gets its own registry-owned `device:<name>` principal."));
             }
-            if policy.device_owner(&current_entry.principal) != Some(pairing_id.as_str()) {
+            let policy_has_principal = policy
+                .principals
+                .keys()
+                .any(|p| p.as_str() == current_entry.principal);
+            let owned_by_this_pairing =
+                policy.device_owner(&current_entry.principal) == Some(pairing_id.as_str());
+            let can_provision_on_role_conflict = current_entry.role_conflict
+                && current_entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX)
+                && !policy_has_principal
+                && !devices_file.devices.iter().any(|(other_id, other)| {
+                    other_id != &pairing_id && other.principal == current_entry.principal
+                })
+                && !devices_file.removed.iter().any(|(tomb_id, tomb)| {
+                    tomb_id != &pairing_id && tomb.principal == current_entry.principal
+                });
+            if !owned_by_this_pairing && !can_provision_on_role_conflict {
                 return Err(ErrorBody::new(
                     ErrorCode::Denied,
                     format!(
@@ -1146,6 +1174,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                 updated_entry.role = Some(target_role.clone());
                 updated_entry.role_updated_at = ts.clone();
                 updated_entry.role_updated_on = valid_node_name.clone();
+                updated_entry.role_conflict = false;
                 Some(ts)
             } else {
                 None
@@ -1405,6 +1434,13 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
                         false,
                         Some(format!(
                             "not active here: conflicting immutable identity or pairing provenance across peers; remove with `legion device.remove id={id}`"
+                        )),
+                    )
+                } else if report.role_conflict_ids.contains(id) || entry.role_conflict {
+                    (
+                        false,
+                        Some(format!(
+                            "not active here: conflicting role updates with equal stamp and origin across peers; resolve as owner with `legion device.set id={id} role=<role>` or remove with `legion device.remove id={id}`"
                         )),
                     )
                 } else if let Some(reason) = report.quarantined_ids.get(id) {
@@ -2615,7 +2651,12 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     .await;
             let still_trusted: Vec<String> = fleet_outcomes
                 .iter()
-                .filter(|(_, outcome)| outcome.status != "synced")
+                .filter(|(_, outcome)| outcome.status != "synced" && outcome.status != "partial")
+                .map(|(machine, _)| machine.clone())
+                .collect();
+            let partial_peers: Vec<String> = fleet_outcomes
+                .iter()
+                .filter(|(_, outcome)| outcome.status == "partial")
                 .map(|(machine, _)| machine.clone())
                 .collect();
             if !still_trusted.is_empty() {
@@ -2623,9 +2664,21 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     Some(id) => format!("{} ({id})", target.device),
                     None => target.device.clone(),
                 };
-                removed.hint = Some(format!(
+                let mut hint = format!(
                     "These machines could not be reached and still trust {label} until their next sync: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` when they are back online.",
                     still_trusted.join(", ")
+                );
+                if !partial_peers.is_empty() {
+                    hint.push_str(&format!(
+                        " Removals were delivered to {}, though live device additions were refused there (see `fleet` for reasons).",
+                        partial_peers.join(", ")
+                    ));
+                }
+                removed.hint = Some(hint);
+            } else if !partial_peers.is_empty() {
+                removed.hint = Some(format!(
+                    "Removal was delivered to {}, though live device additions were refused there (see `fleet` for reasons).",
+                    partial_peers.join(", ")
                 ));
             }
             removed.fleet = fleet_outcomes;
@@ -4331,6 +4384,7 @@ allow = ["effect:read", "effect:write"]
                     role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
                     role_updated_on: "tower".to_owned(),
                     conflict: false,
+                    role_conflict: false,
                 },
             );
         }
@@ -4762,6 +4816,7 @@ allow = ["effect:read", "effect:write"]
                 role_updated_at: b_paired_at.clone(),
                 role_updated_on: "tower".to_owned(),
                 conflict: false,
+                role_conflict: false,
             },
         );
         let dev_a = devices_file.devices.remove(&id_a).unwrap();
@@ -5096,6 +5151,7 @@ device = \"{id_healthy}\"
                     role_updated_at: now.to_owned(),
                     role_updated_on: "tower".to_owned(),
                     conflict: false,
+                    role_conflict: false,
                 },
             );
         }
@@ -6015,6 +6071,168 @@ allow = [\"effect:read\", \"effect:write\"]
     }
 
     #[tokio::test]
+    async fn role_tie_conflict_is_blocked_until_owner_runs_device_set_role_while_immutable_conflict_stays_refused()
+     {
+        let h = Harness::new();
+        std::fs::write(
+            h.node.paths().config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[roles.editor]
+allow = [\"effect:read\", \"effect:write\"]
+
+[roles.helper]
+allow = [\"device.*\"]
+
+[principals.helper_user]
+role = \"helper\"
+",
+        )
+        .unwrap();
+
+        let invite = h
+            .call(
+                "device.invite",
+                json!({"name": "tablet", "role": "observer"}),
+            )
+            .await
+            .unwrap();
+        let invite_id = invite["id"].as_str().unwrap().to_owned();
+        let device_key = keys::ed25519_public_key_from_seed(&[0x59; 32]);
+        let req = format!(
+            "{{\"enrol\":1,\"id\":\"{invite_id}\",\"public_key\":\"{device_key}\",\"name\":\"tablet\"}}\n"
+        );
+        let enrol_reply = enrol::run_enrol(&h.node, &invite_id, req.as_bytes()).await;
+        assert!(enrol_reply.is_ok(), "{enrol_reply:?}");
+
+        // Produce a genuine equal-stamp, equal-origin role tie via merge_devices.
+        let base_bytes = std::fs::read(h.node.paths().config_file("devices.toml")).unwrap();
+        let side_a: DevicesFile =
+            legion_core::config::parse(&h.node.paths().config_file("devices.toml"), &base_bytes)
+                .unwrap();
+        let id = side_a.devices.keys().next().unwrap().clone();
+        let mut side_b = side_a.clone();
+        side_b.devices.get_mut(&id).unwrap().role = Some("editor".to_owned());
+        let tied = registry::merge_devices(&side_a, &side_b);
+        std::fs::write(
+            h.node.paths().config_file("devices.toml"),
+            tied.to_toml_string(),
+        )
+        .unwrap();
+        {
+            let _lock = registry::lock_config(h.node.paths()).unwrap();
+            let _ = registry::reconcile_device_principals_locked(h.node.paths(), &tied).unwrap();
+        }
+
+        // 1. `device.list` flags the role conflict, warns, and strips authorized_keys;
+        //    `meta.doctor` flags it too.
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        let item = listed["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == json!(id))
+            .unwrap();
+        assert!(
+            item["status"]
+                .as_str()
+                .is_some_and(|s| s.contains("device.set") && s.contains("role=")),
+            "expected role-conflict status with device.set role= hint: {item}"
+        );
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys).unwrap().contains(&id),
+            "role-conflicted device must have no authorized_keys line"
+        );
+        let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        assert!(
+            doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == json!("role-conflicting device entries")),
+            "expected meta.doctor role-conflict check: {doctor}"
+        );
+
+        // 2. Rename-only `device.set` without `role=` is REFUSED with Conflict.
+        let rename_err = h
+            .call("device.set", json!({"id": id, "rename": "tablet-2"}))
+            .await
+            .unwrap_err();
+        assert_eq!(rename_err.code, ErrorCode::Conflict, "{rename_err:?}");
+
+        // 3. Non-owner `device.set role=` is REFUSED with Denied.
+        let non_owner_err = h
+            .call_as(
+                "device.set",
+                "helper_user",
+                json!({"id": id, "role": "observer"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(non_owner_err.code, ErrorCode::Denied, "{non_owner_err:?}");
+
+        // 4. Owner `device.set id=<id> role=editor` resolves the role conflict, restores policy
+        //    and authorized_keys, and clears device.list + meta.doctor warnings!
+        let resolved = h
+            .call("device.set", json!({"id": id, "role": "editor"}))
+            .await
+            .unwrap();
+        assert_eq!(resolved["role"], json!("editor"), "{resolved}");
+        let pol: Policy = legion_core::config::parse(
+            &h.node.paths().config_file("policy.toml"),
+            &std::fs::read(h.node.paths().config_file("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pol.role_of("device:tablet").0, "editor");
+        assert!(
+            std::fs::read_to_string(&h.auth_keys).unwrap().contains(&id),
+            "resolving role conflict via owner device.set role= must restore authorized_keys line"
+        );
+        let listed_after = h.call("device.list", json!({})).await.unwrap();
+        let item_after = listed_after["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == json!(id))
+            .unwrap();
+        assert!(
+            item_after.get("status").is_none(),
+            "resolved device should have no conflict status: {item_after}"
+        );
+        let doctor_after = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        assert!(
+            !doctor_after["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == json!("role-conflicting device entries")),
+            "meta.doctor must clear role-conflict warning after resolution: {doctor_after}"
+        );
+
+        // 5. Immutable conflict MUST still refuse even owner `device.set role=`.
+        let mut imm_conflicted: DevicesFile = legion_core::config::parse(
+            &h.node.paths().config_file("devices.toml"),
+            &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        imm_conflicted.devices.get_mut(&id).unwrap().conflict = true;
+        std::fs::write(
+            h.node.paths().config_file("devices.toml"),
+            imm_conflicted.to_toml_string(),
+        )
+        .unwrap();
+        let imm_err = h
+            .call("device.set", json!({"id": id, "role": "observer"}))
+            .await
+            .unwrap_err();
+        assert_eq!(imm_err.code, ErrorCode::Conflict, "{imm_err:?}");
+    }
+
+    #[tokio::test]
     async fn f2_owner_remove_succeeds_at_one_mib_and_live_addition_respects_tombstone_reserve() {
         use crate::device::enrol::run_enrol;
         use crate::device::keys::ed25519_public_key_from_seed;
@@ -6065,6 +6283,7 @@ role = \"owner\"
             role_updated_at: ts.to_owned(),
             role_updated_on: "a".to_owned(),
             conflict: false,
+            role_conflict: false,
         };
         let make_tomb = |idx: u32, pad_len: usize| DeviceTombstone {
             name: format!("d{idx:04}-{}", "p".repeat(pad_len)),
