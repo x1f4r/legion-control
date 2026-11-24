@@ -11,6 +11,7 @@ on:
       - rust-toolchain.toml
       - LICENSE
       - crates/**
+      - apps/ui/**
       - packaging/**
       - scripts/legion-distro-test.sh
       - .github/workflows/legion-packages.yml
@@ -21,6 +22,7 @@ on:
       - rust-toolchain.toml
       - LICENSE
       - crates/**
+      - apps/ui/**
       - packaging/**
       - scripts/legion-distro-test.sh
       - .github/workflows/legion-packages.yml
