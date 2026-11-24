@@ -55,6 +55,9 @@ pub(super) const MAX_LOG_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub(super) const LOCK_FILE: &str = "lock";
 /// Cancel request marker file polled by the supervisor.
 pub(super) const CANCEL_FILE: &str = "cancel";
+/// Prefix used for atomic tombstone renames when pruning expired or excess job directories.
+/// Leading `.` cannot occur in any validated job id.
+const TOMBSTONE_PREFIX: &str = ".deleting-";
 
 /// Maximum number of finished jobs retained when starting a new job.
 pub(super) const RETENTION_MAX_FINISHED: usize = 200;
@@ -923,6 +926,13 @@ pub(super) fn load_all_records(state_dir: &Path) -> Result<Vec<(PathBuf, JobReco
     let mut records = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else { continue };
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(TOMBSTONE_PREFIX))
+        {
+            continue;
+        }
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -984,9 +994,14 @@ pub(super) fn compare_newest_first(a: &JobRecord, b: &JobRecord) -> std::cmp::Or
 
 /// Removes finished jobs beyond [`RETENTION_MAX_FINISHED`] or finished more than 30 days ago.
 ///
-/// Running and starting jobs are never removed. Called under the node-wide jobs lock on
-/// `job.start`.
+/// Running and starting jobs are never removed. Each pruned directory is first renamed atomically
+/// to a `.deleting-*` tombstone before removal so a concurrent reader (especially on Windows)
+/// never leaves a half-deleted directory without `job.json`; leftover tombstones are swept on
+/// every pass. Called under the node-wide jobs lock on `job.start`.
 pub(super) fn prune_retention(state_dir: &Path, now: jiff::Timestamp) {
+    let root = jobs_dir(state_dir);
+    sweep_tombstones(&root);
+
     let Ok(records) = load_all_records(state_dir) else {
         return;
     };
@@ -1012,15 +1027,39 @@ pub(super) fn prune_retention(state_dir: &Path, now: jiff::Timestamp) {
     terminal.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     let now_ms = now.as_millisecond();
 
-    for (index, (stamp_ms, _id, dir)) in terminal.into_iter().enumerate() {
+    for (index, (stamp_ms, id, dir)) in terminal.into_iter().enumerate() {
         let too_many = index >= RETENTION_MAX_FINISHED;
         let too_old = now_ms.saturating_sub(stamp_ms) > RETENTION_MAX_AGE_MS;
         if too_many || too_old {
-            // Double-check the supervisor lock is not held before deleting the directory.
+            // Double-check the supervisor lock is not held before renaming the directory.
             if !probe_lock(&dir).1 {
-                let _ = fs::remove_dir_all(&dir);
+                remove_job_dir_with_tombstone(&root, &dir, &id);
             }
         }
+    }
+}
+
+fn sweep_tombstones(jobs_root: &Path) {
+    let Ok(entries) = fs::read_dir(jobs_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(TOMBSTONE_PREFIX))
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn remove_job_dir_with_tombstone(jobs_root: &Path, dir: &Path, id: &str) {
+    let tombstone = jobs_root.join(format!("{TOMBSTONE_PREFIX}{id}-{}", generate_job_id()));
+    // If renaming fails (for example a Windows reader holds a file open inside `dir`), leave the
+    // directory intact so `job.json` stays valid until the next retention pass retries.
+    if fs::rename(dir, &tombstone).is_ok() {
+        let _ = fs::remove_dir_all(&tombstone);
     }
 }
 
@@ -1162,5 +1201,24 @@ mod tests {
         let summary = command_summary(&rec);
         assert_eq!(summary.chars().count(), 201);
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn tombstones_are_ignored_on_read_and_swept_on_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        let root = jobs_dir(state_dir);
+        let stale = root.join(format!("{TOMBSTONE_PREFIX}leftover"));
+        fs::create_dir_all(&stale).unwrap();
+        write_job_record(
+            &stale,
+            &sample_record("leftover", "2026-01-01T00:00:00.000Z", "b"),
+        )
+        .unwrap();
+        fs::write(stale.join(LOG_FILE), b"partial").unwrap();
+
+        assert!(load_all_records(state_dir).unwrap().is_empty());
+        prune_retention(state_dir, jiff::Timestamp::now());
+        assert!(!stale.exists());
     }
 }

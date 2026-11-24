@@ -1381,6 +1381,30 @@ async fn retention_prunes_old_and_excess_finished_jobs_only() {
     let old_str = old_ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     write_synthetic_finished_job(&jobs_root, "expired-old", &old_str, &old_str, &boot);
 
+    // Seed a leftover `.deleting-*` tombstone directory containing a `job.json` and `output.log`:
+    // `job.list` must ignore it and the next `job.start` retention pass must sweep it.
+    let tombstone = jobs_root.join(".deleting-stale-tombstone");
+    write_synthetic_finished_job(
+        &jobs_root,
+        ".deleting-stale-tombstone",
+        &old_str,
+        &old_str,
+        &boot,
+    );
+    fs::write(tombstone.join("output.log"), b"leftover").unwrap();
+    let before_list = fixture
+        .call("job.list", json!({"limit": 500}))
+        .await
+        .unwrap();
+    assert!(
+        !before_list["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == json!(".deleting-stale-tombstone")),
+        "job.list must ignore tombstone directories"
+    );
+
     // Starting a new job triggers retention pruning.
     let fresh = fixture
         .call("job.start", support_helper_args("args", &["trigger"]))
@@ -1393,7 +1417,16 @@ async fn retention_prunes_old_and_excess_finished_jobs_only() {
         .await
         .unwrap();
 
-    // The 31-day-old job and the 3 oldest excess finished jobs are gone; the newest 200 survive.
+    // The leftover tombstone, 31-day-old job, and 3 oldest excess finished jobs are gone; no
+    // `.deleting-*` tombstones remain; the newest 200 survive.
+    assert!(!tombstone.exists(), "tombstone directory was not swept");
+    assert!(
+        !fs::read_dir(&jobs_root)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(".deleting-")),
+        "leftover tombstone remained after retention"
+    );
     assert!(!jobs_root.join("expired-old").exists());
     for oldest in &seeded_recent[..3] {
         assert!(!jobs_root.join(oldest).exists(), "{oldest} was not pruned");
