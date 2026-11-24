@@ -419,7 +419,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
                     let meta = state.devices.get(name);
                     let resolved_principal = meta
                         .map(|m| m.principal.clone())
-                        .or_else(|| principal.clone());
+                        .unwrap_or_else(|| principal.clone());
                     let fingerprint = fingerprint_key_b64(key_b64)
                         .or_else(|| meta.map(|m| m.fingerprint.clone()))
                         .unwrap_or_else(|| "unknown".to_owned());
@@ -467,18 +467,12 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
 
     let devices = raw_devices
         .into_iter()
-        .filter_map(|(name, principal, fingerprint, added)| {
-            let principal = match principal {
-                Some(p) if caller.may_manage(&p) => p,
-                None if caller.is_owner() => "unknown".to_owned(),
-                _ => return None,
-            };
-            Some(ListedDevice {
-                name,
-                principal,
-                fingerprint,
-                added,
-            })
+        .filter(|(_, principal, _, _)| caller.may_manage(principal))
+        .map(|(name, principal, fingerprint, added)| ListedDevice {
+            name,
+            principal,
+            fingerprint,
+            added,
         })
         .collect();
 
@@ -611,18 +605,13 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                                     .devices
                                     .get(line_name)
                                     .map(|m| m.principal.clone())
-                                    .or_else(|| principal.clone());
-                                let can_manage = match resolved.as_deref() {
-                                    Some(p) => caller.may_manage(p),
-                                    None => caller.is_owner(),
-                                };
-                                if can_manage {
-                                    let p = resolved.unwrap_or_else(|| "unknown".to_owned());
+                                    .unwrap_or_else(|| principal.clone());
+                                if caller.may_manage(&resolved) {
                                     visible_names
                                         .entry(line_name.clone())
-                                        .or_insert_with(|| p.clone());
+                                        .or_insert_with(|| resolved.clone());
                                     if line_name == name {
-                                        matched_principal.get_or_insert(p);
+                                        matched_principal.get_or_insert(resolved);
                                         matched_lines += 1;
                                     }
                                 }
@@ -1628,5 +1617,32 @@ role = "owner"
         // The original non-UTF-8 foreign line must remain untouched byte-for-byte.
         let after = std::fs::read(&h.auth_keys).unwrap();
         assert!(after.starts_with(&foreign_raw));
+    }
+
+    #[tokio::test]
+    async fn hand_written_and_legacy_no_device_lines_are_untouchable_foreign() {
+        let h = Harness::new();
+        let key1 = generate_ephemeral_ed25519().unwrap();
+        let key2 = generate_ephemeral_ed25519().unwrap();
+        let hand_written = format!("{} legion-device:handwritten\n", key1.public_key);
+        let legacy_no_device = format!(
+            "restrict,command=\"/home/me/legion gate --as phone\" {} legion-device:legacy\n",
+            key2.public_key
+        );
+        let initial = format!("{hand_written}{legacy_no_device}");
+        std::fs::write(&h.auth_keys, &initial).unwrap();
+
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        assert_eq!(listed["devices"].as_array().unwrap().len(), 0);
+        assert_eq!(listed["invites"].as_array().unwrap().len(), 0);
+
+        for name in ["handwritten", "legacy"] {
+            let err = h
+                .call("device.remove", json!({"name": name}))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::NotFound, "{name}");
+        }
+        assert_eq!(std::fs::read_to_string(&h.auth_keys).unwrap(), initial);
     }
 }

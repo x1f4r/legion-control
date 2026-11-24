@@ -1,7 +1,8 @@
 //! Safe reading, parsing, quoting, and atomic editing of OpenSSH `authorized_keys` files.
 //!
 //! Guarantees:
-//! - Only lines whose comment begins with `legion-invite:` or `legion-device:` are ever touched.
+//! - Only lines carrying `restrict`, an exact `legion gate` forced command, and a matching
+//!   `legion-invite:<id>` or `legion-device:<name>` comment are ever touched.
 //! - Every foreign line, comment, blank line, line ending, and missing trailing newline is
 //!   preserved byte for byte.
 //! - On Unix, `~/.ssh` is kept or set to mode `0o700` and `authorized_keys` to mode `0o600`
@@ -825,9 +826,10 @@ pub fn format_device_line(
 pub enum LineKind {
     /// Any line not managed by Legion (comments, blank lines, user keys); preserved byte for byte.
     Foreign,
-    /// Temporary invite line whose comment starts with `legion-invite:`.
+    /// Temporary invite line with `restrict`, an exact `legion gate --enrol <id>` command, and a
+    /// matching `legion-invite:<id>` comment.
     Invite {
-        /// Invite id after `legion-invite:`.
+        /// Invite id after `legion-invite:` (matches `--enrol <id>`).
         id: String,
         /// Base64 key blob on the line.
         key_b64: String,
@@ -838,14 +840,15 @@ pub enum LineKind {
         /// Pinned `--account` name extracted from the forced command, when present.
         account: Option<String>,
     },
-    /// Paired device line whose comment starts with `legion-device:`.
+    /// Paired device line with `restrict`, an exact `legion gate --as <principal> --device <name>`
+    /// command, and a matching `legion-device:<name>` comment.
     Device {
-        /// Device name after `legion-device:`.
+        /// Device name after `legion-device:` (matches `--device <name>`).
         name: String,
         /// Base64 key blob on the line.
         key_b64: String,
-        /// Principal extracted from `command="... gate --as <principal>"`, when parseable.
-        principal: Option<String>,
+        /// Principal extracted from `command="... gate --as <principal> --device <name>"`.
+        principal: String,
         /// Pinned `--home` path extracted from the forced command, when present.
         home: Option<String>,
         /// Pinned `--account` name extracted from the forced command, when present.
@@ -1290,6 +1293,12 @@ fn classify_line(raw: &[u8]) -> LineKind {
     }
 
     let (options_bytes, rest) = split_options_and_rest_bytes(trimmed);
+    let Some(options_bytes) = options_bytes else {
+        return LineKind::Foreign;
+    };
+    let Ok(options_str) = std::str::from_utf8(options_bytes) else {
+        return LineKind::Foreign;
+    };
     let Some((key_type, after_type)) = split_ws_token_bytes(rest) else {
         return LineKind::Foreign;
     };
@@ -1305,44 +1314,66 @@ fn classify_line(raw: &[u8]) -> LineKind {
     let Ok(comment_raw) = std::str::from_utf8(after_key) else {
         return LineKind::Foreign;
     };
-    let options = options_bytes.and_then(|b| std::str::from_utf8(b).ok());
     let comment = comment_raw.trim_end_matches([' ', '\t']);
-    let parsed_cmd = options
-        .and_then(|opts| extract_option_value(opts, "command"))
-        .map(|cmd| parse_gate_command_flags(&cmd));
+
+    let Some(parsed_opts) = parse_openssh_options(options_str) else {
+        return LineKind::Foreign;
+    };
+    let has_restrict = parsed_opts
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("restrict") && v.is_none());
+    if !has_restrict {
+        return LineKind::Foreign;
+    }
+
+    let mut command_values = parsed_opts
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("command"));
+    let Some((_, Some(command))) = command_values.next() else {
+        return LineKind::Foreign;
+    };
+    if command_values.next().is_some() {
+        return LineKind::Foreign;
+    }
+
+    let Some(parsed_cmd) = parse_exact_gate_command(command) else {
+        return LineKind::Foreign;
+    };
+
     if let Some(id) = comment.strip_prefix(INVITE_COMMENT_PREFIX)
         && !id.is_empty()
         && !id.chars().any(char::is_whitespace)
+        && let GateCommandMode::Invite { id: ref cmd_id } = parsed_cmd.mode
+        && cmd_id == id
     {
-        let expiry_time = options.and_then(|opts| extract_option_value(opts, "expiry-time"));
-        let (home, account) = match parsed_cmd {
-            Some(flags) => (flags.home, flags.account),
-            None => (None, None),
-        };
+        let expiry_time = parsed_opts
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("expiry-time"))
+            .and_then(|(_, v)| v.clone());
         return LineKind::Invite {
             id: id.to_owned(),
             key_b64: key_b64.to_owned(),
             expiry_time,
-            home,
-            account,
+            home: parsed_cmd.home,
+            account: parsed_cmd.account,
         };
     }
+
     if let Some(name) = comment.strip_prefix(DEVICE_COMMENT_PREFIX)
         && !name.is_empty()
         && !name.chars().any(char::is_whitespace)
+        && let GateCommandMode::Device { principal, device } = parsed_cmd.mode
+        && device == name
     {
-        let (principal, home, account) = match parsed_cmd {
-            Some(flags) => (flags.principal, flags.home, flags.account),
-            None => (None, None, None),
-        };
         return LineKind::Device {
             name: name.to_owned(),
             key_b64: key_b64.to_owned(),
             principal,
-            home,
-            account,
+            home: parsed_cmd.home,
+            account: parsed_cmd.account,
         };
     }
+
     LineKind::Foreign
 }
 
@@ -1412,25 +1443,35 @@ fn is_known_ssh_key_type_bytes(token: &[u8]) -> bool {
     ) || token.ends_with(b"-cert-v01@openssh.com")
 }
 
-/// Extracts and unquotes the value of `key="..."` from an OpenSSH options string.
-fn extract_option_value(options: &str, key: &str) -> Option<String> {
+/// Parses an OpenSSH `authorized_keys` options list into `(name, optional_value)` pairs.
+///
+/// Rejects malformed options such as unclosed double quotes or trailing characters after a quoted
+/// option value.
+fn parse_openssh_options(options: &str) -> Option<Vec<(String, Option<String>)>> {
     let bytes = options.as_bytes();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        while i < bytes.len() && bytes[i] == b',' {
-            i += 1;
-        }
         let name_start = i;
         while i < bytes.len() && bytes[i] != b'=' && bytes[i] != b',' {
             i += 1;
         }
         let name = &options[name_start..i];
+        if name.is_empty() {
+            return None;
+        }
         if i < bytes.len() && bytes[i] == b'=' {
             i += 1;
             if i < bytes.len() && bytes[i] == b'"' {
                 i += 1;
                 let mut val = String::new();
-                while i < bytes.len() && bytes[i] != b'"' {
+                let mut closed = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
                     if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'"') {
                         val.push('"');
                         i += 2;
@@ -1440,91 +1481,169 @@ fn extract_option_value(options: &str, key: &str) -> Option<String> {
                         i += ch.len_utf8();
                     }
                 }
-                if i < bytes.len() && bytes[i] == b'"' {
+                if !closed {
+                    return None;
+                }
+                if i < bytes.len() {
+                    if bytes[i] != b',' {
+                        return None;
+                    }
                     i += 1;
+                    if i == bytes.len() {
+                        return None;
+                    }
                 }
-                if name.eq_ignore_ascii_case(key) {
-                    return Some(val);
-                }
+                out.push((name.to_owned(), Some(val)));
             } else {
                 let val_start = i;
                 while i < bytes.len() && bytes[i] != b',' {
                     i += 1;
                 }
-                if name.eq_ignore_ascii_case(key) {
-                    return Some(options[val_start..i].to_owned());
+                out.push((name.to_owned(), Some(options[val_start..i].to_owned())));
+                if i < bytes.len() {
+                    i += 1;
+                    if i == bytes.len() {
+                        return None;
+                    }
+                }
+            }
+        } else {
+            out.push((name.to_owned(), None));
+            if i < bytes.len() {
+                i += 1;
+                if i == bytes.len() {
+                    return None;
                 }
             }
         }
     }
-    None
+    Some(out)
 }
 
-#[derive(Default)]
-struct GateCommandFlags {
-    principal: Option<String>,
+enum GateCommandMode {
+    Device { principal: String, device: String },
+    Invite { id: String },
+}
+
+struct ParsedGateCommand {
+    mode: GateCommandMode,
     home: Option<String>,
     account: Option<String>,
 }
 
-/// Parses `legion gate` flag values (`--as`, `--home`, `--account`, ...) out of an unescaped
-/// forced command string, handling POSIX single quotes, PowerShell `& '...'` (with `''`), and
-/// Windows `"..."`.
-fn parse_gate_command_flags(command: &str) -> GateCommandFlags {
-    let tokens = split_forced_command_tokens(command);
-    let Some(gate_pos) = tokens.iter().position(|t| t == "gate") else {
-        return GateCommandFlags::default();
-    };
-    let mut flags = GateCommandFlags::default();
-    let mut i = gate_pos + 1;
-    while i < tokens.len() {
-        let token = &tokens[i];
-        if let Some(value) = token.strip_prefix("--as=") {
-            if Principal::parse(value).is_ok() {
-                flags.principal = Some(value.to_owned());
-            }
-            i += 1;
-        } else if token == "--as" {
-            if let Some(value) = tokens.get(i + 1)
-                && Principal::parse(value).is_ok()
-            {
-                flags.principal = Some(value.clone());
-            }
-            i += 2;
-        } else if let Some(value) = token.strip_prefix("--home=") {
-            if !value.is_empty() {
-                flags.home = Some(value.to_owned());
-            }
-            i += 1;
-        } else if token == "--home" {
-            if let Some(value) = tokens.get(i + 1)
-                && !value.is_empty()
-            {
-                flags.home = Some(value.clone());
-            }
-            i += 2;
-        } else if let Some(value) = token.strip_prefix("--account=") {
-            if validate_account_name(value).is_ok() {
-                flags.account = Some(value.to_owned());
-            }
-            i += 1;
-        } else if token == "--account" {
-            if let Some(value) = tokens.get(i + 1)
-                && validate_account_name(value).is_ok()
-            {
-                flags.account = Some(value.clone());
-            }
-            i += 2;
-        } else {
-            i += 1;
-        }
+fn exe_looks_like_legion(exe: &str) -> bool {
+    let path = Path::new(exe);
+    if !path.is_absolute() && !looks_windows_absolute(path) {
+        return false;
     }
-    flags
+    let basename = exe.rsplit(['/', '\\']).next().unwrap_or("");
+    let stem = basename
+        .strip_suffix(".exe")
+        .or_else(|| basename.strip_suffix(".EXE"))
+        .unwrap_or(basename);
+    let lower = stem.to_ascii_lowercase();
+    lower == "legion" || lower.starts_with("legion-") || lower.starts_with("legion_")
 }
 
-/// Splits an unescaped forced command into argv-like tokens, supporting POSIX `'...'` (with
-/// `'\''`), PowerShell `'...'` (with `''`), and `"..."` double-quoted segments.
-fn split_forced_command_tokens(command: &str) -> Vec<String> {
+/// Strictly parses an unescaped forced command and returns `Some` only when it is an exact
+/// `legion gate --as <principal> --device <name>` or `legion gate --enrol <id>` invocation with
+/// no unknown flags, extra arguments, duplicate flags, or shell operators.
+fn parse_exact_gate_command(command: &str) -> Option<ParsedGateCommand> {
+    let tokens = split_forced_command_tokens_strict(command)?;
+    let (exe, subcmd, rest) = if tokens.first().map(String::as_str) == Some("&") {
+        if tokens.len() < 3 {
+            return None;
+        }
+        (&tokens[1], &tokens[2], &tokens[3..])
+    } else {
+        if tokens.len() < 2 {
+            return None;
+        }
+        (&tokens[0], &tokens[1], &tokens[2..])
+    };
+    if !exe_looks_like_legion(exe) || subcmd != "gate" {
+        return None;
+    }
+
+    let mut principal: Option<String> = None;
+    let mut device: Option<String> = None;
+    let mut enrol_id: Option<String> = None;
+    let mut home: Option<String> = None;
+    let mut account: Option<String> = None;
+
+    let mut i = 0;
+    while i < rest.len() {
+        let token = &rest[i];
+        let (flag, value, step) = if let Some((k, v)) = token.split_once('=') {
+            (k, v, 1)
+        } else {
+            let v = rest.get(i + 1)?;
+            (token.as_str(), v.as_str(), 2)
+        };
+        match flag {
+            "--as" => {
+                if principal.is_some() || Principal::parse(value).is_err() {
+                    return None;
+                }
+                principal = Some(value.to_owned());
+            }
+            "--device" => {
+                if device.is_some()
+                    || value.is_empty()
+                    || value.chars().any(|c| c.is_control() || c.is_whitespace())
+                {
+                    return None;
+                }
+                device = Some(value.to_owned());
+            }
+            "--enrol" => {
+                if enrol_id.is_some()
+                    || value.is_empty()
+                    || value.chars().any(|c| c.is_control() || c.is_whitespace())
+                {
+                    return None;
+                }
+                enrol_id = Some(value.to_owned());
+            }
+            "--home" => {
+                let p = Path::new(value);
+                if home.is_some()
+                    || value.is_empty()
+                    || (!p.is_absolute() && !looks_windows_absolute(p))
+                {
+                    return None;
+                }
+                home = Some(value.to_owned());
+            }
+            "--account" => {
+                if account.is_some() || validate_account_name(value).is_err() {
+                    return None;
+                }
+                account = Some(value.to_owned());
+            }
+            _ => return None,
+        }
+        i += step;
+    }
+
+    let mode = match (principal, device, enrol_id) {
+        (Some(principal), Some(device), None) => GateCommandMode::Device { principal, device },
+        (None, None, Some(id)) => GateCommandMode::Invite { id },
+        _ => return None,
+    };
+    Some(ParsedGateCommand {
+        mode,
+        home,
+        account,
+    })
+}
+
+/// Strictly splits an unescaped forced command into argv-like tokens, supporting POSIX `'...'`
+/// (with `'\''`), PowerShell `& '...'` (with `''`), and Windows `cmd.exe` `"..."` segments.
+///
+/// Returns `None` on unclosed quotes or unquoted shell operators/metacharacters.
+fn split_forced_command_tokens_strict(command: &str) -> Option<Vec<String>> {
+    let is_powershell = command.starts_with("& ") || command.starts_with("&\t");
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
@@ -1543,38 +1662,66 @@ fn split_forced_command_tokens(command: &str) -> Vec<String> {
             '\'' => {
                 in_token = true;
                 i += 1;
+                let mut closed = false;
                 while i < chars.len() {
                     if chars[i] == '\'' {
-                        if chars.get(i + 1) == Some(&'\'') {
+                        if is_powershell && chars.get(i + 1) == Some(&'\'') {
                             // PowerShell doubled single quote inside '...'.
                             current.push('\'');
                             i += 2;
                         } else {
                             i += 1;
+                            closed = true;
                             break;
                         }
                     } else {
+                        if chars[i].is_control() {
+                            return None;
+                        }
                         current.push(chars[i]);
                         i += 1;
                     }
+                }
+                if !closed {
+                    return None;
                 }
             }
             '"' => {
                 in_token = true;
                 i += 1;
-                while i < chars.len() && chars[i] != '"' {
+                let mut closed = false;
+                while i < chars.len() {
+                    if chars[i] == '"' {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                    if chars[i].is_control() {
+                        return None;
+                    }
                     current.push(chars[i]);
                     i += 1;
                 }
-                if i < chars.len() && chars[i] == '"' {
-                    i += 1;
+                if !closed {
+                    return None;
                 }
             }
-            '\\' if chars.get(i + 1) == Some(&'\'') => {
+            '\\' if !is_powershell && chars.get(i + 1) == Some(&'\'') => {
                 in_token = true;
                 current.push('\'');
                 i += 2;
             }
+            '&' if is_powershell
+                && tokens.is_empty()
+                && !in_token
+                && matches!(chars.get(i + 1), Some(' ' | '\t')) =>
+            {
+                tokens.push("&".to_owned());
+                i += 1;
+            }
+            ';' | '|' | '<' | '>' | '`' | '$' | '(' | ')' | '&' | '*' | '?' | '{' | '}' | '['
+            | ']' | '!' | '#' => return None,
+            c if c.is_control() => return None,
             _ => {
                 in_token = true;
                 current.push(ch);
@@ -1585,7 +1732,7 @@ fn split_forced_command_tokens(command: &str) -> Vec<String> {
     if in_token {
         tokens.push(current);
     }
-    tokens
+    Some(tokens)
 }
 
 /// Returns `true` when a line's pinned `--account` matches `caller_account`.
@@ -1781,12 +1928,12 @@ mod tests {
             &parsed_ps.lines[0].kind,
             LineKind::Device {
                 name,
-                principal: Some(p),
+                principal,
                 home: Some(h),
                 account: Some(a),
                 ..
             } if name == "pixel"
-                && p == "agent:example"
+                && principal == "agent:example"
                 && h == r"C:\Users\me\O'Neil\Legion Home"
                 && a == "O'Neil"
         ));
@@ -1812,7 +1959,7 @@ mod tests {
 
     #[test]
     fn foreign_lines_comments_and_missing_trailing_newline_are_preserved_byte_for_byte() {
-        let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:pixel\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
+        let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone --device pixel\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:pixel\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
         let mut parsed = AuthKeysFile::parse(initial);
         assert_eq!(parsed.lines.len(), 5);
         assert_eq!(parsed.lines[0].kind, LineKind::Foreign);
@@ -1820,7 +1967,7 @@ mod tests {
         assert_eq!(parsed.lines[2].kind, LineKind::Foreign);
         assert!(matches!(
             &parsed.lines[3].kind,
-            LineKind::Device { name, principal: Some(p), .. } if name == "pixel" && p == "phone"
+            LineKind::Device { name, principal, .. } if name == "pixel" && principal == "phone"
         ));
         assert_eq!(parsed.lines[4].kind, LineKind::Foreign);
 
@@ -1841,7 +1988,7 @@ mod tests {
     fn appending_to_file_without_trailing_newline_inserts_separator() {
         let initial = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 foreign";
         let mut parsed = AuthKeysFile::parse(initial);
-        parsed.append_line("restrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:tablet");
+        parsed.append_line("restrict,command=\"/home/me/legion gate --as phone --device tablet\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:tablet");
         let bytes = parsed.to_bytes();
         let text = std::str::from_utf8(&bytes).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -1995,7 +2142,7 @@ Match Group users
         let (mut file, stamp) = read_auth_keys_stamped(&auth_file).unwrap();
         std::fs::write(&auth_file, "# initial\n# concurrent hand edit\n").unwrap();
         file.append_line(
-            "restrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 legion-device:a",
+            "restrict,command=\"/home/me/legion gate --as phone --device a\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 legion-device:a",
         );
         let outcome =
             write_auth_keys_if_unchanged(&target, &auth_file, &file.to_bytes(), &stamp).unwrap();
@@ -2014,7 +2161,7 @@ Match Group users
             |mut auth| {
                 attempts += 1;
                 auth.append_line(
-                    "restrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:b",
+                    "restrict,command=\"/home/me/legion gate --as phone --device b\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:b",
                 );
                 Ok((Some(auth), ()))
             },
@@ -2233,5 +2380,93 @@ Match Group users
         assert_eq!(parsed_opts.lines[0].kind, LineKind::Foreign);
         assert!(parsed_opts.contains_key_blob(&blob));
         assert_eq!(parsed_opts.to_bytes(), raw_with_opts);
+    }
+
+    #[test]
+    fn strict_classification_requires_restrict_and_exact_gate_command_with_matching_id() {
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000";
+        let cases = [
+            // Hand-written key carrying a legion-device comment without forced command / restrict.
+            format!("{key} legion-device:handwritten\n"),
+            // Hand-written forced command missing `restrict`.
+            format!(
+                "command=\"/home/me/legion gate --as phone --device pixel\" {key} legion-device:pixel\n"
+            ),
+            // `restrict` only inside a quoted option value, not as a bare option.
+            format!(
+                "environment=\"FOO=restrict\",command=\"/home/me/legion gate --as phone --device pixel\" {key} legion-device:pixel\n"
+            ),
+            // Earlier-branch line missing `--device <name>` is not recognised as a Legion line.
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone\" {key} legion-device:legacy\n"
+            ),
+            // Mismatched `--device` vs comment name.
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device other\" {key} legion-device:pixel\n"
+            ),
+            // Shell chaining / metacharacters appended to gate command.
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel; id\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel && id\" {key} legion-device:pixel\n"
+            ),
+            // Unknown flag or extra positional argument.
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel --unknown\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device pixel extra\" {key} legion-device:pixel\n"
+            ),
+            // Duplicate `command=` option.
+            format!(
+                "restrict,command=\"/bin/sh\",command=\"/home/me/legion gate --as phone --device pixel\" {key} legion-device:pixel\n"
+            ),
+            // Wrong executable (not legion).
+            format!(
+                "restrict,command=\"/usr/bin/other gate --as phone --device pixel\" {key} legion-device:pixel\n"
+            ),
+            // Hand-written invite comment without restrict or with mismatched --enrol id.
+            format!("{key} legion-invite:abc123\n"),
+            format!("command=\"/home/me/legion gate --enrol abc123\" {key} legion-invite:abc123\n"),
+            format!(
+                "restrict,command=\"/home/me/legion gate --enrol other\" {key} legion-invite:abc123\n"
+            ),
+            // Device comment paired with --enrol command, or invite comment paired with --as command.
+            format!(
+                "restrict,command=\"/home/me/legion gate --enrol pixel\" {key} legion-device:pixel\n"
+            ),
+            format!(
+                "restrict,command=\"/home/me/legion gate --as phone --device abc123\" {key} legion-invite:abc123\n"
+            ),
+        ];
+
+        for raw in cases {
+            let parsed = AuthKeysFile::parse(raw.as_bytes());
+            assert_eq!(parsed.lines.len(), 1);
+            assert_eq!(
+                parsed.lines[0].kind,
+                LineKind::Foreign,
+                "line must be classified as Foreign: {raw}"
+            );
+        }
+
+        // Exact valid device and invite lines ARE classified properly.
+        let valid_device = format_device_line(
+            Path::new("/home/me/.local/bin/legion"),
+            "phone",
+            key,
+            "pixel",
+            Some(Path::new("/home/me/legion")),
+            None,
+            ForcedCommandShell::Posix,
+        )
+        .unwrap();
+        let parsed_dev = AuthKeysFile::parse(format!("{valid_device}\n").as_bytes());
+        assert!(matches!(
+            &parsed_dev.lines[0].kind,
+            LineKind::Device { name, .. } if name == "pixel"
+        ));
     }
 }
