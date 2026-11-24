@@ -7,10 +7,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use legion_link::{
-    CancellationToken, DeviceKey, Invite, Link, LinkConfig, NodeLink as LinkNode, SshTimeouts,
-    enrol,
-};
+use legion_link::{DeviceKey, Invite, Link, LinkConfig, NodeLink as LinkNode};
 use serde_json::Value;
 use tauri::ipc::Channel;
 use tokio::sync::Mutex as AsyncMutex;
@@ -52,16 +49,30 @@ impl LinkBackend {
     /// explicitly archives the damaged file via [`Backend::repair_store`].
     pub fn from_store(store: AppStore) -> Self {
         let local_program = discover_local_legion();
-        Self::init(store, local_program)
+        Self::init(store, local_program, None)
     }
 
     /// Creates a backend with an explicit local binary override (used in unit tests).
     #[cfg(test)]
     pub fn with_local_program(store: AppStore, local_program: Option<String>) -> Self {
-        Self::init(store, local_program)
+        Self::init(store, local_program, None)
     }
 
-    fn init(store: AppStore, local_program: Option<String>) -> Self {
+    /// Creates a backend with a custom [`legion_link::SessionOpener`] for deterministic unit tests.
+    #[cfg(test)]
+    pub fn with_opener(
+        store: AppStore,
+        local_program: Option<String>,
+        opener: legion_link::SessionOpener,
+    ) -> Self {
+        Self::init(store, local_program, Some(opener))
+    }
+
+    fn init(
+        store: AppStore,
+        local_program: Option<String>,
+        opener: Option<legion_link::SessionOpener>,
+    ) -> Self {
         let (data, store_error) = match store.load() {
             Ok(data) => (data, None),
             Err(err) => (AppStoreData::default(), Some(err)),
@@ -74,7 +85,12 @@ impl LinkBackend {
                 resolve_active_node(&data, local_program.as_deref()),
             )
         };
-        let link = Link::new(link_cfg);
+        let link = match opener {
+            Some(custom) => {
+                Link::with_opener(link_cfg, legion_link::LinkOptions::default(), custom)
+            }
+            None => Link::new(link_cfg),
+        };
 
         Self {
             store,
@@ -128,17 +144,10 @@ impl LinkBackend {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.store_error.is_some() {
-            return;
-        }
-        if guard.active_node.as_deref() == Some(node) {
+        if guard.store_error.is_some() || guard.active_node.as_deref() == Some(node) {
             return;
         }
         guard.active_node = Some(node.to_owned());
-        if guard.data.link.node(node).is_some() {
-            guard.data.current_node = Some(node.to_owned());
-            let _ = self.store.save(&guard.data);
-        }
     }
 
     fn next_call_id(&self, provided: Option<CallId>) -> String {
@@ -273,7 +282,7 @@ impl Backend for LinkBackend {
                 );
             }
 
-            let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
+            let _parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
             let device_label = {
                 let trimmed = name.trim();
                 if trimmed.is_empty() {
@@ -285,33 +294,34 @@ impl Backend for LinkBackend {
 
             let _mutation = self.mutate_lock.lock().await;
 
-            // Reuse the existing device key whenever present so already-paired nodes keep working;
-            // only generate a new key on first pairing.
-            let (existing_pem, had_key) = {
-                let guard = self
+            // Ensure this device has a persisted Ed25519 key BEFORE enrolling so a failed store
+            // save can never leave a node holding a public key whose private half was lost.
+            let link = {
+                let mut guard = self
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let pem = guard.data.link.device_key.clone();
-                let has = pem.is_some();
-                (pem, has)
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
+                if guard.data.link.device_key.is_none() {
+                    let device_key = DeviceKey::generate().map_err(AppError::from)?;
+                    let key_pem = device_key.to_openssh().map_err(AppError::from)?;
+                    let mut next = guard.data.clone();
+                    next.link.device_key = Some(key_pem.clone());
+                    self.store.save(&next)?;
+                    guard.link.set_device_key(key_pem).map_err(AppError::from)?;
+                    guard.data = next;
+                }
+                guard.link.clone()
             };
 
-            let device_key = match existing_pem {
-                Some(pem) => DeviceKey::from_openssh(&pem).map_err(AppError::from)?,
-                None => DeviceKey::generate().map_err(AppError::from)?,
-            };
-            let key_pem = device_key.to_openssh().map_err(AppError::from)?;
-
-            let enrolled = enrol(
-                &parsed,
-                &device_key,
-                &device_label,
-                SshTimeouts::default(),
-                CancellationToken::new(),
-            )
-            .await
-            .map_err(AppError::from)?;
+            // Enrol in place via `Link::pair`, reusing the persisted device key and keeping any
+            // other live sessions and in-flight calls undisturbed.
+            let enrolled = link
+                .pair(trimmed_invite, &device_label)
+                .await
+                .map_err(AppError::from)?;
 
             let node_entry = LinkNode::from(enrolled.clone());
             let node_name = enrolled.node.clone();
@@ -321,51 +331,21 @@ impl Backend for LinkBackend {
                 device: Some(enrolled.device.clone()),
             };
 
-            // Prepare updated store data and persist atomically before exposing it to callers.
-            let (updated_data, local_program, old_link) = {
-                let guard = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut next = guard.data.clone();
-                if next.link.device_key.is_none() {
-                    next.link.device_key = Some(key_pem);
-                }
-                next.link.upsert_node(node_entry.clone());
-                next.upsert_meta(meta);
-                next.current_node = Some(node_name.clone());
-                (next, guard.local_program.clone(), guard.link.clone())
-            };
-
-            self.store.save(&updated_data)?;
-
-            // `legion_link::Link` has no `set_device_key` setter, so rebuild the Link handle when
-            // the device key is newly created; otherwise evict any stale session for the re-paired
-            // node and upsert the updated node entry in place.
-            let next_link = if !had_key {
-                let runtime_cfg =
-                    build_runtime_config(&updated_data.link, local_program.as_deref());
-                Link::new(runtime_cfg)
-            } else {
-                old_link.remove_node(&node_name).await;
-                old_link.upsert_node(node_entry);
-                old_link.clone()
-            };
-
+            // Compute, save, and swap under the single state lock while still holding mutate_lock.
             let app_state = {
                 let mut guard = self
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut updated_data = guard.data.clone();
+                updated_data.link.upsert_node(node_entry);
+                updated_data.upsert_meta(meta);
+                updated_data.current_node = Some(node_name.clone());
+                self.store.save(&updated_data)?;
                 guard.data = updated_data;
                 guard.active_node = Some(node_name);
-                guard.link = next_link;
                 build_app_state(&guard, self.store.path())
             };
-
-            if !had_key {
-                old_link.close().await;
-            }
 
             Ok(app_state)
         })
@@ -404,11 +384,14 @@ impl Backend for LinkBackend {
                 }
             }
 
-            let (updated_data, device_name, link) = {
-                let guard = self
+            let (device_name, link) = {
+                let mut guard = self
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
                 if guard.data.link.node(trimmed).is_none() {
                     return Err(AppError::new(
                         ErrorCode::NotFound,
@@ -424,21 +407,14 @@ impl Backend for LinkBackend {
                 if next.current_node.as_deref() == Some(trimmed) {
                     next.current_node = next.link.nodes.first().map(|n| n.node.clone());
                 }
-                (next, device, guard.link.clone())
+                self.store.save(&next)?;
+                let local_program = guard.local_program.clone();
+                guard.data = next;
+                guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
+                (device, guard.link.clone())
             };
 
-            self.store.save(&updated_data)?;
-            link.remove_node(trimmed).await;
-
-            {
-                let mut guard = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let local_program = guard.local_program.clone();
-                guard.data = updated_data;
-                guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
-            }
+            link.forget(trimmed).await;
 
             let message = format!(
                 "Removed `{trimmed}` from this device. `{trimmed}` still keeps this device until you run `legion device.remove name={device_name}` there."
@@ -464,7 +440,7 @@ impl Backend for LinkBackend {
             }
 
             let _mutation = self.mutate_lock.lock().await;
-            let (updated_state, data_to_save) = {
+            let updated_state = {
                 let mut guard = self
                     .state
                     .lock()
@@ -480,20 +456,17 @@ impl Backend for LinkBackend {
                         format!("No configured node named `{trimmed}`."),
                     ));
                 }
-                guard.active_node = Some(trimmed.to_owned());
-                let save = if exists_ssh {
-                    guard.data.current_node = Some(trimmed.to_owned());
-                    Some(guard.data.clone())
+                let mut next = guard.data.clone();
+                next.current_node = if exists_ssh {
+                    Some(trimmed.to_owned())
                 } else {
-                    guard.data.current_node = None;
-                    Some(guard.data.clone())
+                    None
                 };
-                (build_app_state(&guard, self.store.path()), save)
+                self.store.save(&next)?;
+                guard.data = next;
+                guard.active_node = Some(trimmed.to_owned());
+                build_app_state(&guard, self.store.path())
             };
-
-            if let Some(data) = data_to_save {
-                self.store.save(&data)?;
-            }
 
             Ok(updated_state)
         })
@@ -900,6 +873,163 @@ mod tests {
         );
         assert!(backend.select_node("tower".to_owned()).await.is_err());
         assert_eq!(std::fs::read_to_string(store.path())?, future_json);
+        Ok(())
+    }
+
+    fn unreachable_invite_text() -> Result<String, Box<dyn std::error::Error>> {
+        let host_key = DeviceKey::generate()?.public_key_line("host")?;
+        let invite = Invite {
+            v: legion_link::INVITE_VERSION,
+            id: "inv-test-1".to_owned(),
+            node: "tower".to_owned(),
+            hosts: vec!["127.0.0.1".to_owned()],
+            port: 1,
+            user: "me".to_owned(),
+            host_keys: vec![host_key],
+            key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            principal: "phone".to_owned(),
+            expires: "2099-01-01T00:00:00Z".to_owned(),
+        };
+        Ok(invite.encode()?)
+    }
+
+    #[tokio::test]
+    async fn first_pair_persists_device_key_before_enrolling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let backend = LinkBackend::with_local_program(store.clone(), None);
+        let invite = unreachable_invite_text()?;
+
+        // Enrolment fails on 127.0.0.1:1, yet the generated device key is already persisted on disk.
+        let err = backend
+            .pair(invite.clone(), "phone".to_owned())
+            .await
+            .err()
+            .ok_or("expected enrolment error")?;
+        assert!(matches!(
+            err.code,
+            ErrorCode::Unreachable | ErrorCode::Timeout
+        ));
+
+        let persisted = store.load()?;
+        let first_key = persisted
+            .link
+            .device_key
+            .clone()
+            .ok_or("device key should be saved before enrolment")?;
+
+        // A second attempt reuses the exact persisted device key.
+        let _ = backend.pair(invite, "phone".to_owned()).await;
+        assert_eq!(
+            store.load()?.link.device_key.as_deref(),
+            Some(first_key.as_str())
+        );
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn first_pair_does_not_interrupt_in_flight_call() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::Notify;
+
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let started_tx = Arc::clone(&started);
+        let release_rx = Arc::clone(&release);
+
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let started_tx = Arc::clone(&started_tx);
+            let release_rx = Arc::clone(&release_rx);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            )
+                        } else {
+                            started_tx.notify_one();
+                            release_rx.notified().await;
+                            Response::ok(req.id, serde_json::json!({ "ok": true }))
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                        out.push('\n');
+                        if server_w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = Arc::new(LinkBackend::with_opener(
+            store,
+            Some("/usr/bin/legion".to_owned()),
+            opener,
+        ));
+
+        let call_backend = Arc::clone(&backend);
+        let call_task = tokio::spawn(async move {
+            call_backend
+                .call(
+                    CallRequest {
+                        id: None,
+                        tool: "sys.info".to_owned(),
+                        args: serde_json::json!({}),
+                        on: None,
+                    },
+                    None,
+                )
+                .await
+        });
+
+        started.notified().await;
+
+        // First pairing generates & sets the device key in place without closing the local session.
+        let invite = unreachable_invite_text()?;
+        let _ = backend.pair(invite, "desktop".to_owned()).await;
+
+        release.notify_one();
+        let outcome = call_task.await??;
+        assert_eq!(outcome, serde_json::json!({ "ok": true }));
         Ok(())
     }
 }

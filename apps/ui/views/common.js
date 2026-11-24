@@ -33,7 +33,10 @@ export function Notice({ error, title, message, hint, kind = 'bad', className = 
   const machine = error?.machine ? `${error.machine}: ` : '';
   const reason = error?.details?.reason;
   const canRepair =
-    error?.code === 'denied' && (reason === 'auth_failed' || reason === 'host_key_mismatch');
+    error?.code === 'denied' &&
+    (reason === 'device_removed_or_unknown' ||
+      reason === 'auth_failed' ||
+      reason === 'host_key_mismatch');
   if (!heading) return null;
   const cls = ['notice', kind === 'bad' ? 'bad' : '', className].filter(Boolean).join(' ');
   return html`

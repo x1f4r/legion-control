@@ -19,7 +19,12 @@ function makeTimeoutError(timeoutMs, machine) {
 
 function isPairingError(err) {
   const reason = err?.details?.reason;
-  return err?.code === 'denied' && (reason === 'auth_failed' || reason === 'host_key_mismatch');
+  return (
+    err?.code === 'denied' &&
+    (reason === 'device_removed_or_unknown' ||
+      reason === 'auth_failed' ||
+      reason === 'host_key_mismatch')
+  );
 }
 
 /**
