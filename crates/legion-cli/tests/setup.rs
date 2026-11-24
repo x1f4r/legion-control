@@ -1738,13 +1738,20 @@ role = \"wide\"
     }
 
     // 5. fs.copy file, directory, and symlink to `~/.codex`: all refused.
-    let mut copy_sources = vec![
-        ("file", "~/projects/payload.txt", false),
-        ("dir", "~/projects/plain_dir", true),
-    ];
-    #[cfg(unix)]
-    copy_sources.push(("symlink", "~/projects/codex_link", false));
-    for (label, from, recursive) in copy_sources {
+    // Windows cannot create the link without privilege, so the symlink case runs on Unix only.
+    let copy_sources: &[(&str, &str, bool)] = if cfg!(unix) {
+        &[
+            ("file", "~/projects/payload.txt", false),
+            ("dir", "~/projects/plain_dir", true),
+            ("symlink", "~/projects/codex_link", false),
+        ]
+    } else {
+        &[
+            ("file", "~/projects/payload.txt", false),
+            ("dir", "~/projects/plain_dir", true),
+        ]
+    };
+    for &(label, from, recursive) in copy_sources {
         let from_arg = format!("from={from}");
         let mut args = vec!["fs.copy", &from_arg, "to=~/.codex", "--as", "wide"];
         if recursive {
@@ -1757,13 +1764,19 @@ role = \"wide\"
     }
 
     // 6. fs.move file, directory, and symlink to `~/.codex`: all refused.
-    let mut move_sources = vec![
-        ("file", "~/projects/payload.txt"),
-        ("dir", "~/projects/plain_dir"),
-    ];
-    #[cfg(unix)]
-    move_sources.push(("symlink", "~/projects/codex_link"));
-    for (label, from) in move_sources {
+    let move_sources: &[(&str, &str)] = if cfg!(unix) {
+        &[
+            ("file", "~/projects/payload.txt"),
+            ("dir", "~/projects/plain_dir"),
+            ("symlink", "~/projects/codex_link"),
+        ]
+    } else {
+        &[
+            ("file", "~/projects/payload.txt"),
+            ("dir", "~/projects/plain_dir"),
+        ]
+    };
+    for &(label, from) in move_sources {
         let from_arg = format!("from={from}");
         let res = home.run(&["fs.move", &from_arg, "to=~/.codex", "--as", "wide"]);
         assert_eq!(res.code, 1, "move {label}: {}", res.stdout);
