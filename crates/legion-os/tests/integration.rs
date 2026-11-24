@@ -70,6 +70,10 @@ fn main() -> ExitCode {
             Box::pin(test_run_dropped_future_kills_grandchildren())
         }),
         (
+            "run_normal_exit_kills_background_grandchild_without_timeout",
+            || Box::pin(test_run_normal_exit_kills_background_grandchild_without_timeout()),
+        ),
+        (
             "run_does_not_hang_when_escaped_grandchild_keeps_pipes_open",
             || Box::pin(test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open()),
         ),
@@ -161,6 +165,7 @@ fn run_helper(mode: &str) -> ExitCode {
         "flood" => helper_flood(&args),
         "sleep" => helper_sleep(&args),
         "spawn_tree" => helper_spawn_tree(&args),
+        "spawn_and_exit" => helper_spawn_and_exit(&args),
         "escape_pipes" => helper_escape_pipes(&args),
         "detach_parent" => helper_detach_parent(&args),
         "detach_worker" => helper_detach_worker(&args),
@@ -267,6 +272,31 @@ fn helper_spawn_tree(args: &[String]) -> ExitCode {
     let _ = io::stdout().flush();
 
     let _ = child.wait();
+    ExitCode::SUCCESS
+}
+
+fn helper_spawn_and_exit(args: &[String]) -> ExitCode {
+    let grandchild_id_file = &args[0];
+
+    // Spawn a long-lived background grandchild that keeps stdout/stderr open, then exit immediately
+    // without waiting for it (equivalent to `sleep 999 & echo done`).
+    #[allow(clippy::zombie_processes)]
+    let _bg = Command::new(current_exe())
+        .env(HELPER_ENV, "sleep")
+        .args(["30000", grandchild_id_file])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("failed to spawn background grandchild");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(grandchild_id_file).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    println!("DONE");
+    let _ = io::stdout().flush();
     ExitCode::SUCCESS
 }
 
@@ -692,6 +722,37 @@ async fn test_run_dropped_future_kills_grandchildren() {
     assert!(
         !procid::is_alive(&grandchild_id),
         "grandchild {grandchild_id} leaked after dropping run() future"
+    );
+}
+
+async fn test_run_normal_exit_kills_background_grandchild_without_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild_file = dir.path().join("grandchild_bg.pid");
+    let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+
+    // No timeout set: once the direct child exits, run() must stop the background grandchild
+    // holding stdout open and return promptly instead of hanging or leaking it.
+    let (spec, helper_env) = helper_spec("spawn_and_exit", &[&grandchild_str]);
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(RunOptions::new(spec)
+            .envs(helper_env)
+            .kill_grace(Duration::from_millis(150))),
+    )
+    .await
+    .expect("run() hung waiting on background grandchild's stdout pipe")
+    .unwrap();
+
+    assert!(res.success(), "expected clean exit, got {res:?}");
+    assert!(!res.timed_out);
+    assert!(!res.cancelled);
+    assert_eq!(res.stdout.text.trim(), "DONE");
+
+    let grandchild_id =
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+    assert!(
+        !procid::is_alive(&grandchild_id),
+        "background grandchild {grandchild_id} survived after direct child exited"
     );
 }
 

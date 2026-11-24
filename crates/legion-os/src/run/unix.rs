@@ -52,6 +52,46 @@ pub(super) fn extract_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
     (status.code(), status.signal())
 }
 
+pub(super) async fn cleanup_after_direct_exit(
+    _child: &mut Box<dyn ChildWrapper>,
+    child_pid: Option<u32>,
+    grace: Duration,
+) {
+    let Some(group) = child_pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .map(Pid::from_raw)
+    else {
+        return;
+    };
+
+    // Fast path: when no background descendants remain in the process group, avoid signaling or waiting.
+    if matches!(killpg(group, None), Err(Errno::ESRCH)) {
+        return;
+    }
+
+    let _ = killpg(group, Signal::SIGTERM);
+    let grace_deadline = Instant::now() + grace;
+    while Instant::now() < grace_deadline {
+        if matches!(killpg(group, None), Err(Errno::ESRCH)) {
+            return;
+        }
+        let remaining = grace_deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+    }
+
+    if !matches!(killpg(group, None), Err(Errno::ESRCH)) {
+        let _ = killpg(group, Signal::SIGKILL);
+        let settle_deadline = Instant::now() + POST_KILL_WAIT;
+        while Instant::now() < settle_deadline {
+            if matches!(killpg(group, None), Err(Errno::ESRCH)) {
+                break;
+            }
+            let remaining = settle_deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+        }
+    }
+}
+
 pub(super) async fn terminate_tree(
     child: &mut Box<dyn ChildWrapper>,
     child_pid: Option<u32>,
@@ -73,7 +113,7 @@ pub(super) async fn terminate_tree(
     let mut exit_status: Option<ExitStatus> = None;
 
     // Wait up to `grace` for the direct child to exit.
-    if let Ok(Ok(status)) = tokio::time::timeout(grace, child.wait()).await {
+    if let Ok(Ok(status)) = tokio::time::timeout(grace, child.inner_mut().wait()).await {
         exit_status = Some(status);
     }
 
@@ -102,7 +142,8 @@ pub(super) async fn terminate_tree(
         }
 
         if exit_status.is_none()
-            && let Ok(Ok(status)) = tokio::time::timeout(POST_KILL_WAIT, child.wait()).await
+            && let Ok(Ok(status)) =
+                tokio::time::timeout(POST_KILL_WAIT, child.inner_mut().wait()).await
         {
             exit_status = Some(status);
         }

@@ -35,6 +35,17 @@ pub(super) fn extract_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
     (status.code(), None)
 }
 
+pub(super) async fn cleanup_after_direct_exit(
+    child: &mut Box<dyn ChildWrapper>,
+    _child_pid: Option<u32>,
+    _grace: Duration,
+) {
+    // Terminate any grandchildren remaining in the Job Object once the direct child exits, then
+    // drain the Job Object completion port within a bounded wait.
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(POST_KILL_WAIT, child.wait()).await;
+}
+
 pub(super) async fn terminate_tree(
     child: &mut Box<dyn ChildWrapper>,
     _child_pid: Option<u32>,

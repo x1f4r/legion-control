@@ -1,10 +1,16 @@
 //! Bounded command execution with live streaming and whole-tree termination.
 //!
-//! Every child runs inside an OS containment boundary (its own process group on Unix, a Windows
-//! Job Object on Windows) so timing out or cancelling stops grandchildren as well as the direct
-//! child. Output capture keeps both the head and the tail within a fixed byte budget per stream,
-//! and pipe readers stop promptly after tree termination so an escaped grandchild keeping a pipe
-//! open can never hang [`run`].
+//! [`run`] is strictly for bounded commands and never leaves background descendants behind: once
+//! the direct child exits (or when a timeout or cancellation triggers), any remaining processes
+//! in its containment boundary are terminated (`SIGTERM`, grace, `SIGKILL` on Unix;
+//! `TerminateJobObject` on Windows) and output pipes are drained with a time bound. Processes
+//! meant to outlive the call must be started through [`crate::detach`] instead.
+//!
+//! **Known Unix limitation:** because bounded runs use a POSIX process group rather than a
+//! dedicated cgroup, a descendant that explicitly calls `setsid` (or moves itself to another
+//! process group) escapes group termination. Pipe draining is still time-bounded so such a
+//! descendant can never hang [`run`]. For full cgroup-level containment on Linux, use
+//! [`crate::detach`] with a systemd user scope.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
@@ -326,9 +332,10 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let mut timed_out = false;
     let mut cancelled = false;
 
-    // Phase 1: wait for the child to exit, or for timeout / cancellation.
+    // Phase 1: wait for the DIRECT child to exit (never blocking on grandchildren in a Job Object
+    // or process group), or for timeout / cancellation.
     tokio::select! {
-        status_res = child.wait() => {
+        status_res = child.inner_mut().wait() => {
             exit_status = Some(status_res.map_err(|err| OsError::from_io("failed waiting for child process", err))?);
         }
         () = wait_deadline(deadline) => {
@@ -342,49 +349,38 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let mut stdout_captured: Option<CapturedOutput> = None;
     let mut stderr_captured: Option<CapturedOutput> = None;
 
-    // Phase 2: if the child exited cleanly, drain pipes within the remaining timeout/cancel budget.
-    // A grandchild that outlived the direct child and held stdout/stderr open will trigger the
-    // deadline or cancellation here and get cleaned up in Phase 3.
-    if !timed_out && !cancelled {
-        tokio::select! {
-            () = drain_pipes(&mut stdout_task, &mut stderr_task, &mut stdout_captured, &mut stderr_captured) => {}
-            () = wait_deadline(deadline) => {
-                timed_out = true;
-            }
-            () = options.cancel.cancelled() => {
-                cancelled = true;
-            }
-        }
-    }
-
-    // Phase 3: on timeout or cancellation, terminate the entire tree and bound pipe draining so
-    // any escaped grandchild holding open descriptors can never hang the caller.
+    // Phase 2: stop any surviving processes in the group/job under one consistent rule on every
+    // platform—whether the direct child exited normally or we hit timeout/cancellation.
     if timed_out || cancelled {
         let kill_status = terminate_tree(&mut child, child_pid, options.kill_grace).await;
         if exit_status.is_none() {
             exit_status = kill_status;
         }
+    } else {
+        cleanup_after_direct_exit(&mut child, child_pid, options.kill_grace).await;
+    }
 
-        let _ = tokio::time::timeout(
-            POST_KILL_DRAIN_TIMEOUT,
-            drain_pipes(
-                &mut stdout_task,
-                &mut stderr_task,
-                &mut stdout_captured,
-                &mut stderr_captured,
-            ),
-        )
-        .await;
-
-        drain_stop.cancel();
+    // Phase 3: drain buffered pipe output within a time bound so any escaped descendant holding
+    // stdout/stderr open can never hang the caller.
+    let _ = tokio::time::timeout(
+        POST_KILL_DRAIN_TIMEOUT,
         drain_pipes(
             &mut stdout_task,
             &mut stderr_task,
             &mut stdout_captured,
             &mut stderr_captured,
-        )
-        .await;
-    }
+        ),
+    )
+    .await;
+
+    drain_stop.cancel();
+    drain_pipes(
+        &mut stdout_task,
+        &mut stderr_task,
+        &mut stdout_captured,
+        &mut stderr_captured,
+    )
+    .await;
 
     if let Some(handle) = stdin_task {
         handle.abort();
@@ -624,6 +620,23 @@ fn configure_containment(_wrapped: &mut CommandWrap) -> Result<()> {
     Err(OsError::Unsupported {
         detail: "process-tree containment is not supported on this platform".into(),
     })
+}
+
+#[cfg(any(unix, windows))]
+async fn cleanup_after_direct_exit(
+    child: &mut Box<dyn ChildWrapper>,
+    child_pid: Option<u32>,
+    grace: Duration,
+) {
+    platform::cleanup_after_direct_exit(child, child_pid, grace).await;
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn cleanup_after_direct_exit(
+    _child: &mut Box<dyn ChildWrapper>,
+    _child_pid: Option<u32>,
+    _grace: Duration,
+) {
 }
 
 #[cfg(any(unix, windows))]
