@@ -1,0 +1,188 @@
+name: Legion App
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'crates/**'
+      - '.github/workflows/legion-app.yml'
+      - 'rust-toolchain.toml'
+  pull_request:
+    paths:
+      - 'apps/**'
+      - 'crates/**'
+      - '.github/workflows/legion-app.yml'
+      - 'rust-toolchain.toml'
+permissions:
+  contents: read
+# A newer push to a pull request supersedes the run still going on it; every push to main runs to
+# completion in its own concurrency group.
+concurrency:
+  group: legion-app-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# Every action is pinned to the commit of the release named beside it, matching checks.yml.
+jobs:
+  rust-check:
+    name: Rust check (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Install Linux WebKitGTK and GTK build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libxdo-dev \
+            patchelf \
+            build-essential
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            apps/legion-app/src-tauri/target/
+          key: legion-app-check-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'apps/legion-app/src-tauri/Cargo.lock') }}
+          restore-keys: legion-app-check-${{ runner.os }}-
+      - name: Format, clippy and unit tests
+        run: |
+          cargo fmt --manifest-path apps/legion-app/src-tauri/Cargo.toml -- --check
+          cargo clippy --manifest-path apps/legion-app/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path apps/legion-app/src-tauri/Cargo.toml --locked
+
+  android:
+    name: Android debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: |
+            apps/legion-app/src-tauri/gen/android/*.gradle*
+            apps/legion-app/src-tauri/gen/android/app/*.gradle*
+            apps/legion-app/src-tauri/gen/android/buildSrc/**/*.gradle*
+            apps/legion-app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: platform-tools
+      - name: Install Android platform, build-tools and NDK
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
+            "ndk;30.0.16248370"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+      - name: Install Rust and Android targets
+        run: |
+          rustup toolchain install
+          rustup target add \
+            aarch64-linux-android \
+            x86_64-linux-android \
+            armv7-linux-androideabi \
+            i686-linux-android
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            apps/legion-app/src-tauri/target/
+          key: legion-app-android-${{ runner.os }}-tauri-2.12.6-${{ hashFiles('rust-toolchain.toml', 'apps/legion-app/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            legion-app-android-${{ runner.os }}-tauri-2.12.6-
+            legion-app-android-${{ runner.os }}-
+      - name: Install tauri-cli 2.12.6
+        run: |
+          set -euo pipefail
+          if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
+            cargo install tauri-cli --version =2.12.6 --locked
+          fi
+      - name: Build Android debug APK (arm64 + x86_64)
+        working-directory: apps/legion-app
+        run: cargo tauri android build --debug --apk --target aarch64 --target x86_64
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legion-android-debug-apk
+          path: apps/legion-app/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          if-no-files-found: error
+
+  linux-desktop:
+    name: Linux desktop bundles
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Install Linux Tauri bundle dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libxdo-dev \
+            patchelf \
+            file \
+            curl \
+            build-essential
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            apps/legion-app/src-tauri/target/
+          key: legion-app-linux-${{ runner.os }}-tauri-2.12.6-${{ hashFiles('rust-toolchain.toml', 'apps/legion-app/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            legion-app-linux-${{ runner.os }}-tauri-2.12.6-
+            legion-app-linux-${{ runner.os }}-
+      - name: Install tauri-cli 2.12.6
+        run: |
+          set -euo pipefail
+          if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
+            cargo install tauri-cli --version =2.12.6 --locked
+          fi
+      - name: Build deb and AppImage bundles
+        working-directory: apps/legion-app
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: cargo tauri build --bundles deb,appimage
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legion-linux-bundles
+          path: |
+            apps/legion-app/src-tauri/target/release/bundle/deb/*.deb
+            apps/legion-app/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  # Stage two adds:
+  # - ios: macos-latest simulator build (`cargo tauri ios build --target aarch64-sim --no-sign --ci`)
+  # - macos-desktop: macos-latest `.dmg` bundle (`cargo tauri build --bundles dmg`)
+  # - windows-desktop: windows-latest NSIS installer (`cargo tauri build --bundles nsis`)
