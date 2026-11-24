@@ -1937,3 +1937,37 @@ async fn concurrent_create_is_strictly_exclusive_and_expect_hash_and_edit_are_se
         "A\nB\nC\nD\nE\nF\n"
     );
 }
+
+#[tokio::test]
+async fn find_and_grep_expose_cross_filesystems_opt_in() {
+    let f = Fixture::new();
+    std::fs::write(f.work.join("one.txt"), "hello\n").unwrap();
+
+    let registry = legion_tools::registry();
+    for tool in ["fs.find", "fs.grep"] {
+        let schema = &registry.get(tool).unwrap().spec().input_schema;
+        assert_eq!(
+            schema["properties"]["cross_filesystems"]["type"],
+            json!("boolean"),
+            "{tool} schema missing cross_filesystems"
+        );
+    }
+
+    let found = f
+        .call(
+            "fs.find",
+            json!({"path": "~/projects", "cross_filesystems": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+
+    let grepped = f
+        .call(
+            "fs.grep",
+            json!({"path": "~/projects", "pattern": "hello", "cross_filesystems": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grepped["matches"].as_array().unwrap().len(), 1);
+}

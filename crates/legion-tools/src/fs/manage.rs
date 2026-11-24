@@ -158,6 +158,8 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
         match rename_result {
             Ok(()) => {}
             Err(OsError::Io { source, .. }) if source.kind() == io::ErrorKind::CrossesDevices => {
+                let root_dev = platform::device_id(&from, &from_meta);
+                let same_dev = |p: &Path, m: &Metadata| platform::same_device(&root_dev, p, m);
                 let mut totals = CopyTotals::default();
                 let opts = CopyOptions {
                     overwrite,
@@ -166,8 +168,29 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
                     principal: &principal,
                     tool: "fs.move",
                     own_dirs: &own_dirs,
+                    same_device: &same_dev,
                 };
                 copy_path(&from, &to, &from_meta, &opts, &cancel, &mut progress, &mut totals)?;
+                if !totals.skipped.is_empty() {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            "Cross-device move of {} to {} skipped {} nested directory(s) on another file system, so source {} was not removed.",
+                            from.display(),
+                            to.display(),
+                            totals.skipped.len(),
+                            from.display()
+                        ),
+                    )
+                    .with_hint("Move or unmount nested file systems separately before moving the parent directory.")
+                    .with_details(json!({
+                        "copy_completed": true,
+                        "source_intact": true,
+                        "files": totals.files,
+                        "bytes": totals.bytes,
+                        "skipped": totals.skipped,
+                    })));
+                }
                 let mut removed = RemoveTotals::default();
                 remove_path(
                     &from,
@@ -175,6 +198,7 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
                     true,
                     false,
                     "fs.move",
+                    &same_dev,
                     &cancel,
                     &mut progress,
                     &mut removed,
@@ -214,6 +238,8 @@ struct CopyResult {
     to: String,
     files: u64,
     bytes: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<String>,
 }
 
 async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> {
@@ -241,6 +267,8 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
                 ),
             ));
         }
+        let root_dev = platform::device_id(&from, &from_meta);
+        let same_dev = |p: &Path, m: &Metadata| platform::same_device(&root_dev, p, m);
         let mut totals = CopyTotals::default();
         let opts = CopyOptions {
             overwrite,
@@ -249,6 +277,7 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
             principal: &principal,
             tool: "fs.copy",
             own_dirs: &own_dirs,
+            same_device: &same_dev,
         };
         copy_path(
             &from,
@@ -261,10 +290,16 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
         )
         .map_err(|err| {
             if err.code == ErrorCode::Cancelled {
-                err.with_details(json!({
+                let mut details = json!({
                     "files": totals.files,
                     "bytes": totals.bytes,
-                }))
+                });
+                if !totals.skipped.is_empty()
+                    && let Some(obj) = details.as_object_mut()
+                {
+                    obj.insert("skipped".to_owned(), json!(totals.skipped));
+                }
+                err.with_details(details)
             } else {
                 err
             }
@@ -274,6 +309,7 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
             to: path_to_string(&to),
             files: totals.files,
             bytes: totals.bytes,
+            skipped: totals.skipped,
         })
     })
     .await
@@ -286,6 +322,7 @@ struct CopyOptions<'a> {
     principal: &'a str,
     tool: &'a str,
     own_dirs: &'a OwnDirFilter,
+    same_device: &'a dyn Fn(&Path, &Metadata) -> bool,
 }
 
 fn deny_replace_directory(principal: &str, path: &Path) -> ErrorBody {
@@ -305,6 +342,7 @@ fn deny_replace_directory(principal: &str, path: &Path) -> ErrorBody {
 struct CopyTotals {
     files: u64,
     bytes: u64,
+    skipped: Vec<String>,
 }
 
 /// Reader wrapper that aborts a streaming atomic copy on cancellation and emits progress events.
@@ -434,6 +472,10 @@ fn copy_path(
             }
             let child_meta = fs::symlink_metadata(&child_from)
                 .map_err(|error| map_io_error("inspect", &child_from, error))?;
+            if child_meta.is_dir() && !(opts.same_device)(&child_from, &child_meta) {
+                totals.skipped.push(path_to_string(&child_from));
+                continue;
+            }
             let child_to = to.join(&name);
             copy_path(
                 &child_from,
@@ -603,6 +645,8 @@ struct RemoveResult {
     bytes: u64,
     dry_run: bool,
     sample: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<String>,
 }
 
 async fn remove_entry(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolError> {
@@ -618,39 +662,140 @@ async fn remove_entry(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolE
 
         let meta =
             fs::symlink_metadata(&path).map_err(|error| map_io_error("remove", &path, error))?;
-        let mut totals = RemoveTotals::default();
-        remove_path(
+        let root_dev = platform::device_id(&path, &meta);
+        let same_dev = |p: &Path, m: &Metadata| platform::same_device(&root_dev, p, m);
+        execute_remove(
             &path,
             &meta,
             recursive,
             dry_run,
-            "fs.remove",
+            &same_dev,
             &cancel,
             &mut progress,
-            &mut totals,
         )
-        .map_err(|err| {
-            if err.code == ErrorCode::Cancelled {
-                err.with_details(json!({
-                    "removed": totals.removed,
-                    "bytes": totals.bytes,
-                    "dry_run": dry_run,
-                    "sample": totals.sample,
-                }))
-            } else {
-                err
-            }
-        })?;
-
-        Ok(RemoveResult {
-            path: path_to_string(&path),
-            removed: totals.removed,
-            bytes: totals.bytes,
-            dry_run,
-            sample: totals.sample,
-        })
     })
     .await
+}
+
+fn execute_remove(
+    path: &Path,
+    meta: &Metadata,
+    recursive: bool,
+    dry_run: bool,
+    same_device: &dyn Fn(&Path, &Metadata) -> bool,
+    cancel: &CancellationToken,
+    progress: &mut Progress,
+) -> Result<RemoveResult, ToolError> {
+    if recursive && !dry_run && meta.is_dir() {
+        let mut cross_device = Vec::new();
+        scan_cross_device_dirs(path, same_device, cancel, "fs.remove", &mut cross_device)?;
+        if !cross_device.is_empty() {
+            return Err(cross_device_remove_conflict(path, 0, 0, cross_device));
+        }
+    }
+
+    let mut totals = RemoveTotals::default();
+    remove_path(
+        path,
+        meta,
+        recursive,
+        dry_run,
+        "fs.remove",
+        same_device,
+        cancel,
+        progress,
+        &mut totals,
+    )
+    .map_err(|err| {
+        if err.code == ErrorCode::Cancelled {
+            err.with_details(json!({
+                "removed": totals.removed,
+                "bytes": totals.bytes,
+                "dry_run": dry_run,
+                "sample": totals.sample,
+            }))
+        } else {
+            err
+        }
+    })?;
+
+    if !dry_run && !totals.skipped.is_empty() {
+        return Err(cross_device_remove_conflict(
+            path,
+            totals.removed,
+            totals.bytes,
+            totals.skipped,
+        ));
+    }
+
+    Ok(RemoveResult {
+        path: path_to_string(path),
+        removed: totals.removed,
+        bytes: totals.bytes,
+        dry_run,
+        sample: totals.sample,
+        skipped: totals.skipped,
+    })
+}
+
+fn cross_device_remove_conflict(
+    path: &Path,
+    removed: u64,
+    bytes: u64,
+    skipped: Vec<String>,
+) -> ErrorBody {
+    let first = skipped.first().map(String::as_str).unwrap_or("");
+    let message = if skipped.len() == 1 {
+        format!(
+            "Refusing to remove {} recursively: {} is on a different file system.",
+            path.display(),
+            first
+        )
+    } else {
+        format!(
+            "Refusing to remove {} recursively: {} and {} other directory(s) are on different file systems.",
+            path.display(),
+            first,
+            skipped.len() - 1
+        )
+    };
+    ErrorBody::new(ErrorCode::Conflict, message)
+        .with_hint("Unmount or remove the nested file-system directories separately so fs.remove never crosses mount boundaries.")
+        .with_details(json!({
+            "removed": removed,
+            "bytes": bytes,
+            "skipped": skipped,
+        }))
+}
+
+fn scan_cross_device_dirs(
+    dir: &Path,
+    same_device: &dyn Fn(&Path, &Metadata) -> bool,
+    cancel: &CancellationToken,
+    tool: &str,
+    found: &mut Vec<String>,
+) -> Result<(), ToolError> {
+    if cancel.is_cancelled() {
+        return Err(cancelled_error(tool));
+    }
+    for (_, child_path) in sorted_children(dir)? {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error(tool));
+        }
+        let child_meta = match fs::symlink_metadata(&child_path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(map_io_error("inspect", &child_path, error)),
+        };
+        if child_meta.is_dir() {
+            if !same_device(&child_path, &child_meta) {
+                found.push(path_to_string(&child_path));
+            } else {
+                scan_cross_device_dirs(&child_path, same_device, cancel, tool, found)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -658,6 +803,7 @@ struct RemoveTotals {
     removed: u64,
     bytes: u64,
     sample: Vec<String>,
+    skipped: Vec<String>,
 }
 
 impl RemoveTotals {
@@ -677,6 +823,7 @@ fn remove_path(
     recursive: bool,
     dry_run: bool,
     tool: &str,
+    same_device: &dyn Fn(&Path, &Metadata) -> bool,
     cancel: &CancellationToken,
     progress: &mut Progress,
     totals: &mut RemoveTotals,
@@ -726,6 +873,7 @@ fn remove_path(
     if dry_run {
         totals.record(path, 0);
     }
+    let skipped_before = totals.skipped.len();
     let children = sorted_children(path)?;
     for (_, child_path) in children {
         if cancel.is_cancelled() {
@@ -736,12 +884,17 @@ fn remove_path(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(map_io_error("inspect", &child_path, error)),
         };
+        if child_meta.is_dir() && !same_device(&child_path, &child_meta) {
+            totals.skipped.push(path_to_string(&child_path));
+            continue;
+        }
         remove_path(
             &child_path,
             &child_meta,
             true,
             dry_run,
             tool,
+            same_device,
             cancel,
             progress,
             totals,
@@ -749,7 +902,7 @@ fn remove_path(
         let (removed, bytes) = (totals.removed, totals.bytes);
         progress.maybe_emit(|| json!({"removed": removed, "bytes": bytes, "dry_run": dry_run}));
     }
-    if !dry_run {
+    if !dry_run && totals.skipped.len() == skipped_before {
         if cancel.is_cancelled() {
             return Err(cancelled_error(tool));
         }
@@ -811,12 +964,14 @@ mod tests {
 
         let meta = fs::symlink_metadata(&tree).unwrap();
         let mut totals = RemoveTotals::default();
+        let all_same = |_p: &Path, _m: &Metadata| true;
         let err = remove_path(
             &tree,
             &meta,
             true,
             false,
             "fs.remove",
+            &all_same,
             &cancel,
             &mut progress,
             &mut totals,
@@ -826,5 +981,89 @@ mod tests {
         assert_eq!(totals.removed, 0);
         assert_eq!(totals.bytes, 0);
         assert!(tree.join("a.txt").exists());
+    }
+
+    #[test]
+    fn copy_and_remove_refuse_to_cross_into_another_file_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let mnt = src.join("mnt");
+        let sub = src.join("sub");
+        fs::create_dir_all(&mnt).unwrap();
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(src.join("a.txt"), "aaa").unwrap();
+        fs::write(sub.join("b.txt"), "bb").unwrap();
+        fs::write(mnt.join("mounted.txt"), "do-not-touch").unwrap();
+
+        let same_dev = |p: &Path, _m: &Metadata| p != mnt.as_path();
+
+        // `copy_path` copies same-device entries, skips `mnt`, and reports `mnt` in `skipped`.
+        let dst = dir.path().join("dst");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut progress = Progress::for_test(tx);
+        let cancel = CancellationToken::new();
+        let own_dirs = OwnDirFilter::allow_all_for_test();
+        let opts = CopyOptions {
+            overwrite: false,
+            recursive: true,
+            allows_destroy: true,
+            principal: "owner",
+            tool: "fs.copy",
+            own_dirs: &own_dirs,
+            same_device: &same_dev,
+        };
+        let src_meta = fs::symlink_metadata(&src).unwrap();
+        let mut copy_totals = CopyTotals::default();
+        copy_path(
+            &src,
+            &dst,
+            &src_meta,
+            &opts,
+            &cancel,
+            &mut progress,
+            &mut copy_totals,
+        )
+        .unwrap();
+        assert_eq!(copy_totals.files, 2);
+        assert_eq!(copy_totals.bytes, 5);
+        assert_eq!(copy_totals.skipped, vec![path_to_string(&mnt)]);
+        assert!(!dst.join("mnt").exists());
+        assert_eq!(
+            fs::read_to_string(dst.join("sub").join("b.txt")).unwrap(),
+            "bb"
+        );
+
+        // `execute_remove` dry_run reports `mnt` as skipped and does not count `mounted.txt`.
+        let preview = execute_remove(
+            &src,
+            &src_meta,
+            true,
+            true,
+            &same_dev,
+            &cancel,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(preview.skipped, vec![path_to_string(&mnt)]);
+        assert_eq!(preview.bytes, 5);
+
+        // Live recursive remove fails with `conflict` before deleting anything, leaving `src` intact.
+        let err = execute_remove(
+            &src,
+            &src_meta,
+            true,
+            false,
+            &same_dev,
+            &cancel,
+            &mut progress,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("skipped")),
+            Some(&json!([path_to_string(&mnt)]))
+        );
+        assert!(src.join("a.txt").exists());
+        assert!(mnt.join("mounted.txt").exists());
     }
 }

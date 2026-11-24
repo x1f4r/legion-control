@@ -370,6 +370,14 @@ impl OwnDirFilter {
         }
         self.paths.iter().any(|own| paths_equal(path, own))
     }
+
+    #[cfg(test)]
+    pub(crate) fn allow_all_for_test() -> OwnDirFilter {
+        OwnDirFilter {
+            handles: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
 }
 
 /// Whether `a` and `b` refer to the same path, accounting for platform filename casing.

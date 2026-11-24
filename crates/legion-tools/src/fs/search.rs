@@ -93,17 +93,19 @@ impl GlobFilter {
 }
 
 /// Configures `ignore::WalkBuilder` consistently for `fs.find` and `fs.grep`: never follows
-/// symbolic links, sorts entries deterministically, skips Legion's own configuration and state
-/// directories for non-admin roles, and respects `.gitignore` even outside a `.git` repository
-/// when `respect_ignore` is true.
+/// symbolic links, stays on one file system unless `cross_filesystems` is set, sorts entries
+/// deterministically, skips Legion's own configuration and state directories for non-admin roles,
+/// and respects `.gitignore` even outside a `.git` repository when `respect_ignore` is true.
 fn build_walker(
     root: &Path,
     respect_ignore: bool,
     max_depth: Option<usize>,
+    cross_filesystems: bool,
     own_dirs: OwnDirFilter,
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder.follow_links(false);
+    builder.same_file_system(!cross_filesystems);
     builder.sort_by_file_name(|a, b| a.cmp(b));
     builder.standard_filters(respect_ignore);
     if respect_ignore {
@@ -137,6 +139,9 @@ struct FindArgs {
     /// Respect `.gitignore` / `.ignore` rules and skip hidden files.
     #[serde(default = "default_true")]
     ignore: bool,
+    /// Descend into directories mounted from other file systems (false stays on one file system).
+    #[serde(default)]
+    cross_filesystems: bool,
 }
 
 fn default_find_limit() -> u32 {
@@ -191,6 +196,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         .map(|d| usize::try_from(d).unwrap_or(usize::MAX));
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
     let respect_ignore = args.ignore;
+    let cross_filesystems = args.cross_filesystems;
 
     run_blocking(ctx, "fs.find", move |cancel, mut progress| {
         let meta = fs::metadata(&root).map_err(|error| map_io_error("search", &root, error))?;
@@ -206,7 +212,15 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         let mut truncated = false;
         let mut visited: u64 = 0;
 
-        for item in build_walker(&root, respect_ignore, max_depth, own_dirs).build() {
+        for item in build_walker(
+            &root,
+            respect_ignore,
+            max_depth,
+            cross_filesystems,
+            own_dirs,
+        )
+        .build()
+        {
             if cancel.is_cancelled() {
                 return Err(cancelled_error("fs.find"));
             }
@@ -279,6 +293,9 @@ struct GrepArgs {
     /// Respect `.gitignore` / `.ignore` rules and skip hidden files when searching a directory.
     #[serde(default = "default_true")]
     ignore: bool,
+    /// Descend into directories mounted from other file systems (false stays on one file system).
+    #[serde(default)]
+    cross_filesystems: bool,
 }
 
 fn default_grep_limit() -> u32 {
@@ -340,6 +357,7 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
     let context = usize::try_from(args.context).unwrap_or(0);
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
     let respect_ignore = args.ignore;
+    let cross_filesystems = args.cross_filesystems;
 
     run_blocking(ctx, "fs.grep", move |cancel, mut progress| {
         let meta = fs::metadata(&root).map_err(|error| map_io_error("search", &root, error))?;
@@ -362,7 +380,9 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
                 grep_file(&root, true, &mut state)?;
             }
         } else if meta.is_dir() {
-            for item in build_walker(&root, respect_ignore, None, own_dirs).build() {
+            for item in
+                build_walker(&root, respect_ignore, None, cross_filesystems, own_dirs).build()
+            {
                 if state.cancel.is_cancelled() {
                     return Err(cancelled_error("fs.grep"));
                 }

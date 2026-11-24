@@ -11,8 +11,26 @@ mod imp {
     use std::ffi::OsStr;
     use std::fs::{self, File, Metadata, OpenOptions, Permissions};
     use std::io;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Path;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct DeviceId(u64);
+
+    pub(super) fn device_id(_path: &Path, meta: &Metadata) -> Option<DeviceId> {
+        Some(DeviceId(meta.dev()))
+    }
+
+    pub(super) fn same_device(
+        root: &Option<DeviceId>,
+        child_path: &Path,
+        child_meta: &Metadata,
+    ) -> bool {
+        match (root, device_id(child_path, child_meta)) {
+            (Some(a), Some(b)) => a == &b,
+            _ => true,
+        }
+    }
 
     pub(super) fn unix_mode(meta: &Metadata) -> Option<String> {
         Some(format!("{:04o}", meta.permissions().mode() & 0o7777))
@@ -62,10 +80,46 @@ mod imp {
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::io;
     use std::os::windows::fs::MetadataExt;
-    use std::path::Path;
+    use std::path::{Component, Path};
 
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) enum DeviceId {
+        Volume(String),
+        MountPoint,
+    }
+
+    pub(super) fn device_id(path: &Path, meta: &Metadata) -> Option<DeviceId> {
+        // Directory junctions and NTFS volume mount points carry FILE_ATTRIBUTE_REPARSE_POINT
+        // without reporting as symbolic links; treat them as crossing into another mount.
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            && !meta.file_type().is_symlink()
+        {
+            return Some(DeviceId::MountPoint);
+        }
+        let resolved = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        match resolved.components().next() {
+            Some(Component::Prefix(prefix)) => Some(DeviceId::Volume(
+                prefix.as_os_str().to_string_lossy().to_lowercase(),
+            )),
+            _ => None,
+        }
+    }
+
+    pub(super) fn same_device(
+        root: &Option<DeviceId>,
+        child_path: &Path,
+        child_meta: &Metadata,
+    ) -> bool {
+        match (root, device_id(child_path, child_meta)) {
+            (_, Some(DeviceId::MountPoint)) => false,
+            (Some(a), Some(b)) => a == &b,
+            _ => true,
+        }
+    }
 
     pub(super) fn unix_mode(_meta: &Metadata) -> Option<String> {
         None
@@ -122,6 +176,21 @@ mod imp {
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::io;
     use std::path::Path;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct DeviceId;
+
+    pub(super) fn device_id(_path: &Path, _meta: &Metadata) -> Option<DeviceId> {
+        None
+    }
+
+    pub(super) fn same_device(
+        _root: &Option<DeviceId>,
+        _child_path: &Path,
+        _child_meta: &Metadata,
+    ) -> bool {
+        true
+    }
 
     pub(super) fn unix_mode(_meta: &Metadata) -> Option<String> {
         None
@@ -210,4 +279,23 @@ pub(crate) fn is_hidden_attr(meta: &Metadata) -> bool {
 /// Compares two path components using the platform's filename case rules.
 pub(crate) fn path_component_eq(a: &OsStr, b: &OsStr) -> bool {
     imp::path_component_eq(a, b)
+}
+
+/// Opaque identifier of the file system or volume holding a path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceId(imp::DeviceId);
+
+/// Returns the device/volume identifier for `path` (from `meta`), when available on this platform.
+pub(crate) fn device_id(path: &Path, meta: &Metadata) -> Option<DeviceId> {
+    imp::device_id(path, meta).map(DeviceId)
+}
+
+/// Whether `child_path` lives on the same file system as `root`.
+pub(crate) fn same_device(
+    root: &Option<DeviceId>,
+    child_path: &Path,
+    child_meta: &Metadata,
+) -> bool {
+    let inner = root.as_ref().map(|d| d.0.clone());
+    imp::same_device(&inner, child_path, child_meta)
 }
