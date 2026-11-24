@@ -36,8 +36,8 @@ use crate::config::{FleetFile, validate_machine_name};
 use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
-    self, DeleteDone, GetReady, Host, ManifestDone, PackReady, PutDone, PutReady, StatReply,
-    UnpackDone, UnpackReady,
+    self, DeleteDone, GetReady, Host, ManifestDone, PackReady, Planned, PutDone, PutReady,
+    StatReply, UnpackDone, UnpackReady,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -75,6 +75,11 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// file it was writing) and exit before it is killed.
 const ABORT_GRACE: Duration = Duration::from_secs(2);
 
+/// The longest `busy` lines may put off one reply. A node hashing or listing something very large
+/// says it is busy every few seconds for as long as that takes; past this, a node that only ever
+/// says so is taken to be stuck.
+const MOST_BUSY: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// How long an ended stream is given to exit and say why on stderr.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
 
@@ -85,6 +90,15 @@ const FINISH_WAIT: Duration = Duration::from_secs(10);
 /// The most entries a listing from another node may hold. Both listings of a tree are compared
 /// in this node's memory; a tree bigger than this is transferred a subdirectory at a time.
 const MOST_LISTED_ENTRIES: usize = 1_000_000;
+
+/// The longest line of a listing from another node: an entry, whose path and link target a file
+/// system keeps far shorter, or the line that ends it, whose list of what could not be read the
+/// listing node keeps well within this.
+const MOST_LISTING_LINE: usize = 1024 * 1024;
+
+/// The most bytes a listing from another node may take in all: a million entries with ordinary
+/// names fit several times over, a listing built to exhaust memory does not.
+const MOST_LISTING_BYTES: usize = 512 * 1024 * 1024;
 
 /// How many paths a result lists in each of its lists; the counts are always whole.
 const MOST_LISTED: usize = 100;
@@ -778,7 +792,8 @@ impl Transfer<'_> {
                     Round {
                         names,
                         budget,
-                        expected: args.checksum.then_some(&listed),
+                        listed: &listed,
+                        checksum: args.checksum,
                     },
                     &mut meter,
                     &mut skipped,
@@ -831,7 +846,8 @@ impl Transfer<'_> {
         let Round {
             names,
             budget,
-            expected,
+            listed,
+            checksum,
         } = round;
         let mut source = self
             .open(
@@ -846,11 +862,26 @@ impl Transfer<'_> {
                 return Err(error);
             }
         };
+        // What the destination agrees to take: each name as the source listed it, less what the
+        // source has just said it leaves out.
+        let left_out: HashSet<&str> = ready.skipped.iter().map(|e| e.path.as_str()).collect();
+        let entries: Vec<Planned> = names
+            .iter()
+            .filter(|name| !left_out.contains(name.as_str()))
+            .filter_map(|name| listed.get(name.as_str()))
+            .map(|entry| Planned {
+                path: entry.path.clone(),
+                kind: entry.kind,
+                size: (entry.kind == EntryKind::File).then_some(entry.size),
+                hash: if checksum { entry.hash } else { None },
+                target: entry.link_target.clone(),
+            })
+            .collect();
         skipped.extend(on(&from.machine, ready.skipped));
         let mut dest = match self
             .open(
                 to,
-                json!({"op": "unpack", "root": to.path, "names": names, "hash": expected.is_some()}),
+                json!({"op": "unpack", "root": to.path, "entries": entries}),
             )
             .await
         {
@@ -866,7 +897,7 @@ impl Transfer<'_> {
             return Err(error);
         }
         if let Err(broken) = relay(&mut source, &mut dest, Amount::AtMost(budget), meter).await {
-            return Err(broken.explain(source, dest).await);
+            return Err(blame(broken.explain(source, dest).await, from));
         }
         // The archive ended; it is whole only if the source says it finished.
         if let Err(error) = source.finish().await {
@@ -876,56 +907,7 @@ impl Transfer<'_> {
         dest.end_input().await;
         let done = dest.first::<UnpackDone>().await;
         dest.close().await;
-        let done = done?;
-        if !done.unplanned.is_empty() {
-            let shown: Vec<&String> = done.unplanned.iter().take(MOST_LISTED).collect();
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!(
-                    "{} sent {} entries that were not planned for this transfer, and {} refused them: {}.",
-                    from.machine,
-                    done.unplanned.len(),
-                    to.machine,
-                    shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
-                ),
-            )
-            .with_hint(format!(
-                "legion on {} is not behaving as it should; what was planned arrived, and nothing else was written.",
-                from.machine
-            ))
-            .with_details(json!({"unplanned": shown, "files_sent": done.files}))
-            .with_machine(from.machine.clone()));
-        }
-        if let Some(expected) = expected {
-            // What arrived must be what the source listed: a file edited in place while it was
-            // packed arrives whole and well formed, and only its hash tells.
-            let mismatched: Vec<&String> = done
-                .hashes
-                .iter()
-                .filter(|(path, arrived)| {
-                    let listed = expected.get(path.as_str()).and_then(|entry| entry.hash);
-                    listed.is_none() || **arrived != listed
-                })
-                .map(|(path, _)| path)
-                .collect();
-            if !mismatched.is_empty() {
-                let shown: Vec<&String> = mismatched.iter().copied().take(MOST_LISTED).collect();
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!(
-                        "{} files that arrived on {} are not what {} listed: {}.",
-                        mismatched.len(),
-                        to.machine,
-                        from.machine,
-                        shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
-                    ),
-                )
-                .with_hint("They probably changed while they were sent; run the transfer again once they stop changing.")
-                .with_details(json!({"mismatched": shown}))
-                .with_machine(from.machine.clone()));
-            }
-        }
-        Ok(done)
+        done.map_err(|error| blame(error, from))
     }
 
     async fn manifest(&self, end: &End, args: &TransferArgs) -> Result<Manifest, ErrorBody> {
@@ -1060,12 +1042,39 @@ fn left_in_place(error: ErrorBody, extras: usize, machine: &str) -> ErrorBody {
     error
 }
 
-/// One archive's worth of a tree: its names, the most bytes the archive may take, and, with
-/// `checksum`, what the source listed, to check what arrives against.
+/// One archive's worth of a tree: its names, the most bytes the archive may take, what the source
+/// listed for each, and whether their hashes are checked.
 struct Round<'a> {
     names: &'a [String],
     budget: u64,
-    expected: Option<&'a HashMap<&'a str, &'a Entry>>,
+    listed: &'a HashMap<&'a str, &'a Entry>,
+    checksum: bool,
+}
+
+/// A destination that refused an archive for not being what was planned says which entry and
+/// why; the archive is the source's, so the error names the source.
+fn blame(error: ErrorBody, from: &End) -> ErrorBody {
+    let Some(violation) = error
+        .details
+        .as_ref()
+        .and_then(|d| d.get("violation"))
+        .cloned()
+    else {
+        return error;
+    };
+    ErrorBody::new(
+        ErrorCode::Failed,
+        format!(
+            "{} sent an archive that is not what was planned: {}",
+            from.machine, error.message
+        ),
+    )
+    .with_hint(format!(
+        "Nothing was renamed over what the destination had for that entry. If {} changed while it was sent, run the transfer again; if not, legion there is not behaving as it should.",
+        from.machine
+    ))
+    .with_details(json!({"violation": violation, "refused_by": error.machine}))
+    .with_machine(from.machine.clone())
 }
 
 fn changed(from: &End) -> ErrorBody {
@@ -1145,8 +1154,21 @@ struct Conn {
     answered: bool,
     noise_lines: usize,
     noise_bytes: usize,
+    /// Whether the other end has said, on its first line, that it speaks this protocol.
+    greeted: bool,
+    /// The longest reply line taken once the other end has answered.
+    longest: usize,
+    /// How many bytes of lines have been read, which bounds a listing as a whole.
+    received: usize,
     /// When the pipe was opened, which the first reply's time limit counts from.
     opened: tokio::time::Instant,
+}
+
+/// How much a listing from another node may hold: entries, bytes in all, and bytes in one line.
+struct Bounds {
+    entries: usize,
+    bytes: usize,
+    line: usize,
 }
 
 /// One line of a `manifest` reply.
@@ -1235,6 +1257,9 @@ impl Conn {
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
+            greeted: false,
+            longest: LONGEST_REPLY,
+            received: 0,
             opened: tokio::time::Instant::now(),
         };
         let mut line = header.to_string().into_bytes();
@@ -1268,29 +1293,68 @@ impl Conn {
         writer.flush().await
     }
 
-    /// The next reply, which has the shape `T` or is the other end's error. `{"busy": true}`
-    /// lines, which say the other end is at work, are passed over wherever they come. Before the
-    /// first reply, lines of text that are neither (a login banner, a shell's own noise, even one
-    /// that happens to be JSON) are skipped within bounds, while bytes that are not text at all
-    /// mean the other end speaks another protocol; after it, anything else is the other end gone
-    /// wrong.
+    /// The next reply, which has the shape `T` or is the other end's error.
+    ///
+    /// The other end's first line says which protocol it speaks, and nothing it says is taken
+    /// before that: a node too old to say it would ignore what this one asks of it (the entries an
+    /// unpack must hold to, the hashes it must check), so it is refused before anything is sent
+    /// that relies on them. `{"busy": true}` lines, which say the other end is at work, are passed
+    /// over wherever they come, for at most [`MOST_BUSY`] for one reply. Before the first line,
+    /// lines of text that are neither (a login banner, a shell's own noise, even one that happens
+    /// to be JSON) are skipped within bounds, while bytes that are not text at all mean the other
+    /// end speaks another protocol; after it, anything else is the other end gone wrong.
     async fn first<T: DeserializeOwned>(&mut self) -> Result<T, ErrorBody> {
+        let waiting = tokio::time::Instant::now();
         loop {
             let line = self.line().await?;
             if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&line) {
-                if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
-                    self.answered = true;
+                if !self.greeted {
+                    if let Some(spoken) = fields.get("protocol") {
+                        if spoken.as_u64() != Some(u64::from(stream::STREAM_PROTOCOL)) {
+                            return Err(self.older(&format!(
+                                "speaks stream protocol {spoken}, and this node speaks stream protocol {}",
+                                stream::STREAM_PROTOCOL
+                            )));
+                        }
+                        self.greeted = true;
+                        self.answered = true;
+                        continue;
+                    }
+                    if looks_like_a_reply(&fields) {
+                        let said = fields
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                            .map(|message| format!(" (it said: {message})"))
+                            .unwrap_or_default();
+                        return Err(self.older(&format!(
+                            "answered without saying which stream protocol it speaks{said}, as a legion older than this one does"
+                        )));
+                    }
+                } else if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                    if waiting.elapsed() > MOST_BUSY {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Timeout,
+                            format!(
+                                "{} said it was busy for more than {} hours without answering.",
+                                self.machine,
+                                MOST_BUSY.as_secs() / 3600
+                            ),
+                        )
+                        .with_hint("Transfer a smaller part at a time, or check what is keeping that machine busy.")
+                        .with_machine(self.machine.clone()));
+                    }
                     continue;
                 }
-                if let Some(error) = fields.get("error")
-                    && let Ok(error) = serde_json::from_value::<ErrorBody>(error.clone())
-                {
-                    self.answered = true;
-                    return Err(with_machine(error, &self.machine));
-                }
-                if let Ok(reply) = serde_json::from_value::<T>(Value::Object(fields)) {
-                    self.answered = true;
-                    return Ok(reply);
+                if self.greeted {
+                    if let Some(error) = fields.get("error")
+                        && let Ok(error) = serde_json::from_value::<ErrorBody>(error.clone())
+                    {
+                        return Err(with_machine(error, &self.machine));
+                    }
+                    if let Ok(reply) = serde_json::from_value::<T>(Value::Object(fields)) {
+                        return Ok(reply);
+                    }
                 }
             }
             if self.answered {
@@ -1322,8 +1386,10 @@ impl Conn {
     /// reply, a byte that cannot be in a line of text ends the read at once: it is data from a
     /// node that speaks another protocol, which may never send a newline.
     async fn line(&mut self) -> Result<Vec<u8>, ErrorBody> {
-        let (wait, longest) = if self.answered {
-            (IDLE_TIMEOUT, LONGEST_REPLY)
+        // A reply is a JSON object however long it is; only other text, a banner, is held to
+        // what noise may take before the first reply.
+        let (wait, noise) = if self.answered {
+            (IDLE_TIMEOUT, self.longest)
         } else {
             (
                 FIRST_REPLY_TIMEOUT.saturating_sub(self.opened.elapsed()),
@@ -1334,7 +1400,15 @@ impl Conn {
         let binary_is_foreign = !self.answered;
         let read = tokio::time::timeout(
             wait,
-            read_line(&mut self.reader, &mut line, longest, binary_is_foreign),
+            read_line(
+                &mut self.reader,
+                &mut line,
+                Longest {
+                    reply: self.longest,
+                    noise,
+                },
+                binary_is_foreign,
+            ),
         )
         .await;
         match read {
@@ -1343,22 +1417,38 @@ impl Conn {
             } else {
                 FIRST_REPLY_TIMEOUT
             })),
-            Ok(Ok(Read::Line)) => Ok(line),
+            Ok(Ok(Read::Line)) => {
+                self.received += line.len();
+                Ok(line)
+            }
             Ok(Ok(Read::End)) => Err(self.ended("before it answered").await),
             Ok(Ok(Read::Binary)) => Err(self.mismatch("with bytes that are not text")),
-            Ok(Ok(Read::TooLong)) if !self.answered => {
+            Ok(Ok(Read::TooLong { reply: false })) if !self.answered => {
                 Err(self.mismatch("with more than a banner before its answer"))
             }
-            Ok(Ok(Read::TooLong)) => Err(ErrorBody::new(
+            Ok(Ok(Read::TooLong { .. })) => Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
-                    "{} answered a stream with a line longer than {LONGEST_REPLY} bytes.",
-                    self.machine
+                    "{} answered a stream with a line longer than {} bytes.",
+                    self.machine, self.longest
                 ),
             )
             .with_machine(self.machine.clone())),
             Ok(Err(error)) => Err(self.ended(&format!("while it answered ({error})")).await),
         }
+    }
+
+    /// The other end speaks another version of the protocol, or one too old to say which.
+    fn older(&self, what: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("{} {what}.", self.machine),
+        )
+        .with_hint(format!(
+            "Update legion on {} (or on this machine, if it is the older one), so both speak the same stream protocol.",
+            self.machine
+        ))
+        .with_machine(self.machine.clone())
     }
 
     /// The other end answered with something other than this protocol's first line.
@@ -1409,13 +1499,32 @@ impl Conn {
     /// Reads a `manifest` reply: one entry per line, then the line that ends it, which must come
     /// and must count what came before it.
     async fn manifest(&mut self) -> Result<Manifest, ErrorBody> {
-        self.manifest_at_most(MOST_LISTED_ENTRIES).await
+        self.manifest_within(Bounds {
+            entries: MOST_LISTED_ENTRIES,
+            bytes: MOST_LISTING_BYTES,
+            line: MOST_LISTING_LINE,
+        })
+        .await
     }
 
-    async fn manifest_at_most(&mut self, most: usize) -> Result<Manifest, ErrorBody> {
+    async fn manifest_within(&mut self, bounds: Bounds) -> Result<Manifest, ErrorBody> {
+        let most = bounds.entries;
+        self.longest = bounds.line;
         let mut manifest = Manifest::default();
         loop {
-            match self.first::<Listed>().await? {
+            let listed = self.first::<Listed>().await?;
+            if self.received > bounds.bytes {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "The listing from {} is larger than {} bytes, more than one transfer compares.",
+                        self.machine, bounds.bytes
+                    ),
+                )
+                .with_hint("Transfer its subdirectories one at a time.")
+                .with_machine(self.machine.clone()));
+            }
+            match listed {
                 Listed::Entry(_) if manifest.entries.len() == most => {
                     return Err(ErrorBody::new(
                         ErrorCode::Failed,
@@ -1561,24 +1670,39 @@ impl Conn {
     }
 }
 
+/// Whether a JSON line before the protocol line is a reply from a node too old to send that line,
+/// rather than a banner that happens to be JSON: it has a field one of this protocol's replies has.
+fn looks_like_a_reply(fields: &serde_json::Map<String, Value>) -> bool {
+    const REPLY_FIELDS: [&str; 10] = [
+        "error", "kind", "path", "size", "offset", "ready", "removed", "done", "ok", "busy",
+    ];
+    REPLY_FIELDS.iter().any(|field| fields.contains_key(*field))
+}
+
 /// How reading a line ended.
 enum Read {
     /// A whole line, or the last bytes before the end.
     Line,
     /// The end, before any byte.
     End,
-    /// More than the longest line allowed.
-    TooLong,
+    /// More than the longest line allowed; `reply` when the line began as a JSON object.
+    TooLong { reply: bool },
     /// A NUL byte, which no line of text holds.
     Binary,
 }
 
-/// Reads one line into `line`, newline included, without taking more than `longest` bytes, and
+/// How long a line may grow: one that begins as a JSON object is a reply, anything else noise.
+struct Longest {
+    reply: usize,
+    noise: usize,
+}
+
+/// Reads one line into `line`, newline included, without taking more than `longest` allows, and
 /// stopping at the first NUL byte when `stop_at_binary` says to, without waiting for a newline.
 async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut Vec<u8>,
-    longest: usize,
+    longest: Longest,
     stop_at_binary: bool,
 ) -> std::io::Result<Read> {
     loop {
@@ -1597,8 +1721,14 @@ async fn read_line<R: AsyncBufRead + Unpin>(
         if stop_at_binary && chunk.contains(&0) {
             return Ok(Read::Binary);
         }
-        if line.len() + chunk.len() > longest {
-            return Ok(Read::TooLong);
+        let reply = line
+            .iter()
+            .chain(chunk)
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(&b'{');
+        let most = if reply { longest.reply } else { longest.noise };
+        if line.len() + chunk.len() > most {
+            return Ok(Read::TooLong { reply });
         }
         line.extend_from_slice(chunk);
         let used = chunk.len();
@@ -1995,6 +2125,68 @@ mod tests {
         assert_eq!(join("~", "a.txt"), "~/a.txt");
     }
 
+    /// A listing's usual bounds, with at most `entries` entries.
+    fn bounded(entries: usize) -> Bounds {
+        Bounds {
+            entries,
+            bytes: MOST_LISTING_BYTES,
+            line: MOST_LISTING_LINE,
+        }
+    }
+
+    /// The line a node opens every stream with.
+    const HELLO: &[u8] = b"{\"protocol\":1}\n";
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_does_not_say_it_speaks_this_protocol_is_refused() {
+        for (said, says) in [
+            // Older: it answers straight away, ignoring what it does not know.
+            ("{\"ready\":true}\n", "without saying"),
+            (
+                "{\"error\":{\"code\":\"denied\",\"message\":\"No.\"}}\n",
+                "it said: No.",
+            ),
+            // Newer.
+            (
+                "{\"protocol\":2}\n{\"ready\":true}\n",
+                "speaks stream protocol 2",
+            ),
+        ] {
+            let (mut conn, mut out, _in) = conn("old");
+            out.write_all(said.as_bytes()).await.unwrap();
+            let error = conn.first::<UnpackReady>().await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Unsupported, "{said}: {error:?}");
+            assert!(error.message.contains(says), "{said}: {error:?}");
+            assert!(error.hint.unwrap().contains("Update legion on old"));
+        }
+        // A banner before the protocol line is still passed over.
+        let (mut conn, mut out, _in) = conn("pi");
+        out.write_all(b"Welcome!\n{\"motd\":\"hi\"}\n{\"protocol\":1}\n{\"ready\":true}\n")
+            .await
+            .unwrap();
+        assert!(conn.first::<UnpackReady>().await.unwrap().ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_lines_put_a_reply_off_only_so_long() {
+        let (mut conn, mut out, _in) = conn("pi");
+        tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
+            loop {
+                tokio::time::sleep(stream::HEARTBEAT).await;
+                if out.write_all(b"{\"busy\":true}\n").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let error = conn.first::<StatReply>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert!(error.message.contains("busy"), "{error:?}");
+        assert!(started.elapsed() > MOST_BUSY);
+        assert!(started.elapsed() < MOST_BUSY + stream::HEARTBEAT * 2);
+    }
+
     /// A pipe end that nobody writes to until a test says so, standing for the other node.
     fn conn(machine: &str) -> (Conn, tokio::io::DuplexStream, tokio::io::DuplexStream) {
         let (reader, peer_out) = tokio::io::duplex(CHUNK);
@@ -2010,6 +2202,9 @@ mod tests {
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
+            greeted: false,
+            longest: LONGEST_REPLY,
+            received: 0,
             opened: tokio::time::Instant::now(),
         };
         (conn, peer_out, peer_in)
@@ -2030,6 +2225,7 @@ mod tests {
     async fn an_end_that_says_it_is_busy_is_waited_for() {
         let (mut conn, mut out, _in) = conn("pi");
         let talker = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
             for _ in 0..30 {
                 tokio::time::sleep(stream::HEARTBEAT).await;
                 out.write_all(b"{\"busy\":true}\n").await.unwrap();
@@ -2099,7 +2295,8 @@ mod tests {
             )
         };
         let listing = |count: usize, done: Option<usize>| {
-            let mut text: String = (0..count).map(|at| entry(&format!("f{at}"))).collect();
+            let mut text = String::from_utf8_lossy(HELLO).into_owned();
+            text.extend((0..count).map(|at| entry(&format!("f{at}"))));
             if let Some(said) = done {
                 text.push_str(&format!("{{\"done\":true,\"entries\":{said}}}\n"));
             }
@@ -2123,14 +2320,100 @@ mod tests {
             let (mut conn, mut out, _in) = conn("pi");
             out.write_all(text.as_bytes()).await.unwrap();
             drop(out);
-            let error = conn.manifest_at_most(most).await.unwrap_err();
+            let error = conn.manifest_within(bounded(most)).await.unwrap_err();
             assert_eq!(error.code, code, "{error:?}");
             assert!(error.message.contains(says), "{error:?}");
             assert_eq!(error.machine.as_deref(), Some("pi"));
         }
         let (mut conn, mut out, _in) = conn("pi");
         out.write_all(listing(3, Some(3)).as_bytes()).await.unwrap();
-        assert_eq!(conn.manifest_at_most(3).await.unwrap().entries.len(), 3);
+        assert_eq!(
+            conn.manifest_within(bounded(3))
+                .await
+                .unwrap()
+                .entries
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_line_is_bounded_in_bytes() {
+        // A link whose target alone is far longer than any path a file system takes.
+        let target = "t".repeat(2 * 1024 * 1024);
+        let line = format!(
+            "{{\"path\":\"l\",\"kind\":\"symlink\",\"size\":0,\"mtime\":{{\"secs\":1,\"nanos\":0}},\"link_target\":\"{target}\"}}\n"
+        );
+        let (mut listing, mut out, _in) = conn("pi");
+        let writer = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
+            let _ = out.write_all(line.as_bytes()).await;
+            let _ = out.write_all(b"{\"done\":true,\"entries\":1}\n").await;
+            out
+        });
+        let error = listing.manifest_within(bounded(10)).await.unwrap_err();
+        drop(writer);
+        assert_eq!(error.code, ErrorCode::Failed, "{error:?}");
+        assert_eq!(error.machine.as_deref(), Some("pi"));
+        assert!(error.message.contains("longer than"), "{error:?}");
+
+        // Many ordinary lines may not add up to more than a listing may take in all.
+        let (mut listing, mut out, _in) = conn("pi");
+        let writer = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
+            for at in 0..50 {
+                let line = format!(
+                    "{{\"path\":\"f{at}\",\"kind\":\"file\",\"size\":1,\"mtime\":{{\"secs\":1,\"nanos\":0}}}}\n"
+                );
+                if out.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            out
+        });
+        let error = listing
+            .manifest_within(Bounds {
+                entries: 1000,
+                bytes: 1000,
+                line: MOST_LISTING_LINE,
+            })
+            .await
+            .unwrap_err();
+        drop(writer);
+        assert_eq!(error.code, ErrorCode::Failed, "{error:?}");
+        assert!(error.hint.unwrap().contains("subdirectories"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_first_reply_is_read_whole_while_noise_stays_bounded() {
+        // A listing whose only line names 800 entries it could not read: far longer than any
+        // banner, and a reply all the same.
+        let skipped: Vec<Value> = (0..800)
+            .map(|at| json!({"path": format!("locked/directory-{at:04}"), "reason": "Permission denied (os error 13), which is the whole of it"}))
+            .collect();
+        let done = json!({"done": true, "entries": 0, "skipped": skipped}).to_string();
+        assert!(done.len() > MOST_NOISE_BYTES);
+        let (mut listing, mut out, _in) = conn("pi");
+        // More than the pipe holds, so it is written while the reply is read.
+        let writer = tokio::spawn(async move {
+            out.write_all(HELLO).await.unwrap();
+            out.write_all(format!("{done}\n").as_bytes()).await.unwrap();
+            out
+        });
+        let listed = listing.manifest_within(bounded(10)).await.unwrap();
+        assert_eq!(listed.skipped.len(), 800);
+        drop(writer);
+
+        // Text that is not JSON is still held to what a banner may take.
+        let (mut noisy, mut out, _in) = conn("pi");
+        let banner = "x".repeat(MOST_NOISE_BYTES + 10);
+        let writer = tokio::spawn(async move {
+            let _ = out.write_all(format!("{banner}\n").as_bytes()).await;
+            out
+        });
+        let error = noisy.first::<StatReply>().await.unwrap_err();
+        drop(writer);
+        assert_eq!(error.code, ErrorCode::Unsupported, "{error:?}");
     }
 
     #[test]
