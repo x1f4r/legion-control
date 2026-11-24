@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    OwnDirFilter, Progress, cancelled_error, check_not_protected_tree, is_same_or_descendant,
-    is_strict_ancestor, map_io_error, map_os_error, path_to_string, paths_equal, platform,
-    run_blocking,
+    OwnDirFilter, Progress, cancelled_error, check_fs_path, check_not_protected_tree,
+    is_same_or_descendant, is_strict_ancestor, map_io_error, map_os_error, path_to_string,
+    paths_equal, platform, run_blocking,
 };
 
 const REMOVE_SAMPLE_LIMIT: usize = 50;
@@ -62,8 +62,8 @@ struct MoveResult {
 }
 
 async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> {
-    let from = ctx.grant().check_path(&args.from, Access::Write)?;
-    let to = ctx.grant().check_path(&args.to, Access::Write)?;
+    let from = check_fs_path(ctx.grant(), &args.from, Access::Write)?;
+    let to = check_fs_path(ctx.grant(), &args.to, Access::Write)?;
     check_not_protected_tree(ctx.grant(), &from)?;
     check_not_protected_tree(ctx.grant(), &to)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
@@ -160,48 +160,17 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
             Err(OsError::Io { source, .. }) if source.kind() == io::ErrorKind::CrossesDevices => {
                 let root_dev = platform::device_id(&from, &from_meta);
                 let same_dev = |p: &Path, m: &Metadata| platform::same_device(&root_dev, p, m);
-                let mut totals = CopyTotals::default();
-                let opts = CopyOptions {
-                    overwrite,
-                    recursive: true,
-                    allows_destroy,
-                    principal: &principal,
-                    tool: "fs.move",
-                    own_dirs: &own_dirs,
-                    same_device: &same_dev,
-                };
-                copy_path(&from, &to, &from_meta, &opts, &cancel, &mut progress, &mut totals)?;
-                if !totals.skipped.is_empty() {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Conflict,
-                        format!(
-                            "Cross-device move of {} to {} skipped {} nested directory(s) on another file system, so source {} was not removed.",
-                            from.display(),
-                            to.display(),
-                            totals.skipped.len(),
-                            from.display()
-                        ),
-                    )
-                    .with_hint("Move or unmount nested file systems separately before moving the parent directory.")
-                    .with_details(json!({
-                        "copy_completed": true,
-                        "source_intact": true,
-                        "files": totals.files,
-                        "bytes": totals.bytes,
-                        "skipped": totals.skipped,
-                    })));
-                }
-                let mut removed = RemoveTotals::default();
-                remove_path(
+                move_across_devices(
                     &from,
+                    &to,
                     &from_meta,
-                    true,
-                    false,
-                    "fs.move",
+                    overwrite,
+                    allows_destroy,
+                    &principal,
+                    &own_dirs,
                     &same_dev,
                     &cancel,
                     &mut progress,
-                    &mut removed,
                 )?;
             }
             Err(error) => return Err(map_os_error("move", &from, error)),
@@ -213,6 +182,207 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
         })
     })
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_across_devices(
+    from: &Path,
+    to: &Path,
+    from_meta: &Metadata,
+    overwrite: bool,
+    allows_destroy: bool,
+    principal: &str,
+    own_dirs: &OwnDirFilter,
+    same_device: &dyn Fn(&Path, &Metadata) -> bool,
+    cancel: &CancellationToken,
+    progress: &mut Progress,
+) -> Result<(), ToolError> {
+    move_across_devices_with_hook(
+        from,
+        to,
+        from_meta,
+        overwrite,
+        allows_destroy,
+        principal,
+        own_dirs,
+        same_device,
+        cancel,
+        progress,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_across_devices_with_hook(
+    from: &Path,
+    to: &Path,
+    from_meta: &Metadata,
+    overwrite: bool,
+    allows_destroy: bool,
+    principal: &str,
+    own_dirs: &OwnDirFilter,
+    same_device: &dyn Fn(&Path, &Metadata) -> bool,
+    cancel: &CancellationToken,
+    progress: &mut Progress,
+    after_copy: impl FnOnce(),
+) -> Result<(), ToolError> {
+    let mut totals = CopyTotals::default();
+    let opts = CopyOptions {
+        overwrite,
+        recursive: true,
+        allows_destroy,
+        principal,
+        tool: "fs.move",
+        own_dirs,
+        same_device,
+    };
+    if let Err(err) = copy_path(from, to, from_meta, &opts, cancel, progress, &mut totals) {
+        let verb = if err.code == ErrorCode::Cancelled {
+            "Cross-device move was cancelled before the copy completed"
+        } else {
+            "Cross-device move failed before the copy completed"
+        };
+        let destination_partial = totals.files > 0 || fs::symlink_metadata(to).is_ok();
+        let remain_note = if destination_partial {
+            format!(
+                "source {} is intact; partial data ({} file(s), {} byte(s)) may remain at {}",
+                from.display(),
+                totals.files,
+                totals.bytes,
+                to.display()
+            )
+        } else {
+            format!(
+                "source {} is intact; nothing was written to {}",
+                from.display(),
+                to.display()
+            )
+        };
+        let mut wrapped =
+            ErrorBody::new(err.code, format!("{verb} ({remain_note}): {}", err.message));
+        if let Some(hint) = err.hint {
+            wrapped = wrapped.with_hint(hint);
+        } else {
+            wrapped = wrapped.with_hint(
+                "The source is still intact; inspect or remove any partial destination before retrying fs.move.",
+            );
+        }
+        let mut details = json!({
+            "phase": "copy",
+            "copy_completed": false,
+            "source_intact": true,
+            "destination_partial": destination_partial,
+            "from": path_to_string(from),
+            "to": path_to_string(to),
+            "files_copied": totals.files,
+            "bytes_copied": totals.bytes,
+        });
+        if !totals.skipped.is_empty()
+            && let Some(obj) = details.as_object_mut()
+        {
+            obj.insert("skipped".to_owned(), json!(totals.skipped));
+        }
+        if let Some(cause) = err.details
+            && let Some(obj) = details.as_object_mut()
+        {
+            obj.insert("cause".to_owned(), cause);
+        }
+        return Err(wrapped.with_details(details));
+    }
+
+    if !totals.skipped.is_empty() {
+        return Err(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!(
+                "Cross-device move copied same-device entries from {} to {} ({} file(s), {} byte(s)) but skipped {} nested directory(s) on another file system, so the copy did not complete and source {} was left intact.",
+                from.display(),
+                to.display(),
+                totals.files,
+                totals.bytes,
+                totals.skipped.len(),
+                from.display()
+            ),
+        )
+        .with_hint("Move or unmount nested file systems separately before moving the parent directory.")
+        .with_details(json!({
+            "phase": "copy",
+            "copy_completed": false,
+            "source_intact": true,
+            "destination_partial": true,
+            "from": path_to_string(from),
+            "to": path_to_string(to),
+            "files_copied": totals.files,
+            "bytes_copied": totals.bytes,
+            "skipped": totals.skipped,
+        })));
+    }
+
+    after_copy();
+
+    let mut removed = RemoveTotals::default();
+    if let Err(err) = remove_path(
+        from,
+        from_meta,
+        true,
+        false,
+        "fs.move",
+        same_device,
+        cancel,
+        progress,
+        &mut removed,
+    ) {
+        let verb = if err.code == ErrorCode::Cancelled {
+            "Cross-device move completed copying to destination, then was cancelled while removing the source"
+        } else {
+            "Cross-device move completed copying to destination, then failed while removing the source"
+        };
+        let source_state = if removed.removed == 0 {
+            format!("source {} is still intact", from.display())
+        } else {
+            format!(
+                "source {} was only partially removed ({} entry(s), {} byte(s) deleted)",
+                from.display(),
+                removed.removed,
+                removed.bytes
+            )
+        };
+        let mut wrapped = ErrorBody::new(
+            err.code,
+            format!(
+                "{verb}: the complete copy is at {} ({} file(s), {} byte(s)), and {source_state}: {}",
+                to.display(),
+                totals.files,
+                totals.bytes,
+                err.message
+            ),
+        );
+        if let Some(hint) = err.hint {
+            wrapped = wrapped.with_hint(hint);
+        } else {
+            wrapped = wrapped.with_hint(
+                "The destination holds the complete copy; remove the remaining source with fs.remove once verified.",
+            );
+        }
+        let mut details = json!({
+            "phase": "remove",
+            "copy_completed": true,
+            "source_intact": removed.removed == 0,
+            "from": path_to_string(from),
+            "to": path_to_string(to),
+            "files_copied": totals.files,
+            "bytes_copied": totals.bytes,
+            "source_removed": removed.removed,
+            "source_bytes_removed": removed.bytes,
+        });
+        if let Some(cause) = err.details
+            && let Some(obj) = details.as_object_mut()
+        {
+            obj.insert("cause".to_owned(), cause);
+        }
+        return Err(wrapped.with_details(details));
+    }
+
+    Ok(())
 }
 
 /// Arguments of `fs.copy`.
@@ -243,8 +413,8 @@ struct CopyResult {
 }
 
 async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> {
-    let from = ctx.grant().check_path(&args.from, Access::Read)?;
-    let to = ctx.grant().check_path(&args.to, Access::Write)?;
+    let from = check_fs_path(ctx.grant(), &args.from, Access::Read)?;
+    let to = check_fs_path(ctx.grant(), &args.to, Access::Write)?;
     check_not_protected_tree(ctx.grant(), &to)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
     let allows_destroy = ctx.grant().allows_effect(Effect::Destroy);
@@ -650,7 +820,7 @@ struct RemoveResult {
 }
 
 async fn remove_entry(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolError> {
-    let path = ctx.grant().check_path(&args.path, Access::Write)?;
+    let path = check_fs_path(ctx.grant(), &args.path, Access::Write)?;
     check_not_protected_tree(ctx.grant(), &path)?;
     let recursive = args.recursive;
     let dry_run = args.dry_run;
@@ -1065,5 +1235,149 @@ mod tests {
         );
         assert!(src.join("a.txt").exists());
         assert!(mnt.join("mounted.txt").exists());
+    }
+
+    #[test]
+    fn cross_device_move_errors_report_copy_completion_and_what_remains_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let own_dirs = OwnDirFilter::allow_all_for_test();
+        let all_same = |_p: &Path, _m: &Metadata| true;
+
+        // 1. Pre-cancelled before copy starts: copy did not complete, source intact, nothing at dst.
+        let src1 = dir.path().join("src1.txt");
+        let dst1 = dir.path().join("dst1.txt");
+        fs::write(&src1, "hello").unwrap();
+        let meta1 = fs::symlink_metadata(&src1).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut progress = Progress::for_test(tx);
+        let cancel1 = CancellationToken::new();
+        cancel1.cancel();
+        let err1 = move_across_devices(
+            &src1,
+            &dst1,
+            &meta1,
+            false,
+            true,
+            "owner",
+            &own_dirs,
+            &all_same,
+            &cancel1,
+            &mut progress,
+        )
+        .unwrap_err();
+        assert_eq!(err1.code, ErrorCode::Cancelled);
+        assert!(err1.message.contains("before the copy completed"), "{err1}");
+        assert!(err1.message.contains("intact"), "{err1}");
+        let d1 = err1.details.unwrap();
+        assert_eq!(d1["phase"], json!("copy"));
+        assert_eq!(d1["copy_completed"], json!(false));
+        assert_eq!(d1["source_intact"], json!(true));
+        assert_eq!(d1["destination_partial"], json!(false));
+        assert!(src1.exists() && !dst1.exists());
+
+        // 2. Failure mid-copy: one file copied before hitting a file-vs-dir conflict.
+        let src2 = dir.path().join("src2");
+        let dst2 = dir.path().join("dst2");
+        fs::create_dir_all(&src2).unwrap();
+        fs::write(src2.join("a.txt"), "aaa").unwrap();
+        fs::write(src2.join("b"), "bbb").unwrap();
+        fs::create_dir_all(dst2.join("b")).unwrap();
+        let meta2 = fs::symlink_metadata(&src2).unwrap();
+        let cancel2 = CancellationToken::new();
+        let err2 = move_across_devices(
+            &src2,
+            &dst2,
+            &meta2,
+            true,
+            true,
+            "owner",
+            &own_dirs,
+            &all_same,
+            &cancel2,
+            &mut progress,
+        )
+        .unwrap_err();
+        assert_eq!(err2.code, ErrorCode::Conflict);
+        assert!(err2.message.contains("before the copy completed"), "{err2}");
+        assert!(err2.message.contains("partial data"), "{err2}");
+        let d2 = err2.details.unwrap();
+        assert_eq!(d2["phase"], json!("copy"));
+        assert_eq!(d2["copy_completed"], json!(false));
+        assert_eq!(d2["source_intact"], json!(true));
+        assert_eq!(d2["destination_partial"], json!(true));
+        assert_eq!(d2["files_copied"], json!(1));
+        assert!(src2.join("a.txt").exists() && src2.join("b").exists());
+        assert!(dst2.join("a.txt").exists());
+
+        // 3. Cancelled after copy completes, before source removal: copy completed, both exist.
+        let src3 = dir.path().join("src3");
+        let dst3 = dir.path().join("dst3");
+        fs::create_dir_all(&src3).unwrap();
+        fs::write(src3.join("one.txt"), "1").unwrap();
+        fs::write(src3.join("two.txt"), "22").unwrap();
+        let meta3 = fs::symlink_metadata(&src3).unwrap();
+        let cancel3 = CancellationToken::new();
+        let err3 = move_across_devices_with_hook(
+            &src3,
+            &dst3,
+            &meta3,
+            false,
+            true,
+            "owner",
+            &own_dirs,
+            &all_same,
+            &cancel3,
+            &mut progress,
+            || cancel3.cancel(),
+        )
+        .unwrap_err();
+        assert_eq!(err3.code, ErrorCode::Cancelled);
+        assert!(
+            err3.message.contains("completed copying to destination"),
+            "{err3}"
+        );
+        assert!(err3.message.contains("complete copy is at"), "{err3}");
+        let d3 = err3.details.unwrap();
+        assert_eq!(d3["phase"], json!("remove"));
+        assert_eq!(d3["copy_completed"], json!(true));
+        assert_eq!(d3["source_intact"], json!(true));
+        assert_eq!(d3["files_copied"], json!(2));
+        assert_eq!(d3["bytes_copied"], json!(3));
+        assert_eq!(fs::read_to_string(dst3.join("two.txt")).unwrap(), "22");
+        assert!(src3.join("one.txt").exists());
+
+        // 4. Failure during source removal after copy completed: reports complete copy at dst.
+        let src4 = dir.path().join("src4.txt");
+        let dst4 = dir.path().join("dst4.txt");
+        fs::write(&src4, "payload").unwrap();
+        let meta4 = fs::symlink_metadata(&src4).unwrap();
+        let cancel4 = CancellationToken::new();
+        let err4 = move_across_devices_with_hook(
+            &src4,
+            &dst4,
+            &meta4,
+            false,
+            true,
+            "owner",
+            &own_dirs,
+            &all_same,
+            &cancel4,
+            &mut progress,
+            || {
+                // Swap the copied file for a directory so `fs::remove_file` fails cleanly on every OS.
+                fs::remove_file(&src4).unwrap();
+                fs::create_dir(&src4).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err4.message.contains("completed copying to destination"),
+            "{err4}"
+        );
+        let d4 = err4.details.unwrap();
+        assert_eq!(d4["phase"], json!("remove"));
+        assert_eq!(d4["copy_completed"], json!(true));
+        assert_eq!(d4["files_copied"], json!(1));
+        assert_eq!(fs::read_to_string(&dst4).unwrap(), "payload");
     }
 }

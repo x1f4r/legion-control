@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Encoding, acquire_write_lock, cancelled_error, format_blake3, map_io_error, map_os_error,
-    parse_unix_mode, path_to_string, platform, run_blocking,
+    Encoding, acquire_write_lock, cancelled_error, check_fs_path, check_regular_file,
+    format_blake3, map_io_error, map_os_error, parse_unix_mode, path_to_string, platform,
+    run_blocking, validate_windows_path,
 };
 
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
@@ -144,7 +145,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         })?,
     };
 
-    let checked = ctx.grant().check_path(&args.path, Access::Write)?;
+    let checked = check_fs_path(ctx.grant(), &args.path, Access::Write)?;
     let grant = ctx.grant().clone();
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let mode = args.mode;
@@ -189,13 +190,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
             let (mut file, created) = match platform::open_append_create_new(&path, unix_mode) {
                 Ok(file) => (file, true),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-                        return Err(ErrorBody::new(
-                            ErrorCode::InvalidArgs,
-                            format!("{} is a directory, not a file.", path.display()),
-                        )
-                        .with_hint("Pass a file path to fs.write."));
-                    }
+                    check_regular_file(&path, "append to", "Pass a file path to fs.write.")?;
                     let file = OpenOptions::new()
                         .append(true)
                         .open(&path)
@@ -240,6 +235,16 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
                     .with_hint(
                         "Use mode \"overwrite\" or \"append\" to modify an existing file.",
                     ));
+                }
+                if !meta.is_file() {
+                    return Err(ErrorBody::new(
+                        ErrorCode::InvalidArgs,
+                        format!(
+                            "{} is not a regular file (it is a named pipe, socket or device).",
+                            path.display()
+                        ),
+                    )
+                    .with_hint("Pass a regular file path to fs.write."));
                 }
                 true
             }
@@ -345,7 +350,7 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
             "Provide the exact text to replace, or use fs.write to replace the whole file.",
         ));
     }
-    let checked = ctx.grant().check_path(&args.path, Access::Write)?;
+    let checked = check_fs_path(ctx.grant(), &args.path, Access::Write)?;
     let grant = ctx.grant().clone();
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let old = args.old;
@@ -361,24 +366,14 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
         // other Legion calls, not against external programs).
         let _write_lock = acquire_write_lock(&state_dir, &cancel, "fs.edit")?;
         let path = resolve_write_target(&grant, checked, false)?;
-        let meta = match fs::metadata(&path) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ErrorBody::new(
-                    ErrorCode::NotFound,
-                    format!("{} does not exist.", path.display()),
-                )
-                .with_hint("Check the path or create the file with fs.write."));
-            }
-            Err(error) => return Err(map_io_error("read", &path, error)),
-        };
-        if meta.is_dir() {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!("{} is a directory, not a file.", path.display()),
-            )
-            .with_hint("Pass a file path to fs.edit."));
-        }
+        let meta =
+            check_regular_file(&path, "read", "Pass a file path to fs.edit.").map_err(|err| {
+                if err.code == ErrorCode::NotFound {
+                    err.with_hint("Check the path or create the file with fs.write.")
+                } else {
+                    err
+                }
+            })?;
         if meta.len() > MAX_EDIT_FILE_BYTES as u64 {
             return Err(file_too_large_for_edit(&path, Some(meta.len())));
         }
@@ -513,7 +508,7 @@ struct MkdirResult {
 }
 
 async fn mkdir(ctx: &Ctx, args: MkdirArgs) -> Result<MkdirResult, ToolError> {
-    let path = ctx.grant().check_path(&args.path, Access::Write)?;
+    let path = check_fs_path(ctx.grant(), &args.path, Access::Write)?;
     let parents = args.parents;
 
     run_blocking(ctx, "fs.mkdir", move |_cancel, _progress| {
@@ -609,6 +604,9 @@ fn resolve_write_target(
                 }
                 Err(error) => return Err(map_io_error("resolve symbolic link", &path, error)),
             };
+            if platform::IS_WINDOWS {
+                validate_windows_path(&path_to_string(&target))?;
+            }
             grant.check_path(&target, Access::Write)
         }
         Ok(_) => Ok(path),

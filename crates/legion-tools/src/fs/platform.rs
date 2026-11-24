@@ -14,6 +14,8 @@ mod imp {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Path;
 
+    pub(super) const IS_WINDOWS: bool = false;
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) struct DeviceId(u64);
 
@@ -81,6 +83,8 @@ mod imp {
     use std::io;
     use std::os::windows::fs::MetadataExt;
     use std::path::{Component, Path};
+
+    pub(super) const IS_WINDOWS: bool = true;
 
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
@@ -177,6 +181,8 @@ mod imp {
     use std::io;
     use std::path::Path;
 
+    pub(super) const IS_WINDOWS: bool = false;
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) struct DeviceId;
 
@@ -235,6 +241,9 @@ mod imp {
         a == b
     }
 }
+
+/// Whether the target platform uses Windows path semantics.
+pub(crate) const IS_WINDOWS: bool = imp::IS_WINDOWS;
 
 /// Formats Unix permission bits as a four-digit octal string, or `None` on Windows.
 pub(crate) fn unix_mode(meta: &Metadata) -> Option<String> {

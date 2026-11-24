@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, format_mtime,
-    map_io_error, path_to_string, run_blocking,
+    EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, check_fs_path,
+    format_mtime, map_io_error, path_to_string, run_blocking,
 };
 
 const DEFAULT_FIND_LIMIT: u32 = 200;
@@ -190,7 +190,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         ));
     }
     let glob = args.glob.as_deref().map(GlobFilter::compile).transpose()?;
-    let root = ctx.grant().check_path(&args.path, Access::Read)?;
+    let root = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
     let kind_filter = args.kind;
     let max_depth = args
@@ -367,7 +367,7 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
             .with_hint("Check the regex syntax; escape characters such as ., (, or [ with \\.")
         })?;
     let glob = args.glob.as_deref().map(GlobFilter::compile).transpose()?;
-    let root = ctx.grant().check_path(&args.path, Access::Read)?;
+    let root = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
     let context = usize::try_from(args.context).unwrap_or(0);
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
@@ -442,7 +442,13 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
         } else {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                format!("{} is neither a file nor a directory.", root.display()),
+                format!(
+                    "{} is not a regular file or directory (it is a named pipe, socket or device).",
+                    root.display()
+                ),
+            )
+            .with_hint(
+                "Pass a regular file or directory to fs.grep; special files are refused before opening so calls cannot block.",
             ));
         }
 
@@ -470,6 +476,22 @@ struct GrepState<'a> {
 fn grep_file(path: &Path, fail_on_open: bool, state: &mut GrepState<'_>) -> Result<(), ToolError> {
     if state.cancel.is_cancelled() {
         return Err(cancelled_error("fs.grep"));
+    }
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) if fail_on_open => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "{} is not a regular file (it is a named pipe, socket or device).",
+                    path.display()
+                ),
+            )
+            .with_hint("Pass a regular file or directory to fs.grep."));
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if fail_on_open => return Err(map_io_error("read", path, error)),
+        Err(_) => return Ok(()),
     }
     let file = match File::open(path) {
         Ok(file) => file,

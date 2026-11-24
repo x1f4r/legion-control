@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, format_blake3,
-    format_mtime, is_hidden, map_io_error, path_to_string, platform, run_blocking,
+    Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, check_fs_path,
+    check_regular_file, format_blake3, format_mtime, is_hidden, map_io_error, path_to_string,
+    platform, run_blocking,
 };
 
 const MAX_LIST_DEPTH: u32 = 8;
@@ -123,7 +124,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             ),
         ));
     }
-    let root = ctx.grant().check_path(&args.path, Access::Read)?;
+    let root = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
     let max_depth = args.depth;
     let include_hidden = args.hidden;
@@ -293,7 +294,7 @@ struct StatResult {
 }
 
 async fn stat(ctx: &Ctx, args: StatArgs) -> Result<StatResult, ToolError> {
-    let path = ctx.grant().check_path(&args.path, Access::Read)?;
+    let path = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     run_blocking(ctx, "fs.stat", move |_cancel, _progress| {
         let meta =
             fs::symlink_metadata(&path).map_err(|error| map_io_error("stat", &path, error))?;
@@ -364,22 +365,23 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<ReadResult, ToolError> {
         )
         .with_hint("Page through larger files with offset, or stream them with fs.transfer."));
     }
-    let path = ctx.grant().check_path(&args.path, Access::Read)?;
+    let path = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     let offset = args.offset;
     let length = usize::try_from(args.length).unwrap_or(usize::MAX);
     let requested_encoding = args.encoding;
 
     run_blocking(ctx, "fs.read", move |cancel, _progress| {
+        check_regular_file(&path, "read", "Use fs.list to inspect a directory.")?;
         let mut file = File::open(&path).map_err(|error| map_io_error("read", &path, error))?;
         let meta = file
             .metadata()
             .map_err(|error| map_io_error("read", &path, error))?;
-        if meta.is_dir() {
+        if !meta.is_file() {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                format!("{} is a directory, not a file.", path.display()),
+                format!("{} is not a regular file.", path.display()),
             )
-            .with_hint("Use fs.list to inspect a directory."));
+            .with_hint("Pass a regular file path to fs.read."));
         }
         let size = meta.len();
         let base64_raw_limit = max_base64_raw_bytes(&path, size, offset);
@@ -635,18 +637,19 @@ struct HashResult {
 }
 
 async fn hash(ctx: &Ctx, args: HashArgs) -> Result<HashResult, ToolError> {
-    let path = ctx.grant().check_path(&args.path, Access::Read)?;
+    let path = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     run_blocking(ctx, "fs.hash", move |cancel, mut progress| {
+        check_regular_file(&path, "hash", "Pass a file path to fs.hash.")?;
         let mut file = File::open(&path).map_err(|error| map_io_error("hash", &path, error))?;
         let meta = file
             .metadata()
             .map_err(|error| map_io_error("hash", &path, error))?;
-        if meta.is_dir() {
+        if !meta.is_file() {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                format!("{} is a directory, not a file.", path.display()),
+                format!("{} is not a regular file.", path.display()),
             )
-            .with_hint("Pass a file path to fs.hash."));
+            .with_hint("Pass a regular file path to fs.hash."));
         }
         let total = meta.len();
         let mut hasher = blake3::Hasher::new();

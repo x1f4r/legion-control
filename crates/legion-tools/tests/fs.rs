@@ -2124,3 +2124,59 @@ async fn size_caps_and_reply_byte_budgets_protect_write_edit_read_list_find_and_
         2
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_regular_files_are_refused_before_opening() {
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    let fifo = f.work.join("blocked.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo should be available on Unix");
+    assert!(status.success(), "mkfifo failed: {status}");
+
+    let regular = f.work.join("regular.txt");
+    std::fs::write(&regular, "needle\n").unwrap();
+
+    // Opening a FIFO without a writer/reader would block forever; every file-reading/editing tool
+    // must reject it with `invalid_args` immediately via `stat` before calling `open`.
+    for (tool, args) in [
+        ("fs.read", json!({"path": f.p(&fifo)})),
+        ("fs.hash", json!({"path": f.p(&fifo)})),
+        (
+            "fs.edit",
+            json!({"path": f.p(&fifo), "old": "a", "new": "b"}),
+        ),
+        ("fs.grep", json!({"path": f.p(&fifo), "pattern": "needle"})),
+        (
+            "fs.write",
+            json!({"path": f.p(&fifo), "content": "x", "mode": "append"}),
+        ),
+        (
+            "fs.write",
+            json!({"path": f.p(&fifo), "content": "x", "expect_hash": "blake3:0000"}),
+        ),
+    ] {
+        let res = tokio::time::timeout(Duration::from_secs(2), f.call(tool, args.clone()))
+            .await
+            .unwrap_or_else(|_| panic!("{tool} blocked on FIFO {fifo:?}"));
+        let err = res.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{tool}: {err}");
+    }
+
+    // Grepping a directory containing a FIFO skips it without blocking and still matches regular files.
+    let dir_grep = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.call(
+            "fs.grep",
+            json!({"path": f.p(&f.work), "pattern": "needle"}),
+        ),
+    )
+    .await
+    .expect("directory fs.grep blocked on FIFO")
+    .unwrap();
+    assert_eq!(dir_grep["matches"].as_array().unwrap().len(), 1);
+}
