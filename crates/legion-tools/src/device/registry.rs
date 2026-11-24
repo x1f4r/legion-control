@@ -197,6 +197,24 @@ pub fn inspect_rollback_failures(paths: &Paths) -> Vec<RollbackFailureRecord> {
     }
 }
 
+/// Removes `state/devices-rollback-error.json`, returning how many rollback-failure records were
+/// cleared (or `0` when the file was already absent).
+pub fn clear_rollback_failures(paths: &Paths) -> Result<usize, ErrorBody> {
+    let record_path = rollback_failure_record_path(paths);
+    let cleared = inspect_rollback_failures(paths).len();
+    match std::fs::remove_file(&record_path) {
+        Ok(()) => Ok(cleared),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be removed: {error}.", record_path.display()),
+        )
+        .with_hint(
+            "Check permissions on the state directory and remove the rollback error record again.",
+        )),
+    }
+}
+
 /// Error returned when a change adding or altering a live device would make `devices.toml`
 /// (including the worst-case tombstone reserve for live entries) exceed
 /// [`MAX_DEVICES_TOML_BYTES`].

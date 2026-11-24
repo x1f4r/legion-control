@@ -6224,4 +6224,130 @@ role = \"owner\"
             "size error hint must be honest (no tidy/prune, mention device.remove and lifetime fleet bound): {err:?}"
         );
     }
+
+    #[tokio::test]
+    async fn f4_meta_doctor_acknowledge_devices_rollback_is_owner_only_and_audited() {
+        let h = Harness::new();
+        std::fs::write(
+            h.node.paths().config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+",
+        )
+        .unwrap();
+
+        // Trigger a recorded rollback failure so state/devices-rollback-error.json exists.
+        let blocker = h.dir.path().join("not-a-dir-f4");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        let _ = registry::restore_file_snapshot(
+            h.node.paths(),
+            "device.set",
+            &blocker.join("policy.toml"),
+            Some(b"default = \"owner\"\n"),
+        )
+        .unwrap_err();
+        let record_path = registry::rollback_failure_record_path(h.node.paths());
+        assert!(record_path.is_file());
+
+        // `meta.doctor` fails and its hint points to `meta.doctor acknowledge=devices-rollback`.
+        let before = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        assert_eq!(before["ok"], json!(false), "{before}");
+        let rollback_check = before["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == json!("config rollback failures"))
+            .unwrap();
+        assert!(
+            rollback_check["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("meta.doctor acknowledge=devices-rollback")),
+            "meta.doctor hint must mention `meta.doctor acknowledge=devices-rollback`: {rollback_check}"
+        );
+
+        // Non-owner (`tablet` with effect:read + effect:admin) MUST be denied and leave the marker intact.
+        let mut non_owner_call = Call::new(
+            Door::Ssh,
+            "meta.doctor",
+            json!({"quick": true, "acknowledge": "devices-rollback"}),
+        );
+        non_owner_call.pinned = Some("tablet".to_owned());
+        non_owner_call.device = Some("my-tablet".to_owned());
+        let denied = h.node.call(non_owner_call).await.unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Denied, "{denied:?}");
+        assert!(
+            record_path.is_file(),
+            "denied acknowledge must not delete rollback error marker"
+        );
+
+        // Unknown acknowledge target is rejected with InvalidArgs.
+        let bad_target = h
+            .call(
+                "meta.doctor",
+                json!({"quick": true, "acknowledge": "something-else"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(bad_target.code, ErrorCode::InvalidArgs, "{bad_target:?}");
+        assert!(record_path.is_file());
+
+        // Owner calling `meta.doctor acknowledge="devices-rollback"` removes the marker, reports
+        // ok=true, and records an audit entry naming who acknowledged it.
+        let mut owner_ack = Call::new(
+            Door::Ssh,
+            "meta.doctor",
+            json!({"quick": true, "acknowledge": "devices-rollback"}),
+        );
+        owner_ack.device = Some("owner-laptop".to_owned());
+        let ack_res = h.node.call(owner_ack).await.unwrap();
+        assert_eq!(ack_res["ok"], json!(true), "{ack_res}");
+        assert_eq!(
+            ack_res["acknowledged"],
+            json!("devices-rollback"),
+            "{ack_res}"
+        );
+        assert!(
+            !record_path.exists(),
+            "owner acknowledge must remove state/devices-rollback-error.json"
+        );
+
+        // Subsequent `meta.doctor` is clean with no rollback-failure check.
+        let after = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        assert_eq!(after["ok"], json!(true), "{after}");
+        assert!(
+            !after["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == json!("config rollback failures")),
+            "{after}"
+        );
+
+        // Audit log records who acknowledged the rollback failure.
+        let audit =
+            std::fs::read_to_string(h.node.paths().state_dir().join("audit.jsonl")).unwrap();
+        let records: Vec<Value> = audit
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let ack_audit = records
+            .iter()
+            .find(|r| {
+                r["tool"] == json!("meta.doctor.acknowledge")
+                    && r["principal"] == json!("owner")
+                    && r["device"] == json!("owner-laptop")
+                    && r["args"]["acknowledge"] == json!("devices-rollback")
+            })
+            .unwrap_or_else(|| {
+                panic!("expected audited meta.doctor.acknowledge record: {records:?}")
+            });
+        assert_eq!(ack_audit["args"]["cleared_count"], json!(1), "{ack_audit}");
+    }
 }

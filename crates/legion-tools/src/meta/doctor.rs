@@ -317,7 +317,7 @@ pub fn check_config_rollback_failures(
             items.join("; ")
         ),
         hint: Some(format!(
-            "Inspect policy.toml and devices.toml, run `legion device.list` to verify device principals, then delete {} once verified.",
+            "Inspect policy.toml and devices.toml, run `legion device.list` to verify device principals, then acknowledge and clear this record as owner with `legion meta.doctor acknowledge=devices-rollback` (or delete {} once verified).",
             record_path.display()
         )),
     })
