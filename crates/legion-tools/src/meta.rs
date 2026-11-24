@@ -1,11 +1,15 @@
 //! `meta`: which build this is, who the caller is, and whether the node is healthy.
 
+mod init;
+
 use std::io;
 use std::path::Path;
 
 use legion_core::proto::{Effect, PROTOCOL};
 use legion_core::{Ctx, Door, NoArgs, Registry, ToolError, VERSION};
 use serde::Serialize;
+
+pub use init::{InitResult, render_node_toml, render_policy_toml};
 
 /// Adds the `meta` tools.
 pub fn register(registry: &mut Registry) {
@@ -27,6 +31,7 @@ pub fn register(registry: &mut Registry) {
         "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, and every configuration file parses. Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
+    init::register(registry);
 }
 
 /// What `meta.version` returns.

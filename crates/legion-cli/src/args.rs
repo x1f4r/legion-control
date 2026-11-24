@@ -129,13 +129,28 @@ Usage:
   legion stream [--as PRINCIPAL]
   legion gate --as PRINCIPAL
   legion serve [--listen ADDRESS]
+  legion init [--name NAME] [--no-roles] [--dry-run] [--on MACHINE] [--json]
   legion token add NAME PRINCIPAL [expires_days=N] [allow_owner=true] | list | remove NAME
   legion --version
 
 A value that parses as JSON is JSON (n=3, ok=true, tags=[\"a\"]); anything else is a string.
 --args takes the arguments as one JSON object instead, or reads it from stdin when given -.
 Output is readable on a terminal and JSON otherwise; --json asks for JSON anywhere.
-`legion help cp`, `legion help stream` and `legion help gate` describe those commands.";
+`legion help cp`, `legion help init`, `legion help stream` and `legion help gate` describe those commands.";
+
+/// `legion help init`.
+pub const INIT_HELP: &str = "\
+Usage: legion init [--name NAME] [--no-roles] [--dry-run] [--as PRINCIPAL] [--on MACHINE] [--json]
+
+Runs meta.init to create starter node.toml and policy.toml files where they do not already exist.
+Existing files are never overwritten or reformatted, so it is safe to run again.
+
+  --name NAME   node name to write into node.toml when creating it
+  --no-roles    skip creating policy.toml with starter roles
+  --dry-run     report what would be created or kept without writing anything
+  --as P        act as the principal P
+  --on M        initialise machine M instead of this node
+  --json        print the result as JSON";
 
 /// `legion help cp`.
 pub const CP_HELP: &str = "\
@@ -258,6 +273,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         }
         "cp" => cp(rest).map(Command::Cp),
         "serve" => serve(rest),
+        "init" => init(rest),
         "token" => token(rest),
         tool if tool.starts_with('-') => Err(UsageError(format!(
             "{tool} is not an option here; options come after the tool's name."
@@ -363,6 +379,7 @@ fn cp(rest: &[String]) -> Result<CpCommand, UsageError> {
 pub fn command_help(name: &str) -> Option<&'static str> {
     match name {
         "cp" => Some(CP_HELP),
+        "init" => Some(INIT_HELP),
         "stream" => Some(STREAM_HELP),
         "gate" => Some(GATE_HELP),
         _ => None,
@@ -393,6 +410,107 @@ fn serve(rest: &[String]) -> Result<Command, UsageError> {
         }
     }
     Ok(Command::Serve { listen, help })
+}
+
+/// `legion init`, sugar over `meta.init`.
+fn init(rest: &[String]) -> Result<Command, UsageError> {
+    let mut pairs = Map::new();
+    let mut as_principal = None;
+    let mut on = None;
+    let mut json = false;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if word.starts_with('-') {
+            let (name, inline) = match word.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_owned())),
+                None => (word.as_str(), None),
+            };
+            let mut take_value = |opt: &str| {
+                inline
+                    .clone()
+                    .or_else(|| words.next().cloned())
+                    .ok_or_else(|| UsageError(format!("{opt} needs a value.")))
+            };
+            let no_inline = |opt: &str| {
+                if inline.is_some() {
+                    Err(UsageError(format!("{opt} takes no value.")))
+                } else {
+                    Ok(())
+                }
+            };
+            match name {
+                "--name" => {
+                    let value = take_value(name)?;
+                    if pairs
+                        .insert("name".to_owned(), Value::String(value))
+                        .is_some()
+                    {
+                        return Err(UsageError("name is given twice.".to_owned()));
+                    }
+                }
+                "--no-roles" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("roles".to_owned(), Value::Bool(false))
+                        .is_some()
+                    {
+                        return Err(UsageError("roles is given twice.".to_owned()));
+                    }
+                }
+                "--dry-run" => {
+                    no_inline(name)?;
+                    if pairs
+                        .insert("dry_run".to_owned(), Value::Bool(true))
+                        .is_some()
+                    {
+                        return Err(UsageError("dry_run is given twice.".to_owned()));
+                    }
+                }
+                "--json" => {
+                    no_inline(name)?;
+                    json = true;
+                }
+                "--as" => {
+                    let value = take_value(name)?;
+                    Principal::parse(&value)
+                        .map_err(|error| UsageError(format!("--as: {}", error.message)))?;
+                    if as_principal.replace(value).is_some() {
+                        return Err(UsageError("--as is given twice.".to_owned()));
+                    }
+                }
+                "--on" => {
+                    let value = take_value(name)?;
+                    let target = Target::parse(&value)
+                        .map_err(|error| UsageError(format!("--on: {error}.")))?;
+                    if on.replace(target).is_some() {
+                        return Err(UsageError("--on is given twice.".to_owned()));
+                    }
+                }
+                _ => return Err(UsageError(format!("{name} is not an option of init."))),
+            }
+            continue;
+        }
+        match word.split_once('=') {
+            Some((key, value)) if !key.is_empty() => {
+                if pairs.contains_key(key) {
+                    return Err(UsageError(format!("{key} is given twice.")));
+                }
+                pairs.insert(key.to_owned(), value_of(value));
+            }
+            _ => {
+                return Err(UsageError(format!(
+                    "{word} was not expected here. Use --name NAME, --no-roles, --dry-run, or key=value."
+                )));
+            }
+        }
+    }
+    Ok(Command::Call(CallCommand {
+        tool: "meta.init".to_owned(),
+        args: ArgsSource::Pairs(pairs),
+        as_principal,
+        on,
+        json,
+    }))
 }
 
 /// `legion token add|list|remove`, which is `token.add`, `token.list` and `token.remove` with the
@@ -839,6 +957,42 @@ mod tests {
             &["token", "add", "phone"],
             &["token", "list", "x"],
             &["token", "remove", "phone", "name=other"],
+        ] {
+            assert!(run(wrong).is_err(), "{wrong:?}");
+        }
+
+        let init_plain = call(&["init"]);
+        assert_eq!(init_plain.tool, "meta.init");
+        assert_eq!(init_plain.args, ArgsSource::Pairs(Map::new()));
+
+        let init_opts = call(&[
+            "init",
+            "--name",
+            "tower",
+            "--no-roles",
+            "--dry-run",
+            "--on",
+            "pi",
+            "--json",
+        ]);
+        assert_eq!(init_opts.tool, "meta.init");
+        assert!(init_opts.json);
+        assert_eq!(init_opts.on, Some(Target::One("pi".into())));
+        assert_eq!(
+            init_opts.args,
+            ArgsSource::Pairs(
+                json!({"name": "tower", "roles": false, "dry_run": true})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            )
+        );
+        assert_eq!(command_help("init"), Some(INIT_HELP));
+        for wrong in [
+            &["init", "stray"][..],
+            &["init", "--name"],
+            &["init", "--dry-run=yes"],
+            &["init", "--unknown"],
         ] {
             assert!(run(wrong).is_err(), "{wrong:?}");
         }
