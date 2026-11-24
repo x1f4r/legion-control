@@ -285,6 +285,8 @@ function App() {
   const sheetHistoryRef = useRef(false);
 
   const nodeInfo = linkState?.nodes?.[0] || null;
+  const nodeInfoRef = useRef(nodeInfo);
+  nodeInfoRef.current = nodeInfo;
   const allowedSet = useMemo(
     () => (nodeInfo?.whoami?.tools ? new Set(nodeInfo.whoami.tools) : null),
     [nodeInfo],
@@ -326,12 +328,13 @@ function App() {
   }, []);
 
   const refreshFleet = useCallback(
-    async (activeNodeInfo = nodeInfo) => {
-      if (!activeNodeInfo) return;
+    async (activeNodeInfo) => {
+      const targetNode = activeNodeInfo || nodeInfoRef.current;
+      if (!targetNode) return;
       setRefreshing(true);
       setFleetError(null);
       try {
-        const next = await fetchFleetSnapshot(link, activeNodeInfo.node);
+        const next = await fetchFleetSnapshot(link, targetNode.node);
         setSnapshot(next);
         cache.set('fleet', next);
       } catch (err) {
@@ -340,7 +343,7 @@ function App() {
         setRefreshing(false);
       }
     },
-    [link, cache, nodeInfo],
+    [link, cache],
   );
 
   const hydrate = useCallback(

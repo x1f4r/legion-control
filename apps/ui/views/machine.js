@@ -471,7 +471,9 @@ function FilesTab({ machine, nodeInfo, link }) {
           ${crumbs.map(
             (c, i) => html`
               <span key=${c.path} class="crumb-item">
-                ${i > 0 ? html`<span class="dim" aria-hidden="true">/</span>` : null}
+                ${i > 0 && crumbs[i - 1].label !== '/'
+                  ? html`<span class="dim" aria-hidden="true">/</span>`
+                  : null}
                 <button type="button" onClick=${() => loadDir(c.path)}>${c.label}</button>
               </span>
             `,

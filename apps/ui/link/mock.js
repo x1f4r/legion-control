@@ -1,7 +1,6 @@
 // Deterministic mock link (?mock) shaped like real Legion tool results.
 
-const NOW = Date.parse('2026-11-24T12:00:00Z');
-const isoAgo = (sec) => new Date(NOW - sec * 1000).toISOString();
+const isoAgo = (sec) => new Date(Date.now() - sec * 1000).toISOString();
 
 const MOCK_TOOLS = [
   {

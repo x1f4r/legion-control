@@ -141,20 +141,13 @@ function ToolDetail({
   const remoteNames = machineNames.filter((n) => n !== localNode);
 
   useEffect(() => {
-    setValues(initialValues(tool.input_schema));
-    setRawMode(false);
-    setRawText('{}');
-    setTargetMode('local');
-    setMultiTargets([]);
-    setFieldErrors({});
-    setEvents([]);
-    setResult(null);
-    setError(null);
-    if (abortRef.current) {
-      abortRef.current.abort();
-      abortRef.current = null;
-    }
-  }, [tool.name]);
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+        abortRef.current = null;
+      }
+    };
+  }, []);
 
   function toggleRaw(nextRaw) {
     setError(null);
@@ -529,6 +522,7 @@ export function ToolsView({
                   <span class=${`chip fx ${selectedTool.effect}`}>${selectedTool.effect}</span>
                 </h2>
                 <${ToolDetail}
+                  key=${selectedTool.name}
                   tool=${selectedTool}
                   allowed=${selectedAllowed}
                   nodeInfo=${nodeInfo}
@@ -547,6 +541,7 @@ export function ToolsView({
   if (route.tool && selectedTool) {
     return html`
       <${ToolDetail}
+        key=${selectedTool.name}
         tool=${selectedTool}
         allowed=${selectedAllowed}
         nodeInfo=${nodeInfo}
