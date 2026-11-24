@@ -109,16 +109,16 @@ pub(crate) fn mcp_tool(spec: &ToolSpec, with_on: bool) -> Result<Tool, ErrorBody
     )
 }
 
-/// What a tool's effect tells a client. `read` tools change nothing; `destroy` and `power` can
-/// lose something that cannot be had back. The other effects change things without destroying
-/// them, so they claim neither.
+/// What a tool's effect tells a client. `read` tools change nothing. Every other effect may lose
+/// something that cannot be had back: a write can replace a file's content, a command can do
+/// whatever the account can, and admin changes what Legion allows. A client skips confirmation
+/// for a tool that says it is not destructive, so none of them says so.
 pub(crate) fn annotations(title: &str, effect: Effect) -> ToolAnnotations {
     let annotations = ToolAnnotations::with_title(title);
     match effect {
         Effect::Read => annotations.read_only(true),
-        Effect::Destroy | Effect::Power => annotations.read_only(false).destructive(true),
-        Effect::Write | Effect::Exec | Effect::Admin => {
-            annotations.read_only(false).destructive(false)
+        Effect::Write | Effect::Exec | Effect::Destroy | Effect::Power | Effect::Admin => {
+            annotations.read_only(false).destructive(true)
         }
     }
 }
@@ -246,10 +246,14 @@ mod tests {
             (a.read_only_hint, a.destructive_hint)
         };
         assert_eq!(hints(Effect::Read), (Some(true), None));
-        assert_eq!(hints(Effect::Destroy), (Some(false), Some(true)));
-        assert_eq!(hints(Effect::Power), (Some(false), Some(true)));
-        for effect in [Effect::Write, Effect::Exec, Effect::Admin] {
-            assert_eq!(hints(effect), (Some(false), Some(false)), "{effect}");
+        for effect in [
+            Effect::Write,
+            Effect::Exec,
+            Effect::Destroy,
+            Effect::Power,
+            Effect::Admin,
+        ] {
+            assert_eq!(hints(effect), (Some(false), Some(true)), "{effect}");
         }
     }
 
@@ -389,7 +393,16 @@ mod tests {
                     "{name}: {at} refers to {target}, which is not there"
                 );
             }
-            assert!(tool.annotations.is_some(), "{name}");
+            let annotations = tool.annotations.as_ref().unwrap();
+            if entry.spec.effect == Effect::Read {
+                assert_eq!(annotations.read_only_hint, Some(true), "{name}");
+            } else {
+                assert_eq!(
+                    (annotations.read_only_hint, annotations.destructive_hint),
+                    (Some(false), Some(true)),
+                    "{name} would let a client skip confirming it"
+                );
+            }
         }
     }
 

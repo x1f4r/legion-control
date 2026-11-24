@@ -305,7 +305,7 @@ replaced by their size.
   schema. Output is a readable rendering on a terminal and the raw JSON object otherwise.
 - **MCP.** `legion mcp` serves the registry over stdio. Tool names swap the dot for an underscore
   (`fs_read`), every tool gains the optional `on` argument, and effects become the standard
-  annotations (`readOnlyHint` for `read`, `destructiveHint` for `destroy` and `power`). A failed
+  annotations (`readOnlyHint` for `read`, `destructiveHint` for every other effect). A failed
   call is a result with `isError` and the same error object as text, so the agent can read the
   code and the hint. `--compact` serves three tools instead (`legion_tools`, `legion_describe`,
   `legion_call`) for agents that should not carry forty schemas in their context. Two revisions

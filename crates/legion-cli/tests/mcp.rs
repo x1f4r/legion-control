@@ -246,12 +246,26 @@ fn the_handshake_revision_lists_and_calls_the_tools() {
     assert_eq!(whoami["title"], json!("meta.whoami"));
     assert_eq!(whoami["annotations"]["readOnlyHint"], json!(true));
     assert!(whoami["inputSchema"]["properties"]["on"].is_object());
-    let write = tools
-        .iter()
-        .find(|tool| tool["name"] == json!("test_write_path"))
-        .unwrap();
-    assert_eq!(write["annotations"]["readOnlyHint"], json!(false));
-    assert_eq!(write["annotations"]["destructiveHint"], json!(false));
+    // Anything that is not read-only asks for confirmation in a client that asks.
+    for name in [
+        "test_write_path",
+        "exec_run",
+        "fs_write",
+        "fs_edit",
+        "fs_move",
+        "fs_remove",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == json!(name))
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], json!(false), "{name}");
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            json!(true),
+            "{name}"
+        );
+    }
     assert!(tools.iter().all(|tool| {
         let name = tool["name"].as_str().unwrap();
         !name.contains('.') && tool["inputSchema"]["type"] == json!("object")
