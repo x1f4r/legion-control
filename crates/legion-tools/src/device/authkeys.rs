@@ -2263,7 +2263,7 @@ mod tests {
         // PowerShell treats Unicode single-quote variants U+2018..=U+201B as string delimiters,
         // so paths or arguments containing any of them must be refused rather than escaped.
         for bad_quote in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
-            let bad_exe = format!(r"C:\Users\O{bad_quote}Neil\legion.exe");
+            let bad_exe = format!(r"C:\Users\me\O{bad_quote}Neil\legion.exe");
             let exe_err = format_forced_command(
                 Path::new(&bad_exe),
                 &["gate", "--as", "phone"],
@@ -2272,7 +2272,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(exe_err.code, ErrorCode::Failed, "{bad_quote:?}");
 
-            let bad_arg = format!(r"C:\Users\O{bad_quote}Neil\legion");
+            let bad_arg = format!(r"C:\Users\me\O{bad_quote}Neil\legion");
             let arg_err = format_forced_command(
                 Path::new(r"C:\legion\legion.exe"),
                 &["gate", "--as", "phone", "--home", &bad_arg],
