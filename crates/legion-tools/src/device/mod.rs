@@ -52,8 +52,8 @@ pub const MAX_VALID_MINUTES: u32 = 1440;
 /// Default SSH port for pairing invites.
 pub const DEFAULT_SSH_PORT: u16 = 22;
 
-/// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`) and registers
-/// `devices.toml`.
+/// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`, `device.endpoint`)
+/// and registers `devices.toml`.
 pub fn register(registry: &mut Registry) {
     registry.add_document::<registry::DevicesFile>();
     registry.add_fn(
@@ -74,6 +74,12 @@ pub fn register(registry: &mut Registry) {
         "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions and same-account SSH connections for a removed device. Detached background jobs the device started keep running and are listed in `jobs_left_running` (stop them separately with `job.cancel` if needed). Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home; for foreign devices this removes the key without ending sessions tracked under that other home and reports `sessions_not_ended: true`.",
         remove,
     );
+    registry.add_fn(
+        "device.endpoint",
+        Effect::Read,
+        "Return how a paired device reaches this node over SSH: node name, candidate host names or Tailscale addresses, SSH port, OS account name, and pinned sshd public host keys with their source. Uses the same detection as device.invite (honouring any [devices] settings in node.toml). Call with on=\"all\" through any node to learn every machine's direct SSH endpoint.",
+        endpoint,
+    );
 }
 
 /// Arguments of `device.invite`.
@@ -88,15 +94,16 @@ struct InviteArgs {
     #[schemars(range(min = 1, max = 1440))]
     valid_minutes: u32,
     /// Host name or IP address (a single string or a list of strings) to put in the invite,
-    /// overriding automatic Tailscale/hostname detection.
+    /// overriding `[devices] hosts` in `node.toml` and automatic Tailscale/hostname detection.
     #[serde(default)]
     #[schemars(with = "Option<Vec<String>>")]
     host: Option<HostArg>,
-    /// SSH port on this machine (default 22).
-    #[serde(default = "default_ssh_port")]
+    /// SSH port on this machine (defaults to `[devices] port` in `node.toml`, or 22).
+    #[serde(default)]
     #[schemars(range(min = 1, max = 65535))]
-    port: u16,
-    /// OS account name on this machine (defaults to the account legion runs as).
+    port: Option<u16>,
+    /// OS account name on this machine (defaults to `[devices] user` in `node.toml` or the account
+    /// legion runs as).
     #[serde(default)]
     user: Option<String>,
     /// Allow inviting a device as a principal with the owner role, which may do everything the
@@ -109,8 +116,104 @@ fn default_valid_minutes() -> u32 {
     DEFAULT_VALID_MINUTES
 }
 
-fn default_ssh_port() -> u16 {
-    DEFAULT_SSH_PORT
+/// What `device.endpoint` returns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointResult {
+    /// Node name as configured in `node.toml` or derived from the hostname.
+    pub node: String,
+    /// Candidate host names or Tailscale addresses to reach this node's sshd.
+    pub hosts: Vec<String>,
+    /// SSH port on this node.
+    pub port: u16,
+    /// OS account name on this node.
+    pub user: String,
+    /// Pinned SSH public host keys (`"<type> <base64>"`, without comments).
+    pub host_keys: Vec<String>,
+    /// Where the pinned host keys came from (`configured`, `ssh-keyscan+files`, `ssh-keyscan only`,
+    /// or `files`).
+    pub host_keys_source: String,
+}
+
+async fn endpoint(ctx: &Ctx, _args: NoArgs) -> Result<EndpointResult, ToolError> {
+    let node_file = ctx.config().get::<NodeFile>()?;
+    detect_endpoint(ctx, &node_file, None, None, None).await
+}
+
+async fn detect_endpoint(
+    ctx: &Ctx,
+    node_file: &NodeFile,
+    host_override: Option<HostArg>,
+    port_override: Option<u16>,
+    user_override: Option<String>,
+) -> Result<EndpointResult, ErrorBody> {
+    let port = port_override
+        .or(node_file.devices.port)
+        .unwrap_or(DEFAULT_SSH_PORT);
+    if port == 0 {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "port must be between 1 and 65535.",
+        ));
+    }
+
+    let user = match user_override.or_else(|| node_file.devices.user.clone()) {
+        Some(raw) => {
+            if raw.is_empty()
+                || raw.len() > 128
+                || raw.starts_with('-')
+                || raw.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("{raw:?} is not a valid SSH user name."),
+                )
+                .with_hint(
+                    "Pass an OS account name that does not start with `-` and contains no spaces or control characters.",
+                ));
+            }
+            raw
+        }
+        None => {
+            let detected =
+                resolve_default_ssh_user(ctx.paths().home(), legion_os::user::effective_uid())?;
+            if detected.starts_with('-')
+                || detected
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Detected SSH user name {detected:?} is not safe to place in an invite or endpoint."
+                    ),
+                )
+                .with_hint("Set `[devices] user` in node.toml or pass a valid `user` explicitly."));
+            }
+            detected
+        }
+    };
+
+    let host_arg = host_override.or_else(|| {
+        (!node_file.devices.hosts.is_empty())
+            .then(|| HostArg::Many(node_file.devices.hosts.clone()))
+    });
+    let hosts = resolve_hosts(host_arg, ctx.cancel_token().child_token()).await?;
+    let resolved_host_keys = resolve_host_keys(
+        &node_file.devices.host_keys,
+        ctx.paths().home(),
+        port,
+        ctx.cancel_token().child_token(),
+    )
+    .await?;
+
+    Ok(EndpointResult {
+        node: ctx.node_name().to_owned(),
+        hosts,
+        port,
+        user,
+        host_keys: resolved_host_keys.keys,
+        host_keys_source: resolved_host_keys.source,
+    })
 }
 
 /// What `device.invite` returns.
@@ -174,52 +277,14 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         )
         .with_hint("Use a duration between 1 minute and 1440 minutes (24 hours)."));
     }
-    if args.port == 0 {
-        return Err(ErrorBody::new(
-            ErrorCode::InvalidArgs,
-            "port must be between 1 and 65535.",
-        ));
-    }
 
-    let user = match args.user {
-        Some(raw) => {
-            if raw.is_empty()
-                || raw.len() > 128
-                || raw.starts_with('-')
-                || raw.chars().any(|c| c.is_control() || c.is_whitespace())
-            {
-                return Err(ErrorBody::new(
-                    ErrorCode::InvalidArgs,
-                    format!("{raw:?} is not a valid SSH user name."),
-                )
-                .with_hint(
-                    "Pass an OS account name that does not start with `-` and contains no spaces or control characters.",
-                ));
-            }
-            raw
-        }
-        None => {
-            let detected =
-                resolve_default_ssh_user(ctx.paths().home(), legion_os::user::effective_uid())?;
-            if detected.starts_with('-')
-                || detected
-                    .chars()
-                    .any(|c| c.is_control() || c.is_whitespace())
-            {
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!(
-                        "Detected SSH user name {detected:?} is not safe to place in an invite."
-                    ),
-                )
-                .with_hint("Pass a valid `user` explicitly to device.invite."));
-            }
-            detected
-        }
-    };
-
-    let hosts = resolve_hosts(args.host, ctx.cancel_token().child_token()).await?;
     let node_file = ctx.config().get::<NodeFile>()?;
+    let endpoint = detect_endpoint(ctx, &node_file, args.host, args.port, args.user).await?;
+    let hosts = endpoint.hosts;
+    let port = endpoint.port;
+    let user = endpoint.user;
+    let host_keys = endpoint.host_keys;
+    let host_keys_source = endpoint.host_keys_source;
     let target = resolve_target(ctx.paths(), &node_file)?;
     let pinned_account = if target.windows_admin_acl {
         let acct = legion_os::user::current_username().map_err(|error| {
@@ -232,15 +297,6 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     } else {
         None
     };
-    let resolved_host_keys = resolve_host_keys(
-        &node_file.devices.host_keys,
-        ctx.paths().home(),
-        args.port,
-        ctx.cancel_token().child_token(),
-    )
-    .await?;
-    let host_keys = resolved_host_keys.keys;
-    let host_keys_source = resolved_host_keys.source;
     let exe = legion_core::current_exe()?;
     verify_exe_not_group_or_world_writable(&exe)?;
 
@@ -269,7 +325,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         id: id.clone(),
         node: ctx.node_name().to_owned(),
         hosts: hosts.clone(),
-        port: args.port,
+        port,
         user: user.clone(),
         host_keys: host_keys.clone(),
         key: ephemeral.seed_b64,
@@ -320,7 +376,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         role,
         expires,
         hosts,
-        port: args.port,
+        port,
         user,
         host_keys,
         host_keys_source,
@@ -2075,5 +2131,49 @@ role = "owner"
                 assert!(final_text.contains(seed_content), "{label}: {final_text}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn device_endpoint_is_readable_by_observer_and_matches_invite_detection() {
+        let h = Harness::new();
+        let auth_escaped = h.auth_keys.display().to_string().replace('\\', "\\\\");
+        let hk_path = h.dir.path().join("ssh_host_ed25519_key.pub");
+        let hk_escaped = hk_path.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            h.node.paths().config_file("node.toml"),
+            format!(
+                "name = \"tower\"\n\
+                 [devices]\n\
+                 authorized_keys = \"{auth_escaped}\"\n\
+                 host_keys = [\"{hk_escaped}\"]\n\
+                 hosts = [\"tower.tailnet.example\", \"100.64.0.10\"]\n\
+                 port = 2222\n\
+                 user = \"me\"\n"
+            ),
+        )
+        .unwrap();
+
+        // Observer (`phone`) has only effect:read and can call device.endpoint.
+        let ep = h
+            .call_as("device.endpoint", "phone", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(ep["node"], json!("tower"));
+        assert_eq!(ep["hosts"], json!(["tower.tailnet.example", "100.64.0.10"]));
+        assert_eq!(ep["port"], json!(2222));
+        assert_eq!(ep["user"], json!("me"));
+        assert_eq!(ep["host_keys"], json!([h.host_key]));
+        assert_eq!(ep["host_keys_source"], json!("configured"));
+
+        // device.invite without explicit host/port/user uses the exact same endpoint settings.
+        let inv = h
+            .call("device.invite", json!({"principal": "phone"}))
+            .await
+            .unwrap();
+        assert_eq!(inv["hosts"], ep["hosts"]);
+        assert_eq!(inv["port"], ep["port"]);
+        assert_eq!(inv["user"], ep["user"]);
+        assert_eq!(inv["host_keys"], ep["host_keys"]);
+        assert_eq!(inv["host_keys_source"], ep["host_keys_source"]);
     }
 }

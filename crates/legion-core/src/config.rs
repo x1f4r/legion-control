@@ -372,7 +372,8 @@ fn default_true() -> bool {
     true
 }
 
-/// The `[devices]` table of `node.toml`: where paired devices' SSH keys and host keys are read.
+/// The `[devices]` table of `node.toml`: where paired devices' SSH keys, host keys, and direct
+/// SSH endpoint settings are configured.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevicesConfig {
@@ -387,6 +388,19 @@ pub struct DevicesConfig {
     /// on Windows). Useful for non-standard sshd setups and tests.
     #[serde(default)]
     pub host_keys: Vec<String>,
+    /// Optional explicit host names or IP addresses reported by `device.endpoint` and
+    /// `device.invite` (when no `host` argument is given), overriding automatic Tailscale/hostname
+    /// detection.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Optional SSH port reported by `device.endpoint` and `device.invite` (when no `port`
+    /// argument is given). Defaults to 22 when absent.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Optional OS account name reported by `device.endpoint` and `device.invite` (when no `user`
+    /// argument is given). Defaults to the account legion runs as.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// The `[svc]` table of `node.toml`: how the node controls system services.
@@ -418,6 +432,30 @@ fn validate_devices(devices: &DevicesConfig) -> Result<(), String> {
     }
     for (index, path) in devices.host_keys.iter().enumerate() {
         validate_device_file_path(&format!("devices.host_keys[{index}]"), path)?;
+    }
+    for (index, host) in devices.hosts.iter().enumerate() {
+        if host.trim().is_empty()
+            || host.len() > 255
+            || host.starts_with('-')
+            || host.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(format!(
+                "devices.hosts[{index}] ({host:?}) is not a valid host name or IP address"
+            ));
+        }
+    }
+    if let Some(0) = devices.port {
+        return Err("devices.port must be between 1 and 65535".to_owned());
+    }
+    if let Some(user) = &devices.user
+        && (user.is_empty()
+            || user.len() > 128
+            || user.starts_with('-')
+            || user.chars().any(|c| c.is_control() || c.is_whitespace()))
+    {
+        return Err(format!(
+            "devices.user ({user:?}) is not a valid SSH user name"
+        ));
     }
     Ok(())
 }
