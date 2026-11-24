@@ -68,7 +68,7 @@ stderr is for human-readable diagnostics only and is never parsed.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `hello` | `{client, version}` | `{node, version, protocol, os, arch, systems}` |
+| `hello` | `{client, version}` | `{node, version, protocol, os, arch, systems, system?, boot_id?}` |
 | `tools` | `{}` | `{tools: [ToolSpec]}` |
 | `call` | `{tool, args, as?, on?}` | the tool's result object |
 | `cancel` | `{id}` | `{}` |
@@ -138,7 +138,8 @@ are RFC 3339 UTC, durations are seconds.
 | `fs` (fleet) | `fs.transfer` | between any two machines, or to and from this one |
 | `proj` | `proj.list`, `proj.add`, `proj.remove`, `proj.status`, `proj.clone`, `proj.pull`, `proj.run`, `proj.discover` | named projects and where they live |
 | `svc` | `svc.list`, `svc.status`, `svc.start`, `svc.stop`, `svc.restart`, `svc.logs` | systemd, launchd, Windows services |
-| `power` | `power.sleep`, `power.reboot`, `power.shutdown`, `power.targets`, `power.wake` | busy-gated; `reboot` can name the system to land in |
+| `power` | `power.status`, `power.sleep`, `power.restart`, `power.shutdown` | busy-gated; `restart` can name the system to land in |
+| `power` (fleet) | `power.wol`, `power.wake`, `power.switch` | wake a machine through a helper; restart one and confirm which system came back |
 | `fleet` | `fleet.list`, `fleet.ping`, `fleet.add`, `fleet.remove`, `fleet.discover`, `fleet.install` | the machines and whether they answer |
 | `ext` | `ext.list`, `ext.define`, `ext.remove` | tools you add yourself |
 | `audit` | `audit.tail` | what was called, by whom |
@@ -257,8 +258,8 @@ to send commands to.
 
 Waking is honest. `power.wake` asks a helper on the target's network to send the packet; the
 helper takes the hardware address from its own fleet file, never from the request. The reply says
-`sent`, and says `awake` only once the target itself answered. A sleeping helper is never woken in
-order to wake something else.
+who sent the packet, and says `awake` only once the target itself answered. A sleeping helper is
+never woken in order to wake something else.
 
 Rebooting into another system is verified. The node arms the firmware for one boot with the
 commands `node.toml` gives for that target, reads the setting back, and only then schedules the

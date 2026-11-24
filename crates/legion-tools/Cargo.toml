@@ -11,7 +11,11 @@ publish.workspace = true
 # Tools that exist only so the command line and the rpc session can be tested end to end: one that
 # echoes its arguments, one that sleeps until cancelled, two that check a path. The CLI's tests turn
 # it on through a dev-dependency, so a release build never carries them.
-testing = []
+#
+# It also swaps the power tools' actuator for a recording fake, whatever the environment says, so a
+# test binary can never sleep, restart or wake a real machine (see power::actuator), and lets a test
+# node's boot id be set from a file (legion-core's `testing`).
+testing = ["legion-core/testing"]
 
 [dependencies]
 base64.workspace = true

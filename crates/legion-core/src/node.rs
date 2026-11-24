@@ -163,14 +163,41 @@ impl Node {
             .with_machine(self.name())
             .with_details(serde_json::json!({"supported": [PROTOCOL]})));
         }
+        let file = self.inner.config.get::<NodeFile>().ok();
+        let system = file
+            .as_ref()
+            .and_then(|file| file.system.as_ref())
+            .map(NodeName::to_string);
+        // This system and every one it can restart into, as node.toml names them.
+        let mut systems: Vec<String> = system.iter().cloned().collect();
+        for target in file.iter().flat_map(|file| file.boot.keys()) {
+            if !systems.contains(target) {
+                systems.push(target.clone());
+            }
+        }
         Ok(HelloResult {
             node: self.name(),
             version: VERSION.to_owned(),
             protocol: PROTOCOL,
             os: std::env::consts::OS.to_owned(),
             arch: std::env::consts::ARCH.to_owned(),
-            systems: Vec::new(),
+            systems,
+            system,
+            boot_id: self.boot_id(),
         })
+    }
+
+    /// An identifier of the machine's current boot, which changes on every restart; `None` when
+    /// the platform will not say.
+    pub fn boot_id(&self) -> Option<String> {
+        #[cfg(feature = "testing")]
+        if let Some(file) = std::env::var_os("LEGION_TEST_BOOT_ID_FILE") {
+            // Read on every call, so a test can change it under a running node.
+            return std::fs::read_to_string(file)
+                .ok()
+                .map(|text| text.trim().to_owned());
+        }
+        legion_os::procid::boot_id().ok()
     }
 
     /// Runs one call on this node: decides who it acts as, checks that the policy allows it, runs
@@ -344,4 +371,42 @@ fn cancelled(tool: &str) -> ErrorBody {
         ErrorCode::Cancelled,
         format!("The call to {tool} was cancelled before it finished."),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use legion_proto::HelloParams;
+
+    use super::*;
+
+    fn hello_params() -> HelloParams {
+        HelloParams {
+            client: "test".to_owned(),
+            version: "0".to_owned(),
+            protocol: PROTOCOL,
+        }
+    }
+
+    #[test]
+    fn hello_names_the_system_its_targets_and_the_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::new(Paths::under(dir.path()), Registry::new());
+        let bare = node.hello(&hello_params()).unwrap();
+        assert_eq!(bare.system, None);
+        assert!(bare.systems.is_empty());
+        assert_eq!(bare.boot_id, node.boot_id());
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            assert!(bare.boot_id.is_some_and(|id| !id.is_empty()));
+        }
+
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config").join("node.toml"),
+            "system = \"linux\"\nbusy = \"none\"\n[boot.windows]\nefi_label = \"Windows Boot Manager\"\n[boot.linux]\narm = [\"a\"]\nverify = [\"v\"]\n",
+        )
+        .unwrap();
+        let named = node.hello(&hello_params()).unwrap();
+        assert_eq!(named.system.as_deref(), Some("linux"));
+        assert_eq!(named.systems, ["linux", "windows"]);
+    }
 }

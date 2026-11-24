@@ -173,6 +173,12 @@ impl Ctx {
         self.node.paths()
     }
 
+    /// An identifier of the machine's current boot, the one `hello` reports; `None` when the
+    /// platform will not say.
+    pub fn boot_id(&self) -> Option<String> {
+        self.node.boot_id()
+    }
+
     /// The principal the call acts as.
     pub fn principal(&self) -> &str {
         self.grant.principal()
