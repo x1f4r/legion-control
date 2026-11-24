@@ -105,7 +105,10 @@ async fn whoami_lists_what_the_caller_may_use() {
     assert_eq!(phone["door"], json!("mcp"));
     assert_eq!(phone["delegate"], json!(false));
     assert_eq!(phone["paths"], json!(["~/projects"]));
-    assert_eq!(phone["tools"], json!(["meta.version", "meta.whoami"]));
+    assert_eq!(
+        phone["tools"],
+        json!(["meta.update", "meta.version", "meta.whoami"])
+    );
 }
 
 #[tokio::test]
