@@ -60,13 +60,15 @@ pub enum Command {
     Version,
 }
 
-/// `legion gate --as P [--home PATH]` or `legion gate --enrol ID [--home PATH]`.
+/// `legion gate --as P [--device NAME] [--home PATH]` or `legion gate --enrol ID [--home PATH]`.
 #[derive(Debug, PartialEq)]
 pub enum GateCommand {
     /// Confine an ssh key to `legion rpc` and `legion stream` as `pinned`.
     As {
         /// The principal everything the key does acts as.
         pinned: String,
+        /// Optional paired device name for live-session tracking and immediate revocation.
+        device: Option<String>,
         /// Optional pinned absolute `LEGION_HOME` path overriding the ssh session environment.
         home: Option<PathBuf>,
     },
@@ -471,9 +473,10 @@ pub fn command_help(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `legion gate --as PRINCIPAL [--home PATH] | --enrol ID [--home PATH]`.
+/// `legion gate --as PRINCIPAL [--device NAME] [--home PATH] | --enrol ID [--home PATH]`.
 fn gate(rest: &[String]) -> Result<Command, UsageError> {
     let mut pinned = None;
+    let mut device = None;
     let mut enrol_id = None;
     let mut home: Option<PathBuf> = None;
     let mut words = rest.iter();
@@ -502,6 +505,14 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
                     return Err(UsageError("--as is given twice.".to_owned()));
                 }
             }
+            "--device" => {
+                let value = take_value(name)?;
+                legion_tools::device::sessions::validate_device_label(&value)
+                    .map_err(|error| UsageError(format!("--device: {}", error.message)))?;
+                if device.replace(value).is_some() {
+                    return Err(UsageError("--device is given twice.".to_owned()));
+                }
+            }
             "--enrol" => {
                 let value = take_value(name)?;
                 legion_tools::device::keys::validate_invite_id(&value)
@@ -526,8 +537,19 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
         }
     }
     match (pinned, enrol_id) {
-        (Some(pinned), None) => Ok(Command::Gate(GateCommand::As { pinned, home })),
-        (None, Some(id)) => Ok(Command::Gate(GateCommand::Enrol { id, home })),
+        (Some(pinned), None) => Ok(Command::Gate(GateCommand::As {
+            pinned,
+            device,
+            home,
+        })),
+        (None, Some(id)) => {
+            if device.is_some() {
+                return Err(UsageError(
+                    "--device is only valid with `gate --as`, not `gate --enrol`.".to_owned(),
+                ));
+            }
+            Ok(Command::Gate(GateCommand::Enrol { id, home }))
+        }
         (Some(_), Some(_)) => Err(UsageError(
             "gate takes --as or --enrol, not both.".to_owned(),
         )),
@@ -1470,15 +1492,25 @@ mod tests {
             run(&["gate", "--as", "agent:example"]),
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
+                device: None,
                 home: None,
             }))
         );
         let abs_home = std::env::temp_dir().join("legion-gate-home");
         let abs_home_str = abs_home.to_string_lossy().into_owned();
         assert_eq!(
-            run(&["gate", "--as", "agent:example", "--home", &abs_home_str]),
+            run(&[
+                "gate",
+                "--as",
+                "agent:example",
+                "--device",
+                "pixel",
+                "--home",
+                &abs_home_str
+            ]),
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
+                device: Some("pixel".into()),
                 home: Some(abs_home.clone()),
             }))
         );
@@ -1505,6 +1537,14 @@ mod tests {
         for bad_gate in [
             &["gate", "--as", "phone", "--enrol", "0123456789abcdef"][..],
             &["gate", "--as", "phone", "--home", "relative/path"],
+            &["gate", "--as", "phone", "--device", "../escape"],
+            &[
+                "gate",
+                "--enrol",
+                "0123456789abcdef0123456789abcdef",
+                "--device",
+                "pixel",
+            ],
             &["gate", "--enrol", "bad/id"],
             &["gate", "--enrol"],
             &["gate", "--unknown"],

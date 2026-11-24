@@ -193,9 +193,9 @@ async fn run(command: Command) -> ExitCode {
             router.shutdown().await;
             code
         }
-        Command::Gate(GateCommand::As { pinned, .. }) => {
+        Command::Gate(GateCommand::As { pinned, device, .. }) => {
             let shutdown = install_shutdown_token();
-            gate(node, router, pinned, shutdown).await
+            gate(node, router, pinned, device, shutdown).await
         }
         Command::Gate(GateCommand::Enrol { id, .. }) => {
             let shutdown = install_shutdown_token();
@@ -288,27 +288,45 @@ async fn serve_stream(
 
 /// `legion gate`: serves what a key forced to it asked for, when that is exactly `legion rpc` or
 /// `legion stream` as the ssh connector sends them, pinned to the key's principal. The request is
-/// only compared, never run.
+/// only compared, never run. When `--device` is passed (as on paired-device keys), registers the
+/// live process under `state/device-sessions/` so `device.remove` ends it immediately.
 async fn gate(
     node: Node,
     router: Arc<dyn Router>,
     pinned: String,
+    device: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     let requested = std::env::var("SSH_ORIGINAL_COMMAND")
         .ok()
         .and_then(|command| legion_net::gate::requested(&command));
-    match requested {
-        Some(Subcommand::Rpc) => serve_rpc(node, router, Some(pinned), shutdown).await,
-        Some(Subcommand::Stream) => {
+    let Some(subcommand) = requested else {
+        router.shutdown().await;
+        err(&format!("{}\n", legion_net::gate::REFUSAL));
+        return ExitCode::from(FAILED);
+    };
+    let _session = if let Some(device_name) = device.as_deref() {
+        match legion_tools::device::sessions::DeviceSessionGuard::register(
+            node.paths(),
+            device_name,
+            &pinned,
+        ) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                router.shutdown().await;
+                err(&render::error(&error));
+                return ExitCode::from(FAILED);
+            }
+        }
+    } else {
+        None
+    };
+    match subcommand {
+        Subcommand::Rpc => serve_rpc(node, router, Some(pinned), shutdown).await,
+        Subcommand::Stream => {
             let code = serve_stream(&node, Some(pinned), shutdown).await;
             router.shutdown().await;
             code
-        }
-        None => {
-            router.shutdown().await;
-            err(&format!("{}\n", legion_net::gate::REFUSAL));
-            ExitCode::from(FAILED)
         }
     }
 }

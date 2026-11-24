@@ -391,7 +391,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     );
 
     // 7. (d) `device.list` shows the device with the exact `ssh-keygen -l` fingerprint, and
-    //    `device.remove` makes the key stop working.
+    //    `device.remove` both ends any held-open SSH session immediately and prevents reconnect.
     let listed = home.run(&["device.list"]).json();
     assert_eq!(listed["invites"].as_array().unwrap().len(), 0);
     let devices = listed["devices"].as_array().unwrap();
@@ -400,12 +400,68 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     assert_eq!(devices[0]["principal"], json!("phone"));
     assert_eq!(devices[0]["fingerprint"], json!(expected_fp));
 
+    // Hold open a live SSH `legion rpc` session across `device.remove`.
+    let mut live_child = sshd
+        .ssh_command(&device_key, &known_hosts)
+        .arg("legion rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut live_stdin = live_child.stdin.take().unwrap();
+    let mut live_stdout = BufReader::new(live_child.stdout.take().unwrap());
+    writeln!(
+        live_stdin,
+        "{}",
+        rpc_request(
+            json!(10),
+            "hello",
+            json!({"client": "live-session-test", "version": "1", "protocol": 1})
+        )
+    )
+    .unwrap();
+    live_stdin.flush().unwrap();
+    let live_hello = read_json_line(&mut live_stdout, "live session hello reply");
+    assert_eq!(live_hello["id"], json!(10));
+
     let removed = home.run(&["device.remove", "name=my-pixel-phone"]);
     assert_eq!(removed.code, 0, "device.remove failed: {}", removed.stderr);
     let removed_json = removed.json();
     assert_eq!(removed_json["removed"], json!(true));
     assert_eq!(removed_json["kind"], json!("device"));
     assert_eq!(removed_json["name"], json!("my-pixel-phone"));
+    assert_eq!(removed_json["sessions_ended"], json!(1));
+
+    // The held-open session must terminate promptly and must not answer further calls.
+    let _ = writeln!(
+        live_stdin,
+        "{}",
+        rpc_request(
+            json!(11),
+            "call",
+            json!({"tool": "meta.whoami", "args": {}})
+        )
+    );
+    let _ = live_stdin.flush();
+    let mut after_revoke_line = String::new();
+    let bytes_read = live_stdout.read_line(&mut after_revoke_line).unwrap_or(0);
+    assert_eq!(
+        bytes_read, 0,
+        "revoked live session unexpectedly answered: {after_revoke_line:?}"
+    );
+    drop(live_stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(_status) = live_child.try_wait().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "held-open ssh session did not exit after device.remove"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     let after_revoke = sshd
         .ssh_command(&device_key, &known_hosts)

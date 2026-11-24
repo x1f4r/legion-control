@@ -12,6 +12,7 @@ pub mod authkeys;
 pub mod enrol;
 pub mod hosts;
 pub mod keys;
+pub mod sessions;
 pub mod store;
 
 use std::collections::BTreeMap;
@@ -66,7 +67,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.remove",
         Effect::Admin,
-        "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata.",
+        "Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions for a removed device.",
         remove,
     );
 }
@@ -340,6 +341,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
         if state_changed {
             save_state(&paths, &state)?;
         }
+        sessions::sweep_stale_sessions(&paths);
 
         let mut devices = Vec::new();
         let mut invites = Vec::new();
@@ -449,6 +451,7 @@ struct Removed {
     principal: String,
     removed: bool,
     lines_removed: usize,
+    sessions_ended: usize,
 }
 
 async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
@@ -485,8 +488,9 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     let caller = Caller::of(ctx)?;
     let node_file = ctx.config().get::<NodeFile>()?;
     let paths = ctx.paths().clone();
+    let paths_for_sessions = paths.clone();
 
-    blocking(move || {
+    let (mut removed, terminate_device) = blocking(move || {
         let target = resolve_target(&paths, &node_file)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
         verify_owner_matches_euid(
@@ -576,14 +580,18 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 state.devices.remove(&name);
                 save_state(&paths, &state)?;
 
-                Ok(Removed {
-                    kind: "device",
-                    name: Some(name),
-                    id: None,
-                    principal,
-                    removed: true,
-                    lines_removed: matched_lines,
-                })
+                Ok((
+                    Removed {
+                        kind: "device",
+                        name: Some(name.clone()),
+                        id: None,
+                        principal,
+                        removed: true,
+                        lines_removed: matched_lines,
+                        sessions_ended: 0,
+                    },
+                    Some(name),
+                ))
             }
             RemoveTarget::Invite(id) => {
                 let mut visible_ids: Vec<String> = Vec::new();
@@ -631,18 +639,33 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                 state.invites.remove(&id);
                 save_state(&paths, &state)?;
 
-                Ok(Removed {
-                    kind: "invite",
-                    name: None,
-                    id: Some(id),
-                    principal,
-                    removed: true,
-                    lines_removed: matched_lines,
-                })
+                Ok((
+                    Removed {
+                        kind: "invite",
+                        name: None,
+                        id: Some(id),
+                        principal,
+                        removed: true,
+                        lines_removed: matched_lines,
+                        sessions_ended: 0,
+                    },
+                    None,
+                ))
             }
         }
     })
-    .await
+    .await?;
+
+    if let Some(device_name) = terminate_device {
+        removed.sessions_ended = sessions::terminate_device_sessions(
+            &paths_for_sessions,
+            &device_name,
+            sessions::DEFAULT_TERMINATE_GRACE,
+        )
+        .await;
+    }
+
+    Ok(removed)
 }
 
 fn resolve_default_ssh_user(

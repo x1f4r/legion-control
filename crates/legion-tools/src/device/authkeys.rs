@@ -560,8 +560,10 @@ pub fn format_invite_line(
 
 /// Formats a permanent paired device line for `authorized_keys`.
 ///
-/// When `explicit_home` is `Some`, appends `--home <path>` to the forced command so `legion gate
-/// --as` always reads the same Legion home regardless of `sshd`'s session environment.
+/// Includes `--device <device_name>` so `legion gate --as` tracks live sessions for immediate
+/// revocation by `device.remove`. When `explicit_home` is `Some`, also appends `--home <path>`
+/// so `legion gate --as` always reads the same Legion home regardless of `sshd`'s session
+/// environment.
 pub fn format_device_line(
     exe: &Path,
     principal: &str,
@@ -570,7 +572,13 @@ pub fn format_device_line(
     explicit_home: Option<&Path>,
     windows: bool,
 ) -> Result<String, ErrorBody> {
-    let mut owned_args = vec!["gate".to_owned(), "--as".to_owned(), principal.to_owned()];
+    let mut owned_args = vec![
+        "gate".to_owned(),
+        "--as".to_owned(),
+        principal.to_owned(),
+        "--device".to_owned(),
+        device_name.to_owned(),
+    ];
     if let Some(home) = explicit_home {
         let home_str = home.to_str().ok_or_else(|| {
             ErrorBody::new(
