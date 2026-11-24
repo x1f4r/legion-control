@@ -97,7 +97,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "agent.add",
         Effect::Admin,
-        "Register this `legion` binary as an MCP server named `legion` with an AI coding agent using the agent's own CLI command, never by editing its configuration files directly. `compact` defaults to true because every registered tool schema costs the agent context on every conversation; pass `compact=false` to expose every tool individually. A named, limited principal from policy.toml (such as `agent:claude` with the `operator` or `observer` role) is safer than `owner` because it narrows what the agent may do and identifies its calls in the audit log; registering as `owner` requires `allow_owner=true`.",
+        "Register this `legion` binary as an MCP server named `legion` with an AI coding agent using the agent's own CLI command, never by editing its configuration files directly. `compact` defaults to true because every registered tool schema costs the agent context on every conversation; pass `compact=false` to expose every tool individually. A named, limited principal from policy.toml (such as `agent:claude` with the `editor` or `observer` role) is safer than `owner` because it narrows what the agent may do and identifies its calls in the audit log; registering as `owner` requires `allow_owner=true`.",
         add,
     );
     registry.add_fn(
@@ -309,7 +309,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
                 "Registering an AI agent as `owner` gives it unrestricted access to everything this account can do, so it is refused unless `allow_owner=true`.",
             )
             .with_hint(
-                "Add a named principal with a narrower role in policy.toml (such as `[principals.\"agent:claude\"]` with `role = \"operator\"`), or pass `allow_owner=true` if you really want unrestricted access.",
+                "Add a named principal with a narrower role in policy.toml (such as `[principals.\"agent:claude\"]` with `role = \"editor\"`), or pass `allow_owner=true` if you really want unrestricted access.",
             ));
         }
     } else {

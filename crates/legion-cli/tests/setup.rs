@@ -257,15 +257,24 @@ fn meta_init_empty_idempotent_and_generated_roles() {
 
     // Append principals referencing the three generated roles and verify real enforcement.
     let mut policy_with_principals = String::from_utf8(policy_bytes).unwrap();
+    assert!(!policy_with_principals.contains("[roles.maintainer]"));
     policy_with_principals.push_str(
         "\n[principals.viewer]\nrole = \"observer\"\n\
-         [principals.bot]\nrole = \"operator\"\n\
-         [principals.ops]\nrole = \"maintainer\"\n",
+         [principals.writer]\nrole = \"editor\"\n\
+         [principals.ops]\nrole = \"operator\"\n",
     );
     home.write_config("policy.toml", &policy_with_principals);
 
-    // Observer: can read, cannot write, cannot read audit log.
+    // Observer: can read inside ~/projects, denied outside ~/projects, cannot write or read audit.
     assert_eq!(home.run(&["meta.version", "--as", "viewer"]).code, 0);
+    assert_eq!(
+        home.run(&["fs.list", "path=~/projects", "--as", "viewer"])
+            .code,
+        0
+    );
+    let viewer_outside = home.run(&["fs.list", "path=~/.ssh", "--as", "viewer"]);
+    assert_eq!(viewer_outside.code, 1);
+    assert_eq!(viewer_outside.json()["code"], json!("denied"));
     let viewer_audit = home.run(&["audit.tail", "--as", "viewer"]);
     assert_eq!(viewer_audit.code, 1);
     assert_eq!(viewer_audit.json()["code"], json!("denied"));
@@ -279,32 +288,35 @@ fn meta_init_empty_idempotent_and_generated_roles() {
     assert_eq!(viewer_write.code, 1);
     assert_eq!(viewer_write.json()["code"], json!("denied"));
 
-    // Operator: can write under ~/projects, denied outside ~/projects, denied admin.
-    let op_write = home.run(&[
+    // Editor: can write under ~/projects, denied outside ~/projects, denied exec/destroy/admin.
+    let ed_write = home.run(&[
         "fs.write",
         "path=~/projects/app/hello.txt",
         "content=hi",
         "--as",
-        "bot",
+        "writer",
     ]);
-    assert_eq!(op_write.code, 0, "{}", op_write.stdout);
-    let op_outside = home.run(&["fs.list", "path=~/.ssh", "--as", "bot"]);
-    assert_eq!(op_outside.code, 1);
-    assert_eq!(op_outside.json()["code"], json!("denied"));
-    let op_admin = home.run(&["token.list", "--as", "bot"]);
+    assert_eq!(ed_write.code, 0, "{}", ed_write.stdout);
+    let ed_outside = home.run(&["fs.list", "path=~/.ssh", "--as", "writer"]);
+    assert_eq!(ed_outside.code, 1);
+    assert_eq!(ed_outside.json()["code"], json!("denied"));
+    let ed_exec = home.run(&["exec.run", "cmd=echo hi", "--as", "writer"]);
+    assert_eq!(ed_exec.code, 1);
+    assert_eq!(ed_exec.json()["code"], json!("denied"));
+    let ed_admin = home.run(&["token.list", "--as", "writer"]);
+    assert_eq!(ed_admin.code, 1);
+    assert_eq!(ed_admin.json()["code"], json!("denied"));
+
+    // Operator: can write, destroy, and read audit, but cannot administer or run power tools.
+    let op_remove = home.run(&["fs.remove", "path=~/projects/app/hello.txt", "--as", "ops"]);
+    assert_eq!(op_remove.code, 0, "{}", op_remove.stdout);
+    assert_eq!(home.run(&["audit.tail", "--as", "ops"]).code, 0);
+    let op_admin = home.run(&["token.list", "--as", "ops"]);
     assert_eq!(op_admin.code, 1);
     assert_eq!(op_admin.json()["code"], json!("denied"));
-
-    // Maintainer: can write, destroy, and read audit, but cannot administer.
-    let maint_remove = home.run(&["fs.remove", "path=~/projects/app/hello.txt", "--as", "ops"]);
-    assert_eq!(maint_remove.code, 0, "{}", maint_remove.stdout);
-    assert_eq!(home.run(&["audit.tail", "--as", "ops"]).code, 0);
-    let maint_admin = home.run(&["token.list", "--as", "ops"]);
-    assert_eq!(maint_admin.code, 1);
-    assert_eq!(maint_admin.json()["code"], json!("denied"));
-    let maint_init = home.run(&["meta.init", "--as", "ops"]);
-    assert_eq!(maint_init.code, 1);
-    assert_eq!(maint_init.json()["code"], json!("denied"));
+    let op_init = home.run(&["meta.init", "--as", "ops"]);
+    assert_eq!(op_init.code, 1);
+    assert_eq!(op_init.json()["code"], json!("denied"));
 }
 
 fn agent_add_list_remove_against_fake_program_on_path() {
@@ -487,12 +499,12 @@ fn fleet_sync_status_push_pull_conflicts_force_validation_backups_tools_d_and_pe
     let policy_v1 = "\
 default = \"owner\"
 
-[roles.maintainer]
-allow = [\"*\"]
-deny = [\"effect:admin\"]
+[roles.operator]
+allow = [\"effect:read\", \"effect:write\", \"effect:exec\", \"effect:destroy\"]
+deny = [\"effect:power\", \"effect:admin\"]
 
 [principals.ops]
-role = \"maintainer\"
+role = \"operator\"
 
 [principals.semi]
 role = \"owner\"
@@ -789,12 +801,12 @@ role = \"owner\"
     let pi_narrow_policy = "\
 default = \"owner\"
 
-[roles.maintainer]
-allow = [\"*\"]
-deny = [\"effect:admin\"]
+[roles.operator]
+allow = [\"effect:read\", \"effect:write\", \"effect:exec\", \"effect:destroy\"]
+deny = [\"effect:power\", \"effect:admin\"]
 
 [principals.semi]
-role = \"maintainer\"
+role = \"operator\"
 ";
     pi.write_config("policy.toml", pi_narrow_policy);
     let remote_denied = laptop.run(&[
@@ -815,6 +827,11 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
     let pi = Home::new();
 
     laptop.run(&["init", "--name", "laptop"]);
+    let mut policy = fs::read_to_string(config_dir(&laptop).join("policy.toml")).unwrap();
+    policy.push_str(
+        "\n[roles.confined_exec]\nallow = [\"effect:read\", \"effect:exec\"]\npaths = [\"~/projects/**\"]\n",
+    );
+    laptop.write_config("policy.toml", &policy);
     pi.write_config("node.toml", "name = \"pi\"\n");
 
     let fleet_toml = format!(
