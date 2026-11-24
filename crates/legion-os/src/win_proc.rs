@@ -127,7 +127,7 @@ pub(crate) struct PinnedProcess {
     handle: OwnedHandle,
     pub(crate) id: ProcessId,
     pub(crate) parent_pid: u32,
-    /// Monotonic kernel process creation key (`ProcessStartKey` / `ProcessSequenceNumber` from
+    /// Monotonic kernel process creation key (`ProcessStartKey` from
     /// `ProcessTelemetryIdInformation`), immune to wall-clock adjustments.
     pub(crate) start_key: Option<u64>,
     can_terminate: bool,
@@ -254,17 +254,23 @@ struct ProcessTelemetryIdHeader {
     command_line_offset: u32,
 }
 
-/// Query the monotonic kernel `ProcessStartKey` (or `ProcessSequenceNumber`) directly from a held
-/// process handle via `NtQueryInformationProcess(ProcessTelemetryIdInformation)`.
+/// Query the monotonic kernel `ProcessStartKey` directly from a held process handle via
+/// `NtQueryInformationProcess(ProcessTelemetryIdInformation)`.
 ///
-/// Returns `None` if the OS does not support this class or the returned header does not match
-/// `expected_pid`.
+/// Starts with an 80 KiB buffer (large enough for a maximum-length Windows command line plus
+/// image/package metadata in one syscall) and grows on `STATUS_BUFFER_TOO_SMALL` /
+/// `STATUS_INFO_LENGTH_MISMATCH`. Never substitutes `ProcessSequenceNumber` for `ProcessStartKey`:
+/// returns `None` if `ProcessStartKey` is zero, the OS does not support this class, or the
+/// returned header does not match `expected_pid`.
 fn query_process_start_key_raw(handle: HANDLE, expected_pid: u32) -> Option<u64> {
-    const MAX_TELEMETRY_BYTES: usize = 128 * 1024;
-    let header_bytes = size_of::<ProcessTelemetryIdHeader>();
-    let mut words = vec![0u64; 256]; // 2048 bytes, 8-byte aligned
+    const INITIAL_TELEMETRY_BYTES: usize = 80 * 1024;
+    const MAX_TELEMETRY_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_GROW_ATTEMPTS: usize = 8;
 
-    for _ in 0..2 {
+    let header_bytes = size_of::<ProcessTelemetryIdHeader>();
+    let mut words = vec![0u64; INITIAL_TELEMETRY_BYTES.div_ceil(size_of::<u64>())];
+
+    for _ in 0..MAX_GROW_ATTEMPTS {
         let byte_len = (words.len() * size_of::<u64>()) as u32;
         // Initialize `HeaderSize` at offset 0 of the buffer before calling the kernel.
         // SAFETY: `words` is 8-byte aligned and larger than `ProcessTelemetryIdHeader`.
@@ -293,19 +299,17 @@ fn query_process_start_key_raw(handle: HANDLE, expected_pid: u32) -> Option<u64>
             if header.process_id != expected_pid {
                 return None;
             }
-            if header.process_start_key != 0 {
-                return Some(header.process_start_key);
-            }
-            if header.process_sequence_number != 0 {
-                return Some(header.process_sequence_number);
-            }
-            return None;
+            return (header.process_start_key != 0).then_some(header.process_start_key);
         }
-        if (status == STATUS_BUFFER_TOO_SMALL || status == STATUS_INFO_LENGTH_MISMATCH)
-            && returned > byte_len
-            && (returned as usize) <= MAX_TELEMETRY_BYTES
-        {
-            words.resize((returned as usize).div_ceil(size_of::<u64>()), 0);
+        if status == STATUS_BUFFER_TOO_SMALL || status == STATUS_INFO_LENGTH_MISMATCH {
+            let current_bytes = words.len() * size_of::<u64>();
+            let next_bytes = (returned as usize)
+                .max(current_bytes.saturating_mul(2))
+                .min(MAX_TELEMETRY_BYTES);
+            if next_bytes <= current_bytes {
+                return None;
+            }
+            words.resize(next_bytes.div_ceil(size_of::<u64>()), 0);
             continue;
         }
         return None;
@@ -2118,6 +2122,17 @@ mod tests {
         let child_key = child_proc
             .start_key
             .expect("child process should also have a non-zero start key");
+        let full_query_key = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, child.id()) }
+            .ok()
+            .map(OwnedHandle)
+            .and_then(|h| query_process_start_key_raw(h.0, child.id()));
+        eprintln!(
+            "windows-telemetry-diagnostic: limited_right_key_present={} full_right_key_present={} limited_matches_full={}",
+            child_proc.start_key.is_some(),
+            full_query_key.is_some(),
+            child_proc.start_key == full_query_key
+        );
+        assert_eq!(child_proc.start_key, full_query_key);
         assert!(
             child_key > my_key,
             "expected child start_key ({child_key}) > parent start_key ({my_key})"
