@@ -26,6 +26,13 @@ pub enum OsError {
         detail: String,
     },
 
+    /// A target file already existed when exclusive creation (`no_replace`) was requested.
+    #[error("already exists: {path}")]
+    AlreadyExists {
+        /// Path of the existing file that was not overwritten.
+        path: PathBuf,
+    },
+
     /// The operating system refused the operation due to insufficient permissions.
     #[error("permission denied: {detail}")]
     PermissionDenied {

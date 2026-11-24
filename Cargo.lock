@@ -523,6 +523,7 @@ dependencies = [
  "gethostname",
  "jiff",
  "legion-proto",
+ "same-file",
  "schemars",
  "serde",
  "serde_ignored",

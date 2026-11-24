@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use legion_core::proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, Target, ToolSpec};
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
 
@@ -69,6 +69,12 @@ impl Catalog {
         &self.entries
     }
 
+    /// The tool a client names, by its registry name or its MCP name.
+    pub(crate) fn get(&self, name: &str) -> Option<&Entry> {
+        let name = self.resolve(name);
+        self.entries.iter().find(|entry| entry.spec.name == name)
+    }
+
     /// The registry name a client means: the name itself, or the MCP name of exactly one tool.
     /// Agents switch between `fs.read` and `fs_read` freely, and both are unambiguous.
     pub(crate) fn resolve<'a>(&'a self, name: &'a str) -> &'a str {
@@ -103,16 +109,16 @@ pub(crate) fn mcp_tool(spec: &ToolSpec, with_on: bool) -> Result<Tool, ErrorBody
     )
 }
 
-/// What a tool's effect tells a client. `read` tools change nothing; `destroy` and `power` can
-/// lose something that cannot be had back. The other effects change things without destroying
-/// them, so they claim neither.
+/// What a tool's effect tells a client. `read` tools change nothing. Every other effect may lose
+/// something that cannot be had back: a write can replace a file's content, a command can do
+/// whatever the account can, and admin changes what Legion allows. A client skips confirmation
+/// for a tool that says it is not destructive, so none of them says so.
 pub(crate) fn annotations(title: &str, effect: Effect) -> ToolAnnotations {
     let annotations = ToolAnnotations::with_title(title);
     match effect {
         Effect::Read => annotations.read_only(true),
-        Effect::Destroy | Effect::Power => annotations.read_only(false).destructive(true),
-        Effect::Write | Effect::Exec | Effect::Admin => {
-            annotations.read_only(false).destructive(false)
+        Effect::Write | Effect::Exec | Effect::Destroy | Effect::Power | Effect::Admin => {
+            annotations.read_only(false).destructive(true)
         }
     }
 }
@@ -175,15 +181,25 @@ fn add_on(schema: &mut JsonObject, spec: &ToolSpec) -> Result<(), ErrorBody> {
     Ok(())
 }
 
-/// The schema of `on`, the same in full and compact mode.
+/// The schema of `on`, the same in full and compact mode: one string, the type every client can
+/// send, naming several machines with commas the way the command line's `--on` does.
 pub(crate) fn on_schema() -> Value {
     json!({
-        "description": "Where to run: a machine's name, a list of machine names, or \"all\". Leave it out to run on this machine.",
-        "anyOf": [
-            {"type": "string"},
-            {"type": "array", "items": {"type": "string"}, "minItems": 1}
-        ]
+        "type": "string",
+        "description": "Where to run: a machine's name, several names separated by commas, or \"all\". Leave it out to run on this machine."
     })
+}
+
+/// The machines `on` names. A list of names is taken as well as the string the schema asks for,
+/// since it is what a client that knows the wire protocol sends.
+pub(crate) fn target(on: Value) -> Result<Option<Target>, String> {
+    match on {
+        Value::Null => Ok(None),
+        Value::String(text) => Target::parse(&text).map(Some),
+        other => serde_json::from_value(other)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+    }
 }
 
 /// The first sentence of a description, or its first line, for listings that show many tools.
@@ -197,6 +213,8 @@ pub(crate) fn summary(description: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use legion_core::schema::problems;
+
     use super::*;
 
     fn spec(name: &str, effect: Effect, schema: Value) -> ToolSpec {
@@ -240,10 +258,14 @@ mod tests {
             (a.read_only_hint, a.destructive_hint)
         };
         assert_eq!(hints(Effect::Read), (Some(true), None));
-        assert_eq!(hints(Effect::Destroy), (Some(false), Some(true)));
-        assert_eq!(hints(Effect::Power), (Some(false), Some(true)));
-        for effect in [Effect::Write, Effect::Exec, Effect::Admin] {
-            assert_eq!(hints(effect), (Some(false), Some(false)), "{effect}");
+        for effect in [
+            Effect::Write,
+            Effect::Exec,
+            Effect::Destroy,
+            Effect::Power,
+            Effect::Admin,
+        ] {
+            assert_eq!(hints(effect), (Some(false), Some(true)), "{effect}");
         }
     }
 
@@ -360,6 +382,7 @@ mod tests {
             let schema = Value::Object((*tool.input_schema).clone());
             assert_eq!(schema["type"], json!("object"), "{name}: {schema}");
             assert_eq!(schema.get("$schema"), None, "{name}");
+            assert_eq!(problems(&schema), Vec::<String>::new(), "{name}");
             let properties = schema["properties"].as_object().unwrap();
             assert_eq!(properties[ON], on_schema(), "{name}");
             if let Some(required) = schema.get("required") {
@@ -383,8 +406,37 @@ mod tests {
                     "{name}: {at} refers to {target}, which is not there"
                 );
             }
-            assert!(tool.annotations.is_some(), "{name}");
+            let annotations = tool.annotations.as_ref().unwrap();
+            if entry.spec.effect == Effect::Read {
+                assert_eq!(annotations.read_only_hint, Some(true), "{name}");
+            } else {
+                assert_eq!(
+                    (annotations.read_only_hint, annotations.destructive_hint),
+                    (Some(false), Some(true)),
+                    "{name} would let a client skip confirming it"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn on_is_a_name_names_separated_by_commas_or_all() {
+        assert_eq!(target(Value::Null), Ok(None));
+        assert_eq!(
+            target(json!("tower")),
+            Ok(Some(Target::One("tower".into())))
+        );
+        assert_eq!(
+            target(json!("tower, pi")),
+            Ok(Some(Target::Many(vec!["tower".into(), "pi".into()])))
+        );
+        assert_eq!(target(json!("all")), Ok(Some(Target::All)));
+        assert_eq!(
+            target(json!(["tower", "pi"])),
+            Ok(Some(Target::Many(vec!["tower".into(), "pi".into()])))
+        );
+        assert!(target(json!("")).is_err());
+        assert!(target(json!(5)).is_err());
     }
 
     #[test]
