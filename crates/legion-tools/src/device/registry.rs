@@ -64,6 +64,123 @@ pub const NON_OWNER_DEVICES_TOML_LIMIT_BYTES: usize = MAX_DEVICES_TOML_BYTES / 2
 /// Maximum number of concurrent pending pairing invites a non-owner principal may hold.
 pub const MAX_NON_OWNER_PENDING_INVITES: usize = 32;
 
+/// State file recording any failed configuration rollback (e.g. when restoring `policy.toml` or
+/// `devices.toml` after a partial failure during `device.enrol` or `device.set` itself fails), so
+/// `meta.doctor` surfaces it loudly until inspected and cleared.
+pub const ROLLBACK_FAILURE_FILE: &str = "devices-rollback-error.json";
+
+/// Maximum number of rollback-failure records retained in [`ROLLBACK_FAILURE_FILE`].
+const MAX_ROLLBACK_FAILURE_RECORDS: usize = 20;
+
+/// One recorded failure while restoring a config file snapshot during rollback.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackFailureRecord {
+    /// UTC RFC 3339 timestamp when rollback failed.
+    pub time: String,
+    /// Operation whose rollback failed (`device.enrol`, `device.set`, etc.).
+    pub operation: String,
+    /// Path of the file whose snapshot could not be restored.
+    pub file: String,
+    /// Underlying filesystem error.
+    pub error: String,
+}
+
+/// Path to the rollback-failure record file under `paths.state_dir()`.
+pub fn rollback_failure_record_path(paths: &Paths) -> PathBuf {
+    paths.state_dir().join(ROLLBACK_FAILURE_FILE)
+}
+
+/// Restores `path` to its pre-operation snapshot (`Some(bytes)` -> atomic write, `None` -> remove).
+///
+/// Never ignores its own errors: on failure, appends a [`RollbackFailureRecord`] to
+/// `state/devices-rollback-error.json` (surfaced by `meta.doctor`) and returns a loud error string
+/// describing what failed to roll back.
+pub fn restore_file_snapshot(
+    paths: &Paths,
+    operation: &str,
+    path: &Path,
+    before: Option<&[u8]>,
+) -> Result<(), String> {
+    let result = match before {
+        Some(bytes) => write_atomically(path, bytes).map_err(|e| e.to_string()),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        },
+    };
+    let Err(err_msg) = result else {
+        return Ok(());
+    };
+    let record = RollbackFailureRecord {
+        time: format_precise_rfc3339(Timestamp::now()),
+        operation: operation.to_owned(),
+        file: path.display().to_string(),
+        error: err_msg.clone(),
+    };
+    let record_path = rollback_failure_record_path(paths);
+    let mut records: Vec<RollbackFailureRecord> = std::fs::read(&record_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    records.push(record);
+    if records.len() > MAX_ROLLBACK_FAILURE_RECORDS {
+        let excess = records.len() - MAX_ROLLBACK_FAILURE_RECORDS;
+        records.drain(..excess);
+    }
+    if let Some(parent) = record_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(encoded) = serde_json::to_vec_pretty(&records) {
+        let _ = write_atomically(&record_path, &encoded);
+    }
+    Err(format!(
+        "ROLLBACK FAILED restoring {} after {operation} failed: {err_msg}",
+        path.display()
+    ))
+}
+
+/// Appends any rollback failure messages loudly to `error` and updates its hint to point the owner
+/// at `policy.toml`, `devices.toml`, and `meta.doctor`.
+pub fn attach_rollback_failures(mut error: ErrorBody, failures: &[String]) -> ErrorBody {
+    if failures.is_empty() {
+        return error;
+    }
+    error.message = format!("{} {}", error.message, failures.join("; "));
+    let rollback_hint = "Configuration on disk may be partially updated; inspect policy.toml and devices.toml and run `legion meta.doctor`.";
+    error.hint = Some(match error.hint {
+        Some(existing) if !existing.is_empty() => format!("{existing} {rollback_hint}"),
+        _ => rollback_hint.to_owned(),
+    });
+    error
+}
+
+/// Reads recorded configuration rollback failures for `meta.doctor`.
+pub fn inspect_rollback_failures(paths: &Paths) -> Vec<RollbackFailureRecord> {
+    let record_path = rollback_failure_record_path(paths);
+    let bytes = match std::fs::read(&record_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            return vec![RollbackFailureRecord {
+                time: "unknown".to_owned(),
+                operation: "unknown".to_owned(),
+                file: record_path.display().to_string(),
+                error: format!("rollback error record cannot be read: {error}"),
+            }];
+        }
+    };
+    match serde_json::from_slice::<Vec<RollbackFailureRecord>>(&bytes) {
+        Ok(records) => records,
+        Err(error) => vec![RollbackFailureRecord {
+            time: "unknown".to_owned(),
+            operation: "unknown".to_owned(),
+            file: record_path.display().to_string(),
+            error: format!("rollback error record cannot be parsed: {error}"),
+        }],
+    }
+}
+
 /// Error returned when a change would make `devices.toml` exceed [`MAX_DEVICES_TOML_BYTES`].
 pub fn devices_size_limit_error(bytes: usize) -> ErrorBody {
     ErrorBody::new(

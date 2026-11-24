@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use legion_core::config::{Document, NodeFile, NodeName, parse, write_atomically};
+use legion_core::config::{Document, NodeFile, NodeName, parse};
 use legion_core::policy::{NOBODY, OWNER, Policy};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::{Door, Node};
@@ -27,9 +27,10 @@ use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_inv
 use super::registry::{
     DeviceRegistryPushAudit, DevicesFile, FleetDevice, FleetPushOutcome, MAX_DEVICES_TOML_BYTES,
     NON_OWNER_DEVICES_TOML_LIMIT_BYTES, PairedBy, adopt_legacy_devices_from_auth_keys,
-    devices_size_limit_error, format_precise_rfc3339, load_devices_raw, lock_config,
-    non_owner_devices_half_limit_error, push_devices_to_fleet, reconcile_authorized_keys_in_memory,
-    save_devices_locked, upsert_device_principal_locked,
+    attach_rollback_failures, devices_size_limit_error, format_precise_rfc3339, load_devices_raw,
+    lock_config, non_owner_devices_half_limit_error, push_devices_to_fleet,
+    reconcile_authorized_keys_in_memory, restore_file_snapshot, save_devices_locked,
+    upsert_device_principal_locked,
 };
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
@@ -697,44 +698,72 @@ fn process_enrol_blocking(
 
     // 1. Save the new principal in `policy.toml` (when creating a dedicated `device:*` principal)
     //    and `devices.toml` FIRST, before touching `authorized_keys`. If anything fails here, roll
-    //    back so nothing on disk has changed.
+    //    back so nothing on disk has changed (and report any rollback failure loudly).
     if invite.create_principal
         && let Err(error) = upsert_device_principal_locked(paths, &principal, &role, &pairing_id)
     {
         return (Some(principal), None, base_args, Err(error));
     }
     if let Err(error) = save_devices_locked(paths, &devices) {
-        if invite.create_principal {
-            restore_file_snapshot(&policy_path, policy_before.as_deref());
+        let mut rollback_failures = Vec::new();
+        if invite.create_principal
+            && let Err(msg) = restore_file_snapshot(
+                paths,
+                "device.enrol",
+                &policy_path,
+                policy_before.as_deref(),
+            )
+        {
+            rollback_failures.push(msg);
         }
-        return (Some(principal), None, base_args, Err(error));
+        return (
+            Some(principal),
+            None,
+            base_args,
+            Err(attach_rollback_failures(error, &rollback_failures)),
+        );
     }
+
+    let rollback_both = |error: ErrorBody| -> ErrorBody {
+        let mut rollback_failures = Vec::new();
+        if let Err(msg) = restore_file_snapshot(
+            paths,
+            "device.enrol",
+            &devices_path,
+            devices_before.as_deref(),
+        ) {
+            rollback_failures.push(msg);
+        }
+        if invite.create_principal
+            && let Err(msg) = restore_file_snapshot(
+                paths,
+                "device.enrol",
+                &policy_path,
+                policy_before.as_deref(),
+            )
+        {
+            rollback_failures.push(msg);
+        }
+        attach_rollback_failures(error, &rollback_failures)
+    };
 
     let live_policy = match std::fs::read(&policy_path) {
         Ok(bytes) => match parse::<Policy>(&policy_path, &bytes) {
             Ok(policy) => policy,
             Err(error) => {
-                restore_file_snapshot(&devices_path, devices_before.as_deref());
-                if invite.create_principal {
-                    restore_file_snapshot(&policy_path, policy_before.as_deref());
-                }
-                return (Some(principal), None, base_args, Err(error));
+                return (Some(principal), None, base_args, Err(rollback_both(error)));
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
         Err(error) => {
-            restore_file_snapshot(&devices_path, devices_before.as_deref());
-            if invite.create_principal {
-                restore_file_snapshot(&policy_path, policy_before.as_deref());
-            }
             return (
                 Some(principal),
                 None,
                 base_args,
-                Err(ErrorBody::new(
+                Err(rollback_both(ErrorBody::new(
                     ErrorCode::Failed,
                     format!("{} cannot be read: {error}.", policy_path.display()),
-                )),
+                ))),
             );
         }
     };
@@ -776,11 +805,7 @@ fn process_enrol_blocking(
         Ok((Some(disk_auth), ()))
     });
     if let Err(error) = swap_result {
-        restore_file_snapshot(&devices_path, devices_before.as_deref());
-        if invite.create_principal {
-            restore_file_snapshot(&policy_path, policy_before.as_deref());
-        }
-        return (Some(principal), None, base_args, Err(error));
+        return (Some(principal), None, base_args, Err(rollback_both(error)));
     }
 
     let push_audit = Some(DeviceRegistryPushAudit {
@@ -828,15 +853,4 @@ fn process_enrol_blocking(
             sync_command: None,
         }),
     )
-}
-
-fn restore_file_snapshot(path: &std::path::Path, before: Option<&[u8]>) {
-    match before {
-        Some(bytes) => {
-            let _ = write_atomically(path, bytes);
-        }
-        None => {
-            let _ = std::fs::remove_file(path);
-        }
-    }
 }

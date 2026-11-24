@@ -123,6 +123,14 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         checks.push(check);
     }
 
+    let rollback_failures = crate::device::registry::inspect_rollback_failures(ctx.paths());
+    if let Some(check) = check_config_rollback_failures(
+        &rollback_failures,
+        &crate::device::registry::rollback_failure_record_path(ctx.paths()),
+    ) {
+        checks.push(check);
+    }
+
     if !quick
         && let Some(ping_tool) = ctx.node().registry().get("fleet.ping")
         && ctx.grant().allows(ping_tool.spec())
@@ -246,6 +254,40 @@ pub fn check_quarantined_devices(quarantined: &[(String, String, String)]) -> Op
             "Inspect with `legion device.list`, then either confirm legitimate devices as owner with `legion device.set id=<pairing_id> confirm=true` or remove them with `legion device.remove id=<pairing_id>`."
                 .to_owned(),
         ),
+    })
+}
+
+/// Builds a failing `meta.doctor` check when a previous `device.enrol` or `device.set` rollback
+/// failed to restore a configuration snapshot (`policy.toml` or `devices.toml`).
+pub fn check_config_rollback_failures(
+    failures: &[crate::device::registry::RollbackFailureRecord],
+    record_path: &Path,
+) -> Option<Check> {
+    if failures.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = failures
+        .iter()
+        .map(|rec| {
+            format!(
+                "{} ({} on {}): {}",
+                rec.operation, rec.time, rec.file, rec.error
+            )
+        })
+        .collect();
+    Some(Check {
+        name: "config rollback failures".to_owned(),
+        ok: false,
+        warning: false,
+        detail: format!(
+            "{} configuration rollback failure(s) recorded — policy.toml and devices.toml may have diverged: {}.",
+            failures.len(),
+            items.join("; ")
+        ),
+        hint: Some(format!(
+            "Inspect policy.toml and devices.toml, run `legion device.list` to verify device principals, then delete {} once verified.",
+            record_path.display()
+        )),
     })
 }
 

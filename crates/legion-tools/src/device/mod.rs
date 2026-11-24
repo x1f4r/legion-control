@@ -1024,7 +1024,24 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             .with_hint("Choose a different name."));
         }
 
+        let policy_path = paths.config_file(Policy::FILE);
+        let policy_before = if new_role.is_some() {
+            match std::fs::read(&policy_path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("{} cannot be read: {error}.", policy_path.display()),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         let previous_role_effective = policy.role_of(&current_entry.principal).0;
+        let mut policy_updated = false;
         let final_role = if let Some(ref target_role) = new_role {
             if current_entry.principal == OWNER {
                 return Err(ErrorBody::new(
@@ -1062,16 +1079,34 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                 )));
             }
             upsert_device_principal_locked(&paths, &current_entry.principal, target_role, &pairing_id)?;
+            policy_updated = true;
             target_role.clone()
         } else {
             previous_role_effective.clone()
+        };
+
+        let rollback_policy = |error: ErrorBody| -> ErrorBody {
+            if !policy_updated {
+                return error;
+            }
+            let mut failures = Vec::new();
+            if let Err(msg) = registry::restore_file_snapshot(
+                &paths,
+                "device.set",
+                &policy_path,
+                policy_before.as_deref(),
+            ) {
+                failures.push(msg);
+            }
+            registry::attach_rollback_failures(error, &failures)
         };
 
         let mut updated_entry = current_entry.clone();
         let now = Timestamp::now();
         let confirm_ts = if let Some(removed_ts) = quarantine_removed_ts {
             let removed_str = registry::format_precise_rfc3339(removed_ts);
-            let ts = registry::next_updated_timestamp_at(Some(&removed_str), now)?;
+            let ts = registry::next_updated_timestamp_at(Some(&removed_str), now)
+                .map_err(&rollback_policy)?;
             updated_entry.confirmed_by = Some(caller_principal);
             updated_entry.confirmed_at = Some(ts.clone());
             Some(ts)
@@ -1095,7 +1130,8 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             None
         };
 
-        let mut next_updated = registry::next_updated_timestamp_at(Some(&current_entry.updated_at), now)?;
+        let mut next_updated = registry::next_updated_timestamp_at(Some(&current_entry.updated_at), now)
+            .map_err(&rollback_policy)?;
         if let Some(ref c_str) = confirm_ts
             && let (Ok(c_ts), Ok(u_ts)) = (c_str.parse::<Timestamp>(), next_updated.parse::<Timestamp>())
             && u_ts < c_ts
@@ -1108,12 +1144,11 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             .devices
             .insert(pairing_id.clone(), updated_entry.clone());
 
-        save_devices_locked(&paths, &devices_file)?;
+        save_devices_locked(&paths, &devices_file).map_err(&rollback_policy)?;
 
         if confirm {
             let _ = reconcile_device_principals_locked(&paths, &devices_file)?;
         }
-        let policy_path = paths.config_file(Policy::FILE);
         let live_policy = match std::fs::read(&policy_path) {
             Ok(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
@@ -5591,5 +5626,143 @@ role = \"ops\"
                 .unwrap();
             assert_eq!(owner_rm["removed"], json!(true));
         }
+    }
+
+    #[tokio::test]
+    async fn nit3_device_set_role_restores_policy_snapshot_when_devices_save_fails() {
+        use crate::device::enrol::run_enrol;
+        use crate::device::keys::ed25519_public_key_from_seed;
+
+        let h = Harness::new();
+        std::fs::write(
+            h.node.paths().config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[roles.editor]
+allow = [\"effect:read\", \"effect:write\"]
+",
+        )
+        .unwrap();
+
+        let inv = h
+            .call(
+                "device.invite",
+                json!({
+                    "name": "pixel",
+                    "role": "observer",
+                    "host": "127.0.0.1",
+                    "port": 22,
+                    "user": "tester"
+                }),
+            )
+            .await
+            .unwrap();
+        let inv_id = inv["id"].as_str().unwrap().to_owned();
+        let req = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": inv_id,
+                "public_key": ed25519_public_key_from_seed(&[0x33; 32]),
+                "name": "pixel"
+            })
+        );
+        assert!(run_enrol(&h.node, &inv_id, req.as_bytes()).await.is_ok());
+
+        let policy_path = h.node.paths().config_file("policy.toml");
+        let policy_before = std::fs::read(&policy_path).unwrap();
+        let devices_before = std::fs::read(h.node.paths().config_file("devices.toml")).unwrap();
+
+        // Force `save_devices_locked` to fail AFTER `upsert_device_principal_locked` has already
+        // written the new `editor` role into `policy.toml` by placing a directory at the backup
+        // path `state/sync/backups/devices.toml.bak`.
+        let devices_bak = h
+            .node
+            .paths()
+            .state_dir()
+            .join("sync")
+            .join("backups")
+            .join("devices.toml.bak");
+        let _ = std::fs::remove_file(&devices_bak);
+        std::fs::create_dir_all(&devices_bak).unwrap();
+
+        let err = h
+            .call("device.set", json!({"name": "pixel", "role": "editor"}))
+            .await
+            .expect_err("device.set must fail when saving devices.toml fails");
+        let _ = std::fs::remove_dir_all(&devices_bak);
+        assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+
+        assert_eq!(
+            std::fs::read(&policy_path).unwrap(),
+            policy_before,
+            "policy.toml must be rolled back to its snapshot when devices.toml save fails"
+        );
+        assert_eq!(
+            std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+            devices_before
+        );
+    }
+
+    #[tokio::test]
+    async fn nit4_failed_rollback_reports_loudly_in_error_and_meta_doctor() {
+        let h = Harness::new();
+        // Create a regular file where a parent directory is expected so restoring a snapshot
+        // underneath it fails deterministically across Linux, macOS, Windows, and root.
+        let blocker = h.dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        let unwritable_target = blocker.join("policy.toml");
+
+        let rollback_err = registry::restore_file_snapshot(
+            h.node.paths(),
+            "device.set",
+            &unwritable_target,
+            Some(b"default = \"owner\"\n"),
+        )
+        .expect_err("restore_file_snapshot must return Err when snapshot restoration fails");
+        assert!(
+            rollback_err.contains("ROLLBACK FAILED")
+                && rollback_err.contains("device.set")
+                && rollback_err.contains("policy.toml"),
+            "expected loud rollback error: {rollback_err}"
+        );
+
+        let attached = registry::attach_rollback_failures(
+            ErrorBody::new(ErrorCode::Failed, "devices.toml cannot be written."),
+            &[rollback_err],
+        );
+        assert!(
+            attached.message.contains("ROLLBACK FAILED")
+                && attached.message.contains("policy.toml"),
+            "attached error must loudly surface rollback failure: {attached:?}"
+        );
+        assert!(
+            attached
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("meta.doctor")),
+            "attached error hint should point to meta.doctor: {attached:?}"
+        );
+
+        // `meta.doctor` MUST report a failing check (`ok: false`) for the recorded rollback failure.
+        let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        let checks = doctor["checks"].as_array().unwrap();
+        let rollback_check = checks
+            .iter()
+            .find(|c| c["name"] == json!("config rollback failures"))
+            .unwrap_or_else(|| panic!("expected config rollback failures check in {doctor}"));
+        assert_eq!(doctor["ok"], json!(false), "{doctor}");
+        assert_eq!(rollback_check["ok"], json!(false), "{rollback_check}");
+        assert!(rollback_check.get("warning").is_none(), "{rollback_check}");
+        assert!(
+            rollback_check["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("device.set") && d.contains("policy.toml")),
+            "{rollback_check}"
+        );
     }
 }
