@@ -28,12 +28,13 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
 };
-use rmcp::service::{RequestContext, ServerInitializeError};
-use rmcp::{ErrorData, RoleServer, ServerHandler};
+use rmcp::service::{NotificationContext, RequestContext, ServerInitializeError};
+use rmcp::{ErrorData, Peer, RoleServer, ServerHandler};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
+use tokio_util::sync::DropGuard;
 use tokio_util::task::TaskTracker;
 
 use crate::Authenticated;
@@ -46,6 +47,11 @@ const LIST_COMPACT: &str = "legion_tools lists the tools you may use here.";
 
 /// Bounded wait for in-flight calls to stop and audit when the door is signalled to shut down.
 const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(4));
+
+/// How often an initialized full-mode session checks whether `tools.d` changed on disk so it can
+/// push `notifications/tools/list_changed` even while idle. Metadata-gated in `ExtensionStore`, so
+/// an unchanged directory costs only stat calls and zero file reads.
+const CATALOG_WATCH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How a session is served.
 #[derive(Clone, Debug, Default)]
@@ -79,6 +85,15 @@ pub struct McpDoor {
     http: Option<HttpLink>,
     /// The level `logging/setLevel` asked for, if a client of the older revision asked.
     log_level: Mutex<Option<Level>>,
+    /// The last catalog version this stateful session reported via `on_initialized`, `tools/list`,
+    /// or `notifications/tools/list_changed`. `None` until the session finishes initialization
+    /// (handshake-less `2026-07-28` requests never initialize a session and cannot receive
+    /// unsolicited notifications; those clients re-query `tools/list` or `server/discover` instead).
+    notified_version: Arc<Mutex<Option<u64>>>,
+    /// Cancelled when this door drops (or when the HTTP server shuts down) to stop the idle
+    /// catalog watcher.
+    watcher_stop: CancellationToken,
+    _watcher_guard: DropGuard,
     /// Every call still running, so the session can wait for calls it cancels as it ends to reach
     /// the audit log.
     calls: TaskTracker,
@@ -95,6 +110,8 @@ impl McpDoor {
         options: Options,
     ) -> Result<McpDoor, ErrorBody> {
         let catalog = CatalogCache::new(&node, !options.compact)?;
+        let watcher_stop = CancellationToken::new();
+        let watcher_guard = watcher_stop.clone().drop_guard();
         Ok(McpDoor {
             node,
             router,
@@ -102,6 +119,9 @@ impl McpDoor {
             catalog,
             http: None,
             log_level: Mutex::new(None),
+            notified_version: Arc::new(Mutex::new(None)),
+            watcher_stop,
+            _watcher_guard: watcher_guard,
             calls: TaskTracker::new(),
         })
     }
@@ -117,6 +137,8 @@ impl McpDoor {
         link: HttpLink,
         calls: TaskTracker,
     ) -> McpDoor {
+        let watcher_stop = link.shutdown.child_token();
+        let watcher_guard = watcher_stop.clone().drop_guard();
         McpDoor {
             node,
             router,
@@ -127,6 +149,9 @@ impl McpDoor {
             catalog,
             http: Some(link),
             log_level: Mutex::new(None),
+            notified_version: Arc::new(Mutex::new(None)),
+            watcher_stop,
+            _watcher_guard: watcher_guard,
             calls,
         }
     }
@@ -237,10 +262,18 @@ impl McpDoor {
     /// the node checks every call regardless, and a call is how an agent learns what is wrong with
     /// the policy.
     fn listed(&self, context: &RequestContext<RoleServer>) -> Vec<Tool> {
+        let (catalog, version) = self.catalog.current_with_version(&self.node);
+        let mut notified = self
+            .notified_version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if notified.is_some() {
+            *notified = Some(version);
+        }
+        drop(notified);
         let Ok(grant) = self.grant(context) else {
             return Vec::new();
         };
-        let catalog = self.catalog.current(&self.node);
         catalog
             .entries()
             .iter()
@@ -586,11 +619,83 @@ fn to_object<T: Serialize>(value: &T) -> Result<Value, ErrorBody> {
     })
 }
 
+/// Sends `notifications/tools/list_changed` when the catalog's version has moved past the last
+/// version reported to this session. Returns `false` if the transport refused the send (client
+/// disconnected), signalling any background watcher to exit.
+async fn notify_if_changed(
+    node: &Node,
+    catalog: &CatalogCache,
+    notified_version: &Mutex<Option<u64>>,
+    peer: &Peer<RoleServer>,
+) -> bool {
+    let current = catalog.version(node);
+    let should_notify = {
+        let mut guard = notified_version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match *guard {
+            Some(prev) if prev != current => {
+                *guard = Some(current);
+                true
+            }
+            _ => false,
+        }
+    };
+    if should_notify {
+        return peer.notify_tool_list_changed().await.is_ok();
+    }
+    true
+}
+
 impl ServerHandler for McpDoor {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(events::capabilities())
+        ServerConfig::new(events::capabilities(!self.options.compact))
             .with_server_info(Implementation::new("legion", VERSION).with_title("Legion"))
             .with_instructions(self.instructions())
+    }
+
+    /// Starts watching `tools.d` for a stateful full-mode session once the client finishes the
+    /// `initialize` handshake (stdio sessions, and HTTP sessions that can receive notifications;
+    /// note that HTTP `GET /mcp` currently returns 405, so HTTP sessions without a GET stream
+    /// buffer notifications on the session channel without blocking). Clients speaking the
+    /// handshake-less `2026-07-28` revision have no persistent session and never run this hook;
+    /// they see live catalog updates on their next `tools/list` or `server/discover` request.
+    fn on_initialized(
+        &self,
+        context: NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        if !self.options.compact {
+            let initial = self.catalog.version(&self.node);
+            let mut guard = self
+                .notified_version
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.is_none() {
+                *guard = Some(initial);
+                drop(guard);
+                let node = self.node.clone();
+                let catalog = Arc::clone(&self.catalog);
+                let notified_version = Arc::clone(&self.notified_version);
+                let stop = self.watcher_stop.clone();
+                let peer = context.peer;
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(CATALOG_WATCH_INTERVAL);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            () = stop.cancelled() => break,
+                            _ = interval.tick() => {
+                                if !notify_if_changed(&node, &catalog, &notified_version, &peer).await {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        std::future::ready(())
     }
 
     async fn list_tools(
@@ -617,6 +722,15 @@ impl ServerHandler for McpDoor {
         } else {
             self.call_tool_by_name(&request.name, args, &context).await
         };
+        if !self.options.compact {
+            let _ = notify_if_changed(
+                &self.node,
+                &self.catalog,
+                &self.notified_version,
+                &context.peer,
+            )
+            .await;
+        }
         Ok(tool_result(outcome).into())
     }
 
