@@ -1,11 +1,20 @@
 // Jobs screen: background jobs across all answering machines, running first.
 
-import { html, useEffect, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Notice } from './common.js';
+import { callWithTimeout, DETAIL_TIMEOUT_MS } from '../lib/fleet.js';
 import { formatElapsed, formatRelativeTime } from '../lib/format.js';
-import { isFanOut, fanOutEntries } from '../lib/result.js';
 import { routeHref } from '../lib/route.js';
 import { JobFollowView } from './machine.js';
+
+function sortJobs(list) {
+  return [...list].sort((a, b) => {
+    const aRun = a.state === 'running' || a.state === 'starting' ? 0 : 1;
+    const bRun = b.state === 'running' || b.state === 'starting' ? 0 : 1;
+    if (aRun !== bRun) return aRun - bRun;
+    return String(b.created || '').localeCompare(String(a.created || ''));
+  });
+}
 
 export function JobsView({
   route,
@@ -16,47 +25,86 @@ export function JobsView({
   wide,
   onRefreshFleet,
 }) {
-  const [jobs, setJobs] = useState(null);
+  const [jobsByMachine, setJobsByMachine] = useState(null);
   const [error, setError] = useState(null);
-  const hasRemote = (snapshot?.machines || []).length > 1;
+  const abortRef = useRef(null);
   const localNode = nodeInfo?.node || 'this node';
 
-  async function load() {
-    setError(null);
-    try {
-      const res = await link.call(
-        'job.list',
-        { limit: 50 },
-        { on: hasRemote ? 'all' : undefined },
-      );
-      const collected = [];
-      if (isFanOut(res)) {
-        for (const entry of fanOutEntries(res)) {
-          if (!entry.ok) continue;
-          for (const job of entry.value?.jobs || []) {
-            collected.push({ ...job, machine: entry.machine });
-          }
-        }
-      } else {
-        for (const job of res?.jobs || []) {
-          collected.push({ ...job, machine: localNode });
-        }
-      }
-      collected.sort((a, b) => {
-        const aRun = a.state === 'running' || a.state === 'starting' ? 0 : 1;
-        const bRun = b.state === 'running' || b.state === 'starting' ? 0 : 1;
-        if (aRun !== bRun) return aRun - bRun;
-        return String(b.created || '').localeCompare(String(a.created || ''));
-      });
-      setJobs(collected);
-    } catch (err) {
-      setError(err);
+  // Only query answering machines (plus this node); never wait on unreachable or asking peers.
+  const targetNames = useMemo(() => {
+    const set = new Set();
+    if (localNode) set.add(localNode);
+    for (const m of snapshot?.machines || []) {
+      if (m && m.reachable) set.add(m.name);
     }
+    return Array.from(set).sort();
+  }, [snapshot?.machines, localNode]);
+  const targetKey = targetNames.join('\0');
+
+  async function load(names = targetNames) {
+    if (abortRef.current) abortRef.current.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setError(null);
+
+    const activeSet = new Set(names);
+    let anySucceeded = false;
+    let firstError = null;
+
+    await Promise.all(
+      names.map(async (machine) => {
+        const on = machine === localNode ? undefined : machine;
+        try {
+          const res = await callWithTimeout(
+            link,
+            'job.list',
+            { limit: 50 },
+            { on, signal: ctrl.signal },
+            DETAIL_TIMEOUT_MS,
+          );
+          if (ctrl.signal.aborted) return;
+          anySucceeded = true;
+          const entries = (res?.jobs || []).map((job) => ({ ...job, machine }));
+          setJobsByMachine((prev) => {
+            const next = { ...(prev || {}) };
+            for (const key of Object.keys(next)) {
+              if (!activeSet.has(key)) delete next[key];
+            }
+            next[machine] = entries;
+            return next;
+          });
+        } catch (err) {
+          if (ctrl.signal.aborted) return;
+          if (!firstError) firstError = err;
+        }
+      }),
+    );
+
+    if (ctrl.signal.aborted) return;
+    if (!anySucceeded && firstError) {
+      setError(firstError);
+    }
+    setJobsByMachine((prev) => (prev === null ? {} : prev));
   }
 
   useEffect(() => {
-    load();
-  }, [hasRemote, localNode, route.jobId]);
+    load(targetNames);
+    return () => {
+      if (abortRef.current) {
+        abortRef.current.abort();
+        abortRef.current = null;
+      }
+    };
+  }, [targetKey, localNode, route.jobId]);
+
+  const jobs = useMemo(() => {
+    if (jobsByMachine === null) return null;
+    const flat = [];
+    for (const list of Object.values(jobsByMachine)) {
+      if (Array.isArray(list)) flat.push(...list);
+    }
+    return sortJobs(flat);
+  }, [jobsByMachine]);
 
   const running = (jobs || []).filter((j) => j.state === 'running' || j.state === 'starting');
   const finished = (jobs || []).filter((j) => j.state !== 'running' && j.state !== 'starting');

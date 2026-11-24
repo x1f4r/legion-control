@@ -424,12 +424,18 @@ button.row:active {
   text-align: right;
 }
 
-.row.off {
+.row.off,
+.row.asking {
   color: var(--dim);
 }
 
-.row.off .title {
+.row.off .title,
+.row.asking .title {
   font-weight: 500;
+}
+
+.row.asking .sub {
+  color: var(--faint);
 }
 
 .row.selected {
@@ -461,6 +467,11 @@ button.row:active {
 .dot.off {
   background: none;
   box-shadow: inset 0 0 0 1.5px var(--faint);
+}
+
+.dot.asking {
+  background: none;
+  box-shadow: inset 0 0 0 1.5px var(--line-strong);
 }
 
 /* Three thin bars: processor, memory, disk. Read at a glance, exact numbers live on the machine. */

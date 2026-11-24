@@ -3,9 +3,13 @@
 import { html, render, useCallback, useEffect, useMemo, useRef, useState } from './vendor/preact-htm.js';
 import { Icon, IconSprite } from './icons.js';
 import { createCache } from './lib/cache.js';
-import { firstSentence, formatRelativeTime } from './lib/format.js';
-import { fanOutEntries, isFanOut } from './lib/result.js';
-import { extractHashToken, parseRoute, routeHref } from './lib/route.js';
+import {
+  hydrateFleetCache,
+  refreshFleetProgressive,
+  serializeFleetCache,
+} from './lib/fleet.js';
+import { formatRelativeTime } from './lib/format.js';
+import { extractHashToken, parseRoute } from './lib/route.js';
 import { describePowerConfirm } from './lib/schema.js';
 import { createLink } from './link/index.js';
 import { Notice, Sheet } from './views/common.js';
@@ -42,7 +46,7 @@ function applyTheme(theme) {
   }
 }
 
-function createBrowserCache() {
+function createSessionCache() {
   try {
     return createCache(window.sessionStorage);
   } catch {
@@ -50,147 +54,12 @@ function createBrowserCache() {
   }
 }
 
-function isPairingError(err) {
-  const reason = err?.details?.reason;
-  return err?.code === 'denied' && (reason === 'auth_failed' || reason === 'host_key_mismatch');
-}
-
-async function fetchFleetSnapshot(link, localNode) {
-  let fatalError = null;
-  const capture = (fallback) => (err) => {
-    if (isPairingError(err) && !fatalError) fatalError = err;
-    return fallback;
-  };
-
-  const [fleetList, fleetPing, localVersion] = await Promise.all([
-    link.call('fleet.list', {}).catch(capture({ node: localNode, machines: [] })),
-    link.call('fleet.ping', {}).catch(capture({ results: [] })),
-    link.call('meta.version', {}).catch(capture(null)),
-  ]);
-  if (fatalError) throw fatalError;
-
-  const here = fleetList?.node || localNode;
-  const listedMap = new Map();
-  for (const m of fleetList?.machines || []) {
-    listedMap.set(m.name, m);
+function createPersistentCache() {
+  try {
+    return createCache(window.localStorage);
+  } catch {
+    return createCache(null);
   }
-  if (!listedMap.has(here)) {
-    listedMap.set(here, { name: here, this_node: true, systems: [], wake_via: [] });
-  }
-
-  const pingMap = new Map();
-  for (const r of fleetPing?.results || []) {
-    pingMap.set(r.machine, r);
-  }
-
-  const allNames = Array.from(listedMap.keys());
-  const hasRemote = allNames.some((n) => n !== here);
-  const fanTarget = hasRemote ? 'all' : undefined;
-
-  const [sysRaw, jobsRaw, powerRaw] = await Promise.all([
-    link.call('sys.info', {}, { on: fanTarget }).catch(() => null),
-    link.call('job.list', { state: 'running', limit: 50 }, { on: fanTarget }).catch(() => null),
-    link.call('power.status', {}, { on: fanTarget }).catch(() => null),
-  ]);
-
-  function byMachine(raw) {
-    const map = new Map();
-    if (!raw) return map;
-    if (isFanOut(raw)) {
-      for (const entry of fanOutEntries(raw)) {
-        map.set(entry.machine, entry);
-      }
-    } else {
-      map.set(here, { machine: here, ok: true, value: raw, error: null });
-    }
-    return map;
-  }
-
-  const sysMap = byMachine(sysRaw);
-  const jobsMap = byMachine(jobsRaw);
-  const powerMap = byMachine(powerRaw);
-
-  // Ensure local node always has its own sys.info/job.list even if fleet.toml omits it from "all".
-  if (!sysMap.has(here)) {
-    const [localSys, localJobs, localPower] = await Promise.all([
-      link.call('sys.info', {}).catch(() => null),
-      link.call('job.list', { state: 'running', limit: 50 }).catch(() => null),
-      link.call('power.status', {}).catch(() => null),
-    ]);
-    if (localSys) sysMap.set(here, { machine: here, ok: true, value: localSys, error: null });
-    if (localJobs) jobsMap.set(here, { machine: here, ok: true, value: localJobs, error: null });
-    if (localPower) powerMap.set(here, { machine: here, ok: true, value: localPower, error: null });
-  }
-
-  const runningJobs = [];
-  const machines = [];
-
-  for (const [name, listed] of listedMap.entries()) {
-    const isLocal = name === here || listed.this_node;
-    const ping = pingMap.get(name);
-    const sysEntry = sysMap.get(name);
-    const jobsEntry = jobsMap.get(name);
-    const powerEntry = powerMap.get(name);
-
-    const sys = sysEntry?.ok ? sysEntry.value : null;
-    const power = powerEntry?.ok ? powerEntry.value : null;
-    const jobs = jobsEntry?.ok && Array.isArray(jobsEntry.value?.jobs) ? jobsEntry.value.jobs : [];
-
-    const reachable = isLocal
-      ? Boolean(sys || localVersion)
-      : ping
-        ? Boolean(ping.reachable)
-        : Boolean(sysEntry?.ok);
-
-    let error = null;
-    let reason = null;
-    if (!reachable) {
-      error = ping?.error || sysEntry?.error || {
-        code: 'unreachable',
-        message: 'Did not answer.',
-        hint: null,
-        machine: name,
-      };
-      reason = firstSentence(error.message) || 'Did not answer';
-    }
-
-    for (const job of jobs) {
-      runningJobs.push({ ...job, machine: name });
-    }
-
-    const busyReasons = power?.busy?.state === 'busy' ? power.busy.reasons || [] : [];
-    const busy = jobs.length > 0 || busyReasons.length > 0;
-
-    machines.push({
-      name,
-      thisNode: isLocal,
-      reachable,
-      reason,
-      error,
-      busy,
-      busyReasons,
-      runningJobs: jobs.length,
-      jobs,
-      os: sys?.os?.family || ping?.os || (isLocal ? localVersion?.os : null),
-      arch: sys?.os?.arch || ping?.arch || (isLocal ? localVersion?.arch : null),
-      version: ping?.version || (isLocal ? localVersion?.version : null),
-      system: power?.system || ping?.system || null,
-      latencyMs: ping?.latency_ms ?? null,
-      canWake: Boolean(listed.mac || (listed.wake_via && listed.wake_via.length > 0)),
-      sys,
-    });
-  }
-
-  // Put this node first, then reachable machines alphabetically, then unreachable ones.
-  machines.sort((a, b) => {
-    if (a.thisNode !== b.thisNode) return a.thisNode ? -1 : 1;
-    if (a.reachable !== b.reachable) return a.reachable ? -1 : 1;
-    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
-  });
-
-  runningJobs.sort((a, b) => String(b.created || '').localeCompare(String(a.created || '')));
-
-  return { machines, runningJobs };
 }
 
 function ConfirmSheet({ request, onClose }) {
@@ -292,17 +161,20 @@ function ConfirmSheet({ request, onClose }) {
 
 function App() {
   const link = useMemo(() => createLink(), []);
-  const cache = useMemo(() => createBrowserCache(), []);
+  const sessionCache = useMemo(() => createSessionCache(), []);
+  const persistentCache = useMemo(() => createPersistentCache(), []);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
+  const refreshAbortRef = useRef(null);
+  const refreshInFlightRef = useRef(false);
 
   const [theme, setTheme] = useState(() => readTheme());
   const [wide, setWide] = useState(() => window.innerWidth >= 820);
   const [route, setRoute] = useState(() => parseRoute(window.location.hash));
   const [booting, setBooting] = useState(true);
   const [linkState, setLinkState] = useState(null);
-  const [tools, setTools] = useState(() => cache.get('tools')?.value || []);
-  const [snapshot, setSnapshot] = useState(() => cache.get('fleet')?.value || null);
+  const [tools, setTools] = useState(() => sessionCache.get('tools')?.value || []);
+  const [snapshot, setSnapshot] = useState(null);
   const [fleetError, setFleetError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [confirmRequest, setConfirmRequest] = useState(null);
@@ -313,6 +185,8 @@ function App() {
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
   nodeInfoRef.current = nodeInfo;
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
   const wideRef = useRef(wide);
   wideRef.current = wide;
   const allowedSet = useMemo(
@@ -378,22 +252,51 @@ function App() {
   }, [link]);
 
   const refreshFleet = useCallback(
-    async (activeNodeInfo) => {
+    async (activeNodeInfo, options = {}) => {
       const targetNode = activeNodeInfo || nodeInfoRef.current;
       if (!targetNode) return;
+      if (options.background && refreshInFlightRef.current) return;
+
+      if (refreshAbortRef.current) {
+        refreshAbortRef.current.abort();
+      }
+      const ctrl = new AbortController();
+      refreshAbortRef.current = ctrl;
+      refreshInFlightRef.current = true;
       setRefreshing(true);
       setFleetError(null);
+
+      const baseSnap = options.initialSnapshot !== undefined ? options.initialSnapshot : snapshotRef.current;
+
       try {
-        const next = await fetchFleetSnapshot(link, targetNode.node);
-        setSnapshot(next);
-        cache.set('fleet', next);
+        await refreshFleetProgressive({
+          link,
+          localNode: targetNode.node,
+          initialMachines: baseSnap?.machines || [],
+          cachedAt: baseSnap?.cachedAt ?? null,
+          signal: ctrl.signal,
+          onUpdate(next) {
+            if (ctrl.signal.aborted) return;
+            setSnapshot(next);
+          },
+          onSettled(finalSnap) {
+            if (ctrl.signal.aborted) return;
+            if (link.kind !== 'mock') {
+              persistentCache.set('fleet', serializeFleetCache(targetNode.node, finalSnap.machines));
+            }
+          },
+        });
       } catch (err) {
-        setFleetError(err);
+        if (!ctrl.signal.aborted) setFleetError(err);
       } finally {
-        setRefreshing(false);
+        if (refreshAbortRef.current === ctrl) {
+          refreshAbortRef.current = null;
+          refreshInFlightRef.current = false;
+          setRefreshing(false);
+        }
       }
     },
-    [link, cache],
+    [link, persistentCache],
   );
 
   const hydrate = useCallback(
@@ -409,17 +312,30 @@ function App() {
         return;
       }
       const primary = nextState.nodes[0];
-      const [toolList] = await Promise.all([
-        link.tools({}).catch(() => null),
-        refreshFleet(primary),
-      ]);
-      if (Array.isArray(toolList)) {
-        setTools(toolList);
-        cache.set('tools', toolList);
+      let cachedSnap = null;
+      if (link.kind !== 'mock') {
+        const stored = persistentCache.get('fleet')?.value;
+        cachedSnap = hydrateFleetCache(stored, primary.node);
+        if (cachedSnap) {
+          setSnapshot(cachedSnap);
+        }
       }
+      // Paint immediately with cached list or this node; never block first paint on remote peers.
       setBooting(false);
+
+      link
+        .tools({})
+        .then((toolList) => {
+          if (Array.isArray(toolList)) {
+            setTools(toolList);
+            sessionCache.set('tools', toolList);
+          }
+        })
+        .catch(() => {});
+
+      refreshFleet(primary, { initialSnapshot: cachedSnap });
     },
-    [link, cache, refreshFleet],
+    [link, sessionCache, persistentCache, refreshFleet],
   );
 
   useEffect(() => {
@@ -447,6 +363,10 @@ function App() {
     })();
     return () => {
       alive = false;
+      if (refreshAbortRef.current) {
+        refreshAbortRef.current.abort();
+        refreshAbortRef.current = null;
+      }
     };
   }, [link, hydrate]);
 
@@ -454,10 +374,14 @@ function App() {
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
     const onFocus = () => {
-      if (document.visibilityState === 'visible') refreshFleet(nodeInfo);
+      if (document.visibilityState === 'visible') {
+        refreshFleet(nodeInfo, { background: true });
+      }
     };
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') refreshFleet(nodeInfo);
+      if (document.visibilityState === 'visible') {
+        refreshFleet(nodeInfo, { background: true });
+      }
     }, POLL_MS);
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onFocus);
@@ -526,7 +450,14 @@ function App() {
     // Narrow sub-pages get a Back button and item title in the top bar.
     if (!wide && route.section === 'machines' && route.machine) {
       const m = (snapshot?.machines || []).find((item) => item.name === route.machine);
-      const dotClass = !m?.reachable ? 'dot off' : m.busy ? 'dot busy' : 'dot';
+      const dotClass =
+        m?.status === 'asking' || m?.asking
+          ? 'dot asking'
+          : !m?.reachable
+            ? 'dot off'
+            : m.busy
+              ? 'dot busy'
+              : 'dot';
       return html`
         <header class="bar">
           <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
@@ -679,7 +610,13 @@ function App() {
                                   : null
                               }
                               onDisconnected=${async () => {
-                                cache.clear();
+                                if (refreshAbortRef.current) {
+                                  refreshAbortRef.current.abort();
+                                  refreshAbortRef.current = null;
+                                }
+                                refreshInFlightRef.current = false;
+                                sessionCache.clear();
+                                persistentCache.clear();
                                 setSnapshot(null);
                                 setTools([]);
                                 const st = await link.state();

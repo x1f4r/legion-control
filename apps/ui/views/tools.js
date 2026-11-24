@@ -169,8 +169,15 @@ function ToolDetail({
   const abortRef = useRef(null);
 
   const localNode = nodeInfo?.node || 'this node';
-  const machineNames = (machines || []).map((m) => m.name);
-  const remoteNames = machineNames.filter((n) => n !== localNode);
+  const machineList = machines || [];
+  const machineNames = machineList.map((m) => m.name);
+  const remoteMachines = machineList.filter((m) => m.name !== localNode);
+  const answeringNames = machineList
+    .filter((m) => m.name === localNode || m.reachable)
+    .map((m) => m.name);
+  const skippedNames = machineList
+    .filter((m) => m.name !== localNode && !m.reachable)
+    .map((m) => m.name);
   const isSingleRemote =
     targetMode !== 'local' && targetMode !== 'all' && targetMode !== 'multi';
 
@@ -203,7 +210,15 @@ function ToolDetail({
 
   function resolveOn() {
     if (targetMode === 'local') return undefined;
-    if (targetMode === 'all') return 'all';
+    if (targetMode === 'all') {
+      if (skippedNames.length === 0) return 'all';
+      if (answeringNames.length <= 1) {
+        return answeringNames[0] && answeringNames[0] !== localNode
+          ? answeringNames[0]
+          : undefined;
+      }
+      return answeringNames;
+    }
     if (targetMode === 'multi') {
       if (multiTargets.length === 0) return undefined;
       if (multiTargets.length === 1) {
@@ -216,7 +231,9 @@ function ToolDetail({
 
   function targetLabel() {
     if (targetMode === 'local') return localNode;
-    if (targetMode === 'all') return 'all machines';
+    if (targetMode === 'all') {
+      return skippedNames.length > 0 ? 'all answering machines' : 'all machines';
+    }
     if (targetMode === 'multi') return multiTargets.length ? multiTargets.join(', ') : localNode;
     return targetMode;
   }
@@ -376,9 +393,22 @@ function ToolDetail({
           }}
         >
           <option value="local">${localNode} (this node)</option>
-          ${remoteNames.map((name) => html`<option key=${name} value=${name}>${name}</option>`)}
+          ${remoteMachines.map((m) => {
+            const suffix = m.status === 'asking' || m.asking
+              ? ' (asking…)'
+              : !m.reachable
+                ? ' (offline)'
+                : '';
+            return html`<option key=${m.name} value=${m.name}>${m.name}${suffix}</option>`;
+          })}
           ${machineNames.length > 1
-            ? html`<option value="all">All machines</option>`
+            ? html`
+                <option value="all">
+                  ${skippedNames.length > 0
+                    ? `All answering machines (${answeringNames.length} of ${machineNames.length})`
+                    : 'All machines'}
+                </option>
+              `
             : null}
           ${machineNames.length > 1
             ? html`<option value="multi">Choose several machines…</option>`
@@ -390,23 +420,35 @@ function ToolDetail({
                 ${`Showing tools from ${localNode}; ${targetMode} checks its own tools and permissions when you run.`}
               </small>
             `
-          : null}
+          : targetMode === 'all' && skippedNames.length > 0
+            ? html`
+                <small>
+                  ${`Running on answering machines only; skipping ${skippedNames.join(', ')}.`}
+                </small>
+              `
+            : null}
       </label>
 
       ${targetMode === 'multi'
         ? html`
             <div class="chips" role="group" aria-label="Select target machines">
-              ${machineNames.map((name) => {
-                const active = multiTargets.includes(name);
+              ${machineList.map((m) => {
+                const active = multiTargets.includes(m.name);
+                const stateHint =
+                  m.name === localNode || m.reachable
+                    ? ''
+                    : m.status === 'asking' || m.asking
+                      ? ' · asking…'
+                      : ' · offline';
                 return html`
                   <button
                     type="button"
-                    key=${name}
+                    key=${m.name}
                     class="chip-btn"
                     aria-pressed=${active ? 'true' : 'false'}
-                    onClick=${() => toggleMulti(name)}
+                    onClick=${() => toggleMulti(m.name)}
                   >
-                    ${name}
+                    ${m.name}${stateHint}
                   </button>
                 `;
               })}

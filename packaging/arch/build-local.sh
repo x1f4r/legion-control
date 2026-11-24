@@ -67,11 +67,12 @@ if [[ "$MODE" == "source" ]]; then
   ARCHIVE="${WORK}/legion-${PKGVER}.tar.gz"
   PREFIX="legion-control-legion-v${PKGVER}/"
   # Archive the workspace files needed to build and package legion, including uncommitted edits,
-  # while skipping target/ and other build artifacts.
+  # while skipping target/ and other build artifacts. apps/ui is the interface that legion serve
+  # embeds at compile time.
   tar -C "$REPO_ROOT" \
     --transform "s,^,${PREFIX}," \
     -czf "$ARCHIVE" \
-    Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging
+    Cargo.toml Cargo.lock rust-toolchain.toml LICENSE crates contract packaging apps/ui
   HASH="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
   sed -i "s/^sha256sums=.*/sha256sums=('${HASH}')/" "${WORK}/PKGBUILD"
 else
