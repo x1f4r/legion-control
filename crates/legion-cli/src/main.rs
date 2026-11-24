@@ -389,17 +389,30 @@ async fn gate(
             });
         match auth_check {
             Ok(removed_stale) => {
-                for stale_target in removed_stale {
+                let own_stale = removed_stale
+                    .iter()
+                    .any(|t| t.pairing_id.as_deref() == Some(pairing_id));
+                for stale_target in &removed_stale {
                     let is_self = stale_target.pairing_id.as_deref() == Some(pairing_id);
                     if !is_self {
                         let _ =
                             legion_tools::device::sessions::terminate_device_sessions_for_target(
                                 node.paths(),
-                                &stale_target,
+                                stale_target,
                                 legion_tools::device::sessions::DEFAULT_TERMINATE_GRACE,
                             )
                             .await;
                     }
+                }
+                if own_stale {
+                    err(&format!(
+                        "legion gate: Device {device_name} ({pairing_id}) had a stale authorized_keys entry and is no longer authorized on this session.\n"
+                    ));
+                    router.shutdown().await;
+                    if let Some(guard) = session.take() {
+                        guard.reject_and_terminate_parent().await;
+                    }
+                    return ExitCode::from(FAILED);
                 }
             }
             Err(error) => {

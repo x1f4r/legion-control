@@ -1576,9 +1576,50 @@ pub fn verify_gate_device(
         ));
     }
 
-    // Hot path: check read-only whether authorized_keys already matches devices.toml.
+    // Hot path: check read-only whether authorized_keys on disk actually matches the registry's
+    // key for this pairing id BEFORE reconciling (and also deny if reconciliation marks our own
+    // device stale or inactive due to key collision).
     let caller_account = caller_account_for_target(&target)?;
     let auth_keys = read_auth_keys(&write_path)?;
+    let expected_key = validate_ed25519_public_key(&entry.public_key)?;
+    let mut saw_matching_id_line = false;
+    let mut disk_key_mismatch = false;
+    for line in &auth_keys.lines {
+        if let LineKind::Device {
+            key_b64,
+            pairing_id: line_pid,
+            home,
+            account: line_account,
+            ..
+        } = &line.kind
+            && line_pid == pairing_id
+            && line_matches_home(home.as_ref(), paths)
+            && line_matches_account(
+                line_account.as_deref(),
+                caller_account.as_deref(),
+                target.windows_admin_acl,
+                cfg!(windows),
+            )
+        {
+            saw_matching_id_line = true;
+            let raw_key = format!("ssh-ed25519 {key_b64}");
+            let matches_key = validate_ed25519_public_key(&raw_key)
+                .is_ok_and(|disk_key| disk_key.wire_blob == expected_key.wire_blob);
+            if !matches_key {
+                disk_key_mismatch = true;
+            }
+        }
+    }
+    if !saw_matching_id_line || disk_key_mismatch {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Device {device_name} ({pairing_id}) on disk does not match the public key recorded in devices.toml."
+            ),
+        ));
+    }
+
     let exe = legion_core::current_exe()?;
     let shell = ForcedCommandShell::host()?;
     let mut probe = auth_keys;
@@ -1591,8 +1632,31 @@ pub fn verify_gate_device(
         &exe,
         shell,
     )?;
+    if probe_report.duplicate_key_ids.contains_key(pairing_id)
+        || probe_report.foreign_key_ids.contains(pairing_id)
+    {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Device {device_name} ({pairing_id}) is not active here due to a public key conflict."
+            ),
+        ));
+    }
     if probe_report.changed {
         let outcome = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false)?;
+        if outcome
+            .removed_targets
+            .iter()
+            .any(|t| t.pairing_id.as_deref() == Some(pairing_id))
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Device {device_name} ({pairing_id}) had a stale authorized_keys entry that was replaced; reconnect with the current key."
+                ),
+            ));
+        }
         return Ok(outcome.removed_targets);
     }
 
@@ -2556,5 +2620,79 @@ role = \"observer\"
             "observer",
             "unmarked pre-existing device:legacy principal must not be raised to owner"
         );
+    }
+
+    #[test]
+    fn verify_gate_device_refuses_mismatched_key_on_disk_and_reconciles() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        let node_toml =
+            format!("name = \"tower\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n");
+        std::fs::write(paths.config_file("node.toml"), &node_toml).unwrap();
+        let node_file: NodeFile =
+            parse(&paths.config_file("node.toml"), node_toml.as_bytes()).unwrap();
+
+        let id_x = sample_id(10);
+        let k1 = ed25519_public_key_from_seed(&[1u8; 32]);
+        let k2 = ed25519_public_key_from_seed(&[2u8; 32]);
+
+        // Put a stale K1 line for pairing id X on disk in authorized_keys.
+        let exe = legion_core::current_exe().unwrap();
+        let shell = ForcedCommandShell::host().unwrap();
+        let pinned_home = PinnedHome::from_paths(&paths);
+        let stale_line = format_device_line(
+            &exe,
+            "device:pixel",
+            &k1,
+            "pixel",
+            &id_x,
+            &pinned_home,
+            None,
+            shell,
+        )
+        .unwrap();
+        std::fs::write(&auth_keys, format!("{stale_line}\n")).unwrap();
+
+        // Registry says K2 for the exact same pairing id X, name, and principal.
+        let mut devices = DevicesFile::default();
+        let mut dev = sample_device(10, "pixel", Some("observer"), "2026-11-24T10:00:00Z", "pi");
+        dev.public_key = k2.clone();
+        devices.devices.insert(id_x.clone(), dev);
+        std::fs::write(paths.config_file("devices.toml"), devices.to_toml_string()).unwrap();
+
+        // Gate check for a session authenticated via the stale K1 line MUST return Denied
+        // AND reconcile authorized_keys to K2!
+        let err = verify_gate_device(
+            &paths,
+            "tower",
+            &node_file,
+            "pixel",
+            &id_x,
+            "device:pixel",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+
+        let updated = std::fs::read_to_string(&auth_keys).unwrap();
+        assert!(updated.contains(&k2), "expected K2 on disk:\n{updated}");
+        assert!(!updated.contains(&k1), "expected K1 removed from disk:\n{updated}");
+
+        // Once disk matches K2, a subsequent gate check succeeds.
+        verify_gate_device(
+            &paths,
+            "tower",
+            &node_file,
+            "pixel",
+            &id_x,
+            "device:pixel",
+            None,
+        )
+        .unwrap();
     }
 }
