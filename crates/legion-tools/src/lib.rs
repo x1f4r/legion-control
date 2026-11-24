@@ -15,6 +15,7 @@ pub mod svc;
 pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod token;
 
 use legion_core::Registry;
 
@@ -28,6 +29,7 @@ pub fn register_all(registry: &mut Registry) {
     job::register(registry);
     proj::register(registry);
     svc::register(registry);
+    token::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }

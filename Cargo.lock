@@ -599,6 +599,7 @@ dependencies = [
  "base64",
  "blake3",
  "dunce",
+ "getrandom",
  "globset",
  "ignore",
  "jiff",
