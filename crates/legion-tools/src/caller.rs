@@ -29,6 +29,11 @@ impl Caller {
         })
     }
 
+    /// Whether the caller itself holds the `owner` role.
+    pub(crate) fn is_owner(&self) -> bool {
+        self.owner
+    }
+
     /// Whether `principal` has the owner role, by name (`owner`) or by the role the file gives it.
     pub(crate) fn has_owner_role(&self, principal: &str) -> bool {
         self.policy.role_of(principal).0 == OWNER

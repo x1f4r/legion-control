@@ -1351,3 +1351,83 @@ fn accept_env_cannot_redirect_gate_home_to_crafted_policy() {
         assert!(!user_home.join("pwned.txt").exists(), "{label}");
     }
 }
+
+#[test]
+fn gate_refuses_missing_pinned_home_without_creating_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let legion_bin = env!("CARGO_BIN_EXE_legion");
+
+    // 1. Deleted --home directory: neither `gate --as` nor `gate --enrol` may recreate it.
+    let gone_home = dir.path().join("deleted-legion-home");
+    let gone_str = gone_home.to_string_lossy().into_owned();
+    let out_as = std::process::Command::new(legion_bin)
+        .args(["gate", "--as", "phone", "--home", &gone_str])
+        .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out_as.status.success());
+    assert!(
+        String::from_utf8_lossy(&out_as.stderr).contains("missing its configuration"),
+        "stderr={}",
+        String::from_utf8_lossy(&out_as.stderr)
+    );
+    assert!(
+        !gone_home.exists(),
+        "gate --as recreated missing pinned home at {}",
+        gone_home.display()
+    );
+
+    let out_enrol = std::process::Command::new(legion_bin)
+        .args([
+            "gate",
+            "--enrol",
+            "0123456789abcdef0123456789abcdef",
+            "--home",
+            &gone_str,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out_enrol.status.success());
+    let enrol_reply: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out_enrol.stdout).trim()).unwrap();
+    assert_eq!(enrol_reply["ok"], json!(false));
+    assert!(!gone_home.exists(), "gate --enrol recreated missing home");
+
+    // 2. Existing config dir that is missing `node.toml`: refused without creating `state/`.
+    let partial_home = dir.path().join("partial-home");
+    std::fs::create_dir_all(partial_home.join("config")).unwrap();
+    let partial_str = partial_home.to_string_lossy().into_owned();
+    let out_partial = std::process::Command::new(legion_bin)
+        .args(["gate", "--as", "phone", "--home", &partial_str])
+        .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out_partial.status.success());
+    assert!(
+        !partial_home.join("state").exists(),
+        "gate created state/ despite missing node.toml"
+    );
+
+    // 3. Deleted split `--config-dir` / `--state-dir`: refused without creating either dir.
+    let gone_cfg = dir.path().join("gone-cfg");
+    let gone_state = dir.path().join("gone-state");
+    let out_split = std::process::Command::new(legion_bin)
+        .args([
+            "gate",
+            "--as",
+            "phone",
+            "--config-dir",
+            &gone_cfg.to_string_lossy(),
+            "--state-dir",
+            &gone_state.to_string_lossy(),
+        ])
+        .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out_split.status.success());
+    assert!(!gone_cfg.exists() && !gone_state.exists());
+}

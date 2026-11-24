@@ -96,15 +96,39 @@ async fn run(command: Command) -> ExitCode {
         _ => false,
     };
     let paths_result = match &command {
-        Command::Gate(GateCommand::As { home, .. } | GateCommand::Enrol { home, .. }) => match home
-        {
-            GateHome::Root(root) => Paths::from_explicit_home(root),
-            GateHome::Split {
-                config_dir,
-                state_dir,
-            } => Paths::from_explicit_dirs(config_dir, state_dir),
-            GateHome::Default => Paths::from_gate_default(),
-        },
+        Command::Gate(GateCommand::As { home, .. } | GateCommand::Enrol { home, .. }) => {
+            let resolved = match home {
+                GateHome::Root(root) => Paths::from_explicit_home(root),
+                GateHome::Split {
+                    config_dir,
+                    state_dir,
+                } => Paths::from_explicit_dirs(config_dir, state_dir),
+                GateHome::Default => Paths::from_gate_default(),
+            };
+            resolved.and_then(|paths| {
+                // When a forced command pins a Legion home (`--home` or `--config-dir`/`--state-dir`),
+                // refuse immediately if its config directory or `node.toml` no longer exists —
+                // before `Node::new` can create any directories on disk.
+                if !matches!(home, GateHome::Default) {
+                    let cfg_dir = paths.config_dir();
+                    let node_toml = paths.config_file("node.toml");
+                    if !cfg_dir.is_dir() || !node_toml.is_file() {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!(
+                                "Pinned Legion home {} is missing its configuration ({}).",
+                                cfg_dir.display(),
+                                node_toml.display(),
+                            ),
+                        )
+                        .with_hint(
+                            "Restore that Legion home or remove this orphaned key with `legion device.remove name=<device> foreign=true`.",
+                        ));
+                    }
+                }
+                Ok(paths)
+            })
+        }
         _ => Paths::from_env(),
     };
     let (node, router) = match paths_result {

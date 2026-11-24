@@ -830,6 +830,20 @@ impl PinnedHome {
             && paths_equal(&self.state_dir(), paths.state_dir())
     }
 
+    /// Human-readable path identifying this pinned home in `device.list` and `meta.doctor`.
+    pub fn display_label(&self) -> String {
+        match self {
+            PinnedHome::Root(root) => root.display().to_string(),
+            PinnedHome::Split { config_dir, .. } => config_dir.display().to_string(),
+        }
+    }
+
+    /// Returns `true` when the pinned home's config directory and `node.toml` both exist on disk.
+    pub fn config_exists(&self) -> bool {
+        let cfg = self.config_dir();
+        cfg.is_dir() && cfg.join("node.toml").is_file()
+    }
+
     fn push_cli_args(&self, out: &mut Vec<String>) -> Result<(), ErrorBody> {
         let to_utf8 = |label: &str, path: &Path| -> Result<String, ErrorBody> {
             path.to_str().map(ToOwned::to_owned).ok_or_else(|| {
