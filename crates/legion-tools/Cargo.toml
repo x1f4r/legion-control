@@ -48,6 +48,10 @@ name = "exec"
 harness = false
 
 [[test]]
+name = "ext"
+harness = false
+
+[[test]]
 name = "job"
 harness = false
 
