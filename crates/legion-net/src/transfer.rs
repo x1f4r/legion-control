@@ -1317,7 +1317,9 @@ impl Conn {
     /// reply, a byte that cannot be in a line of text ends the read at once: it is data from a
     /// node that speaks another protocol, which may never send a newline.
     async fn line(&mut self) -> Result<Vec<u8>, ErrorBody> {
-        let (wait, longest) = if self.answered {
+        // A reply is a JSON object however long it is; only other text, a banner, is held to
+        // what noise may take before the first reply.
+        let (wait, noise) = if self.answered {
             (IDLE_TIMEOUT, LONGEST_REPLY)
         } else {
             (
@@ -1329,7 +1331,15 @@ impl Conn {
         let binary_is_foreign = !self.answered;
         let read = tokio::time::timeout(
             wait,
-            read_line(&mut self.reader, &mut line, longest, binary_is_foreign),
+            read_line(
+                &mut self.reader,
+                &mut line,
+                Longest {
+                    reply: LONGEST_REPLY,
+                    noise,
+                },
+                binary_is_foreign,
+            ),
         )
         .await;
         match read {
@@ -1341,10 +1351,10 @@ impl Conn {
             Ok(Ok(Read::Line)) => Ok(line),
             Ok(Ok(Read::End)) => Err(self.ended("before it answered").await),
             Ok(Ok(Read::Binary)) => Err(self.mismatch("with bytes that are not text")),
-            Ok(Ok(Read::TooLong)) if !self.answered => {
+            Ok(Ok(Read::TooLong { reply: false })) if !self.answered => {
                 Err(self.mismatch("with more than a banner before its answer"))
             }
-            Ok(Ok(Read::TooLong)) => Err(ErrorBody::new(
+            Ok(Ok(Read::TooLong { .. })) => Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
                     "{} answered a stream with a line longer than {LONGEST_REPLY} bytes.",
@@ -1562,18 +1572,24 @@ enum Read {
     Line,
     /// The end, before any byte.
     End,
-    /// More than the longest line allowed.
-    TooLong,
+    /// More than the longest line allowed; `reply` when the line began as a JSON object.
+    TooLong { reply: bool },
     /// A NUL byte, which no line of text holds.
     Binary,
 }
 
-/// Reads one line into `line`, newline included, without taking more than `longest` bytes, and
+/// How long a line may grow: one that begins as a JSON object is a reply, anything else noise.
+struct Longest {
+    reply: usize,
+    noise: usize,
+}
+
+/// Reads one line into `line`, newline included, without taking more than `longest` allows, and
 /// stopping at the first NUL byte when `stop_at_binary` says to, without waiting for a newline.
 async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     line: &mut Vec<u8>,
-    longest: usize,
+    longest: Longest,
     stop_at_binary: bool,
 ) -> std::io::Result<Read> {
     loop {
@@ -1592,8 +1608,14 @@ async fn read_line<R: AsyncBufRead + Unpin>(
         if stop_at_binary && chunk.contains(&0) {
             return Ok(Read::Binary);
         }
-        if line.len() + chunk.len() > longest {
-            return Ok(Read::TooLong);
+        let reply = line
+            .iter()
+            .chain(chunk)
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(&b'{');
+        let most = if reply { longest.reply } else { longest.noise };
+        if line.len() + chunk.len() > most {
+            return Ok(Read::TooLong { reply });
         }
         line.extend_from_slice(chunk);
         let used = chunk.len();
@@ -2126,6 +2148,37 @@ mod tests {
         let (mut conn, mut out, _in) = conn("pi");
         out.write_all(listing(3, Some(3)).as_bytes()).await.unwrap();
         assert_eq!(conn.manifest_at_most(3).await.unwrap().entries.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_first_reply_is_read_whole_while_noise_stays_bounded() {
+        // A listing whose only line names 800 entries it could not read: far longer than any
+        // banner, and a reply all the same.
+        let skipped: Vec<Value> = (0..800)
+            .map(|at| json!({"path": format!("locked/directory-{at:04}"), "reason": "Permission denied (os error 13), which is the whole of it"}))
+            .collect();
+        let done = json!({"done": true, "entries": 0, "skipped": skipped}).to_string();
+        assert!(done.len() > MOST_NOISE_BYTES);
+        let (mut listing, mut out, _in) = conn("pi");
+        // More than the pipe holds, so it is written while the reply is read.
+        let writer = tokio::spawn(async move {
+            out.write_all(format!("{done}\n").as_bytes()).await.unwrap();
+            out
+        });
+        let listed = listing.manifest_at_most(10).await.unwrap();
+        assert_eq!(listed.skipped.len(), 800);
+        drop(writer);
+
+        // Text that is not JSON is still held to what a banner may take.
+        let (mut noisy, mut out, _in) = conn("pi");
+        let banner = "x".repeat(MOST_NOISE_BYTES + 10);
+        let writer = tokio::spawn(async move {
+            let _ = out.write_all(format!("{banner}\n").as_bytes()).await;
+            out
+        });
+        let error = noisy.first::<StatReply>().await.unwrap_err();
+        drop(writer);
+        assert_eq!(error.code, ErrorCode::Unsupported, "{error:?}");
     }
 
     #[test]
