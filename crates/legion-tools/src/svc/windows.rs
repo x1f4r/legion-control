@@ -406,6 +406,7 @@ pub(crate) fn parse_status_json(
         enabled: start_mode.as_deref().and_then(map_start_mode),
         pid,
         since: None,
+        instance_id: None,
         description,
         exit_code: effective_exit,
         detail,

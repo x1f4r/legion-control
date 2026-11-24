@@ -479,6 +479,7 @@ pub(crate) fn parse_print(
         enabled: None,
         pid,
         since: None,
+        instance_id: runs.map(|r| format!("runs:{r}")),
         description: program,
         exit_code,
         detail,

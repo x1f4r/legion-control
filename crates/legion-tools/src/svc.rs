@@ -43,10 +43,12 @@ const LOG_LINE_CUT_MARKER: &str = " ... [truncated]";
 const FAILURE_LOG_LINES: usize = 20;
 
 /// How long `svc.start`, `svc.stop` and `svc.restart` wait for the service to reach its expected
-/// state after the control command finishes.
+/// state after the control command finishes, and how long they wait to settle after first seeing
+/// it so an immediate crash is not reported as running.
 const DEFAULT_WAIT_POLICY: WaitPolicy = WaitPolicy {
     timeout: Duration::from_secs(10),
     poll_interval: Duration::from_millis(200),
+    settle: Duration::from_secs(1),
 };
 
 /// Adds the `svc` tools.
@@ -405,6 +407,50 @@ pub struct LogsResult {
 struct WaitPolicy {
     timeout: Duration,
     poll_interval: Duration,
+    settle: Duration,
+}
+
+/// Snapshot of a running service's process/start identity before a `restart` call.
+#[derive(Clone, Debug)]
+struct StartIdentity {
+    pid: Option<u32>,
+    instance_id: Option<String>,
+    since: Option<String>,
+}
+
+impl StartIdentity {
+    fn from_status(status: &BackendStatus) -> Self {
+        Self {
+            pid: status.pid,
+            instance_id: status.instance_id.clone(),
+            since: status.since.clone(),
+        }
+    }
+
+    fn has_identity(&self) -> bool {
+        self.instance_id.is_some() || self.pid.is_some() || self.since.is_some()
+    }
+
+    /// Returns `true` when `after` proves a new instance started compared to `self`.
+    fn changed(&self, after: &BackendStatus) -> bool {
+        if !self.has_identity() {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (&self.instance_id, &after.instance_id) {
+            return a != b;
+        }
+        if let (Some(a), Some(b)) = (self.pid, after.pid)
+            && a != b
+        {
+            return true;
+        }
+        if let (Some(a), Some(b)) = (&self.since, &after.since)
+            && a != b
+        {
+            return true;
+        }
+        false
+    }
 }
 
 async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
@@ -530,6 +576,10 @@ async fn execute_action(
     let scope = before.scope;
     let canonical = before.name.clone();
     let previous_state = before.state;
+    let before_identity = StartIdentity::from_status(&before);
+    let need_new_instance = action == Action::Restart
+        && previous_state == ServiceState::Running
+        && before_identity.has_identity();
     let use_sudo = scope == Scope::System && sudo_enabled;
 
     if let Err(mut error) = backend
@@ -544,16 +594,84 @@ async fn execute_action(
 
     let expected = action.expected_state();
     let deadline = Instant::now() + wait.timeout;
+    let mut saw_unchanged_running = false;
     loop {
+        if ctx.is_cancelled() {
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!(
+                    "The call to svc.{} was cancelled while waiting for {canonical:?}.",
+                    action.as_str()
+                ),
+            ));
+        }
+
         let last_state = match backend.status(ctx, &canonical, scope).await {
             Ok(now) => {
                 if now.state == expected {
-                    return Ok(ActionResult {
-                        name: now.name,
-                        scope,
-                        state: now.state,
-                        previous_state,
-                    });
+                    if expected == ServiceState::Running {
+                        if need_new_instance && !before_identity.changed(&now) {
+                            saw_unchanged_running = true;
+                        } else {
+                            // Wait a short settle period and re-read so a service that crashes
+                            // right after starting is not falsely reported as running.
+                            if !wait.settle.is_zero() {
+                                tokio::select! {
+                                    biased;
+                                    () = ctx.cancelled() => {
+                                        return Err(ErrorBody::new(
+                                            ErrorCode::Cancelled,
+                                            format!(
+                                                "The call to svc.{} was cancelled while confirming {canonical:?} stayed running.",
+                                                action.as_str()
+                                            ),
+                                        ));
+                                    }
+                                    () = tokio::time::sleep(wait.settle) => {}
+                                }
+                            }
+                            let settled = backend.status(ctx, &canonical, scope).await?;
+                            if settled.state == ServiceState::Running
+                                && (!need_new_instance || before_identity.changed(&settled))
+                            {
+                                return Ok(ActionResult {
+                                    name: settled.name,
+                                    scope,
+                                    state: settled.state,
+                                    previous_state,
+                                });
+                            }
+                            let mut error = ErrorBody::new(
+                                ErrorCode::Failed,
+                                format!(
+                                    "Service {canonical:?} in the {} scope started but transitioned to `{}` within {} ms after {}.",
+                                    scope.as_str(),
+                                    settled.state.as_str(),
+                                    wait.settle.as_millis(),
+                                    action.as_str()
+                                ),
+                            )
+                            .with_hint(
+                                "The service exited shortly after starting; inspect the attached logs or call `svc.logs`.",
+                            )
+                            .with_details(json!({
+                                "name": canonical,
+                                "scope": scope,
+                                "state": settled.state,
+                                "previous_state": previous_state,
+                                "exit_code": settled.exit_code,
+                            }));
+                            attach_failure_logs(backend, ctx, &canonical, scope, &mut error).await;
+                            return Err(error);
+                        }
+                    } else {
+                        return Ok(ActionResult {
+                            name: now.name,
+                            scope,
+                            state: now.state,
+                            previous_state,
+                        });
+                    }
                 }
                 // Stop waiting immediately if start/restart transitioned to failed.
                 if expected == ServiceState::Running && now.state == ServiceState::Failed {
@@ -591,8 +709,12 @@ async fn execute_action(
         };
 
         if Instant::now() >= deadline {
-            let mut error = ErrorBody::new(
-                ErrorCode::Failed,
+            let message = if saw_unchanged_running {
+                format!(
+                    "Service {canonical:?} in the {} scope stayed running with the same process/start identity after restart.",
+                    scope.as_str()
+                )
+            } else {
                 format!(
                     "Service {canonical:?} in the {} scope did not reach `{}` within {} seconds after {} (still `{}`).",
                     scope.as_str(),
@@ -600,15 +722,18 @@ async fn execute_action(
                     wait.timeout.as_secs(),
                     action.as_str(),
                     last_state.as_str()
-                ),
-            )
-            .with_hint("Check `svc.status` and `svc.logs` to see why the service did not finish transitioning.")
-            .with_details(json!({
-                "name": canonical,
-                "scope": scope,
-                "state": last_state,
-                "previous_state": previous_state,
-            }));
+                )
+            };
+            let mut error = ErrorBody::new(ErrorCode::Failed, message)
+                .with_hint(
+                    "Check `svc.status` and `svc.logs` to see why the service did not finish transitioning.",
+                )
+                .with_details(json!({
+                    "name": canonical,
+                    "scope": scope,
+                    "state": last_state,
+                    "previous_state": previous_state,
+                }));
             attach_failure_logs(backend, ctx, &canonical, scope, &mut error).await;
             return Err(error);
         }
@@ -1112,13 +1237,31 @@ mod tests {
         }
 
         fn push_status(&self, scope: Scope, name: &str, state: ServiceState) {
+            self.push_status_with(
+                scope,
+                name,
+                state,
+                (state == ServiceState::Running).then_some(123),
+                None,
+            );
+        }
+
+        fn push_status_with(
+            &self,
+            scope: Scope,
+            name: &str,
+            state: ServiceState,
+            pid: Option<u32>,
+            instance_id: Option<&str>,
+        ) {
             let status = BackendStatus {
                 name: name.to_owned(),
                 scope,
                 state,
                 enabled: Some(true),
-                pid: (state == ServiceState::Running).then_some(123),
+                pid,
                 since: None,
+                instance_id: instance_id.map(str::to_owned),
                 description: Some("test service".to_owned()),
                 exit_code: (state == ServiceState::Failed).then_some(1),
                 detail: BTreeMap::new(),
@@ -1258,10 +1401,12 @@ mod tests {
             let fast = WaitPolicy {
                 timeout: Duration::from_millis(80),
                 poll_interval: Duration::from_millis(10),
+                settle: Duration::from_millis(15),
             };
             let act = FakeBackend::new(BackendKind::Systemd, true);
             act.push_status(Scope::System, "app.service", ServiceState::Stopped);
             act.push_status(Scope::System, "app.service", ServiceState::Other);
+            act.push_status(Scope::System, "app.service", ServiceState::Running);
             act.push_status(Scope::System, "app.service", ServiceState::Running);
             let started = execute_action(
                 &act,
@@ -1280,6 +1425,85 @@ mod tests {
                 act.control_log.lock().unwrap().as_slice(),
                 &[("app.service".to_owned(), Scope::System, Action::Start, true)]
             );
+
+            // Service that shows running right after start but crashes during settle fails.
+            let crash_soon = FakeBackend::new(BackendKind::Systemd, true);
+            crash_soon.push_status(Scope::User, "crashy.service", ServiceState::Stopped);
+            crash_soon.push_status(Scope::User, "crashy.service", ServiceState::Running);
+            crash_soon.push_status(Scope::User, "crashy.service", ServiceState::Failed);
+            let err = execute_action(
+                &crash_soon,
+                ctx,
+                "crashy.service",
+                Some(Scope::User),
+                Action::Start,
+                false,
+                fast,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed);
+            assert_eq!(
+                err.details.as_ref().and_then(|d| d.get("logs")),
+                Some(&json!(["boom: exit 1"]))
+            );
+
+            // Restart must observe a new PID or instance id; an unchanged running service fails.
+            let no_restart = FakeBackend::new(BackendKind::Systemd, true);
+            no_restart.push_status_with(
+                Scope::User,
+                "sticky.service",
+                ServiceState::Running,
+                Some(500),
+                Some("inv-1"),
+            );
+            let err = execute_action(
+                &no_restart,
+                ctx,
+                "sticky.service",
+                Some(Scope::User),
+                Action::Restart,
+                false,
+                fast,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed);
+            assert!(
+                err.message.contains("same process/start identity"),
+                "{}",
+                err.message
+            );
+
+            // Restart that gets a new instance id and survives settle succeeds.
+            let did_restart = FakeBackend::new(BackendKind::Systemd, true);
+            did_restart.push_status_with(
+                Scope::User,
+                "fresh.service",
+                ServiceState::Running,
+                Some(500),
+                Some("inv-1"),
+            );
+            did_restart.push_status_with(
+                Scope::User,
+                "fresh.service",
+                ServiceState::Running,
+                Some(501),
+                Some("inv-2"),
+            );
+            let restarted = execute_action(
+                &did_restart,
+                ctx,
+                "fresh.service",
+                Some(Scope::User),
+                Action::Restart,
+                false,
+                fast,
+            )
+            .await
+            .unwrap();
+            assert_eq!(restarted.previous_state, ServiceState::Running);
+            assert_eq!(restarted.state, ServiceState::Running);
 
             // Service that transitions to `failed` returns `ErrorCode::Failed` with logs.
             let fail_backend = FakeBackend::new(BackendKind::Systemd, true);

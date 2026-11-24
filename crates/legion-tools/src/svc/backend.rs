@@ -92,6 +92,9 @@ pub(crate) struct BackendStatus {
     pub(crate) pid: Option<u32>,
     /// When the service entered its current active state, RFC 3339 UTC.
     pub(crate) since: Option<String>,
+    /// Backend-specific run identity (such as systemd `InvocationID` or monotonic start time, or
+    /// launchd `runs` counter) used to prove a restart actually created a new instance.
+    pub(crate) instance_id: Option<String>,
     /// Human-readable description, when available.
     pub(crate) description: Option<String>,
     /// Last reported exit code, when available.

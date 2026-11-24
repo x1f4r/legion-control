@@ -371,3 +371,80 @@ async fn linux_rejects_wildcards_and_non_service_units() {
         assert_eq!(err.code, ErrorCode::InvalidArgs, "{target}");
     }
 }
+
+#[tokio::test]
+async fn linux_start_catches_quick_crash_and_restart_proves_new_pid() {
+    if !linux_user_systemd_available() {
+        return;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let crash_unit = format!("legion-svc-crash-{}-{nanos}.service", std::process::id());
+    let live_unit = format!("legion-svc-live-{}-{nanos}.service", std::process::id());
+    let _guard_crash = TransientUnitGuard {
+        unit: crash_unit.clone(),
+    };
+    let _guard_live = TransientUnitGuard {
+        unit: live_unit.clone(),
+    };
+
+    // 1. A unit that exits with code 3 after 0.4 s stays loaded in `failed` state; restarting it
+    // shows `running` briefly and must be caught as `failed` after the settle window.
+    let out = Command::new("systemd-run")
+        .args([
+            "--user",
+            &format!("--unit={crash_unit}"),
+            "/bin/sh",
+            "-c",
+            "sleep 0.4; exit 3",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    let fixture = Fixture::new();
+    let err = fixture
+        .call("svc.restart", json!({"name": crash_unit, "scope": "user"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Failed, "{err}");
+
+    // 2. Restarting a healthy unit confirms a brand-new PID.
+    let out = Command::new("systemd-run")
+        .args(["--user", &format!("--unit={live_unit}"), "/bin/sleep", "60"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let before = fixture
+        .call("svc.status", json!({"name": live_unit, "scope": "user"}))
+        .await
+        .unwrap();
+    let old_pid = before["pid"].as_u64().unwrap();
+
+    let restarted = fixture
+        .call("svc.restart", json!({"name": live_unit, "scope": "user"}))
+        .await
+        .unwrap();
+    assert_eq!(restarted["previous_state"], json!("running"));
+    assert_eq!(restarted["state"], json!("running"));
+
+    let after = fixture
+        .call("svc.status", json!({"name": live_unit, "scope": "user"}))
+        .await
+        .unwrap();
+    assert_ne!(after["pid"].as_u64().unwrap(), old_pid);
+}

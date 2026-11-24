@@ -14,7 +14,7 @@ use super::backend::{
 use super::{Action, BackendKind, Scope, ServiceState, ServiceSummary};
 
 /// Properties requested from `systemctl show`.
-const SHOW_PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ActiveEnterTimestamp,ExecMainStatus,ExecMainCode,Description,Result,FragmentPath";
+const SHOW_PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,UnitFileState,MainPID,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,InvocationID,ExecMainStatus,ExecMainCode,Description,Result,FragmentPath";
 
 /// Linux systemd service manager backend.
 pub(crate) struct Systemd;
@@ -423,6 +423,23 @@ pub(crate) fn parse_show(
         None
     };
 
+    let instance_id = props
+        .get("InvocationID")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(|| {
+            props
+                .get("ExecMainStartTimestampMonotonic")
+                .filter(|s| !s.is_empty() && s.as_str() != "0")
+                .map(|s| format!("exec:{s}"))
+        })
+        .or_else(|| {
+            props
+                .get("ActiveEnterTimestampMonotonic")
+                .filter(|s| !s.is_empty() && s.as_str() != "0")
+                .map(|s| format!("active:{s}"))
+        });
+
     let description = props.get("Description").filter(|s| !s.is_empty()).cloned();
 
     let exec_code = props
@@ -463,6 +480,7 @@ pub(crate) fn parse_show(
         enabled,
         pid,
         since,
+        instance_id,
         description,
         exit_code,
         detail,
