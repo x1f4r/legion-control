@@ -292,7 +292,10 @@ function App() {
 
   useEffect(() => {
     applySettingsToRoot(document.documentElement, settings);
-  }, [settings]);
+    if (document.documentElement?.dataset) {
+      document.documentElement.dataset.deviceNoun = deviceNoun;
+    }
+  }, [settings, deviceNoun]);
 
   useEffect(() => {
     if (mainRef.current) mainRef.current.scrollTop = 0;
@@ -455,13 +458,22 @@ function App() {
   );
 
   const handleAcceptIdentityChange = useCallback(
-    async (nodeName) => {
+    async (nodeName, fingerprints) => {
       if (typeof link.acceptIdentityChange !== 'function') return;
-      const next = await link.acceptIdentityChange(nodeName);
+      const next = await link.acceptIdentityChange(nodeName, fingerprints);
       if (next) mergeBackendState(next);
       refreshFleet(nodeInfoRef.current, { background: true });
     },
     [link, mergeBackendState, refreshFleet],
+  );
+
+  const handleDismissIdentityChange = useCallback(
+    async (nodeName) => {
+      if (typeof link.dismissIdentityChange !== 'function') return;
+      const next = await link.dismissIdentityChange(nodeName);
+      if (next) mergeBackendState(next);
+    },
+    [link, mergeBackendState],
   );
 
   const hydrate = useCallback(
@@ -683,6 +695,8 @@ function App() {
     (machine) => {
       const args = { machine: machine.name };
       const copy = describePowerConfirm('power.wake', machine.name, args);
+      const wakeRunner =
+        (snapshotRef.current?.machines || []).find((m) => m.reachable)?.name || nodeInfo?.node;
       openConfirm({
         title: copy.title,
         summary: copy.summary,
@@ -693,10 +707,10 @@ function App() {
         confirmLabel: copy.confirmLabel,
         canDryRun: true,
         async onDryRun() {
-          return link.call('power.wake', { machine: machine.name, dry_run: true });
+          return link.call('power.wake', { machine: machine.name, dry_run: true }, { on: wakeRunner });
         },
         async onConfirm() {
-          await link.call('power.wake', { machine: machine.name });
+          await link.call('power.wake', { machine: machine.name }, { on: wakeRunner });
           markWakeSent(machine.name);
           refreshFleet(nodeInfo, { forceOffline: true });
         },
@@ -1173,7 +1187,9 @@ function App() {
                 onConnected=${(next) => {
                   setPairingOpen(false);
                   setFleetError(null);
-                  setPairNotice(next?.last_paired || null);
+                  setPairNotice(
+                    next?.last_paired ? { summary: next.last_paired, screen: 'machines' } : null,
+                  );
                   hydrate(next);
                 }}
               />
@@ -1205,7 +1221,7 @@ function App() {
                         <${MachinesView}
                           snapshot=${snapshot}
                           error=${fleetError}
-                          pairNotice=${pairNotice}
+                          pairNotice=${pairNotice?.screen === 'machines' ? pairNotice.summary : null}
                           onDismissPairNotice=${() => setPairNotice(null)}
                           loading=${refreshing}
                           wide=${wide}
@@ -1269,14 +1285,19 @@ function App() {
                               allowedSet=${allowedSet}
                               snapshot=${snapshot}
                               settings=${settings}
-                              pairNotice=${pairNotice}
+                              pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
                               onDismissPairNotice=${() => setPairNotice(null)}
                               onUpdateSettings=${updateSettings}
                               onRequestConfirm=${openConfirm}
                               onAcceptIdentityChange=${handleAcceptIdentityChange}
+                              onDismissIdentityChange=${handleDismissIdentityChange}
                               onConnected=${(next) => {
                                 setFleetError(null);
-                                setPairNotice(next?.last_paired || null);
+                                setPairNotice(
+                                  next?.last_paired
+                                    ? { summary: next.last_paired, screen: 'connections' }
+                                    : null,
+                                );
                                 hydrate(next);
                               }}
                               onSelectNode=${

@@ -34,7 +34,7 @@ const WIDE_TAB_LABELS = {
 };
 
 function targetFor(machineName, nodeName) {
-  return machineName && machineName !== nodeName ? machineName : undefined;
+  return machineName || nodeName || undefined;
 }
 
 function defaultRoot(whoami) {

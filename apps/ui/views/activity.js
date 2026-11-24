@@ -15,7 +15,7 @@ import { callWithTimeout, DETAIL_TIMEOUT_MS } from '../lib/fleet.js';
 import { routeHref } from '../lib/route.js';
 
 function targetFor(machineName, nodeName) {
-  return machineName && machineName !== nodeName ? machineName : undefined;
+  return machineName || nodeName || undefined;
 }
 
 export function ActivityDetail({

@@ -106,6 +106,11 @@ export function applySettingsToRoot(root, settings) {
   } else {
     delete root.dataset.density;
   }
+  if (s.technical) {
+    root.dataset.technical = 'true';
+  } else {
+    delete root.dataset.technical;
+  }
 }
 
 export function detectDeviceNoun(linkKind, userAgent = '', width = 0) {
@@ -529,27 +534,35 @@ function joinNamesPlain(names) {
 
 /**
  * Plain-language summary of which fleet machines received this device right after pairing
- * and which will receive it at their next sync.
+ * and which will receive it at their next sync (distinguishing `partial` from `not_reached`).
  */
 export function formatPairSyncNotice(lastPaired, technical = false) {
   if (!lastPaired || typeof lastPaired !== 'object') return null;
   const node = String(lastPaired.node || '').trim();
   const synced = Array.isArray(lastPaired.synced) ? lastPaired.synced.filter(Boolean) : [];
-  const notSynced = Array.isArray(lastPaired.not_synced)
-    ? lastPaired.not_synced
-        .map((p) => (typeof p === 'string' ? p : p?.node))
-        .filter(Boolean)
-    : [];
-  if (synced.length === 0 && notSynced.length === 0) return null;
+  const rawPending = Array.isArray(lastPaired.not_synced) ? lastPaired.not_synced : [];
+  const partialPeers = [];
+  const unreachedPeers = [];
+  for (const item of rawPending) {
+    const peerNode = typeof item === 'string' ? item : item?.node;
+    if (!peerNode) continue;
+    const status = typeof item === 'object' ? String(item?.status || '') : '';
+    const reason = typeof item === 'object' && item?.reason ? String(item.reason) : '';
+    if (status === 'partial') {
+      partialPeers.push({ node: peerNode, reason });
+    } else {
+      unreachedPeers.push({ node: peerNode, reason });
+    }
+  }
+  if (synced.length === 0 && partialPeers.length === 0 && unreachedPeers.length === 0) return null;
 
   const syncedNames = joinNamesPlain(synced);
-  const pendingNames = joinNamesPlain(notSynced);
   const title =
     synced.length > 0
       ? `Paired with ${node || 'this machine'} and shared with ${syncedNames}.`
       : `Paired with ${node || 'this machine'}.`;
 
-  if (notSynced.length === 0) {
+  if (partialPeers.length === 0 && unreachedPeers.length === 0) {
     return {
       kind: 'neutral',
       title,
@@ -557,8 +570,26 @@ export function formatPairSyncNotice(lastPaired, technical = false) {
     };
   }
 
-  const pendingVerb = notSynced.length === 1 ? 'did not answer and will get' : 'did not answer and will get';
-  let detail = `${pendingNames} ${pendingVerb} this device at the next sync.`;
+  const parts = [];
+  if (partialPeers.length > 0) {
+    const names = joinNamesPlain(partialPeers.map((p) => p.node));
+    let part = `${names} received removals, but not this device yet — it will get this device at the next sync.`;
+    if (technical) {
+      const reasons = partialPeers
+        .filter((p) => p.reason)
+        .map((p) => `${p.node}: ${p.reason}`);
+      if (reasons.length > 0) {
+        part = `${part} (${reasons.join('; ')})`;
+      }
+    }
+    parts.push(part);
+  }
+  if (unreachedPeers.length > 0) {
+    const names = joinNamesPlain(unreachedPeers.map((p) => p.node));
+    parts.push(`${names} did not answer and will get this device at the next sync.`);
+  }
+
+  let detail = parts.join(' ');
   if (technical) {
     const cmd =
       String(lastPaired.sync_command || '').trim() ||
@@ -583,10 +614,17 @@ export function describeConnectionRoute(entry, technical = false) {
 
   if (route === 'identity_changed') {
     const reporter = idChanged?.reported_by || entry?.route_via || entry?.learned_from || 'another machine';
+    const isPaired = Boolean(idChanged?.is_paired || entry?.origin === 'paired');
+    const hasConflicts = Array.isArray(idChanged?.conflicts) && idChanged.conflicts.length > 0;
+    const hint = isPaired
+      ? `${reporter} reported a different host key for ${node}. Because this device paired with ${node} directly, its saved keys were not changed; pair with ${node} again if its identity really changed.`
+      : hasConflicts
+        ? `Machines disagree on the new identity for ${node}. Review the reports before deciding whether to dismiss or pair directly.`
+        : `${reporter} reported a change for ${node}. Review the details and accept only if ${node} was reinstalled or its keys or address changed.`;
     return {
       kind: 'identity_changed',
       label: 'Identity changed',
-      hint: `${reporter} reported a different host key for ${node}. Accept it only if ${node} was reinstalled or its keys changed.`,
+      hint,
       isWarning: true,
       isIdentityChanged: true,
     };
@@ -662,50 +700,232 @@ export function buildRelayedConnections(linkState, snapshot) {
   return Array.from(byName.values()).sort((a, b) => (a.node < b.node ? -1 : a.node > b.node ? 1 : 0));
 }
 
-/**
- * Plain-English description of a policy role (built-in or custom from `policy.toml`).
- */
-export function describePolicyRolePlain(roleName, policy = null) {
-  const trimmed = String(roleName || '').trim();
-  const lower = trimmed.toLowerCase();
-  if (lower === 'owner') return 'Do everything on this machine';
-  if (lower === 'operator') return 'Do everything except change permissions';
-  if (lower === 'editor') return 'Look at machines and edit files';
-  if (lower === 'observer') return 'Look only';
+function ruleMatchesToolSpec(rule, spec) {
+  if (typeof rule !== 'string' || !rule) return false;
+  if (rule.startsWith('effect:')) {
+    return spec?.effect === rule.slice('effect:'.length);
+  }
+  return globMatches(rule, String(spec?.name || ''));
+}
 
+function analyzePolicyRole(roleName, policy, tools = []) {
+  const trimmed = String(roleName || '').trim();
+  if (trimmed === 'owner') {
+    return {
+      read: true,
+      write: true,
+      exec: true,
+      power: true,
+      destroy: true,
+      admin: true,
+      broadWrite: true,
+      broadExec: true,
+      broadAdmin: true,
+      canWritePolicy: true,
+      hasUnknownToolRule: false,
+      ownerStrength: true,
+      allow: ['*'],
+    };
+  }
   const def = policy?.roles?.[trimmed];
-  if (def && Array.isArray(def.allow)) {
-    if (isRoleOwnerStrength(trimmed, { policy })) {
-      return 'Do everything on this machine';
+  if (!def || !Array.isArray(def.allow)) return null;
+  const allow = def.allow;
+  const deny = Array.isArray(def.deny) ? def.deny : [];
+  const toolList = Array.isArray(tools) ? tools : [];
+
+  const eff = {
+    read: false,
+    write: false,
+    exec: false,
+    power: false,
+    destroy: false,
+    admin: false,
+    broadWrite: false,
+    broadExec: false,
+    broadAdmin: false,
+    canWritePolicy: false,
+    hasUnknownToolRule: false,
+    ownerStrength: false,
+    allow,
+  };
+
+  if (allow.length === 0) return eff;
+
+  const isDeniedEffect = (effectName) =>
+    deny.some((r) => r === `effect:${effectName}` || ruleIsBroadAdmin(r));
+
+  for (const rule of allow) {
+    if (ruleIsBroadAdmin(rule)) {
+      if (!isDeniedEffect('read')) eff.read = true;
+      if (!isDeniedEffect('write')) {
+        eff.write = true;
+        eff.broadWrite = true;
+      }
+      if (!isDeniedEffect('exec')) {
+        eff.exec = true;
+        eff.broadExec = true;
+      }
+      if (!isDeniedEffect('power')) eff.power = true;
+      if (!isDeniedEffect('destroy')) eff.destroy = true;
+      if (!isDeniedEffect('admin')) {
+        eff.admin = true;
+        eff.broadAdmin = true;
+      }
+    } else if (rule === 'effect:read' && !isDeniedEffect('read')) {
+      eff.read = true;
+    } else if (rule === 'effect:write' && !isDeniedEffect('write')) {
+      eff.write = true;
+      eff.broadWrite = true;
+    } else if (rule === 'effect:exec' && !isDeniedEffect('exec')) {
+      eff.exec = true;
+      eff.broadExec = true;
+    } else if (rule === 'effect:power' && !isDeniedEffect('power')) {
+      eff.power = true;
+    } else if (rule === 'effect:destroy' && !isDeniedEffect('destroy')) {
+      eff.destroy = true;
+    } else if (rule === 'effect:admin' && !isDeniedEffect('admin')) {
+      eff.admin = true;
+      eff.broadAdmin = true;
     }
-    const allow = def.allow;
-    const deny = new Set(Array.isArray(def.deny) ? def.deny : []);
-    const has = (tag) => allow.includes(tag) && !deny.has(tag);
-    const hasRead = has('effect:read') || allow.some((r) => !r.startsWith('effect:'));
-    const hasWrite = has('effect:write');
-    const hasExec = has('effect:exec');
-    const hasPower = has('effect:power');
-    if (hasPower && hasExec && hasWrite) return 'Do everything except change permissions';
-    if (hasRead && !hasWrite && !hasExec && !hasPower) return 'Look only';
-    const caps = [];
-    if (hasRead) caps.push('look');
-    if (hasWrite) caps.push('edit files');
-    if (hasExec) caps.push('run commands');
-    if (hasPower) caps.push('control power');
-    if (caps.length === 1) return `May ${caps[0]}`;
-    if (caps.length > 1) return `May ${caps.slice(0, -1).join(', ')} and ${caps[caps.length - 1]}`;
   }
 
-  return 'Use this machine with that role';
+  if (allow.some(ruleMatchesConfigWrite) && !deny.some(ruleMatchesConfigWrite)) {
+    eff.canWritePolicy = true;
+    eff.admin = true;
+  }
+
+  if (toolList.length > 0) {
+    for (const spec of toolList) {
+      const allowed = allow.some((r) => ruleMatchesToolSpec(r, spec));
+      const denied = deny.some((r) => ruleMatchesToolSpec(r, spec));
+      if (allowed && !denied) {
+        if (spec.effect === 'read') eff.read = true;
+        else if (spec.effect === 'write') eff.write = true;
+        else if (spec.effect === 'exec') eff.exec = true;
+        else if (spec.effect === 'power') eff.power = true;
+        else if (spec.effect === 'destroy') eff.destroy = true;
+        else if (spec.effect === 'admin') eff.admin = true;
+        if (spec.name === 'config.write') eff.canWritePolicy = true;
+      }
+    }
+    for (const rule of allow) {
+      if (rule.startsWith('effect:') || ruleIsBroadAdmin(rule)) continue;
+      if (!toolList.some((spec) => globMatches(rule, String(spec?.name || '')))) {
+        eff.hasUnknownToolRule = true;
+      }
+    }
+  } else {
+    for (const rule of allow) {
+      if (rule.startsWith('effect:') || ruleIsBroadAdmin(rule)) continue;
+      if (ruleMatchesConfigWrite(rule)) continue;
+      eff.hasUnknownToolRule = true;
+    }
+  }
+
+  eff.ownerStrength = eff.broadAdmin || eff.canWritePolicy;
+  return eff;
+}
+
+/**
+ * Normalizes the reply from the node's `device.roles` tool (`[{name, description, strongest_effect, owner_strength}]`
+ * or `{ roles: [...] }`). Preserves the node-supplied `description` and `owner_strength` verbatim.
+ */
+export function normalizeNodeRoles(result) {
+  const list = Array.isArray(result)
+    ? result
+    : Array.isArray(result?.roles)
+      ? result.roles
+      : null;
+  if (!list) return null;
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    const name = String(item?.name || '').trim();
+    if (!name || name === 'nobody' || seen.has(name)) continue;
+    seen.add(name);
+    out.push({
+      name,
+      description: String(item?.description || '').trim(),
+      strongestEffect: item?.strongest_effect || null,
+      ownerStrength: Boolean(item?.owner_strength),
+      fromNode: true,
+    });
+  }
+  return out;
+}
+
+/**
+ * Derives a plain-English role description strictly from the node's live `policy.toml` rules and
+ * tool catalogue (matching `legion pair`'s rule analysis; never hardcoded by role name except
+ * built-in `owner`).
+ *
+ * When `technical` is false, custom rule summaries omit raw tool names so plain mode stays free
+ * of internal tool identifiers.
+ */
+export function describePolicyRolePlain(
+  roleName,
+  policy = null,
+  { tools = [], technical = false } = {},
+) {
+  const trimmed = String(roleName || '').trim();
+  if (!trimmed) return '';
+  if (trimmed === 'owner') {
+    return 'everything, including changing who may do what';
+  }
+  const eff = analyzePolicyRole(trimmed, policy, tools);
+  if (!eff) return '';
+  if (eff.allow.length === 0) return 'nothing (no actions allowed)';
+
+  const summary = eff.allow.join(', ');
+  const suffix = technical && summary ? `: ${summary}` : '';
+
+  if (eff.admin) {
+    if (eff.broadAdmin) {
+      return 'everything, including changing who may do what (as strong as owner)';
+    }
+    if (eff.canWritePolicy) {
+      return `everything, including changing who may do what (as strong as owner${suffix})`;
+    }
+    return `custom (allows admin${suffix})`;
+  }
+  if (eff.exec) {
+    if (eff.broadExec && eff.write && !eff.hasUnknownToolRule) {
+      return 'operate (read, change files, and run commands — as strong as this account)';
+    }
+    return `custom (allows running commands — as strong as this account${suffix})`;
+  }
+  if (eff.power) {
+    return `custom (allows power controls${suffix})`;
+  }
+  if (eff.destroy) {
+    return `custom (allows removing files or processes${suffix})`;
+  }
+  if (eff.hasUnknownToolRule) {
+    return `custom${suffix ? ` (${summary})` : ''}`;
+  }
+  if (eff.write) {
+    if (eff.broadWrite) {
+      return 'change files (read and edit files, no running commands)';
+    }
+    return `custom (allows changing files${suffix})`;
+  }
+  if (eff.read) {
+    return 'look only (read status and files, change nothing)';
+  }
+  return 'nothing (no actions allowed)';
 }
 
 const STANDARD_ROLE_ORDER = ['observer', 'editor', 'operator'];
 
 /**
  * Builds the list of selectable roles for "Let another device in" from `policy.toml` + `owner`
- * (or from a schema `enum` if present).
+ * (fallback path when `device.roles` is not offered by the node).
  */
-export function extractInviteRoles(policy, roleProp, { allowOwner = true } = {}) {
+export function extractInviteRoles(
+  policy,
+  roleProp,
+  { allowOwner = true, tools = [], technical = false } = {},
+) {
   const names = [];
   const seen = new Set();
   const push = (name) => {
@@ -730,11 +950,15 @@ export function extractInviteRoles(policy, roleProp, { allowOwner = true } = {})
     }
   }
 
-  return names.map((name) => ({
-    name,
-    description: describePolicyRolePlain(name, policy),
-    ownerStrength: isRoleOwnerStrength(name, { policy }),
-  }));
+  return names.map((name) => {
+    const eff = analyzePolicyRole(name, policy, tools);
+    return {
+      name,
+      description: describePolicyRolePlain(name, policy, { tools, technical }),
+      ownerStrength: eff ? eff.ownerStrength : isRoleOwnerStrength(name, { policy }),
+      fromNode: false,
+    };
+  });
 }
 
 /**

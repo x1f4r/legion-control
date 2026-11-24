@@ -491,6 +491,11 @@ export function createMockLink(mode = '') {
   const isEmpty = flags.has('empty');
   const isMulti = flags.has('multi');
   const isFleet = flags.has('fleet');
+  const isNoRoles = flags.has('noroles');
+  const isDenyRead = flags.has('denyread');
+  const isConflict = flags.has('conflict');
+  const isPairedChange = flags.has('pairedchg');
+  const isPartial = flags.has('partial');
   const isAutoEnrol = flags.has('enrol');
   const isFirst = flags.has('first');
   const isRepair = flags.has('repair');
@@ -505,6 +510,7 @@ export function createMockLink(mode = '') {
   let activeNode = 'tower';
   let pairedNodes = isFleet ? ['tower', 'pi', 'studio', 'mini'] : isMulti ? ['tower', 'pi'] : ['tower'];
   let miniIdentityChanged = isFleet;
+  let towerIdentityChanged = isFleet && isPairedChange;
   let lastPaired = null;
   let deviceListPollCount = 0;
   let fleetDevicesByMachine = null;
@@ -544,6 +550,16 @@ export function createMockLink(mode = '') {
           description: 'Return this node SSH endpoint and host keys for direct pairing.',
           input_schema: { type: 'object', properties: {} },
         },
+        ...(!isNoRoles
+          ? [
+              {
+                name: 'device.roles',
+                effect: 'read',
+                description: 'List the roles this caller may hand to a new device on this machine.',
+                input_schema: { type: 'object', properties: {} },
+              },
+            ]
+          : []),
       ]
     : MOCK_TOOLS;
 
@@ -557,7 +573,8 @@ export function createMockLink(mode = '') {
   let incomingDevices = [
     {
       name: 'Pixel 10',
-      principal: 'phone',
+      principal: 'device:pixel-10',
+      role: 'owner',
       fingerprint: 'SHA256:4kP9vR2mN8xQ1wL6tY3bZ5cH7jD0sF9eA2uK4mV8nX0',
       added: isoAgo(86400 * 12),
       foreign: false,
@@ -565,7 +582,8 @@ export function createMockLink(mode = '') {
     },
     {
       name: 'Work laptop',
-      principal: 'laptop',
+      principal: 'device:work-laptop',
+      role: 'observer',
       fingerprint: 'SHA256:9mB2nC4vX6zL8kJ0hG2fD4sA6pO8iU0yT2rE4wQ6aS8',
       added: isoAgo(86400 * 3),
       foreign: false,
@@ -931,7 +949,51 @@ export function createMockLink(mode = '') {
         }
         return { added: true, machine: addedName, host: addedHost, system: args?.system || 'linux' };
       }
+      case 'device.roles': {
+        if (isNoRoles) {
+          throw {
+            code: 'unknown_tool',
+            message: 'Unknown tool: device.roles',
+            hint: null,
+            machine: name,
+          };
+        }
+        return [
+          {
+            name: 'observer',
+            description: 'look only (read status and files, change nothing)',
+            strongest_effect: 'read',
+            owner_strength: false,
+          },
+          {
+            name: 'editor',
+            description: 'change files (read and edit files, no running commands)',
+            strongest_effect: 'write',
+            owner_strength: false,
+          },
+          {
+            name: 'operator',
+            description: 'operate (read, change files, and run commands — as strong as this account)',
+            strongest_effect: 'exec',
+            owner_strength: false,
+          },
+          {
+            name: 'owner',
+            description: 'everything, including changing who may do what',
+            strongest_effect: 'admin',
+            owner_strength: true,
+          },
+        ];
+      }
       case 'config.read': {
+        if (isDenyRead) {
+          throw {
+            code: 'denied',
+            message: 'Reading policy.toml is not allowed for this device.',
+            hint: null,
+            machine: name,
+          };
+        }
         if (args?.document === 'policy.toml') {
           return {
             exists: true,
@@ -1244,8 +1306,24 @@ export function createMockLink(mode = '') {
     }
   }
 
+  const MOCK_ANY_NODE_TOOLS = new Set([
+    'meta.whoami',
+    'meta.version',
+    'fleet.list',
+    'fleet.ping',
+    'device.endpoint',
+  ]);
+
   async function call(tool, args = {}, options = {}) {
     const { on, onEvent } = options || {};
+    if (kind === 'app' && !on && !MOCK_ANY_NODE_TOOLS.has(tool)) {
+      throw {
+        code: 'invalid_args',
+        message: `Tool \`${tool}\` requires a target machine in \`on\`.`,
+        hint: 'Pass `on: "<machine>"` to name the machine this call should run on.',
+        machine: null,
+      };
+    }
     if (isFirst && tool === 'fleet.ping' && Array.isArray(args?.machines) && args.machines.includes('mini')) {
       // Keep the never-seen machine briefly in asking state so tests & screenshots can observe it.
       await new Promise((r) => setTimeout(r, 120));
@@ -1320,7 +1398,25 @@ export function createMockLink(mode = '') {
       };
       if (isFleet) {
         if (nodeName === 'tower') {
-          base.route = 'direct';
+          if (towerIdentityChanged) {
+            base.route = 'identity_changed';
+            base.route_via = 'pi';
+            base.identity_changed = {
+              reported_by: 'pi',
+              hosts: ['tower.example.net'],
+              port: 22,
+              user: 'me',
+              old_hosts: ['tower.example.net'],
+              old_port: 22,
+              old_user: 'me',
+              old_fingerprints: ['SHA256:oldTowerKey111111111111111111111111111111'],
+              new_fingerprints: ['SHA256:newTowerKey222222222222222222222222222222'],
+              conflicts: [],
+              is_paired: true,
+            };
+          } else {
+            base.route = 'direct';
+          }
         } else if (nodeName === 'pi') {
           base.learned_from = 'tower';
           base.route = 'direct';
@@ -1335,10 +1431,26 @@ export function createMockLink(mode = '') {
             base.route_via = 'tower';
             base.identity_changed = {
               reported_by: 'tower',
-              hosts: ['mini.example.net'],
-              port: 22,
+              hosts: ['mini-new.example.net'],
+              port: 2222,
+              user: 'me',
+              old_hosts: ['mini.example.net'],
+              old_port: 22,
+              old_user: 'me',
               old_fingerprints: ['SHA256:oldMiniKey1111111111111111111111111111111'],
               new_fingerprints: ['SHA256:newMiniKey2222222222222222222222222222222'],
+              conflicts: isConflict
+                ? [
+                    {
+                      reported_by: 'studio',
+                      hosts: ['mini-other.example.net'],
+                      port: 22,
+                      user: 'me',
+                      fingerprints: ['SHA256:conflictMiniKey333333333333333333333333'],
+                    },
+                  ]
+                : [],
+              is_paired: false,
             };
           } else {
             base.route = 'direct';
@@ -1411,7 +1523,9 @@ export function createMockLink(mode = '') {
         device: 'Pixel 10',
         role: 'operator',
         synced: ['pi'],
-        not_synced: [{ node: 'studio', reason: 'connection refused' }],
+        not_synced: isPartial
+          ? [{ node: 'studio', status: 'partial', reason: 'live device changes refused' }]
+          : [{ node: 'studio', status: 'not_reached', reason: 'connection refused' }],
         sync_command: 'legion fleet.sync direction=push documents=\'["devices.toml"]\'',
       };
     }
@@ -1431,10 +1545,42 @@ export function createMockLink(mode = '') {
     };
   }
 
-  async function acceptIdentityChange(node) {
-    if (node === 'mini') {
+  async function acceptIdentityChange(node, fingerprints = []) {
+    if (node === 'tower' && towerIdentityChanged) {
+      throw {
+        code: 'denied',
+        message: 'Cannot accept a learned identity change for directly paired node tower.',
+        hint: null,
+        machine: 'tower',
+      };
+    }
+    if (node === 'mini' && miniIdentityChanged) {
+      if (isConflict) {
+        throw {
+          code: 'conflict',
+          message: 'Conflicting identity reports exist for mini.',
+          hint: null,
+          machine: 'mini',
+        };
+      }
+      const expected = ['SHA256:newMiniKey2222222222222222222222222222222'];
+      const actual = Array.isArray(fingerprints) ? fingerprints : [];
+      if (actual.length !== expected.length || actual[0] !== expected[0]) {
+        throw {
+          code: 'conflict',
+          message: 'Pending identity fingerprints for mini do not match what was reviewed.',
+          hint: null,
+          machine: 'mini',
+        };
+      }
       miniIdentityChanged = false;
     }
+    return state();
+  }
+
+  async function dismissIdentityChange(node) {
+    if (node === 'mini') miniIdentityChanged = false;
+    if (node === 'tower') towerIdentityChanged = false;
     return state();
   }
 
@@ -1486,6 +1632,7 @@ export function createMockLink(mode = '') {
     selectNode,
     learn,
     acceptIdentityChange,
+    dismissIdentityChange,
     repairStore,
     scanInvite,
     initialFleetCache,

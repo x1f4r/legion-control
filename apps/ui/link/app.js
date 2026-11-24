@@ -244,9 +244,21 @@ export function createAppLink() {
     }
   }
 
-  async function acceptIdentityChange(node) {
+  async function acceptIdentityChange(node, fingerprints) {
     try {
-      await invoke('accept_identity_change', { node });
+      await invoke('accept_identity_change', {
+        node,
+        fingerprints: Array.isArray(fingerprints) ? fingerprints : [],
+      });
+      return await state();
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function dismissIdentityChange(node) {
+    try {
+      await invoke('dismiss_identity_change', { node });
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -321,6 +333,7 @@ export function createAppLink() {
     selectNode,
     learn,
     acceptIdentityChange,
+    dismissIdentityChange,
     repairStore,
     invalidateSessions,
     scanInvite,

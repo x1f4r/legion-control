@@ -131,6 +131,9 @@ test('createAppLink exposes learn, acceptIdentityChange, and preserves last_pair
           if (command === 'accept_identity_change') {
             return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
           }
+          if (command === 'dismiss_identity_change') {
+            return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
+          }
           return Promise.resolve({});
         },
         Channel: class FakeChannel {
@@ -150,8 +153,19 @@ test('createAppLink exposes learn, acceptIdentityChange, and preserves last_pair
     const learned = await link.learn();
     assert.deepEqual(learned.report.added, ['pi']);
 
-    await link.acceptIdentityChange('mini');
-    assert.ok(calls.some((c) => c.command === 'accept_identity_change' && c.payload.node === 'mini'));
+    await link.acceptIdentityChange('mini', ['SHA256:abc']);
+    assert.ok(
+      calls.some(
+        (c) =>
+          c.command === 'accept_identity_change' &&
+          c.payload.node === 'mini' &&
+          Array.isArray(c.payload.fingerprints) &&
+          c.payload.fingerprints[0] === 'SHA256:abc',
+      ),
+    );
+
+    await link.dismissIdentityChange('mini');
+    assert.ok(calls.some((c) => c.command === 'dismiss_identity_change' && c.payload.node === 'mini'));
   } finally {
     if (prevWindow === undefined) {
       delete globalThis.window;

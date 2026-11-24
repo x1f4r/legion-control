@@ -899,7 +899,7 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     });
     p.on('pageerror', (err) => pageErrors.push(String(err)));
 
-    // 1. Pairing shows plain fleet sync summary without tool names.
+    // 1. Pairing from StartView shows plain fleet sync summary on Machines ONLY (not repeated on Connections).
     await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
     await p.getByRole('button', { name: 'Paste invite' }).click();
     await p.locator('textarea').fill('legion-invite-1.mock.test');
@@ -908,34 +908,99 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText('studio did not answer and will get this device at the next sync.').waitFor();
     await assertNoToolNames(p, 'post-pair sync summary plain');
 
-    // 2. Settings -> Connections shows direct, relay, unsynced (plain hint), and identity-changed warning.
+    await p.locator('header.top a[aria-label="Settings"]').click();
+    await p.locator('a.row', { hasText: 'Connections' }).click();
+    await p.getByText('Paired machines').waitFor();
+    assert.equal(
+      await p.getByText('Paired with tower and shared with pi.').count(),
+      0,
+      'Pairing sync notice must appear only on the screen the user landed on, not repeated on Connections',
+    );
+
+    // 2. Settings -> Connections shows direct, relay, unsynced (plain hint), and Review-only
+    //    identity-changed link (NEVER an inline Accept button on Connections list!).
     await p.goto(`${server.url}/?mock=fleet,enrol#/settings/connections`, { waitUntil: 'domcontentloaded' });
     await p.getByText('Paired machines').waitFor();
-    await p.locator('a.row', { hasText: 'pi' }).getByText('directly').waitFor();
-    await p.locator('a.row', { hasText: 'studio' }).getByText('not yet: tower has not passed this device on to it').waitFor();
-    await p.locator('a.row', { hasText: 'studio' }).getByText('Ask the owner to sync the machines').waitFor();
+    await p.locator('a.row[href="#/settings/connections/node/pi"]').getByText('directly').waitFor();
+    await p.locator('a.row[href="#/settings/connections/node/studio"]').getByText('not yet: tower has not passed this device on to it').waitFor();
+    await p.locator('a.row[href="#/settings/connections/node/studio"]').getByText('Ask the owner to sync the machines').waitFor();
     await p.getByText('Reached through another machine').waitFor();
     await p.locator('.row', { hasText: 'nas' }).getByText('through tower').waitFor();
     await p.getByText('Identity changed for mini').waitFor();
+    assert.equal(
+      await p.getByRole('button', { name: 'Accept new identity' }).count(),
+      0,
+      'Connections list must never show an inline Accept button',
+    );
+    // "Devices that may come in" in plain mode shows plain access wording, NEVER `device:...`.
+    const connectionsText = await p.locator('main.main').innerText();
+    assert.ok(
+      !connectionsText.includes('device:pixel-10'),
+      `Raw device principal leaked in plain Connections: ${connectionsText}`,
+    );
     await assertNoToolNames(p, 'fleet connections plain');
 
-    // Explicitly accept mini's identity change (never silent).
+    // Open a learned machine's connection page (`pi`) in plain mode and assert zero tool names.
+    await p.locator('a.row[href="#/settings/connections/node/pi"]').click();
+    await p.getByText('Learned from').waitFor();
+    await p.getByText('tower').first().waitFor();
+    await assertNoToolNames(p, 'learned machine connection page plain');
+    await p.locator('header.top button[aria-label="Back"]').click();
+    await p.getByText('Identity changed for mini').waitFor();
+
+    // Open identity-changed machine (`mini`) via Review: verify old & new fingerprints AND changed
+    // address/port are displayed BEFORE Accept new identity, then accept cleanly.
+    await p.getByRole('link', { name: 'Review' }).first().click();
+    await p.getByText('Previous fingerprint').waitFor();
+    await p.getByText('SHA256:oldMiniKey1111111111111111111111111111111').waitFor();
+    await p.getByText('Reported fingerprint').waitFor();
+    await p.getByText('SHA256:newMiniKey2222222222222222222222222222222').waitFor();
+    await p.getByText('mini.example.net').waitFor();
+    await p.getByText('mini-new.example.net').waitFor();
+    await p.getByText('2222', { exact: true }).waitFor();
+    await assertNoToolNames(p, 'identity-changed connection page plain');
+
     await p.getByRole('button', { name: 'Accept new identity' }).click();
     await p.getByText('Identity changed for mini').waitFor({ state: 'hidden' });
-    await p.locator('a.row', { hasText: 'mini' }).getByText('directly').waitFor();
+    await p.getByText('directly').waitFor();
+
+    // Paired machine with an identity-change report is informational only (no Accept button).
+    await p.goto(`${server.url}/?mock=fleet,pairedchg#/settings/connections/node/tower`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('Identity changed for tower').waitFor();
+    assert.equal(
+      await p.getByRole('button', { name: 'Accept new identity' }).count(),
+      0,
+      'Directly paired machine must never offer Accept new identity',
+    );
+    await p.getByRole('button', { name: 'Dismiss' }).waitFor();
+    await assertNoToolNames(p, 'paired identity-changed page plain');
+
+    // Conflicting reports on a learned machine block Accept new identity.
+    await p.goto(`${server.url}/?mock=fleet,conflict#/settings/connections/node/mini`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('Conflicting reports').waitFor();
+    assert.equal(
+      await p.getByRole('button', { name: 'Accept new identity' }).count(),
+      0,
+      'Conflicting reports must block Accept new identity',
+    );
+    await assertNoToolNames(p, 'conflicting identity-changed page plain');
 
     // 3. Technical mode shows the exact fleet.sync hint for unsynced machines.
     await p.goto(`${server.url}/?mock=fleet,tech#/settings/connections`, { waitUntil: 'domcontentloaded' });
     await p.locator('a.row', { hasText: 'studio' }).getByText('legion fleet.sync').waitFor();
 
-    // 4. "Let another device in" offers policy roles with plain descriptions, owner-strength switch,
-    //    and reports which machines received the newly paired device.
+    // 4. "Let another device in" — primary `device.roles` path: offers node-supplied role
+    //    descriptions, owner-strength switch, and reports fleet delivery.
     await p.goto(`${server.url}/?mock=fleet,enrol#/settings/connections/invite`, { waitUntil: 'domcontentloaded' });
-    const roleSelect = p.locator('label.field select');
+    const roleSelect = p.locator('label.field select').last();
     await roleSelect.waitFor();
     await p.getByText('Name for this device').waitFor();
-    await p.getByText('Look only.').waitFor();
-    await assertNoToolNames(p, 'fleet invite plain observer');
+    await p.getByText('Look only (read status and files, change nothing).').waitFor();
+    await assertNoToolNames(p, 'fleet invite plain observer via device.roles');
 
     // Selecting owner reveals the Allow full owner access switch and disables Make invite until ticked.
     await p.locator('label.field input[type="text"]').fill('tablet');
@@ -948,11 +1013,29 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
 
     // Switch back to operator and create invite; auto-enrol completes and shows fleet delivery.
     await roleSelect.selectOption('operator');
-    await p.getByText('Do everything except change permissions.').waitFor();
+    await p
+      .getByText('Operate (read, change files, and run commands — as strong as this account).')
+      .waitFor();
     await makeBtn.click();
     await p.getByText('tablet is paired.').waitFor({ timeout: 5000 });
     await p.getByText('Received by pi and tower. laptop, nas and studio will get it at the next sync.').waitFor();
     await assertNoToolNames(p, 'fleet invite paired delivery plain');
+
+    // 5. Fallback policy.toml path (`noroles`): still loads roles and plain descriptions from live policy.
+    await p.goto(`${server.url}/?mock=fleet,noroles#/settings/connections/invite`, {
+      waitUntil: 'domcontentloaded',
+    });
+    const fallbackSelect = p.locator('label.field select').last();
+    await fallbackSelect.waitFor();
+    await p.getByText('Look only (read status and files, change nothing).').waitFor();
+    await assertNoToolNames(p, 'fleet invite fallback policy.toml plain');
+
+    // 6. Refusal path (`noroles,denyread`): says plainly this device may not see the roles.
+    await p.goto(`${server.url}/?mock=fleet,noroles,denyread#/settings/connections/invite`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('This device may not see the roles on tower; ask the owner.').waitFor();
+    await assertNoToolNames(p, 'fleet invite policy refused plain');
 
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);

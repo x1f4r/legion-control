@@ -29,11 +29,33 @@ export function Meter({ value, level, className = '' }) {
   return html`<span ref=${ref} class=${cls}><i></i></span>`;
 }
 
-export function Notice({ error, title, message, hint, kind = 'bad', className = '', onDismiss }) {
-  const heading = title || (error ? error.message : message);
-  const detail = hint ?? (error ? error.hint : null);
-  const machine = error?.machine ? `${error.machine}: ` : '';
+export function Notice({
+  error,
+  title,
+  message,
+  hint,
+  kind = 'bad',
+  className = '',
+  technical,
+  deviceNoun,
+  onDismiss,
+}) {
+  const isTech =
+    typeof technical === 'boolean'
+      ? technical
+      : typeof document !== 'undefined' && document.documentElement?.dataset?.technical === 'true';
+  const noun =
+    deviceNoun ||
+    (typeof document !== 'undefined' && document.documentElement?.dataset?.deviceNoun) ||
+    'device';
   const reason = error?.details?.reason;
+  const isRemovedPlain =
+    !isTech && !title && error?.code === 'denied' && reason === 'device_removed_or_unknown';
+  const heading = isRemovedPlain
+    ? `${error.machine || 'This machine'} no longer lets this ${noun} in. It may have been removed there.`
+    : title || (error ? error.message : message);
+  const detail = isRemovedPlain ? null : (hint ?? (error ? error.hint : null));
+  const machine = isRemovedPlain ? '' : error?.machine ? `${error.machine}: ` : '';
   const canRepair =
     error?.code === 'denied' &&
     (reason === 'device_removed_or_unknown' ||

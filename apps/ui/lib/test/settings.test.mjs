@@ -21,6 +21,7 @@ import {
   isInviteOwnerStrength,
   isPairingId,
   isRoleOwnerStrength,
+  normalizeNodeRoles,
   normalizeSettings,
   parsePolicyForInvite,
   readSettings,
@@ -371,12 +372,29 @@ test('formatPairSyncNotice describes synced and pending fleet machines without l
     {
       node: 'tower',
       synced: ['pi'],
-      not_synced: [{ node: 'studio' }],
+      not_synced: [{ node: 'studio', status: 'not_reached' }],
       sync_command: 'legion fleet.sync direction=push documents=\'["devices.toml"]\'',
     },
     true,
   );
   assert.match(partialTech.detail, /legion fleet\.sync/);
+
+  // Partial peer (removals delivered, live device changes refused) is distinguished from not_reached.
+  const partialStatusPlain = formatPairSyncNotice(
+    {
+      node: 'tower',
+      synced: ['pi'],
+      not_synced: [
+        { node: 'studio', status: 'partial', reason: 'live device changes refused' },
+        { node: 'nas', status: 'not_reached' },
+      ],
+    },
+    false,
+  );
+  assert.equal(partialStatusPlain.kind, 'warn');
+  assert.match(partialStatusPlain.detail, /studio received removals, but not this device yet/);
+  assert.match(partialStatusPlain.detail, /nas did not answer/);
+  assert.ok(!partialStatusPlain.detail.includes('fleet.sync'));
 });
 
 test('describeConnectionRoute and buildRelayedConnections render direct, relay, unsynced, and identity-changed routes cleanly', () => {
@@ -403,6 +421,7 @@ test('describeConnectionRoute and buildRelayedConnections render direct, relay, 
   const changed = describeConnectionRoute(
     {
       node: 'mini',
+      origin: 'learned',
       route: 'identity_changed',
       identity_changed: { reported_by: 'tower', old_fingerprints: ['a'], new_fingerprints: ['b'] },
     },
@@ -410,7 +429,23 @@ test('describeConnectionRoute and buildRelayedConnections render direct, relay, 
   );
   assert.equal(changed.isIdentityChanged, true);
   assert.equal(changed.label, 'Identity changed');
-  assert.match(changed.hint, /tower reported a different host key for mini/);
+  assert.match(changed.hint, /tower reported a change for mini/);
+
+  const changedPaired = describeConnectionRoute(
+    {
+      node: 'tower',
+      origin: 'paired',
+      route: 'identity_changed',
+      identity_changed: {
+        reported_by: 'pi',
+        is_paired: true,
+        old_fingerprints: ['a'],
+        new_fingerprints: ['b'],
+      },
+    },
+    false,
+  );
+  assert.match(changedPaired.hint, /pair with tower again/);
 
   const relayed = buildRelayedConnections(
     {
@@ -432,7 +467,46 @@ test('describeConnectionRoute and buildRelayedConnections render direct, relay, 
   );
 });
 
-test('extractInviteRoles and summarizeInvitedDeviceFleet build plain role descriptions and delivery notices', () => {
+test('extractInviteRoles, normalizeNodeRoles, and live policy analysis never hardcode descriptions by role name', () => {
+  // Primary path: device.roles preserves node-supplied descriptions verbatim.
+  const fromNode = normalizeNodeRoles([
+    {
+      name: 'observer',
+      description: 'node custom description for observer',
+      strongest_effect: 'read',
+      owner_strength: false,
+    },
+    {
+      name: 'owner',
+      description: 'everything, including changing who may do what',
+      strongest_effect: 'admin',
+      owner_strength: true,
+    },
+  ]);
+  assert.equal(fromNode.length, 2);
+  assert.equal(fromNode[0].description, 'node custom description for observer');
+  assert.equal(fromNode[0].ownerStrength, false);
+  assert.equal(fromNode[1].ownerStrength, true);
+
+  // Fallback path: descriptions are derived strictly from live policy rules, NOT role names.
+  // Even a role named "observer" that grants effect:admin is described as owner-strength!
+  const swappedPolicy = parsePolicyForInvite(`
+[roles.observer]
+allow = ["effect:admin"]
+
+[roles.operator]
+allow = ["effect:read"]
+
+[roles.helper]
+allow = ["effect:read", "effect:exec"]
+`);
+  const swappedDescObserver = describePolicyRolePlain('observer', swappedPolicy);
+  assert.match(swappedDescObserver, /as strong as owner/);
+  assert.equal(
+    describePolicyRolePlain('operator', swappedPolicy),
+    'look only (read status and files, change nothing)',
+  );
+
   const policy = parsePolicyForInvite(`
 [roles.observer]
 allow = ["effect:read"]
@@ -451,8 +525,11 @@ allow = ["effect:read", "effect:exec"]
     roles.map((r) => r.name),
     ['observer', 'editor', 'operator', 'helper', 'owner'],
   );
-  assert.equal(describePolicyRolePlain('observer', policy), 'Look only');
-  assert.equal(describePolicyRolePlain('helper', policy), 'May look and run commands');
+  assert.equal(
+    describePolicyRolePlain('observer', policy),
+    'look only (read status and files, change nothing)',
+  );
+  assert.match(describePolicyRolePlain('helper', policy), /allows running commands/);
   assert.equal(roles.find((r) => r.name === 'owner').ownerStrength, true);
   assert.equal(roles.find((r) => r.name === 'observer').ownerStrength, false);
 

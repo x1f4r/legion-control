@@ -296,7 +296,7 @@ export async function refreshFleetProgressive({
   };
 
   async function fetchMachineDetails(name, isLocal) {
-    const on = link?.kind === 'app' ? name : isLocal ? undefined : name;
+    const on = name || undefined;
     const onErr = isLocal ? capturePairingError(undefined) : () => {};
     const tasks = [
       callWithTimeout(link, 'sys.info', {}, { on, signal }, detailTimeoutMs)

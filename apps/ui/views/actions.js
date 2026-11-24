@@ -79,6 +79,8 @@ function ActionDetail({
   // Wake: pick an off wakeable machine and confirm.
   if (action.id === 'wake') {
     const wakeable = machines.filter((m) => !m.reachable && m.canWake);
+    const wakeRunner =
+      machines.find((m) => m.reachable)?.name || (localNode !== 'this node' ? localNode : undefined);
     return html`
       <div>
         ${error ? html`<${Notice} error=${error} />` : null}
@@ -106,12 +108,16 @@ function ActionDetail({
                           confirmLabel: copy.confirmLabel,
                           canDryRun: true,
                           async onDryRun() {
-                            return link.call('power.wake', { machine: m.name, dry_run: true });
+                            return link.call(
+                              'power.wake',
+                              { machine: m.name, dry_run: true },
+                              { on: wakeRunner },
+                            );
                           },
                           async onConfirm() {
                             setError(null);
                             try {
-                              await link.call('power.wake', { machine: m.name });
+                              await link.call('power.wake', { machine: m.name }, { on: wakeRunner });
                               if (onWakeSent) onWakeSent(m.name);
                               setResultMsg(`Wake sent to ${m.name} — waiting for it to answer.`);
                               if (onRefreshFleet) onRefreshFleet();
@@ -159,7 +165,7 @@ function ActionDetail({
                       class="row"
                       onClick=${() => {
                         if (isPower && action.tool !== 'power.restart') {
-                          const on = m.name === localNode ? undefined : m.name;
+                          const on = m.name;
                           const liveJobs = Array.isArray(m.jobs) ? m.jobs : [];
                           const copy = describePowerConfirm(
                             action.tool,

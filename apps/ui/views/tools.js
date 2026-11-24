@@ -212,24 +212,23 @@ export function ToolDetail({
   }
 
   function resolveOn() {
-    if (targetMode === 'local') return undefined;
+    const namedLocal = localNode && localNode !== 'this node' ? localNode : undefined;
+    if (targetMode === 'local') return namedLocal;
     if (targetMode === 'all') {
       if (skippedNames.length === 0) return 'all';
       if (answeringNames.length <= 1) {
-        return answeringNames[0] && answeringNames[0] !== localNode
-          ? answeringNames[0]
-          : undefined;
+        return answeringNames[0] || namedLocal;
       }
       return answeringNames;
     }
     if (targetMode === 'multi') {
-      if (multiTargets.length === 0) return undefined;
+      if (multiTargets.length === 0) return namedLocal;
       if (multiTargets.length === 1) {
-        return multiTargets[0] === localNode ? undefined : multiTargets[0];
+        return multiTargets[0];
       }
       return multiTargets;
     }
-    return targetMode === localNode ? undefined : targetMode;
+    return targetMode;
   }
 
   function targetLabel() {
