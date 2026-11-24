@@ -21,7 +21,7 @@
 use std::path::PathBuf;
 
 use legion_core::proto::{ErrorBody, ErrorCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::actuator::Ran;
@@ -63,7 +63,7 @@ impl Platform {
 }
 
 /// What a power call does to the machine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     /// Suspend.
@@ -75,6 +75,15 @@ pub enum Action {
 }
 
 impl Action {
+    /// The action as the result spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Sleep => "sleep",
+            Action::Restart => "restart",
+            Action::Shutdown => "shutdown",
+        }
+    }
+
     /// The action as a phrase: "restart this machine".
     pub fn phrase(self) -> &'static str {
         match self {

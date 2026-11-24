@@ -14,9 +14,11 @@ use std::time::Duration;
 
 use legion_core::proto::ErrorBody;
 use legion_core::{BoxFuture, CancellationToken};
+use legion_os::lock::FileLock;
 use serde::{Deserialize, Serialize};
 
-use super::actuator::{Actuator, Ran};
+use super::actuator::{Actuator, Ran, Scheduled};
+use super::pending;
 
 /// The environment variable naming the directory a test binary's fake reads and writes.
 pub const TEST_POWER_DIR: &str = "LEGION_TEST_POWER";
@@ -108,6 +110,7 @@ pub struct RecordingActuator {
     file: Option<PathBuf>,
     refuse_datagrams: bool,
     refuse_schedules: bool,
+    runners: Mutex<Vec<FileLock>>,
 }
 
 impl RecordingActuator {
@@ -159,6 +162,18 @@ impl RecordingActuator {
     pub fn refusing_schedules(mut self) -> RecordingActuator {
         self.refuse_schedules = true;
         self
+    }
+
+    /// Lets every runner this fake stands in for finish: their locks go, and so does the record of
+    /// what they were to run.
+    pub fn finish_runners(&self) {
+        let finished: Vec<FileLock> = lock(&self.runners).drain(..).collect();
+        for held in finished {
+            if let Some(dir) = held.path().parent() {
+                pending::clear_pending(dir);
+            }
+            drop(held);
+        }
     }
 
     /// Everything recorded so far, in order.
@@ -234,27 +249,25 @@ impl Actuator for RecordingActuator {
         Box::pin(async move { outcome })
     }
 
-    fn schedule<'a>(
-        &'a self,
-        argv: &'a [String],
-        delay: Duration,
-        _log: Option<&'a Path>,
-    ) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
+    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
         self.record(Record::Schedule {
-            argv: argv.to_vec(),
-            delay_s: delay.as_secs(),
+            argv: job.argv.clone(),
+            delay_s: job.delay.as_secs(),
         });
-        let refused = self.refuse_schedules;
-        Box::pin(async move {
-            if refused {
-                Err(ErrorBody::new(
-                    legion_core::proto::ErrorCode::Failed,
-                    "The detached runner could not be started.",
-                ))
-            } else {
-                Ok(Vec::new())
+        let outcome = if self.refuse_schedules {
+            Err(ErrorBody::new(
+                legion_core::proto::ErrorCode::Failed,
+                "The detached runner could not be started.",
+            ))
+        } else {
+            // Stands in for a runner that has taken over and not run yet: it holds the runner
+            // lock until finish_runners, or until this process ends.
+            if let Some(held) = pending::take_runner_lock(&job.dir, Duration::from_secs(5)) {
+                lock(&self.runners).push(held);
             }
-        })
+            Ok(Vec::new())
+        };
+        Box::pin(async move { outcome })
     }
 
     fn send_datagram(&self, payload: &[u8], to: SocketAddrV4) -> Result<(), String> {
@@ -333,13 +346,18 @@ mod tests {
         );
         assert_eq!(special.exit_code, Some(2));
         assert_eq!(other, Ran::exited(0, ""));
-        fake.schedule(
-            &argv(&["systemctl", "reboot"]),
-            Duration::from_secs(3),
-            None,
-        )
-        .await
-        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let job = Scheduled {
+            argv: argv(&["systemctl", "reboot"]),
+            delay: Duration::from_secs(3),
+            dir: dir.path().to_path_buf(),
+            id: "a1".to_owned(),
+        };
+        fake.schedule(&job).await.unwrap();
+        // It stands in for a runner that has taken over, until told it finished.
+        assert!(pending::runner_holds(dir.path()));
+        fake.finish_runners();
+        assert!(!pending::runner_holds(dir.path()));
         fake.send_datagram(&[0xff, 0x02], "192.0.2.255:9".parse().unwrap())
             .unwrap();
         assert_eq!(fake.runs().len(), 5);

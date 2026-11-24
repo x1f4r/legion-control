@@ -19,6 +19,7 @@ pub mod busy;
 mod delay;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
+pub mod pending;
 pub mod plan;
 pub mod wol;
 
@@ -34,10 +35,11 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use self::actuator::{Actuator, Ran, SystemActuator, actuator};
+pub use self::actuator::{Actuator, Ran, Scheduled, SystemActuator, actuator};
 pub use self::delay::{DELAY_MODE, try_delay_cli};
 
 use self::busy::Busy;
+use self::pending::Pending;
 use self::plan::{Action, Answer, Check, Platform, SLEEP_DELAY_S, Timing};
 
 /// The delay `power.restart` and `power.shutdown` use when not given one, and their range.
@@ -46,6 +48,8 @@ const DELAY_S: (u32, u32, u32) = (3, 1, 60);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long each `before_sleep` command, and a command that schedules itself, may take.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a call waits for its delayed runner to take over before giving the action up.
+const HANDOFF_PATIENCE: Duration = Duration::from_secs(15);
 
 /// What every gated tool's description says about the gate.
 const GATE: &str = "Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. `dry_run: true` returns the exact commands without running them.";
@@ -277,6 +281,9 @@ struct StatusResult {
     targets: Vec<TargetInfo>,
     /// Whether system actions run through `sudo -n`.
     sudo: bool,
+    /// The action handed over and not yet run, while there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<Pending>,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +309,7 @@ async fn status(actuator: &Arc<dyn Actuator>, ctx: &Ctx) -> Result<StatusResult,
             })
             .collect(),
         sudo: file.power.sudo && platform.has_sudo(),
+        pending: pending::pending(ctx.paths(), ctx.boot_id().as_deref()),
     })
 }
 
@@ -383,6 +391,17 @@ async fn act(
         file.power.sleep.as_deref(),
         &|name| actuator.find_program(name),
     )?;
+    let boot_id = ctx.boot_id();
+    // One power action at a time, from before the gate until this one is handed over.
+    let _call = if request.dry_run {
+        None
+    } else {
+        Some(pending::begin(
+            ctx.paths(),
+            request.action,
+            boot_id.as_deref(),
+        )?)
+    };
     if !request.force {
         gate(actuator, ctx, &file, what).await?;
     }
@@ -411,7 +430,7 @@ async fn act(
         in_s: request.delay_s,
         into: request.into.clone(),
         entry: arming.as_ref().and_then(|arming| arming.entry.clone()),
-        boot_id: ctx.boot_id(),
+        boot_id: boot_id.clone(),
         commands,
         dry_run: request.dry_run,
         warnings: Vec::new(),
@@ -442,19 +461,26 @@ async fn act(
     if let (Some(arming), Some((name, _))) = (&arming, target) {
         boot::arm(actuator.as_ref(), cancel, platform, sudo, name, arming).await?;
     }
+    let dir = pending::dir(ctx.paths());
+    let mut record = Pending {
+        id: pending::new_id(),
+        action: request.action,
+        into: request.into.clone(),
+        argv: plan.argv.clone(),
+        delay_s: request.delay_s,
+        since: pending::now(),
+        boot_id,
+        runner: plan.timing == Timing::Delayed,
+        taken: None,
+        abandoned: false,
+    };
     let handed = match plan.timing {
-        Timing::Delayed => {
-            let log = ctx.paths().state_dir().join("power").join("scheduled.log");
-            actuator
-                .schedule(
-                    &plan.argv,
-                    Duration::from_secs(u64::from(request.delay_s)),
-                    Some(&log),
-                )
-                .await
-        }
+        Timing::Delayed => hand_over(actuator, &dir, &mut record).await,
         Timing::SelfTimed => match actuator.run(&plan.argv, COMMAND_TIMEOUT, cancel).await {
-            Ok(ran) => plan::read_self_timed(&plan.argv, what, &ran).map(|()| Vec::new()),
+            // Windows times it: the record stands for it until it is due.
+            Ok(ran) => plan::read_self_timed(&plan.argv, what, &ran)
+                .and_then(|()| pending::write_pending(&dir, &record))
+                .map(|()| Vec::new()),
             Err(error) => Err(error),
         },
     };
@@ -471,6 +497,48 @@ async fn act(
     })?;
     result.scheduled = true;
     Ok(result)
+}
+
+/// Records the action, starts its delayed runner and waits until the runner has taken over; on any
+/// failure the record is given up, so a runner that starts late does nothing.
+async fn hand_over(
+    actuator: &Arc<dyn Actuator>,
+    dir: &std::path::Path,
+    record: &mut Pending,
+) -> Result<Vec<String>, ErrorBody> {
+    pending::write_pending(dir, record)?;
+    let job = Scheduled {
+        argv: record.argv.clone(),
+        delay: Duration::from_secs(u64::from(record.delay_s)),
+        dir: dir.to_path_buf(),
+        id: record.id.clone(),
+    };
+    let give_up = |record: &mut Pending| {
+        record.abandoned = true;
+        let _ = pending::write_pending(dir, record);
+    };
+    let warnings = match actuator.schedule(&job).await {
+        Ok(warnings) => warnings,
+        Err(error) => {
+            give_up(record);
+            return Err(error);
+        }
+    };
+    if pending::wait_for_runner(dir, &record.id, HANDOFF_PATIENCE).await {
+        Ok(warnings)
+    } else {
+        Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "The delayed runner did not take the action over within {} seconds, so it was given up and will not run.",
+                HANDOFF_PATIENCE.as_secs()
+            ),
+        )
+        .with_hint(format!(
+            "Its output, if it started at all, is in {}.",
+            delay::log_path(dir).display()
+        )))
+    }
 }
 
 fn find_target<'a>(file: &'a NodeFile, name: &str) -> Result<&'a BootTarget, ErrorBody> {

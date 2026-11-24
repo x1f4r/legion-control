@@ -40,6 +40,10 @@ fn main() -> ExitCode {
             local_tools_gate_dry_run_policy_and_exclusive_jobs,
         ),
         (
+            "one_power_action_at_a_time_on_a_long_lived_node",
+            one_power_action_at_a_time_on_a_long_lived_node,
+        ),
+        (
             "wake_asks_the_first_helper_that_answers_and_waits_for_the_machine",
             wake_asks_the_first_helper_that_answers_and_waits_for_the_machine,
         ),
@@ -401,6 +405,75 @@ fn local_tools_gate_dry_run_policy_and_exclusive_jobs() {
     assert_eq!(denied.json()["code"], json!("denied"), "{}", denied.stdout);
     let looked = laptop.legion(&machine, &["power.status", "--as", "agent:test"]);
     assert_eq!(looked.code, 0, "{}", looked.stderr);
+    assert_eq!(laptop.power_actions().len(), 1);
+}
+
+/// `legion rpc` with a system's fake, answering one call at a time.
+struct Rpc {
+    child: Child,
+    lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+    next: u64,
+}
+
+impl Rpc {
+    fn start(system: &System, machine: &Machine) -> Rpc {
+        let mut child = system
+            .cli(machine, &["rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        Rpc {
+            child,
+            lines: std::io::BufRead::lines(std::io::BufReader::new(stdout)),
+            next: 0,
+        }
+    }
+
+    /// Calls `tool` and returns the reply's `result` or `error`.
+    fn call(&mut self, tool: &str, args: Value) -> Value {
+        self.next += 1;
+        let request = json!({"jsonrpc": "2.0", "id": self.next, "method": "call", "params": {"tool": tool, "args": args}});
+        let stdin = self.child.stdin.as_mut().unwrap();
+        std::io::Write::write_all(stdin, format!("{request}\n").as_bytes()).unwrap();
+        loop {
+            let line = self.lines.next().unwrap().unwrap();
+            let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if reply["id"] == json!(self.next) {
+                return reply
+                    .get("result")
+                    .cloned()
+                    .unwrap_or_else(|| reply["error"]["data"].clone());
+            }
+        }
+    }
+}
+
+impl Drop for Rpc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn one_power_action_at_a_time_on_a_long_lived_node() {
+    let machine = Machine::new("laptop", "boot-1");
+    let laptop = System::new(
+        "name = \"laptop\"\nbusy = \"none\"\n[power]\nsudo = true\nsleep = [\"go-to-sleep\"]\n",
+    );
+    let mut node = Rpc::start(&laptop, &machine);
+    let first = node.call("power.sleep", json!({}));
+    assert_eq!(first["scheduled"], json!(true), "{first}");
+    // The runner the fake stands in for has not run: a second sleep would put the machine back
+    // to sleep as it woke.
+    let second = node.call("power.sleep", json!({}));
+    assert_eq!(second["code"], json!("conflict"), "{second}");
+    let status = node.call("power.status", json!({}));
+    assert_eq!(status["pending"]["action"], json!("sleep"), "{status}");
     assert_eq!(laptop.power_actions().len(), 1);
 }
 

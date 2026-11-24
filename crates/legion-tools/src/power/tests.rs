@@ -471,6 +471,71 @@ async fn before_sleep_runs_first_and_a_failure_stops_the_sleep() {
 }
 
 #[tokio::test]
+async fn one_power_action_is_carried_out_at_a_time() {
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new(),
+        "busy = \"none\"\n[power]\nsudo = true\nsleep = [\"go-to-sleep\"]\n[boot.windows]\narm = [\"arm-windows\"]\nverify = [\"verify-windows\"]\n",
+    );
+    let first = fixture.call("power.sleep", json!({})).await.unwrap();
+    assert_eq!(first["scheduled"], json!(true));
+
+    // Its runner has taken over and not run yet: a second sleep would put the machine back to
+    // sleep as it woke, and a restart would re-arm the firmware, so both are refused.
+    let again = fixture.call("power.sleep", json!({})).await.unwrap_err();
+    assert_eq!(again.code, ErrorCode::Conflict);
+    assert!(
+        again.message.starts_with("A sleep handed over at"),
+        "{}",
+        again.message
+    );
+    let restart = fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap_err();
+    assert_eq!(restart.code, ErrorCode::Conflict);
+    assert!(!fixture.fake.runs().contains(&strings(&["arm-windows"])));
+    assert_eq!(fixture.fake.schedules().len(), 1);
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status["pending"]["action"], json!("sleep"), "{status}");
+    assert_eq!(status["pending"]["argv"], json!(["go-to-sleep"]));
+
+    // Once it has run, the next one goes ahead.
+    fixture.fake.finish_runners();
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status.get("pending"), None, "{status}");
+    let restart = fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap();
+    assert_eq!(restart["scheduled"], json!(true));
+}
+
+#[tokio::test]
+async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let dir = pending::dir(fixture.node.paths());
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocker = pending::take_runner_lock(&dir, std::time::Duration::from_secs(1)).unwrap();
+    let record = Pending {
+        id: "earlier".to_owned(),
+        action: Action::Sleep,
+        into: None,
+        argv: strings(&["x"]),
+        delay_s: 3,
+        since: pending::now(),
+        boot_id: None,
+        runner: true,
+        taken: None,
+        abandoned: false,
+    };
+    pending::write_pending(&dir, &record).unwrap();
+    let error = fixture.call("power.shutdown", json!({})).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict, "{error:?}");
+    assert!(fixture.fake.records().is_empty());
+    drop(blocker);
+}
+
+#[tokio::test]
 async fn arguments_are_checked() {
     let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
     for (tool, args) in [
