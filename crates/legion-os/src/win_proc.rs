@@ -494,6 +494,7 @@ fn build_unicode_env_block(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_detached_direct(
     program_display: &str,
+    application_name: Option<&str>,
     command_line: &str,
     cwd: Option<&Path>,
     env_remove: &[OsString],
@@ -586,6 +587,11 @@ pub(crate) fn spawn_detached_direct(
     si.StartupInfo.hStdError = h_err;
     si.lpAttributeList = attr_list.ptr;
 
+    let app_wide = application_name.map(|app| to_wide_null(OsStr::new(app)));
+    let app_pcwstr = match app_wide {
+        Some(ref buf) => PCWSTR::from_raw(buf.as_ptr()),
+        None => PCWSTR::null(),
+    };
     let mut cmdline_wide: Vec<u16> = command_line
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -604,12 +610,13 @@ pub(crate) fn spawn_detached_direct(
         | EXTENDED_STARTUPINFO_PRESENT;
 
     let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: All pointers (`cmdline_wide`, `env_block`, `cwd_wide`, `si`, `attr_list`,
-    // `handle_list`) remain live and properly aligned/terminated across `CreateProcessW`, and
-    // `si.StartupInfo.cb == size_of::<STARTUPINFOEXW>()` matches `EXTENDED_STARTUPINFO_PRESENT`.
+    // SAFETY: All pointers (`app_wide`, `cmdline_wide`, `env_block`, `cwd_wide`, `si`,
+    // `attr_list`, `handle_list`) remain live and properly aligned/terminated across
+    // `CreateProcessW`, and `si.StartupInfo.cb == size_of::<STARTUPINFOEXW>()` matches
+    // `EXTENDED_STARTUPINFO_PRESENT`.
     let create_res = unsafe {
         CreateProcessW(
-            PCWSTR::null(),
+            app_pcwstr,
             Some(PWSTR::from_raw(cmdline_wide.as_mut_ptr())),
             None,
             None,

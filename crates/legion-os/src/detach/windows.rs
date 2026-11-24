@@ -31,9 +31,9 @@ use crate::win_proc::{self, DirectSpawnError};
 use crate::{OsError, Result};
 
 use super::{
-    DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE, build_wmi_create_script_for_cmdline,
-    build_wmi_launcher_script, merge_windows_env, parse_wmi_handoff, reconcile_wmi_identity,
-    resolve_wmi_program, validate_wmi_batch_target,
+    DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE, build_windows_direct_launch,
+    build_wmi_create_script_for_cmdline, build_wmi_launcher_script, merge_windows_env,
+    parse_wmi_handoff, reconcile_wmi_identity, resolve_wmi_program, validate_wmi_batch_target,
 };
 
 const WMI_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -93,11 +93,16 @@ pub(super) async fn spawn_detached(
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
     let merged_env = merge_windows_env(inherited_str, &env_remove_str, &overrides_str);
 
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .and_then(|v| v.into_string().ok());
     let resolved_program = resolve_wmi_program(&program_display, &base_cwd, &merged_env);
-    let command_line = build_direct_command_line(&resolved_program, &args_vec)?;
+    let (application_name, command_line) =
+        build_windows_direct_launch(&resolved_program, &args_vec, system_root.as_deref())?;
 
     match win_proc::spawn_detached_direct(
         &program_display,
+        application_name.as_deref(),
         &command_line,
         options.cwd.as_deref(),
         &combined_env_remove_os,
@@ -118,28 +123,6 @@ pub(super) async fn spawn_detached(
         Err(DirectSpawnError::BreakawayRefused) => spawn_via_wmi(resolved, options).await,
         Err(DirectSpawnError::Other(err)) => Err(err),
     }
-}
-
-fn build_direct_command_line(program: &str, args: &[String]) -> Result<String> {
-    let trimmed = program.trim().trim_end_matches(['.', ' ']);
-    let lower = trimmed.to_ascii_lowercase();
-    let is_batch = lower.ends_with(".cmd") || lower.ends_with(".bat");
-    if is_batch {
-        validate_wmi_batch_target(program, args)?;
-        let mut inner = windows_cmdline_escape(program);
-        for arg in args {
-            inner.push(' ');
-            inner.push_str(&windows_cmdline_escape(arg));
-        }
-        return Ok(format!("cmd.exe /d /s /c \"{inner}\""));
-    }
-
-    let mut line = windows_cmdline_escape(program);
-    for arg in args {
-        line.push(' ');
-        line.push_str(&windows_cmdline_escape(arg));
-    }
-    Ok(line)
 }
 
 async fn spawn_via_wmi(

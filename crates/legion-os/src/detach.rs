@@ -885,31 +885,84 @@ fn resolve_on_disk_filename(path: &Path) -> PathBuf {
     }
 }
 
-/// Refuse `.cmd`/`.bat` targets on the Windows WMI path unless every argument is free of `cmd.exe`
-/// metacharacters.
-///
-/// Launching a batch file through `CreateProcessW` implicitly routes the command line through
-/// `cmd.exe /c`, where characters like `&`, `|`, `<`, `>`, `^`, `%`, `!`, `"`, or newlines can
-/// inject unintended commands despite MSVCRT quoting.
+/// Return `true` when `program` refers to a Windows batch script (`.cmd` or `.bat`).
 #[allow(dead_code)]
-pub(crate) fn validate_wmi_batch_target(program: &str, args: &[String]) -> Result<()> {
+pub(crate) fn is_windows_batch_file(program: &str) -> bool {
     let trimmed = program.trim().trim_end_matches(['.', ' ']);
     let lower = trimmed.to_ascii_lowercase();
-    let is_batch = lower.ends_with(".cmd") || lower.ends_with(".bat");
-    if !is_batch {
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
+/// Refuse `.cmd`/`.bat` targets on Windows unless both the batch path itself and every argument
+/// are free of `cmd.exe` metacharacters.
+///
+/// Launching a batch file runs through `cmd.exe /c`, where characters like `&`, `|`, `<`, `>`,
+/// `^`, `%`, `!`, `"`, or newlines in either the program path (such as `C:\R&D\x.cmd`) or any
+/// argument can inject unintended commands despite quoting.
+#[allow(dead_code)]
+pub(crate) fn validate_wmi_batch_target(program: &str, args: &[String]) -> Result<()> {
+    if !is_windows_batch_file(program) {
         return Ok(());
+    }
+
+    if !is_safe_cmd_batch_arg(program) {
+        return Err(OsError::InvalidArgument {
+            detail: format!(
+                "refusing to launch batch file {program:?} because its path contains cmd.exe metacharacters; invoke the underlying executable directly or use CommandSpec::Shell"
+            ),
+        });
     }
 
     for (idx, arg) in args.iter().enumerate() {
         if !is_safe_cmd_batch_arg(arg) {
             return Err(OsError::InvalidArgument {
                 detail: format!(
-                    "refusing to launch batch file {program:?} via WMI because argument {idx} contains cmd.exe metacharacters; invoke the underlying executable directly or use CommandSpec::Shell"
+                    "refusing to launch batch file {program:?} because argument {idx} contains cmd.exe metacharacters; invoke the underlying executable directly or use CommandSpec::Shell"
                 ),
             });
         }
     }
     Ok(())
+}
+
+/// Build `(lpApplicationName, lpCommandLine)` for direct Windows `CreateProcessW` launches.
+///
+/// For `.cmd`/`.bat` targets, validates both the batch path and arguments against `cmd.exe`
+/// metacharacters, always quotes the batch path (even without spaces), and passes the full
+/// `%SystemRoot%\System32\cmd.exe` path as `lpApplicationName` so `CreateProcessW` never resolves
+/// a stray `cmd.exe` from the working directory or `PATH`.
+#[allow(dead_code)]
+pub(crate) fn build_windows_direct_launch(
+    program: &str,
+    args: &[String],
+    system_root: Option<&str>,
+) -> Result<(Option<String>, String)> {
+    if is_windows_batch_file(program) {
+        validate_wmi_batch_target(program, args)?;
+        let root = system_root
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(r"C:\Windows")
+            .trim_end_matches(['\\', '/']);
+        let cmd_exe = format!(r"{root}\System32\cmd.exe");
+
+        // Always quote `program` (safe because `validate_wmi_batch_target` rejected `"`, trailing
+        // `\`, and all cmd metacharacters in `program`).
+        let mut inner = format!("\"{program}\"");
+        for arg in args {
+            inner.push(' ');
+            inner.push_str(&windows_cmdline_escape(arg));
+        }
+        let command_line = format!("\"{cmd_exe}\" /d /s /c \"{inner}\"");
+        return Ok((Some(cmd_exe), command_line));
+    }
+
+    let mut line = windows_cmdline_escape(program);
+    for arg in args {
+        line.push(' ');
+        line.push_str(&windows_cmdline_escape(arg));
+    }
+    Ok((None, line))
 }
 
 #[allow(dead_code)]
@@ -1156,6 +1209,39 @@ mod tests {
                 "expected batch rejection for arg {dangerous:?}"
             );
         }
+
+        // Batch paths containing cmd.exe metacharacters (such as `C:\R&D\x.cmd`) must be refused.
+        for dangerous_path in [
+            r"C:\R&D\x.cmd",
+            r"C:\dir(1)\run.bat",
+            r"C:\tmp\%TEMP%\job.cmd",
+        ] {
+            assert!(
+                matches!(
+                    build_windows_direct_launch(dangerous_path, &[], Some(r"C:\Windows")),
+                    Err(OsError::InvalidArgument { .. })
+                ),
+                "expected batch path rejection for {dangerous_path:?}"
+            );
+            assert!(
+                matches!(
+                    validate_wmi_batch_target(dangerous_path, &[]),
+                    Err(OsError::InvalidArgument { .. })
+                ),
+                "expected WMI batch path rejection for {dangerous_path:?}"
+            );
+        }
+
+        // Safe batch paths on the direct path are always quoted and launched via full
+        // `%SystemRoot%\System32\cmd.exe` as lpApplicationName.
+        let (app, cmdline) =
+            build_windows_direct_launch(r"C:\safe\x.cmd", &["--ok".into()], Some(r"D:\WinNT\"))
+                .unwrap();
+        assert_eq!(app.as_deref(), Some(r"D:\WinNT\System32\cmd.exe"));
+        assert_eq!(
+            cmdline,
+            r#""D:\WinNT\System32\cmd.exe" /d /s /c ""C:\safe\x.cmd" --ok""#
+        );
 
         // Non-batch executables allow arbitrary arguments without restriction.
         assert!(
