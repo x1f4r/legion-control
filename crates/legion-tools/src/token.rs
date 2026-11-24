@@ -37,19 +37,19 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "token.add",
         Effect::Admin,
-        "Make a bearer token for `legion serve`, standing for one principal that policy.toml names. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for owner is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so it is refused unless allow_owner is true.",
+        "Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any but owner when its role delegates. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for owner is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so only owner may make one, and only with allow_owner true.",
         add,
     );
     registry.add_fn(
         "token.list",
         Effect::Admin,
-        "List the tokens `legion serve` accepts: each one's name, principal, when it was made and when it expires. The tokens themselves are not kept, so they cannot be shown.",
+        "List the tokens `legion serve` accepts for principals the caller could act as: each one's name, principal, when it was made and when it expires. The tokens themselves are not kept, so they cannot be shown.",
         list,
     );
     registry.add_fn(
         "token.remove",
         Effect::Admin,
-        "Remove a token, so `legion serve` refuses it from its next request on.",
+        "Remove a token of a principal the caller could act as, so `legion serve` refuses it from its next request on and ends its MCP sessions.",
         remove,
     );
 }
@@ -87,6 +87,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
         .map_err(|message| ErrorBody::new(ErrorCode::InvalidArgs, format!("name: {message}.")))?;
     let principal = Principal::parse(&args.principal)?;
     let principal = principal.as_str().to_owned();
+    may_manage(ctx, &principal)?;
     if principal == OWNER {
         if !args.allow_owner {
             return Err(ErrorBody::new(
@@ -189,6 +190,7 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<Listing, ToolError> {
     let tokens = file
         .tokens
         .iter()
+        .filter(|(_, entry)| may_manage(ctx, entry.principal.as_str()).is_ok())
         .map(|(name, entry)| Listed {
             name: name.clone(),
             principal: entry.principal.as_str().to_owned(),
@@ -223,10 +225,19 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     let name = args.name.clone();
     let file = ctx.config().path_of::<Tokens>();
     let lock = lock_path(ctx);
+    // Which tokens the caller may see, decided before the file is locked: a token of a principal
+    // it may not act as is treated exactly like one that does not exist.
+    let caller = Caller::of(ctx);
     blocking(move || {
         update(&file, &lock, |current, doc| {
-            if !current.tokens.contains_key(&name) {
-                let known: Vec<&str> = current.tokens.keys().map(String::as_str).collect();
+            let visible = |entry: &tokens::TokenEntry| caller.may_manage(entry.principal.as_str());
+            if !current.tokens.get(&name).is_some_and(visible) {
+                let known: Vec<&str> = current
+                    .tokens
+                    .iter()
+                    .filter(|(_, entry)| visible(entry))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
                 let hint = if known.is_empty() {
                     "There are no tokens.".to_owned()
                 } else {
@@ -247,6 +258,56 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         name: args.name,
         removed: true,
     })
+}
+
+/// Who is calling a token tool, as far as deciding whose tokens it may manage goes.
+struct Caller {
+    principal: String,
+    delegates: bool,
+}
+
+impl Caller {
+    fn of(ctx: &Ctx) -> Caller {
+        Caller {
+            principal: ctx.principal().to_owned(),
+            delegates: ctx.grant().delegates(),
+        }
+    }
+
+    /// Whether the caller may make, see or remove a token for `principal`: one it could act as
+    /// itself, so a token never gives anyone more than they already have. That is its own
+    /// principal, or any when its role delegates, except owner: a token for owner is the keys to
+    /// the machine, which only owner may hand out.
+    fn may_manage(&self, principal: &str) -> bool {
+        principal == self.principal || (self.delegates && principal != OWNER)
+    }
+}
+
+/// [`Caller::may_manage`] as the error that says which rule refused it.
+fn may_manage(ctx: &Ctx, principal: &str) -> Result<(), ErrorBody> {
+    let caller = Caller::of(ctx);
+    if caller.may_manage(principal) {
+        return Ok(());
+    }
+    let (message, hint) = if principal == OWNER {
+        (
+            format!(
+                "{} may not make a token for owner: only owner may, since such a token may do everything the account can.",
+                caller.principal
+            ),
+            "Ask the owner of this machine to make it.",
+        )
+    } else {
+        (
+            format!(
+                "{} may not make a token for {principal}: a token may stand only for the caller itself unless the caller's role, {}, delegates.",
+                caller.principal,
+                ctx.grant().role()
+            ),
+            "Ask the owner of this machine to make the token, or give the caller's role delegate = true in policy.toml.",
+        )
+    };
+    Err(ErrorBody::new(ErrorCode::Denied, message).with_hint(hint))
 }
 
 /// A token as the file will keep it.

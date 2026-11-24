@@ -321,8 +321,10 @@ pub struct NodeFile {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeConfig {
-    /// Browser origins (`https://app.example.net`) whose pages may call the server. A request
-    /// from any other page is refused, so a site open in a browser on this machine cannot use it.
+    /// Browser pages allowed to call this API, by origin (`https://app.example.net`). Their
+    /// requests are answered with the CORS headers that let the page read the answer, and their
+    /// preflights without a token. A request from any other page is refused, so a site open in a
+    /// browser on this machine cannot use the server.
     #[serde(default)]
     pub origins: Vec<String>,
     /// Host names the server answers to besides loopback, such as the name Tailscale Serve

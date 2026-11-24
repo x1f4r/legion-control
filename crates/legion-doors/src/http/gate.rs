@@ -8,6 +8,8 @@ use axum::http::{HeaderMap, Uri};
 use legion_core::config::ServeConfig;
 use legion_core::tokens::Tokens;
 
+use crate::Authenticated;
+
 /// Why a request's token will not do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -17,24 +19,43 @@ pub(crate) enum Refusal {
     BadToken,
 }
 
+/// Why a request is not well formed enough to judge, when it is not: every header the gate
+/// decides by is given once at most, so what is checked is what is used, and the host is named
+/// once, as text, in `Host` and in nothing that disagrees with it.
+pub(crate) fn malformed(headers: &HeaderMap, uri: &Uri) -> Option<&'static str> {
+    for (name, message) in [
+        (HOST, "The request names its host more than once."),
+        (ORIGIN, "The request gives more than one Origin."),
+        (
+            AUTHORIZATION,
+            "The request gives more than one Authorization.",
+        ),
+    ] {
+        if headers.get_all(name).iter().nth(1).is_some() {
+            return Some(message);
+        }
+    }
+    let Some(host) = headers.get(HOST) else {
+        return Some("The request has no Host header.");
+    };
+    let Ok(host) = host.to_str() else {
+        return Some("The request's Host header is not text.");
+    };
+    if let Some(authority) = uri.authority()
+        && !authority.as_str().eq_ignore_ascii_case(host.trim())
+    {
+        return Some("The request names one host in its target and another in Host.");
+    }
+    None
+}
+
 /// Whether the request's `Host` is this server: a loopback name or address with the port it
 /// listens on, or one of the names `[serve] hosts` gives. A request naming no host is refused,
 /// since a client that names none cannot be told apart from one that names the wrong one.
-pub(crate) fn host_allowed(
-    headers: &HeaderMap,
-    uri: &Uri,
-    port: u16,
-    config: &ServeConfig,
-) -> bool {
-    let named = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| {
-            uri.authority()
-                .map(|authority| authority.as_str().to_owned())
-        });
-    let Some((host, given_port)) = named.as_deref().and_then(split_authority) else {
+/// [`malformed`] has already made sure there is one `Host` and nothing disagreeing with it.
+pub(crate) fn host_allowed(headers: &HeaderMap, port: u16, config: &ServeConfig) -> bool {
+    let named = headers.get(HOST).and_then(|value| value.to_str().ok());
+    let Some((host, given_port)) = named.and_then(split_authority) else {
         return false;
     };
     let loopback = host == "localhost"
@@ -70,8 +91,8 @@ pub(crate) fn origin_allowed(headers: &HeaderMap, config: &ServeConfig) -> bool 
         .any(|allowed| normalise_origin(allowed) == origin)
 }
 
-/// The principal the request's bearer token stands for.
-pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<String, Refusal> {
+/// Who the request's bearer token says it is.
+pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<Authenticated, Refusal> {
     let Some(value) = headers.get(AUTHORIZATION) else {
         return Err(Refusal::NoToken);
     };
@@ -81,8 +102,12 @@ pub(crate) fn principal(headers: &HeaderMap, tokens: &Tokens) -> Result<String, 
         return Err(Refusal::BadToken);
     }
     tokens
-        .verify(token.trim(), jiff::Timestamp::now())
-        .map(str::to_owned)
+        .verify_entry(token.trim(), jiff::Timestamp::now())
+        .map(|(name, entry)| Authenticated {
+            principal: entry.principal.as_str().to_owned(),
+            token: name.to_owned(),
+            hash: entry.hash.clone(),
+        })
         .ok_or(Refusal::BadToken)
 }
 
@@ -141,12 +166,7 @@ mod tests {
     }
 
     fn host_ok(host: &str, config: &ServeConfig) -> bool {
-        host_allowed(
-            &headers(&[("host", host)]),
-            &Uri::from_static("/"),
-            7117,
-            config,
-        )
+        host_allowed(&headers(&[("host", host)]), 7117, config)
     }
 
     #[test]
@@ -174,12 +194,31 @@ mod tests {
         ] {
             assert!(!host_ok(host, &none), "{host}");
         }
-        assert!(!host_allowed(
-            &HeaderMap::new(),
-            &Uri::from_static("/"),
-            7117,
-            &none
-        ));
+        assert!(!host_allowed(&HeaderMap::new(), 7117, &none));
+    }
+
+    #[test]
+    fn a_request_names_its_host_once_and_each_deciding_header_once() {
+        let target = Uri::from_static("/v1/tools");
+        let host = || headers(&[("host", "127.0.0.1:7117")]);
+        assert_eq!(malformed(&host(), &target), None);
+        assert!(malformed(&HeaderMap::new(), &target).is_some());
+        for name in [HOST, ORIGIN, AUTHORIZATION] {
+            let mut twice = host();
+            twice.append(name.clone(), HeaderValue::from_static("a"));
+            twice.append(name.clone(), HeaderValue::from_static("b"));
+            assert!(malformed(&twice, &target).is_some(), "{name}");
+        }
+        let mut binary = HeaderMap::new();
+        binary.insert(
+            HOST,
+            HeaderValue::from_bytes(b"127.0.0.1:7117\xff").unwrap(),
+        );
+        assert!(malformed(&binary, &target).is_some());
+        let absolute = Uri::from_static("http://evil.example:7117/v1/tools");
+        assert!(malformed(&host(), &absolute).is_some());
+        let same = Uri::from_static("http://127.0.0.1:7117/v1/tools");
+        assert_eq!(malformed(&host(), &same), None);
     }
 
     #[test]

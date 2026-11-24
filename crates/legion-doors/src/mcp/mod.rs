@@ -146,7 +146,7 @@ impl McpDoor {
             .extensions
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<Authenticated>())
-            .map(|authenticated| Some(authenticated.0.clone()))
+            .map(|authenticated| Some(authenticated.principal.clone()))
             .ok_or_else(|| {
                 self.door_error(
                     ErrorCode::Denied,
@@ -283,7 +283,7 @@ impl McpDoor {
             Err(error) => return RouteOutcome::One(Err(error)),
         };
         // Over HTTP every call also ends when the server shuts down, and waits for a permit.
-        let (cancel, _permit, _linked) = match &self.http {
+        let (cancel, permit, _linked) = match &self.http {
             None => (context.ct.clone(), None, None),
             Some(link) => {
                 let Ok(permit) = Arc::clone(&link.limit).try_acquire_owned() else {
@@ -328,9 +328,12 @@ impl McpDoor {
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);
-        let running = self
-            .calls
-            .spawn(async move { router.call(&node, call, on).await });
+        // The permit goes with the call, so a call still stopping after its request was dropped
+        // counts against the limit until it has.
+        let running = self.calls.spawn(async move {
+            let _permit = permit;
+            router.call(&node, call, on).await
+        });
         let joined = match (forwarder, queue) {
             (Some(forwarder), Some(queue)) => forwarder.forward_during(queue, running).await,
             _ => running.await,

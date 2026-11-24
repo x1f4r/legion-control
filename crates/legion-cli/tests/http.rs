@@ -91,6 +91,27 @@ fn main() -> ExitCode {
             "shutting_down_cancels_and_records_calls",
             shutting_down_cancels_and_records_calls,
         ),
+        (
+            "a_token_gives_no_one_more_than_they_have",
+            a_token_gives_no_one_more_than_they_have,
+        ),
+        (
+            "an_mcp_session_belongs_to_its_token",
+            an_mcp_session_belongs_to_its_token,
+        ),
+        (
+            "headers_the_gate_decides_by_come_once",
+            headers_the_gate_decides_by_come_once,
+        ),
+        (
+            "a_listed_origin_can_call_from_a_browser",
+            a_listed_origin_can_call_from_a_browser,
+        ),
+        (
+            "leaving_an_mcp_session_call_cancels_it",
+            leaving_an_mcp_session_call_cancels_it,
+        ),
+        ("mcp_takes_post_and_delete", mcp_takes_post_and_delete),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -125,9 +146,19 @@ fn main() -> ExitCode {
 
 /// `--http-helper rpc <legion_home> <user_home>`: `legion rpc` for another node, which the
 /// `command` connector starts with this node's environment.
+///
+/// `--http-helper wait <marker>`: writes the marker and waits a minute, a command a test can see
+/// start before it does what it means to test to a running call.
 fn helper(args: &[String]) -> ExitCode {
+    if let [mode, marker] = args
+        && mode == "wait"
+    {
+        std::fs::write(marker, b"started").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+        return ExitCode::SUCCESS;
+    }
     let [mode, legion_home, user_home] = args else {
-        eprintln!("the helper takes rpc, a LEGION_HOME and a home");
+        eprintln!("the helper takes rpc, a LEGION_HOME and a home, or wait and a marker");
         return ExitCode::from(2);
     };
     assert_eq!(mode, "rpc");
@@ -175,6 +206,8 @@ struct Server {
     child: Child,
     port: u16,
     stderr: Arc<Mutex<String>>,
+    /// Says when the stderr reader has read everything there is.
+    read_all: mpsc::Receiver<()>,
 }
 
 impl Server {
@@ -190,6 +223,7 @@ impl Server {
         let seen = Arc::new(Mutex::new(String::new()));
         let (ports, port) = mpsc::channel();
         let collected = Arc::clone(&seen);
+        let (finished, read_all) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
@@ -201,6 +235,7 @@ impl Server {
                 all.push_str(&line);
                 all.push('\n');
             }
+            let _ = finished.send(());
         });
         let port = port
             .recv_timeout(PATIENCE)
@@ -209,6 +244,7 @@ impl Server {
             child,
             port,
             stderr: seen,
+            read_all,
         }
     }
 
@@ -232,8 +268,9 @@ impl Server {
         let deadline = Instant::now() + PATIENCE;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
-                // Let the reader thread take the last lines.
-                std::thread::sleep(Duration::from_millis(100));
+                self.read_all
+                    .recv_timeout(PATIENCE)
+                    .expect("stderr did not end with the server");
                 return status.code().unwrap_or(-1);
             }
             assert!(Instant::now() < deadline, "legion serve did not stop");
@@ -471,6 +508,37 @@ impl Events {
                 .push_str(std::str::from_utf8(&chunk[..size]).unwrap());
         }
     }
+}
+
+/// Starts a call that runs until cancelled, through `exec.run` with a token whose role may use it,
+/// and returns its connection once the command is seen running.
+fn running_call(server: &Server, token: &str, home: &Home) -> TcpStream {
+    let marker = home.home().join("call-started");
+    let _ = std::fs::remove_file(&marker);
+    let argv = [
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        HELPER_FLAG.to_owned(),
+        "wait".to_owned(),
+        marker.to_string_lossy().into_owned(),
+    ];
+    let stream = send(
+        server.port,
+        "POST",
+        "/v1/call",
+        &auth(Some(token)),
+        json!({"tool": "exec.run", "args": {"argv": argv}})
+            .to_string()
+            .as_bytes(),
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "the command never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stream
 }
 
 /// Waits for the audit log to hold a line that `wanted` accepts, and returns it.
@@ -801,20 +869,11 @@ fn a_client_that_goes_away_cancels_its_call() {
             assert_eq!(events.next().unwrap().0, "event");
             drop(events);
         } else {
-            let stream = send(
-                server.port,
-                "POST",
-                "/v1/call",
-                &auth(Some(&fixture.phone)),
-                json!({"tool": "test.sleep", "args": {"seconds": 60}})
-                    .to_string()
-                    .as_bytes(),
-            );
-            std::thread::sleep(Duration::from_millis(300));
-            drop(stream);
+            drop(running_call(&server, &fixture.admin, &fixture.home));
         }
         let line = audited(&fixture.home, |line| {
-            line["tool"] == json!("test.sleep") && line["outcome"] == json!("cancelled")
+            (line["tool"] == json!("test.sleep") || line["tool"] == json!("exec.run"))
+                && line["outcome"] == json!("cancelled")
         });
         assert_eq!(line["door"], json!("http"));
         assert!(
@@ -1233,23 +1292,424 @@ fn token_tools_guard_principals_and_keep_comments() {
 fn shutting_down_cancels_and_records_calls() {
     let fixture = Fixture::new();
     let mut server = Server::start(&fixture.home);
-    let stream = send(
-        server.port,
-        "POST",
-        "/v1/call",
-        &auth(Some(&fixture.phone)),
-        json!({"tool": "test.sleep", "args": {"seconds": 60}})
-            .to_string()
-            .as_bytes(),
-    );
-    std::thread::sleep(Duration::from_millis(300));
+    let stream = running_call(&server, &fixture.admin, &fixture.home);
     let started = Instant::now();
     assert_eq!(server.stop(), if cfg!(unix) { 0 } else { 1 });
     assert!(started.elapsed() < Duration::from_secs(15));
     drop(stream);
     if cfg!(unix) {
-        let line = audited(&fixture.home, |line| line["tool"] == json!("test.sleep"));
+        let line = audited(&fixture.home, |line| line["tool"] == json!("exec.run"));
         assert_eq!(line["outcome"], json!("cancelled"));
         assert!(server.stderr().contains("legion serve: stopped"));
+    }
+}
+
+fn a_token_gives_no_one_more_than_they_have() {
+    let home = Home::new();
+    home.write_config(
+        "policy.toml",
+        &format!("{POLICY}\n[principals.keeper]\nrole = \"keeper\"\n\n[roles.keeper]\nallow = [\"effect:admin\"]\n"),
+    );
+    let refused = |line: &[&str], says: &str| {
+        let mut line = line.to_vec();
+        line.push("--json");
+        let run = home.run(&line);
+        assert_eq!(run.code, 1, "{line:?}: {}", run.stdout);
+        let error = run.json();
+        assert_eq!(error["code"], json!("denied"), "{line:?}: {error}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(says), "{line:?}: {message}");
+    };
+    // A role that may only administer cannot mint its way to more.
+    refused(
+        &[
+            "token",
+            "add",
+            "x",
+            "owner",
+            "allow_owner=true",
+            "--as",
+            "keeper",
+        ],
+        "only owner may",
+    );
+    refused(
+        &["token", "add", "x", "phone", "--as", "keeper"],
+        "unless the caller's role, keeper, delegates",
+    );
+    refused(
+        &[
+            "token",
+            "add",
+            "x",
+            "owner",
+            "allow_owner=true",
+            "--as",
+            "admin",
+        ],
+        "only owner may",
+    );
+    let keeper = make_token(&home, &["keeper", "keeper", "--as", "keeper"]);
+    make_token(&home, &["phone", "phone", "--as", "admin"]);
+    make_token(&home, &["root", "owner", "allow_owner=true"]);
+
+    let names = |line: &[&str]| -> Vec<String> {
+        let mut line = line.to_vec();
+        line.push("--json");
+        home.run(&line).json()["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|token| token["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(names(&["token", "list", "--as", "keeper"]), ["keeper"]);
+    assert_eq!(
+        names(&["token", "list", "--as", "admin"]),
+        ["keeper", "phone"]
+    );
+    assert_eq!(names(&["token", "list"]), ["keeper", "phone", "root"]);
+    for (name, caller) in [("phone", "keeper"), ("root", "admin")] {
+        let removed = home.run(&["token", "remove", name, "--as", caller, "--json"]);
+        assert_eq!(
+            removed.json()["code"],
+            json!("not_found"),
+            "{name} as {caller}"
+        );
+    }
+
+    // The way it was found: over HTTP, with the keeper's own token.
+    let server = Server::start(&home);
+    let minted = server.call(
+        &keeper,
+        json!({"tool": "token.add", "args": {"name": "x", "principal": "owner", "allow_owner": true}}),
+    );
+    assert_eq!(minted.status, 403, "{}", minted.text());
+    assert!(!minted.text().contains("lgn_"));
+    assert_eq!(names(&["token", "list"]), ["keeper", "phone", "root"]);
+}
+
+/// Opens an MCP session of the revision with a handshake, and returns its id.
+fn open_session(server: &Server, token: &str) -> String {
+    let mut mcp = Mcp {
+        server,
+        token,
+        path: "/mcp",
+        session: None,
+        inline: false,
+        next_id: 0,
+    };
+    mcp.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }),
+    );
+    let session = mcp.session.clone().expect("no session header");
+    let initialized = mcp.post(
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        "notifications/initialized",
+        None,
+    );
+    assert_eq!(initialized.status, 202);
+    session
+}
+
+/// What `token` gets for `tools/list` (or, with `DELETE`, for ending the session) in `session`.
+fn in_session(server: &Server, token: &str, session: &str, method: &str) -> Reply {
+    let mcp = Mcp {
+        server,
+        token,
+        path: "/mcp",
+        session: Some(session.to_owned()),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/list", None);
+    let body = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+    match method {
+        "DELETE" => http(server.port, "DELETE", "/mcp", &headers, b""),
+        _ => http(
+            server.port,
+            "POST",
+            "/mcp",
+            &headers,
+            body.to_string().as_bytes(),
+        ),
+    }
+}
+
+fn an_mcp_session_belongs_to_its_token() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let admins = open_session(&server, &fixture.admin);
+
+    // Another token gets what a session that does not exist gets, whatever it tries.
+    let unknown = in_session(&server, &fixture.phone, "no-such-session", "POST");
+    assert_eq!(unknown.status, 404);
+    for method in ["POST", "DELETE"] {
+        let reply = in_session(&server, &fixture.phone, &admins, method);
+        assert_eq!(reply.status, 404, "{method}");
+        assert_eq!(reply.body, unknown.body, "{method}");
+        assert!(!reply.text().contains("exec_run"), "{method}");
+    }
+    let still = in_session(&server, &fixture.admin, &admins, "POST");
+    assert_eq!(still.status, 200, "{}", still.text());
+    assert!(still.text().contains("exec_run"));
+
+    // A token holds only so many sessions; its oldest makes way.
+    let first = open_session(&server, &fixture.phone);
+    for _ in 0..16 {
+        open_session(&server, &fixture.phone);
+    }
+    assert_eq!(
+        in_session(&server, &fixture.phone, &first, "POST").status,
+        404
+    );
+    assert_eq!(
+        in_session(&server, &fixture.admin, &admins, "POST").status,
+        200
+    );
+
+    // Removing a token ends its sessions, even when a new token takes its name.
+    let tablet = make_token(&fixture.home, &["tablet", "phone"]);
+    let tablets = open_session(&server, &tablet);
+    assert_eq!(in_session(&server, &tablet, &tablets, "POST").status, 200);
+    fixture.home.run(&["token", "remove", "tablet"]);
+    assert_eq!(in_session(&server, &tablet, &tablets, "POST").status, 401);
+    let tablet = make_token(&fixture.home, &["tablet", "phone"]);
+    assert_eq!(in_session(&server, &tablet, &tablets, "POST").status, 404);
+
+    // A session ended by its own token is gone.
+    assert!((200..300).contains(&in_session(&server, &fixture.admin, &admins, "DELETE").status));
+    assert_eq!(
+        in_session(&server, &fixture.admin, &admins, "POST").status,
+        404
+    );
+}
+
+/// The status a request written byte for byte gets.
+fn raw_status(port: u16, request: &[u8]) -> u16 {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    stream.write_all(request).unwrap();
+    read_head(&mut BufReader::new(stream)).0
+}
+
+fn headers_the_gate_decides_by_come_once() {
+    let fixture = Fixture::new();
+    fixture.home.write_config(
+        "node.toml",
+        "name = \"laptop\"\n\n[serve]\norigins = [\"https://app.example.net\"]\n",
+    );
+    let server = Server::start(&fixture.home);
+    let port = server.port;
+    let host = format!("Host: 127.0.0.1:{port}\r\n");
+    let good = format!("Authorization: Bearer {}\r\n", fixture.phone);
+    let get = |lines: &str| {
+        raw_status(
+            port,
+            format!("GET /v1/tools HTTP/1.1\r\nConnection: close\r\n{lines}\r\n").as_bytes(),
+        )
+    };
+    assert_eq!(get(&format!("{host}{good}")), 200);
+    for (what, lines) in [
+        (
+            "a second Host",
+            format!("{host}Host: evil.example\r\n{good}"),
+        ),
+        (
+            "a second Authorization",
+            format!("{host}{good}Authorization: Bearer lgn_x\r\n"),
+        ),
+        (
+            "a second Origin",
+            format!(
+                "{host}{good}Origin: https://app.example.net\r\nOrigin: https://evil.example\r\n"
+            ),
+        ),
+        ("no Host", good.clone()),
+    ] {
+        assert_eq!(get(&lines), 400, "{what}");
+    }
+    let mut binary =
+        format!("GET /v1/tools HTTP/1.1\r\nConnection: close\r\n{good}Host: 127.0.0.1:{port}")
+            .into_bytes();
+    binary.extend_from_slice(b"\xff\r\n\r\n");
+    assert_eq!(raw_status(port, &binary), 400);
+    let elsewhere = format!(
+        "GET http://evil.example:{port}/v1/tools HTTP/1.1\r\nConnection: close\r\n{host}{good}\r\n"
+    );
+    assert_eq!(raw_status(port, elsewhere.as_bytes()), 400);
+    let here = format!(
+        "GET http://127.0.0.1:{port}/v1/tools HTTP/1.1\r\nConnection: close\r\n{host}{good}\r\n"
+    );
+    assert_eq!(raw_status(port, here.as_bytes()), 200);
+}
+
+fn a_listed_origin_can_call_from_a_browser() {
+    let fixture = Fixture::new();
+    fixture.home.write_config(
+        "node.toml",
+        "name = \"laptop\"\n\n[serve]\norigins = [\"https://app.example.net\"]\n",
+    );
+    let server = Server::start(&fixture.home);
+    let page = "https://app.example.net".to_owned();
+    let asking = |origin: &str| {
+        vec![
+            ("Origin", origin.to_owned()),
+            ("Access-Control-Request-Method", "POST".to_owned()),
+            (
+                "Access-Control-Request-Headers",
+                "authorization, content-type, mcp-session-id".to_owned(),
+            ),
+        ]
+    };
+
+    // The preflight carries no token.
+    let preflight = http(server.port, "OPTIONS", "/v1/call", &asking(&page), b"");
+    assert_eq!(preflight.status, 204);
+    assert_eq!(
+        preflight.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+    let allowed = preflight
+        .header("access-control-allow-headers")
+        .unwrap()
+        .to_ascii_lowercase();
+    for header in [
+        "authorization",
+        "content-type",
+        "accept",
+        "mcp-session-id",
+        "mcp-protocol-version",
+    ] {
+        assert!(allowed.contains(header), "{allowed}");
+    }
+    assert!(
+        preflight
+            .header("access-control-allow-methods")
+            .is_some_and(|methods| methods.contains("POST"))
+    );
+    assert_eq!(preflight.header("access-control-allow-credentials"), None);
+    assert!(
+        preflight
+            .header("vary")
+            .is_some_and(|vary| vary.contains("Origin"))
+    );
+    let mcp = http(server.port, "OPTIONS", "/mcp", &asking(&page), b"");
+    assert_eq!(mcp.status, 204);
+
+    // The call itself, and a refusal, both name the page so it can read them.
+    let mut headers = auth(Some(&fixture.phone));
+    headers.push(("Origin", page.clone()));
+    let called = http(
+        server.port,
+        "POST",
+        "/v1/call",
+        &headers,
+        json!({"tool": "meta.version"}).to_string().as_bytes(),
+    );
+    assert_eq!(called.status, 200);
+    assert_eq!(
+        called.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+    assert!(
+        called
+            .header("vary")
+            .is_some_and(|vary| vary.contains("Origin"))
+    );
+    let refused = http(
+        server.port,
+        "GET",
+        "/v1/tools",
+        &[("Origin", page.clone())],
+        b"",
+    );
+    assert_eq!(refused.status, 401);
+    assert_eq!(
+        refused.header("access-control-allow-origin"),
+        Some(page.as_str())
+    );
+
+    // Any other page gets nothing it could use.
+    let other = http(
+        server.port,
+        "OPTIONS",
+        "/v1/call",
+        &asking("https://evil.example"),
+        b"",
+    );
+    assert_eq!(other.status, 403);
+    assert_eq!(other.header("access-control-allow-origin"), None);
+    // Without an Origin an OPTIONS is no preflight, and needs a token like anything else.
+    assert_eq!(
+        http(server.port, "OPTIONS", "/v1/call", &[], b"").status,
+        401
+    );
+}
+
+fn leaving_an_mcp_session_call_cancels_it() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let session = open_session(&server, &fixture.phone);
+    let mcp = Mcp {
+        server: &server,
+        token: &fixture.phone,
+        path: "/mcp",
+        session: Some(session),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/call", Some("test_sleep"));
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"_meta": {"progressToken": "p"}, "name": "test_sleep", "arguments": {"seconds": 60}}
+    });
+    let stream = send(
+        server.port,
+        "POST",
+        "/mcp",
+        &headers,
+        call.to_string().as_bytes(),
+    );
+    let mut reader = BufReader::new(stream);
+    let (status, _) = read_head(&mut reader);
+    assert_eq!(status, 200);
+    // The call is running once it reports progress; then the client goes.
+    let mut line = String::new();
+    while !line.contains("notifications/progress") {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "the stream ended first"
+        );
+    }
+    let started = Instant::now();
+    drop(reader);
+    let line = audited(&fixture.home, |line| line["tool"] == json!("test.sleep"));
+    assert_eq!(line["outcome"], json!("cancelled"));
+    assert_eq!(line["door"], json!("http"));
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+fn mcp_takes_post_and_delete() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    for method in ["GET", "PUT", "PATCH", "HEAD", "OPTIONS", "TRACE"] {
+        let reply = http(
+            server.port,
+            method,
+            "/mcp",
+            &auth(Some(&fixture.phone)),
+            b"",
+        );
+        assert_eq!(reply.status, 405, "{method}");
+        assert_eq!(reply.header("allow"), Some("POST, DELETE"), "{method}");
     }
 }
