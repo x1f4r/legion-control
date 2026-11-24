@@ -347,10 +347,13 @@ async fn stop_detached_impl(handle: &DetachHandle, grace: Duration) -> Result<Ki
 
 /// Build the PowerShell launcher script executed by WMI `Win32_Process.Create`.
 ///
-/// The launcher starts the target via `System.Diagnostics.Process` with stdin closed and raw
-/// stdout/stderr streams pumped unbuffered into append-mode `FileStream`s, avoiding PowerShell
-/// 5.1's UTF-16 `>>` redirection mangling and keeping the WMI process alive until the target exits.
-#[allow(dead_code)]
+/// The launcher starts the target via `System.Diagnostics.Process` with stdin closed, applies
+/// the merged caller environment (since WMI spawns under the service environment rather than the
+/// caller's), writes the target's real PID and 100-ns `FILETIME` creation timestamp atomically to
+/// `handoff_path`, and pumps raw stdout/stderr streams unbuffered into append-mode `FileStream`s.
+/// When `stdout_path` and `stderr_path` target the same file, a single synchronized `FileStream`
+/// is shared by both streams so concurrent writes never overwrite each other.
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn build_wmi_launcher_script(
     program: &str,
     args: &[String],
@@ -359,6 +362,8 @@ pub(crate) fn build_wmi_launcher_script(
     env: &[(String, String)],
     stdout_path: Option<&str>,
     stderr_path: Option<&str>,
+    handoff_path: &str,
+    self_script_path: Option<&str>,
 ) -> String {
     let escaped_args: String = args
         .iter()
@@ -366,8 +371,15 @@ pub(crate) fn build_wmi_launcher_script(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let shared_output = match (stdout_path, stderr_path) {
+        (Some(out), Some(err)) => same_windows_path(out, err),
+        _ => false,
+    };
+
     let mut lines = vec![
         "$ErrorActionPreference = 'Stop'".to_owned(),
+        format!("$handoffPath = {}", powershell_single_quote(handoff_path)),
+        "$handoffTmp = $handoffPath + '.tmp'".to_owned(),
         "$psi = New-Object System.Diagnostics.ProcessStartInfo".to_owned(),
         format!("$psi.FileName = {}", powershell_single_quote(program)),
         format!(
@@ -405,47 +417,152 @@ pub(crate) fn build_wmi_launcher_script(
         ));
     }
 
-    lines.push(match stdout_path {
-        Some(path) => format!(
-            "$outStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 1, [System.IO.FileOptions]::WriteThrough)",
-            powershell_single_quote(path)
-        ),
-        None => "$outStream = [System.IO.Stream]::Null".to_owned(),
-    });
-    lines.push(match stderr_path {
-        Some(path) => format!(
-            "$errStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 1, [System.IO.FileOptions]::WriteThrough)",
-            powershell_single_quote(path)
-        ),
-        None => "$errStream = [System.IO.Stream]::Null".to_owned(),
-    });
+    lines.extend([
+        "$outStream = $null".to_owned(),
+        "$errStream = $null".to_owned(),
+        "$proc = $null".to_owned(),
+        "try {".to_owned(),
+    ]);
+
+    if shared_output {
+        if let Some(path) = stdout_path {
+            lines.push(format!(
+                "  $rawShared = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 1, [System.IO.FileOptions]::WriteThrough)",
+                powershell_single_quote(path)
+            ));
+            lines.push("  $outStream = [System.IO.Stream]::Synchronized($rawShared)".to_owned());
+            lines.push("  $errStream = $outStream".to_owned());
+        }
+    } else {
+        lines.push(match stdout_path {
+            Some(path) => format!(
+                "  $outStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 1, [System.IO.FileOptions]::WriteThrough)",
+                powershell_single_quote(path)
+            ),
+            None => "  $outStream = [System.IO.Stream]::Null".to_owned(),
+        });
+        lines.push(match stderr_path {
+            Some(path) => format!(
+                "  $errStream = New-Object System.IO.FileStream({}, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete), 1, [System.IO.FileOptions]::WriteThrough)",
+                powershell_single_quote(path)
+            ),
+            None => "  $errStream = [System.IO.Stream]::Null".to_owned(),
+        });
+    }
 
     lines.extend([
-        "try {".to_owned(),
         "  $proc = [System.Diagnostics.Process]::Start($psi)".to_owned(),
         "  $proc.StandardInput.Close()".to_owned(),
+        "  [System.IO.File]::WriteAllText($handoffTmp, (\"{0}:{1}\" -f $proc.Id, $proc.StartTime.ToFileTimeUtc()))".to_owned(),
+        "  [System.IO.File]::Move($handoffTmp, $handoffPath)".to_owned(),
         "  $outTask = $proc.StandardOutput.BaseStream.CopyToAsync($outStream, 4096)".to_owned(),
         "  $errTask = $proc.StandardError.BaseStream.CopyToAsync($errStream, 4096)".to_owned(),
         "  $proc.WaitForExit()".to_owned(),
         "  [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask))".to_owned(),
         "  exit $proc.ExitCode".to_owned(),
+        "} catch {".to_owned(),
+        "  if ($null -eq $proc) {".to_owned(),
+        "    try {".to_owned(),
+        "      [System.IO.File]::WriteAllText($handoffTmp, ('ERR:' + $_.Exception.Message))".to_owned(),
+        "      [System.IO.File]::Move($handoffTmp, $handoffPath)".to_owned(),
+        "    } catch {}".to_owned(),
+        "  }".to_owned(),
+        "  exit 1".to_owned(),
         "} finally {".to_owned(),
         "  if ($null -ne $outStream) { $outStream.Dispose() }".to_owned(),
-        "  if ($null -ne $errStream) { $errStream.Dispose() }".to_owned(),
-        "}".to_owned(),
     ]);
+
+    if !shared_output {
+        lines.push("  if ($null -ne $errStream) { $errStream.Dispose() }".to_owned());
+    }
+    if let Some(script_path) = self_script_path {
+        lines.push(format!(
+            "  Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue",
+            powershell_single_quote(script_path)
+        ));
+    }
+    lines.push("}".to_owned());
 
     lines.join("\n")
 }
 
-/// Build the outer PowerShell script that invokes `Win32_Process.Create` via `Invoke-CimMethod`
-/// and prints the created PID to stdout.
+/// Compare two Windows file paths case-insensitively, treating `/` and `\` as equivalent.
 #[allow(dead_code)]
-pub(crate) fn build_wmi_create_script(launcher_script: &str, cwd: Option<&str>) -> Result<String> {
-    let encoded = encode_utf16le_base64(launcher_script);
-    let command_line = format!(
-        "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
-    );
+pub(crate) fn same_windows_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+/// Merge the caller's environment with `env_remove` exclusions and `overrides` using Windows
+/// case-insensitive variable name semantics.
+#[allow(dead_code)]
+pub(crate) fn merge_windows_env(
+    inherited: impl IntoIterator<Item = (String, String)>,
+    env_remove: &[String],
+    overrides: &[(String, String)],
+) -> Vec<(String, String)> {
+    let removed_lower: Vec<String> = env_remove.iter().map(|k| k.to_ascii_lowercase()).collect();
+    let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    for (key, value) in inherited {
+        let lower = key.to_ascii_lowercase();
+        if removed_lower.contains(&lower) {
+            continue;
+        }
+        merged.insert(lower, (key, value));
+    }
+    for (key, value) in overrides {
+        let lower = key.to_ascii_lowercase();
+        merged.insert(lower, (key.clone(), value.clone()));
+    }
+    merged.into_values().collect()
+}
+
+/// Parse the target identity handoff file written by the WMI launcher (`<pid>:<filetime_ticks>`
+/// or `ERR:<message>`).
+#[allow(dead_code)]
+pub(crate) fn parse_wmi_handoff(contents: &str) -> Result<ProcessId> {
+    let trimmed = contents.trim();
+    if let Some(err_msg) = trimmed.strip_prefix("ERR:") {
+        return Err(OsError::Platform {
+            detail: format!("WMI detached target failed to start: {}", err_msg.trim()),
+        });
+    }
+    let Some((pid_str, start_str)) = trimmed.split_once(':') else {
+        return Err(OsError::Platform {
+            detail: format!("malformed WMI handoff payload: {trimmed:?}"),
+        });
+    };
+    let pid = pid_str
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|&p| p > 0)
+        .ok_or_else(|| OsError::Platform {
+            detail: format!("invalid target PID in WMI handoff: {pid_str:?}"),
+        })?;
+    let start_time = start_str
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&t| t > 0)
+        .ok_or_else(|| OsError::Platform {
+            detail: format!("invalid creation time in WMI handoff: {start_str:?}"),
+        })?;
+    Ok(ProcessId::new(pid, start_time))
+}
+
+/// Build the outer PowerShell script that invokes `Win32_Process.Create` via `Invoke-CimMethod`
+/// for a pre-built `command_line` and prints the created wrapper PID to stdout.
+#[allow(dead_code)]
+pub(crate) fn build_wmi_create_script_for_cmdline(
+    command_line: &str,
+    cwd: Option<&str>,
+) -> Result<String> {
     if command_line.len() > WINDOWS_WMI_MAX_CMDLINE {
         return Err(OsError::InvalidArgument {
             detail: format!(
@@ -459,7 +576,7 @@ pub(crate) fn build_wmi_create_script(launcher_script: &str, cwd: Option<&str>) 
         "$ErrorActionPreference = 'Stop'".to_owned(),
         format!(
             "$cimArgs = @{{ CommandLine = {} }}",
-            powershell_single_quote(&command_line)
+            powershell_single_quote(command_line)
         ),
     ];
     if let Some(dir) = cwd {
@@ -478,6 +595,17 @@ pub(crate) fn build_wmi_create_script(launcher_script: &str, cwd: Option<&str>) 
     Ok(lines.join("\n"))
 }
 
+/// Build the `-EncodedCommand` command line for a launcher script and wrap it in a WMI
+/// `Invoke-CimMethod` creation script.
+#[allow(dead_code)]
+pub(crate) fn build_wmi_create_script(launcher_script: &str, cwd: Option<&str>) -> Result<String> {
+    let encoded = encode_utf16le_base64(launcher_script);
+    let command_line = format!(
+        "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
+    );
+    build_wmi_create_script_for_cmdline(&command_line, cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,18 +620,91 @@ mod tests {
             &[("LEGION_KEY".into(), "it's ok".into())],
             Some(r"C:\Users\me\out.log"),
             Some(r"C:\Users\me\err.log"),
+            r"C:\Users\me\handoff.pid",
+            None,
         );
         assert!(launcher.contains(r"'C:\Users\me\O''Brien\worker.exe'"));
         assert!(launcher.contains(r#"--flag "value with spaces""#));
         assert!(launcher.contains("$psi.EnvironmentVariables.Remove('PSModulePath')"));
         assert!(launcher.contains("$psi.EnvironmentVariables['LEGION_KEY'] = 'it''s ok'"));
         assert!(launcher.contains("[System.IO.FileMode]::Append"));
+        assert!(launcher.contains("$proc.Id, $proc.StartTime.ToFileTimeUtc()"));
         assert!(launcher.contains("[System.Threading.Tasks.Task[]]@($outTask, $errTask)"));
+        assert_eq!(
+            launcher.matches("New-Object System.IO.FileStream").count(),
+            2
+        );
 
         let cim = build_wmi_create_script(&launcher, Some(r"C:\Users\me\work")).unwrap();
         assert!(cim.contains("Invoke-CimMethod -ClassName Win32_Process -MethodName Create"));
         assert!(cim.contains("$cimArgs['CurrentDirectory'] = 'C:\\Users\\me\\work'"));
         assert!(!cim.contains("$args ="));
+    }
+
+    #[test]
+    fn wmi_launcher_shares_single_synchronized_stream_when_stdout_equals_stderr() {
+        let launcher = build_wmi_launcher_script(
+            r"C:\Users\me\worker.exe",
+            &[],
+            None,
+            &[],
+            &[],
+            Some(r"C:\Users\me\combined.log"),
+            Some("c:/users/me/COMBINED.LOG"),
+            r"C:\Users\me\handoff.pid",
+            Some(r"C:\Users\me\temp.ps1"),
+        );
+        assert_eq!(
+            launcher.matches("New-Object System.IO.FileStream").count(),
+            1
+        );
+        assert!(launcher.contains("[System.IO.Stream]::Synchronized($rawShared)"));
+        assert!(launcher.contains("$errStream = $outStream"));
+        assert!(!launcher.contains("$errStream.Dispose()"));
+        assert!(launcher.contains("Remove-Item -LiteralPath 'C:\\Users\\me\\temp.ps1'"));
+    }
+
+    #[test]
+    fn wmi_env_merge_and_handoff_parsing_handle_overrides_and_errors() {
+        let merged = merge_windows_env(
+            [
+                ("Path".into(), r"C:\Windows".into()),
+                (
+                    "PSModulePath".into(),
+                    r"C:\Program Files\PowerShell\7".into(),
+                ),
+                ("LEGION_HOME".into(), r"C:\Users\me\old".into()),
+            ],
+            &["psmodulepath".into()],
+            &[
+                ("legion_home".into(), r"C:\Users\me\new".into()),
+                ("EXTRA".into(), "1".into()),
+            ],
+        );
+        assert!(
+            merged
+                .iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("PSModulePath"))
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("PATH") && v == r"C:\Windows")
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("LEGION_HOME") && v == r"C:\Users\me\new")
+        );
+        assert!(merged.iter().any(|(k, v)| k == "EXTRA" && v == "1"));
+
+        let parsed = parse_wmi_handoff("4321:133700000000000001\n").unwrap();
+        assert_eq!(parsed, ProcessId::new(4321, 133_700_000_000_000_001));
+
+        let err = parse_wmi_handoff("ERR:The system cannot find the file specified").unwrap_err();
+        assert!(matches!(err, OsError::Platform { .. }));
+        assert!(parse_wmi_handoff("not-a-handoff").is_err());
+        assert!(parse_wmi_handoff("0:12345").is_err());
     }
 
     #[test]
