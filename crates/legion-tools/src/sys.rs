@@ -4,17 +4,22 @@
 //! kernel, so every read runs on the blocking pool and the async runtime keeps serving other
 //! calls. CPU usage is a rate, which takes two samples a short interval apart; the interval is
 //! awaited on the runtime between two blocking reads rather than slept through on a thread.
+//!
+//! One rule for every result of the `sys` and `exec` families: a field that may have no value is
+//! left out when it has none, never sent as `null`, so a caller tests for presence and never for
+//! both.
 
 mod disks;
 mod gpu;
-mod stop;
+mod probe;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Ctx, NoArgs, Registry, ToolError};
-use legion_os::procid;
+use legion_core::{Ctx, NoArgs, Registry, ToolError, audit};
+use legion_os::OsError;
+use legion_os::procid::{self, ProcessId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,7 +42,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "sys.procs",
         Effect::Read,
-        "List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory in bytes and start time. `filter` keeps those whose name or command line contains it.",
+        "List the processes running on this machine, busiest first, with their id, parent, name, command line, user, CPU usage (percent of one core), memory in bytes and start time. `filter` keeps those whose name or command line contains it. Command lines are shown with secret-looking values (passwords, tokens, credentials in URLs) replaced by [redacted].",
         procs,
     );
     registry.add_fn(
@@ -61,12 +66,14 @@ pub struct Info {
     /// The node's name.
     pub node: String,
     /// The host name the operating system reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     /// The operating system.
     pub os: Os,
     /// Seconds since the machine booted.
     pub uptime_s: u64,
     /// An identifier that changes on every boot, so a reboot can be told apart from a dropped link.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
     /// The processor.
     pub cpu: Cpu,
@@ -84,10 +91,13 @@ pub struct Os {
     /// `linux`, `macos` or `windows`.
     pub family: &'static str,
     /// The system's own name for itself, such as a Linux distribution's.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Its version.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// The kernel's version.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kernel: Option<String>,
     /// The CPU architecture, such as `x86_64` or `aarch64`.
     pub arch: &'static str,
@@ -243,10 +253,12 @@ pub struct Proc {
     /// Its process id.
     pub pid: u32,
     /// Its parent's, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ppid: Option<u32>,
     /// The program's name.
     pub name: String,
-    /// The command line, cut at 300 characters; empty where the system does not say.
+    /// The command line with secret-looking values replaced by `[redacted]`, cut at 300
+    /// characters; empty where the system does not say.
     pub cmd: String,
     /// The account it runs as, when that can be read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,8 +268,10 @@ pub struct Proc {
     pub cpu_pct: f64,
     /// Resident memory, in bytes.
     pub memory: u64,
-    /// When it started, to the second. `sys.kill` takes it back to be sure of the process.
-    pub start_time: String,
+    /// When it started, to the second, when the system says. `sys.kill` takes it back to be sure
+    /// of the process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
 }
 
 /// The default and the largest `limit` of `sys.procs`.
@@ -305,12 +319,13 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
             .values()
             .filter(|process| process.thread_kind() != Some(ThreadKind::Userland))
             .map(|process| {
-                let cmd = process
+                // Redacted before the filter sees it, so a filter cannot probe for a secret.
+                let words: Vec<String> = process
                     .cmd()
                     .iter()
-                    .map(|part| part.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .map(|part| part.to_string_lossy().into_owned())
+                    .collect();
+                let cmd = audit::redact_command(&words).join(" ");
                 Proc {
                     pid: process.pid().as_u32(),
                     ppid: process.parent().map(Pid::as_u32),
@@ -404,18 +419,10 @@ pub struct Killed {
 
 async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     let pid = args.pid;
-    let own = std::process::id();
-    if pid == 0 || pid == 1 || pid == own {
-        let what = if pid == own {
-            "the legion process answering this call"
-        } else {
-            "part of the operating system itself"
-        };
-        return Err(ErrorBody::new(
-            ErrorCode::Denied,
-            format!("sys.kill does not stop process {pid}: it is {what}."),
-        )
-        .with_hint("Restart or shut down the machine with the power tools instead."));
+    // What can be refused from the pid alone is, before anything is looked up: a process another
+    // account owns may not even let its identity be read.
+    if let Some(reason) = protected_by_pid(pid, std::process::id(), std::env::consts::OS) {
+        return Err(protected(pid, Some(reason)));
     }
     let expected = args
         .start_time
@@ -431,33 +438,68 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
         })
         .transpose()?;
 
-    let (identity, started) = blocking(move || {
-        let started = start_time_of(pid)?;
-        let identity =
-            procid::of_pid(pid).map_err(|error| failed(&format!("read process {pid}"), &error))?;
-        Ok(identity.zip(started))
+    let outcome = blocking(move || {
+        let lookup = identify(pid)?;
+        let probe = match lookup {
+            Lookup::Missing => probe::probe(pid),
+            Lookup::Found(..) | Lookup::NotPermitted => probe::Probe::Unknown,
+        };
+        let outcome = decide(pid, std::process::id(), std::env::consts::OS, lookup, probe);
+        // The rules that need the identity: the processes legion runs under, and those the system
+        // marks as its own.
+        Ok(match outcome {
+            Outcome::Found(identity, started) => match procid::is_protected(&identity) {
+                Some(reason) => Outcome::Protected(reason),
+                None => Outcome::Found(identity, started),
+            },
+            other => other,
+        })
     })
-    .await?
-    .ok_or_else(|| {
-        ErrorBody::new(
-            ErrorCode::NotFound,
-            format!("There is no process {pid} on this machine."),
-        )
-        .with_hint("It may have exited already; sys.procs lists the processes running now.")
-    })?;
-    if let Some(expected) = expected
-        && expected != started
-    {
-        return Err(ErrorBody::new(
-            ErrorCode::Conflict,
-            format!(
-                "Process {pid} started at {}, not at {}: the process that had this id has exited and the id was reused, so nothing was stopped.",
-                rfc3339(started),
-                rfc3339(expected)
-            ),
-        )
-        .with_hint("Look the process up again with sys.procs before stopping it.")
-        .with_details(json!({"pid": pid, "start_time": rfc3339(started)})));
+    .await?;
+    let (identity, started) = match outcome {
+        Outcome::Found(identity, started) => (identity, started),
+        Outcome::Protected(reason) => return Err(protected(pid, Some(reason))),
+        Outcome::NotPermitted => {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!("Process {pid} belongs to another user or to the system, which does not let legion look at it, so it was not stopped."),
+            )
+            .with_hint("Stop it as the account it runs as, or as an administrator.")
+            .with_details(json!({"pid": pid})));
+        }
+        Outcome::NotFound => {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("There is no process {pid} on this machine."),
+            )
+            .with_hint("It may have exited already; sys.procs lists the processes running now."));
+        }
+    };
+    if let Some(expected) = expected {
+        let Some(started) = started else {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("The system does not say when process {pid} started, so it cannot be checked against the start_time given, and nothing was stopped."),
+            )
+            .with_hint("Call sys.kill without start_time if you are sure of the process.")
+            .with_details(json!({"pid": pid})));
+        };
+        if expected != started {
+            let mut details = json!({"pid": pid});
+            if let Some(time) = rfc3339(started) {
+                details["start_time"] = json!(time);
+            }
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "Process {pid} started at {}, not at {}: the process that had this id has exited and the id was reused, so nothing was stopped.",
+                    rfc3339(started).unwrap_or_default(),
+                    rfc3339(expected).unwrap_or_default(),
+                ),
+            )
+            .with_hint("Look the process up again with sys.procs before stopping it.")
+            .with_details(details));
+        }
     }
 
     let grace = if args.force {
@@ -465,17 +507,26 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     } else {
         KILL_GRACE
     };
+    // The identity read above goes all the way down: legion-os checks it again at the moment it
+    // signals, so a process that exits meanwhile and whose id is reused is never hit.
     let survivors = if args.tree {
-        let report = procid::kill_tree(&identity, grace)
-            .await
-            .map_err(|error| failed(&format!("stop process {pid} and its descendants"), &error))?;
+        let report = procid::kill_tree(&identity, grace).await.map_err(|error| {
+            os_error(
+                pid,
+                &format!("stop process {pid} and its descendants"),
+                error,
+            )
+        })?;
         report
             .survivors
             .iter()
             .map(|survivor| survivor.pid)
             .collect()
     } else {
-        stop::one(identity, grace).await?
+        let gone = procid::kill_process(&identity, args.force, grace)
+            .await
+            .map_err(|error| os_error(pid, &format!("stop process {pid}"), error))?;
+        if gone { Vec::new() } else { vec![pid] }
     };
     Ok(Killed {
         pid,
@@ -484,9 +535,87 @@ async fn kill(_ctx: &Ctx, args: KillArgs) -> Result<Killed, ToolError> {
     })
 }
 
-/// When a live process started, in seconds since the epoch, or `None` when there is no such
-/// process. The same clock `sys.procs` reports, so a time read back from it compares equal.
-fn start_time_of(pid: u32) -> Result<Option<u64>, ErrorBody> {
+/// Why sys.kill refuses a process legion-os names as protected: legion itself, the processes it
+/// runs under, and those the operating system cannot do without.
+fn protected(pid: u32, reason: Option<&str>) -> ErrorBody {
+    let reason = reason.unwrap_or("protected");
+    ErrorBody::new(
+        ErrorCode::Denied,
+        format!("sys.kill does not stop process {pid}, which is protected: {reason}."),
+    )
+    .with_hint("Legion never stops itself, the processes it runs under, or the system's own; a process that must go anyway has to be stopped outside legion.")
+    .with_details(json!({"pid": pid, "reason": reason}))
+}
+
+/// What reading a process's identity found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lookup {
+    /// The process, and when it started in seconds since the epoch where the system says.
+    Found(ProcessId, Option<u64>),
+    /// Nothing could be read, which is either no process or one that hides itself.
+    Missing,
+    /// The system refused to say anything about it.
+    NotPermitted,
+}
+
+/// What sys.kill does about a pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// Stops this process, once the rules that need its identity have passed.
+    Found(ProcessId, Option<u64>),
+    /// Refuses: the process is protected, for this reason.
+    Protected(&'static str),
+    /// Refuses: the process exists but belongs to another user or the system.
+    NotPermitted,
+    /// There is no such process.
+    NotFound,
+}
+
+/// The processes refused from the pid alone: the kernel's (0), the first process on Unix (1),
+/// the System process on Windows (4), and legion itself.
+fn protected_by_pid(pid: u32, own: u32, os: &str) -> Option<&'static str> {
+    match pid {
+        0 => Some("kernel / idle process (pid 0)"),
+        1 if os != "windows" => Some("init process (pid 1)"),
+        4 if os == "windows" => Some("Windows System process (pid 4)"),
+        _ if pid == own => Some("current process"),
+        _ => None,
+    }
+}
+
+/// What sys.kill does, given the pid, what reading its identity found, and what asking the system
+/// about the pid said. A process whose identity cannot be read is someone else's when the system
+/// says a process is there, and missing only when it says there is none.
+fn decide(pid: u32, own: u32, os: &str, lookup: Lookup, probe: probe::Probe) -> Outcome {
+    if let Some(reason) = protected_by_pid(pid, own, os) {
+        return Outcome::Protected(reason);
+    }
+    match (lookup, probe) {
+        (Lookup::Found(identity, started), _) => Outcome::Found(identity, started),
+        (Lookup::NotPermitted, _)
+        | (Lookup::Missing, probe::Probe::Exists | probe::Probe::NotPermitted) => {
+            Outcome::NotPermitted
+        }
+        (Lookup::Missing, probe::Probe::Missing | probe::Probe::Unknown) => Outcome::NotFound,
+    }
+}
+
+/// The identity of a live process and when it started.
+///
+/// The seconds are what `sys.procs` reports and a caller passes back; the identity is what
+/// legion-os stops by. Both are read for the same process: the identity is read before and after
+/// the start time, and a process that changed in between counts as gone.
+fn identify(pid: u32) -> Result<Lookup, ErrorBody> {
+    let read = || match procid::of_pid(pid) {
+        Err(OsError::PermissionDenied { .. }) => Ok(Err(Lookup::NotPermitted)),
+        Err(error) => Err(os_error(pid, &format!("read process {pid}"), error)),
+        Ok(None) => Ok(Err(Lookup::Missing)),
+        Ok(Some(identity)) => Ok(Ok(identity)),
+    };
+    let identity = match read()? {
+        Ok(identity) => identity,
+        Err(lookup) => return Ok(lookup),
+    };
     let mut system = System::new().map_err(|error| failed("look the process up", &error))?;
     let target = Pid::from_u32(pid);
     system.refresh_processes_specifics(
@@ -494,15 +623,45 @@ fn start_time_of(pid: u32) -> Result<Option<u64>, ErrorBody> {
         true,
         ProcessRefreshKind::nothing(),
     );
-    Ok(system.process(target).map(sysinfo::Process::start_time))
+    let started = system
+        .process(target)
+        .map(sysinfo::Process::start_time)
+        .filter(|&seconds| seconds > 0);
+    match read()? {
+        Ok(again) if again.matches(&identity) => Ok(Lookup::Found(identity, started)),
+        _ => Ok(Lookup::Missing),
+    }
 }
 
-/// Seconds since the epoch as RFC 3339 UTC.
-fn rfc3339(seconds: u64) -> String {
-    i64::try_from(seconds)
+/// What a failure to read or stop a process means for the caller. The system refusing for lack
+/// of permission is `denied`, whichever way the process was being stopped, and names the process.
+fn os_error(pid: u32, what: &str, error: OsError) -> ErrorBody {
+    match error {
+        OsError::PermissionDenied { .. } => ErrorBody::new(
+            ErrorCode::Denied,
+            format!("The system does not let legion {what}: it belongs to another account, or the system protects it."),
+        )
+        .with_hint("Stop it as the account it runs as, or as an administrator.")
+        .with_details(json!({"pid": pid})),
+        OsError::Unsupported { detail } => ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("This system cannot {what}: {detail}."),
+        )
+        .with_details(json!({"pid": pid})),
+        other => failed(what, &other),
+    }
+}
+
+/// Seconds since the epoch as RFC 3339 UTC. Zero is what the system says when it cannot tell, and
+/// is no time at all.
+fn rfc3339(seconds: u64) -> Option<String> {
+    if seconds == 0 {
+        return None;
+    }
+    let seconds = i64::try_from(seconds).ok()?;
+    jiff::Timestamp::from_second(seconds)
         .ok()
-        .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
-        .map_or_else(|| seconds.to_string(), |time| time.to_string())
+        .map(|time| time.to_string())
 }
 
 /// An RFC 3339 time as whole seconds since the epoch, the resolution `sys.procs` reports.
@@ -586,8 +745,91 @@ mod tests {
     }
 
     #[test]
+    fn protection_and_ownership_are_decided_before_absence() {
+        use probe::Probe;
+        let own = 4242;
+        let found = Lookup::Found(ProcessId::new(77, 1), Some(1));
+        // macOS hides root's launchd from other users: pid 1 reads as missing, and is still
+        // protected, not absent.
+        for os in ["macos", "linux"] {
+            assert_eq!(
+                decide(1, own, os, Lookup::Missing, Probe::NotPermitted),
+                Outcome::Protected("init process (pid 1)")
+            );
+        }
+        assert_eq!(
+            decide(4, own, "windows", Lookup::NotPermitted, Probe::Unknown),
+            Outcome::Protected("Windows System process (pid 4)")
+        );
+        assert!(matches!(
+            decide(0, own, "linux", Lookup::Missing, Probe::Missing),
+            Outcome::Protected(_)
+        ));
+        assert!(matches!(
+            decide(own, own, "macos", found, Probe::Exists),
+            Outcome::Protected(_)
+        ));
+        // Another user's process whose identity cannot be read is theirs, never missing.
+        assert_eq!(
+            decide(500, own, "macos", Lookup::Missing, Probe::NotPermitted),
+            Outcome::NotPermitted
+        );
+        assert_eq!(
+            decide(500, own, "macos", Lookup::Missing, Probe::Exists),
+            Outcome::NotPermitted
+        );
+        assert_eq!(
+            decide(500, own, "windows", Lookup::NotPermitted, Probe::Unknown),
+            Outcome::NotPermitted
+        );
+        assert_eq!(
+            decide(500, own, "linux", Lookup::Missing, Probe::Missing),
+            Outcome::NotFound
+        );
+        assert_eq!(
+            decide(77, own, "linux", found, Probe::Unknown),
+            Outcome::Found(ProcessId::new(77, 1), Some(1))
+        );
+        // Pid 1 and 4 are ordinary on the other family.
+        assert_eq!(
+            decide(1, own, "windows", Lookup::Missing, Probe::Missing),
+            Outcome::NotFound
+        );
+        assert_eq!(
+            decide(4, own, "linux", Lookup::Missing, Probe::Missing),
+            Outcome::NotFound
+        );
+    }
+
+    #[test]
+    fn refusals_by_the_system_are_denied_and_missing_abilities_unsupported() {
+        let denied = os_error(
+            42,
+            "stop process 42",
+            OsError::PermissionDenied {
+                detail: "kill".into(),
+                source: None,
+            },
+        );
+        assert_eq!(denied.code, ErrorCode::Denied);
+        assert_eq!(denied.details, Some(json!({"pid": 42})));
+        let unsupported = os_error(
+            42,
+            "stop process 42",
+            OsError::Unsupported {
+                detail: "no signals".into(),
+            },
+        );
+        assert_eq!(unsupported.code, ErrorCode::Unsupported);
+    }
+
+    #[test]
     fn start_times_round_trip_through_rfc_3339() {
-        assert_eq!(rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(
+            rfc3339(1_700_000_000).as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(rfc3339(0), None);
         assert_eq!(parse_rfc3339("2023-11-14T22:13:20Z"), Some(1_700_000_000));
         assert_eq!(
             parse_rfc3339("2023-11-14T23:13:20+01:00"),

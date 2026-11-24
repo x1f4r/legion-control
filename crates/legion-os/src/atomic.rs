@@ -49,9 +49,11 @@ pub struct WriteOptions {
     /// When `true`, create the target exclusively and fail with [`OsError::AlreadyExists`] if it
     /// already exists instead of replacing it.
     ///
-    /// Commits atomically via hard-link (`std::fs::hard_link`) followed by unlinking the temporary
-    /// name so concurrent creators never overwrite each other. On filesystems that do not support
-    /// hard links (such as FAT/exFAT), falls back to a best-effort existence check plus rename.
+    /// Commits atomically via the kernel's exclusive rename (`renameat2(RENAME_NOREPLACE)` on
+    /// Linux, `renamex_np(RENAME_EXCL)` on macOS, `MoveFileExW` without
+    /// `MOVEFILE_REPLACE_EXISTING` on Windows), falling back to `hard_link` + unlink only when the
+    /// exclusive rename is unsupported by the filesystem. If neither atomic primitive is
+    /// supported, returns [`OsError::Unsupported`] rather than falling back to a replacing rename.
     pub no_replace: bool,
 }
 
@@ -280,68 +282,121 @@ fn inspect_target(target: &Path, no_replace: bool) -> Result<(&Path, Option<Meta
     Ok((parent, existing_meta))
 }
 
+/// Outcome of the platform's kernel exclusive-rename primitive.
+pub(crate) enum ExclusiveRenameError {
+    /// Target path already exists.
+    AlreadyExists,
+    /// Kernel or filesystem does not support exclusive rename; hard-link fallback may be tried.
+    Unsupported,
+    /// Any other I/O or permission error (never triggers a fallback).
+    Io(io::Error),
+}
+
 /// Atomically publish `guard.path` at `target` only if `target` does not yet exist.
 ///
-/// Uses `hard_link` + unlink of the temporary name, which fails atomically with `AlreadyExists`
-/// on POSIX and NTFS/ReFS. Where the underlying filesystem does not support hard links (for
-/// example FAT/exFAT or certain FUSE mounts), falls back to a best-effort existence check and
-/// rename, which carries a narrow TOCTOU window only on those filesystems.
+/// Prefers the kernel's exclusive rename (`renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`,
+/// or `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`), falls back to `hard_link` + unlink ONLY
+/// when exclusive rename is unsupported, and returns [`OsError::Unsupported`] rather than ever
+/// replacing an existing file when neither atomic mechanism is available.
 fn commit_exclusive(guard: &mut TempFileGuard, target: &Path) -> Result<()> {
-    match fs::hard_link(&guard.path, target) {
-        Ok(()) => {
-            // Target now points to the synced inode; remove the temporary name.
-            let _ = fs::remove_file(&guard.path);
-            guard.disarm();
-            Ok(())
-        }
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(OsError::AlreadyExists {
-            path: target.to_path_buf(),
-        }),
-        Err(err) if is_hard_link_unsupported(&err) => {
-            if fs::symlink_metadata(target).is_ok() {
-                return Err(OsError::AlreadyExists {
-                    path: target.to_path_buf(),
-                });
-            }
-            replace_file(&guard.path, target)?;
-            guard.disarm();
-            Ok(())
-        }
-        Err(err) => Err(OsError::from_io(
-            format!(
-                "cannot link temporary file {} to {}",
-                guard.path.display(),
-                target.display()
-            ),
-            err,
-        )),
-    }
+    let from = guard.path.clone();
+    commit_exclusive_with_ops(
+        || rename_exclusive_impl(&from, target),
+        || fs::hard_link(&from, target),
+        || {
+            let _ = fs::remove_file(&from);
+        },
+        &from,
+        target,
+    )?;
+    guard.disarm();
+    Ok(())
 }
 
 async fn commit_exclusive_async(guard: &mut TempFileGuard, target: &Path) -> Result<()> {
-    match fs::hard_link(&guard.path, target) {
+    let from = guard.path.clone();
+    match rename_exclusive_async_impl(&from, target).await {
         Ok(()) => {
-            let _ = fs::remove_file(&guard.path);
             guard.disarm();
+            Ok(())
+        }
+        Err(ExclusiveRenameError::AlreadyExists) => Err(OsError::AlreadyExists {
+            path: target.to_path_buf(),
+        }),
+        Err(ExclusiveRenameError::Io(err)) => Err(OsError::from_io(
+            format!("cannot rename {} to {}", from.display(), target.display()),
+            err,
+        )),
+        Err(ExclusiveRenameError::Unsupported) => {
+            commit_via_hard_link(
+                || fs::hard_link(&from, target),
+                || {
+                    let _ = fs::remove_file(&from);
+                },
+                &from,
+                target,
+            )?;
+            guard.disarm();
+            Ok(())
+        }
+    }
+}
+
+fn commit_exclusive_with_ops<FR, FL, FU>(
+    rename_exclusive: FR,
+    hard_link: FL,
+    unlink_temp: FU,
+    from: &Path,
+    target: &Path,
+) -> Result<()>
+where
+    FR: FnOnce() -> std::result::Result<(), ExclusiveRenameError>,
+    FL: FnOnce() -> io::Result<()>,
+    FU: FnOnce(),
+{
+    match rename_exclusive() {
+        Ok(()) => Ok(()),
+        Err(ExclusiveRenameError::AlreadyExists) => Err(OsError::AlreadyExists {
+            path: target.to_path_buf(),
+        }),
+        Err(ExclusiveRenameError::Io(err)) => Err(OsError::from_io(
+            format!("cannot rename {} to {}", from.display(), target.display()),
+            err,
+        )),
+        Err(ExclusiveRenameError::Unsupported) => {
+            commit_via_hard_link(hard_link, unlink_temp, from, target)
+        }
+    }
+}
+
+fn commit_via_hard_link<FL, FU>(
+    hard_link: FL,
+    unlink_temp: FU,
+    from: &Path,
+    target: &Path,
+) -> Result<()>
+where
+    FL: FnOnce() -> io::Result<()>,
+    FU: FnOnce(),
+{
+    match hard_link() {
+        Ok(()) => {
+            unlink_temp();
             Ok(())
         }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(OsError::AlreadyExists {
             path: target.to_path_buf(),
         }),
-        Err(err) if is_hard_link_unsupported(&err) => {
-            if fs::symlink_metadata(target).is_ok() {
-                return Err(OsError::AlreadyExists {
-                    path: target.to_path_buf(),
-                });
-            }
-            replace_file_async(&guard.path, target).await?;
-            guard.disarm();
-            Ok(())
-        }
+        Err(err) if is_hard_link_unsupported(&err) => Err(OsError::Unsupported {
+            detail: format!(
+                "filesystem does not support atomic exclusive file creation for {}: {err}",
+                target.display()
+            ),
+        }),
         Err(err) => Err(OsError::from_io(
             format!(
                 "cannot link temporary file {} to {}",
-                guard.path.display(),
+                from.display(),
                 target.display()
             ),
             err,
@@ -355,16 +410,17 @@ fn is_hard_link_unsupported(err: &io::Error) -> bool {
     }
     #[cfg(unix)]
     {
-        // EOPNOTSUPP (95 on Linux, 45 on macOS), ENOSYS (38/78), EPERM (1 on FAT/VFAT),
-        // EXDEV (18), EMLINK (31).
-        matches!(
+        // Only true lack-of-support errnos (never EPERM/EDQUOT, which are real failures).
+        #[allow(unreachable_patterns)]
+        let unsupported = matches!(
             err.raw_os_error(),
-            Some(1 | 18 | 31 | 38 | 45 | 78 | 95 | 122)
-        )
+            Some(libc::EOPNOTSUPP | libc::ENOTSUP | libc::ENOSYS | libc::EXDEV | libc::EMLINK)
+        );
+        unsupported
     }
     #[cfg(windows)]
     {
-        // ERROR_INVALID_FUNCTION (1), ERROR_NOT_SUPPORTED (50), ERROR_NOT_SAME_DEVICE (17).
+        // ERROR_INVALID_FUNCTION (1), ERROR_NOT_SAME_DEVICE (17), ERROR_NOT_SUPPORTED (50).
         matches!(err.raw_os_error(), Some(1 | 17 | 50))
     }
     #[cfg(not(any(unix, windows)))]
@@ -372,6 +428,35 @@ fn is_hard_link_unsupported(err: &io::Error) -> bool {
         let _ = err;
         false
     }
+}
+
+#[cfg(any(unix, windows))]
+fn rename_exclusive_impl(from: &Path, to: &Path) -> std::result::Result<(), ExclusiveRenameError> {
+    platform::rename_exclusive(from, to)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_exclusive_impl(
+    _from: &Path,
+    _to: &Path,
+) -> std::result::Result<(), ExclusiveRenameError> {
+    Err(ExclusiveRenameError::Unsupported)
+}
+
+#[cfg(any(unix, windows))]
+async fn rename_exclusive_async_impl(
+    from: &Path,
+    to: &Path,
+) -> std::result::Result<(), ExclusiveRenameError> {
+    platform::rename_exclusive_async(from, to).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn rename_exclusive_async_impl(
+    from: &Path,
+    to: &Path,
+) -> std::result::Result<(), ExclusiveRenameError> {
+    rename_exclusive_impl(from, to)
 }
 
 fn create_sibling_temp(
@@ -777,6 +862,80 @@ mod tests {
         assert!(matches!(err, OsError::AlreadyExists { .. }));
         assert_eq!(fs::read(&target).unwrap(), b"first");
         assert_eq!(list_dir_names(dir.path()), vec!["exclusive-async.txt"]);
+    }
+
+    #[test]
+    fn no_replace_never_falls_back_to_overwrite_on_unsupported_or_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("tmp");
+        let target = dir.path().join("target");
+        fs::write(&from, b"new").unwrap();
+        fs::write(&target, b"existing").unwrap();
+
+        // 1. EPERM/EDQUOT on exclusive rename must return an error without trying hard_link.
+        let mut link_called = false;
+        let err = commit_exclusive_with_ops(
+            || {
+                Err(ExclusiveRenameError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "eperm",
+                )))
+            },
+            || {
+                link_called = true;
+                Ok(())
+            },
+            || {},
+            &from,
+            &target,
+        )
+        .unwrap_err();
+        assert!(!link_called);
+        assert!(matches!(err, OsError::PermissionDenied { .. }));
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+
+        // 2. Unsupported exclusive rename + unsupported hard_link returns OsError::Unsupported
+        //    and leaves target untouched (never falls back to replacing rename).
+        let err = commit_exclusive_with_ops(
+            || Err(ExclusiveRenameError::Unsupported),
+            || Err(io::Error::new(io::ErrorKind::Unsupported, "no hard_link")),
+            || {},
+            &from,
+            &target,
+        )
+        .unwrap_err();
+        assert!(matches!(err, OsError::Unsupported { .. }));
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+
+        // 3. Unsupported exclusive rename falls back to hard_link when supported, unlinking temp.
+        let mut unlinked = false;
+        commit_exclusive_with_ops(
+            || Err(ExclusiveRenameError::Unsupported),
+            || Ok(()),
+            || unlinked = true,
+            &from,
+            &target,
+        )
+        .unwrap();
+        assert!(unlinked);
+
+        // 4. Hard-link EPERM/EDQUOT is surfaced as PermissionDenied/Io, never misclassified as
+        //    unsupported or silently overwritten.
+        let err = commit_exclusive_with_ops(
+            || Err(ExclusiveRenameError::Unsupported),
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "eperm on link",
+                ))
+            },
+            || {},
+            &from,
+            &target,
+        )
+        .unwrap_err();
+        assert!(matches!(err, OsError::PermissionDenied { .. }));
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
     }
 
     #[test]

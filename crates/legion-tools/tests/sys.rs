@@ -28,6 +28,12 @@ fn main() -> ExitCode {
         ("kill_refuses_a_reused_pid_and_protected_processes", || {
             Box::pin(kill_refuses_a_reused_pid_and_protected_processes())
         }),
+        ("the_runtime_stays_free_while_the_system_is_read", || {
+            Box::pin(the_runtime_stays_free_while_the_system_is_read())
+        }),
+        ("procs_hides_secrets_in_command_lines", || {
+            Box::pin(procs_hides_secrets_in_command_lines())
+        }),
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
@@ -40,7 +46,8 @@ async fn info_describes_the_machine() {
     let started = Instant::now();
     let info = fixture.call("sys.info", json!({})).await.unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        // Generous: on a cold Windows runner the boot id alone starts PowerShell.
+        started.elapsed() < Duration::from_secs(30),
         "took {:?}",
         started.elapsed()
     );
@@ -73,6 +80,8 @@ async fn info_describes_the_machine() {
     }
     assert!(info["gpus"].is_array());
 
+    assert_no_nulls(&info);
+
     let error = fixture
         .call("sys.info", json!({"verbose": true}))
         .await
@@ -103,6 +112,8 @@ async fn procs_finds_this_process_and_respects_its_limits() {
     assert!(me["cmd"].as_str().unwrap().chars().count() <= 301, "{me}");
     let start: jiff::Timestamp = me["start_time"].as_str().unwrap().parse().unwrap();
     assert!(start <= jiff::Timestamp::now());
+
+    assert_no_nulls(&found);
 
     let busiest = fixture
         .call("sys.procs", json!({"limit": 1}))
@@ -151,11 +162,11 @@ async fn start_time_of(fixture: &Fixture, pid: u32) -> String {
 
 async fn kill_stops_a_child_and_only_that_child() {
     let fixture = Fixture::new();
-    let mut child = spawn_helper("sleep", &["60"]);
-    let pid = child.id();
-    wait_for(Duration::from_secs(10), || alive(pid).then_some(()))
-        .await
-        .unwrap();
+    let pids = fixture.dir.path().join("pids");
+    let mut child = spawn_helper("family", &[&pids.to_string_lossy()]);
+    let family = read_pids(&pids).await;
+    let (pid, grandchild) = (family[0], family[1]);
+    assert_eq!(pid, child.id());
     let start_time = start_time_of(&fixture, pid).await;
     let killed = fixture
         .call("sys.kill", json!({"pid": pid, "start_time": start_time}))
@@ -167,12 +178,21 @@ async fn kill_stops_a_child_and_only_that_child() {
     );
     let status = child.wait().unwrap();
     assert!(!status.success());
+    // Without `tree`, what the process started is left running.
+    assert!(alive(grandchild), "the grandchild was stopped too");
 
     let error = fixture
         .call("sys.kill", json!({"pid": pid}))
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::NotFound, "{}", error.message);
+
+    let killed = fixture
+        .call("sys.kill", json!({"pid": grandchild, "force": true}))
+        .await
+        .unwrap();
+    assert_eq!(killed["stopped"], json!(true), "{killed}");
+    assert!(gone(grandchild).await);
 }
 
 async fn kill_tree_stops_the_descendants_too() {
@@ -199,7 +219,7 @@ async fn kill_refuses_a_reused_pid_and_protected_processes() {
     let fixture = Fixture::new();
     let mut child = spawn_helper("sleep", &["60"]);
     let pid = child.id();
-    wait_for(Duration::from_secs(10), || alive(pid).then_some(()))
+    wait_for(Duration::from_secs(30), || alive(pid).then_some(()))
         .await
         .unwrap();
     let error = fixture
@@ -225,12 +245,22 @@ async fn kill_refuses_a_reused_pid_and_protected_processes() {
     child.kill().unwrap();
     child.wait().unwrap();
 
-    for pid in [0, 1, std::process::id()] {
+    // Legion itself, the test runner that started it, and the system's own.
+    let parent = parent_of(std::process::id());
+    let mut protected = vec![0, std::process::id()];
+    protected.extend(parent);
+    if std::env::consts::OS == "windows" {
+        protected.push(4);
+    } else {
+        protected.push(1);
+    }
+    for pid in protected {
         let error = fixture
             .call("sys.kill", json!({"pid": pid}))
             .await
             .unwrap_err();
-        assert_eq!(error.code, ErrorCode::Denied, "{pid}");
+        assert_eq!(error.code, ErrorCode::Denied, "{pid}: {}", error.message);
+        assert!(error.details.unwrap()["reason"].is_string());
     }
 }
 
@@ -252,4 +282,113 @@ async fn a_role_without_the_effect_is_denied() {
     assert_eq!(error.code, ErrorCode::Denied);
     assert!(error.message.contains("sys.kill"), "{}", error.message);
     let _: Value = error.details.unwrap();
+}
+
+/// The parent of a process, as sys.procs reports it.
+fn parent_of(pid: u32) -> Option<u32> {
+    let mut system = sysinfo::System::new().ok()?;
+    let target = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+    system.process(target)?.parent().map(sysinfo::Pid::as_u32)
+}
+
+/// The sys tools read the system on the blocking pool: on a single-threaded runtime, a task that
+/// wakes every few milliseconds keeps waking while they run.
+async fn the_runtime_stays_free_while_the_system_is_read() {
+    let worst = tokio::task::spawn_blocking(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fixture = Fixture::new();
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let ticker = async {
+                let mut worst = Duration::ZERO;
+                let mut last = Instant::now();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    worst = worst.max(last.elapsed());
+                    last = Instant::now();
+                }
+                worst
+            };
+            let work = async {
+                fixture.call("sys.info", json!({})).await.unwrap();
+                fixture
+                    .call("sys.procs", json!({"limit": 500}))
+                    .await
+                    .unwrap();
+                let mut child = spawn_helper("sleep", &["60"]);
+                let pid = child.id();
+                fixture.call("sys.kill", json!({"pid": pid})).await.unwrap();
+                child.wait().unwrap();
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+            };
+            tokio::join!(ticker, work).0
+        })
+    })
+    .await
+    .unwrap();
+    // Sleeping through a CPU sample on the runtime would hold it for 250 ms. Windows timers tick
+    // every 15 ms and its runners stall now and then, so there only a gross stall counts.
+    let limit = if std::env::consts::OS == "windows" {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(200)
+    };
+    assert!(worst < limit, "the runtime was held for {worst:?}");
+}
+
+async fn procs_hides_secrets_in_command_lines() {
+    let fixture = Fixture::new();
+    let mut child = spawn_helper(
+        "sleep",
+        &["60", "--password", "hunter2-7d1c", "--token=s3cr3t-7d1c"],
+    );
+    let pid = child.id();
+    wait_for(Duration::from_secs(30), || alive(pid).then_some(()))
+        .await
+        .unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let name = exe.file_stem().unwrap().to_string_lossy().into_owned();
+    let listed = fixture
+        .call("sys.procs", json!({"filter": name, "limit": 500}))
+        .await
+        .unwrap();
+    let proc = listed["procs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|proc| proc["pid"] == json!(pid))
+        .cloned()
+        .unwrap_or_else(|| panic!("process {pid} is not among {listed:#}"));
+    let cmd = proc["cmd"].as_str().unwrap();
+    assert!(
+        cmd.ends_with("60 --password [redacted] --token=[redacted]"),
+        "{cmd}"
+    );
+    // A filter cannot find a process by its secret either.
+    let probed = fixture
+        .call("sys.procs", json!({"filter": "hunter2-7d1c"}))
+        .await
+        .unwrap();
+    assert_eq!(probed["total"], json!(0), "{probed:#}");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Optional fields are left out, never `null`.
+fn assert_no_nulls(value: &Value) {
+    match value {
+        Value::Null => panic!("a result holds null"),
+        Value::Array(items) => items.iter().for_each(assert_no_nulls),
+        Value::Object(map) => {
+            for (key, value) in map {
+                assert!(!value.is_null(), "`{key}` is null");
+                assert_no_nulls(value);
+            }
+        }
+        _ => {}
+    }
 }

@@ -23,6 +23,34 @@ const SAME_BOOT_TOLERANCE_TICKS: u64 = SAME_BOOT_TOLERANCE_SECS * TICKS_PER_SEC;
 const BOOT_TICKS_PREFIX: &str = "boot-ticks-";
 const BOOT_SEC_PREFIX: &str = "boot-sec-";
 
+/// Generous backward wall-clock step tolerance (24 hours) applied when comparing parent and child
+/// creation times on platforms whose kernel process start timestamps are wall-clock based
+/// (Windows `FILETIME` and macOS `proc_bsdinfo` epoch time).
+///
+/// Dual-boot machines and NTP syncs can step the system wall clock backward (up to ~14 hours for
+/// UTC/local RTC timezone mismatches); without tolerance, a real child started after a backward
+/// step looks older than its parent and would be skipped. Linux uses monotonic boot-relative
+/// jiffies and needs zero backward tolerance.
+#[allow(dead_code)]
+pub(crate) const WALL_CLOCK_BACKWARD_TOLERANCE_SECS: u64 = 86_400;
+#[allow(dead_code)]
+pub(crate) const WALL_CLOCK_BACKWARD_TOLERANCE_MICROS: u64 =
+    WALL_CLOCK_BACKWARD_TOLERANCE_SECS * 1_000_000;
+#[allow(dead_code)]
+pub(crate) const WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME: u64 =
+    WALL_CLOCK_BACKWARD_TOLERANCE_SECS * TICKS_PER_SEC;
+
+/// Return `true` when `child_start` is no more than `backward_tolerance` units earlier than
+/// `parent_start`.
+#[allow(dead_code)]
+pub(crate) const fn child_not_older_than_parent(
+    child_start: u64,
+    parent_start: u64,
+    backward_tolerance: u64,
+) -> bool {
+    child_start.saturating_add(backward_tolerance) >= parent_start
+}
+
 #[cfg(unix)]
 #[path = "procid/unix.rs"]
 mod platform;
@@ -45,12 +73,14 @@ pub struct ProcessId {
     /// Full-precision kernel start timestamp for the process.
     ///
     /// Units per platform (never compared across machines or operating systems):
-    /// - **Linux:** clock ticks (jiffies) since boot from `/proc/<pid>/stat` field 22, immune to
-    ///   wall-clock adjustments.
+    /// - **Linux:** clock ticks (jiffies) since boot from `/proc/<pid>/stat` field 22, monotonic
+    ///   and immune to wall-clock adjustments.
     /// - **macOS:** microseconds since the Unix epoch from `proc_bsdinfo`
-    ///   (`pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`).
+    ///   (`pbi_start_tvsec * 1_000_000 + pbi_start_tvusec`); wall-clock based, so parent-before-child
+    ///   ordering allows up to 24 hours of backward clock-step tolerance.
     /// - **Windows:** 100-nanosecond `FILETIME` ticks since 1601-01-01 UTC from
-    ///   `GetProcessTimes` (`CreationTime`).
+    ///   `GetProcessTimes` (`CreationTime`); wall-clock based, so parent-before-child ordering
+    ///   allows up to 24 hours of backward clock-step tolerance.
     pub start_time: u64,
 }
 
@@ -77,10 +107,28 @@ impl fmt::Display for ProcessId {
 /// Result of attempting to terminate a process and its entire descendant tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KillTreeReport {
-    /// `true` once the root process and every discovered descendant have exited.
+    /// `true` once the root process and every discovered descendant have exited and no
+    /// unverified orphan candidates remain.
     pub all_gone: bool,
-    /// Processes that remained alive after the kill and settle phase completed.
+    /// Verified target processes that remained alive after the kill and settle phase completed.
     pub survivors: Vec<ProcessId>,
+    /// Candidate orphan processes discovered after an exited root that could not be proved to
+    /// belong to the tree (for example because no detach marker was available or their environment
+    /// could not be inspected) and were therefore intentionally left running.
+    pub unverified_survivors: Vec<ProcessId>,
+}
+
+/// Outcome of checking whether a live process's environment carries a specific `KEY=VALUE` marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum EnvMarkerCheck {
+    /// The process environment was read and contains the exact `KEY=VALUE` entry.
+    Matched,
+    /// The process environment was read completely and does not contain the entry.
+    NotMatched,
+    /// The process environment could not be read (permission denied, unsupported OS, or truncated),
+    /// so ownership cannot be proved or disproved.
+    Unverifiable,
 }
 
 /// Return the [`ProcessId`] of the current process.
@@ -225,18 +273,31 @@ pub async fn kill_process(identity: &ProcessId, force: bool, grace: Duration) ->
 
 /// Stop a process and all of its descendants when the root is not a direct child of this process.
 ///
-/// Works even if the root process has already exited while descendants survive:
-/// - **Unix:** signals the target's isolated process group, any process still in the target's
-///   process group or session started at or after `identity.start_time`, and every discovered
-///   descendant with `SIGTERM`, waits up to `grace`, and escalates any survivors to `SIGKILL`.
-/// - **Windows:** walks the process tree starting from `identity.pid` (orphans retain their
-///   original `parent_pid`), verifies each candidate's `parent_pid` and 100-ns `FILETIME` creation
-///   time directly through an open handle (keeping handles pinned across bounded re-snapshot
-///   waves), and calls `TerminateProcess` through those handles.
+/// While the verified root process is still alive:
+/// - **Unix:** signals the root (via `pidfd_send_signal` on Linux), its isolated process group
+///   when it leads one, and every discovered descendant with `SIGTERM`, waits up to `grace`, and
+///   escalates any survivors to `SIGKILL`.
+/// - **Windows:** pins the root's handle (preventing PID reuse across bounded re-snapshot waves),
+///   walks live descendants while verifying each candidate's `parent_pid` and 100-ns `FILETIME`
+///   creation time through an open handle, and calls `TerminateProcess` through those handles.
 ///
-/// Returns only once every tracked process has exited or the post-kill settle period elapses,
-/// reporting any survivors.
+/// Once the root process has already exited, a plain [`kill_tree`] call has no detach marker to
+/// prove ownership across PID reuse, so it **does not** terminate processes solely by session,
+/// process group, or `parent_pid`; instead it leaves those candidates untouched and reports them
+/// in [`KillTreeReport::unverified_survivors`] (with `all_gone == false`). For detached processes
+/// launched by [`crate::detach::spawn_detached`], use [`crate::detach::stop_detached`], which uses
+/// the recorded systemd scope, Windows Job Object, or `LEGION_DETACH_ID` environment marker.
 pub async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
+    kill_tree_with_marker(identity, None, grace).await
+}
+
+/// Internal variant of [`kill_tree`] that accepts an optional [`crate::detach::DETACH_MARKER_ENV`]
+/// value so detached orphans can be proved by environment marker after the root has exited.
+pub(crate) async fn kill_tree_with_marker(
+    identity: &ProcessId,
+    marker: Option<&str>,
+    grace: Duration,
+) -> Result<KillTreeReport> {
     if identity.pid == 0 {
         return Err(OsError::InvalidArgument {
             detail: "cannot terminate pid 0".into(),
@@ -247,7 +308,7 @@ pub async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTree
             detail: "refusing to terminate the current process".into(),
         });
     }
-    kill_tree_impl(identity, grace).await
+    kill_tree_impl(identity, marker, grace).await
 }
 
 #[cfg(any(unix, windows))]
@@ -274,25 +335,54 @@ fn read_boot_id_impl() -> Result<String> {
     })
 }
 
-/// Return `true` while `identity` itself or any surviving process belonging to its tree/session
-/// (using the same verified ownership rule as [`kill_tree`]) is still running.
+/// Return `true` while `identity` itself is alive, or—when `marker` is provided—while any live
+/// process carries `LEGION_DETACH_ID=<marker>` in its environment.
 ///
-/// Runs all OS queries off the async executor via `spawn_blocking` and performs no writes or
-/// signaling.
+/// Once the root process has exited and no `marker` is available, returns `Ok(false)` rather than
+/// trusting unverified session, process-group, or `parent_pid` matches across PID reuse. Runs all
+/// OS queries off the async executor via `spawn_blocking` and performs no writes or signaling.
+#[allow(dead_code)]
 pub(crate) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
+    tree_is_active_with_marker(identity, None).await
+}
+
+/// Internal variant of [`tree_is_active`] that proves surviving orphans after root exit via an
+/// optional [`crate::detach::DETACH_MARKER_ENV`] value.
+pub(crate) async fn tree_is_active_with_marker(
+    identity: &ProcessId,
+    marker: Option<&str>,
+) -> Result<bool> {
     if identity.pid == 0 {
         return Ok(false);
     }
-    tree_is_active_impl(identity).await
+    tree_is_active_impl(identity, marker).await
+}
+
+/// Return every live (non-zombie) process whose environment contains `LEGION_DETACH_ID=<marker>`.
+///
+/// Uses the exact same environment-marker verification rule as [`tree_is_active_with_marker`] so
+/// `stop_detached` can re-check after stopping and report anything still active.
+pub(crate) async fn find_marked_live_processes(marker: &str) -> Result<Vec<ProcessId>> {
+    find_marked_live_processes_impl(marker).await
 }
 
 #[cfg(any(unix, windows))]
-async fn tree_is_active_impl(identity: &ProcessId) -> Result<bool> {
-    platform::tree_is_active(identity).await
+async fn find_marked_live_processes_impl(marker: &str) -> Result<Vec<ProcessId>> {
+    platform::find_marked_live_processes(marker).await
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn tree_is_active_impl(_identity: &ProcessId) -> Result<bool> {
+async fn find_marked_live_processes_impl(_marker: &str) -> Result<Vec<ProcessId>> {
+    Ok(Vec::new())
+}
+
+#[cfg(any(unix, windows))]
+async fn tree_is_active_impl(identity: &ProcessId, marker: Option<&str>) -> Result<bool> {
+    platform::tree_is_active(identity, marker).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn tree_is_active_impl(_identity: &ProcessId, _marker: Option<&str>) -> Result<bool> {
     Err(OsError::Unsupported {
         detail: "process tree liveness check is not supported on this platform".into(),
     })
@@ -321,15 +411,165 @@ async fn kill_process_impl(_identity: &ProcessId, _force: bool, _grace: Duration
 }
 
 #[cfg(any(unix, windows))]
-async fn kill_tree_impl(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
-    platform::kill_tree(identity, grace).await
+async fn kill_tree_impl(
+    identity: &ProcessId,
+    marker: Option<&str>,
+    grace: Duration,
+) -> Result<KillTreeReport> {
+    platform::kill_tree(identity, marker, grace).await
 }
 
 #[cfg(not(any(unix, windows)))]
-async fn kill_tree_impl(_identity: &ProcessId, _grace: Duration) -> Result<KillTreeReport> {
+async fn kill_tree_impl(
+    _identity: &ProcessId,
+    _marker: Option<&str>,
+    _grace: Duration,
+) -> Result<KillTreeReport> {
     Err(OsError::Unsupported {
         detail: "process tree termination is not supported on this platform".into(),
     })
+}
+
+/// Return `true` when a NUL-separated Unix environment block (such as Linux `/proc/<pid>/environ`)
+/// contains the exact `key=expected` entry.
+#[allow(dead_code)]
+pub(crate) fn environ_bytes_has_marker(bytes: &[u8], key: &str, expected: &str) -> bool {
+    let key_bytes = key.as_bytes();
+    let expected_bytes = expected.as_bytes();
+    for entry in bytes.split(|&b| b == 0) {
+        if let Some(rest) = entry.strip_prefix(key_bytes)
+            && rest.first() == Some(&b'=')
+            && &rest[1..] == expected_bytes
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a macOS `sysctl([CTL_KERN, KERN_PROCARGS2, pid])` buffer and report whether the process's
+/// environment block contains `key=expected`.
+///
+/// Returns `None` if `buf` is malformed or truncated before the environment section begins.
+#[allow(dead_code)]
+pub(crate) fn parse_macos_procargs2_env_has_marker(
+    buf: &[u8],
+    key: &str,
+    expected: &str,
+) -> Option<bool> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if argc < 0 {
+        return None;
+    }
+    let mut rest = &buf[4..];
+
+    // Skip NUL-terminated `exec_path`.
+    let exec_end = rest.iter().position(|&b| b == 0)?;
+    rest = &rest[exec_end + 1..];
+
+    // Skip NUL alignment padding between `exec_path` and `argv[0]`.
+    while rest.first() == Some(&0) {
+        rest = &rest[1..];
+    }
+
+    // Advance past exactly `argc` NUL-terminated argv entries (preserving empty `""` arguments by
+    // advancing past a single NUL per argument).
+    for _ in 0..argc {
+        let arg_end = rest.iter().position(|&b| b == 0)?;
+        rest = &rest[arg_end + 1..];
+    }
+
+    let key_bytes = key.as_bytes();
+    let expected_bytes = expected.as_bytes();
+    while !rest.is_empty() {
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let entry = &rest[..end];
+        if entry.is_empty() {
+            // Double-NUL terminates `envp` before the `apple[]` auxiliary vector.
+            break;
+        }
+        if let Some(val) = entry.strip_prefix(key_bytes)
+            && val.first() == Some(&b'=')
+            && &val[1..] == expected_bytes
+        {
+            return Some(true);
+        }
+        rest = if end < rest.len() {
+            &rest[end + 1..]
+        } else {
+            &[]
+        };
+    }
+
+    Some(false)
+}
+
+/// Check a Windows UTF-16 NUL-separated PEB environment block for `key=expected` (ASCII
+/// case-insensitive key match, exact value match).
+///
+/// When `truncated` is `true` and the marker was not found before the buffer ended without seeing
+/// the double-NUL terminator, returns [`EnvMarkerCheck::Unverifiable`] rather than falsely
+/// claiming [`EnvMarkerCheck::NotMatched`].
+#[allow(dead_code)]
+pub(crate) fn windows_env_utf16_has_marker(
+    units: &[u16],
+    key: &str,
+    expected: &str,
+    truncated: bool,
+) -> EnvMarkerCheck {
+    let key_u16: Vec<u16> = key.encode_utf16().collect();
+    let expected_u16: Vec<u16> = expected.encode_utf16().collect();
+
+    let mut idx = 0usize;
+    let mut saw_terminator = false;
+    while idx < units.len() {
+        let Some(rel_end) = units[idx..].iter().position(|&u| u == 0) else {
+            break;
+        };
+        if rel_end == 0 {
+            saw_terminator = true;
+            break;
+        }
+        let entry = &units[idx..idx + rel_end];
+        if let Some(eq_pos) = entry.iter().position(|&u| u == b'=' as u16) {
+            let entry_key = &entry[..eq_pos];
+            let entry_val = &entry[eq_pos + 1..];
+            if entry_key.len() == key_u16.len()
+                && entry_key
+                    .iter()
+                    .zip(key_u16.iter())
+                    .all(|(&a, &b)| ascii_utf16_eq_ignore_case(a, b))
+                && entry_val == expected_u16.as_slice()
+            {
+                return EnvMarkerCheck::Matched;
+            }
+        }
+        idx += rel_end + 1;
+    }
+
+    if saw_terminator || !truncated {
+        EnvMarkerCheck::NotMatched
+    } else {
+        EnvMarkerCheck::Unverifiable
+    }
+}
+
+#[allow(dead_code)]
+const fn ascii_utf16_eq_ignore_case(a: u16, b: u16) -> bool {
+    let na = if a >= b'A' as u16 && a <= b'Z' as u16 {
+        a + 32
+    } else {
+        a
+    };
+    let nb = if b >= b'A' as u16 && b <= b'Z' as u16 {
+        b + 32
+    } else {
+        b
+    };
+    na == nb
 }
 
 /// Recover the clock-step-invariant Windows boot timestamp from `SYSTEM_TIMEOFDAY_INFORMATION`'s
@@ -596,6 +836,35 @@ mod tests {
     }
 
     #[test]
+    fn child_not_older_than_parent_respects_platform_clock_tolerance() {
+        // Monotonic (Linux): exact ordering only.
+        assert!(child_not_older_than_parent(100, 100, 0));
+        assert!(child_not_older_than_parent(101, 100, 0));
+        assert!(!child_not_older_than_parent(99, 100, 0));
+
+        // Wall-clock (macOS / Windows): tolerates backward steps up to 24 hours (e.g. dual-boot
+        // RTC timezone step), while still rejecting much older unrelated processes.
+        let parent_ft: u64 = 133_700_000_000_000_000;
+        let two_hours_ft = 2 * 3_600 * TICKS_PER_SEC;
+        let twenty_five_hours_ft = 25 * 3_600 * TICKS_PER_SEC;
+        assert!(child_not_older_than_parent(
+            parent_ft - two_hours_ft,
+            parent_ft,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME
+        ));
+        assert!(child_not_older_than_parent(
+            parent_ft - WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+            parent_ft,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME
+        ));
+        assert!(!child_not_older_than_parent(
+            parent_ft - twenty_five_hours_ft,
+            parent_ft,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME
+        ));
+    }
+
+    #[test]
     fn unbiased_windows_boot_ticks_cancels_positive_and_negative_clock_steps() {
         let initial_boot: i64 = 133_700_000_000_000_000;
         let base = unbiased_windows_boot_ticks(initial_boot, 0);
@@ -651,6 +920,85 @@ mod tests {
         assert!(is_alive(&me));
     }
 
+    #[test]
+    fn env_marker_parsers_handle_linux_macos_and_windows_layouts() {
+        // Linux `/proc/<pid>/environ` NUL-separated bytes.
+        let linux_env = b"PATH=/usr/bin\0LEGION_DETACH_ID=abc-123\0HOME=/home/me\0";
+        assert!(environ_bytes_has_marker(
+            linux_env,
+            "LEGION_DETACH_ID",
+            "abc-123"
+        ));
+        assert!(!environ_bytes_has_marker(
+            linux_env,
+            "LEGION_DETACH_ID",
+            "abc-12"
+        ));
+        assert!(!environ_bytes_has_marker(
+            linux_env,
+            "LEGION_DETACH_ID",
+            "abc-1234"
+        ));
+        assert!(!environ_bytes_has_marker(
+            b"",
+            "LEGION_DETACH_ID",
+            "abc-123"
+        ));
+
+        // macOS `KERN_PROCARGS2`: argc + exec_path + NUL padding + argc args (including empty "")
+        // + NUL-separated envp + double-NUL + apple[].
+        let mut procargs = Vec::new();
+        procargs.extend_from_slice(&3i32.to_ne_bytes());
+        procargs.extend_from_slice(b"/usr/local/bin/worker\0\0\0\0");
+        procargs.extend_from_slice(b"worker\0\0--flag\0");
+        procargs.extend_from_slice(b"FOO=bar\0LEGION_DETACH_ID=mac-99\0\0executable_path=/bin\0");
+        assert_eq!(
+            parse_macos_procargs2_env_has_marker(&procargs, "LEGION_DETACH_ID", "mac-99"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_macos_procargs2_env_has_marker(&procargs, "LEGION_DETACH_ID", "other"),
+            Some(false)
+        );
+        // Must not mistake an argv token looking like `LEGION_DETACH_ID=...` for an env var.
+        let mut argv_spoof = Vec::new();
+        argv_spoof.extend_from_slice(&2i32.to_ne_bytes());
+        argv_spoof.extend_from_slice(b"/bin/echo\0\0\0");
+        argv_spoof.extend_from_slice(b"echo\0LEGION_DETACH_ID=spoof\0");
+        argv_spoof.extend_from_slice(b"HOME=/Users/me\0\0");
+        assert_eq!(
+            parse_macos_procargs2_env_has_marker(&argv_spoof, "LEGION_DETACH_ID", "spoof"),
+            Some(false)
+        );
+        // Truncated/malformed buffer returns `None` (unverifiable).
+        assert_eq!(
+            parse_macos_procargs2_env_has_marker(&[1, 2], "LEGION_DETACH_ID", "mac-99"),
+            None
+        );
+
+        // Windows UTF-16 NUL-separated PEB environment block (case-insensitive key, exact value).
+        let win_block: Vec<u16> = "PATH=C:\\Windows\0legion_detach_id=Win-42\0\0"
+            .encode_utf16()
+            .collect();
+        assert_eq!(
+            windows_env_utf16_has_marker(&win_block, "LEGION_DETACH_ID", "Win-42", false),
+            EnvMarkerCheck::Matched
+        );
+        assert_eq!(
+            windows_env_utf16_has_marker(&win_block, "LEGION_DETACH_ID", "win-42", false),
+            EnvMarkerCheck::NotMatched
+        );
+        let partial_no_term: Vec<u16> = "PATH=C:\\Windows\0FOO=bar\0".encode_utf16().collect();
+        assert_eq!(
+            windows_env_utf16_has_marker(&partial_no_term, "LEGION_DETACH_ID", "Win-42", true),
+            EnvMarkerCheck::Unverifiable
+        );
+        assert_eq!(
+            windows_env_utf16_has_marker(&partial_no_term, "LEGION_DETACH_ID", "Win-42", false),
+            EnvMarkerCheck::NotMatched
+        );
+    }
+
     #[tokio::test]
     async fn kill_tree_reports_gone_for_absent_pid() {
         let me = current().unwrap();
@@ -658,6 +1006,7 @@ mod tests {
         let report = kill_tree(&absent, Duration::from_millis(10)).await.unwrap();
         assert!(report.all_gone);
         assert!(report.survivors.is_empty());
+        assert!(report.unverified_survivors.is_empty());
         assert!(is_alive(&me));
     }
 }

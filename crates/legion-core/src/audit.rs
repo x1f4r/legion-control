@@ -10,6 +10,7 @@
 //!
 //! - file contents, which a tool takes in a field named `content`, `contents`, `data`, `bytes`,
 //!   `body`, `stdin`, `old` or `new`;
+//! - values inside an object under a key named `env`, keeping the variable names;
 //! - values under a key that names a secret, however it is spelt (`password`, `X-API-Key`,
 //!   `apiKey`, `signing_key`, `auth`, …);
 //! - in a list of arguments, the value after a flag that takes a secret (`--password`, `-p`,
@@ -298,6 +299,9 @@ impl AuditLog {
 const CONTENT_KEYS: [&str; 8] = [
     "content", "contents", "data", "bytes", "body", "stdin", "old", "new",
 ];
+/// Keys whose object value holds name-to-secret pairs: the names are kept so the audit log shows
+/// what was set, while every value is replaced by its byte size.
+const SECRET_VALUE_MAP_KEYS: [&str; 1] = ["env"];
 const SECRET_WORDS: [&str; 12] = [
     "password",
     "passwd",
@@ -321,8 +325,8 @@ const SECRET_KEY_ENDINGS: [&str; 3] = ["_key", "_auth", "_pass"];
 /// `sshpass` and others, and `-u`/`--user` takes `user:password` for `curl`.
 const SECRET_FLAGS: [&str; 3] = ["p", "u", "user"];
 /// How a token from a well-known service starts, as a word: GitHub, GitLab, OpenAI, Slack, AWS,
-/// Google, npm, PyPI, Hugging Face, Stripe.
-const TOKEN_PREFIXES: [&str; 23] = [
+/// Google, npm, PyPI, Hugging Face, Stripe, and Legion's own HTTP tokens.
+const TOKEN_PREFIXES: [&str; 24] = [
     "ghp_",
     "gho_",
     "ghu_",
@@ -346,6 +350,7 @@ const TOKEN_PREFIXES: [&str; 23] = [
     "sk_live_",
     "rk_live_",
     "sk_test_",
+    "lgn_",
 ];
 /// What gives a secret away wherever it stands in a string, compared in lower case: a PEM block
 /// such as a private key, and a bearer token.
@@ -381,9 +386,48 @@ pub fn redact_message(message: &str) -> Value {
     redact_value(None, &Value::String(message.to_owned()))
 }
 
+/// What [`redact_command`] puts in place of a secret.
+pub const REDACTED: &str = "[redacted]";
+
+/// A command line's arguments as a person may be shown them, by the rules the log applies to
+/// argument lists: the value after a secret flag (`--password x`, `-p x`), the value of a secret
+/// assignment (`--token=x` keeps `--token=`), and any argument that gives a secret away by itself
+/// (a known token, a URL with credentials, a bearer header) become [`REDACTED`].
+pub fn redact_command(args: &[String]) -> Vec<String> {
+    let mut follows_flag = false;
+    args.iter()
+        .map(|arg| {
+            let shown = if follows_flag {
+                REDACTED.to_owned()
+            } else if let Some((name, _)) = arg.split_once('=')
+                && (takes_secret(name) || is_sensitive_key(name.trim_start_matches('-')))
+            {
+                format!("{name}={REDACTED}")
+            } else if looks_secret(arg) {
+                REDACTED.to_owned()
+            } else {
+                arg.clone()
+            };
+            follows_flag = takes_secret(arg);
+            shown
+        })
+        .collect()
+}
+
 fn redact_value(key: Option<&str>, value: &Value) -> Value {
     if key.is_some_and(is_sensitive_key) {
         return size_of(value);
+    }
+    if key.is_some_and(is_secret_value_map_key) {
+        return match value {
+            Value::Null => Value::Null,
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(name, val)| (name.clone(), size_of(val)))
+                    .collect::<Map<String, Value>>(),
+            ),
+            other => size_of(other),
+        };
     }
     match value {
         Value::String(text) if text.len() > LONGEST_KEPT || looks_secret(text) => size_of(value),
@@ -416,6 +460,11 @@ fn redact_value(key: Option<&str>, value: &Value) -> Value {
 /// A key or a flag's name the way the rules compare it: lower case, with `-` read as `_`.
 fn normalise(name: &str) -> String {
     name.to_ascii_lowercase().replace('-', "_")
+}
+
+fn is_secret_value_map_key(key: &str) -> bool {
+    let key = normalise(key);
+    SECRET_VALUE_MAP_KEYS.contains(&key.as_str())
 }
 
 fn is_sensitive_key(key: &str) -> bool {
@@ -564,7 +613,7 @@ mod tests {
             redacted["env"]["GITHUB_TOKEN"],
             json!({"redacted_bytes": 1})
         );
-        assert_eq!(redacted["env"]["LANG"], json!("C"));
+        assert_eq!(redacted["env"]["LANG"], json!({"redacted_bytes": 1}));
         assert_eq!(redacted["argv"][0], json!("mysql"));
         assert_eq!(redacted["argv"][1], json!({"redacted_bytes": 18}));
         assert_eq!(redacted["argv"][3], json!("db"));
@@ -609,6 +658,7 @@ mod tests {
             "curl -u me:hunter2 https://example.com",
             "gh auth login --with-token ghp_abc",
             "export GH=ghp_abc",
+            "curl -H x:lgn_Zm9v-YmFy_ https://tower.example",
             "  -----BEGIN OPENSSH PRIVATE KEY-----",
         ] {
             assert!(is_redacted(&recorded(json!(secret))), "{secret:?} was kept");
@@ -671,6 +721,30 @@ mod tests {
         for key in ["key", "path", "author", "monkey", "keyboard"] {
             assert_eq!(redact(&json!({ key: "x" }))[key], json!("x"), "{key}");
         }
+    }
+
+    #[test]
+    fn env_object_keeps_names_and_redacts_every_value() {
+        let args = json!({
+            "cmd": "echo hi",
+            "env": {
+                "MYVAR": "supersecretvalue123",
+                "LANG": "C",
+                "EMPTY": "",
+            },
+        });
+        let redacted = redact(&args);
+        assert_eq!(redacted["cmd"], json!("echo hi"));
+        assert_eq!(
+            redacted["env"],
+            json!({
+                "MYVAR": {"redacted_bytes": 19},
+                "LANG": {"redacted_bytes": 1},
+                "EMPTY": {"redacted_bytes": 0},
+            })
+        );
+        assert_eq!(redact(&json!({"env": null}))["env"], Value::Null);
+        assert!(is_redacted(&redact(&json!({"env": "RAW=secret"}))["env"]));
     }
 
     #[test]
@@ -868,6 +942,40 @@ mod tests {
             lines
                 .iter()
                 .all(|line| serde_json::from_str::<Value>(line).is_ok())
+        );
+    }
+
+    #[test]
+    fn a_command_line_keeps_its_shape_and_loses_its_secrets() {
+        let args: Vec<String> = [
+            "mysql",
+            "--user",
+            "me",
+            "--password",
+            "hunter2",
+            "--api-key=abc123",
+            "--host=db",
+            "https://me:pw@example.com/x",
+            "ghp_0123456789abcdef",
+            "plain",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+        assert_eq!(
+            redact_command(&args),
+            [
+                "mysql",
+                "--user",
+                REDACTED,
+                "--password",
+                REDACTED,
+                "--api-key=[redacted]",
+                "--host=db",
+                REDACTED,
+                REDACTED,
+                "plain",
+            ]
         );
     }
 }

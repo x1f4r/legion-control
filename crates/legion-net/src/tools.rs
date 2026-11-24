@@ -32,9 +32,11 @@ const MAX_PING_TIMEOUT_S: f64 = 60.0;
 /// Timeout for running `tailscale status --json`.
 const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Registers `fleet.toml` with `meta.doctor` and adds every `fleet.*` tool to `registry`.
+/// Registers `fleet.toml` with `meta.doctor` and adds every `fleet.*` tool, and `fs.transfer`,
+/// to `registry`.
 pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add_document::<FleetFile>();
+    crate::transfer::register(registry, fleet.clone());
 
     registry.add(FleetTool::<NoArgs, ListResult, _>::new(
         "fleet.list",

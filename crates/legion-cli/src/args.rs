@@ -37,8 +37,48 @@ pub enum Command {
         /// Serve three tools that list, describe and call the others.
         compact: bool,
     },
+    /// `legion stream`: serve one bulk-data operation on stdin and stdout.
+    Stream {
+        /// The principal the operation acts as.
+        pinned: Option<String>,
+    },
+    /// `legion gate --as P`: the forced command of a restricted ssh key.
+    Gate {
+        /// The principal everything the key does acts as.
+        pinned: String,
+    },
+    /// `legion cp <from> <to> …`: `fs.transfer` from a command line.
+    Cp(CpCommand),
+    /// `legion serve`: serve the tools over HTTP on a loopback address.
+    Serve {
+        /// `--listen`.
+        listen: Option<String>,
+        /// `--help`: say how, rather than serve.
+        help: bool,
+    },
     /// `legion --version`.
     Version,
+}
+
+/// `legion cp <from> <to> [--delete] [--checksum] [--exclude G]... [--dry-run] [--as P] [--json]`.
+#[derive(Debug, PartialEq)]
+pub struct CpCommand {
+    /// What to send.
+    pub from: String,
+    /// Where it goes.
+    pub to: String,
+    /// `--delete`.
+    pub delete: bool,
+    /// `--checksum`.
+    pub checksum: bool,
+    /// Every `--exclude`.
+    pub exclude: Vec<String>,
+    /// `--dry-run`.
+    pub dry_run: bool,
+    /// `--as`.
+    pub as_principal: Option<String>,
+    /// `--json`.
+    pub json: bool,
 }
 
 /// `legion <tool> [key=value …] [--args JSON|-] [--as P] [--on M] [--json]`.
@@ -83,13 +123,68 @@ Usage:
   legion <tool> [key=value ...] [--args JSON | --args -] [--as PRINCIPAL] [--on MACHINE] [--json]
   legion tools [--json]
   legion help [<tool>] [--json]
+  legion cp <from> <to> [--delete] [--checksum] [--exclude GLOB]... [--dry-run] [--as PRINCIPAL] [--json]
   legion rpc [--as PRINCIPAL]
   legion mcp [--as PRINCIPAL] [--compact]
+  legion stream [--as PRINCIPAL]
+  legion gate --as PRINCIPAL
+  legion serve [--listen ADDRESS]
+  legion token add NAME PRINCIPAL [expires_days=N] [allow_owner=true] | list | remove NAME
   legion --version
 
 A value that parses as JSON is JSON (n=3, ok=true, tags=[\"a\"]); anything else is a string.
 --args takes the arguments as one JSON object instead, or reads it from stdin when given -.
-Output is readable on a terminal and JSON otherwise; --json asks for JSON anywhere.";
+Output is readable on a terminal and JSON otherwise; --json asks for JSON anywhere.
+`legion help cp`, `legion help stream` and `legion help gate` describe those commands.";
+
+/// `legion help cp`.
+pub const CP_HELP: &str = "\
+Usage: legion cp <from> <to> [--delete] [--checksum] [--exclude GLOB]... [--dry-run] [--as PRINCIPAL] [--json]
+
+Copies a file or a directory tree with fs.transfer. Each of <from> and <to> is machine:/path, for a
+machine in fleet.toml, or a path on this machine; ~ means the home directory of the machine the
+path is on. <to> names the destination itself, except that a file sent to an existing directory, or
+to a path ending in /, lands inside it under its own name. A Windows drive path (C:\\... or C:/...)
+is always a path on this machine.
+
+A file that was interrupted continues where it stopped. A tree sends only what differs, so running
+the same command again sends nothing.
+
+  --delete      remove from the destination tree what the source no longer has
+  --checksum    compare files by hash instead of size and modification time
+  --exclude G   leave out paths matching the glob G at both ends (repeatable; a trailing / matches
+                directories only)
+  --dry-run     say what would be sent and deleted, and change nothing
+  --as P        act as the principal P
+  --json        print the result as JSON
+
+Progress is shown on stderr when it is a terminal.";
+
+/// `legion help stream`.
+pub const STREAM_HELP: &str = "\
+Usage: legion stream [--as PRINCIPAL]
+
+The pipe file transfers move bytes over; fs.transfer and legion cp start it on the other machine.
+It reads one JSON header on stdin, saying what to do (manifest, stat, get, put, pack, unpack or
+delete) and where, then moves raw bytes. Every path is inside that header, so the command line is
+always exactly `legion stream`. Each operation is allowed as the file tool it amounts to would be
+(fs.read, fs.write or fs.remove) and is written to the audit log with the door stream.";
+
+/// `legion help gate`.
+pub const GATE_HELP: &str = "\
+Usage: legion gate --as PRINCIPAL
+
+The forced command of an ssh key that may do exactly what PRINCIPAL's role in policy.toml allows on
+this machine, and nothing else. sshd runs it whatever the client asked for. It reads the request
+from SSH_ORIGINAL_COMMAND without a shell and, when that is exactly one of the commands legion's ssh
+connector sends for `legion rpc` or `legion stream`, serves it itself, pinned to PRINCIPAL. Anything
+else is refused with exit code 1.
+
+In ~/.ssh/authorized_keys on this machine, one line per key:
+
+  command=\"/home/me/.local/bin/legion gate --as agent:example\",restrict ssh-ed25519 AAAA... comment
+
+Use the full path to legion; restrict turns off port forwarding, a terminal and the rest.";
 
 /// Reads the arguments after the program's name.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageError> {
@@ -144,6 +239,26 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
                 compact: flags.compact,
             })
         }
+        "stream" => {
+            let mut flags = Flags::read(rest, &["--as"])?;
+            flags.no_pairs("stream")?;
+            Ok(Command::Stream {
+                pinned: flags.as_principal,
+            })
+        }
+        "gate" => {
+            let mut flags = Flags::read(rest, &["--as"])?;
+            flags.no_pairs("gate")?;
+            let pinned = flags.as_principal.ok_or_else(|| {
+                UsageError(
+                    "gate needs --as: the principal the key acts as. `legion help gate` shows the authorized_keys line.".to_owned(),
+                )
+            })?;
+            Ok(Command::Gate { pinned })
+        }
+        "cp" => cp(rest).map(Command::Cp),
+        "serve" => serve(rest),
+        "token" => token(rest),
         tool if tool.starts_with('-') => Err(UsageError(format!(
             "{tool} is not an option here; options come after the tool's name."
         ))),
@@ -176,6 +291,150 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
             }))
         }
     }
+}
+
+/// Reads `legion cp`'s words: two places, and options anywhere among them.
+fn cp(rest: &[String]) -> Result<CpCommand, UsageError> {
+    let mut places = Vec::new();
+    let mut command = CpCommand {
+        from: String::new(),
+        to: String::new(),
+        delete: false,
+        checksum: false,
+        exclude: Vec::new(),
+        dry_run: false,
+        as_principal: None,
+        json: false,
+    };
+    let mut words = rest.iter();
+    let mut options_ended = false;
+    while let Some(word) = words.next() {
+        if options_ended || !word.starts_with("--") {
+            places.push(word.clone());
+            continue;
+        }
+        let (name, inline) = match word.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_owned())),
+            None => (word.as_str(), None),
+        };
+        let mut value = |name: &str| {
+            inline
+                .clone()
+                .or_else(|| words.next().cloned())
+                .ok_or_else(|| UsageError(format!("{name} needs a value.")))
+        };
+        let flag = |set: &mut bool| {
+            if inline.is_some() {
+                return Err(UsageError(format!("{name} takes no value.")));
+            }
+            *set = true;
+            Ok(())
+        };
+        match name {
+            "--" if inline.is_none() => options_ended = true,
+            "--delete" => flag(&mut command.delete)?,
+            "--checksum" => flag(&mut command.checksum)?,
+            "--dry-run" => flag(&mut command.dry_run)?,
+            "--json" => flag(&mut command.json)?,
+            "--exclude" => command.exclude.push(value(name)?),
+            "--as" => {
+                let principal = value(name)?;
+                Principal::parse(&principal)
+                    .map_err(|error| UsageError(format!("--as: {}", error.message)))?;
+                if command.as_principal.replace(principal).is_some() {
+                    return Err(UsageError("--as is given twice.".to_owned()));
+                }
+            }
+            _ => return Err(UsageError(format!("{name} is not an option of cp."))),
+        }
+    }
+    let [from, to] = <[String; 2]>::try_from(places).map_err(|places| {
+        UsageError(format!(
+            "cp takes two places, what to send and where, and {} were given.",
+            places.len()
+        ))
+    })?;
+    command.from = from;
+    command.to = to;
+    Ok(command)
+}
+
+/// The help of a command that is not a tool, for `legion help <command>`.
+pub fn command_help(name: &str) -> Option<&'static str> {
+    match name {
+        "cp" => Some(CP_HELP),
+        "stream" => Some(STREAM_HELP),
+        "gate" => Some(GATE_HELP),
+        _ => None,
+    }
+}
+
+/// `legion serve [--listen ADDRESS]`, or `--help`.
+fn serve(rest: &[String]) -> Result<Command, UsageError> {
+    let mut listen = None;
+    let mut help = false;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        let value = if word == "--help" || word == "-h" {
+            help = true;
+            continue;
+        } else if let Some(value) = word.strip_prefix("--listen=") {
+            value.to_owned()
+        } else if word == "--listen" {
+            words
+                .next()
+                .cloned()
+                .ok_or_else(|| UsageError("--listen needs a value.".to_owned()))?
+        } else {
+            return Err(UsageError(format!("{word} was not expected here.")));
+        };
+        if listen.replace(value).is_some() {
+            return Err(UsageError("--listen is given twice.".to_owned()));
+        }
+    }
+    Ok(Command::Serve { listen, help })
+}
+
+/// `legion token add|list|remove`, which is `token.add`, `token.list` and `token.remove` with the
+/// names and the principal written as words rather than `key=value`.
+fn token(rest: &[String]) -> Result<Command, UsageError> {
+    let Some((verb, rest)) = rest.split_first() else {
+        return Err(UsageError("token takes add, list or remove.".to_owned()));
+    };
+    let (tool, names): (&str, &[&str]) = match verb.as_str() {
+        "add" => ("token.add", &["name", "principal"]),
+        "list" => ("token.list", &[]),
+        "remove" => ("token.remove", &["name"]),
+        other => {
+            return Err(UsageError(format!(
+                "{other} is not something token does; it takes add, list or remove."
+            )));
+        }
+    };
+    let mut flags = Flags::read(rest, &["--json", "--as", "--on"])?;
+    if flags.positional.len() != names.len() {
+        return Err(UsageError(match names {
+            [] => format!("token {verb} takes no names."),
+            [name] => format!("token {verb} takes the token's {name}."),
+            _ => format!("token {verb} takes the token's name and the principal it stands for."),
+        }));
+    }
+    for (name, value) in names.iter().zip(flags.positional.drain(..)) {
+        if flags
+            .pairs
+            .insert((*name).to_owned(), Value::String(value))
+            .is_some()
+        {
+            return Err(UsageError(format!("{name} is given twice.")));
+        }
+    }
+    Ok(Command::Call(CallCommand {
+        tool: tool.to_owned(),
+        args: ArgsSource::Pairs(flags.pairs),
+        as_principal: flags.as_principal,
+        on: flags.on,
+        json: flags.json,
+    }))
 }
 
 fn no_more(rest: &[String]) -> Result<(), UsageError> {
@@ -404,6 +663,15 @@ mod tests {
             &["mcp", "a=1"],
             &["help", "a.b", "c.d"],
             &["--version", "x"],
+            &["gate"],
+            &["gate", "--as", "a", "extra"],
+            &["stream", "x=1"],
+            &["cp", "a"],
+            &["cp", "a", "b", "c"],
+            &["cp", "a", "b", "--frob"],
+            &["cp", "a", "b", "--delete=yes"],
+            &["cp", "a", "b", "--exclude"],
+            &["cp", "a", "b", "--as", "not ok"],
         ] {
             assert!(run(line).is_err(), "{line:?} was accepted");
         }
@@ -448,6 +716,63 @@ mod tests {
                 compact: false
             })
         );
+        assert_eq!(
+            run(&["stream", "--as", "phone"]),
+            Ok(Command::Stream {
+                pinned: Some("phone".into())
+            })
+        );
+        assert_eq!(
+            run(&["gate", "--as", "agent:example"]),
+            Ok(Command::Gate {
+                pinned: "agent:example".into()
+            })
+        );
+        assert_eq!(
+            run(&["cp", "pi:~/app", "--checksum", "--", "--odd-name"]),
+            Ok(Command::Cp(CpCommand {
+                from: "pi:~/app".into(),
+                to: "--odd-name".into(),
+                delete: false,
+                checksum: true,
+                exclude: Vec::new(),
+                dry_run: false,
+                as_principal: None,
+                json: false,
+            }))
+        );
+        assert_eq!(
+            run(&[
+                "cp",
+                "--exclude",
+                "*.log",
+                "pi:~/app",
+                "--delete",
+                "C:\\Work\\app",
+                "--exclude=target/",
+                "--dry-run",
+                "--as",
+                "agent:example",
+                "--json",
+            ]),
+            Ok(Command::Cp(CpCommand {
+                from: "pi:~/app".into(),
+                to: "C:\\Work\\app".into(),
+                delete: true,
+                checksum: false,
+                exclude: vec!["*.log".into(), "target/".into()],
+                dry_run: true,
+                as_principal: Some("agent:example".into()),
+                json: true,
+            }))
+        );
+        assert_eq!(command_help("gate"), Some(GATE_HELP));
+        assert!(
+            GATE_HELP.contains(
+                "command=\"/home/me/.local/bin/legion gate --as agent:example\",restrict"
+            )
+        );
+        assert_eq!(command_help("fs.read"), None);
         assert_eq!(run(&["--version"]), Ok(Command::Version));
         assert_eq!(
             run(&["-h"]),
@@ -456,5 +781,66 @@ mod tests {
                 json: false
             })
         );
+    }
+
+    #[test]
+    fn serve_and_token_words() {
+        assert_eq!(
+            run(&["serve"]),
+            Ok(Command::Serve {
+                listen: None,
+                help: false
+            })
+        );
+        assert_eq!(
+            run(&["serve", "--listen", "127.0.0.1:0"]),
+            Ok(Command::Serve {
+                listen: Some("127.0.0.1:0".into()),
+                help: false
+            })
+        );
+        assert_eq!(
+            run(&["serve", "--listen=[::1]:7117", "--help"]),
+            Ok(Command::Serve {
+                listen: Some("[::1]:7117".into()),
+                help: true
+            })
+        );
+        assert!(run(&["serve", "--listen"]).is_err());
+        assert!(run(&["serve", "--listen", "a", "--listen", "b"]).is_err());
+        assert!(run(&["serve", "--port", "1"]).is_err());
+
+        let add = call(&[
+            "token",
+            "add",
+            "phone",
+            "phone",
+            "expires_days=30",
+            "--json",
+        ]);
+        assert_eq!(add.tool, "token.add");
+        assert!(add.json);
+        assert_eq!(
+            add.args,
+            ArgsSource::Pairs(
+                json!({"expires_days": 30, "name": "phone", "principal": "phone"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+            )
+        );
+        assert_eq!(call(&["token", "list"]).tool, "token.list");
+        let remove = call(&["token", "remove", "phone", "--on", "pi"]);
+        assert_eq!(remove.tool, "token.remove");
+        assert_eq!(remove.on, Some(Target::One("pi".into())));
+        for wrong in [
+            &["token"][..],
+            &["token", "make"],
+            &["token", "add", "phone"],
+            &["token", "list", "x"],
+            &["token", "remove", "phone", "name=other"],
+        ] {
+            assert!(run(wrong).is_err(), "{wrong:?}");
+        }
     }
 }

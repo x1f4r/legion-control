@@ -19,7 +19,7 @@ legion-proto.workspace = true
 legion-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 legion-tools = { workspace = true, features = ["testing"] }
@@ -30,6 +30,17 @@ tokio = { workspace = true, features = ["time"] }
 # node, emitting banners, simulating disconnects) without relying on sh, env, or sleep.
 [[test]]
 name = "fleet"
+harness = false
+
+# Runs its own binary as the connector to second and third nodes, to cut, slow down or prefix a
+# banner to their stream pipes.
+[[test]]
+name = "transfer"
+harness = false
+
+# Hosts extra nodes for its fan-out test by re-executing itself, as the fleet tests do.
+[[test]]
+name = "http"
 harness = false
 
 [lints]

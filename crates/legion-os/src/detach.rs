@@ -26,8 +26,10 @@
 //!   job, to launch the process so it survives SSH disconnect.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,7 +38,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::procid::{self, KillTreeReport, ProcessId};
+#[cfg(not(any(unix, windows)))]
+use crate::procid;
+use crate::procid::{KillTreeReport, ProcessId};
 use crate::shell::{
     self, CommandSpec, ResolvedCommand, encode_utf16le_base64, powershell_single_quote,
     windows_cmdline_escape,
@@ -44,6 +48,16 @@ use crate::shell::{
 use crate::{OsError, Result};
 
 static SCOPE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Environment variable injected into every process launched by [`spawn_detached`] with a unique
+/// per-launch token (recorded in [`DetachHandle::marker`]).
+///
+/// Always applied after [`DetachOptions::env_remove`] and [`DetachOptions::env`] so callers that
+/// drop inherited `LEGION_*` variables still tag the newly detached process tree. When no kernel
+/// boundary (Linux systemd user scope or Windows named Job Object) is active, [`detached_active`]
+/// and [`stop_detached`] use this marker to prove orphan ownership after the root process exits.
+pub const DETACH_MARKER_ENV: &str = "LEGION_DETACH_ID";
 
 #[cfg(unix)]
 #[path = "detach/unix.rs"]
@@ -74,6 +88,8 @@ pub struct DetachOptions {
     pub cwd: Option<PathBuf>,
     /// Extra environment variables overlaid on the inherited environment.
     pub env: BTreeMap<OsString, OsString>,
+    /// Inherited environment variable names to drop before applying explicit [`Self::env`] entries.
+    pub env_remove: Vec<OsString>,
     /// File path to append standard output to; redirected to null when `None`.
     pub stdout_path: Option<PathBuf>,
     /// File path to append standard error to; redirected to null when `None`.
@@ -88,6 +104,7 @@ impl DetachOptions {
             name: None,
             cwd: None,
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
             stdout_path: None,
             stderr_path: None,
         }
@@ -124,6 +141,22 @@ impl DetachOptions {
         self
     }
 
+    /// Remove an inherited environment variable before explicit [`Self::env`] entries are applied.
+    pub fn env_remove(mut self, key: impl Into<OsString>) -> Self {
+        self.env_remove.push(key.into());
+        self
+    }
+
+    /// Remove multiple inherited environment variables before explicit [`Self::env`] entries are applied.
+    pub fn env_removes<I, K>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<OsString>,
+    {
+        self.env_remove.extend(keys.into_iter().map(Into::into));
+        self
+    }
+
     /// Append standard output to `path`.
     pub fn stdout_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.stdout_path = Some(path.into());
@@ -148,7 +181,9 @@ impl DetachOptions {
 /// Persistent handle for a detached process, serializable for storage in a job record.
 ///
 /// Later invocations (including in a different process) can deserialize this handle and pass it
-/// to [`stop_detached`] to tear down the entire detached process tree or Linux systemd scope.
+/// to [`stop_detached`] to tear down the entire detached process tree, Linux systemd scope, or
+/// Windows named Job Object. Handles persisted by older versions without `windows_job` or `marker`
+/// deserialize cleanly with those fields set to `None`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DetachHandle {
     /// Process identity (`pid` and full-precision kernel start time) of the detached target.
@@ -157,9 +192,33 @@ pub struct DetachHandle {
     /// the process was started inside a systemd user scope; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub systemd_unit: Option<String>,
+    /// Named Windows Job Object (`Local\legion-job-...`) bounding the detached process tree when
+    /// started through the direct Windows path; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_job: Option<String>,
+    /// Unique value placed in [`DETACH_MARKER_ENV`] (`LEGION_DETACH_ID`) for this launch, used to
+    /// prove orphan ownership after the root process exits when no systemd scope or Windows Job
+    /// Object is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
     /// Non-fatal warnings produced while launching (for example when systemd user lingering is off).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// Internal test seam controlling Linux systemd user-scope selection so integration tests can
+/// exercise both the systemd-scope path and the `setsid` fallback paths on any host.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScopeProbeOverride {
+    /// Probe the systemd user manager and lingering state normally.
+    #[default]
+    Auto,
+    /// Behave as if no systemd user manager is reachable (forces direct `setsid`).
+    ForceNoSystemd,
+    /// Probe the systemd user manager normally, but treat lingering as disabled (forces `setsid`
+    /// fallback with the lingering warning when a user manager is reachable).
+    ForceLingerDisabled,
 }
 
 /// Start a detached process that outlives the caller, its terminal, and its SSH session.
@@ -169,6 +228,16 @@ pub struct DetachHandle {
 /// [`DetachHandle`] carrying the target's [`ProcessId`], its Linux systemd scope unit name when
 /// a scope was used, and any non-fatal launch warnings.
 pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
+    spawn_detached_for_test(options, ScopeProbeOverride::Auto).await
+}
+
+/// Test-only entry point for [`spawn_detached`] that allows forcing the Linux scope-selection
+/// branch without mutating process-wide environment variables.
+#[doc(hidden)]
+pub async fn spawn_detached_for_test(
+    options: DetachOptions,
+    scope_override: ScopeProbeOverride,
+) -> Result<DetachHandle> {
     let resolved = shell::resolve(&options.command)?;
     validate_scope_name(options.name.as_deref())?;
 
@@ -191,7 +260,7 @@ pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
         }
     }
 
-    spawn_detached_impl(&resolved, &options).await
+    spawn_detached_impl(&resolved, &options, scope_override).await
 }
 
 /// Return `true` while any process started under `handle` is still running—not just the root.
@@ -201,29 +270,82 @@ pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
 /// - **Linux with a systemd user scope (`handle.systemd_unit`):** checks the root process first,
 ///   then reads the scope's cgroup (`cgroup.procs` / `cgroup.events`) directly under `/sys/fs/cgroup`
 ///   when available, falling back to `systemctl --user show` on non-standard cgroup layouts.
-/// - **Other Unix (or `setsid` fallback):** returns `true` if `handle.process` is alive or if any
-///   live process still has `handle.process.pid` as its session ID or process group ID and started
-///   at or after `handle.process.start_time` (the same rule [`procid::kill_tree`] uses).
-/// - **Windows:** returns `true` if `handle.process` is alive or if a verified read-only process
-///   tree walk finds any live descendant whose handle confirms `parent_pid` and creation time.
+/// - **Windows with a named Job Object (`handle.windows_job`):** opens the job read-only
+///   (`JOB_OBJECT_QUERY`) and queries `JobObjectBasicProcessIdList`, falling back to root plus
+///   `handle.marker` if the job object is no longer openable.
+/// - **Without a scope or Job Object:** returns `true` while `handle.process` is alive or—when
+///   `handle.marker` is set—while any live process carries `LEGION_DETACH_ID=<marker>` in its
+///   environment. Legacy handles without a scope, job, or marker return `false` once the root
+///   exits rather than trusting unverified session, group, or `parent_pid` matches across PID reuse.
 pub async fn detached_active(handle: &DetachHandle) -> Result<bool> {
-    if handle.systemd_unit.is_some() {
-        return detached_active_impl(handle).await;
-    }
-    procid::tree_is_active(&handle.process).await
+    detached_active_impl(handle).await
 }
 
 /// Stop a detached process and its entire tree using the boundary recorded in `handle`.
 ///
-/// When `handle.systemd_unit` names a Linux transient systemd user scope, termination goes through
-/// `systemctl --user kill`/`stop` on that scope so even descendants that called `setsid` are
-/// stopped inside the cgroup. Otherwise falls back to [`procid::kill_tree`]. Returns only once
-/// every process is gone or reports any survivors.
+/// - **Linux with `handle.systemd_unit`:** stops the transient systemd user scope via
+///   `systemctl --user kill`/`stop` so even descendants that called `setsid` are stopped inside
+///   the cgroup.
+/// - **Windows with `handle.windows_job`:** terminates the named Job Object via
+///   `TerminateJobObject`, falling back to root plus `handle.marker` if the job object is no
+///   longer openable.
+/// - **Without a scope or Job Object:** delegates to the marker-verified process-tree stopper
+///   (using `handle.marker` to catch `setsid` grandchildren and prove orphan ownership once the
+///   root has exited, leaving unverifiable candidates untouched in
+///   [`KillTreeReport::unverified_survivors`]).
+///
+/// After stopping, re-checks using the same rule as [`detached_active`] and attempts to stop or
+/// report anything still running so `all_gone: true` is never returned while a matching detached
+/// process remains active.
 pub async fn stop_detached(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
-    if handle.systemd_unit.is_some() {
-        return stop_detached_impl(handle, grace).await;
+    stop_detached_impl(handle, grace).await
+}
+
+/// Merge any processes still found live by the post-stop [`detached_active`] re-check into
+/// `report`, deduplicating by PID and updating [`KillTreeReport::all_gone`].
+pub(crate) fn merge_recheck_survivors(report: &mut KillTreeReport, remaining: Vec<ProcessId>) {
+    for id in remaining {
+        if !report
+            .survivors
+            .iter()
+            .any(|existing| existing.pid == id.pid)
+        {
+            report.survivors.push(id);
+        }
     }
-    procid::kill_tree(&handle.process, grace).await
+    report.survivors.sort_by_key(|id| id.pid);
+    report
+        .unverified_survivors
+        .retain(|u| !report.survivors.iter().any(|s| s.pid == u.pid));
+    report.unverified_survivors.sort_by_key(|id| id.pid);
+    report.all_gone = report.survivors.is_empty() && report.unverified_survivors.is_empty();
+}
+
+/// Generate a unique ASCII token for [`DETACH_MARKER_ENV`] (`LEGION_DETACH_ID`) and Windows named
+/// Job Objects.
+pub(crate) fn generate_detach_marker() -> String {
+    let pid = std::process::id();
+    let seq = MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u32(pid);
+    h1.write_u64(seq);
+    h1.write_u128(nanos);
+    let r1 = h1.finish();
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(r1);
+    h2.write_u64(seq.wrapping_add(1));
+    let r2 = h2.finish();
+    format!("{pid:x}-{seq:x}-{r1:016x}{r2:016x}")
+}
+
+/// Build the session-local Windows named Job Object identifier (`Local\legion-job-<marker>`).
+#[allow(dead_code)]
+pub(crate) fn resolve_windows_job_name(marker: &str) -> String {
+    format!(r"Local\legion-job-{marker}")
 }
 
 /// Validate an optional caller-supplied job name for systemd scope naming.
@@ -260,6 +382,26 @@ pub(crate) fn sanitize_scope_prefix(raw: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// Return `true` when `systemd-run --help` advertises `--expand-environment`.
+#[allow(dead_code)]
+pub(crate) fn systemd_help_supports_expand_env_no(help: &str) -> bool {
+    help.contains("--expand-environment")
+}
+
+/// Parse the leading major version number from `systemd-run --version` (for example
+/// `"systemd 255 (255.4-1ubuntu8)"` -> `Some(255)`).
+#[allow(dead_code)]
+pub(crate) fn parse_systemd_major_version(output: &str) -> Option<u32> {
+    let first_line = output.lines().next()?.trim();
+    let rest = first_line.strip_prefix("systemd")?.trim_start();
+    let token = rest.split_ascii_whitespace().next()?;
+    let digits: String = token.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
 }
 
 /// Parse the `populated` flag (`0` or `1`) from a Linux cgroup v2 `cgroup.events` file.
@@ -397,10 +539,20 @@ fn open_append_file(path: &Path) -> Result<std::fs::File> {
         .map_err(|err| OsError::from_io(format!("cannot open log file {}", path.display()), err))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 async fn spawn_detached_impl(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
+    scope_override: ScopeProbeOverride,
+) -> Result<DetachHandle> {
+    platform::spawn_detached(resolved, options, scope_override).await
+}
+
+#[cfg(windows)]
+async fn spawn_detached_impl(
+    resolved: &ResolvedCommand,
+    options: &DetachOptions,
+    _scope_override: ScopeProbeOverride,
 ) -> Result<DetachHandle> {
     platform::spawn_detached(resolved, options).await
 }
@@ -409,30 +561,31 @@ async fn spawn_detached_impl(
 async fn spawn_detached_impl(
     _resolved: &ResolvedCommand,
     _options: &DetachOptions,
+    _scope_override: ScopeProbeOverride,
 ) -> Result<DetachHandle> {
     Err(OsError::Unsupported {
         detail: "detached process launching is not supported on this platform".into(),
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn detached_active_impl(handle: &DetachHandle) -> Result<bool> {
     platform::detached_active(handle).await
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn detached_active_impl(handle: &DetachHandle) -> Result<bool> {
-    procid::tree_is_active(&handle.process).await
+    procid::tree_is_active_with_marker(&handle.process, handle.marker.as_deref()).await
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn stop_detached_impl(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
     platform::stop_detached(handle, grace).await
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn stop_detached_impl(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
-    procid::kill_tree(&handle.process, grace).await
+    procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await
 }
 
 /// Build the PowerShell launcher script executed by WMI `Win32_Process.Create`.
@@ -756,14 +909,14 @@ fn split_windows_path_entries(path_var: &str) -> impl Iterator<Item = &str> {
 fn probe_executable_with_exts(base: &Path, exts: &[String]) -> Option<PathBuf> {
     let has_ext = base.extension().is_some();
     if (has_ext || exts.is_empty()) && base.is_file() {
-        return Some(base.to_path_buf());
+        return Some(resolve_on_disk_filename(base));
     }
     if !has_ext {
         let raw = base.to_string_lossy();
         for ext in exts {
             let candidate = PathBuf::from(format!("{raw}{ext}"));
             if candidate.is_file() {
-                return Some(candidate);
+                return Some(resolve_on_disk_filename(&candidate));
             }
             // Support case-sensitive filesystems (for example cross-platform unit tests on Linux)
             // by also checking the lowercase extension when `PATHEXT` contains uppercase entries.
@@ -771,7 +924,7 @@ fn probe_executable_with_exts(base: &Path, exts: &[String]) -> Option<PathBuf> {
             if lower_ext != *ext {
                 let lower_candidate = PathBuf::from(format!("{raw}{lower_ext}"));
                 if lower_candidate.is_file() {
-                    return Some(lower_candidate);
+                    return Some(resolve_on_disk_filename(&lower_candidate));
                 }
             }
         }
@@ -779,31 +932,115 @@ fn probe_executable_with_exts(base: &Path, exts: &[String]) -> Option<PathBuf> {
     None
 }
 
-/// Refuse `.cmd`/`.bat` targets on the Windows WMI path unless every argument is free of `cmd.exe`
-/// metacharacters.
-///
-/// Launching a batch file through `CreateProcessW` implicitly routes the command line through
-/// `cmd.exe /c`, where characters like `&`, `|`, `<`, `>`, `^`, `%`, `!`, `"`, or newlines can
-/// inject unintended commands despite MSVCRT quoting.
+/// Replace the final path component with its actual on-disk spelling when the parent directory is
+/// readable, avoiding uppercase `PATHEXT` suffixes (such as `mytool.EXE`) on case-insensitive
+/// filesystems without introducing Windows `\\?\` verbatim prefixes from `canonicalize`.
 #[allow(dead_code)]
-pub(crate) fn validate_wmi_batch_target(program: &str, args: &[String]) -> Result<()> {
+fn resolve_on_disk_filename(path: &Path) -> PathBuf {
+    let (Some(parent), Some(target_name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let target_str = target_name.to_string_lossy();
+    let mut ci_match = None;
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let entry_name = entry.file_name();
+            if entry_name == target_name {
+                return parent.join(entry_name);
+            }
+            if ci_match.is_none()
+                && entry_name
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&target_str)
+            {
+                ci_match = Some(entry_name);
+            }
+        }
+    }
+    match ci_match {
+        Some(name) => parent.join(name),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Return `true` when `program` refers to a Windows batch script (`.cmd` or `.bat`).
+#[allow(dead_code)]
+pub(crate) fn is_windows_batch_file(program: &str) -> bool {
     let trimmed = program.trim().trim_end_matches(['.', ' ']);
     let lower = trimmed.to_ascii_lowercase();
-    let is_batch = lower.ends_with(".cmd") || lower.ends_with(".bat");
-    if !is_batch {
+    lower.ends_with(".cmd") || lower.ends_with(".bat")
+}
+
+/// Refuse `.cmd`/`.bat` targets on Windows unless both the batch path itself and every argument
+/// are free of `cmd.exe` metacharacters.
+///
+/// Launching a batch file runs through `cmd.exe /c`, where characters like `&`, `|`, `<`, `>`,
+/// `^`, `%`, `!`, `"`, or newlines in either the program path (such as `C:\R&D\x.cmd`) or any
+/// argument can inject unintended commands despite quoting.
+#[allow(dead_code)]
+pub(crate) fn validate_wmi_batch_target(program: &str, args: &[String]) -> Result<()> {
+    if !is_windows_batch_file(program) {
         return Ok(());
+    }
+
+    if !is_safe_cmd_batch_arg(program) {
+        return Err(OsError::InvalidArgument {
+            detail: format!(
+                "refusing to launch batch file {program:?} because its path contains cmd.exe metacharacters; invoke the underlying executable directly or use CommandSpec::Shell"
+            ),
+        });
     }
 
     for (idx, arg) in args.iter().enumerate() {
         if !is_safe_cmd_batch_arg(arg) {
             return Err(OsError::InvalidArgument {
                 detail: format!(
-                    "refusing to launch batch file {program:?} via WMI because argument {idx} contains cmd.exe metacharacters; invoke the underlying executable directly or use CommandSpec::Shell"
+                    "refusing to launch batch file {program:?} because argument {idx} contains cmd.exe metacharacters; invoke the underlying executable directly or use CommandSpec::Shell"
                 ),
             });
         }
     }
     Ok(())
+}
+
+/// Build `(lpApplicationName, lpCommandLine)` for direct Windows `CreateProcessW` launches.
+///
+/// For `.cmd`/`.bat` targets, validates both the batch path and arguments against `cmd.exe`
+/// metacharacters, always quotes the batch path (even without spaces), and passes the full
+/// `%SystemRoot%\System32\cmd.exe` path as `lpApplicationName` so `CreateProcessW` never resolves
+/// a stray `cmd.exe` from the working directory or `PATH`.
+#[allow(dead_code)]
+pub(crate) fn build_windows_direct_launch(
+    program: &str,
+    args: &[String],
+    system_root: Option<&str>,
+) -> Result<(Option<String>, String)> {
+    if is_windows_batch_file(program) {
+        validate_wmi_batch_target(program, args)?;
+        let root = system_root
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(r"C:\Windows")
+            .trim_end_matches(['\\', '/']);
+        let cmd_exe = format!(r"{root}\System32\cmd.exe");
+
+        // Always quote `program` (safe because `validate_wmi_batch_target` rejected `"`, trailing
+        // `\`, and all cmd metacharacters in `program`).
+        let mut inner = format!("\"{program}\"");
+        for arg in args {
+            inner.push(' ');
+            inner.push_str(&windows_cmdline_escape(arg));
+        }
+        let command_line = format!("\"{cmd_exe}\" /d /s /c \"{inner}\"");
+        return Ok((Some(cmd_exe), command_line));
+    }
+
+    let mut line = windows_cmdline_escape(program);
+    for arg in args {
+        line.push(' ');
+        line.push_str(&windows_cmdline_escape(arg));
+    }
+    Ok((None, line))
 }
 
 #[allow(dead_code)]
@@ -998,12 +1235,33 @@ mod tests {
             ("PATHEXT".to_owned(), ".EXE;.CMD;.BAT".to_owned()),
         ];
 
-        assert_eq!(
-            resolve_wmi_program("mytool", dir.path(), &merged_env),
-            exe_path.to_string_lossy()
+        let resolved_exe = resolve_wmi_program("mytool", dir.path(), &merged_env);
+        assert!(
+            same_windows_path(&resolved_exe, &exe_path.to_string_lossy()),
+            "expected {}, got {resolved_exe}",
+            exe_path.display()
         );
+        assert_eq!(
+            Path::new(&resolved_exe).file_name(),
+            Some(std::ffi::OsStr::new("mytool.exe"))
+        );
+
         let resolved_shim = resolve_wmi_program("shim", dir.path(), &merged_env);
-        assert_eq!(resolved_shim, cmd_path.to_string_lossy());
+        assert!(
+            same_windows_path(&resolved_shim, &cmd_path.to_string_lossy()),
+            "expected {}, got {resolved_shim}",
+            cmd_path.display()
+        );
+        assert_eq!(
+            Path::new(&resolved_shim).file_name(),
+            Some(std::ffi::OsStr::new("shim.cmd"))
+        );
+
+        // Even when probed with uppercase `PATHEXT` casing, on-disk filename spelling is returned.
+        assert_eq!(
+            resolve_on_disk_filename(&bin_dir.join("MYTOOL.EXE")),
+            exe_path
+        );
 
         // Safe args to a `.cmd` file are allowed; cmd.exe metacharacters are refused.
         assert!(
@@ -1029,6 +1287,39 @@ mod tests {
                 "expected batch rejection for arg {dangerous:?}"
             );
         }
+
+        // Batch paths containing cmd.exe metacharacters (such as `C:\R&D\x.cmd`) must be refused.
+        for dangerous_path in [
+            r"C:\R&D\x.cmd",
+            r"C:\dir(1)\run.bat",
+            r"C:\tmp\%TEMP%\job.cmd",
+        ] {
+            assert!(
+                matches!(
+                    build_windows_direct_launch(dangerous_path, &[], Some(r"C:\Windows")),
+                    Err(OsError::InvalidArgument { .. })
+                ),
+                "expected batch path rejection for {dangerous_path:?}"
+            );
+            assert!(
+                matches!(
+                    validate_wmi_batch_target(dangerous_path, &[]),
+                    Err(OsError::InvalidArgument { .. })
+                ),
+                "expected WMI batch path rejection for {dangerous_path:?}"
+            );
+        }
+
+        // Safe batch paths on the direct path are always quoted and launched via full
+        // `%SystemRoot%\System32\cmd.exe` as lpApplicationName.
+        let (app, cmdline) =
+            build_windows_direct_launch(r"C:\safe\x.cmd", &["--ok".into()], Some(r"D:\WinNT\"))
+                .unwrap();
+        assert_eq!(app.as_deref(), Some(r"D:\WinNT\System32\cmd.exe"));
+        assert_eq!(
+            cmdline,
+            r#""D:\WinNT\System32\cmd.exe" /d /s /c ""C:\safe\x.cmd" --ok""#
+        );
 
         // Non-batch executables allow arbitrary arguments without restriction.
         assert!(
@@ -1092,23 +1383,54 @@ mod tests {
         let with_scope = DetachHandle {
             process: ProcessId::new(9001, 42_000),
             systemd_unit: Some("legion-job-build-1.scope".into()),
+            windows_job: None,
+            marker: Some("abc-1".into()),
             warnings: Vec::new(),
         };
         let json = serde_json::to_string(&with_scope).unwrap();
         assert!(json.contains("\"systemd_unit\":\"legion-job-build-1.scope\""));
+        assert!(json.contains("\"marker\":\"abc-1\""));
+        assert!(!json.contains("\"windows_job\""));
         assert!(!json.contains("\"warnings\""));
         let decoded: DetachHandle = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, with_scope);
 
-        let without_scope = DetachHandle {
+        let with_job = DetachHandle {
             process: ProcessId::new(9002, 42_001),
             systemd_unit: None,
+            windows_job: Some(r"Local\legion-job-abc-2".into()),
+            marker: Some("abc-2".into()),
             warnings: vec!["lingering disabled".into()],
         };
-        let json2 = serde_json::to_string(&without_scope).unwrap();
+        let json2 = serde_json::to_string(&with_job).unwrap();
         assert!(!json2.contains("systemd_unit"));
+        assert!(json2.contains("\"windows_job\""));
         let decoded2: DetachHandle = serde_json::from_str(&json2).unwrap();
-        assert_eq!(decoded2, without_scope);
+        assert_eq!(decoded2, with_job);
+
+        // Backward compatibility: handles persisted before `marker` and `windows_job` existed
+        // must deserialize cleanly with those fields defaulting to `None`.
+        let legacy_json = r#"{"process":{"pid":9003,"start_time":42002}}"#;
+        let legacy: DetachHandle = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            legacy,
+            DetachHandle {
+                process: ProcessId::new(9003, 42_002),
+                systemd_unit: None,
+                windows_job: None,
+                marker: None,
+                warnings: Vec::new(),
+            }
+        );
+
+        let m1 = generate_detach_marker();
+        let m2 = generate_detach_marker();
+        assert_ne!(m1, m2);
+        assert!(m1.is_ascii() && !m1.is_empty());
+        assert_eq!(
+            resolve_windows_job_name(&m1),
+            format!(r"Local\legion-job-{m1}")
+        );
     }
 
     #[test]
@@ -1182,6 +1504,44 @@ mod tests {
             Some(false)
         );
         assert_eq!(parse_cgroup_events_populated("frozen 0\n"), None);
+
+        assert!(systemd_help_supports_expand_env_no(
+            "  --expand-environment=BOOL  Control expansion\n"
+        ));
+        assert!(!systemd_help_supports_expand_env_no("  --scope\n"));
+        assert_eq!(
+            parse_systemd_major_version("systemd 262 (262.1-1-arch)\n+PAM\n"),
+            Some(262)
+        );
+        assert_eq!(
+            parse_systemd_major_version("systemd 254~rc1 (254)\n"),
+            Some(254)
+        );
+        assert_eq!(parse_systemd_major_version("unknown"), None);
+    }
+
+    #[test]
+    fn merge_recheck_survivors_flips_all_gone_and_deduplicates() {
+        let p1 = ProcessId::new(200, 10);
+        let p2 = ProcessId::new(100, 20);
+        let mut report = KillTreeReport {
+            all_gone: true,
+            survivors: Vec::new(),
+            unverified_survivors: vec![p2],
+        };
+        merge_recheck_survivors(&mut report, vec![p1, p2, p1]);
+        assert!(!report.all_gone);
+        assert_eq!(report.survivors, vec![p2, p1]);
+        assert!(report.unverified_survivors.is_empty());
+
+        let mut clean = KillTreeReport {
+            all_gone: true,
+            survivors: Vec::new(),
+            unverified_survivors: Vec::new(),
+        };
+        merge_recheck_survivors(&mut clean, Vec::new());
+        assert!(clean.all_gone);
+        assert!(clean.survivors.is_empty());
     }
 
     #[tokio::test]
@@ -1189,6 +1549,8 @@ mod tests {
         let absent = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
             systemd_unit: None,
+            windows_job: None,
+            marker: None,
             warnings: Vec::new(),
         };
         assert!(!detached_active(&absent).await.unwrap());
@@ -1196,6 +1558,8 @@ mod tests {
         let absent_scope = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
             systemd_unit: Some("legion-job-definitely-absent-0.scope".into()),
+            windows_job: None,
+            marker: Some("absent-marker-0".into()),
             warnings: Vec::new(),
         };
         assert!(!detached_active(&absent_scope).await.unwrap());

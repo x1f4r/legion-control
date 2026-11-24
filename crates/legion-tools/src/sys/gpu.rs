@@ -15,10 +15,13 @@ pub struct Gpu {
     /// The model name.
     pub name: String,
     /// Its memory, in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_total: Option<u64>,
     /// Memory in use, in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_used: Option<u64>,
     /// How busy it is, in percent.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub utilization_pct: Option<f64>,
 }
 

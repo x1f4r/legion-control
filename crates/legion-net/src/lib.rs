@@ -10,10 +10,13 @@
 
 pub mod config;
 pub mod connector;
+pub mod gate;
 pub mod pool;
 pub mod session;
 mod state;
+pub mod stream;
 pub mod tools;
+pub mod transfer;
 
 pub use config::{
     FleetFile, MachineEntry, RemoteOs, ResolvedSystem, SystemEntry, Transport, validate_mac,

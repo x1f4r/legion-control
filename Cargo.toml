@@ -15,6 +15,7 @@ legion-proto = { path = "crates/legion-proto" }
 legion-core = { path = "crates/legion-core" }
 legion-net = { path = "crates/legion-net" }
 legion-tools = { path = "crates/legion-tools" }
+legion-xfer = { path = "crates/legion-xfer" }
 dunce = "1.0.5"
 gethostname = "1.1.0"
 jiff = { version = "1.0.2", default-features = false, features = ["std"] }
@@ -30,18 +31,28 @@ tempfile = "3.27.0"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
-toml_edit = "0.25.20"
+# Edits fleet.toml and projects.toml in place, keeping the comments and layout a person gave them.
+toml_edit = { version = "0.25.20", default-features = false, features = ["parse", "display"] }
 legion-os = { path = "crates/legion-os" }
+nix = { version = "0.31.1", default-features = false, features = ["signal"] }
 # Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.
 sysinfo = { version = "0.40.4", default-features = false, features = ["system", "disk", "user"] }
 base64 = "0.23.1"
 blake3 = "1.8.7"
+# The operating system's randomness, for the HTTP door's tokens.
+getrandom = "0.4.3"
 globset = "0.4.22"
 ignore = "0.4.35"
 regex = "1.13.2"
 legion-doors = { path = "crates/legion-doors" }
 # The official MCP SDK; it speaks the revisions with and without the initialize handshake.
 rmcp = { version = "3.11.0", default-features = false }
+# The HTTP door: axum routes, hyper serves each connection so its timeouts and shutdown are ours,
+# http-body for the event stream's body. The versions are the ones rmcp's HTTP transport uses.
+axum = { version = "0.8.9", default-features = false }
+http-body = "1.1.0"
+hyper = { version = "1.13.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

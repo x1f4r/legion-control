@@ -282,13 +282,47 @@ fn line_and_column(bytes: &[u8], offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// `node.toml`: what this node calls itself. Later milestones add its boot targets and busy probes.
+/// `node.toml`: what this node calls itself and node-wide settings. Later milestones add its boot
+/// targets and busy probes.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeFile {
     /// The node's name; the host name when absent.
     #[serde(default)]
     pub name: Option<NodeName>,
+    /// Settings for the `svc` tool family.
+    #[serde(default)]
+    pub svc: SvcConfig,
+    /// Settings for `legion serve`.
+    #[serde(default)]
+    pub serve: ServeConfig,
+}
+
+/// The `[serve]` table of `node.toml`: what `legion serve` accepts besides this machine itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeConfig {
+    /// Browser origins (`https://app.example.net`) whose pages may call the server. A request
+    /// from any other page is refused, so a site open in a browser on this machine cannot use it.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// Host names the server answers to besides loopback, such as the name Tailscale Serve
+    /// publishes it under (`tower.example.ts.net`, or `tower.example.ts.net:8443` for one port).
+    /// Any other `Host` is refused, which is what stops a DNS rebinding page from reaching it.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// The `[svc]` table of `node.toml`: how the node controls system services.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SvcConfig {
+    /// Whether system-scope `svc.start`, `svc.stop` and `svc.restart` on Unix run through
+    /// `sudo -n`. Defaults to `false` so the node never escalates privileges on its own; enabling
+    /// it lets any principal allowed those tools control system services as root via
+    /// non-interactive sudoers rules.
+    #[serde(default)]
+    pub sudo: bool,
 }
 
 impl Document for NodeFile {
@@ -571,9 +605,30 @@ mod tests {
     fn node_toml_takes_a_name_or_falls_back_to_the_host() {
         let named = parse::<NodeFile>(Path::new("node.toml"), b"name = \"tower\"\n").unwrap();
         assert_eq!(named.name_or_host().as_str(), "tower");
+        assert!(!named.svc.sudo);
         let error = parse::<NodeFile>(Path::new("node.toml"), b"name = \"Tower\"\n").unwrap_err();
         assert!(error.message.contains("line 1"), "{}", error.message);
         let empty = parse::<NodeFile>(Path::new("node.toml"), b"").unwrap();
         assert_eq!(empty.name_or_host(), NodeName::from_host());
+        assert!(!empty.svc.sudo);
+    }
+
+    #[test]
+    fn node_toml_parses_svc_sudo_strictly() {
+        let enabled = parse::<NodeFile>(Path::new("node.toml"), b"[svc]\nsudo = true\n").unwrap();
+        assert!(enabled.svc.sudo);
+        let disabled = parse::<NodeFile>(Path::new("node.toml"), b"[svc]\n").unwrap();
+        assert!(!disabled.svc.sudo);
+        let wrong_type =
+            parse::<NodeFile>(Path::new("node.toml"), b"[svc]\nsudo = \"yes\"\n").unwrap_err();
+        assert!(
+            wrong_type.message.contains("line 2"),
+            "{}",
+            wrong_type.message
+        );
+        let unknown =
+            parse::<NodeFile>(Path::new("node.toml"), b"[svc]\nroot = true\n").unwrap_err();
+        assert!(unknown.message.contains("line 2"), "{}", unknown.message);
+        assert!(unknown.message.contains("root"), "{}", unknown.message);
     }
 }
