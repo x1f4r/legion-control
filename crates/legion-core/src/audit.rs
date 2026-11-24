@@ -7,7 +7,7 @@
 //! Arguments are recorded with what must not be kept replaced by `{"redacted_bytes": <size>}`:
 //!
 //! - file contents, which a tool takes in a field named `content`, `contents`, `data`, `bytes`,
-//!   `body` or `stdin`;
+//!   `body`, `stdin`, `old` or `new`;
 //! - values under a key that names a secret (`password`, `token`, `secret`, `api_key`, …);
 //! - strings that look like one: a private key, a bearer token, a known token prefix, a JWT, or
 //!   `password=…` inside a longer string;
@@ -242,7 +242,9 @@ impl AuditLog {
     }
 }
 
-const CONTENT_KEYS: [&str; 6] = ["content", "contents", "data", "bytes", "body", "stdin"];
+const CONTENT_KEYS: [&str; 8] = [
+    "content", "contents", "data", "bytes", "body", "stdin", "old", "new",
+];
 const SECRET_WORDS: [&str; 12] = [
     "password",
     "passwd",
@@ -370,6 +372,8 @@ mod tests {
         let args = json!({
             "path": "/home/me/notes.txt",
             "content": "twelve bytes",
+            "old": "before",
+            "new": "afterwards",
             "env": {"GITHUB_TOKEN": "x", "LANG": "C"},
             "argv": ["mysql", "--password=hunter2", "-h", "db"],
             "header": "Bearer abc",
@@ -381,6 +385,8 @@ mod tests {
         let redacted = redact(&args);
         assert_eq!(redacted["path"], json!("/home/me/notes.txt"));
         assert_eq!(redacted["content"], json!({"redacted_bytes": 12}));
+        assert_eq!(redacted["old"], json!({"redacted_bytes": 6}));
+        assert_eq!(redacted["new"], json!({"redacted_bytes": 10}));
         assert_eq!(
             redacted["env"]["GITHUB_TOKEN"],
             json!({"redacted_bytes": 1})
