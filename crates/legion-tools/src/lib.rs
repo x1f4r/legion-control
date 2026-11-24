@@ -10,6 +10,7 @@ pub mod exec;
 pub mod fs;
 pub mod job;
 pub mod meta;
+pub mod power;
 pub mod proj;
 pub mod svc;
 pub mod sys;
