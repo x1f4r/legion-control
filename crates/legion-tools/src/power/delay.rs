@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use super::pending::{self, Pending};
+use super::pending::{self, Disarmed, Outcome, Pending};
 
 /// The first argument that makes `legion` this runner instead of a command line.
 pub const DELAY_MODE: &str = "power-delay";
@@ -26,6 +26,8 @@ const LOCK_PATIENCE: Duration = Duration::from_secs(20);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// How much of the command's standard error is kept.
 const SAID_LIMIT: usize = 2048;
+/// How long clearing the firmware's next boot may take.
+const DISARM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Exit codes: the command's own, or these when it was not run.
 const NO_LOCK: u8 = 3;
@@ -102,6 +104,41 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
         return NOTHING_TO_DO;
     }
     let finished = commands.run(&record.argv, COMMAND_TIMEOUT);
+    let succeeded = finished.exit_code == Some(0) && !finished.timed_out;
+    // A restart into another system that did not happen leaves the firmware set to start it on
+    // whatever restart comes next: clear that again, best effort, and say so in the outcome.
+    let disarmed = match (&record.disarm, succeeded) {
+        (Some(disarm), false) => {
+            let cleared = commands.run(disarm, DISARM_TIMEOUT);
+            say(&format!(
+                "legion power-delay {id}: the restart failed, so the firmware's next boot was cleared with {disarm:?}: exit {:?}",
+                cleared.exit_code
+            ));
+            Some(Disarmed {
+                argv: disarm.clone(),
+                exit_code: cleared.exit_code,
+                said: cleared.said,
+            })
+        }
+        _ => None,
+    };
+    let outcome = Outcome {
+        id: record.id.clone(),
+        action: record.action,
+        into: record.into.clone(),
+        argv: record.argv.clone(),
+        since: record.since.clone(),
+        ran_at: pending::now(),
+        exit_code: finished.exit_code,
+        timed_out: finished.timed_out,
+        said: finished.said.clone(),
+        disarmed,
+    };
+    if let Err(error) = pending::write_outcome(dir, &outcome) {
+        say(&format!(
+            "legion power-delay {id}: its outcome could not be recorded: {error}"
+        ));
+    }
     say(&format!(
         "legion power-delay {id}: {:?} ended: exit {:?}{}{}",
         record.argv,
@@ -243,9 +280,20 @@ mod tests {
 
         fn run(&self, argv: &[String], _timeout: Duration) -> Finished {
             assert!(runner_holds(&self.dir), "the command runs under the lock");
-            self.ran.lock().unwrap().push(argv.to_vec());
+            let mut ran = self.ran.lock().unwrap();
+            ran.push(argv.to_vec());
+            // The action gets exit_code; anything after it (the disarm) succeeds.
             Finished {
-                exit_code: self.exit_code,
+                exit_code: if ran.len() == 1 {
+                    self.exit_code
+                } else {
+                    Some(0)
+                },
+                said: if ran.len() == 1 && self.exit_code != Some(0) {
+                    "sudo: a password is required".to_owned()
+                } else {
+                    String::new()
+                },
                 ..Finished::default()
             }
         }
@@ -262,6 +310,7 @@ mod tests {
             boot_id: None,
             runner: true,
             taken: None,
+            disarm: None,
             abandoned: false,
         };
         write_pending(dir, &record).unwrap();
@@ -329,6 +378,72 @@ mod tests {
         assert_eq!(carry_out(dir.path(), "a1", &giving_up), NOTHING_TO_DO);
         assert!(commands.ran.lock().unwrap().is_empty());
         assert!(giving_up.ran.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_runner_records_how_its_action_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = handed_over(dir.path());
+        let commands = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            ..Recorded::default()
+        };
+        carry_out(dir.path(), "a1", &commands);
+        let outcome: Outcome =
+            serde_json::from_slice(&std::fs::read(dir.path().join("last.json")).unwrap()).unwrap();
+        assert_eq!(outcome.id, "a1");
+        assert_eq!(outcome.argv, record.argv);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.disarmed, None);
+    }
+
+    #[test]
+    fn a_failed_restart_into_another_system_clears_the_firmware_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = handed_over(dir.path());
+        record.action = Action::Restart;
+        record.into = Some("windows".to_owned());
+        record.argv = vec![
+            "sudo".to_owned(),
+            "-n".to_owned(),
+            "systemctl".to_owned(),
+            "reboot".to_owned(),
+        ];
+        record.disarm = Some(vec![
+            "sudo".to_owned(),
+            "-n".to_owned(),
+            "efibootmgr".to_owned(),
+            "--delete-bootnext".to_owned(),
+        ]);
+        write_pending(dir.path(), &record).unwrap();
+        let commands = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(1),
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &commands), 1);
+        assert_eq!(commands.ran.lock().unwrap().last(), record.disarm.as_ref());
+        let outcome: Outcome =
+            serde_json::from_slice(&std::fs::read(dir.path().join("last.json")).unwrap()).unwrap();
+        assert_eq!(outcome.exit_code, Some(1));
+        assert_eq!(outcome.said, "sudo: a password is required");
+        let disarmed = outcome.disarmed.unwrap();
+        assert_eq!(Some(&disarmed.argv), record.disarm.as_ref());
+        assert_eq!(disarmed.exit_code, Some(0));
+
+        // A restart that worked leaves the firmware as armed.
+        let done = tempfile::tempdir().unwrap();
+        let mut ok = record.clone();
+        ok.taken = None;
+        write_pending(done.path(), &ok).unwrap();
+        let worked = Recorded {
+            dir: done.path().to_path_buf(),
+            exit_code: Some(0),
+            ..Recorded::default()
+        };
+        carry_out(done.path(), "a1", &worked);
+        assert_eq!(worked.ran.lock().unwrap().len(), 1);
     }
 
     #[test]

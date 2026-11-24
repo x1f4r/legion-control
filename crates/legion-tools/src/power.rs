@@ -305,6 +305,9 @@ struct StatusResult {
     /// The action handed over and not yet run, while there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pending: Option<Pending>,
+    /// The last handed-over action that has run, and how it ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last: Option<pending::Outcome>,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,6 +334,7 @@ async fn status(actuator: &Arc<dyn Actuator>, ctx: &Ctx) -> Result<StatusResult,
             .collect(),
         sudo: file.power.sudo && platform.has_sudo(),
         pending: pending::pending(ctx.paths(), ctx.boot_id().as_deref()),
+        last: pending::last(ctx.paths()),
     })
 }
 
@@ -538,6 +542,7 @@ async fn act(
         boot_id,
         runner: plan.timing == Timing::Delayed,
         taken: None,
+        disarm: arming.as_ref().and_then(|arming| arming.disarm.clone()),
         abandoned: false,
     };
     let handed = match plan.timing {
@@ -550,19 +555,52 @@ async fn act(
             Err(error) => Err(error),
         },
     };
-    result.warnings = handed.map_err(|error| match &request.into {
-        // Armed but not restarted: whatever restarts the machine next lands there.
-        Some(name) => {
-            let message = format!(
-                "{} The firmware stays set to start {name} on the next boot, whatever causes it.",
-                error.message
-            );
-            ErrorBody { message, ..error }
-        }
-        None => error,
-    })?;
+    result.warnings = match handed {
+        Ok(warnings) => warnings,
+        Err(error) => match (&request.into, &record.disarm) {
+            (None, _) => return Err(error),
+            // Armed but not restarted: whatever restarts the machine next would land there.
+            (Some(name), disarm) => {
+                let after = disarm_after_failure(actuator, cancel, disarm.as_deref(), name).await;
+                return Err(ErrorBody {
+                    message: format!("{} {after}", error.message),
+                    ..error
+                });
+            }
+        },
+    };
     result.scheduled = true;
     Ok(result)
+}
+
+/// Clears an arming whose restart could not be handed over, saying how that went.
+async fn disarm_after_failure(
+    actuator: &Arc<dyn Actuator>,
+    cancel: &legion_core::CancellationToken,
+    disarm: Option<&[String]>,
+    name: &str,
+) -> String {
+    let stays =
+        format!("The firmware stays set to start {name} on the next boot, whatever causes it.");
+    let Some(disarm) = disarm else {
+        return stays;
+    };
+    match actuator.run(disarm, COMMAND_TIMEOUT, cancel).await {
+        Ok(ran) if ran.ok() => format!(
+            "The firmware's setting to start {name} next was cleared again with `{}`.",
+            disarm.join(" ")
+        ),
+        Ok(ran) => format!(
+            "Clearing it with `{}` failed ({}), so: {stays}",
+            disarm.join(" "),
+            describe_failure(&ran)
+        ),
+        Err(error) => format!(
+            "Clearing it with `{}` failed ({}), so: {stays}",
+            disarm.join(" "),
+            error.message
+        ),
+    }
 }
 
 /// Records the action, starts its delayed runner and waits until the runner has taken over; on any

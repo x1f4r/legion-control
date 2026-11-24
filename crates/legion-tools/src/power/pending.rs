@@ -66,9 +66,70 @@ pub struct Pending {
     /// When the runner took it over, RFC 3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub taken: Option<String>,
+    /// For a restart into another system: the command that clears the firmware's next boot
+    /// again, which the runner runs when the restart command fails, so the next restart, whatever
+    /// causes it, does not land in that system unasked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disarm: Option<Vec<String>>,
     /// Whether the call gave up on it, so a runner that starts late must not act.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub abandoned: bool,
+}
+
+/// How a handed-over action ended, as its runner wrote it to `last.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Outcome {
+    /// The hand-over's id.
+    pub id: String,
+    /// What it did.
+    pub action: Action,
+    /// The boot target a restart went into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub into: Option<String>,
+    /// The command.
+    pub argv: Vec<String>,
+    /// When it was handed over, RFC 3339.
+    pub since: String,
+    /// When the command ended, RFC 3339.
+    pub ran_at: String,
+    /// Its exit status; absent when it did not exit by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Whether it was stopped for taking too long.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub timed_out: bool,
+    /// The end of what it wrote to standard error.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub said: String,
+    /// The firmware's next boot cleared again after a failed restart, when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disarmed: Option<Disarmed>,
+}
+
+/// The clearing of the firmware's next boot after a failed restart into another system.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Disarmed {
+    /// The command.
+    pub argv: Vec<String>,
+    /// Its exit status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The end of what it wrote to standard error.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub said: String,
+}
+
+/// The last handed-over action's outcome, when one has run.
+pub fn last(paths: &Paths) -> Option<Outcome> {
+    let bytes = std::fs::read(dir(paths).join("last.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Records how a handed-over action ended.
+pub fn write_outcome(dir: &Path, outcome: &Outcome) -> Result<(), String> {
+    let text = serde_json::to_vec_pretty(outcome).map_err(|error| error.to_string())?;
+    legion_core::config::write_atomically(&dir.join("last.json"), &text)
+        .map_err(|error| error.to_string())
 }
 
 /// What a running call is doing, for the message a second call gets.
@@ -331,6 +392,7 @@ mod tests {
             boot_id: Some("boot-1".to_owned()),
             runner,
             taken: None,
+            disarm: None,
             abandoned: false,
         }
     }

@@ -199,6 +199,9 @@ pub struct Arming {
     pub readback: Readback,
     /// The firmware entry chosen, for messages, when there is one.
     pub entry: Option<String>,
+    /// The command that clears the arming again, when legion knows one: arm and verify commands
+    /// from node.toml have none.
+    pub disarm: Option<Vec<String>>,
 }
 
 /// How an arming is confirmed.
@@ -266,6 +269,7 @@ pub async fn prepare(
                 arm: arm.clone(),
                 readback: Readback::Verify(verify.clone()),
                 entry: None,
+                disarm: None,
             });
         }
         BootTarget::EfiLabel(label) => label,
@@ -308,6 +312,11 @@ pub async fn prepare(
                 ),
                 readback: Readback::BootNext(entry.number.clone()),
                 entry: Some(format!("Boot{} {:?}", entry.number, entry.label)),
+                disarm: Some(maybe_sudo(
+                    platform,
+                    sudo,
+                    strings(&["efibootmgr", "--delete-bootnext"]),
+                )),
             })
         }
         Platform::Windows => {
@@ -338,6 +347,12 @@ pub async fn prepare(
                 arm: strings(&["bcdedit", "/set", "{fwbootmgr}", "bootsequence", &entry.id]),
                 readback: Readback::BootSequence(entry.id.clone()),
                 entry: Some(format!("{} {label:?}", entry.id)),
+                disarm: Some(strings(&[
+                    "bcdedit",
+                    "/deletevalue",
+                    "{fwbootmgr}",
+                    "bootsequence",
+                ])),
             })
         }
     }
@@ -624,6 +639,10 @@ Boot000A* UEFI: PXE IPv4 Ethernet\tPciRoot(0x0)/Pci(0x1c,0x0)/MAC(020000000001,0
             argv(&["sudo", "-n", "efibootmgr", "--bootnext", "0000"])
         );
         assert_eq!(arming.readback, Readback::BootNext("0000".to_owned()));
+        assert_eq!(
+            arming.disarm,
+            Some(argv(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]))
+        );
         arm(&fake, &cancel, Platform::Linux, true, "windows", &arming)
             .await
             .unwrap();
@@ -831,6 +850,15 @@ description             UEFI: PXE IPv4 Ethernet\r\n";
                 "bootsequence",
                 "{7a1c5e2b-3d4f-4a6b-8c9d-0e1f2a3b4c5d}"
             ])
+        );
+        assert_eq!(
+            arming.disarm,
+            Some(argv(&[
+                "bcdedit",
+                "/deletevalue",
+                "{fwbootmgr}",
+                "bootsequence"
+            ]))
         );
         arm(&fake, &cancel, Platform::Windows, true, "linux", &arming)
             .await

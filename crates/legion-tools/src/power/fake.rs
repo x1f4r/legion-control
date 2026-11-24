@@ -292,8 +292,18 @@ impl Actuator for RecordingActuator {
 }
 
 /// What a machine that allows everything and holds nothing back answers: logind says `yes` and
-/// lists no inhibitors; any other command exits 0 and prints nothing.
+/// lists no inhibitors, sudo shows a NOPASSWD rule for any command; any other command exits 0
+/// and prints nothing.
 pub fn permissive(argv: &[String]) -> Ran {
+    if argv.len() > 4 && argv[..4] == ["sudo", "-n", "-l", "-l"] {
+        let command = argv[4..].join(" ");
+        return Ran::exited(
+            0,
+            format!(
+                "Sudoers entry: /etc/sudoers.d/power\n    RunAsUsers: root\n    Options: !authenticate\n    Commands:\n\t{command}\n    Matched: {command}\n"
+            ),
+        );
+    }
     let asks_logind = argv.first().is_some_and(|program| program == "busctl");
     match argv.last().map(String::as_str) {
         Some(method) if asks_logind && method.starts_with("Can") => Ran::exited(0, "s \"yes\"\n"),

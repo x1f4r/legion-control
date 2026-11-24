@@ -126,7 +126,9 @@ pub enum Check {
     /// holds the action back. Asked whatever `[power] sudo` says, because a block inhibitor
     /// refuses root too.
     Logind(Vec<String>),
-    /// `sudo -n -l <command>`: exit 0 allows.
+    /// `sudo -n -l -l <command>`: the rule that matches the command must let it run without a
+    /// password. A plain `sudo -l` is not enough: with sudoers' default `listpw=any`, any
+    /// unrelated NOPASSWD rule lets the listing succeed for a command that needs a password.
     Sudo(Vec<String>),
     /// `id -u`: `0` allows.
     Root(Vec<String>),
@@ -266,9 +268,55 @@ pub fn action_plan(
 }
 
 fn sudo_check(plain: &[String]) -> Vec<String> {
-    let mut argv = strings(&["sudo", "-n", "-l"]);
+    let mut argv = strings(&["sudo", "-n", "-l", "-l"]);
     argv.extend(plain.iter().cloned());
     argv
+}
+
+/// What sudo's long listing of one command says about its password.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SudoRule {
+    /// The rule that decides lets it run without a password; the text names where it is.
+    NoPassword(String),
+    /// The rule that decides wants a password; the text names where it is.
+    Password(String),
+    /// No rule could be read from the listing.
+    Unreadable,
+}
+
+/// Reads `sudo -l -l <command>`: one entry per matching rule, each opening with `Sudoers entry:`
+/// (or `LDAP Role:`), with an `Options:` line holding `!authenticate` for NOPASSWD. sudoers uses
+/// the last rule that matches, so the last entry decides.
+pub fn parse_sudo_listing(text: &str) -> SudoRule {
+    let mut decided = SudoRule::Unreadable;
+    let mut current: Option<(String, bool)> = None;
+    let settle = |entry: Option<(String, bool)>, decided: &mut SudoRule| {
+        if let Some((source, no_password)) = entry {
+            *decided = if no_password {
+                SudoRule::NoPassword(source)
+            } else {
+                SudoRule::Password(source)
+            };
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let header = trimmed
+            .strip_prefix("Sudoers entry:")
+            .or_else(|| trimmed.strip_prefix("LDAP Role:"));
+        if let Some(source) = header {
+            settle(current.take(), &mut decided);
+            current = Some((source.trim().to_owned(), false));
+        } else if let (Some(options), Some((_, no_password))) =
+            (trimmed.strip_prefix("Options:"), current.as_mut())
+        {
+            *no_password = options
+                .split(',')
+                .any(|option| option.trim() == "!authenticate");
+        }
+    }
+    settle(current, &mut decided);
+    decided
 }
 
 fn no_psshutdown() -> ErrorBody {
@@ -347,13 +395,20 @@ pub fn read_check(check: &Check, outcome: &Result<Ran, ErrorBody>) -> Answer {
             }
         }
         Check::Sudo(_) => {
-            if ran.ok() {
-                Answer::Allowed
-            } else {
-                Answer::Refused(nonempty(
+            if !ran.ok() {
+                return Answer::Refused(nonempty(
                     &ran.said(),
                     "sudo does not allow this command without a password",
-                ))
+                ));
+            }
+            match parse_sudo_listing(&ran.stdout) {
+                SudoRule::NoPassword(_) => Answer::Allowed,
+                SudoRule::Password(source) => Answer::Refused(format!(
+                    "the sudo rule for it ({source}) asks for a password, and a command run after the reply has nobody to type one"
+                )),
+                SudoRule::Unreadable => Answer::Unknown(
+                    "sudo allowed the listing but did not show the rule for the command, so whether it needs a password is unknown".to_owned(),
+                ),
             }
         }
         Check::Root(_) => match ran.stdout.trim() {
@@ -581,7 +636,14 @@ mod tests {
             sudo.checks,
             [
                 logind("CanPowerOff"),
-                Check::Sudo(strings(&["sudo", "-n", "-l", "systemctl", "poweroff"]))
+                Check::Sudo(strings(&[
+                    "sudo",
+                    "-n",
+                    "-l",
+                    "-l",
+                    "systemctl",
+                    "poweroff"
+                ]))
             ]
         );
         let sleep = plan(Platform::Linux, Action::Sleep, false);
@@ -603,7 +665,15 @@ mod tests {
         );
         assert_eq!(
             past.checks[1],
-            Check::Sudo(strings(&["sudo", "-n", "-l", "systemctl", "-i", "suspend"]))
+            Check::Sudo(strings(&[
+                "sudo",
+                "-n",
+                "-l",
+                "-l",
+                "systemctl",
+                "-i",
+                "suspend"
+            ]))
         );
     }
 
@@ -620,7 +690,7 @@ mod tests {
         assert_eq!(
             off.checks,
             [Check::Sudo(strings(&[
-                "sudo", "-n", "-l", "shutdown", "-h", "now"
+                "sudo", "-n", "-l", "-l", "shutdown", "-h", "now"
             ]))]
         );
     }
@@ -699,6 +769,50 @@ mod tests {
         }
     }
 
+    /// `sudo -l -l systemctl reboot` where a NOPASSWD rule matches.
+    const NOPASSWD_RULE: &str = "Sudoers entry: /etc/sudoers.d/power\n    RunAsUsers: root\n    Options: !authenticate\n    Commands:\n\t/usr/bin/systemctl reboot\n    Matched: /usr/bin/systemctl reboot\n";
+
+    /// The same where only the group's password rule matches.
+    const PASSWORD_RULE: &str = "Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n    Commands:\n\tALL\n    Matched: /usr/bin/systemctl reboot\n";
+
+    #[test]
+    fn the_rule_that_decides_says_whether_a_password_is_needed() {
+        assert_eq!(
+            parse_sudo_listing(NOPASSWD_RULE),
+            SudoRule::NoPassword("/etc/sudoers.d/power".to_owned())
+        );
+        assert_eq!(
+            parse_sudo_listing(PASSWORD_RULE),
+            SudoRule::Password("/etc/sudoers".to_owned())
+        );
+        // Both match: sudoers uses the last one.
+        assert_eq!(
+            parse_sudo_listing(&format!("{PASSWORD_RULE}\n{NOPASSWD_RULE}")),
+            SudoRule::NoPassword("/etc/sudoers.d/power".to_owned())
+        );
+        assert_eq!(
+            parse_sudo_listing(&format!("{NOPASSWD_RULE}\n{PASSWORD_RULE}")),
+            SudoRule::Password("/etc/sudoers".to_owned())
+        );
+        // Options other than NOPASSWD, or the opposite, do not count.
+        let setenv = NOPASSWD_RULE.replace("!authenticate", "setenv, authenticate");
+        assert_eq!(
+            parse_sudo_listing(&setenv),
+            SudoRule::Password("/etc/sudoers.d/power".to_owned())
+        );
+        let several = NOPASSWD_RULE.replace("!authenticate", "setenv, !authenticate");
+        assert!(matches!(
+            parse_sudo_listing(&several),
+            SudoRule::NoPassword(_)
+        ));
+        // No rule at all.
+        assert_eq!(parse_sudo_listing(""), SudoRule::Unreadable);
+        assert_eq!(
+            parse_sudo_listing("/usr/bin/systemctl reboot\n"),
+            SudoRule::Unreadable
+        );
+    }
+
     #[test]
     fn logind_inhibitor_answers_are_told_apart() {
         let check = logind("CanSuspend");
@@ -769,11 +883,21 @@ mod tests {
             Answer::Unknown(_)
         ));
 
-        let sudo = Check::Sudo(strings(&["sudo", "-n", "-l", "systemctl", "reboot"]));
+        let sudo = Check::Sudo(strings(&["sudo", "-n", "-l", "-l", "systemctl", "reboot"]));
         assert_eq!(
-            answer(&sudo, Ran::exited(0, "/usr/bin/systemctl reboot\n")),
+            answer(&sudo, Ran::exited(0, NOPASSWD_RULE)),
             Answer::Allowed
         );
+        assert!(matches!(
+            answer(&sudo, Ran::exited(0, PASSWORD_RULE)),
+            Answer::Refused(said) if said.contains("/etc/sudoers") && said.contains("password")
+        ));
+        // A short listing names the command but not its rule: whether it needs a password is
+        // unknown, which is not the same as no.
+        assert!(matches!(
+            answer(&sudo, Ran::exited(0, "/usr/bin/systemctl reboot\n")),
+            Answer::Unknown(_)
+        ));
         let refused = Ran {
             stderr: "sudo: a password is required\n".to_owned(),
             ..Ran::exited(1, "")

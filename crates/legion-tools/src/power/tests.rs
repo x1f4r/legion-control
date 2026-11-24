@@ -526,6 +526,7 @@ async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
         boot_id: None,
         runner: true,
         taken: None,
+        disarm: None,
         abandoned: false,
     };
     pending::write_pending(&dir, &record).unwrap();
@@ -618,7 +619,7 @@ async fn logind_is_asked_even_with_sudo_and_root_decides_the_rest() {
     assert_eq!(done["scheduled"], json!(true));
     let runs = fixture.fake.runs();
     assert_eq!(runs[0][0], "busctl");
-    assert_eq!(runs[1][..3], strings(&["sudo", "-n", "-l"]));
+    assert_eq!(runs[1][..4], strings(&["sudo", "-n", "-l", "-l"]));
 }
 
 #[tokio::test]
@@ -666,6 +667,114 @@ async fn a_dry_run_shows_the_commands_and_what_would_refuse_them() {
             json!([["sudo", "-n", "systemctl", "suspend"]])
         );
     }
+}
+
+#[tokio::test]
+async fn a_sudo_rule_that_wants_a_password_refuses_before_anything_is_armed() {
+    if here() == Platform::Windows {
+        return;
+    }
+    // An unrelated NOPASSWD rule lets the listing succeed; the rule for the command wants a
+    // password, which nobody can type after the reply.
+    let listing = "Sudoers entry: /etc/sudoers\n    RunAsUsers: ALL\n    Commands:\n\tALL\n";
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new().reply(Reply::new(&["sudo", "-n", "-l", "-l"], 0, listing)),
+        "busy = \"none\"\n[power]\nsudo = true\n[boot.windows]\narm = [\"arm-windows\"]\nverify = [\"verify-windows\"]\n",
+    );
+    let error = fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+    assert!(
+        error.message.contains("asks for a password"),
+        "{}",
+        error.message
+    );
+    let (argv, _) = expected(Action::Restart, 3, true);
+    assert_eq!(error.details.as_ref().unwrap()["argv"], json!(argv));
+    assert!(!fixture.fake.runs().contains(&strings(&["arm-windows"])));
+    assert!(fixture.fake.schedules().is_empty());
+}
+
+#[tokio::test]
+async fn status_reports_the_last_action_and_how_it_ended() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let outcome = pending::Outcome {
+        id: "a1".to_owned(),
+        action: Action::Restart,
+        into: Some("windows".to_owned()),
+        argv: strings(&["sudo", "-n", "systemctl", "reboot"]),
+        since: "2026-11-24T10:00:00Z".to_owned(),
+        ran_at: "2026-11-24T10:00:03Z".to_owned(),
+        exit_code: Some(1),
+        timed_out: false,
+        said: "sudo: a password is required".to_owned(),
+        disarmed: Some(pending::Disarmed {
+            argv: strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]),
+            exit_code: Some(0),
+            said: String::new(),
+        }),
+    };
+    let dir = pending::dir(fixture.node.paths());
+    std::fs::create_dir_all(&dir).unwrap();
+    pending::write_outcome(&dir, &outcome).unwrap();
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status["last"]["exit_code"], json!(1), "{status}");
+    assert_eq!(status["last"]["into"], json!("windows"));
+    assert_eq!(
+        status["last"]["disarmed"]["argv"],
+        json!(["sudo", "-n", "efibootmgr", "--delete-bootnext"])
+    );
+}
+
+/// efibootmgr on a dual boot machine, before arming and after.
+const EFI_LISTING: &str = "BootCurrent: 0001\nBootOrder: 0001,0000\nBoot0000* Windows Boot Manager\tHD(1,GPT,0f5b7c1e,0x800,0x100000)\nBoot0001* Linux Boot Manager\tHD(1,GPT,0f5b7c1e,0x800,0x100000)\n";
+
+fn efi_armed() -> RecordingActuator {
+    RecordingActuator::new()
+        .reply(Reply::new(&["efibootmgr"], 0, EFI_LISTING))
+        .reply(Reply::new(
+            &["efibootmgr"],
+            0,
+            &format!("BootNext: 0000\n{EFI_LISTING}"),
+        ))
+}
+
+#[tokio::test]
+async fn a_restart_into_another_system_tells_its_runner_how_to_disarm() {
+    if here() != Platform::Linux {
+        return;
+    }
+    let node_toml = "busy = \"none\"\n[power]\nsudo = true\n[boot.windows]\nefi_label = \"Windows Boot Manager\"\n";
+    let fixture = Fixture::with_node_toml(efi_armed(), node_toml);
+    fixture
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap();
+    let record = pending::read_pending(&pending::dir(fixture.node.paths())).unwrap();
+    assert_eq!(
+        record.disarm,
+        Some(strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]))
+    );
+
+    // Handing over fails: the call clears the arming itself and says so.
+    let failing = Fixture::with_node_toml(efi_armed().refusing_schedules(), node_toml);
+    let error = failing
+        .call("power.restart", json!({"into": "windows"}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.ends_with(
+            "The firmware's setting to start windows next was cleared again with `sudo -n efibootmgr --delete-bootnext`."
+        ),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        failing.fake.runs().last(),
+        Some(&strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]))
+    );
 }
 
 #[tokio::test]
