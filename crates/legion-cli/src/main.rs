@@ -6,7 +6,6 @@
 
 mod args;
 mod render;
-mod route;
 mod rpc;
 
 use std::io::{self, IsTerminal, Write};
@@ -14,13 +13,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use legion_core::proto::{ErrorBody, EventKind, ToolsResult};
-use legion_core::{Call, Door, EventSink, Node, Paths, VERSION};
+use legion_core::{Call, Door, EventSink, Local, Node, Paths, Router, VERSION};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
 use crate::args::{ArgsSource, CallCommand, Command, USAGE, UsageError};
-use crate::route::{Local, Router};
 
 const FAILED: u8 = 1;
 const USAGE_ERROR: u8 = 2;

@@ -13,15 +13,13 @@ use legion_core::proto::{
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, Id, METHOD_NOT_FOUND, Notification,
     PARSE_ERROR, Request, Response, RpcError, TOOL_ERROR, ToolsResult, method,
 };
-use legion_core::{Call, CancellationToken, Door, EventSink, Node};
+use legion_core::{Call, CancellationToken, Door, EventSink, Node, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinSet;
-
-use crate::route::Router;
 
 /// The longest line read. JSON carries control, never bulk data, so a longer line is a client
 /// gone wrong, and is refused rather than read into memory without end.

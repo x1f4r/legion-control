@@ -13,6 +13,7 @@ mod node;
 pub mod paths;
 pub mod policy;
 mod registry;
+mod route;
 mod tool;
 
 pub use config::{ConfigStore, Document};
@@ -21,6 +22,7 @@ pub use node::{Call, Node, VERSION};
 pub use paths::Paths;
 pub use policy::{Access, Grant, Policy};
 pub use registry::{DocumentInfo, Registry};
+pub use route::{Local, Router};
 pub use tool::{BoxFuture, Handler, NoArgs, Tool, ToolError, input_schema, parse_args};
 
 /// The wire types, so a tool family needs only this crate.
