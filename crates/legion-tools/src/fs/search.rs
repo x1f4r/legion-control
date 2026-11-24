@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    EntryKind, Progress, cancelled_error, format_mtime, map_io_error, path_to_string, run_blocking,
+    EntryKind, OwnDirFilter, Progress, cancelled_error, format_mtime, map_io_error, path_to_string,
+    run_blocking,
 };
 
 const DEFAULT_FIND_LIMIT: u32 = 200;
@@ -92,9 +93,15 @@ impl GlobFilter {
 }
 
 /// Configures `ignore::WalkBuilder` consistently for `fs.find` and `fs.grep`: never follows
-/// symbolic links, sorts entries deterministically, and respects `.gitignore` even outside a
-/// `.git` repository when `respect_ignore` is true.
-fn build_walker(root: &Path, respect_ignore: bool, max_depth: Option<usize>) -> WalkBuilder {
+/// symbolic links, sorts entries deterministically, skips Legion's own configuration and state
+/// directories for non-admin roles, and respects `.gitignore` even outside a `.git` repository
+/// when `respect_ignore` is true.
+fn build_walker(
+    root: &Path,
+    respect_ignore: bool,
+    max_depth: Option<usize>,
+    own_dirs: OwnDirFilter,
+) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder.follow_links(false);
     builder.sort_by_file_name(|a, b| a.cmp(b));
@@ -103,6 +110,7 @@ fn build_walker(root: &Path, respect_ignore: bool, max_depth: Option<usize>) -> 
         builder.require_git(false);
     }
     builder.max_depth(max_depth);
+    builder.filter_entry(move |entry| entry.depth() == 0 || !own_dirs.is_blocked(entry.path()));
     builder
 }
 
@@ -176,6 +184,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
     }
     let glob = args.glob.as_deref().map(GlobFilter::compile).transpose()?;
     let root = ctx.grant().check_path(&args.path, Access::Read)?;
+    let own_dirs = OwnDirFilter::for_ctx(ctx);
     let kind_filter = args.kind;
     let max_depth = args
         .max_depth
@@ -197,7 +206,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
         let mut truncated = false;
         let mut visited: u64 = 0;
 
-        for item in build_walker(&root, respect_ignore, max_depth).build() {
+        for item in build_walker(&root, respect_ignore, max_depth, own_dirs).build() {
             if cancel.is_cancelled() {
                 return Err(cancelled_error("fs.find"));
             }
@@ -327,6 +336,7 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
         })?;
     let glob = args.glob.as_deref().map(GlobFilter::compile).transpose()?;
     let root = ctx.grant().check_path(&args.path, Access::Read)?;
+    let own_dirs = OwnDirFilter::for_ctx(ctx);
     let context = usize::try_from(args.context).unwrap_or(0);
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
     let respect_ignore = args.ignore;
@@ -352,7 +362,7 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
                 grep_file(&root, true, &mut state)?;
             }
         } else if meta.is_dir() {
-            for item in build_walker(&root, respect_ignore, None).build() {
+            for item in build_walker(&root, respect_ignore, None, own_dirs).build() {
                 if state.cancel.is_cancelled() {
                     return Err(cancelled_error("fs.grep"));
                 }

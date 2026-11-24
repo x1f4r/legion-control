@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Encoding, EntryKind, Progress, cancelled_error, format_blake3, format_mtime, is_hidden,
-    map_io_error, path_to_string, platform, run_blocking,
+    Encoding, EntryKind, OwnDirFilter, Progress, cancelled_error, format_blake3, format_mtime,
+    is_hidden, map_io_error, path_to_string, platform, run_blocking,
 };
 
 const MAX_LIST_DEPTH: u32 = 8;
@@ -124,6 +124,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
         ));
     }
     let root = ctx.grant().check_path(&args.path, Access::Read)?;
+    let own_dirs = OwnDirFilter::for_ctx(ctx);
     let max_depth = args.depth;
     let include_hidden = args.hidden;
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
@@ -143,6 +144,7 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             max_depth,
             include_hidden,
             limit,
+            own_dirs: &own_dirs,
             cancel: &cancel,
             progress: &mut progress,
             entries: &mut entries,
@@ -162,6 +164,7 @@ struct ListWalk<'a> {
     max_depth: u32,
     include_hidden: bool,
     limit: usize,
+    own_dirs: &'a OwnDirFilter,
     cancel: &'a CancellationToken,
     progress: &'a mut Progress,
     entries: &'a mut Vec<ListEntry>,
@@ -189,6 +192,9 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
             continue;
         };
         let child_path = entry.path();
+        if walk.own_dirs.is_blocked(&child_path) {
+            continue;
+        }
         let meta = match fs::symlink_metadata(&child_path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,

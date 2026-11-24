@@ -24,6 +24,7 @@ legion-core.workspace = true
 legion-os.workspace = true
 legion-proto.workspace = true
 regex.workspace = true
+same-file.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

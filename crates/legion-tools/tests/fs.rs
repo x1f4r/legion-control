@@ -819,18 +819,19 @@ async fn copy_preserves_symlinks_without_following_out_of_tree() {
 async fn remove_handles_dry_run_sample_cap_conflicts_and_protected_refusals() {
     let f = Fixture::new();
 
-    // Protected refusals (always `denied`): filesystem root, home itself, config and state dirs.
+    // Protected refusals (always `denied`): filesystem root, home itself, config and state dirs,
+    // and any ancestor of them.
     let fs_root = f.dir.path().ancestors().last().unwrap().to_path_buf();
     let config_dir = f.dir.path().join("config");
     let state_dir = f.dir.path().join("state");
+    let home_with_slash = format!("{}/", f.p(&f.home));
     for protected in [
         f.p(&fs_root),
         "~".to_owned(),
         f.p(&f.home),
+        home_with_slash,
         f.p(&config_dir),
-        f.p(&config_dir.join("policy.toml")),
         f.p(&state_dir),
-        f.p(&state_dir.join("audit.jsonl")),
     ] {
         let err = f
             .call(
@@ -1305,4 +1306,162 @@ async fn cancelled_calls_stop_with_cancelled_error() {
     call.cancel.cancel();
     let err = f.node.call(call).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Cancelled);
+}
+
+#[tokio::test]
+async fn protected_ancestors_and_move_sources_are_refused_by_file_identity() {
+    // Separate Legion's home from its config/state root so removing the parent of `home` tests
+    // the home-ancestor refusal specifically (independent of config/state).
+    let base = tempfile::tempdir().unwrap();
+    let legion_root = base.path().join("legion");
+    let home_parent = base.path().join("users");
+    let home = home_parent.join("me");
+    let work = home.join("projects");
+    std::fs::create_dir_all(&work).unwrap();
+    let node = Node::new(
+        Paths::under(&legion_root).with_home(&home),
+        legion_tools::registry(),
+    );
+
+    let call = |tool: &str, args: Value| {
+        let node = node.clone();
+        let tool = tool.to_owned();
+        async move { node.call(Call::new(Door::Cli, tool, args)).await }
+    };
+
+    // Removing the parent of `home`, or the parent of `config`/`state`, is refused.
+    for ancestor in [&home_parent, &legion_root] {
+        let err = call(
+            "fs.remove",
+            json!({"path": ancestor.to_string_lossy(), "recursive": true, "dry_run": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "{}", ancestor.display());
+    }
+
+    // Moving `home`, its parent, or Legion's config/state directories is refused too.
+    let dst = base.path().join("relocated");
+    for source in [
+        home.clone(),
+        home_parent.clone(),
+        legion_root.join("config"),
+        legion_root.join("state"),
+        legion_root.clone(),
+    ] {
+        let err = call(
+            "fs.move",
+            json!({"from": source.to_string_lossy(), "to": dst.to_string_lossy()}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "{}", source.display());
+    }
+
+    // On case-folding volumes, an alternate-case spelling of `home` is still refused.
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let upper_home = home_parent.join("ME");
+        let err = call(
+            "fs.remove",
+            json!({"path": upper_home.to_string_lossy(), "recursive": true, "dry_run": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+    }
+
+    // Via a symlinked parent directory, `home` is still recognized by file identity and refused.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let alias = base.path().join("users_alias");
+        symlink(&home_parent, &alias).unwrap();
+        let err = call(
+            "fs.remove",
+            json!({"path": alias.join("me").to_string_lossy(), "recursive": true, "dry_run": true}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+    }
+}
+
+#[tokio::test]
+async fn non_admin_walks_skip_legion_config_and_state_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let legion_dir = home.join(".legion");
+    let paths = Paths::under(&legion_dir).with_home(&home);
+    std::fs::create_dir_all(paths.config_dir()).unwrap();
+    std::fs::write(
+        paths.config_file("policy.toml"),
+        r#"
+[principals.agent]
+role = "operator"
+
+[roles.operator]
+allow = ["effect:read", "effect:write"]
+paths = ["~/**"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(home.join("visible.txt"), "POLICY_MARKER\n").unwrap();
+    let node = Node::new(paths, legion_tools::registry());
+
+    let call_agent = |tool: &str, args: Value| {
+        let node = node.clone();
+        let tool = tool.to_owned();
+        async move {
+            let mut call = Call::new(Door::Mcp, tool, args);
+            call.as_principal = Some("agent".to_owned());
+            node.call(call).await
+        }
+    };
+
+    // Direct access to policy.toml and audit.jsonl is denied by Grant::check_path.
+    assert_eq!(
+        call_agent("fs.read", json!({"path": "~/.legion/config/policy.toml"}))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Denied
+    );
+    assert_eq!(
+        call_agent("fs.read", json!({"path": "~/.legion/state/audit.jsonl"}))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Denied
+    );
+
+    // Walking from `~` skips Legion's config and state directories so policy/audit stay hidden.
+    let listed = call_agent("fs.list", json!({"path": "~", "depth": 4}))
+        .await
+        .unwrap();
+    assert!(
+        listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["name"] != json!("policy.toml") && e["name"] != json!("audit.jsonl")),
+        "{listed}"
+    );
+    let found = call_agent("fs.find", json!({"path": "~", "ignore": false}))
+        .await
+        .unwrap();
+    assert!(
+        found["matches"].as_array().unwrap().iter().all(|m| {
+            let p = m["path"].as_str().unwrap();
+            !p.ends_with("policy.toml") && !p.ends_with("audit.jsonl")
+        }),
+        "{found}"
+    );
+    let grepped = call_agent(
+        "fs.grep",
+        json!({"path": "~", "pattern": "operator", "ignore": false}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(grepped["matches"].as_array().unwrap().len(), 0);
 }

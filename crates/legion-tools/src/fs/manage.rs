@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Progress, cancelled_error, is_filesystem_root, is_same_or_descendant, is_strict_ancestor,
-    map_io_error, map_os_error, path_to_string, paths_equal, platform, resolve_best_effort,
+    OwnDirFilter, Progress, cancelled_error, check_not_protected_tree, is_same_or_descendant,
+    is_strict_ancestor, map_io_error, map_os_error, path_to_string, paths_equal, platform,
     run_blocking,
 };
 
@@ -64,6 +64,9 @@ struct MoveResult {
 async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> {
     let from = ctx.grant().check_path(&args.from, Access::Write)?;
     let to = ctx.grant().check_path(&args.to, Access::Write)?;
+    check_not_protected_tree(ctx.grant(), &from)?;
+    check_not_protected_tree(ctx.grant(), &to)?;
+    let own_dirs = OwnDirFilter::for_ctx(ctx);
     let overwrite = args.overwrite;
 
     run_blocking(ctx, "fs.move", move |cancel, mut progress| {
@@ -158,6 +161,7 @@ async fn move_entry(ctx: &Ctx, args: MoveArgs) -> Result<MoveResult, ToolError> 
                     overwrite,
                     true,
                     "fs.move",
+                    &own_dirs,
                     &cancel,
                     &mut progress,
                     &mut totals,
@@ -213,6 +217,8 @@ struct CopyResult {
 async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> {
     let from = ctx.grant().check_path(&args.from, Access::Read)?;
     let to = ctx.grant().check_path(&args.to, Access::Write)?;
+    check_not_protected_tree(ctx.grant(), &to)?;
+    let own_dirs = OwnDirFilter::for_ctx(ctx);
     let overwrite = args.overwrite;
     let recursive = args.recursive;
 
@@ -239,6 +245,7 @@ async fn copy_entry(ctx: &Ctx, args: CopyArgs) -> Result<CopyResult, ToolError> 
             overwrite,
             recursive,
             "fs.copy",
+            &own_dirs,
             &cancel,
             &mut progress,
             &mut totals,
@@ -293,12 +300,22 @@ fn copy_path(
     overwrite: bool,
     recursive: bool,
     tool: &str,
+    own_dirs: &OwnDirFilter,
     cancel: &CancellationToken,
     progress: &mut Progress,
     totals: &mut CopyTotals,
 ) -> Result<(), ToolError> {
     if cancel.is_cancelled() {
         return Err(cancelled_error(tool));
+    }
+    if own_dirs.is_blocked(from) {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Cannot copy {}: Legion's own configuration and state directories require effect:admin.",
+                from.display()
+            ),
+        ));
     }
 
     if from_meta.file_type().is_symlink() {
@@ -386,6 +403,7 @@ fn copy_path(
                 overwrite,
                 true,
                 tool,
+                own_dirs,
                 cancel,
                 progress,
                 totals,
@@ -538,9 +556,7 @@ struct RemoveResult {
 
 async fn remove_entry(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolError> {
     let path = ctx.grant().check_path(&args.path, Access::Write)?;
-    let home = ctx.paths().home().map(Path::to_path_buf);
-    let config_dir = ctx.paths().config_dir().to_path_buf();
-    let state_dir = ctx.paths().state_dir().to_path_buf();
+    check_not_protected_tree(ctx.grant(), &path)?;
     let recursive = args.recursive;
     let dry_run = args.dry_run;
 
@@ -548,16 +564,6 @@ async fn remove_entry(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolE
         if cancel.is_cancelled() {
             return Err(cancelled_error("fs.remove"));
         }
-        let resolved_home = home.as_deref().map(resolve_best_effort);
-        let resolved_config = resolve_best_effort(&config_dir);
-        let resolved_state = resolve_best_effort(&state_dir);
-        refuse_protected_path(
-            &path,
-            resolved_home.as_deref(),
-            &resolved_config,
-            &resolved_state,
-            recursive,
-        )?;
 
         let meta =
             fs::symlink_metadata(&path).map_err(|error| map_io_error("remove", &path, error))?;
@@ -582,61 +588,6 @@ async fn remove_entry(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolE
         })
     })
     .await
-}
-
-/// Refuses to remove a filesystem root, the user's home directory itself, or Legion's own
-/// configuration and state directories (or an ancestor of them when removing recursively).
-fn refuse_protected_path(
-    target: &Path,
-    home: Option<&Path>,
-    config_dir: &Path,
-    state_dir: &Path,
-    recursive: bool,
-) -> Result<(), ToolError> {
-    if is_filesystem_root(target) {
-        return Err(ErrorBody::new(
-            ErrorCode::Denied,
-            format!("Refusing to remove filesystem root {}.", target.display()),
-        )
-        .with_hint("Name a specific file or subdirectory to remove."));
-    }
-    if let Some(home) = home
-        && paths_equal(target, home)
-    {
-        return Err(ErrorBody::new(
-            ErrorCode::Denied,
-            format!(
-                "Refusing to remove the user's home directory {}.",
-                target.display()
-            ),
-        )
-        .with_hint("Remove a specific file or subdirectory inside the home directory instead."));
-    }
-    if is_same_or_descendant(target, config_dir)
-        || (recursive && is_strict_ancestor(target, config_dir))
-    {
-        return Err(ErrorBody::new(
-            ErrorCode::Denied,
-            format!(
-                "Refusing to remove Legion's configuration directory ({}).",
-                config_dir.display()
-            ),
-        )
-        .with_hint("Manage Legion's configuration files directly outside fs.remove."));
-    }
-    if is_same_or_descendant(target, state_dir)
-        || (recursive && is_strict_ancestor(target, state_dir))
-    {
-        return Err(ErrorBody::new(
-            ErrorCode::Denied,
-            format!(
-                "Refusing to remove Legion's state directory ({}).",
-                state_dir.display()
-            ),
-        )
-        .with_hint("Legion's state directory holds the audit log and runtime state and cannot be removed by fs.remove."));
-    }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -772,51 +723,4 @@ fn sorted_children(dir: &Path) -> Result<Vec<(std::ffi::OsString, PathBuf)>, Too
     }
     children.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(children)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn protected_paths_are_refused() {
-        let home = Path::new("/home/me");
-        let config = Path::new("/home/me/.config/legion");
-        let state = Path::new("/home/me/.local/state/legion");
-
-        for blocked in [
-            Path::new("/"),
-            home,
-            config,
-            Path::new("/home/me/.config/legion/policy.toml"),
-            state,
-            Path::new("/home/me/.local/state/legion/audit.jsonl"),
-        ] {
-            let err = refuse_protected_path(blocked, Some(home), config, state, false).unwrap_err();
-            assert_eq!(err.code, ErrorCode::Denied, "{}", blocked.display());
-        }
-
-        // Recursive removal of an ancestor of Legion's directories is also refused.
-        let parent_err = refuse_protected_path(
-            Path::new("/home/me/.config"),
-            Some(home),
-            config,
-            state,
-            true,
-        )
-        .unwrap_err();
-        assert_eq!(parent_err.code, ErrorCode::Denied);
-
-        // Regular files and directories inside home are allowed.
-        assert!(
-            refuse_protected_path(
-                Path::new("/home/me/projects/tmp"),
-                Some(home),
-                config,
-                state,
-                true,
-            )
-            .is_ok()
-        );
-    }
 }

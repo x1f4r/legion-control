@@ -588,6 +588,7 @@ dependencies = [
  "legion-os",
  "legion-proto",
  "regex",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

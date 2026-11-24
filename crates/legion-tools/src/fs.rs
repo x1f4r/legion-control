@@ -11,18 +11,18 @@ mod read;
 mod search;
 mod write;
 
-use std::ffi::OsString;
 use std::fs::{FileType, Metadata};
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use legion_core::proto::{ErrorBody, ErrorCode, EventKind};
-use legion_core::{CancellationToken, Ctx, Registry, ToolError};
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind};
+use legion_core::{CancellationToken, Ctx, Grant, Place, Registry, ToolError};
 use legion_os::OsError;
+use same_file::Handle;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// How often long-running filesystem operations emit a `progress` event.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
@@ -247,41 +247,83 @@ pub(crate) fn map_os_error(action: &str, path: &Path, error: OsError) -> ErrorBo
     }
 }
 
-/// Resolves every existing prefix of `path` (following symlinks and folding `..`) and appends any
-/// trailing non-existent components, so paths can be compared even before a directory exists.
-pub(crate) fn resolve_best_effort(path: &Path) -> PathBuf {
-    let mut existing = path.to_path_buf();
-    let mut missing: Vec<OsString> = Vec::new();
-    loop {
-        match dunce::canonicalize(&existing) {
-            Ok(mut resolved) => {
-                for part in missing.iter().rev() {
-                    resolved.push(part);
-                }
-                return resolved;
-            }
-            Err(_) => {
-                let Some(name) = existing.file_name().map(OsString::from) else {
-                    return path.to_path_buf();
-                };
-                missing.push(name);
-                if !existing.pop() {
-                    return path.to_path_buf();
-                }
-            }
-        }
-    }
+/// Refuses whole-tree mutation (remove, move or directory replacement) on any protected place
+/// reported by [`Grant::protected`]: a file-system root, the home directory, Legion's own
+/// configuration or state directories, or any ancestor holding one of them.
+pub(crate) fn check_not_protected_tree(grant: &Grant, path: &Path) -> Result<(), ToolError> {
+    let Some(place) = grant.protected(path)? else {
+        return Ok(());
+    };
+    let (what, hint) = match place {
+        Place::Root => (
+            "the root of a file system",
+            "Name a specific file or subdirectory instead.",
+        ),
+        Place::Home => (
+            "the user's home directory",
+            "Name a specific file or subdirectory inside the home directory instead.",
+        ),
+        Place::Config => (
+            "Legion's configuration directory",
+            "Legion's configuration directory cannot be removed, moved or replaced as a whole.",
+        ),
+        Place::State => (
+            "Legion's state directory",
+            "Legion's state directory holds the audit log and runtime state and cannot be removed, moved or replaced as a whole.",
+        ),
+    };
+    Err(ErrorBody::new(
+        ErrorCode::Denied,
+        format!(
+            "Refusing to remove, move or replace {}: it is or contains {what}.",
+            path.display()
+        ),
+    )
+    .with_hint(hint)
+    .with_details(json!({"path": path, "place": format!("{place:?}").to_lowercase()})))
 }
 
-/// Whether `path` names a filesystem root (such as `/` on Unix or `C:\` on Windows).
-pub(crate) fn is_filesystem_root(path: &Path) -> bool {
-    path.parent().is_none()
-        || path.components().all(|component| {
-            matches!(
-                component,
-                Component::Prefix(_) | Component::RootDir | Component::CurDir
-            )
-        })
+/// Identifies Legion's own configuration and state directories during recursive directory walks
+/// so roles without `effect:admin` cannot read or copy them by starting at an ancestor such as `~`.
+#[derive(Debug)]
+pub(crate) struct OwnDirFilter {
+    handles: Vec<Handle>,
+    paths: Vec<PathBuf>,
+}
+
+impl OwnDirFilter {
+    /// Builds a filter for `ctx`: empty for roles with `effect:admin`, and matching Legion's
+    /// configuration and state directories (by file identity and resolved path) otherwise.
+    pub(crate) fn for_ctx(ctx: &Ctx) -> OwnDirFilter {
+        if ctx.grant().allows_effect(Effect::Admin) {
+            return OwnDirFilter {
+                handles: Vec::new(),
+                paths: Vec::new(),
+            };
+        }
+        let mut handles = Vec::new();
+        let mut paths = Vec::new();
+        for dir in [ctx.paths().config_dir(), ctx.paths().state_dir()] {
+            if let Ok(handle) = Handle::from_path(dir) {
+                handles.push(handle);
+            }
+            paths.push(dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        }
+        OwnDirFilter { handles, paths }
+    }
+
+    /// Whether `path` refers to Legion's configuration or state directory.
+    pub(crate) fn is_blocked(&self, path: &Path) -> bool {
+        if self.handles.is_empty() && self.paths.is_empty() {
+            return false;
+        }
+        if let Ok(handle) = Handle::from_path(path)
+            && self.handles.contains(&handle)
+        {
+            return true;
+        }
+        self.paths.iter().any(|own| paths_equal(path, own))
+    }
 }
 
 /// Whether `a` and `b` refer to the same path, accounting for platform filename casing.
@@ -341,10 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn path_relationship_helpers_handle_roots_and_ancestors() {
-        let root = Path::new("/");
-        assert!(is_filesystem_root(root));
-        assert!(!is_filesystem_root(Path::new("/home/me")));
+    fn path_relationship_helpers_handle_ancestors() {
         assert!(paths_equal(Path::new("/a/b"), Path::new("/a/b")));
         assert!(!paths_equal(Path::new("/a/b"), Path::new("/a/bc")));
         assert!(is_same_or_descendant(
