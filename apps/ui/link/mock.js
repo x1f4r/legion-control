@@ -1557,9 +1557,9 @@ export function createMockLink(mode = '') {
       };
     }
     const target = options?.on || activeNode;
-    if (machines[target] && !machines[target].reachable) {
+    if (!machines[target] || !machines[target].reachable) {
       throw (
-        machines[target].error || {
+        machines[target]?.error || {
           code: 'unreachable',
           message: `${target} did not answer.`,
           hint: null,

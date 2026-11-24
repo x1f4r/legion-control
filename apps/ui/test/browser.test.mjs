@@ -1037,6 +1037,18 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText('This device may not see the roles on tower; ask the owner.').waitFor();
     await assertNoToolNames(p, 'fleet invite policy refused plain');
 
+    // 6b. Switching to a target whose tool catalogue cannot be read (`mini`) says so instead of
+    //     falling back to another machine's catalogue.
+    const machineSelect = p.locator('label.field:has-text("Machine") select');
+    await machineSelect.selectOption('mini');
+    await p.getByText('Could not read what mini supports right now.').waitFor();
+    assert.equal(
+      await p.getByRole('button', { name: 'Make invite' }).count(),
+      0,
+      'Invite form must not fall back to another machine catalogue when target catalogue fails',
+    );
+    await assertNoToolNames(p, 'fleet invite target catalogue error plain');
+
     // 7. Unreachable selected node (`aoff`): keeps selected node (`tower`) shown as unreachable
     //    with its last known role marked "as of <when>", never adopting answering peer (`pi`).
     await p.goto(`${server.url}/?mock=fleet,aoff#/settings/device`, {
