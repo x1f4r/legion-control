@@ -428,15 +428,20 @@ impl Transfer<'_> {
                 return Ok(report);
             }
             "file" | "missing" | "symlink" => {}
-            _ => {
+            other => {
+                let what = if other == "dir" {
+                    "a directory"
+                } else {
+                    "a special file"
+                };
                 return Err(ErrorBody::new(
                     ErrorCode::Conflict,
                     format!(
-                        "{} on {} is a directory, and a file cannot replace it.",
+                        "{} on {} is {what}, and a file cannot replace it.",
                         target.path, target.machine
                     ),
                 )
-                .with_hint("Name a path inside it, or a different one.")
+                .with_hint("Name a different path.")
                 .with_machine(target.machine.clone()));
             }
         }
