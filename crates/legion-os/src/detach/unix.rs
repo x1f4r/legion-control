@@ -39,7 +39,19 @@ pub(super) async fn spawn_detached(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
 ) -> Result<DetachHandle> {
-    let use_systemd_scope = systemd_user_scope_available(options).await;
+    let mut warnings = Vec::new();
+    let use_systemd_scope = if systemd_user_scope_available(options).await {
+        if systemd_linger_enabled().await {
+            true
+        } else {
+            // Without lingering, logind tears down `systemd --user` ~10 s after logout and takes
+            // any transient user scope with it; fall back to `setsid` and warn the caller.
+            warnings.push(super::LINGER_DISABLED_WARNING.to_owned());
+            false
+        }
+    } else {
+        false
+    };
 
     // `systemd-run` itself exists even when the target executable does not, so validate the
     // target executable up front to preserve the typed `ProgramNotFound` error.
@@ -112,7 +124,7 @@ pub(super) async fn spawn_detached(
     Ok(DetachHandle {
         process,
         systemd_unit,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -356,6 +368,46 @@ async fn systemd_user_scope_available(options: &DetachOptions) -> bool {
 #[cfg(not(target_os = "linux"))]
 async fn systemd_user_scope_available(_options: &DetachOptions) -> bool {
     let _ = (Duration::ZERO, Instant::now());
+    false
+}
+
+#[cfg(target_os = "linux")]
+async fn systemd_linger_enabled() -> bool {
+    let uid = nix::unistd::Uid::current();
+    let username = nix::unistd::User::from_uid(uid)
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("LOGNAME").ok());
+
+    if let Some(ref name) = username
+        && super::linger_file_exists(Path::new("/var/lib/systemd/linger"), name)
+    {
+        return true;
+    }
+
+    let uid_str = uid.as_raw().to_string();
+    let mut cmd = tokio::process::Command::new("loginctl");
+    cmd.args(["show-user", &uid_str, "--property=Linger"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    if let Ok(Ok(output)) = tokio::time::timeout(SYSTEMD_CMD_TIMEOUT, cmd.output()).await
+        && output.status.success()
+        && let Some(enabled) =
+            super::parse_loginctl_linger(&String::from_utf8_lossy(&output.stdout))
+    {
+        return enabled;
+    }
+
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn systemd_linger_enabled() -> bool {
     false
 }
 

@@ -2,12 +2,16 @@
 //!
 //! Each platform needs a different escape hatch so session teardown does not kill a detached job:
 //!
-//! - **Linux with a reachable `systemd --user` manager:** a process started inside an SSH session
-//!   remains in that session's cgroup (`session-N.scope`) even after `setsid()`, so `systemd-logind`
-//!   with `KillUserProcesses=yes` terminates it when SSH disconnects. Wrapping the command in a
-//!   transient `systemd-run --user --scope --quiet --collect --` moves it into the user manager's
-//!   cgroup hierarchy while `exec`-ing the target in place (preserving its PID and environment),
-//!   and `setsid()` detaches it from any controlling terminal.
+//! - **Linux with a reachable `systemd --user` manager and lingering enabled:** a process started
+//!   inside an SSH session remains in that session's cgroup (`session-N.scope`) even after
+//!   `setsid()`, so `systemd-logind` with `KillUserProcesses=yes` terminates it when SSH
+//!   disconnects. Wrapping the command in a transient
+//!   `systemd-run --user --scope --quiet --collect --unit=legion-job-<name> --` moves it into the
+//!   user manager's cgroup hierarchy while `exec`-ing the target in place. Because `logind` stops
+//!   the user manager roughly ten seconds after the last session ends unless lingering is enabled
+//!   for the account, lingering is checked first (`/var/lib/systemd/linger/<user>` or
+//!   `loginctl show-user --property=Linger`); when lingering is off, launching falls back to
+//!   `setsid` and records an actionable `loginctl enable-linger` warning in [`DetachHandle::warnings`].
 //! - **Other Unix systems (macOS, containers, or Linux without a user manager):** starting the
 //!   child in a new session via `setsid()` detaches it from the caller's controlling terminal and
 //!   process group so `SIGHUP` on terminal or session close does not reach it.
@@ -215,6 +219,41 @@ pub(crate) fn validate_scope_name(name: Option<&str>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Warning recorded on [`DetachHandle::warnings`] when Linux `systemd --user` is reachable but
+/// lingering is disabled for the current account.
+#[allow(dead_code)]
+pub(crate) const LINGER_DISABLED_WARNING: &str = "systemd user lingering is disabled for this account, so the process was detached with setsid instead of a systemd user scope and may be stopped on logout; run `loginctl enable-linger` to keep user scopes alive across sessions";
+
+/// Return `true` when `linger_dir/<username>` exists as a file.
+#[allow(dead_code)]
+pub(crate) fn linger_file_exists(linger_dir: &Path, username: &str) -> bool {
+    !username.is_empty()
+        && !username.contains('/')
+        && !username.contains('\\')
+        && username != "."
+        && username != ".."
+        && linger_dir.join(username).is_file()
+}
+
+/// Parse `loginctl show-user --property=Linger` output (`Linger=yes`, `Linger=no`, `yes`, or `no`).
+#[allow(dead_code)]
+pub(crate) fn parse_loginctl_linger(output: &str) -> Option<bool> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let value = trimmed
+            .strip_prefix("Linger=")
+            .unwrap_or(trimmed)
+            .trim()
+            .to_ascii_lowercase();
+        match value.as_str() {
+            "yes" | "true" | "1" => return Some(true),
+            "no" | "false" | "0" => return Some(false),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Build the `(unit_flag_value, full_scope_unit)` pair for `systemd-run --user --scope --unit=...`.
@@ -515,6 +554,26 @@ mod tests {
             resolve_scope_unit_name(Some("has space")),
             Err(OsError::InvalidArgument { .. })
         ));
+    }
+
+    #[test]
+    fn linger_checks_detect_enabled_and_disabled_states() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!linger_file_exists(dir.path(), "me"));
+        std::fs::write(dir.path().join("me"), b"").unwrap();
+        assert!(linger_file_exists(dir.path(), "me"));
+        assert!(!linger_file_exists(dir.path(), "../me"));
+        assert!(!linger_file_exists(dir.path(), ""));
+
+        assert_eq!(parse_loginctl_linger("Linger=yes\n"), Some(true));
+        assert_eq!(parse_loginctl_linger("Linger=no\n"), Some(false));
+        assert_eq!(parse_loginctl_linger("yes\n"), Some(true));
+        assert_eq!(parse_loginctl_linger("no\n"), Some(false));
+        assert_eq!(parse_loginctl_linger(""), None);
+        assert_eq!(parse_loginctl_linger("Linger=maybe"), None);
+
+        assert!(LINGER_DISABLED_WARNING.contains("loginctl enable-linger"));
+        assert!(LINGER_DISABLED_WARNING.contains("setsid"));
     }
 
     #[tokio::test]
