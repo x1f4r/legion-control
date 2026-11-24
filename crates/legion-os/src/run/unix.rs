@@ -29,10 +29,12 @@ pub(super) async fn terminate_tree(
         .and_then(|pid| i32::try_from(pid).ok())
         .map(Pid::from_raw);
 
-    // Send SIGTERM to the entire process group first so cooperative commands can flush or clean up.
-    let _ = child.signal(Signal::SIGTERM as i32);
+    // Send SIGTERM once to the process group so cooperative commands that treat a second signal
+    // as an immediate force-quit still run their cleanup handler.
     if let Some(group) = pgid {
         let _ = killpg(group, Signal::SIGTERM);
+    } else {
+        let _ = child.signal(Signal::SIGTERM as i32);
     }
 
     let grace_deadline = Instant::now() + grace;
@@ -61,9 +63,10 @@ pub(super) async fn terminate_tree(
         .unwrap_or(false);
 
     if exit_status.is_none() || group_still_alive {
-        let _ = child.start_kill();
         if let Some(group) = pgid {
             let _ = killpg(group, Signal::SIGKILL);
+        } else {
+            let _ = child.start_kill();
         }
 
         if exit_status.is_none()

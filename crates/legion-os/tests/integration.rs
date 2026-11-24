@@ -63,6 +63,9 @@ fn main() -> ExitCode {
         ("run_escalation_kills_term_ignoring_grandchild", || {
             Box::pin(test_run_escalation_kills_term_ignoring_grandchild())
         }),
+        ("run_delivers_single_sigterm_for_graceful_cleanup", || {
+            Box::pin(test_run_delivers_single_sigterm_for_graceful_cleanup())
+        }),
         (
             "run_does_not_hang_when_escaped_grandchild_keeps_pipes_open",
             || Box::pin(test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open()),
@@ -159,6 +162,7 @@ fn run_helper(mode: &str) -> ExitCode {
         "detach_parent" => helper_detach_parent(&args),
         "detach_worker" => helper_detach_worker(&args),
         "lock_holder" => helper_lock_holder(&args),
+        "count_sigterm" => helper_count_sigterm(),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -381,6 +385,33 @@ fn helper_lock_holder(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn helper_count_sigterm() -> ExitCode {
+    #[cfg(unix)]
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("helper tokio runtime");
+        rt.block_on(async {
+            let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            println!("READY");
+            let _ = io::stdout().flush();
+
+            if sig.recv().await.is_some() {
+                let mut count = 1u32;
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+                while tokio::time::timeout_at(deadline, sig.recv()).await.is_ok() {
+                    count += 1;
+                }
+                println!("sigterm_count={count}");
+                let _ = io::stdout().flush();
+            }
+        });
+    }
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests
 // ---------------------------------------------------------------------------
@@ -591,6 +622,35 @@ async fn test_run_escalation_kills_term_ignoring_grandchild() {
         !procid::is_alive(&grandchild_id),
         "SIGTERM-ignoring grandchild {grandchild_id} survived SIGKILL escalation"
     );
+}
+
+async fn test_run_delivers_single_sigterm_for_graceful_cleanup() {
+    #[cfg(unix)]
+    {
+        let token = CancellationToken::new();
+        let trigger = token.clone();
+        let (spec, helper_env) = helper_spec("count_sigterm", &[]);
+        let res = run(RunOptions::new(spec)
+            .envs(helper_env)
+            .timeout(Duration::from_secs(10))
+            .kill_grace(Duration::from_millis(500))
+            .cancel(token)
+            .on_output(Arc::new(move |chunk| {
+                if String::from_utf8_lossy(&chunk.bytes).contains("READY") {
+                    trigger.cancel();
+                }
+            })))
+        .await
+        .unwrap();
+
+        assert!(res.cancelled);
+        assert_eq!(res.exit_code, Some(0));
+        assert!(
+            res.stdout.text.contains("sigterm_count=1"),
+            "expected exactly one SIGTERM, got stdout: {:?}",
+            res.stdout.text
+        );
+    }
 }
 
 async fn test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open() {
