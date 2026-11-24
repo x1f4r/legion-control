@@ -16,7 +16,7 @@ use crate::{OsError, Result};
 use super::{KillTreeReport, ProcessId, is_alive};
 
 const BOOT_ID_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
@@ -52,30 +52,50 @@ pub(super) fn boot_id() -> Result<String> {
 }
 
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
-    if !is_alive(identity) {
+    let identity = *identity;
+    let own_pid = std::process::id();
+
+    let tracked_list: Vec<ProcessId> =
+        tokio::task::spawn_blocking(move || -> Result<Vec<ProcessId>> {
+            if !is_alive(&identity) {
+                return Ok(Vec::new());
+            }
+
+            let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
+            tracked.insert(identity.pid, identity);
+            collect_descendants_into(&identity, own_pid, &mut tracked)?;
+            terminate_tracked(&tracked, own_pid)?;
+
+            // Take one more snapshot right after the first wave in case a process spawned a late child
+            // just before TerminateProcess landed.
+            if collect_descendants_into(&identity, own_pid, &mut tracked).is_ok() {
+                terminate_tracked(&tracked, own_pid)?;
+            }
+
+            Ok(tracked.into_values().collect())
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_tree worker task failed: {err}"),
+        })??;
+
+    if tracked_list.is_empty() {
         return Ok(KillTreeReport {
             all_gone: true,
             survivors: Vec::new(),
         });
     }
 
-    let own_pid = std::process::id();
-    let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
-    tracked.insert(identity.pid, *identity);
-    collect_descendants_into(identity, own_pid, &mut tracked)?;
-
-    terminate_tracked(&tracked, own_pid)?;
-
-    // Take one more snapshot right after the first wave in case a process spawned a late child
-    // just before TerminateProcess landed.
-    if collect_descendants_into(identity, own_pid, &mut tracked).is_ok() {
-        terminate_tracked(&tracked, own_pid)?;
-    }
-
     let settle = SETTLE_TIMEOUT.max(grace.min(Duration::from_secs(5)));
     let deadline = Instant::now() + settle;
     loop {
-        if !tracked.values().any(is_alive) {
+        let probe_list = tracked_list.clone();
+        let any_alive = tokio::task::spawn_blocking(move || probe_list.iter().any(is_alive))
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("kill_tree poll task failed: {err}"),
+            })?;
+        if !any_alive {
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
@@ -89,8 +109,16 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 
-    let mut survivors: Vec<ProcessId> = tracked.values().copied().filter(is_alive).collect();
-    survivors.sort_by_key(|id| id.pid);
+    let survivors = tokio::task::spawn_blocking(move || {
+        let mut left: Vec<ProcessId> = tracked_list.into_iter().filter(is_alive).collect();
+        left.sort_by_key(|id| id.pid);
+        left
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_tree survivor check failed: {err}"),
+    })?;
+
     Ok(KillTreeReport {
         all_gone: survivors.is_empty(),
         survivors,
