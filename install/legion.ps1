@@ -203,7 +203,7 @@ try {
             }
             if (-not $verifiedWithOpenSsl) {
                 throw @"
-Cannot verify who published $tag: neither 'gh' (for attestation verification) nor OpenSSL with Ed25519 -rawin support is installed.
+Cannot verify who published ${tag}: neither 'gh' (for attestation verification) nor OpenSSL with Ed25519 -rawin support is installed.
 
 Verify manually before installing:
   1. Install GitHub CLI (gh) and re-run this script, or run:
