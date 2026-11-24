@@ -190,7 +190,7 @@ textarea {
   grid-area: main;
   min-height: 0;
   overflow-y: auto;
-  padding: 4px var(--pad) 28px;
+  padding: 4px var(--pad) calc(28px + max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)));
   scrollbar-width: thin;
 }
 
@@ -257,7 +257,7 @@ textarea {
   }
 
   .main {
-    padding: 4px 28px 40px;
+    padding: 4px 28px calc(40px + max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)));
   }
 
   .split {
@@ -1071,7 +1071,7 @@ button.row:active {
 .sheet {
   max-height: 86%;
   overflow-y: auto;
-  padding: 10px var(--pad) calc(env(safe-area-inset-bottom) + 18px);
+  padding: 10px var(--pad) calc(max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 18px);
   border-radius: 22px 22px 0 0;
   background: var(--raised);
   border-top: 1px solid var(--line-strong);

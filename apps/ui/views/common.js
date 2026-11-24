@@ -39,7 +39,7 @@ export function Notice({ error, title, message, hint, kind = 'bad', className = 
   return html`
     <div class=${cls} role="status">
       <strong>${machine}${heading}</strong>
-      ${detail ? html`<span>${detail}</span>` : null}
+      ${detail ? html`<span><${CodeText} text=${detail} /></span>` : null}
       ${canRepair
         ? html`
             <div class="actions">

@@ -16,7 +16,7 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
   useEffect(() => {
     if (pasteOpen && inviteInputRef.current) {
       inviteInputRef.current.focus();
-      inviteInputRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      inviteInputRef.current.scrollIntoView({ block: 'nearest', behavior: 'auto' });
     }
   }, [pasteOpen]);
 
