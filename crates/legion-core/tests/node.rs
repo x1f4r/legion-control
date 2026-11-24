@@ -71,7 +71,7 @@ impl Fixture {
     fn write_config(&self, name: &str, text: &str) {
         let config = self.dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join(name), text).unwrap();
+        legion_core::config::write_atomically(&config.join(name), text.as_bytes()).unwrap();
     }
 
     fn audit(&self) -> Vec<Value> {
@@ -228,6 +228,23 @@ async fn a_policy_that_does_not_parse_fails_every_call_instead_of_allowing_it() 
     assert_eq!(error.code, ErrorCode::Failed);
     assert!(error.message.contains("policy.toml"), "{}", error.message);
     assert!(error.message.contains("line 2"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn a_policy_file_with_nothing_in_it_fails_every_call_instead_of_allowing_it() {
+    let fixture = Fixture::new();
+    fixture.write_config("policy.toml", "[principals.phone]\nrole = \"nobody\"\n");
+    // Caught half way through a rewrite that is not atomic, a policy can read as empty.
+    for empty in ["", " \n\t\r\n", "# the policy for tower\n"] {
+        fixture.write_config("policy.toml", empty);
+        let error = fixture.call("t.echo", json!({})).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Failed, "{empty:?}");
+        assert!(error.message.contains("policy.toml"), "{}", error.message);
+        assert!(
+            error.hint.as_deref().unwrap_or_default().contains("Delete"),
+            "{error:?}"
+        );
+    }
 }
 
 #[tokio::test]

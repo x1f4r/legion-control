@@ -24,7 +24,7 @@ impl Fixture {
     fn write_config(&self, name: &str, text: &str) {
         let config = self.dir.path().join("config");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join(name), text).unwrap();
+        legion_core::config::write_atomically(&config.join(name), text.as_bytes()).unwrap();
     }
 
     async fn call(&self, tool: &str, args: Value) -> Result<Value, ErrorBody> {

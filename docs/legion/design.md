@@ -320,7 +320,10 @@ test runs under its own.
 Configuration is TOML: `node.toml` (this node's name, boot targets, busy probes), `fleet.toml`,
 `projects.toml`, `policy.toml`, `tokens.toml`, `tools.d/*.toml`. A missing file means its empty
 default; a file that does not parse fails the one call that needed it with the line it failed on,
-and never falls back silently to a default that would widen access.
+and never falls back silently to a default that would widen access. A file that is there but says
+nothing is refused the same way, unless its default grants nothing (`node.toml`): a file caught
+half way through a rewrite reads as empty. Legion itself writes them atomically, beside the
+target and renamed over it.
 
 ## Platforms
 

@@ -2,14 +2,17 @@
 //!
 //! A missing file is its document's default. A file that does not parse is an error naming the file
 //! and the line, never a quiet fall back to the default: for `policy.toml` the default is "the owner
-//! may do anything", and a typo must not grant that.
+//! may do anything", and a typo must not grant that. For the same reason a file that is there but
+//! says nothing is refused unless its document allows it, and every configuration file is written
+//! with [`write_atomically`], so a reader never sees one half written.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use legion_proto::{ErrorBody, ErrorCode};
 use serde::Deserialize;
@@ -31,6 +34,13 @@ pub trait Document: DeserializeOwned + Default + Send + Sync + 'static {
     fn validate(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Whether a file that exists but says nothing (it is empty, or holds only whitespace and
+    /// comments) reads as the default. Off unless a document turns it on: a file being rewritten
+    /// in place can read as empty for a moment, and where the default allows more than a written
+    /// file would, as with `policy.toml`, that moment must not widen access. A document whose
+    /// default grants nothing, such as `node.toml`, can turn it on.
+    const EMPTY_IS_DEFAULT: bool = false;
 }
 
 /// Reads documents from one directory and keeps each until its file's bytes change.
@@ -67,7 +77,8 @@ impl ConfigStore {
     }
 
     /// The document as its file says now: the default when the file is missing, an error naming
-    /// the file and the line when it does not parse.
+    /// the file and the line when it does not parse or, unless the document allows it, says
+    /// nothing.
     pub fn get<D: Document>(&self) -> Result<Arc<D>, ErrorBody> {
         let path = self.path_of::<D>();
         let bytes = match std::fs::read(&path) {
@@ -107,6 +118,79 @@ impl ConfigStore {
             },
         );
         Ok(value)
+    }
+
+    /// Replaces a document's file with `text`, creating the directory if need be.
+    ///
+    /// The text is parsed first and refused, with the line, if it would not be read back, so a
+    /// tool that edits configuration can never leave a file that fails every later call. The file
+    /// is replaced with [`write_atomically`]. It blocks, so async code calls it from
+    /// `spawn_blocking`.
+    pub fn write<D: Document>(&self, text: &str) -> Result<(), ErrorBody> {
+        let path = self.path_of::<D>();
+        parse::<D>(&path, text.as_bytes())?;
+        std::fs::create_dir_all(&self.dir)
+            .and_then(|()| write_atomically(&path, text.as_bytes()))
+            .map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be written: {error}.", path.display()),
+                )
+                .with_hint(
+                    "Make the configuration directory writable by the account legion runs as.",
+                )
+            })
+    }
+}
+
+/// How long replacing a file keeps trying while something holds it open. On Windows an indexer or
+/// a virus scanner that has the file open makes a rename fail for a moment; anywhere else a failed
+/// rename has failed for good.
+const REPLACE_PATIENCE: Duration = Duration::from_secs(3);
+
+/// Writes a file so that a reader at the same moment sees the old file or the new one, never part of
+/// either, and a crash leaves one of the two: the bytes go to a temporary file beside it, are
+/// flushed to disk, and the temporary file is renamed over the old one, keeping its permissions.
+///
+/// Every configuration file the workspace writes goes through here. It blocks, retrying a rename
+/// on Windows for a few seconds, so async code calls it from `spawn_blocking`.
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    temporary.write_all(bytes)?;
+    match std::fs::metadata(path) {
+        Ok(old) => temporary.as_file().set_permissions(old.permissions())?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    temporary.as_file().sync_all()?;
+    let started = Instant::now();
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match temporary.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && error.error.kind() == io::ErrorKind::PermissionDenied
+                    && started.elapsed() < REPLACE_PATIENCE =>
+            {
+                temporary = error.file;
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(250));
+            }
+            // Dropping the temporary file removes it.
+            Err(error) => return Err(error.error),
+        }
     }
 }
 
@@ -153,6 +237,25 @@ pub fn parse<D: Document>(path: &Path, bytes: &[u8]) -> Result<D, ErrorBody> {
             .with_details(json!({"file": path})),
         }
     })?;
+    let says_nothing = !D::EMPTY_IS_DEFAULT
+        && toml::from_str::<toml::Table>(text).is_ok_and(|table| table.is_empty());
+    if says_nothing {
+        let file = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "{} is there but says nothing, and it is refused rather than read as the defaults.",
+                path.display()
+            ),
+        )
+        .with_hint(format!(
+            "Delete {file} to get its defaults, or write what it should say into it; a file caught half way through being rewritten reads like this, so write it whole and rename it into place."
+        ))
+        .with_details(json!({"file": path})));
+    }
     document.validate().map_err(|message| {
         ErrorBody::new(
             ErrorCode::Failed,
@@ -190,6 +293,8 @@ pub struct NodeFile {
 
 impl Document for NodeFile {
     const FILE: &'static str = "node.toml";
+    // Its default is the host's name, which grants nothing.
+    const EMPTY_IS_DEFAULT: bool = true;
 }
 
 impl NodeFile {
@@ -356,6 +461,71 @@ mod tests {
         assert_eq!(store.get::<Sample>().unwrap().colour, "tan");
         std::fs::remove_file(&file).unwrap();
         assert_eq!(store.get::<Sample>().unwrap().colour, "");
+    }
+
+    #[test]
+    fn a_file_that_says_nothing_is_refused_unless_its_document_allows_it() {
+        let (dir, store) = store();
+        for nothing in ["", "  \n\r\n", "# colour = \"red\"\n"] {
+            std::fs::write(dir.path().join("sample.toml"), nothing).unwrap();
+            let error = store.get::<Sample>().unwrap_err();
+            assert_eq!(error.code, ErrorCode::Failed);
+            assert!(error.message.contains("sample.toml"), "{}", error.message);
+            assert!(
+                error
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.starts_with("Delete sample.toml")),
+                "{error:?}"
+            );
+            std::fs::write(dir.path().join("node.toml"), nothing).unwrap();
+            assert!(store.get::<NodeFile>().unwrap().name.is_none());
+        }
+    }
+
+    #[test]
+    fn writing_atomically_replaces_the_whole_file_and_leaves_nothing_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("policy.toml");
+        write_atomically(&file, b"first").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"first");
+        write_atomically(&file, b"second, longer").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"second, longer");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["policy.toml"]);
+        assert!(write_atomically(&dir.path().join("no").join("such.toml"), b"x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_atomically_keeps_the_permissions_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fleet.toml");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomically(&file, b"new").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+    }
+
+    #[test]
+    fn a_store_writes_only_what_it_would_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(dir.path().join("config"));
+        let error = store.write::<Sample>("size = 11\n").unwrap_err();
+        assert!(
+            error.message.contains("size is at most 10"),
+            "{}",
+            error.message
+        );
+        assert!(store.write::<Sample>("").is_err());
+        assert!(!store.path_of::<Sample>().exists());
+        store.write::<Sample>("colour = \"red\"\n").unwrap();
+        assert_eq!(store.get::<Sample>().unwrap().colour, "red");
     }
 
     #[test]
