@@ -97,20 +97,29 @@ leaves it.
 2. In the app: scan or paste the invite. The app connects, checks the host key against the
    invite (there is no trust on first use), and hands over its public key and a name.
 3. The node enforces exact UTC expiry against `state/devices.json` (and refuses the temporary key
-   or any key already present in `authorized_keys`), replaces the temporary line with a permanent
-   one that forces `legion gate --as <principal> --device <name> --pairing <id>` (always pinning a
-   random per-pairing id and `--home` or `--config-dir`/`--state-dir`, plus `--account` on
-   Windows's shared `administrators_authorized_keys`), records the device, and audits it with
-   `door: "ssh"`. From then on the device can only speak the Legion protocol as that principal, with
-   that principal's role, and every call it makes is reported and audited with `door: "ssh"` and its
-   device name.
+   or any key already present in `authorized_keys` or `devices.toml`), records the device in
+   `devices.toml` beside `policy.toml`, reconciles `authorized_keys` so the temporary line is
+   replaced with a permanent one that forces
+   `legion gate --as <principal> --device <name> --pairing <id>` (always pinning a random
+   per-pairing id and `--home` or `--config-dir`/`--state-dir`, plus `--account` on Windows's
+   shared `administrators_authorized_keys`), pushes `devices.toml` to reachable peers in
+   `fleet.toml`, and audits it with `door: "ssh"`. From then on the device can only speak the
+   Legion protocol as that principal, with that principal's role, and every call it makes is
+   reported and audited with `door: "ssh"` and its device name.
 
-`device.list` shows paired devices (and sweeps expired invites recorded by this home, plus reports
-foreign or orphaned Legion lines for owner callers) and `device.remove` removes the key, immediately
-terminates any live sessions and same-account parent `sshd` connections for that device, and reports
-any background jobs the device left running in `jobs_left_running` without killing them. Making an
-invite needs the `admin` effect and follows the token rule: only for a principal the caller could
-act as, and never via a forwarded or local expiring credential.
+`device.list` shows paired devices (reconciling `authorized_keys` from `devices.toml`, adopting
+pre-existing `--pairing` lines on first run, sweeping expired invites recorded by this home, and
+reporting foreign or orphaned Legion lines for owner callers), `device.set` changes a paired
+device's role or name and pushes the update to the fleet, `device.endpoint` (`effect: read`)
+advertises a node's direct SSH connection details and pinned host keys, and `device.remove`
+tombstones the device in `devices.toml`, removes its key and unused `device:*` principal,
+immediately terminates any live sessions and verified same-account parent `sshd` connections for
+that device, reports any background jobs the device left running in `jobs_left_running` without
+killing them, and pushes the revocation to reachable peers (naming unreachable peers in
+`still_trusted_by`). Making an invite or changing a role needs the `admin` effect and follows the
+token rule: only for a principal the caller could act as (and `owner` role for creating
+`device:<name>` principals or changing roles), and never via a forwarded or local expiring
+credential.
 
 The key is kept in the app's private storage, like the earlier Android app did. Wrapping it with
 the platform's hardware keystore is a later step.
@@ -128,15 +137,20 @@ can, including pairing further devices. `--as <principal>` still pairs under an 
 No role and no device name is built in; what a person prefers lives in their own policy.
 
 **Paired devices are fleet configuration.** They are kept in `devices.toml` beside `policy.toml`:
-the device's name, public key, principal, when and where it was paired, and, once removed, a
-tombstone. `fleet.sync` carries the file like the policy, but merges it instead of replacing it:
-entries are added from both sides and a tombstone always wins, so two nodes that each paired or
-removed something while apart agree again when they meet. Every node keeps its own
-`authorized_keys` in step with the file whenever it pairs, syncs, lists or removes, and the gate
-refuses a device the file no longer names. Pairing and removing push to every node that can be
-reached at that moment and say which ones could not; those catch up at their next sync. Until
-then a removed device is still accepted by a node that has not heard: that is the price of having
-no hub, and `device.remove` says so by name.
+the device's name, public key, principal, recorded role (for `device:*` principals), when and where
+it was paired and updated, and, once removed, a tombstone. `fleet.sync` carries the file like the
+policy, but merges it in both directions instead of replacing it: entries are added from both sides
+and a tombstone always wins, so two nodes that each paired or removed something while apart agree
+again when they meet (and `meta.doctor` warns if any reachable peer's `devices.toml` differs).
+Every node adopts any pre-existing `--pairing` lines on first run, keeps its own `authorized_keys`
+and `device:*` principals in step with the file whenever it pairs, syncs, lists, updates, or
+removes (failing closed to `nobody` if a synced role is undefined locally), and the gate refuses a
+device the file no longer names (ending its parent `sshd` on `Denied`). Pairing, updating, and
+removing push in parallel to every node that can be reached at that moment and say which ones could
+not; those catch up at their next sync (and immediately tear down active sessions for any newly
+tombstoned devices on sync). Until then a removed device is still accepted by a node that has not
+heard: that is the price of having no hub, and `device.remove` says so by name in
+`still_trusted_by`.
 
 **The device learns every way in.** Each node can describe how a device reaches it (`device.endpoint`:
 names, port, account, ssh host keys). After pairing, and from then on in the background, the app

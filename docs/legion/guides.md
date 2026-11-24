@@ -677,16 +677,29 @@ that `would_refuse` is absent:
 
 ## Pair a phone or tablet (`legion pair`)
 
-A phone, tablet, or other controller pairs with a node once and afterwards connects over SSH,
-confined to one principal by `legion gate --as <principal>`.
+A phone, tablet, or other controller pairs with a node once and belongs to the whole fleet: once
+paired, it connects over SSH to any synced machine in `fleet.toml`, confined to its principal by
+`legion gate --as <principal>`.
 
-First make sure the principal exists in `policy.toml` with the role you want (for example
-`[principals.phone]` with `role = "observer"`), then run `legion pair`:
+Run `legion pair` in your terminal:
 
 ```sh
+legion pair
+```
+
+When run interactively without flags, `legion pair` asks for a device name and lists the roles
+defined in `policy.toml` (plus the built-in `owner` role, with explicit confirmation) with a
+plain one-line description of what each role allows. No role or device name is built in. You can
+also pass flags directly, or pair under an existing principal:
+
+```sh
+legion pair --name pixel --role observer
+legion pair --name tablet --role owner --allow-owner
 legion pair --as phone
 ```
 
+When pairing with `--name` and `--role` (or interactively), Legion creates a dedicated
+`[principals."device:<name>"]` entry in `policy.toml` so two devices never share an identity.
 `legion pair` calls `device.invite`, prints who the device will act as and when the invite expires,
 draws the invite as a terminal QR code, prints the invite text on one line (for copying and pasting
 when a camera is inconvenient), and prints the commands to list and remove devices. Pass `--invert`
@@ -715,39 +728,69 @@ What happens during pairing:
    in your own terminal whenever you do not want an agent transcript to see the invite.
 2. The device scans the QR code or pastes the invite, connects over SSH verifying the pinned host
    key, and sends its own newly generated Ed25519 public key and name.
-3. `legion gate --enrol <id>` validates the invite and public key under an owner-only lock file
-   beside `authorized_keys`, enforces exact UTC expiry from `state/devices.json` (an expired
-   temporary key stops working at its exact expiry because `legion gate --enrol` refuses it and
-   the expired line is swept on the next `device.*` command), refuses enrolling the invite's own
-   temporary key or any key already present in `authorized_keys`, replaces the temporary line with
-   a permanent `restrict,command="<legion> gate --as phone --device <name> --pairing <id> ..."` line
-   pinning a random per-pairing id and the node's config and state directories, records the device
-   in `state/devices.json`, and writes an audit record (`door: "ssh"`, `tool: "device.enrol"`,
-   `device: "<name>"`). The temporary key immediately stops working. Every subsequent call served
-   through `legion gate` is reported and audited with `door: "ssh"` (and `device: "<name>"` when
-   `--device` is set).
+3. `legion gate --enrol <id>` validates the invite and public key under locks on shared config and
+   `authorized_keys`, enforces exact UTC expiry from `state/devices.json` (an expired temporary
+   key stops working at its exact expiry because `legion gate --enrol` refuses it and the expired
+   line is swept on the next `device.*` command), refuses enrolling the invite's own temporary key
+   or any key already present in `authorized_keys` or `devices.toml`, writes the device to
+   `devices.toml` beside `policy.toml`, reconciles `authorized_keys` so the temporary line is
+   replaced by a permanent
+   `restrict,command="<legion> gate --as <principal> --device <name> --pairing <id> ..."` line
+   pinning a random per-pairing id and the node's config and state directories, records non-secret
+   metadata in `state/devices.json`, pushes `devices.toml` in parallel to reachable machines in
+   `fleet.toml` (reporting per-machine outcomes under `fleet`), and writes an audit record
+   (`door: "ssh"`, `tool: "device.enrol"`, `device: "<name>"`). The temporary key immediately stops
+   working. Every subsequent call served through `legion gate` is reported and audited with
+   `door: "ssh"` (and `device: "<name>"` when `--device` is set).
 
-Inspect paired devices and pending invites, or revoke one at once (removing a paired device also
-terminates any active sessions and same-account parent `sshd` connections — including multiplexed
-`ControlMaster` connections — immediately and reports `sessions_ended`, while `legion gate`
-re-checks `authorized_keys` for its exact `--device` and `--pairing` id after registering and tears
-down its verified same-account parent `sshd` on refusal, so neither a newly opened channel on an
-already-open connection nor a later re-pair under the same name can revive a revoked pairing;
-detached background jobs the device started keep running and their IDs are reported in
-`jobs_left_running`, so cancel them separately with `job.cancel` if needed). For owner callers,
-`device.list` also shows Legion lines pointing at another or deleted Legion home (`foreign: true`,
-`missing_home: true`, `home`), `meta.doctor` warns about orphaned keys, and
-`device.remove ... foreign=true` cleans them up (removing a foreign device's key without ending
-sessions tracked under that other home and reporting `sessions_not_ended: true` with a hint):
+### Managing devices across the fleet (`device.list`, `device.set`, `device.endpoint`, `device.remove`)
+
+Paired devices are stored in `devices.toml` beside `policy.toml`, and each node derives its own
+`authorized_keys` device lines from `devices.toml` (adopting any pre-existing `--pairing` lines
+automatically on first run so existing pairings keep working). Foreign `authorized_keys` lines,
+pending invites, and entries belonging to other Legion homes or OS accounts are preserved byte for
+byte.
+
+- **List devices and invites**: `legion device.list` reconciles `authorized_keys` with
+  `devices.toml`, sweeps expired invites recorded by this home, and shows each device's `id`,
+  `name`, `principal`, effective `role`, `fingerprint`, `added`, and `paired_on`. For owner
+  callers, it also shows Legion lines pointing at another or deleted Legion home (`foreign: true`,
+  `missing_home: true`, `home`), and `meta.doctor` warns about orphaned keys or fleet device drift.
+- **Change role or rename**: `legion device.set` changes a paired device's role (owner role only,
+  requiring `allow_owner=true` to raise to `owner`, and refusing expiring credentials) or renames
+  it, updating `policy.toml`, `devices.toml`, and `authorized_keys`, then pushing `devices.toml`
+  to reachable fleet peers.
+- **Discover endpoints**: `legion device.endpoint` (`effect: read`) returns this node's SSH
+  connection details (`node`, `hosts`, `port`, `user`, `host_keys`, `host_keys_source`) using the
+  same detection as `device.invite`. Controllers call `device.endpoint` with `on: "all"` through
+  any reachable node to learn every machine's direct SSH address and pinned host keys.
+- **Remove a device**: `legion device.remove` accepts `name=<device>` or `id=<pairing-or-invite-id>`,
+  writes a tombstone to `devices.toml`, cleans up its unused `device:*` principal in `policy.toml`,
+  removes its `authorized_keys` line, immediately terminates any active sessions and verified
+  same-account parent `sshd` connections (including multiplexed `ControlMaster` connections,
+  reporting `sessions_ended`), reports any still-running background jobs started by that device in
+  `jobs_left_running` without killing them, and pushes the tombstone to reachable peers in
+  `fleet.toml`. **Honest limit without a central hub:** any machine that could not be reached
+  continues trusting the removed device until its next `fleet.sync`; `device.remove` names every
+  such machine in `still_trusted_by` and prints the `fleet.sync` command to finish revoking once
+  they return. On refusal, `legion gate` re-checks `devices.toml` for its exact `--device` and
+  `--pairing` id after registering and tears down its verified same-account parent `sshd` only on
+  `Denied`, so neither a newly opened channel on an already-open connection nor a later re-pair
+  under the same name can revive a removed pairing, while transient local config errors do not
+  kill an unrelated healthy connection. Owner callers can clean up foreign/orphaned Legion lines
+  with `device.remove ... foreign=true` (reporting `sessions_not_ended: true`).
 
 ```sh
 legion device.list
-legion device.remove name=my-phone
-legion device.remove id=<invite-id>
+legion device.set name=pixel role=editor
+legion device.set name=pixel rename=pixel-10
+legion device.endpoint --on all
+legion device.remove name=pixel-10
+legion device.remove id=<pairing-or-invite-id>
 legion device.remove name=old-phone foreign=true
 ```
 
-### Overriding `authorized_keys` and host keys (`[devices]`)
+### Overriding `authorized_keys`, host keys, and endpoint details (`[devices]`)
 
 By default Legion edits `~/.ssh/authorized_keys` (on Windows, when the account is in the
 `Administrators` group and `sshd_config` uses `administrators_authorized_keys`, it edits
@@ -759,12 +802,16 @@ Unicode curly single-quote delimiters `U+2018`–`U+201B`), or a POSIX shell suc
 refusing unrecognised shells clearly). Host keys intersect `ssh-keyscan`
 against local `sshd` on the invite's port with `/etc/ssh/ssh_host_*_key.pub` (or
 `%ProgramData%\ssh\ssh_host_*_key.pub` on Windows), refusing disjoint keys unless configured
-explicitly. To override either for a custom sshd setup, set `[devices]` in `node.toml`:
+explicitly. To override paths or advertised endpoint details (`hosts`, `port`, `user`) for a custom
+sshd setup, set `[devices]` in `node.toml`:
 
 ```toml
 [devices]
 authorized_keys = "/home/me/.ssh/authorized_keys"
 host_keys = ["/etc/ssh/ssh_host_ed25519_key.pub"]
+hosts = ["tower.example.ts.net"]
+port = 22
+user = "me"
 ```
 
 ## The HTTP door (`legion serve`)
@@ -979,11 +1026,15 @@ See [`examples/legion/tools.d/`](../../examples/legion/tools.d/) for complete TO
 `fleet.sync` compares, pushes, or pulls shared configuration across machines in `fleet.toml` (all
 requiring `effect:admin`, built on `config.list`, `config.read`, and `config.write`):
 
-- **Shared documents**: `fleet.toml`, `policy.toml`, `projects.toml`, and `tools.d/<name>.toml`.
-  Extension files may contain internal dots (matching `ext.define` files such as
-  `tools.d/ops.greet.toml`); on write, the receiver enforces the same rules as `ext.define` — the
-  filename stem must match the `name` field inside the file, duplicate tool names across files are
-  refused, and reserved families are rejected.
+- **Shared documents**: `devices.toml`, `fleet.toml`, `policy.toml`, `projects.toml`, and
+  `tools.d/<name>.toml`. Extension files may contain internal dots (matching `ext.define` files
+  such as `tools.d/ops.greet.toml`); on write, the receiver enforces the same rules as `ext.define`
+  — the filename stem must match the `name` field inside the file, duplicate tool names across
+  files are refused, and reserved families are rejected. `devices.toml` merges cleanly in both
+  directions (entries combine from both sides, tombstones always win, `device:*` principals and
+  `authorized_keys` are reconciled, and active sessions for newly removed devices are ended), so
+  two machines that paired or removed devices while apart converge without conflict when they meet.
+  `meta.doctor` warns if any reachable peer has a different `devices.toml`.
 - **Machine-local (never synced)**: `node.toml` and `tokens.toml`.
 
 Inspect differences with `direction=status` (reporting per-document status `same`, `only_here`,
