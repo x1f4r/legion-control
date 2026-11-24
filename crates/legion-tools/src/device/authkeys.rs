@@ -12,8 +12,9 @@
 //! - Never follows a symlink in `~/.ssh` or `~/.ssh/authorized_keys` outside the account's home
 //!   directory unless configured explicitly via `[devices] authorized_keys` in `node.toml`.
 
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -901,11 +902,107 @@ fn extract_line_key_blob(raw: &[u8]) -> Option<Vec<u8>> {
     STANDARD.decode(key_b64).ok()
 }
 
-/// Reads `path`, returning an empty [`AuthKeysFile`] when the file does not exist yet.
-pub fn read_auth_keys(path: &Path) -> Result<AuthKeysFile, ErrorBody> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(AuthKeysFile::parse(&bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AuthKeysFile::default()),
+/// Maximum attempts to re-read and re-apply an `authorized_keys` edit when a concurrent out-of-band
+/// edit changes the file before rename.
+const MAX_CONCURRENT_EDIT_RETRIES: usize = 4;
+
+/// Sentinel detail carried through `OsError::Platform` to signal a pre-rename stamp mismatch.
+const CONCURRENT_EDIT_SENTINEL: &str = "legion-authkeys-concurrent-edit";
+
+/// File identity, size, and timestamps captured when reading `authorized_keys`, compared right
+/// before atomic rename so an out-of-band hand edit is never silently overwritten.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileStamp {
+    /// The file did not exist when read.
+    Missing,
+    /// The file existed with this identity and metadata.
+    Present {
+        /// File byte length.
+        len: u64,
+        /// Last modification timestamp.
+        modified: Option<SystemTime>,
+        /// Unix device id.
+        #[cfg(unix)]
+        dev: u64,
+        /// Unix inode number.
+        #[cfg(unix)]
+        ino: u64,
+        /// Unix status-change seconds (catches same-size in-place edits).
+        #[cfg(unix)]
+        ctime: i64,
+        /// Unix status-change nanoseconds.
+        #[cfg(unix)]
+        ctime_nsec: i64,
+    },
+}
+
+impl FileStamp {
+    fn from_metadata(meta: &std::fs::Metadata) -> FileStamp {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            FileStamp::Present {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                ctime: meta.ctime(),
+                ctime_nsec: meta.ctime_nsec(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            FileStamp::Present {
+                len: meta.len(),
+                modified: meta.modified().ok(),
+            }
+        }
+    }
+}
+
+/// Outcome of [`write_auth_keys_if_unchanged`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The file matched the expected stamp right before rename and was updated atomically.
+    Written,
+    /// The file changed on disk since it was read; the staged temp file was discarded untouched.
+    ConcurrentEdit,
+}
+
+fn stamp_path_os(path: &Path) -> legion_os::Result<FileStamp> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(FileStamp::from_metadata(&meta)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(FileStamp::Missing),
+        Err(error) => Err(legion_os::OsError::Platform {
+            detail: format!("cannot inspect {}: {error}", path.display()),
+        }),
+    }
+}
+
+/// Reads `path` together with its [`FileStamp`] from the same open handle, returning an empty
+/// [`AuthKeysFile`] and [`FileStamp::Missing`] when the file does not exist yet.
+pub fn read_auth_keys_stamped(path: &Path) -> Result<(AuthKeysFile, FileStamp), ErrorBody> {
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            let meta = file.metadata().map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be inspected: {error}.", path.display()),
+                )
+            })?;
+            let stamp = FileStamp::from_metadata(&meta);
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be read: {error}.", path.display()),
+                )
+            })?;
+            Ok((AuthKeysFile::parse(&bytes), stamp))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok((AuthKeysFile::default(), FileStamp::Missing))
+        }
         Err(error) => {
             let mut body = ErrorBody::new(
                 ErrorCode::Failed,
@@ -919,6 +1016,107 @@ pub fn read_auth_keys(path: &Path) -> Result<AuthKeysFile, ErrorBody> {
             Err(body)
         }
     }
+}
+
+/// Reads `path`, returning an empty [`AuthKeysFile`] when the file does not exist yet.
+pub fn read_auth_keys(path: &Path) -> Result<AuthKeysFile, ErrorBody> {
+    read_auth_keys_stamped(path).map(|(file, _)| file)
+}
+
+/// Atomically writes `bytes` to `write_path` only if `write_path`'s current [`FileStamp`] still
+/// equals `expected` immediately before rename.
+///
+/// If an out-of-band edit changed `write_path` since it was read, discards the staged temp file
+/// and returns [`WriteOutcome::ConcurrentEdit`] so the caller can re-read and retry without
+/// losing the concurrent edit.
+pub fn write_auth_keys_if_unchanged(
+    target: &AuthKeysTarget,
+    write_path: &Path,
+    bytes: &[u8],
+    expected: &FileStamp,
+) -> Result<WriteOutcome, ErrorBody> {
+    if let Some(parent) = write_path.parent() {
+        let is_own_ssh_dir = target.is_default_home_ssh && target.path.parent() == Some(parent);
+        ensure_parent_dir(parent, is_own_ssh_dir)?;
+    }
+
+    let mode = desired_auth_keys_mode(write_path);
+    let options = WriteOptions::with_mode(mode).force_mode(true);
+    let need_win_acl = target.windows_admin_acl;
+    let check_path = write_path.to_path_buf();
+    let expected_stamp = expected.clone();
+    match write_atomic_prepared(write_path, bytes, options, move |temp_path| {
+        if need_win_acl {
+            legion_os::user::apply_windows_admin_ssh_acl(temp_path)?;
+        }
+        let current = stamp_path_os(&check_path)?;
+        if current != expected_stamp {
+            return Err(legion_os::OsError::Platform {
+                detail: CONCURRENT_EDIT_SENTINEL.to_owned(),
+            });
+        }
+        Ok(())
+    }) {
+        Ok(()) => Ok(WriteOutcome::Written),
+        Err(legion_os::OsError::Platform { detail }) if detail == CONCURRENT_EDIT_SENTINEL => {
+            Ok(WriteOutcome::ConcurrentEdit)
+        }
+        Err(error) => {
+            let mut body = ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be written: {error}.", write_path.display()),
+            );
+            if target.windows_admin_acl {
+                body = body.with_hint(
+                    "Run from an elevated Administrator terminal so Legion can update administrators_authorized_keys and set its Administrators/SYSTEM ACL.",
+                );
+            }
+            Err(body)
+        }
+    }
+}
+
+/// Runs an `authorized_keys` read-modify-write closure under the caller's lock, retrying from a
+/// fresh read if a concurrent out-of-band hand edit modifies `write_path` before rename.
+///
+/// The closure receives the freshly read [`AuthKeysFile`] and returns `(Some(updated), value)` to
+/// commit the edit or `(None, value)` when no write is needed.
+pub fn edit_auth_keys_with_retry<T>(
+    target: &AuthKeysTarget,
+    write_path: &Path,
+    edit: impl FnMut(AuthKeysFile) -> Result<(Option<AuthKeysFile>, T), ErrorBody>,
+) -> Result<T, ErrorBody> {
+    edit_auth_keys_with_hook(target, write_path, edit, |_| {})
+}
+
+fn edit_auth_keys_with_hook<T>(
+    target: &AuthKeysTarget,
+    write_path: &Path,
+    mut edit: impl FnMut(AuthKeysFile) -> Result<(Option<AuthKeysFile>, T), ErrorBody>,
+    mut before_write: impl FnMut(usize),
+) -> Result<T, ErrorBody> {
+    for attempt in 0..MAX_CONCURRENT_EDIT_RETRIES {
+        let (file, stamp) = read_auth_keys_stamped(write_path)?;
+        let (maybe_updated, value) = edit(file)?;
+        let Some(updated) = maybe_updated else {
+            return Ok(value);
+        };
+        before_write(attempt);
+        match write_auth_keys_if_unchanged(target, write_path, &updated.to_bytes(), &stamp)? {
+            WriteOutcome::Written => return Ok(value),
+            WriteOutcome::ConcurrentEdit => continue,
+        }
+    }
+    Err(ErrorBody::new(
+        ErrorCode::Conflict,
+        format!(
+            "{} changed concurrently while Legion was updating it.",
+            write_path.display()
+        ),
+    )
+    .with_hint(
+        "Retry once no other editor or process is modifying authorized_keys at the same time.",
+    ))
 }
 
 /// Writes `bytes` atomically to `write_path`, ensuring safe Unix directory/file modes and
@@ -1713,6 +1911,80 @@ Match Group users
         assert_eq!(
             std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777,
             0o400
+        );
+    }
+
+    #[test]
+    fn concurrent_hand_edit_is_detected_and_retried_from_fresh_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_file = dir.path().join("authorized_keys");
+        std::fs::write(&auth_file, "# initial\n").unwrap();
+        let target = AuthKeysTarget {
+            path: auth_file.clone(),
+            is_default_home_ssh: false,
+            windows_admin_acl: false,
+        };
+
+        // 1. Direct write_auth_keys_if_unchanged detects a concurrent edit without overwriting it.
+        let (mut file, stamp) = read_auth_keys_stamped(&auth_file).unwrap();
+        std::fs::write(&auth_file, "# initial\n# concurrent hand edit\n").unwrap();
+        file.append_line(
+            "restrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 legion-device:a",
+        );
+        let outcome =
+            write_auth_keys_if_unchanged(&target, &auth_file, &file.to_bytes(), &stamp).unwrap();
+        assert_eq!(outcome, WriteOutcome::ConcurrentEdit);
+        assert_eq!(
+            std::fs::read_to_string(&auth_file).unwrap(),
+            "# initial\n# concurrent hand edit\n"
+        );
+
+        // 2. edit_auth_keys_with_hook retries on the first collision and preserves BOTH the
+        //    concurrent hand edit and Legion's new line.
+        let mut attempts = 0usize;
+        edit_auth_keys_with_hook(
+            &target,
+            &auth_file,
+            |mut auth| {
+                attempts += 1;
+                auth.append_line(
+                    "restrict,command=\"/home/me/legion gate --as phone\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:b",
+                );
+                Ok((Some(auth), ()))
+            },
+            |attempt| {
+                if attempt == 0 {
+                    std::fs::write(
+                        &auth_file,
+                        "# initial\n# concurrent hand edit\n# second hand edit\n",
+                    )
+                    .unwrap();
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts, 2);
+        let final_text = std::fs::read_to_string(&auth_file).unwrap();
+        assert!(final_text.contains("# second hand edit\n"), "{final_text}");
+        assert!(final_text.contains("legion-device:b"), "{final_text}");
+
+        // 3. Persistent concurrent edits fail with Conflict without clobbering the last edit.
+        let conflict = edit_auth_keys_with_hook(
+            &target,
+            &auth_file,
+            |mut auth| {
+                auth.append_line("# never lands");
+                Ok((Some(auth), ()))
+            },
+            |attempt| {
+                std::fs::write(&auth_file, format!("# hand edit {attempt}\n")).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert_eq!(conflict.code, ErrorCode::Conflict);
+        assert_eq!(
+            std::fs::read_to_string(&auth_file).unwrap(),
+            format!("# hand edit {}\n", MAX_CONCURRENT_EDIT_RETRIES - 1)
         );
     }
 

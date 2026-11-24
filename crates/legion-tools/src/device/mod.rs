@@ -28,9 +28,9 @@ use serde::{Deserialize, Serialize};
 use crate::caller::Caller;
 
 use self::authkeys::{
-    ForcedCommandShell, LineKind, format_invite_line, line_matches_account, line_matches_home,
-    read_auth_keys, resolve_safe_write_path, resolve_target, verify_owner_matches_euid,
-    write_auth_keys,
+    ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_invite_line,
+    line_matches_account, line_matches_home, resolve_safe_write_path, resolve_target,
+    verify_owner_matches_euid, write_auth_keys,
 };
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
@@ -294,14 +294,15 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        let mut auth_keys = read_auth_keys(&write_path)?;
-        let original_bytes = auth_keys.to_bytes();
-        let existed_before = write_path.exists();
-        let mut state = load_state(&paths)?;
-
-        sweep(&mut auth_keys, &mut state, now);
-        auth_keys.append_line(&invite_line);
-        write_auth_keys(&target, &write_path, &auth_keys.to_bytes())?;
+        let (original_bytes, existed_before, mut state) =
+            edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+                let original_bytes = auth_keys.to_bytes();
+                let existed_before = write_path.exists();
+                let mut state = load_state(&paths)?;
+                sweep(&mut auth_keys, &mut state, now);
+                auth_keys.append_line(&invite_line);
+                Ok((Some(auth_keys), (original_bytes, existed_before, state)))
+            })?;
 
         state.invites.insert(id_for_write, record);
         if let Err(state_err) = save_state(&paths, &state) {
@@ -377,13 +378,14 @@ async fn list(ctx: &Ctx, _args: NoArgs) -> Result<ListResult, ToolError> {
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        let mut auth_keys = read_auth_keys(&write_path)?;
-        let mut state = load_state(&paths)?;
-        let now = Timestamp::now();
-        let (auth_changed, state_changed) = sweep(&mut auth_keys, &mut state, now);
-        if auth_changed {
-            write_auth_keys(&target, &write_path, &auth_keys.to_bytes())?;
-        }
+        let (auth_keys, state, state_changed) =
+            edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+                let mut state = load_state(&paths)?;
+                let now = Timestamp::now();
+                let (auth_changed, state_changed) = sweep(&mut auth_keys, &mut state, now);
+                let to_write = auth_changed.then(|| auth_keys.clone());
+                Ok((to_write, (auth_keys, state, state_changed)))
+            })?;
         if state_changed {
             save_state(&paths, &state)?;
         }
@@ -570,191 +572,211 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        let mut auth_keys = read_auth_keys(&write_path)?;
-        let mut state = load_state(&paths)?;
-        let now = Timestamp::now();
-        let (swept_auth, swept_state) = sweep(&mut auth_keys, &mut state, now);
+        let (outcome, state_to_save) =
+            edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+                let mut state = load_state(&paths)?;
+                let now = Timestamp::now();
+                let (swept_auth, swept_state) = sweep(&mut auth_keys, &mut state, now);
 
-        match target_item {
-            RemoveTarget::Device(name) => {
-                let mut visible_names: BTreeMap<String, String> = BTreeMap::new();
-                let mut matched_principal: Option<String> = None;
-                let mut matched_lines = 0usize;
+                match &target_item {
+                    RemoveTarget::Device(name) => {
+                        let mut visible_names: BTreeMap<String, String> = BTreeMap::new();
+                        let mut matched_principal: Option<String> = None;
+                        let mut matched_lines = 0usize;
 
-                for line in &auth_keys.lines {
-                    if let LineKind::Device {
-                        name: line_name,
-                        principal,
-                        home,
-                        account,
-                        ..
-                    } = &line.kind
-                    {
-                        if !line_matches_account(
-                            account.as_deref(),
-                            caller_account.as_deref(),
-                            target.windows_admin_acl,
-                            cfg!(windows),
-                        ) {
-                            continue;
-                        }
-                        if !line_matches_home(home.as_deref(), &paths)
-                            && !(home.is_none() && state.devices.contains_key(line_name))
-                        {
-                            continue;
-                        }
-                        let resolved = state
-                            .devices
-                            .get(line_name)
-                            .map(|m| m.principal.clone())
-                            .or_else(|| principal.clone());
-                        let can_manage = match resolved.as_deref() {
-                            Some(p) => caller.may_manage(p),
-                            None => caller.is_owner(),
-                        };
-                        if can_manage {
-                            let p = resolved.unwrap_or_else(|| "unknown".to_owned());
-                            visible_names
-                                .entry(line_name.clone())
-                                .or_insert_with(|| p.clone());
-                            if line_name == &name {
-                                matched_principal.get_or_insert(p);
-                                matched_lines += 1;
+                        for line in &auth_keys.lines {
+                            if let LineKind::Device {
+                                name: line_name,
+                                principal,
+                                home,
+                                account,
+                                ..
+                            } = &line.kind
+                            {
+                                if !line_matches_account(
+                                    account.as_deref(),
+                                    caller_account.as_deref(),
+                                    target.windows_admin_acl,
+                                    cfg!(windows),
+                                ) {
+                                    continue;
+                                }
+                                if !line_matches_home(home.as_deref(), &paths)
+                                    && !(home.is_none() && state.devices.contains_key(line_name))
+                                {
+                                    continue;
+                                }
+                                let resolved = state
+                                    .devices
+                                    .get(line_name)
+                                    .map(|m| m.principal.clone())
+                                    .or_else(|| principal.clone());
+                                let can_manage = match resolved.as_deref() {
+                                    Some(p) => caller.may_manage(p),
+                                    None => caller.is_owner(),
+                                };
+                                if can_manage {
+                                    let p = resolved.unwrap_or_else(|| "unknown".to_owned());
+                                    visible_names
+                                        .entry(line_name.clone())
+                                        .or_insert_with(|| p.clone());
+                                    if line_name == name {
+                                        matched_principal.get_or_insert(p);
+                                        matched_lines += 1;
+                                    }
+                                }
                             }
                         }
-                    }
-                }
 
-                let Some(principal) = matched_principal else {
-                    if swept_auth {
-                        let _ = write_auth_keys(&target, &write_path, &auth_keys.to_bytes());
-                    }
-                    if swept_state {
-                        let _ = save_state(&paths, &state);
-                    }
-                    let hint = if visible_names.is_empty() {
-                        "There are no paired devices.".to_owned()
-                    } else {
-                        let known: Vec<&str> = visible_names.keys().map(String::as_str).collect();
-                        format!("The paired devices are {}.", known.join(", "))
-                    };
-                    return Err(ErrorBody::new(
-                        ErrorCode::NotFound,
-                        format!("There is no paired device called {name}."),
-                    )
-                    .with_hint(hint));
-                };
+                        let Some(principal) = matched_principal else {
+                            let hint = if visible_names.is_empty() {
+                                "There are no paired devices.".to_owned()
+                            } else {
+                                let known: Vec<&str> =
+                                    visible_names.keys().map(String::as_str).collect();
+                                format!("The paired devices are {}.", known.join(", "))
+                            };
+                            let err = ErrorBody::new(
+                                ErrorCode::NotFound,
+                                format!("There is no paired device called {name}."),
+                            )
+                            .with_hint(hint);
+                            return Ok((
+                                swept_auth.then_some(auth_keys),
+                                (Err(err), swept_state.then_some(state)),
+                            ));
+                        };
 
-                auth_keys.retain(|line| {
-                    !matches!(
-                        &line.kind,
-                        LineKind::Device { name: line_name, home, account, .. }
-                            if line_name == &name
+                        auth_keys.retain(|line| {
+                            !matches!(
+                                &line.kind,
+                                LineKind::Device { name: line_name, home, account, .. }
+                                    if line_name == name
+                                        && line_matches_account(
+                                            account.as_deref(),
+                                            caller_account.as_deref(),
+                                            target.windows_admin_acl,
+                                            cfg!(windows),
+                                        )
+                                        && (line_matches_home(home.as_deref(), &paths)
+                                            || (home.is_none()
+                                                && state.devices.contains_key(line_name)))
+                            )
+                        });
+                        state.devices.remove(name);
+                        Ok((
+                            Some(auth_keys),
+                            (
+                                Ok((
+                                    Removed {
+                                        kind: "device",
+                                        name: Some(name.clone()),
+                                        id: None,
+                                        principal,
+                                        removed: true,
+                                        lines_removed: matched_lines,
+                                        sessions_ended: 0,
+                                    },
+                                    Some(name.clone()),
+                                )),
+                                Some(state),
+                            ),
+                        ))
+                    }
+                    RemoveTarget::Invite(id) => {
+                        let mut visible_ids: Vec<String> = Vec::new();
+                        let mut matched_principal: Option<String> = None;
+                        let mut matched_lines = 0usize;
+
+                        for line in &auth_keys.lines {
+                            if let LineKind::Invite {
+                                id: line_id,
+                                account,
+                                ..
+                            } = &line.kind
                                 && line_matches_account(
                                     account.as_deref(),
                                     caller_account.as_deref(),
                                     target.windows_admin_acl,
                                     cfg!(windows),
                                 )
-                                && (line_matches_home(home.as_deref(), &paths)
-                                    || (home.is_none() && state.devices.contains_key(line_name)))
-                    )
-                });
-                write_auth_keys(&target, &write_path, &auth_keys.to_bytes())?;
-                state.devices.remove(&name);
-                save_state(&paths, &state)?;
+                                && let Some(meta) = state.invites.get(line_id)
+                                && caller.may_manage(&meta.principal)
+                            {
+                                if !visible_ids.contains(line_id) {
+                                    visible_ids.push(line_id.clone());
+                                }
+                                if line_id == id {
+                                    matched_principal.get_or_insert_with(|| meta.principal.clone());
+                                    matched_lines += 1;
+                                }
+                            }
+                        }
 
-                Ok((
-                    Removed {
-                        kind: "device",
-                        name: Some(name.clone()),
-                        id: None,
-                        principal,
-                        removed: true,
-                        lines_removed: matched_lines,
-                        sessions_ended: 0,
-                    },
-                    Some(name),
-                ))
+                        let Some(principal) = matched_principal else {
+                            let hint = if visible_ids.is_empty() {
+                                "There are no pending invites.".to_owned()
+                            } else {
+                                format!("The pending invites are {}.", visible_ids.join(", "))
+                            };
+                            let err = ErrorBody::new(
+                                ErrorCode::NotFound,
+                                format!("There is no pending invite with id {id}."),
+                            )
+                            .with_hint(hint);
+                            return Ok((
+                                swept_auth.then_some(auth_keys),
+                                (Err(err), swept_state.then_some(state)),
+                            ));
+                        };
+
+                        auth_keys.retain(|line| {
+                            !matches!(
+                                &line.kind,
+                                LineKind::Invite { id: line_id, account, .. }
+                                    if line_id == id
+                                        && line_matches_account(
+                                            account.as_deref(),
+                                            caller_account.as_deref(),
+                                            target.windows_admin_acl,
+                                            cfg!(windows),
+                                        )
+                            )
+                        });
+                        state.invites.remove(id);
+                        Ok((
+                            Some(auth_keys),
+                            (
+                                Ok((
+                                    Removed {
+                                        kind: "invite",
+                                        name: None,
+                                        id: Some(id.clone()),
+                                        principal,
+                                        removed: true,
+                                        lines_removed: matched_lines,
+                                        sessions_ended: 0,
+                                    },
+                                    None,
+                                )),
+                                Some(state),
+                            ),
+                        ))
+                    }
+                }
+            })?;
+        match outcome {
+            Ok(result) => {
+                if let Some(state) = state_to_save {
+                    save_state(&paths, &state)?;
+                }
+                Ok(result)
             }
-            RemoveTarget::Invite(id) => {
-                let mut visible_ids: Vec<String> = Vec::new();
-                let mut matched_principal: Option<String> = None;
-                let mut matched_lines = 0usize;
-
-                for line in &auth_keys.lines {
-                    if let LineKind::Invite {
-                        id: line_id,
-                        account,
-                        ..
-                    } = &line.kind
-                        && line_matches_account(
-                            account.as_deref(),
-                            caller_account.as_deref(),
-                            target.windows_admin_acl,
-                            cfg!(windows),
-                        )
-                        && let Some(meta) = state.invites.get(line_id)
-                        && caller.may_manage(&meta.principal)
-                    {
-                        if !visible_ids.contains(line_id) {
-                            visible_ids.push(line_id.clone());
-                        }
-                        if line_id == &id {
-                            matched_principal.get_or_insert_with(|| meta.principal.clone());
-                            matched_lines += 1;
-                        }
-                    }
+            Err(err) => {
+                if let Some(state) = state_to_save {
+                    let _ = save_state(&paths, &state);
                 }
-
-                let Some(principal) = matched_principal else {
-                    if swept_auth {
-                        let _ = write_auth_keys(&target, &write_path, &auth_keys.to_bytes());
-                    }
-                    if swept_state {
-                        let _ = save_state(&paths, &state);
-                    }
-                    let hint = if visible_ids.is_empty() {
-                        "There are no pending invites.".to_owned()
-                    } else {
-                        format!("The pending invites are {}.", visible_ids.join(", "))
-                    };
-                    return Err(ErrorBody::new(
-                        ErrorCode::NotFound,
-                        format!("There is no pending invite with id {id}."),
-                    )
-                    .with_hint(hint));
-                };
-
-                auth_keys.retain(|line| {
-                    !matches!(
-                        &line.kind,
-                        LineKind::Invite { id: line_id, account, .. }
-                            if line_id == &id
-                                && line_matches_account(
-                                    account.as_deref(),
-                                    caller_account.as_deref(),
-                                    target.windows_admin_acl,
-                                    cfg!(windows),
-                                )
-                    )
-                });
-                write_auth_keys(&target, &write_path, &auth_keys.to_bytes())?;
-                state.invites.remove(&id);
-                save_state(&paths, &state)?;
-
-                Ok((
-                    Removed {
-                        kind: "invite",
-                        name: None,
-                        id: Some(id),
-                        principal,
-                        removed: true,
-                        lines_removed: matched_lines,
-                        sessions_ended: 0,
-                    },
-                    None,
-                ))
+                Err(err)
             }
         }
     })

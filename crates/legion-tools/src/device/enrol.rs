@@ -19,8 +19,8 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
 use super::authkeys::{
-    ForcedCommandShell, LineKind, format_device_line, read_auth_keys, resolve_safe_write_path,
-    resolve_target, verify_owner_matches_euid, write_auth_keys,
+    ForcedCommandShell, LineKind, edit_auth_keys_with_retry, format_device_line,
+    resolve_safe_write_path, resolve_target, verify_owner_matches_euid,
 };
 use super::keys::{validate_ed25519_public_key, validate_invite_id};
 use super::store::{
@@ -276,206 +276,240 @@ fn process_enrol_blocking(
         Ok(guard) => guard,
         Err(error) => return (None, base_args, Err(error)),
     };
-    let mut auth_keys = match read_auth_keys(&write_path) {
-        Ok(file) => file,
-        Err(error) => return (None, base_args, Err(error)),
-    };
-    let mut state = match load_state(paths) {
-        Ok(state) => state,
-        Err(error) => return (None, base_args, Err(error)),
-    };
 
-    let now = Timestamp::now();
-    // Inspect the requested invite before sweeping so we can distinguish "expired" from "unknown/used".
-    let invite_record = state.invites.get(forced_id).cloned();
-    let principal_hint = invite_record.as_ref().map(|r| r.principal.clone());
-
-    let (swept_auth, swept_state) = sweep(&mut auth_keys, &mut state, now);
-    let persist_sweep = |auth: &super::authkeys::AuthKeysFile, st: &super::store::DevicesState| {
-        if swept_auth {
-            let _ = write_auth_keys(&target, &write_path, &auth.to_bytes());
-        }
-        if swept_state {
-            let _ = save_state(paths, st);
-        }
-    };
-
-    let Some(invite) = state.invites.get(forced_id).cloned() else {
-        persist_sweep(&auth_keys, &state);
-        let expired = invite_record
-            .as_ref()
-            .and_then(|r| parse_rfc3339(&r.expires))
-            .is_some_and(|exp| now >= exp);
-        let err = if expired {
-            ErrorBody::new(ErrorCode::Denied, "This pairing invite has expired.")
-                .with_hint("Create a new invite on the node with `legion pair`.")
-        } else {
-            ErrorBody::new(
-                ErrorCode::NotFound,
-                "This pairing invite is no longer valid or has already been used.",
-            )
-            .with_hint("Create a new invite on the node with `legion pair`.")
-        };
-        return (principal_hint, base_args, Err(err));
-    };
-
-    let principal = invite.principal.clone();
-
-    // Validate the incoming public key strictly before making any changes.
-    let validated_key = match validate_ed25519_public_key(&request.public_key) {
-        Ok(key) => key,
-        Err(error) => {
-            persist_sweep(&auth_keys, &state);
-            return (Some(principal), base_args, Err(error));
-        }
-    };
-
-    // Refuse enrolling the invite's own temporary key (its private seed was carried in the QR and
-    // transcripts) or any key already present on any line of authorized_keys (managed or foreign).
-    let matches_invite_key = validated_key.fingerprint == invite.fingerprint
-        || auth_keys.lines.iter().any(|line| {
-            matches!(&line.kind, LineKind::Invite { id, key_b64, .. } if id == forced_id && key_b64 == &validated_key.key_b64)
-        });
-    if matches_invite_key {
-        persist_sweep(&auth_keys, &state);
-        return (
-            Some(principal),
-            base_args,
-            Err(ErrorBody::new(
-                ErrorCode::Denied,
-                "The device public key cannot be the temporary key from the pairing invite.",
-            )
-            .with_hint(
-                "Generate a fresh Ed25519 key pair on the device and send its public key instead.",
-            )),
-        );
-    }
-    if auth_keys.contains_key_blob(&validated_key.wire_blob) {
-        persist_sweep(&auth_keys, &state);
-        return (
-            Some(principal),
-            base_args,
-            Err(ErrorBody::new(
-                ErrorCode::Conflict,
-                "That public key is already present in authorized_keys.",
-            )
-            .with_hint(
-                "Generate a fresh, dedicated Ed25519 key pair for this device and try again.",
-            )),
-        );
-    }
-
-    // Resolve the principal's current role from policy.toml.
-    let policy = match node.config().get::<Policy>() {
-        Ok(policy) => policy,
-        Err(error) => {
-            persist_sweep(&auth_keys, &state);
-            return (Some(principal), base_args, Err(error));
-        }
-    };
-    let (role, _) = policy.role_of(&principal);
-    if role != OWNER
-        && !policy
-            .principals
-            .keys()
-            .any(|known| known.as_str() == principal)
-    {
-        persist_sweep(&auth_keys, &state);
-        return (
-            Some(principal.clone()),
-            base_args,
-            Err(ErrorBody::new(
-                ErrorCode::Denied,
-                format!(
-                    "policy.toml no longer names {principal}, so this device cannot be enrolled."
-                ),
-            )
-            .with_hint("Restore the principal in policy.toml and create a new invite.")),
-        );
-    }
-
-    let exe = match legion_core::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            persist_sweep(&auth_keys, &state);
-            return (Some(principal), base_args, Err(error));
-        }
-    };
-
-    let existing_names: HashSet<String> = auth_keys
-        .lines
-        .iter()
-        .filter_map(|line| match &line.kind {
-            LineKind::Device { name, .. } => Some(name.clone()),
-            _ => None,
-        })
-        .chain(state.devices.keys().cloned())
-        .collect();
-    let device_name = unique_device_name(&request.name, &existing_names);
-
-    let pinned_account: Option<String> = auth_keys
-        .lines
-        .iter()
-        .find_map(|line| match &line.kind {
-            LineKind::Invite { id, account, .. } if id == forced_id => account.clone(),
-            _ => None,
-        })
-        .or_else(|| {
-            if target.windows_admin_acl {
-                legion_os::user::current_username().ok()
-            } else {
-                None
-            }
-        });
-    if target.windows_admin_acl && pinned_account.is_none() {
-        persist_sweep(&auth_keys, &state);
-        return (
-            Some(principal),
-            base_args,
-            Err(ErrorBody::new(
-                ErrorCode::Failed,
-                "Cannot pin OS account on shared administrators_authorized_keys because the current account name is unavailable.",
-            )),
-        );
-    }
-
-    let permanent_line = match format_device_line(
-        &exe,
-        &principal,
-        &validated_key.canonical,
-        &device_name,
-        paths.explicit_home(),
-        pinned_account.as_deref(),
-        ForcedCommandShell::host(),
-    ) {
-        Ok(line) => line,
-        Err(error) => {
-            persist_sweep(&auth_keys, &state);
-            return (Some(principal), base_args, Err(error));
-        }
-    };
-
-    // Swap temporary invite line for the permanent device line in authorized_keys first: if this
-    // write fails, nothing on disk changes; if it succeeds, the temporary key is immediately gone.
-    auth_keys.retain(|line| !matches!(&line.kind, LineKind::Invite { id, .. } if id == forced_id));
-    auth_keys.append_line(&permanent_line);
-    if let Err(error) = write_auth_keys(&target, &write_path, &auth_keys.to_bytes()) {
-        return (Some(principal), base_args, Err(error));
-    }
-
-    let added = Timestamp::from_second(now.as_second())
-        .map(format_rfc3339)
-        .unwrap_or_else(|_| format_rfc3339(now));
-    state.invites.remove(forced_id);
-    state.devices.insert(
-        device_name.clone(),
-        DeviceRecord {
-            name: device_name.clone(),
-            principal: principal.clone(),
-            added,
-            fingerprint: validated_key.fingerprint.clone(),
+    enum EnrolAttempt {
+        Succeeded {
+            principal: String,
+            role: String,
+            device_name: String,
+            fingerprint: String,
+            state: super::store::DevicesState,
         },
-    );
+        Failed {
+            principal: Option<String>,
+            error: ErrorBody,
+            swept_state: Option<super::store::DevicesState>,
+        },
+    }
+
+    let attempt = match edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+        let mut state = load_state(paths)?;
+        let now = Timestamp::now();
+        // Inspect the requested invite before sweeping so we can distinguish "expired" from "unknown/used".
+        let invite_record = state.invites.get(forced_id).cloned();
+        let principal_hint = invite_record.as_ref().map(|r| r.principal.clone());
+        let (swept_auth, swept_state) = sweep(&mut auth_keys, &mut state, now);
+
+        let fail_with_sweep = |principal: Option<String>,
+                               error: ErrorBody,
+                               auth_keys: super::authkeys::AuthKeysFile,
+                               state: super::store::DevicesState| {
+            Ok((
+                swept_auth.then_some(auth_keys),
+                EnrolAttempt::Failed {
+                    principal,
+                    error,
+                    swept_state: swept_state.then_some(state),
+                },
+            ))
+        };
+
+        let Some(invite) = state.invites.get(forced_id).cloned() else {
+            let expired = invite_record
+                .as_ref()
+                .and_then(|r| parse_rfc3339(&r.expires))
+                .is_some_and(|exp| now >= exp);
+            let err = if expired {
+                ErrorBody::new(ErrorCode::Denied, "This pairing invite has expired.")
+                    .with_hint("Create a new invite on the node with `legion pair`.")
+            } else {
+                ErrorBody::new(
+                    ErrorCode::NotFound,
+                    "This pairing invite is no longer valid or has already been used.",
+                )
+                .with_hint("Create a new invite on the node with `legion pair`.")
+            };
+            return fail_with_sweep(principal_hint, err, auth_keys, state);
+        };
+
+        let principal = invite.principal.clone();
+
+        // Validate the incoming public key strictly before making any changes.
+        let validated_key = match validate_ed25519_public_key(&request.public_key) {
+            Ok(key) => key,
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
+
+        // Refuse enrolling the invite's own temporary key (its private seed was carried in the QR and
+        // transcripts) or any key already present on any line of authorized_keys (managed or foreign).
+        let matches_invite_key = validated_key.fingerprint == invite.fingerprint
+            || auth_keys.lines.iter().any(|line| {
+                matches!(&line.kind, LineKind::Invite { id, key_b64, .. } if id == forced_id && key_b64 == &validated_key.key_b64)
+            });
+        if matches_invite_key {
+            return fail_with_sweep(
+                Some(principal),
+                ErrorBody::new(
+                    ErrorCode::Denied,
+                    "The device public key cannot be the temporary key from the pairing invite.",
+                )
+                .with_hint(
+                    "Generate a fresh Ed25519 key pair on the device and send its public key instead.",
+                ),
+                auth_keys,
+                state,
+            );
+        }
+        if auth_keys.contains_key_blob(&validated_key.wire_blob) {
+            return fail_with_sweep(
+                Some(principal),
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    "That public key is already present in authorized_keys.",
+                )
+                .with_hint(
+                    "Generate a fresh, dedicated Ed25519 key pair for this device and try again.",
+                ),
+                auth_keys,
+                state,
+            );
+        }
+
+        // Resolve the principal's current role from policy.toml.
+        let policy = match node.config().get::<Policy>() {
+            Ok(policy) => policy,
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
+        let (role, _) = policy.role_of(&principal);
+        if role != OWNER
+            && !policy
+                .principals
+                .keys()
+                .any(|known| known.as_str() == principal)
+        {
+            return fail_with_sweep(
+                Some(principal.clone()),
+                ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "policy.toml no longer names {principal}, so this device cannot be enrolled."
+                    ),
+                )
+                .with_hint("Restore the principal in policy.toml and create a new invite."),
+                auth_keys,
+                state,
+            );
+        }
+
+        let exe = match legion_core::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
+
+        let existing_names: HashSet<String> = auth_keys
+            .lines
+            .iter()
+            .filter_map(|line| match &line.kind {
+                LineKind::Device { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .chain(state.devices.keys().cloned())
+            .collect();
+        let device_name = unique_device_name(&request.name, &existing_names);
+
+        let pinned_account: Option<String> = auth_keys
+            .lines
+            .iter()
+            .find_map(|line| match &line.kind {
+                LineKind::Invite { id, account, .. } if id == forced_id => account.clone(),
+                _ => None,
+            })
+            .or_else(|| {
+                if target.windows_admin_acl {
+                    legion_os::user::current_username().ok()
+                } else {
+                    None
+                }
+            });
+        if target.windows_admin_acl && pinned_account.is_none() {
+            return fail_with_sweep(
+                Some(principal),
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    "Cannot pin OS account on shared administrators_authorized_keys because the current account name is unavailable.",
+                ),
+                auth_keys,
+                state,
+            );
+        }
+
+        let permanent_line = match format_device_line(
+            &exe,
+            &principal,
+            &validated_key.canonical,
+            &device_name,
+            paths.explicit_home(),
+            pinned_account.as_deref(),
+            ForcedCommandShell::host(),
+        ) {
+            Ok(line) => line,
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
+
+        // Swap temporary invite line for the permanent device line in authorized_keys atomically.
+        auth_keys
+            .retain(|line| !matches!(&line.kind, LineKind::Invite { id, .. } if id == forced_id));
+        auth_keys.append_line(&permanent_line);
+
+        let added = Timestamp::from_second(now.as_second())
+            .map(format_rfc3339)
+            .unwrap_or_else(|_| format_rfc3339(now));
+        state.invites.remove(forced_id);
+        state.devices.insert(
+            device_name.clone(),
+            DeviceRecord {
+                name: device_name.clone(),
+                principal: principal.clone(),
+                added,
+                fingerprint: validated_key.fingerprint.clone(),
+            },
+        );
+
+        Ok((
+            Some(auth_keys),
+            EnrolAttempt::Succeeded {
+                principal,
+                role,
+                device_name,
+                fingerprint: validated_key.fingerprint,
+                state,
+            },
+        ))
+    }) {
+        Ok(attempt) => attempt,
+        Err(error) => return (None, base_args, Err(error)),
+    };
+
+    let (principal, role, device_name, fingerprint, state) = match attempt {
+        EnrolAttempt::Succeeded {
+            principal,
+            role,
+            device_name,
+            fingerprint,
+            state,
+        } => (principal, role, device_name, fingerprint, state),
+        EnrolAttempt::Failed {
+            principal,
+            error,
+            swept_state,
+        } => {
+            if let Some(state) = swept_state {
+                let _ = save_state(paths, &state);
+            }
+            return (principal, base_args, Err(error));
+        }
+    };
+
     if let Err(error) = save_state(paths, &state) {
         // authorized_keys already has the permanent line and no longer has the temp invite line,
         // so surface the state error without leaving the invite reusable.
@@ -485,7 +519,7 @@ fn process_enrol_blocking(
     let audit_args = json!({
         "id": forced_id,
         "device": device_name,
-        "fingerprint": validated_key.fingerprint,
+        "fingerprint": fingerprint,
     });
     (
         Some(principal.clone()),
