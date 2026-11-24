@@ -454,13 +454,22 @@ impl Grant {
     ///
     /// `~` is expanded and relative paths are refused. Every directory on the way is resolved,
     /// symbolic links and `..` included, so the result names the same file the kernel would open;
-    /// the last part is kept as given, so a tool that removes or renames a symbolic link acts on
-    /// the link and not on what it points to.
+    /// the last part is kept as given when it is a symbolic link, so a tool that removes or renames
+    /// one acts on the link and not on what it points to.
     ///
     /// When the role confines file tools to `paths`, the result must lie under one of them, and so
     /// must the file a symbolic link in the last part leads to: a link inside a root cannot be a
     /// way out of it. A path whose parent directories do not exist yet is checked as it will be
     /// once they do, and `..` among those is refused, since nothing can say where it would lead.
+    /// Whatever cannot be told for sure is refused rather than guessed at: a symbolic link on the
+    /// way that leads nowhere, a directory that cannot be looked into, and on Windows a path that
+    /// names an alternate data stream (`file:stream`). On macOS and Windows, whose file systems
+    /// usually ignore case, names that do not exist yet are compared ignoring case too.
+    ///
+    /// The answer holds when it is given. A tool that uses the path a moment later uses whatever is
+    /// there then, so another process that swaps a directory on the way for a symbolic link in
+    /// between is not defended against: confinement keeps a confined caller to its own roots, it
+    /// does not protect the machine from a local attacker racing it.
     pub fn check_path(&self, path: impl AsRef<Path>, access: Access) -> Result<PathBuf, ErrorBody> {
         let given = path.as_ref();
         let expanded = expand_tilde(given, self.home.as_deref())?;
@@ -474,47 +483,82 @@ impl Grant {
             )
             .with_hint("Write the path from the root of the file system, or from ~."));
         }
-        let resolved = resolve_keeping_last(&expanded)?;
+        if names_a_stream(expanded.as_os_str().as_encoded_bytes(), Platform::HOST) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "{} names an alternate data stream, which Legion does not open.",
+                    given.display()
+                ),
+            )
+            .with_hint("Name the file itself: on Windows a colon after the drive selects a stream inside a file."));
+        }
 
         let Some(roots) = &self.rules.paths else {
-            return Ok(resolved);
+            return resolve_keeping_last(&expanded)
+                .map(|resolved| resolved.path())
+                .map_err(|error| error.unconfined(given));
         };
-        let mut resolved_roots = Vec::with_capacity(roots.len());
-        for root in roots {
-            let root = expand_tilde(Path::new(root.as_str()), self.home.as_deref())?;
-            resolved_roots.push(resolve(&root)?);
-        }
-        let inside = |path: &Path| resolved_roots.iter().any(|root| path.starts_with(root));
-        let outside = || {
+        let denied = |reason: &str| {
             ErrorBody::new(
                 ErrorCode::Denied,
                 format!(
-                    "{} may not {} {}: its role {} confines file tools to {}.",
+                    "{} may not {} {}: {reason}.",
                     self.principal,
                     access.verb(),
-                    given.display(),
-                    self.role,
-                    roots.iter().map(PathRoot::as_str).collect::<Vec<_>>().join(", ")
+                    given.display()
                 ),
             )
+        };
+        let resolved = resolve_keeping_last(&expanded).map_err(|error| match error {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(_, reason) => denied(&reason).with_hint(
+                "A confined role may only use a path that resolves, link by link, to a place under its roots.",
+            ),
+        })?;
+        let mut resolved_roots = Vec::with_capacity(roots.len());
+        for root in roots {
+            let expanded = expand_tilde(Path::new(root.as_str()), self.home.as_deref())?;
+            let resolved_root = resolve(&expanded).map_err(|error| {
+                let reason = match error {
+                    Unresolved::Invalid(error) => error.message,
+                    Unresolved::Unclear(_, reason) => reason,
+                };
+                denied(&format!("its role's root {} cannot be resolved ({reason})", root.as_str()))
+                    .with_hint("Ask the owner of this machine to fix the role's paths in policy.toml, or the directory they name.")
+            })?;
+            resolved_roots.push(resolved_root);
+        }
+        let inside = |path: &Resolved| {
+            resolved_roots
+                .iter()
+                .any(|root| within(path, root, Platform::HOST))
+        };
+        let outside = || {
+            denied(&format!(
+                "its role {} confines file tools to {}",
+                self.role,
+                roots.iter().map(PathRoot::as_str).collect::<Vec<_>>().join(", ")
+            ))
             .with_hint("Use a path under one of those directories, or ask the owner to add the directory to the role's paths in policy.toml.")
-            .with_details(json!({"path": resolved, "roots": resolved_roots}))
+            .with_details(json!({
+                "path": resolved.path(),
+                "roots": resolved_roots.iter().map(Resolved::path).collect::<Vec<_>>(),
+            }))
         };
         if !inside(&resolved) {
             return Err(outside());
         }
-        // The last part was kept as given; if it is a symbolic link, where it leads must be inside
-        // as well. A link that leads nowhere cannot be checked, and writing through it would
-        // create a file wherever it points.
-        let is_link =
-            std::fs::symlink_metadata(&resolved).is_ok_and(|meta| meta.file_type().is_symlink());
-        if is_link {
-            match dunce::canonicalize(&resolved) {
-                Ok(target) if inside(&target) => {}
-                _ => return Err(outside()),
+        // A last part that is a symbolic link was kept as given; where it leads must be inside as
+        // well. A link that leads nowhere cannot be checked, and writing through it would create a
+        // file wherever it points.
+        if resolved.link.is_some() {
+            let target = dunce::canonicalize(resolved.path()).map(Resolved::existing);
+            if !target.is_ok_and(|target| inside(&target)) {
+                return Err(outside());
             }
         }
-        Ok(resolved)
+        Ok(resolved.path())
     }
 }
 
@@ -550,60 +594,310 @@ pub fn expand_tilde(path: &Path, home: Option<&Path>) -> Result<PathBuf, ErrorBo
     Ok(path.to_path_buf())
 }
 
+/// A path resolved as far as it exists.
+#[derive(Clone, Debug)]
+struct Resolved {
+    /// The deepest part that exists, canonicalised, so its names are spelt as they are on disk.
+    existing: PathBuf,
+    /// The names below it that do not exist yet, as written.
+    missing: Vec<OsString>,
+    /// A last part that is a symbolic link, as written: kept rather than followed, so a tool acts on
+    /// the link itself.
+    link: Option<OsString>,
+}
+
+impl Resolved {
+    fn existing(path: PathBuf) -> Resolved {
+        Resolved {
+            existing: path,
+            missing: Vec::new(),
+            link: None,
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        let mut path = self.existing.clone();
+        path.extend(&self.missing);
+        if let Some(link) = &self.link {
+            path.push(link);
+        }
+        path
+    }
+}
+
+/// Why a path could not be resolved.
+#[derive(Debug)]
+enum Unresolved {
+    /// The path is wrong as written, whoever asks.
+    Invalid(ErrorBody),
+    /// Something on the way leads nowhere or cannot be looked at: a confined caller is refused, and
+    /// anyone else gets the code with the reason.
+    Unclear(ErrorCode, String),
+}
+
+impl Unresolved {
+    fn unconfined(self, given: &Path) -> ErrorBody {
+        match self {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(code, reason) => ErrorBody::new(
+                code,
+                format!("{} cannot be used: {reason}.", given.display()),
+            ),
+        }
+    }
+}
+
 /// Resolves every part of an absolute path that exists, symbolic links and `..` included, and
 /// appends the parts that do not exist yet as they are.
-fn resolve(path: &Path) -> Result<PathBuf, ErrorBody> {
+///
+/// Only a part that is genuinely absent may be appended unresolved. Each part is looked at without
+/// following it, so a symbolic link that leads nowhere is found as the link it is, not taken for a
+/// directory that does not exist yet, and anything that cannot be looked at stops the walk.
+fn resolve(path: &Path) -> Result<Resolved, Unresolved> {
     let mut existing = path.to_path_buf();
     // The parts that do not exist, the last one first.
     let mut missing: Vec<OsString> = Vec::new();
     loop {
-        match dunce::canonicalize(&existing) {
-            Ok(mut resolved) => {
-                for part in missing.iter().rev() {
-                    resolved.push(part);
-                }
-                return Ok(resolved);
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                return match dunce::canonicalize(&existing) {
+                    Ok(resolved) => {
+                        missing.reverse();
+                        Ok(Resolved {
+                            existing: resolved,
+                            missing,
+                            link: None,
+                        })
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Err(Unresolved::Unclear(
+                            ErrorCode::NotFound,
+                            format!(
+                                "{} is a symbolic link that leads nowhere",
+                                existing.display()
+                            ),
+                        ))
+                    }
+                    Err(error) => Err(Unresolved::Unclear(
+                        ErrorCode::Failed,
+                        format!("{} cannot be resolved ({error})", existing.display()),
+                    )),
+                };
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match existing.components().next_back() {
                     Some(Component::Normal(name)) => missing.push(name.to_owned()),
                     Some(Component::ParentDir) => {
-                        return Err(ErrorBody::new(
+                        return Err(Unresolved::Invalid(ErrorBody::new(
                             ErrorCode::InvalidArgs,
                             format!(
                                 "{} goes up with .. out of a directory that does not exist.",
                                 path.display()
                             ),
                         )
-                        .with_hint("Write the path without .., the way it will be once its directories exist."));
+                        .with_hint("Write the path without .., the way it will be once its directories exist.")));
                     }
                     _ => {
-                        return Err(ErrorBody::new(
+                        return Err(Unresolved::Invalid(ErrorBody::new(
                             ErrorCode::NotFound,
                             format!(
                                 "{} is on a drive or volume that does not exist.",
                                 path.display()
                             ),
-                        ));
+                        )));
                     }
                 }
                 existing.pop();
             }
             Err(error) => {
-                return Err(ErrorBody::new(
+                return Err(Unresolved::Unclear(
                     ErrorCode::Failed,
-                    format!("{} cannot be resolved: {error}.", existing.display()),
+                    format!("{} cannot be looked at ({error})", existing.display()),
                 ));
             }
         }
     }
 }
 
-/// [`resolve`] for every part but the last, which is appended as given.
-fn resolve_keeping_last(path: &Path) -> Result<PathBuf, ErrorBody> {
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => Ok(resolve(parent)?.join(name)),
-        _ => resolve(path),
+/// [`resolve`] for every part but the last, which is resolved too unless it is a symbolic link.
+fn resolve_keeping_last(path: &Path) -> Result<Resolved, Unresolved> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return resolve(path);
+    };
+    let mut resolved = resolve(parent)?;
+    if !resolved.missing.is_empty() {
+        resolved.missing.push(name.to_owned());
+        return Ok(resolved);
+    }
+    let last = resolved.existing.join(name);
+    match std::fs::symlink_metadata(&last) {
+        Ok(meta) if meta.file_type().is_symlink() => resolved.link = Some(name.to_owned()),
+        // Resolved like the rest, so it is spelt as it is on disk.
+        Ok(_) => resolved = resolve(&last)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            resolved.missing.push(name.to_owned());
+        }
+        Err(error) => {
+            return Err(Unresolved::Unclear(
+                ErrorCode::Failed,
+                format!("{} cannot be looked at ({error})", last.display()),
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+/// The rules a platform's file systems usually follow, as far as confining paths needs them. A
+/// parameter rather than `cfg`, so the rules of each are tested on all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    /// Linux and the other Unix systems: `/` separates, case matters.
+    Unix,
+    /// `/` separates, and APFS as macOS formats it ignores case.
+    Mac,
+    /// `\` and `/` separate, a path starts at a drive or a share, NTFS ignores case, and a colon
+    /// after the drive selects a stream inside a file.
+    Windows,
+}
+
+impl Platform {
+    const HOST: Platform = if cfg!(windows) {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::Mac
+    } else {
+        Platform::Unix
+    };
+
+    fn separates(self, byte: u8) -> bool {
+        byte == b'/' || (self == Platform::Windows && byte == b'\\')
+    }
+
+    fn ignores_case(self) -> bool {
+        self != Platform::Unix
+    }
+}
+
+/// One name in a path, as bytes in the platform's own encoding.
+#[derive(Clone, Copy, Debug)]
+struct Name<'a> {
+    bytes: &'a [u8],
+    /// Whether the name exists. One that exists is compared exactly: if it was read from the disk
+    /// it is spelt the way the disk spells it, and a name that does not exist cannot be another
+    /// spelling of it, or it would exist too. Only two names that do not exist yet are compared the
+    /// way the file system will compare them once they do.
+    exists: bool,
+}
+
+/// The volume a path is on, written the same way however the path spelt it, and the rest of the
+/// path. On Windows `\\?\C:\x` and `C:\x` are both on `C:`, and `\\?\UNC\server\share\x` and
+/// `\\server\share\x` both on `\\server\share`, so a path too long for the short form still
+/// matches a root written in it. Everywhere else the volume is empty.
+fn volume(path: &[u8], platform: Platform) -> (Vec<u8>, &[u8]) {
+    if platform != Platform::Windows {
+        return (Vec::new(), path);
+    }
+    let separates = |byte: Option<&u8>| byte.is_some_and(|byte| platform.separates(*byte));
+    let mut rest = path;
+    let verbatim = separates(rest.first())
+        && separates(rest.get(1))
+        && matches!(rest.get(2), Some(b'?' | b'.'))
+        && separates(rest.get(3));
+    let unc = if verbatim {
+        rest = &rest[4..];
+        let unc = rest
+            .get(..3)
+            .is_some_and(|start| start.eq_ignore_ascii_case(b"UNC"))
+            && separates(rest.get(3));
+        if unc {
+            rest = &rest[4..];
+        }
+        unc
+    } else if separates(rest.first()) && separates(rest.get(1)) {
+        rest = &rest[2..];
+        true
+    } else {
+        false
+    };
+    let take_name = |rest: &mut &[u8]| {
+        let end = rest
+            .iter()
+            .position(|byte| platform.separates(*byte))
+            .unwrap_or(rest.len());
+        let name = rest[..end].to_ascii_lowercase();
+        *rest = &rest[end..];
+        name
+    };
+    if unc {
+        let server = take_name(&mut rest);
+        rest = rest.get(1..).unwrap_or_default();
+        let share = take_name(&mut rest);
+        let mut volume = b"\\\\".to_vec();
+        volume.extend_from_slice(&server);
+        volume.push(b'\\');
+        volume.extend_from_slice(&share);
+        (volume, rest)
+    } else if rest.first().is_some_and(u8::is_ascii_alphabetic) && rest.get(1) == Some(&b':') {
+        (vec![rest[0].to_ascii_uppercase(), b':'], &rest[2..])
+    } else if verbatim {
+        (take_name(&mut rest), rest)
+    } else {
+        (Vec::new(), rest)
+    }
+}
+
+/// Whether a path names an alternate data stream: on Windows, a colon anywhere after its volume.
+fn names_a_stream(path: &[u8], platform: Platform) -> bool {
+    platform == Platform::Windows && volume(path, platform).1.contains(&b':')
+}
+
+/// The volume of a resolved path and its names, from the top down.
+fn names_of(resolved: &Resolved, platform: Platform) -> (Vec<u8>, Vec<Name<'_>>) {
+    let (volume, rest) = volume(resolved.existing.as_os_str().as_encoded_bytes(), platform);
+    let mut names: Vec<Name<'_>> = rest
+        .split(|byte| platform.separates(*byte))
+        .filter(|name| !name.is_empty())
+        .map(|bytes| Name {
+            bytes,
+            exists: true,
+        })
+        .collect();
+    names.extend(resolved.missing.iter().map(|name| Name {
+        bytes: name.as_encoded_bytes(),
+        exists: false,
+    }));
+    if let Some(link) = &resolved.link {
+        names.push(Name {
+            bytes: link.as_encoded_bytes(),
+            exists: true,
+        });
+    }
+    (volume, names)
+}
+
+/// Whether `path` is `root` or lies under it.
+fn within(path: &Resolved, root: &Resolved, platform: Platform) -> bool {
+    let (path_volume, path_names) = names_of(path, platform);
+    let (root_volume, root_names) = names_of(root, platform);
+    path_volume == root_volume
+        && path_names.len() >= root_names.len()
+        && root_names
+            .iter()
+            .zip(&path_names)
+            .all(|(root, name)| same_name(*root, *name, platform))
+}
+
+fn same_name(a: Name<'_>, b: Name<'_>, platform: Platform) -> bool {
+    if a.bytes == b.bytes {
+        return true;
+    }
+    if a.exists || b.exists || !platform.ignores_case() {
+        return false;
+    }
+    // A name that is not Unicode is compared exactly: refusing a match is the safe mistake.
+    match (std::str::from_utf8(a.bytes), std::str::from_utf8(b.bytes)) {
+        (Ok(a), Ok(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => false,
     }
 }
 
@@ -922,6 +1216,43 @@ paths = ["~/projects/**"]
 
     #[cfg(unix)]
     #[test]
+    fn a_dangling_link_on_the_way_is_refused_not_taken_for_a_missing_directory() {
+        use std::os::unix::fs::symlink;
+        let confined = Confined::new();
+        let home = confined.home();
+        symlink(
+            home.join(".ssh").join("newdir"),
+            home.join("projects").join("escape"),
+        )
+        .unwrap();
+        let error = confined
+            .grant
+            .check_path("~/projects/escape/authorized_keys", Access::Write)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert!(error.message.contains("escape"), "{}", error.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_last_part_that_cannot_be_looked_at_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let confined = Confined::new();
+        let locked = confined.home().join("projects").join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Root may look anyway, and then there is nothing to test.
+        let refused = std::fs::symlink_metadata(locked.join("x"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+        let result = confined.check("~/projects/locked/x");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if refused {
+            assert_eq!(result, Err(ErrorCode::Denied));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_root_that_is_itself_a_link_confines_to_where_it_leads() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
@@ -932,6 +1263,117 @@ paths = ["~/projects/**"]
         let grant = policy(DESIGN_EXAMPLE).grant("agent:claude", Some(&dir.path().join("home")));
         let resolved = grant.check_path("~/projects/a.txt", Access::Write).unwrap();
         assert_eq!(resolved, dunce::canonicalize(&real).unwrap().join("a.txt"));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn another_spelling_of_a_root_on_a_disk_that_ignores_case_is_the_root() {
+        let confined = Confined::new();
+        let projects = confined.home().join("projects");
+        assert_eq!(confined.check("~/PROJECTS"), Ok(projects.clone()));
+        assert_eq!(
+            confined.check("~/Projects/App/new.txt"),
+            Ok(projects.join("app").join("new.txt"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_streams_and_matches_paths_too_long_for_the_short_form() {
+        let confined = Confined::new();
+        assert_eq!(
+            confined.check("~/projects/app::$DATA"),
+            Err(ErrorCode::InvalidArgs)
+        );
+        let mut deep = confined.home().join("projects");
+        for n in 0..30 {
+            deep.push(format!("directory{n:02}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let long = deep.join("file.txt");
+        assert!(long.as_os_str().len() > 260);
+        let checked = confined.grant.check_path(&long, Access::Write).unwrap();
+        assert!(checked.ends_with(Path::new("directory29").join("file.txt")));
+    }
+
+    fn resolved(existing: &str, missing: &[&str]) -> Resolved {
+        Resolved {
+            existing: PathBuf::from(existing),
+            missing: missing.iter().map(OsString::from).collect(),
+            link: None,
+        }
+    }
+
+    #[test]
+    fn windows_paths_match_their_roots_however_the_volume_is_spelt() {
+        let root = resolved(r"C:\Users\me\projects", &[]);
+        let inside = |path: &str| within(&resolved(path, &[]), &root, Platform::Windows);
+        let long = format!(r"\\?\C:\Users\me\projects\{}", "a".repeat(300));
+        assert!(inside(&long));
+        assert!(inside(r"c:\Users\me\projects\x"));
+        assert!(inside("C:/Users/me/projects"));
+        assert!(!inside(r"D:\Users\me\projects"));
+        assert!(!inside(r"C:\Users\me\projects2"));
+        assert!(!inside(r"C:\Users\me"));
+
+        let share = resolved(r"\\tower\Data\projects", &[]);
+        let on_share = |path: &str| within(&resolved(path, &[]), &share, Platform::Windows);
+        assert!(on_share(r"\\?\UNC\TOWER\data\projects\x"));
+        assert!(!on_share(r"\\pi\data\projects"));
+        assert!(!on_share(r"C:\tower\data\projects"));
+
+        // Elsewhere a backslash is part of a name, and the long form is not the short one.
+        assert!(!within(&resolved(&long, &[]), &root, Platform::Unix));
+    }
+
+    #[test]
+    fn case_is_ignored_only_between_names_that_do_not_exist_yet_and_only_where_disks_ignore_it() {
+        let root = resolved("/Users/me", &["projects"]);
+        let path = resolved("/Users/me", &["PROJECTS", "x"]);
+        assert!(within(&path, &root, Platform::Mac));
+        assert!(!within(&path, &root, Platform::Unix));
+        assert!(within(
+            &resolved(r"C:\Users\me", &["Projects", "x"]),
+            &resolved(r"C:\Users\me", &["projects"]),
+            Platform::Windows
+        ));
+        // Names read from the disk are spelt the way the disk spells them, so two spellings are
+        // two entries, as they are on a volume that minds case.
+        let existing = resolved("/Users/me/projects", &[]);
+        assert!(!within(
+            &resolved("/Users/me/PROJECTS/x", &[]),
+            &existing,
+            Platform::Mac
+        ));
+        // And a name that does not exist is no other spelling of one that does, or it would exist.
+        assert!(!within(
+            &resolved("/Users/me", &["PROJECTS", "x"]),
+            &existing,
+            Platform::Mac
+        ));
+        assert!(within(
+            &resolved("/Users/me/projects", &["new", "x"]),
+            &existing,
+            Platform::Mac
+        ));
+    }
+
+    #[test]
+    fn only_windows_has_streams_and_only_after_the_volume() {
+        assert!(names_a_stream(
+            br"C:\Users\me\key::$DATA",
+            Platform::Windows
+        ));
+        assert!(names_a_stream(
+            br"C:\Users\me\notes.txt:hidden",
+            Platform::Windows
+        ));
+        assert!(names_a_stream(br"\\?\C:\Users\me\key:x", Platform::Windows));
+        assert!(names_a_stream(br"\\tower\share\key:x", Platform::Windows));
+        assert!(!names_a_stream(br"C:\Users\me\key", Platform::Windows));
+        assert!(!names_a_stream(br"\\?\C:\Users\me\key", Platform::Windows));
+        assert!(!names_a_stream(b"/home/me/a:b", Platform::Unix));
+        assert!(!names_a_stream(b"/Users/me/a:b", Platform::Mac));
     }
 
     #[test]
