@@ -106,9 +106,11 @@ Machines are called concurrently and one failing never fails the others.
 JSON carries control, never bulk bytes. File content beyond what `fs.read` allows in one reply
 (1 MiB) moves over a second pipe, `legion stream`. Its first line on stdin is one JSON object
 carrying `protocol` (starting at 1), `op`, optional `as`, and the operation's fields; raw bytes
-follow in the direction the operation needs. Every reply starts with one JSON line, and while an
-operation works on something long it writes a `{"busy": true}` heartbeat every 10 seconds where a
-reply line is awaited:
+follow in the direction the operation needs. The node's first line on stdout, before any reply or
+refusal, is `{"protocol": 1}` so both ends agree on the protocol version before bulk bytes move
+(waiting up to 60 seconds for the handshake and first reply, and 120 seconds between messages or
+chunks). While an operation works on something long it writes `{"busy": true}` every 10 seconds
+where a reply line is awaited:
 
 | `op` | Header | Then |
 | --- | --- | --- |
@@ -117,7 +119,7 @@ reply line is awaited:
 | `get` | `{protocol, op, path, offset?}` | one JSON line `{size}` on stdout, then the file's bytes from `offset` to the end |
 | `put` | `{protocol, op, path, size, hash, mode?, mtime?}` | `{offset}` on stdout (what is on disk decides where it starts); bytes on stdin; `{ok, size, hash}` when verified and renamed |
 | `pack` | `{protocol, op, root, names: […]}` | `{ready, skipped}` on stdout, then a tar stream of those names |
-| `unpack` | `{protocol, op, root, names: […], hash?}` | `{ready}` on stdout; a tar stream on stdin (only planned `names` are accepted); `{ok, files, …}` when done |
+| `unpack` | `{protocol, op, root, entries: [{path, kind, size?, hash?, target?}]}` | `{ready}` on stdout; a tar stream on stdin (only the planned `entries` are accepted, verified before replacing the destination); `{ok, files, …}` when done |
 | `delete` | `{protocol, op, root, names: […]}` | `{removed, skipped}` on stdout |
 
 They are the same permission-checked operations as the `fs.*` tools (`fs.read` for `manifest`,
@@ -203,19 +205,27 @@ changes until the file says `busy = "none"` in so many words: not knowing is not
 - One file: resumable. The destination keeps a partial file, the transfer continues from its
   length, and the result is renamed into place only after the whole-file hash matches.
 - A directory: both sides list their tree (size and modification time, or hash with
-  `checksum: true`), only what differs is packed, and a second run sends nothing. `delete: true`
-  removes what the source no longer has.
-- The bytes are relayed through the calling node, which can reach both ends by definition. A
-  direct path between the two ends is an optimisation for later, not a different result.
+  `checksum: true`), only what differs is packed, and a second run sends nothing. When
+  `checksum: true`, each unpacked file is verified against its planned hash before replacing the
+  destination. `delete: true` removes what the source no longer has only after the new content has
+  arrived (entries removed to make room for a kind change go first).
+- The bytes are relayed through the calling node, which can reach both ends directly. A machine
+  reached `via` a relay cannot be an end of a transfer started elsewhere; run the transfer on the
+  relay instead (`legion fs.transfer --on <relay> ...`). A direct path between two ends is an
+  optimisation for later, not a different result.
 
 ### Extension tools
 
 A file in `tools.d/` defines a tool: name, description, effect, parameter schema and a command
 (`run` as exact argv or `cmd` for the platform shell). Arguments reach the command as
 `LEGION_ARG_<NAME>` environment variables and as one JSON object on stdin, alongside `LEGION_TOOL`,
-`LEGION_PRINCIPAL` and `LEGION_NODE`. Its standard output is returned directly when it parses as a
-JSON object, as `{"value": …}` for other JSON, and as `{"output": …, "truncated": …}` otherwise. An
-extension cannot take the name of a built-in tool, and defining one needs the `admin` effect.
+`LEGION_PRINCIPAL` and `LEGION_NODE`. Oversized string arguments (over 32 KiB per variable or
+96 KiB total) are refused by default (`large = "refuse"`); `large = "stdin"` omits the variable,
+sets `LEGION_ARG_<NAME>_OMITTED=1` and leaves the full value in stdin JSON. Its standard output is
+returned directly when it parses as a JSON object, as `{"value": …}` for other JSON, and as
+`{"output": …, "truncated": …}` otherwise. An extension cannot take the name of a built-in tool or
+any family registered in the built-in registry (plus reserved families), and defining one needs the
+`admin` effect.
 
 ## Reaching other machines
 
@@ -332,10 +342,11 @@ What the effects do and do not promise:
   names the location explicitly in its `paths` (a broad root like `~/**` does not opt in). This
   safety net constrains file tools only and does not bind a role with `exec`.
 
-A door that pinned a principal ignores a different `as` in the request. Only the built-in owner role may act
-as someone else: a role that could act as anyone would be the owner under another name, so a policy
-file that sets `delegate = true` on any other role is refused when it is loaded. A forwarded call names its principal to
-the target, and the target applies its own policy to it.
+A door that pinned a principal ignores a different `as` in the request. Only the built-in owner
+role may act as someone else: a role that could act as anyone would be the owner under another
+name, so a policy file that sets `delegate = true` on any other role is refused when it is
+loaded. A forwarded call names its principal to the target, and the target applies its own policy
+to it.
 
 Every call is appended to `state/audit.jsonl`: time, principal, door, tool, target, outcome and
 duration. Arguments are recorded with file contents and anything that looks like a secret
@@ -389,10 +400,11 @@ target and renamed over it.
 
 ## Platforms
 
-Linux, macOS and Windows on x86-64 and arm64 are first class: every tool either works or fails
-with `unsupported` and a hint, and CI runs the test suite on all three. Platform differences live
-behind one module per concern (`shell`, `proctree`, `detach`, `services`, `power`), never as `cfg`
-scattered through tool code.
+Linux and macOS on x86-64 and arm64, and Windows on x86-64 (Windows arm64 runs the x86-64 build
+under emulation), are first class: every tool either works or fails with `unsupported` and a hint,
+and CI runs the test suite on Linux, macOS, and Windows. Platform differences live behind one
+module per concern (`shell`, `proctree`, `detach`, `services`, `power`), never as `cfg` scattered
+through tool code.
 
 Traps the Node agent already paid for, which the Rust code handles from the start:
 
@@ -420,4 +432,4 @@ Traps the Node agent already paid for, which the Rust code handles from the star
 2. **One machine** *(done)*: `sys`, `exec`, `fs`, MCP over stdio.
 3. **The fleet** *(done)*: sessions, routing, fan-out, `fleet`, `job`, transfer.
 4. **The rest** *(done)*: `proj`, `svc`, `power`, `ext`, HTTP, tokens.
-5. **Shipping** *(done)*: install and update, release builds, first-run setup, agent registration, config sync, the handbook.
+5. **Shipping** *(done)*: offline-signed releases, downgrade protection, install and update with rollback, first-run setup, agent registration, config sync, the handbook.
