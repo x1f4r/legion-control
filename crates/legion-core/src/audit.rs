@@ -321,8 +321,8 @@ const SECRET_KEY_ENDINGS: [&str; 3] = ["_key", "_auth", "_pass"];
 /// `sshpass` and others, and `-u`/`--user` takes `user:password` for `curl`.
 const SECRET_FLAGS: [&str; 3] = ["p", "u", "user"];
 /// How a token from a well-known service starts, as a word: GitHub, GitLab, OpenAI, Slack, AWS,
-/// Google, npm, PyPI, Hugging Face, Stripe.
-const TOKEN_PREFIXES: [&str; 23] = [
+/// Google, npm, PyPI, Hugging Face, Stripe, and Legion's own HTTP tokens.
+const TOKEN_PREFIXES: [&str; 24] = [
     "ghp_",
     "gho_",
     "ghu_",
@@ -346,6 +346,7 @@ const TOKEN_PREFIXES: [&str; 23] = [
     "sk_live_",
     "rk_live_",
     "sk_test_",
+    "lgn_",
 ];
 /// What gives a secret away wherever it stands in a string, compared in lower case: a PEM block
 /// such as a private key, and a bearer token.
@@ -637,6 +638,7 @@ mod tests {
             "curl -u me:hunter2 https://example.com",
             "gh auth login --with-token ghp_abc",
             "export GH=ghp_abc",
+            "curl -H x:lgn_Zm9v-YmFy_ https://tower.example",
             "  -----BEGIN OPENSSH PRIVATE KEY-----",
         ] {
             assert!(is_redacted(&recorded(json!(secret))), "{secret:?} was kept");
