@@ -160,6 +160,9 @@ struct LinkInner {
     options: LinkOptions,
     opener: SessionOpener,
     slots: Mutex<HashMap<String, Arc<NodeSlot>>>,
+    /// Sessions displaced by a config update while callers may still hold clones; reaped by
+    /// `close_idle` once no caller holds a reference or in-flight call.
+    retired: Mutex<Vec<LiveSession>>,
     active_calls: Mutex<HashMap<String, CancellationToken>>,
     reaper_started: AtomicBool,
 }
@@ -258,6 +261,7 @@ impl Link {
                 options,
                 opener,
                 slots: Mutex::new(HashMap::new()),
+                retired: Mutex::new(Vec::new()),
                 active_calls: Mutex::new(HashMap::new()),
                 reaper_started: AtomicBool::new(false),
             }),
@@ -524,6 +528,14 @@ impl Link {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             map.drain().map(|(_, slot)| slot).collect()
         };
+        let retired: Vec<LiveSession> = {
+            let mut list = self
+                .inner
+                .retired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *list)
+        };
         let mut closing = JoinSet::new();
         for slot in slots {
             let live = slot
@@ -536,6 +548,11 @@ impl Link {
                     live.session.close().await;
                 });
             }
+        }
+        for live in retired {
+            closing.spawn(async move {
+                live.session.close().await;
+            });
         }
         while closing.join_next().await.is_some() {}
     }
@@ -654,7 +671,13 @@ impl Link {
             guard.take()
         };
         if let Some(old) = stale {
-            old.session.close().await;
+            // Do not close the displaced session while callers may still hold an `Arc<Session>`
+            // for in-flight calls; park it so the reaper closes it once idle, or `Drop` cleans up.
+            self.inner
+                .retired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(old);
         }
 
         let session = (self.inner.opener)(entry.clone(), device_key, cancel).await?;
@@ -734,6 +757,23 @@ async fn close_idle_inner(inner: &LinkInner) {
         {
             to_close.push(stale.session);
         }
+    }
+    {
+        let mut retired = inner
+            .retired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut keep = Vec::new();
+        for live in retired.drain(..) {
+            if Arc::strong_count(&live.session) == 1
+                && live.in_flight.load(Ordering::Acquire) == 0
+            {
+                to_close.push(live.session);
+            } else {
+                keep.push(live);
+            }
+        }
+        *retired = keep;
     }
     for session in to_close {
         session.close().await;
@@ -1118,6 +1158,102 @@ mod tests {
         // Session was reaped, so the next hello opens a fresh session.
         link.hello("tower").await.unwrap();
         assert_eq!(opens.load(Ordering::SeqCst), 2);
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn config_update_does_not_close_displaced_session_while_calls_are_in_flight() {
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let opens = Arc::new(AtomicUsize::new(0));
+
+        let first_started_c = Arc::clone(&first_started);
+        let release_first_c = Arc::clone(&release_first);
+        let opens_c = Arc::clone(&opens);
+
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let idx = opens_c.fetch_add(1, Ordering::SeqCst);
+            let started = Arc::clone(&first_started_c);
+            let release = Arc::clone(&release_first_c);
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                let (server_r, mut server_w) = tokio::io::split(server);
+                let node_name = entry.node.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let resp = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        } else if req.method == method::CALL {
+                            if idx == 0 {
+                                started.notify_one();
+                                release.notified().await;
+                            }
+                            let resp = Response::ok(req.id, json!({"session": idx}));
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        }
+                    }
+                });
+                Session::open_io(client_r, client_w, &entry.node, None, Duration::from_secs(5), cancel)
+                    .await
+            })
+        });
+
+        let link = Link::with_opener(test_config("tower"), LinkOptions::default(), opener);
+        let link1 = link.clone();
+        let slow_call = tokio::spawn(async move {
+            link1
+                .call("tower", "slow.op", json!({}), None, |_| {})
+                .await
+        });
+
+        first_started.notified().await;
+
+        // Change the node's config while `slow_call` is in flight on session 0.
+        link.upsert_node(NodeLink::local("tower", "/usr/local/bin/legion"));
+        let second = link
+            .call("tower", "fast.op", json!({}), None, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(second["session"], json!(1));
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+
+        // Now release session 0's in-flight call: it must succeed rather than being killed.
+        release_first.notify_one();
+        let first = slow_call.await.unwrap().unwrap();
+        assert_eq!(first["session"], json!(0));
+
+        // Once no holders remain, `close_idle` reaps the retired session.
+        link.close_idle().await;
         link.close().await;
     }
 
