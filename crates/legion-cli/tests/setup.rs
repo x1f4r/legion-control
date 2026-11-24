@@ -831,11 +831,6 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
     let pi = Home::new();
 
     laptop.run(&["init", "--name", "laptop"]);
-    let mut policy = fs::read_to_string(config_dir(&laptop).join("policy.toml")).unwrap();
-    policy.push_str(
-        "\n[roles.confined_exec]\nallow = [\"effect:read\", \"effect:exec\"]\npaths = [\"~/projects/**\"]\n",
-    );
-    laptop.write_config("policy.toml", &policy);
     pi.write_config("node.toml", "name = \"pi\"\n");
 
     let fleet_toml = format!(
@@ -845,7 +840,7 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
     );
     laptop.write_config("fleet.toml", &fleet_toml);
 
-    // Full doctor pings fleet machines concurrently and warns about operator combining paths + exec.
+    // Full doctor pings fleet machines concurrently and warns on operator allowing exec (even with no paths).
     let full = laptop.run(&["meta.doctor"]);
     assert_eq!(full.code, 0, "{}", full.stderr);
     let full_json = full.json();
@@ -865,15 +860,14 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
 
     let policy_warn = checks
         .iter()
-        .find(|c| c["name"] == json!("policy exec with paths"))
+        .find(|c| c["name"] == json!("policy exec roles"))
         .unwrap();
     assert_eq!(policy_warn["ok"], json!(true), "{policy_warn}");
     assert_eq!(policy_warn["warning"], json!(true), "{policy_warn}");
+    let detail = policy_warn["detail"].as_str().unwrap();
+    assert!(detail.contains("operator"), "{policy_warn}");
     assert!(
-        policy_warn["detail"]
-            .as_str()
-            .unwrap()
-            .contains("as strong as the account"),
+        detail.contains("as strong as the account, admin included"),
         "{policy_warn}"
     );
 

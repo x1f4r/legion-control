@@ -136,7 +136,7 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
     );
     assert!(names.contains(&"executable on PATH"), "{names:?}");
     assert!(names.contains(&"ssh"), "{names:?}");
-    assert!(names.contains(&"policy exec with paths"), "{names:?}");
+    assert!(names.contains(&"policy exec roles"), "{names:?}");
     #[cfg(target_os = "linux")]
     assert!(names.contains(&"systemd lingering"), "{names:?}");
     assert!(
