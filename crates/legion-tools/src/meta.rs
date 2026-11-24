@@ -27,6 +27,7 @@ pub fn register(registry: &mut Registry) {
         "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, and every configuration file parses. Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
+    crate::update::register(registry);
 }
 
 /// What `meta.version` returns.

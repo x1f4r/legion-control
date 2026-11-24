@@ -38,6 +38,7 @@ fn main() -> ExitCode {
     if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
         return code;
     }
+    legion_tools::update::cleanup_old_binary();
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,
         Err(error) => return usage_error(&error),
