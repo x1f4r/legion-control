@@ -1410,7 +1410,29 @@ fn a_token_gives_no_one_more_than_they_have() {
         &["token", "add", "x", "phone", "--as", "keeper"],
         "unless the caller has the owner role",
     );
-    let keeper = make_token(&home, &["keeper", "keeper", "--as", "keeper"]);
+    // `keeper` has `effect:admin` (owner-strength), so neither `keeper` itself nor an owner
+    // without `allow_owner=true` may mint a token for it.
+    refused(
+        &["token", "add", "keeper", "keeper", "--as", "keeper"],
+        "this role can change who may do what, which makes it as strong as owner",
+    );
+    refused(
+        &[
+            "token",
+            "add",
+            "keeper",
+            "keeper",
+            "allow_owner=true",
+            "--as",
+            "keeper",
+        ],
+        "this role can change who may do what, which makes it as strong as owner",
+    );
+    refused(
+        &["token", "add", "keeper", "keeper"],
+        "this role can change who may do what, which makes it as strong as owner",
+    );
+    let keeper = make_token(&home, &["keeper", "keeper", "allow_owner=true"]);
     make_token(&home, &["phone", "phone", "--as", "admin"]);
     make_token(&home, &["root", "owner", "allow_owner=true"]);
 
@@ -1809,12 +1831,28 @@ fn only_the_owner_role_acts_as_others() {
     let home = Home::new();
     let roles = "\n[principals.boss]\nrole = \"owner\"\n\n[principals.deputy]\nrole = \"deputy\"\n\n[roles.deputy]\nallow = [\"*\"]\n";
     home.write_config("policy.toml", &format!("{POLICY}{roles}"));
-    let deputy = make_token(&home, &["deputy", "deputy"]);
     let run = |line: &[&str]| {
         let mut line = line.to_vec();
         line.push("--json");
         home.run(&line)
     };
+    // `deputy` allows `*` (owner-strength), so minting a token for it requires `allow_owner=true`.
+    let deputy_no_flag = run(&["token", "add", "deputy", "deputy"]);
+    assert_eq!(
+        deputy_no_flag.json()["code"],
+        json!("denied"),
+        "{}",
+        deputy_no_flag.stdout
+    );
+    assert!(
+        deputy_no_flag.stdout.contains("deputy")
+            && deputy_no_flag.stdout.contains(
+                "this role can change who may do what, which makes it as strong as owner"
+            ),
+        "{}",
+        deputy_no_flag.stdout
+    );
+    let deputy = make_token(&home, &["deputy", "deputy", "allow_owner=true"]);
 
     // A principal the file gives the owner role is as much the owner as owner is.
     let boss = run(&["token", "add", "b", "boss"]);

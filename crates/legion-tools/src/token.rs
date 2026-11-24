@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::caller::Caller;
+use crate::roles::OWNER_STRENGTH_REASON;
 
 /// How many random bytes a token carries: as many as the hash that stands for it.
 const TOKEN_BYTES: usize = 32;
@@ -39,7 +40,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "token.add",
         Effect::Admin,
-        "Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any when the caller has the owner role. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for a principal with the owner role is the keys to the machine (whoever holds it may do anything the account can, from anywhere the server is published), so only a caller with the owner role may make one, and only with allow_owner true. A token made by a call that came with an expiring token expires no later.",
+        "Make a bearer token for `legion serve`, standing for one principal that policy.toml names and the caller could act as itself: its own, or any when the caller has the owner role. The token is in this reply and nowhere else: only its hash is kept, so copy it now. A token for a principal with the owner role or any admin (owner-strength) role is the keys to the machine (whoever holds it may change who may do what and do anything the account can, from anywhere the server is published), so only a caller with the owner role may make one, and only with allow_owner true. A token made by a call that came with an expiring token expires no later.",
         add,
     );
     registry.add_fn(
@@ -68,7 +69,8 @@ struct AddArgs {
     /// Days until the token stops working; it never does when left out.
     #[serde(default)]
     expires_days: Option<u32>,
-    /// Allow a token for owner, which may do everything. Off unless given as true.
+    /// Allow a token for `owner` or any admin (owner-strength) role, which can change who may do
+    /// what. Off unless given as true.
     #[serde(default)]
     allow_owner: bool,
 }
@@ -95,7 +97,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
         args.allow_owner,
         "a token",
         format!(
-            "{principal} has the owner role: a token for it may do everything the account can, from anywhere the server is published, so it is not made unless asked for in so many words."
+            "{principal} has the owner role ({OWNER_STRENGTH_REASON}): a token for it may do everything the account can, from anywhere the server is published, so it is not made unless asked for in so many words."
         ),
         "Give the token a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want.",
     )?;
@@ -538,5 +540,150 @@ mod tests {
         let error = update(&file, &dir.path().join("lock"), |_, _| Ok(true)).unwrap_err();
         assert_eq!(error.code, ErrorCode::Failed);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "[tokens.x\n");
+    }
+
+    #[tokio::test]
+    async fn token_add_requires_owner_caller_and_allow_owner_for_all_owner_strength_roles() {
+        use legion_core::{Call, Door, Node, Paths};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            r#"
+default = "owner"
+
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny = ["effect:power", "effect:admin"]
+
+[roles.keeper]
+allow = ["effect:admin"]
+
+[roles.deputy]
+allow = ["*"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+
+[roles.token_minter]
+allow = ["effect:read", "token.add"]
+
+[principals.phone]
+role = "observer"
+
+[principals.ops]
+role = "operator"
+
+[principals.keeper]
+role = "keeper"
+
+[principals.deputy]
+role = "deputy"
+
+[principals.writer]
+role = "policy_writer"
+
+[principals.minter]
+role = "token_minter"
+"#,
+        )
+        .unwrap();
+
+        let mut reg = crate::registry();
+        reg.add_fn(
+            "config.write",
+            Effect::Admin,
+            "Write a config file (test stub).",
+            |_ctx: &Ctx, _args: NoArgs| async { Ok(json!({})) },
+        );
+        let node = Node::new(paths, reg);
+
+        let reason = "this role can change who may do what, which makes it as strong as owner";
+
+        let call_as = |principal: Option<&str>, args: serde_json::Value| {
+            let mut call = Call::new(Door::Cli, "token.add", args);
+            if let Some(p) = principal {
+                call.pinned = Some(p.to_owned());
+            }
+            node.call(call)
+        };
+
+        // Non-admin principals do not require allow_owner=true.
+        for (name, principal) in [("tok-phone", "phone"), ("tok-ops", "ops")] {
+            call_as(None, json!({"name": name, "principal": principal}))
+                .await
+                .unwrap_or_else(|e| panic!("non-admin {principal} should succeed: {e:?}"));
+        }
+
+        // Owner-strength principals require BOTH an owner caller AND allow_owner=true.
+        for (idx, (role, principal)) in [
+            ("keeper", "keeper"),
+            ("deputy", "deputy"),
+            ("policy_writer", "writer"),
+            ("token_minter", "minter"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Owner without allow_owner=true -> Denied naming role + plain reason.
+            let err = call_as(
+                None,
+                json!({"name": format!("no-flag-{idx}"), "principal": principal}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{principal}: {err:?}");
+            assert!(
+                err.message.contains(role) && err.message.contains(reason),
+                "token.add without allow_owner for {principal}/{role}: {}",
+                err.message
+            );
+
+            // Non-owner caller (both self and `keeper`), with or without allow_owner=true -> Denied.
+            for caller in [principal, "keeper"] {
+                for flag in [false, true] {
+                    let err = call_as(
+                        Some(caller),
+                        json!({
+                            "name": format!("non-owner-{idx}-{caller}"),
+                            "principal": principal,
+                            "allow_owner": flag
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(
+                        err.code,
+                        ErrorCode::Denied,
+                        "{caller} -> {principal} (allow_owner={flag}): {err:?}"
+                    );
+                    if caller != "writer" {
+                        assert!(
+                            err.message.contains(role) && err.message.contains(reason),
+                            "{caller} -> {principal} (allow_owner={flag}): {}",
+                            err.message
+                        );
+                    }
+                }
+            }
+
+            // Owner WITH allow_owner=true -> succeeds.
+            call_as(
+                None,
+                json!({
+                    "name": format!("ok-{idx}"),
+                    "principal": principal,
+                    "allow_owner": true
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("owner + allow_owner for {principal} failed: {e:?}"));
+        }
     }
 }

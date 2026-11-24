@@ -294,13 +294,13 @@ single-use temporary key that expires automatically. Once paired, the device is 
 devices.toml and pushed to every reachable machine in fleet.toml.
 
   --name NAME     device name for a new `device:<name>` principal (use with --role)
-  --role ROLE     role from policy.toml (or `owner` with --allow-owner) for `device:<name>`
+  --role ROLE     role from policy.toml (or `owner` / admin roles with --allow-owner) for `device:<name>`
   --as P          existing principal from policy.toml to pair under instead of --name/--role
   --valid DUR     how long the invite stays valid (e.g. 15m, 1h, 24h; default 15m, max 24h)
   --host H        host name or address to put in the invite (repeatable; overrides detection)
   --port N        SSH port on this machine (defaults to [devices] port in node.toml, or 22)
   --user U        OS account name on this machine (defaults to the current user)
-  --allow-owner   permit pairing with the unrestricted owner role
+  --allow-owner   permit pairing with `owner` or any admin (owner-strength) role
   --invert        swap QR code foreground and background (useful on light terminals)
   --on M          create the invite on machine M instead of this node
   --json          print the device.invite tool result as JSON

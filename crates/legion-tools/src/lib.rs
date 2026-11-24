@@ -19,6 +19,7 @@ pub mod meta;
 pub mod package;
 pub mod power;
 pub mod proj;
+pub mod roles;
 pub mod svc;
 pub mod sys;
 #[cfg(feature = "testing")]
