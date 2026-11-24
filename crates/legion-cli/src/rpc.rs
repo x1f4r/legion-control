@@ -300,6 +300,7 @@ impl Session {
             pinned: self.pinned.clone(),
             cancel,
             events,
+            hops: params.hops,
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);

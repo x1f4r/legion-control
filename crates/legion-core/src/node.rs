@@ -36,6 +36,8 @@ pub struct Call {
     pub cancel: CancellationToken,
     /// Where the call's events go.
     pub events: EventSink,
+    /// How many nodes have already forwarded this call; 0 when it started on this node.
+    pub hops: u32,
 }
 
 impl Call {
@@ -50,6 +52,7 @@ impl Call {
             pinned: None,
             cancel: CancellationToken::new(),
             events: EventSink::discard(),
+            hops: 0,
         }
     }
 }

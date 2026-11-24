@@ -172,6 +172,7 @@ impl McpDoor {
             // Cancelled when the client cancels the request, and when the session ends.
             cancel: context.ct.clone(),
             events,
+            hops: 0,
         };
         let node = self.node.clone();
         let router = Arc::clone(&self.router);

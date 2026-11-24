@@ -237,13 +237,25 @@ fn call_spells_as_and_on_the_way_the_design_does() {
             args: json!({"path": "~/notes.txt"}),
             as_principal: Some("agent:claude".into()),
             on: Some(Target::One("tower".into())),
+            hops: 0,
         },
         json!({"tool": "fs.read", "args": {"path": "~/notes.txt"}, "as": "agent:claude", "on": "tower"}),
+    );
+    pin(
+        CallParams {
+            tool: "meta.version".into(),
+            args: json!({}),
+            as_principal: None,
+            on: Some(Target::One("pi".into())),
+            hops: 2,
+        },
+        json!({"tool": "meta.version", "args": {}, "on": "pi", "hops": 2}),
     );
     let bare: CallParams = serde_json::from_value(json!({"tool": "meta.version"})).unwrap();
     assert_eq!(bare.args, json!({}));
     assert_eq!(bare.as_principal, None);
     assert_eq!(bare.on, None);
+    assert_eq!(bare.hops, 0);
 }
 
 #[test]
