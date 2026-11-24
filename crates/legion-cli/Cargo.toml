@@ -32,5 +32,11 @@ tokio = { workspace = true, features = ["time"] }
 name = "fleet"
 harness = false
 
+# Re-executes its own binary as the connector command of simulated machines (which system is up,
+# which boot it is on) and as a long-running exclusive job.
+[[test]]
+name = "power"
+harness = false
+
 [lints]
 workspace = true
