@@ -283,6 +283,15 @@ fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64)
                     });
                 }
                 let actual = meta.len();
+                if actual > size {
+                    // A stale partial file larger than the whole incoming file cannot be a valid
+                    // prefix of this transfer; truncate and start cleanly from offset 0.
+                    return OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(partial)
+                        .map_err(|e| classify_io(partial, e));
+                }
                 if actual != 0 {
                     return Err(Error::BadOffset {
                         path: target.to_path_buf(),
@@ -611,5 +620,27 @@ mod tests {
         let mut sink = Vec::new();
         let err = handle.stream_to(&mut sink).unwrap_err();
         assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn put_cleans_up_oversized_stale_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("small.bin");
+        let stale = part_path(&dst).unwrap();
+        fs::write(&stale, vec![b'X'; 500]).unwrap();
+
+        let payload = b"fresh 10!!";
+        put(
+            &dst,
+            payload.len() as u64,
+            hash_bytes(payload),
+            0,
+            Cursor::new(payload),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), payload);
+        assert!(!stale.exists());
     }
 }

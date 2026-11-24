@@ -332,6 +332,7 @@ where
 
                 platform::replace_file(guard.path(), &dest)?;
                 guard.disarm();
+                remove_stale_part_file(&dest);
                 dirs_to_sync.insert(parent);
 
                 record_written(&mut written_exact, &mut written_ancestors, &rel);
@@ -377,6 +378,7 @@ where
                 }
 
                 if platform::create_symlink_atomic(Path::new(target_str), &dest)? {
+                    remove_stale_part_file(&dest);
                     dirs_to_sync.insert(parent);
                     record_written(&mut written_exact, &mut written_ancestors, &rel);
                     report.symlinks.push(rel);
@@ -499,6 +501,16 @@ fn append_exact_reader<R: Read, W: Write>(
             ),
         }),
         Err(err) => Err(Error::from(err)),
+    }
+}
+
+/// Removes a stale `<name>.legion-part` file beside `dest` when `unpack` replaces `dest`.
+fn remove_stale_part_file(dest: &Path) {
+    if let Ok(partial) = crate::file::part_path(dest)
+        && let Ok(meta) = fs::symlink_metadata(&partial)
+        && meta.file_type().is_file()
+    {
+        let _ = fs::remove_file(&partial);
     }
 }
 
@@ -1204,5 +1216,22 @@ mod tests {
         let hostile = build_raw_tar(&[("../escape.txt", EntryType::Regular, b"nope", None)]);
         let err = unpack_filtered(dst.path(), Cursor::new(hostile), |_, _| false).unwrap_err();
         assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn unpack_cleans_up_stale_partial_file_for_unpacked_target() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        fs::write(src.path().join("data.bin"), b"fresh").unwrap();
+        let stale_part = crate::file::part_path(&dst.path().join("data.bin")).unwrap();
+        fs::write(&stale_part, b"abandoned partial upload").unwrap();
+
+        let mut tar_bytes = Vec::new();
+        pack(src.path(), &["data.bin"], &mut tar_bytes).unwrap();
+        unpack(dst.path(), Cursor::new(&tar_bytes)).unwrap();
+
+        assert_eq!(fs::read(dst.path().join("data.bin")).unwrap(), b"fresh");
+        assert!(!stale_part.exists());
     }
 }

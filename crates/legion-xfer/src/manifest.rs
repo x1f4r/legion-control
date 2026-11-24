@@ -178,7 +178,7 @@ pub fn build(root: &Path, options: &ManifestOptions) -> Result<Manifest> {
             });
             return Ok(manifest);
         };
-        if !matcher.is_excluded(name, name, false) {
+        if !platform::is_internal_temp_name(name) && !matcher.is_excluded(name, name, false) {
             record_non_dir(
                 root,
                 name,
@@ -277,6 +277,10 @@ fn walk_entries(
             });
             continue;
         };
+
+        if platform::is_internal_temp_name(name) {
+            continue;
+        }
 
         let rel = join_rel(prefix, name);
         let meta = match fs::symlink_metadata(&child.path) {
@@ -696,5 +700,24 @@ mod tests {
             assert_eq!(manifest.skipped.len(), 1);
             assert_eq!(manifest.skipped[0].path, "secret_dir");
         }
+    }
+
+    #[test]
+    fn ignores_internal_temp_and_part_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("real.txt"), b"keep").unwrap();
+        fs::write(root.join("real.txt.legion-part"), b"partial").unwrap();
+        fs::write(root.join(".legion-unpack-42-0.tmp"), b"tmp").unwrap();
+        fs::write(root.join(".legion-link-42-1.tmp"), b"tmp").unwrap();
+        fs::write(root.join(".legion-CaseProbe-42-2.tmp"), b"tmp").unwrap();
+        fs::write(root.join("sub/nested.bin.legion-part"), b"partial").unwrap();
+        fs::write(root.join("sub/keep.bin"), b"ok").unwrap();
+
+        let manifest = build(root, &ManifestOptions::default()).unwrap();
+        let paths: Vec<&str> = manifest.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["real.txt", "sub", "sub/keep.bin"]);
+        assert!(manifest.skipped.is_empty());
     }
 }

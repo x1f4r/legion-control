@@ -22,6 +22,15 @@ pub(crate) fn next_temp_id() -> u64 {
     TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Returns `true` when `name` matches one of this crate's own temporary file patterns.
+pub(crate) fn is_internal_temp_name(name: &str) -> bool {
+    name.ends_with(".legion-part")
+        || ((name.starts_with(".legion-unpack-")
+            || name.starts_with(".legion-link-")
+            || name.starts_with(".legion-CaseProbe-"))
+            && name.ends_with(".tmp"))
+}
+
 /// Replaces `to` with `from` using a single rename call.
 ///
 /// Centralized here so a future shared retrying rename (needed on Windows when indexers hold a
