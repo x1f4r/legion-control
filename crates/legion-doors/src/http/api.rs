@@ -34,24 +34,38 @@ pub(crate) async fn health(State(shared): State<Arc<Shared>>) -> Response<Body> 
     )
 }
 
-/// `GET /v1/tools`: the tools the token's principal may use. A policy that cannot be read lists
-/// nothing and says why, as every door fails closed.
+/// `GET /v1/tools`: the tools the token's principal may use, or every registered tool when `?all=1`
+/// is passed (so a controller UI can show unavailable tools with the reason from `meta.whoami`).
+/// A policy that cannot be read lists nothing and says why, as every door fails closed.
 pub(crate) async fn tools(State(shared): State<Arc<Shared>>, request: Request) -> Response<Body> {
     let Some(Authenticated { principal, .. }) = request.extensions().get::<Authenticated>() else {
         return reply::error(&no_principal());
     };
+    let include_all = wants_all(&request);
     match crate::grant(&shared.node, Some(principal)) {
         Ok(grant) => {
-            let tools = shared
-                .node
-                .specs()
-                .into_iter()
-                .filter(|spec| grant.allows(spec))
-                .collect();
+            let specs = shared.node.specs();
+            let tools = if include_all {
+                specs
+            } else {
+                specs
+                    .into_iter()
+                    .filter(|spec| grant.allows(spec))
+                    .collect()
+            };
             reply::json(StatusCode::OK, &ToolsResult { tools })
         }
         Err(error) => reply::error(&error),
     }
+}
+
+fn wants_all(request: &Request) -> bool {
+    request.uri().query().is_some_and(|query| {
+        query.split('&').any(|pair| match pair.split_once('=') {
+            Some((name, value)) => name == "all" && matches!(value.trim(), "1" | "true" | "yes"),
+            None => pair == "all",
+        })
+    })
 }
 
 /// The body of `POST /v1/call`.
