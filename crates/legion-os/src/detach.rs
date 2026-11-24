@@ -205,6 +205,11 @@ impl DetachOptions {
 pub struct DetachHandle {
     /// Process identity (`pid` and full-precision kernel start time) of the detached target.
     pub process: ProcessId,
+    /// Monotonic kernel process creation key (`ProcessStartKey` on Windows) captured for
+    /// `process` at launch time so lineage checks remain immune to PID reuse even after the root
+    /// process exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_start_key: Option<u64>,
     /// Transient Linux systemd user scope unit name (for example `legion-job-<name>.scope`) when
     /// the process was started inside a systemd user scope; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1786,6 +1791,7 @@ mod tests {
     fn detach_handle_serializes_cleanly_for_job_records() {
         let with_scope = DetachHandle {
             process: ProcessId::new(9001, 42_000),
+            root_start_key: None,
             systemd_unit: Some("legion-job-build-1.scope".into()),
             windows_job: None,
             marker: Some("abc-1".into()),
@@ -1794,6 +1800,7 @@ mod tests {
         let json = serde_json::to_string(&with_scope).unwrap();
         assert!(json.contains("\"systemd_unit\":\"legion-job-build-1.scope\""));
         assert!(json.contains("\"marker\":\"abc-1\""));
+        assert!(!json.contains("\"root_start_key\""));
         assert!(!json.contains("\"windows_job\""));
         assert!(!json.contains("\"warnings\""));
         let decoded: DetachHandle = serde_json::from_str(&json).unwrap();
@@ -1801,6 +1808,7 @@ mod tests {
 
         let with_job = DetachHandle {
             process: ProcessId::new(9002, 42_001),
+            root_start_key: Some(0x0001_0000_0000_0042),
             systemd_unit: None,
             windows_job: Some(r"Local\legion-job-abc-2".into()),
             marker: Some("abc-2".into()),
@@ -1808,18 +1816,20 @@ mod tests {
         };
         let json2 = serde_json::to_string(&with_job).unwrap();
         assert!(!json2.contains("systemd_unit"));
+        assert!(json2.contains("\"root_start_key\""));
         assert!(json2.contains("\"windows_job\""));
         let decoded2: DetachHandle = serde_json::from_str(&json2).unwrap();
         assert_eq!(decoded2, with_job);
 
-        // Backward compatibility: handles persisted before `marker` and `windows_job` existed
-        // must deserialize cleanly with those fields defaulting to `None`.
+        // Backward compatibility: handles persisted before `marker`, `windows_job`, and
+        // `root_start_key` existed must deserialize cleanly with those fields defaulting to `None`.
         let legacy_json = r#"{"process":{"pid":9003,"start_time":42002}}"#;
         let legacy: DetachHandle = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(
             legacy,
             DetachHandle {
                 process: ProcessId::new(9003, 42_002),
+                root_start_key: None,
                 systemd_unit: None,
                 windows_job: None,
                 marker: None,
@@ -1952,6 +1962,7 @@ mod tests {
     async fn detached_active_reports_false_for_absent_handle() {
         let absent = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
+            root_start_key: None,
             systemd_unit: None,
             windows_job: None,
             marker: None,
@@ -1961,6 +1972,7 @@ mod tests {
 
         let absent_scope = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
+            root_start_key: None,
             systemd_unit: Some("legion-job-definitely-absent-0.scope".into()),
             windows_job: None,
             marker: Some("absent-marker-0".into()),

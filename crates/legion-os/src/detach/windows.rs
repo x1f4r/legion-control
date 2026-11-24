@@ -133,12 +133,13 @@ pub(super) async fn spawn_detached(
         options.stderr_path.as_deref(),
         Some(&job_name),
     ) {
-        Ok((process, windows_job)) => {
+        Ok((process, root_start_key, windows_job)) => {
             // The detached child is already running and may still be reading a spilled `.ps1`
             // wrapper (which deletes itself as its first action); disarm caller-side removal.
             resolved.disarm_temp_script();
             Ok(DetachHandle {
                 process,
+                root_start_key,
                 systemd_unit: None,
                 windows_job,
                 marker: Some(marker),
@@ -219,8 +220,13 @@ pub(super) async fn stop_detached(
     if let Some(ref marker) = handle.marker {
         let mut remaining = procid::find_marked_live_processes(marker).await?;
         if !remaining.is_empty() {
-            let followup =
-                procid::kill_tree_with_marker(&handle.process, Some(marker), grace).await?;
+            let followup = procid::kill_tree_with_marker_and_start_key(
+                &handle.process,
+                handle.root_start_key,
+                Some(marker),
+                grace,
+            )
+            .await?;
             for id in followup.unverified_survivors {
                 if !report
                     .unverified_survivors
@@ -337,7 +343,13 @@ async fn stop_detached_primary(handle: &DetachHandle, grace: Duration) -> Result
         }
     }
 
-    procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await
+    procid::kill_tree_with_marker_and_start_key(
+        &handle.process,
+        handle.root_start_key,
+        handle.marker.as_deref(),
+        grace,
+    )
+    .await
 }
 
 async fn spawn_via_wmi(
@@ -500,7 +512,7 @@ async fn spawn_via_wmi(
             if !options.allow_in_job_fallback {
                 return Err(wmi_unavailable_error(&wmi_reason));
             }
-            let (process, windows_job) = win_proc::spawn_detached_in_current_job(
+            let (process, root_start_key, windows_job) = win_proc::spawn_detached_in_current_job(
                 direct_fallback.program_display,
                 direct_fallback.application_name,
                 direct_fallback.command_line,
@@ -519,6 +531,7 @@ async fn spawn_via_wmi(
             resolved.disarm_temp_script();
             return Ok(DetachHandle {
                 process,
+                root_start_key,
                 systemd_unit: None,
                 windows_job,
                 marker: Some(marker),
@@ -528,16 +541,21 @@ async fn spawn_via_wmi(
     };
     resolved.disarm_temp_script();
 
-    // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID, accepting the
-    // queried identity only when it matches `reported` exactly or differs by exactly +/- 1 hour
-    // (DST ambiguity in .NET's Process.StartTime); reject any other mismatch as a recycled PID.
-    let process = match win_proc::query_process_identity(reported.pid, true) {
-        Ok(queried) => reconcile_wmi_identity(reported, queried)?,
-        Err(_) => reported,
-    };
+    // Prefer querying Win32 GetProcessTimes directly in UTC for the target PID (and capture its
+    // monotonic kernel ProcessStartKey at launch time), accepting the queried identity only when
+    // it matches `reported` exactly or differs by exactly +/- 1 hour (DST ambiguity in .NET's
+    // Process.StartTime); reject any other mismatch as a recycled PID.
+    let (process, root_start_key) =
+        match win_proc::query_process_identity_with_start_key(reported.pid, true) {
+            Ok(Some((queried, start_key))) => {
+                (reconcile_wmi_identity(reported, Some(queried))?, start_key)
+            }
+            Ok(None) | Err(_) => (reported, None),
+        };
 
     Ok(DetachHandle {
         process,
+        root_start_key,
         systemd_unit: None,
         windows_job: None,
         marker: Some(marker),

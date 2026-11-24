@@ -1674,6 +1674,7 @@ async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
     // orphan as active and must NOT kill it (simulating an unrelated process reusing the PID).
     let wrong_marker = DetachHandle {
         process: handle.process,
+        root_start_key: handle.root_start_key,
         systemd_unit: None,
         windows_job: None,
         marker: Some("unrelated-job-marker-0000".into()),
@@ -1696,6 +1697,7 @@ async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
     // active and must report it in `unverified_survivors` without killing it.
     let legacy_handle = DetachHandle {
         process: handle.process,
+        root_start_key: None,
         systemd_unit: None,
         windows_job: None,
         marker: None,

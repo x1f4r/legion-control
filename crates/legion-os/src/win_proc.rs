@@ -704,7 +704,7 @@ pub(crate) fn spawn_detached_direct(
     stdout_path: Option<&Path>,
     stderr_path: Option<&Path>,
     job_name: Option<&str>,
-) -> std::result::Result<(ProcessId, Option<String>), DirectSpawnError> {
+) -> std::result::Result<(ProcessId, Option<u64>, Option<String>), DirectSpawnError> {
     spawn_detached_with_breakaway(
         program_display,
         application_name,
@@ -720,8 +720,8 @@ pub(crate) fn spawn_detached_direct(
 }
 
 /// Spawn a detached Windows process via `CreateProcessW` without `CREATE_BREAKAWAY_FROM_JOB`,
-/// used only as a last-resort fallback when the caller's Job Object forbids breakaway and WMI
-/// `Win32_Process.Create` is provably unavailable.
+/// used only when the caller explicitly opted into in-job fallback after breakaway was refused
+/// and WMI `Win32_Process.Create` was provably unavailable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_detached_in_current_job(
     program_display: &str,
@@ -733,7 +733,7 @@ pub(crate) fn spawn_detached_in_current_job(
     stdout_path: Option<&Path>,
     stderr_path: Option<&Path>,
     job_name: Option<&str>,
-) -> Result<(ProcessId, Option<String>)> {
+) -> Result<(ProcessId, Option<u64>, Option<String>)> {
     match spawn_detached_with_breakaway(
         program_display,
         application_name,
@@ -767,7 +767,7 @@ fn spawn_detached_with_breakaway(
     stderr_path: Option<&Path>,
     job_name: Option<&str>,
     breakaway: bool,
-) -> std::result::Result<(ProcessId, Option<String>), DirectSpawnError> {
+) -> std::result::Result<(ProcessId, Option<u64>, Option<String>), DirectSpawnError> {
     // Open base stdio handles non-inheritable before taking the spawn lock.
     let stdin_base = open_non_inheritable_nul(GENERIC_READ.0).map_err(DirectSpawnError::Other)?;
 
@@ -979,7 +979,12 @@ fn spawn_detached_with_breakaway(
 
     let (creation, _) = query_times_raw(proc_handle.0, "detached child process")
         .map_err(DirectSpawnError::Other)?;
-    Ok((ProcessId::new(pi.dwProcessId, creation), assigned_job_name))
+    let start_key = query_process_start_key_raw(proc_handle.0, pi.dwProcessId);
+    Ok((
+        ProcessId::new(pi.dwProcessId, creation),
+        start_key,
+        assigned_job_name,
+    ))
 }
 
 /// Outcome of an in-process COM WMI `Win32_Process.Create` attempt.
@@ -1691,11 +1696,12 @@ pub(crate) fn check_process_env_marker(pid: u32, key: &str, expected: &str) -> E
     windows_env_utf16_has_marker(&units, key, expected, truncated || env_bytes_read < to_read)
 }
 
-/// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) for `pid`.
-///
-/// Returns `Ok(None)` when no process with `pid` exists or when it has already exited and
-/// `include_exited` is `false`.
-pub(crate) fn query_process_identity(pid: u32, include_exited: bool) -> Result<Option<ProcessId>> {
+/// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) and monotonic
+/// kernel `ProcessStartKey` for `pid` through a single held handle.
+pub(crate) fn query_process_identity_with_start_key(
+    pid: u32,
+    include_exited: bool,
+) -> Result<Option<(ProcessId, Option<u64>)>> {
     // SAFETY: `OpenProcess` takes only plain integer flags and returns an owned handle or an error.
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => OwnedHandle(h),
@@ -1717,7 +1723,16 @@ pub(crate) fn query_process_identity(pid: u32, include_exited: bool) -> Result<O
     if !include_exited && !is_still_running(handle.0, exit_ft) {
         return Ok(None);
     }
-    Ok(Some(ProcessId::new(pid, creation)))
+    let start_key = query_process_start_key_raw(handle.0, pid);
+    Ok(Some((ProcessId::new(pid, creation), start_key)))
+}
+
+/// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) for `pid`.
+///
+/// Returns `Ok(None)` when no process with `pid` exists or when it has already exited and
+/// `include_exited` is `false`.
+pub(crate) fn query_process_identity(pid: u32, include_exited: bool) -> Result<Option<ProcessId>> {
+    Ok(query_process_identity_with_start_key(pid, include_exited)?.map(|(id, _)| id))
 }
 
 /// Capture a snapshot of all `(pid, parent_pid)` entries currently in the Windows process table.

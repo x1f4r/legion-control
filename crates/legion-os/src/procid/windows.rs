@@ -13,7 +13,7 @@ use crate::{OsError, Result};
 
 use super::{
     EnvMarkerCheck, KillTreeReport, ProcessId, WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
-    child_not_older_than_parent, is_alive,
+    child_not_older_than_parent, is_alive, windows_child_causally_valid,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -24,9 +24,8 @@ const MAX_ANCESTOR_HOPS: usize = 256;
 /// Verify that `child` is causally newer than `parent`, preferring monotonic Windows kernel
 /// `ProcessStartKey` values (immune to NTP / dual-boot wall-clock steps and recycled PIDs).
 ///
-/// Falls back to wall-clock `FILETIME` comparison only when either process lacks a start key,
-/// restricting backward clock-step tolerance to non-protected same-user processes so recycled
-/// parent PIDs never match boot-time or elevated system processes.
+/// Always enforces `max_start_key` when both `child.start_key` and `max_start_key` are known,
+/// even if `parent_start_key` is unavailable.
 fn is_causally_not_older_than_parent(
     child: &PinnedProcess,
     parent_id: &ProcessId,
@@ -37,27 +36,26 @@ fn is_causally_not_older_than_parent(
     if child.parent_pid != parent_id.pid {
         return false;
     }
-    if let (Some(ck), Some(pk)) = (child.start_key, parent_start_key) {
-        if ck <= pk {
-            return false;
-        }
-        if max_start_key.is_some_and(|limit| ck >= limit) {
-            return false;
-        }
-        return true;
-    }
-    if max_start_time.is_some_and(|limit| child.id.start_time >= limit) {
-        return false;
-    }
-    if child.id.start_time >= parent_id.start_time {
-        return true;
-    }
-    child_not_older_than_parent(
+    // Avoid token/image syscalls when monotonic start keys or forward FILETIME already decide.
+    let needs_backward_fallback = child.start_key.is_none()
+        || parent_start_key.is_none() && child.id.start_time < parent_id.start_time;
+    let (is_protected_system, same_user) = if needs_backward_fallback {
+        (child.is_protected_system(), child.same_user_as_current())
+    } else {
+        (false, true)
+    };
+    windows_child_causally_valid(
+        child.parent_pid,
+        parent_id.pid,
         child.id.start_time,
         parent_id.start_time,
-        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
-    ) && !child.is_protected_system()
-        && child.same_user_as_current()
+        child.start_key,
+        parent_start_key,
+        max_start_time,
+        max_start_key,
+        is_protected_system,
+        same_user,
+    )
 }
 
 pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
@@ -321,6 +319,7 @@ pub(super) async fn kill_process(
 
 pub(super) async fn kill_tree(
     identity: &ProcessId,
+    recorded_root_start_key: Option<u64>,
     marker: Option<&str>,
     grace: Duration,
 ) -> Result<KillTreeReport> {
@@ -334,7 +333,7 @@ pub(super) async fn kill_tree(
             let mut unverified: HashMap<u32, ProcessId> = HashMap::new();
             let mut root_pinned = false;
             let mut root_live_unopened = false;
-            let mut root_start_key: Option<u64> = None;
+            let mut root_start_key: Option<u64> = recorded_root_start_key;
             let mut recycled_root_guard: Option<PinnedProcess> = None;
             let mut direct_child_max_start: Option<u64> = None;
             let mut direct_child_max_start_key: Option<u64> = None;
@@ -343,7 +342,7 @@ pub(super) async fn kill_tree(
             match win_proc::open_pinned(identity.pid, false) {
                 OpenPinnedOutcome::Pinned(root_proc) => {
                     if identity.matches(&root_proc.id) {
-                        root_start_key = root_proc.start_key;
+                        root_start_key = root_proc.start_key.or(recorded_root_start_key);
                         let _ = root_proc.terminate();
                         pinned.insert(root_proc.id.pid, root_proc);
                         root_pinned = true;

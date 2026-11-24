@@ -914,6 +914,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let handle = DetachHandle {
             process: legion_os::procid::ProcessId::new(4242, 7),
+            root_start_key: None,
             systemd_unit: Some("legion-job-power.scope".to_owned()),
             windows_job: None,
             marker: Some("m".to_owned()),

@@ -301,6 +301,7 @@ impl Actuator for RecordingActuator {
             Ok(Started {
                 runner: Some(DetachHandle {
                     process: ProcessId::new(FAKE_RUNNER_PID, 1),
+                    root_start_key: None,
                     systemd_unit: None,
                     windows_job: None,
                     marker: Some(job.dir.to_string_lossy().into_owned()),

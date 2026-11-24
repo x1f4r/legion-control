@@ -1432,6 +1432,7 @@ mod tests {
                 pid: u32::MAX,
                 start_time: 1,
             },
+            root_start_key: None,
             systemd_unit: None,
             windows_job: None,
             marker: None,
