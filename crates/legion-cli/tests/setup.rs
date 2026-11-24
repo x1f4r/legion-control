@@ -49,6 +49,10 @@ fn main() -> ExitCode {
             "meta_doctor_fleet_reachability_quick_and_policy_warning",
             meta_doctor_fleet_reachability_quick_and_policy_warning,
         ),
+        (
+            "secret_locations_refused_and_skipped_in_recursive_tools",
+            secret_locations_refused_and_skipped_in_recursive_tools,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -886,4 +890,175 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
             .starts_with("fleet: ")),
         "{quick_checks:?}"
     );
+}
+
+fn secret_locations_refused_and_skipped_in_recursive_tools() {
+    let home = Home::new();
+    let user_home = home.home();
+
+    fs::create_dir_all(user_home.join(".ssh")).unwrap();
+    fs::write(user_home.join(".ssh").join("id_ed25519"), "SECRET_SSH_KEY").unwrap();
+    fs::write(user_home.join(".claude.json"), "SECRET_CLAUDE_TOKEN").unwrap();
+    fs::write(
+        user_home.join("projects").join("app").join("pub.txt"),
+        "PUBLIC_NOTE",
+    )
+    .unwrap();
+
+    home.write_config(
+        "policy.toml",
+        "\
+default = \"owner\"
+
+[roles.wide]
+allow = [\"effect:read\", \"effect:write\"]
+
+[roles.home_only]
+allow = [\"effect:read\"]
+paths = [\"~/**\"]
+
+[roles.ssh_allowed]
+allow = [\"effect:read\"]
+paths = [\"~/.ssh/**\"]
+
+[principals.wide]
+role = \"wide\"
+
+[principals.homey]
+role = \"home_only\"
+
+[principals.sshuser]
+role = \"ssh_allowed\"
+",
+    );
+
+    // Direct stat/read on ~/.ssh/id_ed25519 and ~/.claude.json refused for unconfined non-admin and `~/**`.
+    for principal in ["wide", "homey"] {
+        for target in ["~/.ssh/id_ed25519", "~/.claude.json"] {
+            let stat = home.run(&["fs.stat", &format!("path={target}"), "--as", principal]);
+            assert_eq!(stat.code, 1, "{principal} {target}");
+            assert_eq!(stat.json()["code"], json!("denied"));
+            assert!(
+                stat.json()["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("secret locations"),
+                "{}",
+                stat.stdout
+            );
+        }
+    }
+
+    // Explicit opt-in in paths allows reading ~/.ssh/id_ed25519.
+    let opted_in = home.run(&["fs.read", "path=~/.ssh/id_ed25519", "--as", "sshuser"]);
+    assert_eq!(opted_in.code, 0, "{}", opted_in.stdout);
+    assert!(
+        opted_in.json()["content"]
+            .as_str()
+            .unwrap()
+            .contains("SECRET_SSH_KEY")
+    );
+
+    // Recursive tools skip secret locations and report them in `skipped`.
+    let listed = home.run(&["fs.list", "path=~", "hidden=true", "--as", "wide"]);
+    assert_eq!(listed.code, 0, "{}", listed.stdout);
+    let listed_json = listed.json();
+    let skipped = listed_json["skipped"].as_array().unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.ends_with(".ssh"))),
+        "{listed_json}"
+    );
+    assert!(
+        skipped
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.ends_with(".claude.json"))),
+        "{listed_json}"
+    );
+    assert!(
+        !listed_json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == json!(".ssh") || e["name"] == json!(".claude.json")),
+        "{listed_json}"
+    );
+
+    let found = home.run(&["fs.find", "path=~", "ignore=false", "--as", "wide"]);
+    assert_eq!(found.code, 0, "{}", found.stdout);
+    let found_json = found.json();
+    assert!(
+        !found_json["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["path"].as_str().is_some_and(|s| s.contains("id_ed25519"))),
+        "{found_json}"
+    );
+    assert!(
+        found_json["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.ends_with(".ssh"))),
+        "{found_json}"
+    );
+
+    let grepped = home.run(&[
+        "fs.grep",
+        "path=~",
+        "pattern=SECRET_",
+        "ignore=false",
+        "--as",
+        "wide",
+    ]);
+    assert_eq!(grepped.code, 0, "{}", grepped.stdout);
+    let grepped_json = grepped.json();
+    assert!(
+        grepped_json["matches"].as_array().unwrap().is_empty(),
+        "{grepped_json}"
+    );
+    assert!(
+        grepped_json["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.ends_with(".ssh"))),
+        "{grepped_json}"
+    );
+
+    let manifest = home.run(&["fs.manifest", "path=~", "--as", "wide"]);
+    assert_eq!(manifest.code, 0, "{}", manifest.stdout);
+    let manifest_json = manifest.json();
+    assert!(
+        !manifest_json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"]
+                .as_str()
+                .is_some_and(|p| p.contains(".ssh") || p.contains(".claude.json"))),
+        "{manifest_json}"
+    );
+    assert!(
+        manifest_json["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["path"] == json!(".ssh")),
+        "{manifest_json}"
+    );
+    assert!(
+        manifest_json["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["path"] == json!(".claude.json")),
+        "{manifest_json}"
+    );
+
+    // Owner (admin) is not blocked.
+    let owner_read = home.run(&["fs.read", "path=~/.ssh/id_ed25519"]);
+    assert_eq!(owner_read.code, 0, "{}", owner_read.stdout);
 }

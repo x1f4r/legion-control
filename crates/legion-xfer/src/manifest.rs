@@ -150,9 +150,10 @@ pub fn build(root: &Path, options: &ManifestOptions) -> Result<Manifest> {
     build_pruned(root, options, |_| None)
 }
 
-/// Like [`build`], asking `prune` about each directory below `root` before looking inside it: a
-/// directory for which it gives a reason is left out with everything in it, and named in
-/// [`Manifest::skipped`] with that reason. Nothing inside it is read, listed or hashed.
+/// Like [`build`], asking `prune` about each entry below `root` before reading or entering it: an
+/// entry for which it gives a reason is left out (along with everything inside it if it is a
+/// directory), and named in [`Manifest::skipped`] with that reason. Nothing inside a pruned
+/// directory is read, listed or hashed.
 pub fn build_pruned<F>(root: &Path, options: &ManifestOptions, mut prune: F) -> Result<Manifest>
 where
     F: FnMut(&Path) -> Option<String>,
@@ -313,11 +314,12 @@ fn walk_entries(
             continue;
         }
 
+        if let Some(reason) = prune(&child.path) {
+            skipped.push(SkippedEntry { path: rel, reason });
+            continue;
+        }
+
         if is_dir {
-            if let Some(reason) = prune(&child.path) {
-                skipped.push(SkippedEntry { path: rel, reason });
-                continue;
-            }
             let sub_children = match read_dir_sorted(&child.path) {
                 Ok(c) => c,
                 Err(err) => {
@@ -668,6 +670,7 @@ mod tests {
         fs::create_dir_all(root.join("private/deeper")).unwrap();
         fs::write(root.join("keep/inner/a.txt"), b"a").unwrap();
         fs::write(root.join("private/deeper/secret.txt"), b"s").unwrap();
+        fs::write(root.join("secret.key"), b"k").unwrap();
 
         let mut asked = Vec::new();
         let manifest = build_pruned(
@@ -678,8 +681,11 @@ mod tests {
             },
             |path| {
                 asked.push(path.strip_prefix(root).unwrap().to_path_buf());
-                (path.file_name() == Some(std::ffi::OsStr::new("private")))
-                    .then(|| "not for you".to_string())
+                matches!(
+                    path.file_name().and_then(|n| n.to_str()),
+                    Some("private" | "secret.key")
+                )
+                .then(|| "not for you".to_string())
             },
         )
         .unwrap();
@@ -688,19 +694,27 @@ mod tests {
         assert_eq!(paths, vec!["keep", "keep/inner", "keep/inner/a.txt"]);
         assert_eq!(
             manifest.skipped,
-            vec![SkippedEntry {
-                path: "private".to_string(),
-                reason: "not for you".to_string(),
-            }]
+            vec![
+                SkippedEntry {
+                    path: "private".to_string(),
+                    reason: "not for you".to_string(),
+                },
+                SkippedEntry {
+                    path: "secret.key".to_string(),
+                    reason: "not for you".to_string(),
+                },
+            ]
         );
-        // Asked about each directory once, and never about what is inside a pruned one.
+        // Asked about each visited entry once, and never about anything inside a pruned directory.
         asked.sort();
         assert_eq!(
             asked,
             vec![
                 Path::new("keep").to_path_buf(),
                 Path::new("keep/inner").to_path_buf(),
+                Path::new("keep/inner/a.txt").to_path_buf(),
                 Path::new("private").to_path_buf(),
+                Path::new("secret.key").to_path_buf(),
             ]
         );
     }

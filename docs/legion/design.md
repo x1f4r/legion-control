@@ -313,6 +313,11 @@ What the effects do and do not promise:
 - **Legion's own configuration and state belong to `admin`.** No file tool reads or writes the
   configuration or state directory for a role without the `admin` effect, whatever its `paths`
   say, so a role cannot edit the policy that confines it or the log that records it.
+- **Secret locations are refused without `admin`.** File tools refuse well-known credential
+  directories and files under the home directory (such as `~/.ssh`, `~/.aws`, agent credentials,
+  and browser profiles), and recursive walks skip them, unless the role allows `effect:admin` or
+  names the location explicitly in its `paths` (a broad root like `~/**` does not opt in). This
+  safety net constrains file tools only and does not bind a role with `exec`.
 
 A door that pinned a principal ignores a different `as` in the request. Only a role with
 `delegate = true` (the owner's) may act as someone else. A forwarded call names its principal to
