@@ -28,6 +28,8 @@ tempfile = "3.27.0"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 toml = "1.2.2"
+# The official MCP SDK; it speaks the revisions with and without the initialize handshake.
+rmcp = { version = "3.11.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
