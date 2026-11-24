@@ -111,7 +111,7 @@ impl McpDoor {
     fn grant(&self) -> Option<Grant> {
         let policy = self.node.config().get::<Policy>().ok()?;
         let principal = policy.resolve(None, self.options.pinned.as_deref()).ok()?;
-        Some(policy.grant(&principal, self.node.paths().home()))
+        Some(policy.grant(&principal, self.node.paths()))
     }
 
     /// The tools listed in full mode: those the principal may use. Listing is a courtesy that

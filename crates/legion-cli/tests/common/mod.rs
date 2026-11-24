@@ -59,7 +59,7 @@ impl Home {
     pub fn write_config(&self, name: &str, text: &str) {
         let config = self.dir.path().join("legion").join("config");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join(name), text).unwrap();
+        legion_core::config::write_atomically(&config.join(name), text.as_bytes()).unwrap();
     }
 
     /// The audit log, one value per line.

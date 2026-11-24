@@ -19,7 +19,12 @@
 //! anyone else, and `nobody`, which allows nothing and is what a principal the file does not name
 //! gets. With no file at all the only principal is `owner`, so a fresh install behaves like the
 //! shell it was started from.
+//!
+//! Whatever its `paths`, a role keeps its file tools out of the node's own configuration and state
+//! unless it allows `effect:admin`: a role that may write files could otherwise rewrite its own
+//! policy, or the audit log of what it did.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -28,11 +33,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use same_file::Handle;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::Document;
 use crate::glob;
+use crate::paths::Paths;
 
 /// The principal a local shell is, and the role that may do anything.
 pub const OWNER: &str = "owner";
@@ -327,14 +334,16 @@ impl Policy {
         }
     }
 
-    /// Whether `principal` may call the tool, and if so the grant its call carries.
+    /// Whether `principal` may call the tool, and if so the grant its call carries. `paths` are
+    /// the node's: the grant expands `~` to its home and keeps file tools out of its configuration
+    /// and state.
     pub fn authorize(
         &self,
         principal: &str,
         spec: &ToolSpec,
-        home: Option<&Path>,
+        paths: &Paths,
     ) -> Result<Grant, ErrorBody> {
-        let grant = self.grant(principal, home);
+        let grant = self.grant(principal, paths);
         let tool = &spec.name;
         let role = &grant.role;
         if let Some(rule) = grant.rules.deny.iter().find(|rule| rule.matches(spec)) {
@@ -375,13 +384,13 @@ impl Policy {
     }
 
     /// The grant a principal has, whatever it calls; what `meta.whoami` reports.
-    pub fn grant(&self, principal: &str, home: Option<&Path>) -> Grant {
+    pub fn grant(&self, principal: &str, paths: &Paths) -> Grant {
         let (role, rules) = self.role_of(principal);
         Grant {
             principal: principal.to_owned(),
             role,
             rules: Arc::new(rules),
-            home: home.map(Path::to_path_buf),
+            paths: paths.clone(),
         }
     }
 }
@@ -393,7 +402,7 @@ pub struct Grant {
     principal: String,
     role: String,
     rules: Arc<Role>,
-    home: Option<PathBuf>,
+    paths: Paths,
 }
 
 /// Whether a path is wanted for reading or for writing.
@@ -401,8 +410,33 @@ pub struct Grant {
 pub enum Access {
     /// The tool will read it, list it or look at it.
     Read,
-    /// The tool will create, change, move or remove it.
+    /// The tool will create, change, move or remove it. One that removes, moves or replaces
+    /// everything under it asks [`Grant::check_tree`] as well.
     Write,
+}
+
+/// A place a tool that acts on a whole tree treats with care, as [`Grant::protected`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// The root of a file system, such as `/` or `C:\`.
+    Root,
+    /// The home directory `~` stands for.
+    Home,
+    /// The node's configuration directory.
+    Config,
+    /// The node's state directory: the audit log and, later, jobs.
+    State,
+}
+
+impl Place {
+    fn describe(self) -> &'static str {
+        match self {
+            Place::Root => "the root of a file system",
+            Place::Home => "the home directory",
+            Place::Config => "Legion's own configuration",
+            Place::State => "Legion's own state",
+        }
+    }
 }
 
 impl Access {
@@ -416,8 +450,8 @@ impl Access {
 
 impl Grant {
     /// The grant of the owner, for a node with no policy at all.
-    pub fn owner(home: Option<&Path>) -> Grant {
-        Policy::default().grant(OWNER, home)
+    pub fn owner(paths: &Paths) -> Grant {
+        Policy::default().grant(OWNER, paths)
     }
 
     /// The principal the call acts as.
@@ -441,8 +475,20 @@ impl Grant {
             && self.rules.allow.iter().any(|rule| rule.matches(spec))
     }
 
-    /// The directories file tools are confined to, as written in the policy, or `None` when they
-    /// are not confined.
+    /// Whether this grant's role may use tools of this effect at all, decided as authorising a call
+    /// decides: a rule for the effect, or `*`, which covers every tool, allows it, and the same in
+    /// `deny` forbids it. A rule that names some tools says nothing about the effect as a whole.
+    pub fn allows_effect(&self, effect: Effect) -> bool {
+        let covers = |rule: &Rule| match rule {
+            Rule::Effect(of) => *of == effect,
+            Rule::Tools(pattern) => pattern.chars().all(|c| c == '*'),
+        };
+        !self.rules.deny.iter().any(covers) && self.rules.allow.iter().any(covers)
+    }
+
+    /// The directories file tools are confined to, as written in the policy (`~` not expanded), or
+    /// `None` when they are not confined. A tool that needs a working directory nobody named takes
+    /// the first of them, through [`Grant::check_path`], and the home directory when there are none.
     pub fn roots(&self) -> Option<Vec<String>> {
         self.rules
             .paths
@@ -454,16 +500,25 @@ impl Grant {
     ///
     /// `~` is expanded and relative paths are refused. Every directory on the way is resolved,
     /// symbolic links and `..` included, so the result names the same file the kernel would open;
-    /// the last part is kept as given, so a tool that removes or renames a symbolic link acts on
-    /// the link and not on what it points to.
+    /// the last part is kept as given when it is a symbolic link, so a tool that removes or renames
+    /// one acts on the link and not on what it points to.
     ///
     /// When the role confines file tools to `paths`, the result must lie under one of them, and so
     /// must the file a symbolic link in the last part leads to: a link inside a root cannot be a
     /// way out of it. A path whose parent directories do not exist yet is checked as it will be
     /// once they do, and `..` among those is refused, since nothing can say where it would lead.
+    /// Whatever cannot be told for sure is refused rather than guessed at: a symbolic link on the
+    /// way that leads nowhere, a directory that cannot be looked into, and on Windows a path that
+    /// names an alternate data stream (`file:stream`). On macOS and Windows, whose file systems
+    /// usually ignore case, names that do not exist yet are compared ignoring case too.
+    ///
+    /// The answer holds when it is given. A tool that uses the path a moment later uses whatever is
+    /// there then, so another process that swaps a directory on the way for a symbolic link in
+    /// between is not defended against: confinement keeps a confined caller to its own roots, it
+    /// does not protect the machine from a local attacker racing it.
     pub fn check_path(&self, path: impl AsRef<Path>, access: Access) -> Result<PathBuf, ErrorBody> {
         let given = path.as_ref();
-        let expanded = expand_tilde(given, self.home.as_deref())?;
+        let expanded = expand_tilde(given, self.paths.home())?;
         if !expanded.is_absolute() {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
@@ -474,48 +529,285 @@ impl Grant {
             )
             .with_hint("Write the path from the root of the file system, or from ~."));
         }
-        let resolved = resolve_keeping_last(&expanded)?;
+        if names_a_stream(expanded.as_os_str().as_encoded_bytes(), Platform::HOST) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "{} names an alternate data stream, which Legion does not open.",
+                    given.display()
+                ),
+            )
+            .with_hint("Name the file itself: on Windows a colon after the drive selects a stream inside a file."));
+        }
 
         let Some(roots) = &self.rules.paths else {
-            return Ok(resolved);
+            let resolved =
+                resolve_keeping_last(&expanded).map_err(|error| error.unconfined(given))?;
+            self.keep_out_of_own_dirs(&resolved, given, access)?;
+            return Ok(resolved.path());
         };
-        let mut resolved_roots = Vec::with_capacity(roots.len());
-        for root in roots {
-            let root = expand_tilde(Path::new(root.as_str()), self.home.as_deref())?;
-            resolved_roots.push(resolve(&root)?);
-        }
-        let inside = |path: &Path| resolved_roots.iter().any(|root| path.starts_with(root));
-        let outside = || {
+        let denied = |reason: &str| {
             ErrorBody::new(
                 ErrorCode::Denied,
                 format!(
-                    "{} may not {} {}: its role {} confines file tools to {}.",
+                    "{} may not {} {}: {reason}.",
                     self.principal,
                     access.verb(),
-                    given.display(),
-                    self.role,
-                    roots.iter().map(PathRoot::as_str).collect::<Vec<_>>().join(", ")
+                    given.display()
                 ),
             )
+        };
+        let resolved = resolve_keeping_last(&expanded).map_err(|error| match error {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(_, reason) => denied(&reason).with_hint(
+                "A confined role may only use a path that resolves, link by link, to a place under its roots.",
+            ),
+        })?;
+        let mut resolved_roots = Vec::with_capacity(roots.len());
+        for root in roots {
+            let expanded = expand_tilde(Path::new(root.as_str()), self.paths.home())?;
+            let resolved_root = resolve(&expanded).map_err(|error| {
+                let reason = match error {
+                    Unresolved::Invalid(error) => error.message,
+                    Unresolved::Unclear(_, reason) => reason,
+                };
+                denied(&format!("its role's root {} cannot be resolved ({reason})", root.as_str()))
+                    .with_hint("Ask the owner of this machine to fix the role's paths in policy.toml, or the directory they name.")
+            })?;
+            resolved_roots.push(resolved_root);
+        }
+        let inside = |path: &Resolved| {
+            resolved_roots
+                .iter()
+                .any(|root| within(path, root, Platform::HOST))
+        };
+        let outside = || {
+            denied(&format!(
+                "its role {} confines file tools to {}",
+                self.role,
+                roots.iter().map(PathRoot::as_str).collect::<Vec<_>>().join(", ")
+            ))
             .with_hint("Use a path under one of those directories, or ask the owner to add the directory to the role's paths in policy.toml.")
-            .with_details(json!({"path": resolved, "roots": resolved_roots}))
+            .with_details(json!({
+                "path": resolved.path(),
+                "roots": resolved_roots.iter().map(Resolved::path).collect::<Vec<_>>(),
+            }))
         };
         if !inside(&resolved) {
             return Err(outside());
         }
-        // The last part was kept as given; if it is a symbolic link, where it leads must be inside
-        // as well. A link that leads nowhere cannot be checked, and writing through it would
-        // create a file wherever it points.
-        let is_link =
-            std::fs::symlink_metadata(&resolved).is_ok_and(|meta| meta.file_type().is_symlink());
-        if is_link {
-            match dunce::canonicalize(&resolved) {
-                Ok(target) if inside(&target) => {}
-                _ => return Err(outside()),
+        // A last part that is a symbolic link was kept as given; where it leads must be inside as
+        // well. A link that leads nowhere cannot be checked, and writing through it would create a
+        // file wherever it points.
+        if resolved.link.is_some() {
+            let target = dunce::canonicalize(resolved.path()).map(Resolved::existing);
+            if !target.is_ok_and(|target| inside(&target)) {
+                return Err(outside());
             }
         }
-        Ok(resolved)
+        self.keep_out_of_own_dirs(&resolved, given, access)?;
+        Ok(resolved.path())
     }
+
+    /// Whether a path is one of the places a tool must not remove, move or replace as a whole, or a
+    /// directory that holds one: the root of a file system, the home directory, the node's
+    /// configuration or its state directory, named in that order of precedence.
+    ///
+    /// `path` is one [`Grant::check_path`] returned. A last part that is a symbolic link is never
+    /// one of them, since acting on it acts on the link. Names are compared as the file system
+    /// compares them and, where both exist, so are the files themselves, so neither a symbolic link
+    /// nor another spelling hides a place. [`Grant::check_tree`] says what to refuse.
+    pub fn protected(&self, path: &Path) -> Result<Option<Place>, ErrorBody> {
+        let unclear = |error: Unresolved| match error {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(code, reason) => ErrorBody::new(
+                code,
+                format!("{} cannot be checked: {reason}.", path.display()),
+            ),
+        };
+        let resolved = resolve_keeping_last(path).map_err(unclear)?;
+        if resolved.link.is_some() {
+            return Ok(None);
+        }
+        if names_of(&resolved, Platform::HOST).1.is_empty() {
+            return Ok(Some(Place::Root));
+        }
+        // Only a path that exists has an identity to find among a place's ancestors.
+        let identity = if resolved.missing.is_empty() {
+            Handle::from_path(&resolved.existing).ok()
+        } else {
+            None
+        };
+        let holds = |place: &Resolved| {
+            within(place, &resolved, Platform::HOST)
+                || identity.as_ref().is_some_and(|identity| {
+                    place
+                        .existing
+                        .ancestors()
+                        .any(|ancestor| Handle::from_path(ancestor).is_ok_and(|h| h == *identity))
+                })
+        };
+        if let Some(home) = self.paths.home() {
+            let home = resolve(home).map_err(unclear)?;
+            if holds(&home) {
+                return Ok(Some(Place::Home));
+            }
+        }
+        for dir in self.own_dirs().map_err(|(_, error)| unclear(error))? {
+            if holds(&dir.resolved) {
+                return Ok(Some(dir.place));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Checks a path a tool is about to remove, move or replace with everything under it, after
+    /// [`Grant::check_path`] has: the root of a file system and the home directory are refused to
+    /// every role, and a directory holding the node's configuration or state to a role that does
+    /// not allow `effect:admin`.
+    pub fn check_tree(&self, path: &Path) -> Result<(), ErrorBody> {
+        let place = match self.protected(path)? {
+            None => return Ok(()),
+            Some(Place::Config | Place::State) if self.allows_effect(Effect::Admin) => {
+                return Ok(());
+            }
+            Some(place) => place,
+        };
+        let hint = match place {
+            Place::Root | Place::Home => {
+                "Name what is under it instead; no tool takes all of it at once."
+            }
+            Place::Config | Place::State => {
+                "Only a role that allows effect:admin may change Legion's own files; ask the owner of this machine."
+            }
+        };
+        Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "{} may not remove, move or replace all of {}: it is or holds {}.",
+                self.principal,
+                path.display(),
+                place.describe()
+            ),
+        )
+        .with_hint(hint)
+        .with_details(json!({"path": path, "place": format!("{place:?}").to_lowercase()})))
+    }
+
+    /// The node's configuration and state directories, resolved as far as they exist, with the
+    /// identity of each that does.
+    fn own_dirs(&self) -> Result<Vec<OwnDir>, (PathBuf, Unresolved)> {
+        [
+            (Place::Config, self.paths.config_dir()),
+            (Place::State, self.paths.state_dir()),
+        ]
+        .into_iter()
+        .map(|(place, dir)| {
+            let resolved = resolve(dir).map_err(|error| (dir.to_path_buf(), error))?;
+            let identity = if resolved.missing.is_empty() {
+                Handle::from_path(&resolved.existing).ok()
+            } else {
+                None
+            };
+            Ok(OwnDir {
+                place,
+                dir: dir.to_path_buf(),
+                resolved,
+                identity,
+            })
+        })
+        .collect()
+    }
+
+    /// Refuses a path in the node's own configuration or state to a role that does not allow
+    /// `effect:admin`, and so does a last part that is a symbolic link leading there, which a tool
+    /// writing through it would change.
+    fn keep_out_of_own_dirs(
+        &self,
+        resolved: &Resolved,
+        given: &Path,
+        access: Access,
+    ) -> Result<(), ErrorBody> {
+        if self.allows_effect(Effect::Admin) {
+            return Ok(());
+        }
+        let refuse = |reason: String| {
+            ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "{} may not {} {}: {reason}.",
+                    self.principal,
+                    access.verb(),
+                    given.display()
+                ),
+            )
+        };
+        let own = self.own_dirs().map_err(|(dir, error)| {
+            let reason = match error {
+                Unresolved::Invalid(error) => error.message,
+                Unresolved::Unclear(_, reason) => reason,
+            };
+            refuse(format!(
+                "Legion's own directory {} cannot be resolved ({reason}), so no path can be told apart from it",
+                dir.display()
+            ))
+            .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
+        })?;
+        let mut places = vec![Cow::Borrowed(resolved)];
+        if resolved.link.is_some() {
+            let target = link_target(resolved).map_err(|_| {
+                refuse("it is a symbolic link, and where it leads cannot be told".to_owned())
+            })?;
+            places.push(Cow::Owned(target));
+        }
+        for place in &places {
+            let ancestors: Vec<Handle> = place
+                .existing
+                .ancestors()
+                .filter_map(|ancestor| Handle::from_path(ancestor).ok())
+                .collect();
+            for dir in &own {
+                let inside = within(place, &dir.resolved, Platform::HOST)
+                    || dir
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| ancestors.contains(identity));
+                if inside {
+                    return Err(refuse(format!(
+                        "it is in {}, {}, which only a role that allows effect:admin may read or change",
+                        dir.dir.display(),
+                        dir.place.describe()
+                    ))
+                    .with_hint("Legion's own files are read through its tools, such as audit.tail and meta.whoami; ask the owner of this machine for more.")
+                    .with_details(json!({"path": resolved.path(), "directory": dir.dir})));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One of the node's own directories.
+struct OwnDir {
+    place: Place,
+    /// As the node's paths name it.
+    dir: PathBuf,
+    resolved: Resolved,
+    /// Which directory it is, when it exists, so a second name for it is known for what it is.
+    identity: Option<Handle>,
+}
+
+/// Where a last part that is a symbolic link leads, resolved as far as that exists.
+fn link_target(resolved: &Resolved) -> Result<Resolved, Unresolved> {
+    let link = resolved.path();
+    let target = std::fs::read_link(&link).map_err(|error| {
+        Unresolved::Unclear(
+            ErrorCode::Failed,
+            format!("{} cannot be read as a link ({error})", link.display()),
+        )
+    })?;
+    // A relative target is relative to the directory the link is in, which is what exists.
+    resolve(&resolved.existing.join(target))
 }
 
 /// Expands a leading `~` to the home directory. `~user` is refused rather than guessed at.
@@ -550,60 +842,310 @@ pub fn expand_tilde(path: &Path, home: Option<&Path>) -> Result<PathBuf, ErrorBo
     Ok(path.to_path_buf())
 }
 
+/// A path resolved as far as it exists.
+#[derive(Clone, Debug)]
+struct Resolved {
+    /// The deepest part that exists, canonicalised, so its names are spelt as they are on disk.
+    existing: PathBuf,
+    /// The names below it that do not exist yet, as written.
+    missing: Vec<OsString>,
+    /// A last part that is a symbolic link, as written: kept rather than followed, so a tool acts on
+    /// the link itself.
+    link: Option<OsString>,
+}
+
+impl Resolved {
+    fn existing(path: PathBuf) -> Resolved {
+        Resolved {
+            existing: path,
+            missing: Vec::new(),
+            link: None,
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        let mut path = self.existing.clone();
+        path.extend(&self.missing);
+        if let Some(link) = &self.link {
+            path.push(link);
+        }
+        path
+    }
+}
+
+/// Why a path could not be resolved.
+#[derive(Debug)]
+enum Unresolved {
+    /// The path is wrong as written, whoever asks.
+    Invalid(ErrorBody),
+    /// Something on the way leads nowhere or cannot be looked at: a confined caller is refused, and
+    /// anyone else gets the code with the reason.
+    Unclear(ErrorCode, String),
+}
+
+impl Unresolved {
+    fn unconfined(self, given: &Path) -> ErrorBody {
+        match self {
+            Unresolved::Invalid(error) => error,
+            Unresolved::Unclear(code, reason) => ErrorBody::new(
+                code,
+                format!("{} cannot be used: {reason}.", given.display()),
+            ),
+        }
+    }
+}
+
 /// Resolves every part of an absolute path that exists, symbolic links and `..` included, and
 /// appends the parts that do not exist yet as they are.
-fn resolve(path: &Path) -> Result<PathBuf, ErrorBody> {
+///
+/// Only a part that is genuinely absent may be appended unresolved. Each part is looked at without
+/// following it, so a symbolic link that leads nowhere is found as the link it is, not taken for a
+/// directory that does not exist yet, and anything that cannot be looked at stops the walk.
+fn resolve(path: &Path) -> Result<Resolved, Unresolved> {
     let mut existing = path.to_path_buf();
     // The parts that do not exist, the last one first.
     let mut missing: Vec<OsString> = Vec::new();
     loop {
-        match dunce::canonicalize(&existing) {
-            Ok(mut resolved) => {
-                for part in missing.iter().rev() {
-                    resolved.push(part);
-                }
-                return Ok(resolved);
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                return match dunce::canonicalize(&existing) {
+                    Ok(resolved) => {
+                        missing.reverse();
+                        Ok(Resolved {
+                            existing: resolved,
+                            missing,
+                            link: None,
+                        })
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Err(Unresolved::Unclear(
+                            ErrorCode::NotFound,
+                            format!(
+                                "{} is a symbolic link that leads nowhere",
+                                existing.display()
+                            ),
+                        ))
+                    }
+                    Err(error) => Err(Unresolved::Unclear(
+                        ErrorCode::Failed,
+                        format!("{} cannot be resolved ({error})", existing.display()),
+                    )),
+                };
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match existing.components().next_back() {
                     Some(Component::Normal(name)) => missing.push(name.to_owned()),
                     Some(Component::ParentDir) => {
-                        return Err(ErrorBody::new(
+                        return Err(Unresolved::Invalid(ErrorBody::new(
                             ErrorCode::InvalidArgs,
                             format!(
                                 "{} goes up with .. out of a directory that does not exist.",
                                 path.display()
                             ),
                         )
-                        .with_hint("Write the path without .., the way it will be once its directories exist."));
+                        .with_hint("Write the path without .., the way it will be once its directories exist.")));
                     }
                     _ => {
-                        return Err(ErrorBody::new(
+                        return Err(Unresolved::Invalid(ErrorBody::new(
                             ErrorCode::NotFound,
                             format!(
                                 "{} is on a drive or volume that does not exist.",
                                 path.display()
                             ),
-                        ));
+                        )));
                     }
                 }
                 existing.pop();
             }
             Err(error) => {
-                return Err(ErrorBody::new(
+                return Err(Unresolved::Unclear(
                     ErrorCode::Failed,
-                    format!("{} cannot be resolved: {error}.", existing.display()),
+                    format!("{} cannot be looked at ({error})", existing.display()),
                 ));
             }
         }
     }
 }
 
-/// [`resolve`] for every part but the last, which is appended as given.
-fn resolve_keeping_last(path: &Path) -> Result<PathBuf, ErrorBody> {
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => Ok(resolve(parent)?.join(name)),
-        _ => resolve(path),
+/// [`resolve`] for every part but the last, which is resolved too unless it is a symbolic link.
+fn resolve_keeping_last(path: &Path) -> Result<Resolved, Unresolved> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return resolve(path);
+    };
+    let mut resolved = resolve(parent)?;
+    if !resolved.missing.is_empty() {
+        resolved.missing.push(name.to_owned());
+        return Ok(resolved);
+    }
+    let last = resolved.existing.join(name);
+    match std::fs::symlink_metadata(&last) {
+        Ok(meta) if meta.file_type().is_symlink() => resolved.link = Some(name.to_owned()),
+        // Resolved like the rest, so it is spelt as it is on disk.
+        Ok(_) => resolved = resolve(&last)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            resolved.missing.push(name.to_owned());
+        }
+        Err(error) => {
+            return Err(Unresolved::Unclear(
+                ErrorCode::Failed,
+                format!("{} cannot be looked at ({error})", last.display()),
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+/// The rules a platform's file systems usually follow, as far as confining paths needs them. A
+/// parameter rather than `cfg`, so the rules of each are tested on all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    /// Linux and the other Unix systems: `/` separates, case matters.
+    Unix,
+    /// `/` separates, and APFS as macOS formats it ignores case.
+    Mac,
+    /// `\` and `/` separate, a path starts at a drive or a share, NTFS ignores case, and a colon
+    /// after the drive selects a stream inside a file.
+    Windows,
+}
+
+impl Platform {
+    const HOST: Platform = if cfg!(windows) {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::Mac
+    } else {
+        Platform::Unix
+    };
+
+    fn separates(self, byte: u8) -> bool {
+        byte == b'/' || (self == Platform::Windows && byte == b'\\')
+    }
+
+    fn ignores_case(self) -> bool {
+        self != Platform::Unix
+    }
+}
+
+/// One name in a path, as bytes in the platform's own encoding.
+#[derive(Clone, Copy, Debug)]
+struct Name<'a> {
+    bytes: &'a [u8],
+    /// Whether the name exists. One that exists is compared exactly: if it was read from the disk
+    /// it is spelt the way the disk spells it, and a name that does not exist cannot be another
+    /// spelling of it, or it would exist too. Only two names that do not exist yet are compared the
+    /// way the file system will compare them once they do.
+    exists: bool,
+}
+
+/// The volume a path is on, written the same way however the path spelt it, and the rest of the
+/// path. On Windows `\\?\C:\x` and `C:\x` are both on `C:`, and `\\?\UNC\server\share\x` and
+/// `\\server\share\x` both on `\\server\share`, so a path too long for the short form still
+/// matches a root written in it. Everywhere else the volume is empty.
+fn volume(path: &[u8], platform: Platform) -> (Vec<u8>, &[u8]) {
+    if platform != Platform::Windows {
+        return (Vec::new(), path);
+    }
+    let separates = |byte: Option<&u8>| byte.is_some_and(|byte| platform.separates(*byte));
+    let mut rest = path;
+    let verbatim = separates(rest.first())
+        && separates(rest.get(1))
+        && matches!(rest.get(2), Some(b'?' | b'.'))
+        && separates(rest.get(3));
+    let unc = if verbatim {
+        rest = &rest[4..];
+        let unc = rest
+            .get(..3)
+            .is_some_and(|start| start.eq_ignore_ascii_case(b"UNC"))
+            && separates(rest.get(3));
+        if unc {
+            rest = &rest[4..];
+        }
+        unc
+    } else if separates(rest.first()) && separates(rest.get(1)) {
+        rest = &rest[2..];
+        true
+    } else {
+        false
+    };
+    let take_name = |rest: &mut &[u8]| {
+        let end = rest
+            .iter()
+            .position(|byte| platform.separates(*byte))
+            .unwrap_or(rest.len());
+        let name = rest[..end].to_ascii_lowercase();
+        *rest = &rest[end..];
+        name
+    };
+    if unc {
+        let server = take_name(&mut rest);
+        rest = rest.get(1..).unwrap_or_default();
+        let share = take_name(&mut rest);
+        let mut volume = b"\\\\".to_vec();
+        volume.extend_from_slice(&server);
+        volume.push(b'\\');
+        volume.extend_from_slice(&share);
+        (volume, rest)
+    } else if rest.first().is_some_and(u8::is_ascii_alphabetic) && rest.get(1) == Some(&b':') {
+        (vec![rest[0].to_ascii_uppercase(), b':'], &rest[2..])
+    } else if verbatim {
+        (take_name(&mut rest), rest)
+    } else {
+        (Vec::new(), rest)
+    }
+}
+
+/// Whether a path names an alternate data stream: on Windows, a colon anywhere after its volume.
+fn names_a_stream(path: &[u8], platform: Platform) -> bool {
+    platform == Platform::Windows && volume(path, platform).1.contains(&b':')
+}
+
+/// The volume of a resolved path and its names, from the top down.
+fn names_of(resolved: &Resolved, platform: Platform) -> (Vec<u8>, Vec<Name<'_>>) {
+    let (volume, rest) = volume(resolved.existing.as_os_str().as_encoded_bytes(), platform);
+    let mut names: Vec<Name<'_>> = rest
+        .split(|byte| platform.separates(*byte))
+        .filter(|name| !name.is_empty())
+        .map(|bytes| Name {
+            bytes,
+            exists: true,
+        })
+        .collect();
+    names.extend(resolved.missing.iter().map(|name| Name {
+        bytes: name.as_encoded_bytes(),
+        exists: false,
+    }));
+    if let Some(link) = &resolved.link {
+        names.push(Name {
+            bytes: link.as_encoded_bytes(),
+            exists: true,
+        });
+    }
+    (volume, names)
+}
+
+/// Whether `path` is `root` or lies under it.
+fn within(path: &Resolved, root: &Resolved, platform: Platform) -> bool {
+    let (path_volume, path_names) = names_of(path, platform);
+    let (root_volume, root_names) = names_of(root, platform);
+    path_volume == root_volume
+        && path_names.len() >= root_names.len()
+        && root_names
+            .iter()
+            .zip(&path_names)
+            .all(|(root, name)| same_name(*root, *name, platform))
+}
+
+fn same_name(a: Name<'_>, b: Name<'_>, platform: Platform) -> bool {
+    if a.bytes == b.bytes {
+        return true;
+    }
+    if a.exists || b.exists || !platform.ignores_case() {
+        return false;
+    }
+    // A name that is not Unicode is compared exactly: refusing a match is the safe mistake.
+    match (std::str::from_utf8(a.bytes), std::str::from_utf8(b.bytes)) {
+        (Ok(a), Ok(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => false,
     }
 }
 
@@ -613,6 +1155,16 @@ mod tests {
 
     use super::*;
     use crate::config::parse;
+
+    /// Paths for a check that never looks at the disk.
+    fn nowhere() -> Paths {
+        Paths::under("/legion")
+    }
+
+    /// A node's directories under `dir`, with its home at `dir/home`.
+    fn under(dir: &Path) -> Paths {
+        Paths::under(dir.join("legion")).with_home(dir.join("home"))
+    }
 
     fn policy(text: &str) -> Policy {
         parse::<Policy>(Path::new("policy.toml"), text.as_bytes()).unwrap()
@@ -651,11 +1203,15 @@ paths = ["~/projects/**"]
         assert_eq!(empty.default_principal(), "owner");
         assert!(
             empty
-                .authorize("owner", &spec("power.reboot", Effect::Power), None)
+                .authorize("owner", &spec("power.reboot", Effect::Power), &nowhere())
                 .is_ok()
         );
         let error = empty
-            .authorize("agent:claude", &spec("meta.version", Effect::Read), None)
+            .authorize(
+                "agent:claude",
+                &spec("meta.version", Effect::Read),
+                &nowhere(),
+            )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Denied);
         assert!(error.message.contains("nobody"), "{}", error.message);
@@ -665,7 +1221,9 @@ paths = ["~/projects/**"]
     fn rules_match_names_globs_and_effects_and_deny_wins() {
         let policy = policy(DESIGN_EXAMPLE);
         let allowed = |who: &str, name: &str, effect: Effect| {
-            policy.authorize(who, &spec(name, effect), None).is_ok()
+            policy
+                .authorize(who, &spec(name, effect), &nowhere())
+                .is_ok()
         };
         assert!(allowed("phone", "sys.info", Effect::Read));
         assert!(!allowed("phone", "fs.write", Effect::Write));
@@ -677,7 +1235,11 @@ paths = ["~/projects/**"]
         assert!(!allowed("agent:claude", "power.targets", Effect::Read));
         assert!(!allowed("agent:claude", "fleet.add", Effect::Admin));
         let error = policy
-            .authorize("agent:claude", &spec("fs.remove", Effect::Destroy), None)
+            .authorize(
+                "agent:claude",
+                &spec("fs.remove", Effect::Destroy),
+                &nowhere(),
+            )
             .unwrap_err();
         assert!(
             error.message.contains("rule fs.remove"),
@@ -692,7 +1254,11 @@ paths = ["~/projects/**"]
         let (role, _) = policy.role_of("agent:gemini");
         assert_eq!(role, "nobody");
         let error = policy
-            .authorize("agent:gemini", &spec("meta.version", Effect::Read), None)
+            .authorize(
+                "agent:gemini",
+                &spec("meta.version", Effect::Read),
+                &nowhere(),
+            )
             .unwrap_err();
         assert!(
             error
@@ -775,14 +1341,14 @@ paths = ["~/projects/**"]
     #[test]
     fn a_grant_reports_what_its_role_allows() {
         let policy = policy(DESIGN_EXAMPLE);
-        let grant = policy.grant("agent:claude", None);
+        let grant = policy.grant("agent:claude", &nowhere());
         assert_eq!(grant.role(), "operator");
         assert!(!grant.delegates());
         assert!(grant.allows(&spec("fs.read", Effect::Read)));
         assert!(!grant.allows(&spec("fs.remove", Effect::Destroy)));
         assert_eq!(grant.roots(), Some(vec!["~/projects".to_owned()]));
-        assert!(Grant::owner(None).delegates());
-        assert_eq!(Grant::owner(None).roots(), None);
+        assert!(Grant::owner(&nowhere()).delegates());
+        assert_eq!(Grant::owner(&nowhere()).roots(), None);
     }
 
     #[test]
@@ -821,8 +1387,7 @@ paths = ["~/projects/**"]
             std::fs::create_dir_all(dir.path().join("home").join("projects").join("app")).unwrap();
             std::fs::create_dir_all(dir.path().join("home").join(".ssh")).unwrap();
             std::fs::write(dir.path().join("home").join(".ssh").join("id"), "key").unwrap();
-            let grant =
-                policy(DESIGN_EXAMPLE).grant("agent:claude", Some(&dir.path().join("home")));
+            let grant = policy(DESIGN_EXAMPLE).grant("agent:claude", &under(dir.path()));
             Confined { dir, grant }
         }
 
@@ -922,6 +1487,43 @@ paths = ["~/projects/**"]
 
     #[cfg(unix)]
     #[test]
+    fn a_dangling_link_on_the_way_is_refused_not_taken_for_a_missing_directory() {
+        use std::os::unix::fs::symlink;
+        let confined = Confined::new();
+        let home = confined.home();
+        symlink(
+            home.join(".ssh").join("newdir"),
+            home.join("projects").join("escape"),
+        )
+        .unwrap();
+        let error = confined
+            .grant
+            .check_path("~/projects/escape/authorized_keys", Access::Write)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert!(error.message.contains("escape"), "{}", error.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_last_part_that_cannot_be_looked_at_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let confined = Confined::new();
+        let locked = confined.home().join("projects").join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Root may look anyway, and then there is nothing to test.
+        let refused = std::fs::symlink_metadata(locked.join("x"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied);
+        let result = confined.check("~/projects/locked/x");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if refused {
+            assert_eq!(result, Err(ErrorCode::Denied));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_root_that_is_itself_a_link_confines_to_where_it_leads() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
@@ -929,15 +1531,341 @@ paths = ["~/projects/**"]
         std::fs::create_dir_all(&real).unwrap();
         std::fs::create_dir_all(dir.path().join("home")).unwrap();
         symlink(&real, dir.path().join("home").join("projects")).unwrap();
-        let grant = policy(DESIGN_EXAMPLE).grant("agent:claude", Some(&dir.path().join("home")));
+        let grant = policy(DESIGN_EXAMPLE).grant("agent:claude", &under(dir.path()));
         let resolved = grant.check_path("~/projects/a.txt", Access::Write).unwrap();
         assert_eq!(resolved, dunce::canonicalize(&real).unwrap().join("a.txt"));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn another_spelling_of_a_root_on_a_disk_that_ignores_case_is_the_root() {
+        let confined = Confined::new();
+        let projects = confined.home().join("projects");
+        assert_eq!(confined.check("~/PROJECTS"), Ok(projects.clone()));
+        assert_eq!(
+            confined.check("~/Projects/App/new.txt"),
+            Ok(projects.join("app").join("new.txt"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_streams_and_matches_paths_too_long_for_the_short_form() {
+        let confined = Confined::new();
+        assert_eq!(
+            confined.check("~/projects/app::$DATA"),
+            Err(ErrorCode::InvalidArgs)
+        );
+        let mut deep = confined.home().join("projects");
+        for n in 0..30 {
+            deep.push(format!("directory{n:02}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let long = deep.join("file.txt");
+        assert!(long.as_os_str().len() > 260);
+        let checked = confined.grant.check_path(&long, Access::Write).unwrap();
+        assert!(checked.ends_with(Path::new("directory29").join("file.txt")));
+    }
+
+    const KEEPERS: &str = r#"
+[principals."agent:claude"]
+role = "operator"
+
+[principals.phone]
+role = "observer"
+
+[principals.keeper]
+role = "keeper"
+
+[roles.operator]
+allow = ["effect:read", "effect:write"]
+deny = ["fs.remove"]
+paths = ["~/**"]
+
+[roles.observer]
+allow = ["effect:read"]
+
+[roles.keeper]
+allow = ["effect:read", "effect:write", "effect:admin"]
+paths = ["~/**"]
+"#;
+
+    /// A node whose configuration and state live under its home, as they do by default.
+    struct Own {
+        _dir: tempfile::TempDir,
+        paths: Paths,
+        home: PathBuf,
+    }
+
+    impl Own {
+        fn new() -> Own {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            let paths = Paths::under(home.join(".legion")).with_home(&home);
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::write(paths.config_file("policy.toml"), KEEPERS).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+            std::fs::write(paths.audit_log(), "").unwrap();
+            std::fs::create_dir_all(home.join("projects")).unwrap();
+            let home = dunce::canonicalize(home).unwrap();
+            Own {
+                _dir: dir,
+                paths,
+                home,
+            }
+        }
+
+        fn grant(&self, who: &str) -> Grant {
+            policy(KEEPERS).grant(who, &self.paths)
+        }
+
+        fn check(&self, who: &str, path: &str, access: Access) -> Result<PathBuf, ErrorBody> {
+            self.grant(who).check_path(path, access)
+        }
+    }
+
+    #[test]
+    fn legion_s_own_files_are_kept_from_every_role_without_the_admin_effect() {
+        let own = Own::new();
+        for (who, path, access) in [
+            (
+                "agent:claude",
+                "~/.legion/config/policy.toml",
+                Access::Write,
+            ),
+            ("agent:claude", "~/.legion/config", Access::Write),
+            (
+                "agent:claude",
+                "~/.legion/config/tokens.toml",
+                Access::Write,
+            ),
+            ("agent:claude", "~/.legion/config/new/deeper", Access::Write),
+            ("agent:claude", "~/.legion/state/audit.jsonl", Access::Write),
+            ("agent:claude", "~/.legion/state/audit.jsonl", Access::Read),
+            (
+                "agent:claude",
+                "~/projects/../.legion/config/policy.toml",
+                Access::Read,
+            ),
+            ("phone", "~/.legion/state/audit.jsonl", Access::Read),
+        ] {
+            let error = own.check(who, path, access).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Denied, "{who} {path}");
+            assert!(
+                error.message.contains("effect:admin") && error.message.contains(".legion"),
+                "{}",
+                error.message
+            );
+        }
+        assert!(
+            own.check("agent:claude", "~/projects/notes.txt", Access::Write)
+                .is_ok()
+        );
+        assert!(own.check("agent:claude", "~/.legion", Access::Read).is_ok());
+        assert!(
+            own.check("keeper", "~/.legion/config/policy.toml", Access::Write)
+                .is_ok()
+        );
+        let audit_log = own.home.join(".legion").join("state").join("audit.jsonl");
+        assert!(
+            Grant::owner(&own.paths)
+                .check_path(&audit_log, Access::Write)
+                .is_ok()
+        );
+
+        // Before the node has written anything there, its directories are kept all the same.
+        std::fs::remove_dir_all(own.paths.config_dir()).unwrap();
+        let error = own
+            .check(
+                "agent:claude",
+                "~/.legion/config/policy.toml",
+                Access::Write,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_do_not_lead_a_role_into_legion_s_own_files() {
+        use std::os::unix::fs::symlink;
+        let own = Own::new();
+        let legion = own.home.join(".legion");
+        let projects = own.home.join("projects");
+        symlink(legion.join("config"), projects.join("conf")).unwrap();
+        symlink(
+            legion.join("config").join("policy.toml"),
+            projects.join("policy"),
+        )
+        .unwrap();
+        // It leads nowhere yet; written through, it would create tokens.toml.
+        symlink(
+            legion.join("config").join("tokens.toml"),
+            projects.join("tokens"),
+        )
+        .unwrap();
+        for path in [
+            "~/projects/conf/policy.toml",
+            "~/projects/policy",
+            "~/projects/tokens",
+        ] {
+            for who in ["agent:claude", "phone"] {
+                let checked = own.check(who, path, Access::Write);
+                assert_eq!(
+                    checked.map_err(|error| error.code),
+                    Err(ErrorCode::Denied),
+                    "{who} {path}"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn another_spelling_does_not_lead_a_role_into_legion_s_own_files() {
+        let own = Own::new();
+        let error = own
+            .check(
+                "agent:claude",
+                "~/.LEGION/Config/policy.toml",
+                Access::Write,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+    }
+
+    #[test]
+    fn a_role_allows_an_effect_as_a_whole_only_by_the_effect_or_by_star() {
+        let policy = policy(&format!(
+            "{KEEPERS}\n[principals.most]\nrole = \"most\"\n[roles.most]\nallow = [\"*\"]\ndeny = [\"effect:admin\"]\n\n[principals.files]\nrole = \"files\"\n[roles.files]\nallow = [\"fs.*\"]\n"
+        ));
+        let allows =
+            |who: &str, effect: Effect| policy.grant(who, &nowhere()).allows_effect(effect);
+        assert!(allows("agent:claude", Effect::Write));
+        assert!(!allows("agent:claude", Effect::Admin));
+        assert!(!allows("agent:claude", Effect::Exec));
+        assert!(allows("keeper", Effect::Admin));
+        assert!(allows("owner", Effect::Admin));
+        assert!(allows("most", Effect::Destroy));
+        assert!(!allows("most", Effect::Admin));
+        assert!(!allows("files", Effect::Write));
+        assert!(!allows("stranger", Effect::Read));
+    }
+
+    #[test]
+    fn the_places_a_whole_tree_must_not_be_taken_from_are_named() {
+        let own = Own::new();
+        let grant = own.grant("agent:claude");
+        let home = &own.home;
+        let legion = home.join(".legion");
+        let root = home.ancestors().last().unwrap();
+        let place = |path: &Path| grant.protected(path).unwrap();
+        assert_eq!(place(root), Some(Place::Root));
+        assert_eq!(place(home), Some(Place::Home));
+        assert_eq!(place(home.parent().unwrap()), Some(Place::Home));
+        assert_eq!(place(&legion), Some(Place::Config));
+        assert_eq!(place(&legion.join("config")), Some(Place::Config));
+        assert_eq!(place(&legion.join("state")), Some(Place::State));
+        assert_eq!(place(&legion.join("config").join("policy.toml")), None);
+        assert_eq!(place(&home.join("projects")), None);
+        assert_eq!(place(&home.join("projects").join("new")), None);
+
+        let refused = |who: &str, path: &Path| own.grant(who).check_tree(path).is_err();
+        assert!(refused("agent:claude", &legion));
+        assert!(refused("agent:claude", home));
+        assert!(!refused("agent:claude", &home.join("projects")));
+        assert!(!refused("keeper", &legion));
+        assert!(refused("keeper", home));
+        assert!(refused("owner", root));
+        let error = own.grant("agent:claude").check_tree(&legion).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert!(error.message.contains("configuration"), "{}", error.message);
+    }
+
+    fn resolved(existing: &str, missing: &[&str]) -> Resolved {
+        Resolved {
+            existing: PathBuf::from(existing),
+            missing: missing.iter().map(OsString::from).collect(),
+            link: None,
+        }
+    }
+
+    #[test]
+    fn windows_paths_match_their_roots_however_the_volume_is_spelt() {
+        let root = resolved(r"C:\Users\me\projects", &[]);
+        let inside = |path: &str| within(&resolved(path, &[]), &root, Platform::Windows);
+        let long = format!(r"\\?\C:\Users\me\projects\{}", "a".repeat(300));
+        assert!(inside(&long));
+        assert!(inside(r"c:\Users\me\projects\x"));
+        assert!(inside("C:/Users/me/projects"));
+        assert!(!inside(r"D:\Users\me\projects"));
+        assert!(!inside(r"C:\Users\me\projects2"));
+        assert!(!inside(r"C:\Users\me"));
+
+        let share = resolved(r"\\tower\Data\projects", &[]);
+        let on_share = |path: &str| within(&resolved(path, &[]), &share, Platform::Windows);
+        assert!(on_share(r"\\?\UNC\TOWER\data\projects\x"));
+        assert!(!on_share(r"\\pi\data\projects"));
+        assert!(!on_share(r"C:\tower\data\projects"));
+
+        // Elsewhere a backslash is part of a name, and the long form is not the short one.
+        assert!(!within(&resolved(&long, &[]), &root, Platform::Unix));
+    }
+
+    #[test]
+    fn case_is_ignored_only_between_names_that_do_not_exist_yet_and_only_where_disks_ignore_it() {
+        let root = resolved("/Users/me", &["projects"]);
+        let path = resolved("/Users/me", &["PROJECTS", "x"]);
+        assert!(within(&path, &root, Platform::Mac));
+        assert!(!within(&path, &root, Platform::Unix));
+        assert!(within(
+            &resolved(r"C:\Users\me", &["Projects", "x"]),
+            &resolved(r"C:\Users\me", &["projects"]),
+            Platform::Windows
+        ));
+        // Names read from the disk are spelt the way the disk spells them, so two spellings are
+        // two entries, as they are on a volume that minds case.
+        let existing = resolved("/Users/me/projects", &[]);
+        assert!(!within(
+            &resolved("/Users/me/PROJECTS/x", &[]),
+            &existing,
+            Platform::Mac
+        ));
+        // And a name that does not exist is no other spelling of one that does, or it would exist.
+        assert!(!within(
+            &resolved("/Users/me", &["PROJECTS", "x"]),
+            &existing,
+            Platform::Mac
+        ));
+        assert!(within(
+            &resolved("/Users/me/projects", &["new", "x"]),
+            &existing,
+            Platform::Mac
+        ));
+    }
+
+    #[test]
+    fn only_windows_has_streams_and_only_after_the_volume() {
+        assert!(names_a_stream(
+            br"C:\Users\me\key::$DATA",
+            Platform::Windows
+        ));
+        assert!(names_a_stream(
+            br"C:\Users\me\notes.txt:hidden",
+            Platform::Windows
+        ));
+        assert!(names_a_stream(br"\\?\C:\Users\me\key:x", Platform::Windows));
+        assert!(names_a_stream(br"\\tower\share\key:x", Platform::Windows));
+        assert!(!names_a_stream(br"C:\Users\me\key", Platform::Windows));
+        assert!(!names_a_stream(br"\\?\C:\Users\me\key", Platform::Windows));
+        assert!(!names_a_stream(b"/home/me/a:b", Platform::Unix));
+        assert!(!names_a_stream(b"/Users/me/a:b", Platform::Mac));
     }
 
     #[test]
     fn an_unconfined_grant_still_resolves_and_refuses_relative_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let grant = Grant::owner(Some(dir.path()));
+        let grant = Grant::owner(&Paths::under(dir.path().join("legion")).with_home(dir.path()));
         let resolved = grant
             .check_path("~/anything/at/all", Access::Write)
             .unwrap();
