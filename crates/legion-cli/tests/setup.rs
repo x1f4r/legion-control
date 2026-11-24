@@ -57,6 +57,10 @@ fn main() -> ExitCode {
             "fleet_sync_ext_define_dotted_filename_runs_on_peer",
             fleet_sync_ext_define_dotted_filename_runs_on_peer,
         ),
+        (
+            "config_write_and_sync_validate_tools_d_strictly",
+            config_write_and_sync_validate_tools_d_strictly,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -518,13 +522,13 @@ role = \"operator\"
 role = \"owner\"
 ";
     let projects_v1 = "[projects.demo.on]\nlaptop = \"~/projects/demo\"\n";
-    let tool_v1 = "name = \"ext.hello\"\ndescription = \"Say hello.\"\n";
+    let tool_v1 = "name = \"demo.hello\"\ndescription = \"Say hello.\"\neffect = \"read\"\ncmd = \"echo hello\"\n";
 
     laptop.write_config("policy.toml", policy_v1);
     laptop.write_config("projects.toml", projects_v1);
     fs::create_dir_all(config_dir(&laptop).join("tools.d")).unwrap();
     fs::write(
-        config_dir(&laptop).join("tools.d").join("hello.toml"),
+        config_dir(&laptop).join("tools.d").join("demo.hello.toml"),
         tool_v1,
     )
     .unwrap();
@@ -561,26 +565,32 @@ role = \"owner\"
     // 3. Initial status shows differs without writing anything to pi or sidecars.
     let status = laptop.run(&[
         "fleet.sync",
-        "documents=[\"policy.toml\",\"projects.toml\",\"tools.d/hello.toml\"]",
+        "documents=[\"policy.toml\",\"projects.toml\",\"tools.d/demo.hello.toml\"]",
     ]);
     assert_eq!(status.code, 0, "{}", status.stdout);
     let pi_status = &status.json()["results"]["pi"];
     assert_eq!(pi_status["policy.toml"]["status"], json!("differs"));
     assert_eq!(pi_status["projects.toml"]["status"], json!("differs"));
-    assert_eq!(pi_status["tools.d/hello.toml"]["status"], json!("differs"));
+    assert_eq!(
+        pi_status["tools.d/demo.hello.toml"]["status"],
+        json!("differs")
+    );
     assert!(!config_dir(&pi).join("policy.toml").exists());
 
     // 4. Push sends all three documents to pi, records sidecars on laptop, and audits before/after hashes on pi.
     let pushed = laptop.run(&[
         "fleet.sync",
         "direction=push",
-        "documents=[\"policy.toml\",\"projects.toml\",\"tools.d/hello.toml\"]",
+        "documents=[\"policy.toml\",\"projects.toml\",\"tools.d/demo.hello.toml\"]",
     ]);
     assert_eq!(pushed.code, 0, "{}", pushed.stdout);
     let pi_pushed = &pushed.json()["results"]["pi"];
     assert_eq!(pi_pushed["policy.toml"]["status"], json!("pushed"));
     assert_eq!(pi_pushed["projects.toml"]["status"], json!("pushed"));
-    assert_eq!(pi_pushed["tools.d/hello.toml"]["status"], json!("pushed"));
+    assert_eq!(
+        pi_pushed["tools.d/demo.hello.toml"]["status"],
+        json!("pushed")
+    );
 
     assert_eq!(
         fs::read_to_string(config_dir(&pi).join("policy.toml")).unwrap(),
@@ -591,7 +601,7 @@ role = \"owner\"
         projects_v1
     );
     assert_eq!(
-        fs::read_to_string(config_dir(&pi).join("tools.d").join("hello.toml")).unwrap(),
+        fs::read_to_string(config_dir(&pi).join("tools.d").join("demo.hello.toml")).unwrap(),
         tool_v1
     );
 
@@ -627,7 +637,7 @@ role = \"owner\"
     // 5. Status after push reports same.
     let status_same = laptop.run(&[
         "fleet.sync",
-        "documents=[\"policy.toml\",\"projects.toml\",\"tools.d/hello.toml\"]",
+        "documents=[\"policy.toml\",\"projects.toml\",\"tools.d/demo.hello.toml\"]",
     ]);
     assert_eq!(
         status_same.json()["results"]["pi"]["projects.toml"]["status"],
@@ -701,11 +711,15 @@ role = \"owner\"
     );
 
     // 8. Pull brings changes and new tools.d files back from pi, and detects local conflicts.
-    let tool_v2 = "name = \"ext.hello\"\ndescription = \"Say hello from pi.\"\n";
-    let tool_remote_only = "name = \"ext.ping\"\ndescription = \"Ping from pi.\"\n";
-    fs::write(config_dir(&pi).join("tools.d").join("hello.toml"), tool_v2).unwrap();
+    let tool_v2 = "name = \"demo.hello\"\ndescription = \"Say hello from pi.\"\neffect = \"read\"\ncmd = \"echo pi\"\n";
+    let tool_remote_only = "name = \"demo.ping\"\ndescription = \"Ping from pi.\"\neffect = \"read\"\ncmd = \"echo ping\"\n";
     fs::write(
-        config_dir(&pi).join("tools.d").join("remote_only.toml"),
+        config_dir(&pi).join("tools.d").join("demo.hello.toml"),
+        tool_v2,
+    )
+    .unwrap();
+    fs::write(
+        config_dir(&pi).join("tools.d").join("demo.ping.toml"),
         tool_remote_only,
     )
     .unwrap();
@@ -713,17 +727,20 @@ role = \"owner\"
     let pulled = laptop.run(&["fleet.sync", "direction=pull", "from=pi"]);
     assert_eq!(pulled.code, 0, "{}", pulled.stdout);
     let pulled_pi = &pulled.json()["results"]["pi"];
-    assert_eq!(pulled_pi["tools.d/hello.toml"]["status"], json!("pulled"));
     assert_eq!(
-        pulled_pi["tools.d/remote_only.toml"]["status"],
+        pulled_pi["tools.d/demo.hello.toml"]["status"],
         json!("pulled")
     );
     assert_eq!(
-        fs::read_to_string(config_dir(&laptop).join("tools.d").join("hello.toml")).unwrap(),
+        pulled_pi["tools.d/demo.ping.toml"]["status"],
+        json!("pulled")
+    );
+    assert_eq!(
+        fs::read_to_string(config_dir(&laptop).join("tools.d").join("demo.hello.toml")).unwrap(),
         tool_v2
     );
     assert_eq!(
-        fs::read_to_string(config_dir(&laptop).join("tools.d").join("remote_only.toml")).unwrap(),
+        fs::read_to_string(config_dir(&laptop).join("tools.d").join("demo.ping.toml")).unwrap(),
         tool_remote_only
     );
     assert_eq!(
@@ -733,7 +750,7 @@ role = \"owner\"
                 .join("sync")
                 .join("backups")
                 .join("tools.d")
-                .join("hello.toml.bak")
+                .join("demo.hello.toml.bak")
         )
         .unwrap(),
         tool_v1
@@ -741,23 +758,23 @@ role = \"owner\"
 
     // Divergent local edit causes pull conflict until force=true.
     fs::write(
-        config_dir(&laptop).join("tools.d").join("hello.toml"),
-        "name = \"ext.hello\"\ndescription = \"Local edit.\"\n",
+        config_dir(&laptop).join("tools.d").join("demo.hello.toml"),
+        "name = \"demo.hello\"\ndescription = \"Local edit.\"\neffect = \"read\"\ncmd = \"echo local\"\n",
     )
     .unwrap();
     fs::write(
-        config_dir(&pi).join("tools.d").join("hello.toml"),
-        "name = \"ext.hello\"\ndescription = \"Remote edit.\"\n",
+        config_dir(&pi).join("tools.d").join("demo.hello.toml"),
+        "name = \"demo.hello\"\ndescription = \"Remote edit.\"\neffect = \"read\"\ncmd = \"echo remote\"\n",
     )
     .unwrap();
     let pull_conflict = laptop.run(&[
         "fleet.sync",
         "direction=pull",
         "from=pi",
-        "documents=[\"tools.d/hello.toml\"]",
+        "documents=[\"tools.d/demo.hello.toml\"]",
     ]);
     assert_eq!(
-        pull_conflict.json()["results"]["pi"]["tools.d/hello.toml"]["status"],
+        pull_conflict.json()["results"]["pi"]["tools.d/demo.hello.toml"]["status"],
         json!("conflict")
     );
 
@@ -1125,5 +1142,109 @@ fn fleet_sync_ext_define_dotted_filename_runs_on_peer() {
             .contains("hello_from_synced_ext"),
         "{}",
         ran.stdout
+    );
+}
+
+fn config_write_and_sync_validate_tools_d_strictly() {
+    let laptop = Home::new();
+    let pi = Home::new();
+
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    let fleet_toml = format!("[machines.pi]\ncommand = {}\n", toml_argv(&run_argv(&pi)));
+    laptop.write_config("fleet.toml", &fleet_toml);
+
+    // 1. Reserved family refused.
+    let reserved = laptop.run(&[
+        "config.write",
+        "document=tools.d/meta.evil.toml",
+        "content=name = \"meta.evil\"\ndescription = \"Evil.\"\neffect = \"read\"\ncmd = \"echo x\"\n",
+    ]);
+    assert_eq!(reserved.code, 1, "{}", reserved.stdout);
+    assert!(
+        reserved.json()["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reserved"),
+        "{}",
+        reserved.stdout
+    );
+
+    // 2. Built-in tool shadowing refused (including non-reserved families such as config.* and agent.*).
+    for builtin in ["config.read", "agent.list"] {
+        let shadow = laptop.run(&[
+            "config.write",
+            &format!("document=tools.d/{builtin}.toml"),
+            &format!(
+                "content=name = \"{builtin}\"\ndescription = \"Shadow.\"\neffect = \"read\"\ncmd = \"echo x\"\n"
+            ),
+        ]);
+        assert_eq!(shadow.code, 1, "{builtin}: {}", shadow.stdout);
+        assert!(
+            shadow.json()["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("built-in"),
+            "{builtin}: {}",
+            shadow.stdout
+        );
+    }
+
+    // 3. Unknown field refused.
+    let unknown = laptop.run(&[
+        "config.write",
+        "document=tools.d/demo.bad.toml",
+        "content=name = \"demo.bad\"\ndescription = \"Bad.\"\neffect = \"read\"\ncmd = \"echo x\"\nextra = 1\n",
+    ]);
+    assert_eq!(unknown.code, 1, "{}", unknown.stdout);
+
+    // 4. File name stem mismatch refused.
+    let mismatch = laptop.run(&[
+        "config.write",
+        "document=tools.d/aaa.toml",
+        "content=name = \"demo.greet\"\ndescription = \"Greet.\"\neffect = \"read\"\ncmd = \"echo hi\"\n",
+    ]);
+    assert_eq!(mismatch.code, 1, "{}", mismatch.stdout);
+    assert!(
+        mismatch.json()["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not match file name stem"),
+        "{}",
+        mismatch.stdout
+    );
+
+    // 5. Duplicate tool name already defined in another tools.d file on pi is refused by sync.
+    let def_toml =
+        "name = \"demo.greet\"\ndescription = \"Greet.\"\neffect = \"read\"\ncmd = \"echo hi\"\n";
+    fs::create_dir_all(config_dir(&pi).join("tools.d")).unwrap();
+    fs::write(config_dir(&pi).join("tools.d").join("alias.toml"), def_toml).unwrap();
+    fs::create_dir_all(config_dir(&laptop).join("tools.d")).unwrap();
+    fs::write(
+        config_dir(&laptop).join("tools.d").join("demo.greet.toml"),
+        def_toml,
+    )
+    .unwrap();
+
+    let pushed = laptop.run(&[
+        "fleet.sync",
+        "direction=push",
+        "documents=[\"tools.d/demo.greet.toml\"]",
+    ]);
+    assert_eq!(pushed.code, 0, "{}", pushed.stdout);
+    let entry = &pushed.json()["results"]["pi"]["tools.d/demo.greet.toml"];
+    assert_eq!(entry["status"], json!("error"), "{entry}");
+    assert!(
+        entry["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already defined"),
+        "{entry}"
+    );
+    assert!(
+        !config_dir(&pi)
+            .join("tools.d")
+            .join("demo.greet.toml")
+            .exists()
     );
 }

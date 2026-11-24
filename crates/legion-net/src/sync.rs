@@ -26,6 +26,7 @@ use legion_core::{
 use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_tools::ext::def::parse_toml as parse_extension_toml;
 use legion_tools::proj::ProjectsFile;
 use legion_xfer::hash::{Hash, hash_bytes};
 use schemars::JsonSchema;
@@ -237,7 +238,12 @@ impl SharedDocument {
     }
 
     /// Validates `content` using this node's own strict loader before replacing anything.
-    pub fn validate(&self, path: &Path, content: &str) -> Result<(), ErrorBody> {
+    pub fn validate(
+        &self,
+        path: &Path,
+        content: &str,
+        is_builtin: &dyn Fn(&str) -> bool,
+    ) -> Result<(), ErrorBody> {
         if content.len() > MAX_DOCUMENT_BYTES {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
@@ -262,7 +268,9 @@ impl SharedDocument {
                 parse::<ProjectsFile>(path, content.as_bytes())?;
                 Ok(())
             }
-            Self::ToolExt(_) => validate_tools_d_toml(path, content),
+            Self::ToolExt(bare) => {
+                validate_tools_d_toml(path, bare, &self.canonical_name(), content, is_builtin)
+            }
         }
     }
 }
@@ -287,44 +295,97 @@ fn is_valid_tools_d_filename(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-fn validate_tools_d_toml(path: &Path, content: &str) -> Result<(), ErrorBody> {
-    let table: toml::Table = toml::from_str(content).map_err(|error| {
-        let message = error.message().trim_end_matches('.').to_owned();
-        match error.span() {
-            Some(span) => {
-                let line = content[..span.start.min(content.len())]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1;
-                ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!(
-                        "{} does not parse at line {line}: {message}.",
-                        path.display()
-                    ),
-                )
-                .with_hint("Fix the TOML syntax before syncing this extension file.")
-                .with_details(json!({"file": path, "line": line}))
-            }
-            None => ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} does not parse: {message}.", path.display()),
-            )
-            .with_hint("Fix the TOML syntax before syncing this extension file.")
-            .with_details(json!({"file": path})),
+fn validate_tools_d_toml(
+    path: &Path,
+    bare: &str,
+    canonical_name: &str,
+    content: &str,
+    is_builtin: &dyn Fn(&str) -> bool,
+) -> Result<(), ErrorBody> {
+    let def = parse_extension_toml(content.as_bytes(), is_builtin).map_err(|failure| {
+        let mut details = json!({"file": path});
+        if let Some(line) = failure.line
+            && let Some(obj) = details.as_object_mut()
+        {
+            obj.insert("line".to_owned(), json!(line));
         }
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "{} is not a valid extension definition: {}.",
+                path.display(),
+                failure.reason
+            ),
+        )
+        .with_hint(
+            "Fix the extension definition to match `ext.define` rules before writing or syncing.",
+        )
+        .with_details(details)
     })?;
-    if table.is_empty() {
+
+    let stem = bare.strip_suffix(".toml").unwrap_or(bare);
+    if def.name != stem {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
-                "{} is empty or contains only comments, and cannot be installed.",
-                path.display()
+                "{canonical_name} defines tool {:?}, which does not match file name stem {:?}.",
+                def.name, stem
             ),
         )
-        .with_hint("Provide a non-empty TOML definition for the extension tool."));
+        .with_hint(format!(
+            "Store this tool at tools.d/{}.toml, or set name = {:?}.",
+            def.name, stem
+        ))
+        .with_details(json!({"file": path, "name": def.name, "stem": stem})));
     }
+
+    if let Some(tools_dir) = path.parent()
+        && let Ok(entries) = std::fs::read_dir(tools_dir)
+    {
+        for entry in entries.flatten() {
+            let other_name = entry.file_name();
+            let Some(other_str) = other_name.to_str() else {
+                continue;
+            };
+            if !other_str.ends_with(".toml") {
+                continue;
+            }
+            let same_file = other_str == bare
+                || (cfg!(any(windows, target_os = "macos"))
+                    && other_str.eq_ignore_ascii_case(bare));
+            if same_file {
+                continue;
+            }
+            let other_path = entry.path();
+            if !other_path.is_file() {
+                continue;
+            }
+            let Ok(other_bytes) = std::fs::read(&other_path) else {
+                continue;
+            };
+            if let Ok(other_def) = parse_extension_toml(&other_bytes, is_builtin)
+                && other_def.name == def.name
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "{canonical_name} defines tool {:?}, which is already defined by {}.",
+                        def.name,
+                        other_path.display()
+                    ),
+                )
+                .with_hint(
+                    "Remove or rename the conflicting file in tools.d/ before installing this tool.",
+                )
+                .with_details(json!({
+                    "file": path,
+                    "name": def.name,
+                    "existing_file": other_path,
+                })));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -551,6 +612,7 @@ fn write_local_document_blocking(
     doc: &SharedDocument,
     content: &str,
     expect_hash: Option<&str>,
+    is_builtin: &dyn Fn(&str) -> bool,
 ) -> Result<WriteOutcome, ErrorBody> {
     if let Some(expected) = expect_hash {
         expected.parse::<Hash>().map_err(|_| {
@@ -598,7 +660,7 @@ fn write_local_document_blocking(
     }
 
     // Validate strictly with the receiving node's own loader BEFORE touching backup or target.
-    doc.validate(&target, content)?;
+    doc.validate(&target, content, is_builtin)?;
 
     let backup = if let Some(old_bytes) = existing.as_deref() {
         let backup_path = doc.backup_path(state_dir);
@@ -657,13 +719,22 @@ async fn apply_local_write(
     let started = Instant::now();
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let state_dir = ctx.paths().state_dir().to_path_buf();
+    let builtins: BTreeSet<String> = ctx
+        .node()
+        .registry()
+        .specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
     let outcome = tokio::task::spawn_blocking(move || {
+        let is_builtin = |name: &str| builtins.contains(name);
         write_local_document_blocking(
             &config_dir,
             &state_dir,
             &doc,
             &content,
             expect_hash.as_deref(),
+            &is_builtin,
         )
     })
     .await
@@ -1360,7 +1431,8 @@ async fn sync_one_document(
             };
             if dry_run {
                 let target = doc.config_path(ctx.paths().config_dir());
-                if let Err(error) = doc.validate(&target, &remote_content) {
+                let is_builtin = |name: &str| ctx.has_builtin(name);
+                if let Err(error) = doc.validate(&target, &remote_content, &is_builtin) {
                     return DocSyncOutcome {
                         status: SyncStatus::Error,
                         local_hash: local.hash,
@@ -1660,20 +1732,29 @@ mod tests {
         let state = dir.path().join("state");
 
         // Invalid policy is refused before creating anything.
+        let no_builtins = |_: &str| false;
         let bad = write_local_document_blocking(
             &cfg,
             &state,
             &SharedDocument::Policy,
             "default = 123\n",
             None,
+            &no_builtins,
         );
         assert!(bad.is_err());
         assert!(!cfg.join("policy.toml").exists());
 
         // First valid write creates the file with no backup.
         let v1 = "default = \"owner\"\n";
-        let first =
-            write_local_document_blocking(&cfg, &state, &SharedDocument::Policy, v1, None).unwrap();
+        let first = write_local_document_blocking(
+            &cfg,
+            &state,
+            &SharedDocument::Policy,
+            v1,
+            None,
+            &no_builtins,
+        )
+        .unwrap();
         assert!(first.backup.is_none());
         assert!(first.hash_before.is_none());
 
@@ -1685,6 +1766,7 @@ mod tests {
             &SharedDocument::Policy,
             v2,
             Some(&first.hash_after),
+            &no_builtins,
         )
         .unwrap();
         let backup_path = second.backup.as_deref().unwrap();
@@ -1701,11 +1783,82 @@ mod tests {
             &SharedDocument::Policy,
             v1,
             Some(&first.hash_after),
+            &no_builtins,
         );
         assert_eq!(stale.err().map(|e| e.code), Some(ErrorCode::Conflict));
         assert_eq!(
             std::fs::read_to_string(cfg.join("policy.toml")).unwrap(),
             v2
         );
+    }
+
+    #[test]
+    fn tools_d_validation_enforces_ext_parser_stem_match_and_no_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config");
+        let state = dir.path().join("state");
+        let is_builtin = |name: &str| matches!(name, "agent.list" | "config.read");
+
+        let valid = "name = \"demo.hello\"\ndescription = \"Say hello.\"\neffect = \"read\"\ncmd = \"echo hi\"\n";
+
+        // Unknown field is refused by ext.define's strict parser.
+        let unknown = format!("{valid}bogus = 1\n");
+        let doc = SharedDocument::parse("tools.d/demo.hello.toml").unwrap();
+        assert!(
+            write_local_document_blocking(&cfg, &state, &doc, &unknown, None, &is_builtin).is_err()
+        );
+
+        // Reserved family is refused.
+        let reserved_doc = SharedDocument::parse("tools.d/meta.evil.toml").unwrap();
+        let reserved =
+            "name = \"meta.evil\"\ndescription = \"Evil.\"\neffect = \"read\"\ncmd = \"echo x\"\n";
+        let err =
+            write_local_document_blocking(&cfg, &state, &reserved_doc, reserved, None, &is_builtin)
+                .err()
+                .unwrap();
+        assert!(err.message.contains("reserved"), "{err:?}");
+
+        // Built-in shadowing is refused.
+        let shadow_doc = SharedDocument::parse("tools.d/agent.list.toml").unwrap();
+        let shadow = "name = \"agent.list\"\ndescription = \"Shadow.\"\neffect = \"read\"\ncmd = \"echo x\"\n";
+        let err =
+            write_local_document_blocking(&cfg, &state, &shadow_doc, shadow, None, &is_builtin)
+                .err()
+                .unwrap();
+        assert!(err.message.contains("built-in"), "{err:?}");
+
+        // File stem mismatch is refused.
+        let wrong_stem = SharedDocument::parse("tools.d/other.toml").unwrap();
+        let err =
+            write_local_document_blocking(&cfg, &state, &wrong_stem, valid, None, &is_builtin)
+                .err()
+                .unwrap();
+        assert!(
+            err.message.contains("does not match file name stem"),
+            "{err:?}"
+        );
+
+        // Duplicate tool name already defined in another tools.d file is refused.
+        std::fs::create_dir_all(cfg.join("tools.d")).unwrap();
+        std::fs::write(cfg.join("tools.d").join("legacy.toml"), valid).unwrap();
+        let err = write_local_document_blocking(&cfg, &state, &doc, valid, None, &is_builtin)
+            .err()
+            .unwrap();
+        assert!(err.message.contains("already defined"), "{err:?}");
+
+        // Removing the conflicting file allows writing and updating tools.d/demo.hello.toml.
+        std::fs::remove_file(cfg.join("tools.d").join("legacy.toml")).unwrap();
+        let first =
+            write_local_document_blocking(&cfg, &state, &doc, valid, None, &is_builtin).unwrap();
+        let updated = "name = \"demo.hello\"\ndescription = \"Say hi.\"\neffect = \"read\"\ncmd = \"echo hi2\"\n";
+        write_local_document_blocking(
+            &cfg,
+            &state,
+            &doc,
+            updated,
+            Some(&first.hash_after),
+            &is_builtin,
+        )
+        .unwrap();
     }
 }
