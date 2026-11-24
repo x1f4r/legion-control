@@ -852,6 +852,8 @@ async fn apply_local_write(
             }
             Err(error) => return Err(error),
         };
+        let legacy_single_stamp_ids =
+            legion_tools::device::registry::legacy_single_stamp_device_ids(&content);
         let node_file = ctx.config().get::<NodeFile>()?;
         let paths = ctx.paths().clone();
         let paths_for_sessions = paths.clone();
@@ -904,6 +906,13 @@ async fn apply_local_write(
                  _live_policy: &Policy,
                  incoming_mut: &mut DevicesFile|
                  -> Result<(), ErrorBody> {
+                    if !legacy_single_stamp_ids.is_empty() {
+                        return Err(
+                            legion_tools::device::registry::legacy_single_stamp_incoming_error(
+                                &legacy_single_stamp_ids,
+                            ),
+                        );
+                    }
                     for (id, inc) in &mut incoming_mut.devices {
                         if local.removed.contains_key(id) {
                             continue;
@@ -2431,6 +2440,27 @@ async fn sync_devices_document(
             }
         }
         SyncDirection::Pull => {
+            let remote_legacy_ids = remote
+                .content
+                .as_deref()
+                .map(legion_tools::device::registry::legacy_single_stamp_device_ids)
+                .unwrap_or_default();
+            if !remote_legacy_ids.is_empty() {
+                return DocSyncOutcome {
+                    status: SyncStatus::Error,
+                    local_hash: local.hash,
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: None,
+                    detail: None,
+                    warnings: Vec::new(),
+                    error: Some(
+                        legion_tools::device::registry::legacy_single_stamp_incoming_error(
+                            &remote_legacy_ids,
+                        ),
+                    ),
+                };
+            }
             // Explicit pull: merges the peer's live devices and tombstones into local `devices.toml`
             // without writing back to the peer. Confirmations are node-local (`device.set`), so
             // strip incoming confirmations; `preserve_local_confirmations` keeps this node's own
@@ -4251,6 +4281,10 @@ confirmed_by = \"owner\"
 confirmed_at = \"{t2}\"
 updated_at = \"{t2}\"
 updated_on = \"box-a\"
+name_updated_at = \"{t1}\"
+name_updated_on = \"box-a\"
+role_updated_at = \"{t1}\"
+role_updated_on = \"box-a\"
 ",
             base_child.public_key
         );
@@ -5048,5 +5082,130 @@ removed_on = \"box-a\"
                 "{bad_ts}: {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn config_write_refuses_legacy_single_stamp_entries_while_local_load_still_migrates() {
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::load_devices_raw;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        std::fs::write(&auth_keys, "").unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(paths.config_file("policy.toml"), "default = \"owner\"\n").unwrap();
+
+        let local_id = "11".repeat(16);
+        let local_key = ed25519_public_key_from_seed(&[0x11; 32]);
+        let local_legacy = format!(
+            "\
+version = 1
+
+[devices.{local_id}]
+name = \"local-old\"
+public_key = \"{local_key}\"
+principal = \"owner\"
+paired_at = \"2026-11-24T10:00:00Z\"
+paired_on = \"box-a\"
+updated_at = \"2026-11-24T10:00:00Z\"
+updated_on = \"box-a\"
+"
+        );
+        std::fs::write(paths.config_file("devices.toml"), &local_legacy).unwrap();
+
+        // 1. Local load STILL accepts the older single-stamp format for local migration.
+        let loaded = load_devices_raw(&paths).unwrap().unwrap();
+        assert!(loaded.devices.contains_key(&local_id));
+        assert_eq!(
+            loaded.devices[&local_id].name_updated_at,
+            "2026-11-24T10:00:00Z"
+        );
+        assert_eq!(
+            loaded.devices[&local_id].role_updated_at,
+            "2026-11-24T10:00:00Z"
+        );
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        // 2. Incoming `config.write` carrying a legacy single-stamp live entry (either omitting
+        //    both per-field stamps or omitting just role_updated_*) MUST be refused with a hint
+        //    to update the sending machine.
+        let incoming_id = "22".repeat(16);
+        let incoming_key = ed25519_public_key_from_seed(&[0x22; 32]);
+        let cases = [
+            (
+                "missing both name_updated_* and role_updated_*",
+                format!(
+                    "\
+version = 1
+
+[devices.{incoming_id}]
+name = \"peer-old\"
+public_key = \"{incoming_key}\"
+principal = \"owner\"
+paired_at = \"2026-11-24T10:00:00Z\"
+paired_on = \"box-b\"
+updated_at = \"2026-11-24T10:00:00Z\"
+updated_on = \"box-b\"
+"
+                ),
+            ),
+            (
+                "missing role_updated_* only",
+                format!(
+                    "\
+version = 1
+
+[devices.{incoming_id}]
+name = \"peer-old\"
+public_key = \"{incoming_key}\"
+principal = \"owner\"
+paired_at = \"2026-11-24T10:00:00Z\"
+paired_on = \"box-b\"
+updated_at = \"2026-11-24T10:00:00Z\"
+updated_on = \"box-b\"
+name_updated_at = \"2026-11-24T10:00:00Z\"
+name_updated_on = \"box-b\"
+"
+                ),
+            ),
+        ];
+
+        for (label, content) in cases {
+            let err = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.write",
+                    json!({"document": "devices.toml", "content": content}),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{label}: {err:?}");
+            assert!(
+                err.hint
+                    .as_deref()
+                    .is_some_and(|h| h.to_ascii_lowercase().contains("update")
+                        && h.to_ascii_lowercase().contains("sending machine")),
+                "{label}: expected update sending machine hint: {err:?}"
+            );
+        }
+
+        // Local devices.toml stayed untouched and did not absorb incoming_id.
+        let still_local = load_devices_raw(&paths).unwrap().unwrap();
+        assert!(!still_local.devices.contains_key(&incoming_id));
+        assert!(still_local.devices.contains_key(&local_id));
     }
 }

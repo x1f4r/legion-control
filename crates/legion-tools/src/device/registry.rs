@@ -1442,6 +1442,10 @@ pub fn lock_config(paths: &Paths) -> Result<FileLock, ErrorBody> {
 }
 
 /// Reads and strictly validates `config/devices.toml`, returning `Ok(None)` when absent.
+///
+/// Older single-stamp live entries (missing `name_updated_*` or `role_updated_*`) are accepted
+/// here for local migration only; incoming pushes, pulls, and `config.write` calls must refuse
+/// them via [`legacy_single_stamp_device_ids`].
 pub fn load_devices_raw(paths: &Paths) -> Result<Option<DevicesFile>, ErrorBody> {
     let path = paths.config_file(DevicesFile::FILE);
     match std::fs::read(&path) {
@@ -1453,6 +1457,51 @@ pub fn load_devices_raw(paths: &Paths) -> Result<Option<DevicesFile>, ErrorBody>
         )
         .with_hint("Make devices.toml readable by the account legion runs as.")),
     }
+}
+
+/// Inspects raw `devices.toml` text and returns the sorted pairing ids of any `[devices.<id>]`
+/// entry that omits one or more per-field update stamps (`name_updated_at`, `name_updated_on`,
+/// `role_updated_at`, `role_updated_on`).
+///
+/// Older single-stamp entries are accepted ONLY for local disk load (migration); incoming pushes,
+/// pulls, and `config.write` calls must refuse them with [`legacy_single_stamp_incoming_error`].
+pub fn legacy_single_stamp_device_ids(content: &str) -> Vec<String> {
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(devices) = doc.get("devices").and_then(Item::as_table_like) else {
+        return Vec::new();
+    };
+    let mut legacy = Vec::new();
+    for (id, item) in devices.iter() {
+        if let Some(table) = item.as_table_like() {
+            let has_all = table.contains_key("name_updated_at")
+                && table.contains_key("name_updated_on")
+                && table.contains_key("role_updated_at")
+                && table.contains_key("role_updated_on");
+            if !has_all {
+                legacy.push(id.to_owned());
+            }
+        }
+    }
+    legacy.sort();
+    legacy
+}
+
+/// Error returned when an incoming `devices.toml` push, pull, or `config.write` contains live
+/// device entries in the older single-stamp format without per-field `name_updated_*` /
+/// `role_updated_*` stamps.
+pub fn legacy_single_stamp_incoming_error(legacy_ids: &[String]) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::InvalidArgs,
+        format!(
+            "Incoming devices.toml contains live device entry(ies) in the older single-stamp format without per-field name_updated_*/role_updated_* stamps: {}.",
+            legacy_ids.join(", ")
+        ),
+    )
+    .with_hint(
+        "Update Legion on the sending machine (and let it rewrite devices.toml with per-field stamps) before syncing.",
+    )
 }
 
 /// Validates, backs up, and atomically writes `config/devices.toml`, enforcing the 1 MiB limit
@@ -3924,6 +3973,15 @@ updated_on = \"pi\"
 "
         );
         let legacy: DevicesFile = parse(Path::new("devices.toml"), legacy_toml.as_bytes()).unwrap();
+        assert_eq!(
+            legacy_single_stamp_device_ids(&legacy_toml),
+            vec![id.clone()],
+            "legacy single-stamp entry must be flagged for incoming refusal"
+        );
+        assert!(
+            legacy_single_stamp_device_ids(&legacy.to_toml_string()).is_empty(),
+            "canonical re-serialized entry carries all per-field stamps"
+        );
         let dev = &legacy.devices[&id];
         assert_eq!(dev.name_updated_at, "2026-11-24T10:00:00Z");
         assert_eq!(dev.name_updated_on, "pi");
