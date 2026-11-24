@@ -506,10 +506,17 @@ impl Session {
             return;
         };
         self.running().remove(&id);
+        // What the panic said goes into the reply: on a node reached over ssh, its stderr is
+        // somebody else's terminal, and the caller would otherwise learn nothing at all.
         let message = if failure.is_panic() {
-            "The call failed inside legion before it could reply."
+            match panic_text(failure.into_panic().as_ref()) {
+                Some(text) => {
+                    format!("The call failed inside legion before it could reply: {text}")
+                }
+                None => "The call failed inside legion before it could reply.".to_owned(),
+            }
         } else {
-            "The call was stopped before it could reply."
+            "The call was stopped before it could reply.".to_owned()
         };
         self.reply(
             Some(id),
@@ -521,6 +528,14 @@ impl Session {
         )
         .await;
     }
+}
+
+/// The message a panic was raised with, when it was text.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
 }
 
 fn response(id: Option<Id>, result: Result<Value, RpcError>) -> Response {
@@ -733,6 +748,11 @@ mod tests {
         let reply = client.reply_to(1).await;
         assert_eq!(reply["error"]["code"], json!(INTERNAL_ERROR));
         assert_eq!(reply["error"]["data"]["code"], json!("internal"));
+        let message = reply["error"]["data"]["message"].as_str().unwrap();
+        assert!(
+            message.ends_with(": t.panic panics on purpose"),
+            "{message}"
+        );
         client.call(1, "t.echo").await;
         assert_eq!(client.reply_to(1).await["result"], json!({}));
         client.finish().await.unwrap();
