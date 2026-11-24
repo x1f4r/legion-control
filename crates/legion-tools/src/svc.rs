@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use self::backend::{Backend, BackendStatus, backend_for_os};
+use self::backend::{Backend, BackendStatus, backend_for_os, dedup_suggestions, not_found_hint};
 
 /// Default and maximum number of services returned by `svc.list`.
 const LIST_LIMIT: (u32, u32) = (100, 1000);
@@ -961,6 +961,25 @@ async fn logs(ctx: &Ctx, args: LogsArgs) -> Result<LogsResult, ToolError> {
     })
 }
 
+async fn status_in_scope(
+    backend: &dyn Backend,
+    ctx: &Ctx,
+    name: &str,
+    scope: Scope,
+) -> Result<BackendStatus, ErrorBody> {
+    match backend.status(ctx, name, scope).await {
+        Ok(status) => Ok(status),
+        Err(mut err) if err.code == ErrorCode::NotFound => {
+            let suggestions = dedup_suggestions(backend.suggest_names(ctx, name, scope).await);
+            if !suggestions.is_empty() {
+                err.hint = Some(not_found_hint(&suggestions));
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Resolves which scope a named service lives in and returns its current status.
 ///
 /// When `requested` is `None` on platforms with both user and system scopes, probes `user` first
@@ -977,8 +996,10 @@ async fn resolve_scope(
             "This operating system only has system-scope services.",
         )
         .with_hint("Omit `scope` or pass `scope: \"system\"`.")),
-        Some(scope) => backend.status(ctx, name, scope).await,
-        None if !backend.supports_user_scope() => backend.status(ctx, name, Scope::System).await,
+        Some(scope) => status_in_scope(backend, ctx, name, scope).await,
+        None if !backend.supports_user_scope() => {
+            status_in_scope(backend, ctx, name, Scope::System).await
+        }
         None => {
             let user = backend.status(ctx, name, Scope::User).await;
             let system = backend.status(ctx, name, Scope::System).await;
@@ -996,11 +1017,17 @@ async fn resolve_scope(
                         && (u_err.code == ErrorCode::NotFound
                             || u_err.message.contains("user manager"))
                     {
+                        let mut suggestions = Vec::new();
+                        if u_err.code == ErrorCode::NotFound {
+                            suggestions.extend(backend.suggest_names(ctx, name, Scope::User).await);
+                        }
+                        suggestions.extend(backend.suggest_names(ctx, name, Scope::System).await);
+                        let suggestions = dedup_suggestions(suggestions);
                         Err(ErrorBody::new(
                             ErrorCode::NotFound,
                             format!("Service {name:?} was not found in the user or system scope."),
                         )
-                        .with_hint("Run `svc.list` to see the services on this machine."))
+                        .with_hint(not_found_hint(&suggestions)))
                     } else if u_err.code == ErrorCode::NotFound {
                         Err(s_err)
                     } else {
@@ -1366,6 +1393,7 @@ mod tests {
 
     type StatusQueueMap = BTreeMap<(Scope, String), Vec<Result<BackendStatus, ErrorBody>>>;
     type ListResultMap = BTreeMap<Scope, Result<Vec<ServiceSummary>, ErrorBody>>;
+    type SuggestionsMap = BTreeMap<(Scope, String), Vec<String>>;
     type ControlCall = (String, Scope, Action, bool);
 
     #[derive(Clone)]
@@ -1374,6 +1402,7 @@ mod tests {
         supports_user: bool,
         lists: Arc<Mutex<ListResultMap>>,
         statuses: Arc<Mutex<StatusQueueMap>>,
+        suggestions: Arc<Mutex<SuggestionsMap>>,
         control_log: Arc<Mutex<Vec<ControlCall>>>,
         logs: Vec<String>,
     }
@@ -1385,9 +1414,17 @@ mod tests {
                 supports_user,
                 lists: Arc::new(Mutex::new(BTreeMap::new())),
                 statuses: Arc::new(Mutex::new(BTreeMap::new())),
+                suggestions: Arc::new(Mutex::new(BTreeMap::new())),
                 control_log: Arc::new(Mutex::new(Vec::new())),
                 logs: vec!["boom: exit 1".to_owned()],
             }
+        }
+
+        fn set_suggestions(&self, scope: Scope, name: &str, items: Vec<&str>) {
+            self.suggestions.lock().unwrap().insert(
+                (scope, name.to_owned()),
+                items.into_iter().map(str::to_owned).collect(),
+            );
         }
 
         fn set_list(&self, scope: Scope, result: Result<Vec<ServiceSummary>, ErrorBody>) {
@@ -1508,6 +1545,22 @@ mod tests {
                     truncated: false,
                 })
             })
+        }
+
+        fn suggest_names<'a>(
+            &'a self,
+            _ctx: &'a Ctx,
+            name: &'a str,
+            scope: Scope,
+        ) -> BoxFuture<'a, Vec<String>> {
+            let items = self
+                .suggestions
+                .lock()
+                .unwrap()
+                .get(&(scope, name.to_owned()))
+                .cloned()
+                .unwrap_or_default();
+            Box::pin(async move { items })
         }
     }
 
@@ -1866,6 +1919,41 @@ mod tests {
             assert_eq!(listed.scope_errors.len(), 1);
             assert_eq!(listed.scope_errors[0].scope, Scope::User);
             assert!(listed.scope_errors[0].message.contains("user manager"));
+
+            // NotFound surfaces near-match suggestions in its hint for both explicit and omitted
+            // scopes without acting on them.
+            let hinted = FakeBackend::new(BackendKind::Launchd, true);
+            hinted.set_suggestions(
+                Scope::System,
+                "com.apple.mDNSResponder",
+                vec!["com.apple.mDNSResponder.reloaded"],
+            );
+            let explicit_err =
+                resolve_scope(&hinted, ctx, "com.apple.mDNSResponder", Some(Scope::System))
+                    .await
+                    .unwrap_err();
+            assert_eq!(explicit_err.code, ErrorCode::NotFound);
+            assert!(
+                explicit_err
+                    .hint
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Did you mean `com.apple.mDNSResponder.reloaded`?"),
+                "{explicit_err}"
+            );
+            let unscoped_err = resolve_scope(&hinted, ctx, "com.apple.mDNSResponder", None)
+                .await
+                .unwrap_err();
+            assert_eq!(unscoped_err.code, ErrorCode::NotFound);
+            assert!(
+                unscoped_err
+                    .hint
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Did you mean `com.apple.mDNSResponder.reloaded`?"),
+                "{unscoped_err}"
+            );
+            assert!(hinted.control_log.lock().unwrap().is_empty());
 
             Ok(json!({}))
         }

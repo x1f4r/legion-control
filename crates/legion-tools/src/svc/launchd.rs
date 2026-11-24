@@ -5,7 +5,7 @@
 //! tail of `StandardOutPath` / `StandardErrorPath` when the service's plist declares them and
 //! returns `unsupported` with a `log show` hint otherwise.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::backend::{
     ACTION_TIMEOUT, Backend, BackendLogs, BackendStatus, CmdSpec, QUERY_CAPTURE_LIMIT,
-    QUERY_TIMEOUT, is_sudo_denied, run_cmd, unix_privilege_denied,
+    QUERY_TIMEOUT, dedup_suggestions, is_sudo_denied, run_cmd, unix_privilege_denied,
 };
 use super::{Action, BackendKind, Scope, ServiceState, ServiceSummary};
 
@@ -235,6 +235,20 @@ impl Backend for Launchd {
             Ok(collected)
         })
     }
+
+    fn suggest_names<'a>(
+        &'a self,
+        ctx: &'a Ctx,
+        name: &'a str,
+        scope: Scope,
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            let Ok(services) = self.list(ctx, scope).await else {
+                return Vec::new();
+            };
+            suggest_labels(name, services.iter().map(|svc| svc.name.as_str()))
+        })
+    }
 }
 
 /// Resolves `gui/<uid>` (via `id -u`) for user scope, or `"system"` for system scope.
@@ -369,12 +383,22 @@ pub(crate) fn plist_search_dirs(scope: Scope, home: Option<&Path>) -> Vec<PathBu
 
 /// Finds the plist file for `label` in `dirs`, checking `<label>.plist` first and falling back
 /// to scanning XML `.plist` files for a matching `<key>Label</key>`.
+///
+/// If `<label>.plist` is readable XML and declares a different `<key>Label</key>` (for example
+/// `com.apple.mDNSResponder.plist` declaring `com.apple.mDNSResponder.reloaded`), it is skipped
+/// rather than falsely matched to `label`.
 pub(crate) fn find_plist_in_dirs(label: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let direct_name = format!("{label}.plist");
     for dir in dirs {
         let candidate = dir.join(&direct_name);
         if candidate.is_file() {
-            return Some(candidate);
+            let mismatched_label = std::fs::read_to_string(&candidate)
+                .ok()
+                .and_then(|text| extract_plist_string(&text, "Label"))
+                .is_some_and(|declared| declared != label);
+            if !mismatched_label {
+                return Some(candidate);
+            }
         }
     }
     for dir in dirs {
@@ -394,6 +418,30 @@ pub(crate) fn find_plist_in_dirs(label: &str, dirs: &[PathBuf]) -> Option<PathBu
         }
     }
     None
+}
+
+/// Finds up to five loaded launchd labels that equal `requested` case-insensitively or start with
+/// `requested` followed by a dot (`.`).
+pub(crate) fn suggest_labels<'a>(
+    requested: &str,
+    loaded: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut case_matches = BTreeSet::new();
+    let mut dot_prefixed = BTreeSet::new();
+    for label in loaded {
+        if label == requested {
+            continue;
+        }
+        if label.eq_ignore_ascii_case(requested) {
+            case_matches.insert(label.to_owned());
+        } else if label
+            .strip_prefix(requested)
+            .is_some_and(|rest| rest.starts_with('.'))
+        {
+            dot_prefixed.insert(label.to_owned());
+        }
+    }
+    dedup_suggestions(case_matches.into_iter().chain(dot_prefixed))
 }
 
 fn unloaded_status(label: &str, scope: Scope, domain: &str, plist: &Path) -> BackendStatus {
@@ -1126,6 +1174,72 @@ gui/501/com.example.plain = {
             Some(renamed.as_path())
         );
         assert_eq!(find_plist_in_dirs("com.example.absent", &dirs), None);
+
+        // A plist named `<label>.plist` whose XML `<key>Label</key>` declares a different label
+        // (such as com.apple.mDNSResponder.plist declaring com.apple.mDNSResponder.reloaded)
+        // must not falsely match `label`.
+        let reloaded = agents.join("com.example.dns.plist");
+        std::fs::write(
+            &reloaded,
+            "<plist><dict><key>Label</key><string>com.example.dns.reloaded</string></dict></plist>",
+        )
+        .unwrap();
+        assert_eq!(find_plist_in_dirs("com.example.dns", &dirs), None);
+        assert_eq!(
+            find_plist_in_dirs("com.example.dns.reloaded", &dirs).as_deref(),
+            Some(reloaded.as_path())
+        );
+    }
+
+    #[test]
+    fn suggest_labels_finds_dot_prefixed_and_case_insensitive_matches_capped_at_five() {
+        let domain_out = "\
+system = {
+    type = system
+    services = {
+             123      -       com.apple.mDNSResponder.reloaded
+             124      -       com.apple.mDNSResponderHelper
+             125      -       com.apple.mDNSResponder.helper
+             126      -       com.apple.syslogd
+    }
+}
+";
+        let loaded = parse_print_domain_services(domain_out, Scope::System);
+        let names: Vec<&str> = loaded.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            suggest_labels("com.apple.mDNSResponder", names.iter().copied()),
+            [
+                "com.apple.mDNSResponder.helper",
+                "com.apple.mDNSResponder.reloaded",
+            ]
+        );
+
+        let list_out = "\
+PID\tStatus\tLabel
+100\t0\tcom.example.Worker
+101\t0\tcom.example.worker.a
+102\t0\tcom.example.worker.b
+103\t0\tcom.example.worker.c
+104\t0\tcom.example.worker.d
+105\t0\tcom.example.worker.e
+106\t0\tcom.example.worker.f
+107\t0\tcom.example.worker2
+";
+        let user_loaded = parse_list(list_out, Scope::User);
+        let user_names: Vec<&str> = user_loaded.iter().map(|s| s.name.as_str()).collect();
+        let suggested = suggest_labels("com.example.worker", user_names);
+        assert_eq!(suggested.len(), 5);
+        assert_eq!(
+            suggested,
+            [
+                "com.example.Worker",
+                "com.example.worker.a",
+                "com.example.worker.b",
+                "com.example.worker.c",
+                "com.example.worker.d",
+            ]
+        );
+        assert!(suggest_labels("com.example.absent", ["com.example.other"]).is_empty());
     }
 
     #[test]

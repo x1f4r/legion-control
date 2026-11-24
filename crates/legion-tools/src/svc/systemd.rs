@@ -1,6 +1,6 @@
 //! Linux `systemd` backend: command builders and pure parsers for `systemctl` and `journalctl`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jiff::Timestamp;
 use legion_core::proto::{ErrorBody, ErrorCode};
@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 
 use super::backend::{
     ACTION_TIMEOUT, Backend, BackendLogs, BackendStatus, CmdSpec, LOGS_CAPTURE_LIMIT,
-    QUERY_CAPTURE_LIMIT, QUERY_TIMEOUT, is_sudo_denied, run_cmd, unix_privilege_denied,
+    QUERY_CAPTURE_LIMIT, QUERY_TIMEOUT, dedup_suggestions, is_sudo_denied, run_cmd,
+    unix_privilege_denied,
 };
 use super::{Action, BackendKind, Scope, ServiceState, ServiceSummary};
 
@@ -130,6 +131,34 @@ impl Backend for Systemd {
             Ok(parsed)
         })
     }
+
+    fn suggest_names<'a>(
+        &'a self,
+        ctx: &'a Ctx,
+        name: &'a str,
+        scope: Scope,
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            let mut candidates = Vec::new();
+            let units_cmd = list_units_for_suggestions_cmd(scope);
+            if let Ok(out) = run_cmd(ctx, &units_cmd, QUERY_TIMEOUT, QUERY_CAPTURE_LIMIT).await
+                && out.success()
+            {
+                candidates.extend(
+                    parse_list_units(&out.stdout.text, scope)
+                        .into_iter()
+                        .map(|svc| svc.name),
+                );
+            }
+            let files_cmd = list_unit_files_for_suggestions_cmd(scope);
+            if let Ok(out) = run_cmd(ctx, &files_cmd, QUERY_TIMEOUT, QUERY_CAPTURE_LIMIT).await
+                && out.success()
+            {
+                candidates.extend(parse_unit_file_names(&out.stdout.text));
+            }
+            suggest_units(name, candidates.iter().map(String::as_str))
+        })
+    }
 }
 
 /// Builds `systemctl [--user] list-units ...`.
@@ -159,6 +188,43 @@ pub(crate) fn list_unit_files_cmd(scope: Scope) -> CmdSpec {
     args.extend([
         "list-unit-files",
         "--type=service",
+        "--no-pager",
+        "--no-legend",
+        "--plain",
+        "--full",
+    ]);
+    with_systemd_env(CmdSpec::new("systemctl", args))
+}
+
+/// Builds `systemctl [--user] list-units` across all supported `svc` unit types for `NotFound`
+/// hints (different suffix or template instance).
+pub(crate) fn list_units_for_suggestions_cmd(scope: Scope) -> CmdSpec {
+    let mut args = Vec::new();
+    if scope == Scope::User {
+        args.push("--user");
+    }
+    args.extend([
+        "list-units",
+        "--type=service,timer,socket,path",
+        "--all",
+        "--no-pager",
+        "--no-legend",
+        "--plain",
+        "--full",
+    ]);
+    with_systemd_env(CmdSpec::new("systemctl", args))
+}
+
+/// Builds `systemctl [--user] list-unit-files` across all supported `svc` unit types for
+/// `NotFound` hints.
+pub(crate) fn list_unit_files_for_suggestions_cmd(scope: Scope) -> CmdSpec {
+    let mut args = Vec::new();
+    if scope == Scope::User {
+        args.push("--user");
+    }
+    args.extend([
+        "list-unit-files",
+        "--type=service,timer,socket,path",
         "--no-pager",
         "--no-legend",
         "--plain",
@@ -303,6 +369,85 @@ pub(crate) fn parse_list_unit_files(text: &str) -> Vec<UnitFileEntry> {
         });
     }
     out
+}
+
+/// Extracts unit names from `systemctl list-unit-files` output across all supported types,
+/// skipping template definitions and aliases.
+pub(crate) fn parse_unit_file_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(state)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if state == "alias" {
+            continue;
+        }
+        if let Some((stem, _)) = split_supported_suffix(name)
+            && !stem.ends_with('@')
+        {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+const SUGGESTION_SUFFIXES: [&str; 4] = [".service", ".timer", ".socket", ".path"];
+
+fn split_supported_suffix(unit: &str) -> Option<(&str, &'static str)> {
+    for suffix in SUGGESTION_SUFFIXES {
+        if let Some(stem) = unit.strip_suffix(suffix) {
+            return Some((stem, suffix));
+        }
+    }
+    None
+}
+
+/// Finds up to five systemd units matching `requested` case-insensitively, with a different
+/// supported suffix (`.service`, `.timer`, `.socket`, `.path`), or as a template instance
+/// (`<stem>@<instance>.<suffix>`).
+pub(crate) fn suggest_units<'a>(
+    requested: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let (req_stem, req_suffix) = split_supported_suffix(requested).unwrap_or((requested, ""));
+    if req_stem.is_empty() {
+        return Vec::new();
+    }
+    let mut case_matches = BTreeSet::new();
+    let mut other_suffix = BTreeSet::new();
+    let mut template_instances = BTreeSet::new();
+
+    for cand in candidates {
+        if cand == requested {
+            continue;
+        }
+        let Some((cand_stem, cand_suffix)) = split_supported_suffix(cand) else {
+            continue;
+        };
+        if cand.eq_ignore_ascii_case(requested) {
+            case_matches.insert(cand.to_owned());
+        } else if cand_stem.eq_ignore_ascii_case(req_stem) && cand_suffix != req_suffix {
+            other_suffix.insert(cand.to_owned());
+        } else if cand_stem.len() > req_stem.len() + 1
+            && cand_stem.is_char_boundary(req_stem.len())
+            && cand_stem.as_bytes()[req_stem.len()] == b'@'
+            && cand_stem[..req_stem.len()].eq_ignore_ascii_case(req_stem)
+        {
+            template_instances.insert(cand.to_owned());
+        }
+    }
+
+    dedup_suggestions(
+        case_matches
+            .into_iter()
+            .chain(other_suffix)
+            .chain(template_instances),
+    )
 }
 
 /// Merges loaded units with installed unit files so stopped disabled services and `enabled`
@@ -1096,6 +1241,75 @@ InvocationID=abc123
                 .as_deref()
                 .unwrap_or("")
                 .contains("systemd-journal")
+        );
+    }
+
+    #[test]
+    fn suggest_units_finds_different_suffix_template_instances_and_case_matches() {
+        let units_out = "\
+backup.timer        loaded active   waiting Daily backup timer
+backup.socket       loaded active   listening Backup socket
+backup.target       loaded active   active  Ignored target unit
+worker@1.service    loaded active   running Worker 1
+worker@2.service    loaded active   running Worker 2
+worker-extra.service loaded active  running Unrelated prefix
+Nginx.service       loaded active   running Web server
+";
+        let files_out = "\
+backup.path         enabled  enabled
+worker@.service     static   -
+worker@3.service    disabled disabled
+worker@4.service    disabled disabled
+worker@5.service    disabled disabled
+worker@6.service    disabled disabled
+worker@7.service    disabled disabled
+alias-worker.service alias   -
+";
+        let mut candidates: Vec<String> = parse_list_units(units_out, Scope::System)
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        candidates.extend(parse_unit_file_names(files_out));
+        let refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+
+        // Different supported suffixes match; unsupported `.target` is excluded.
+        assert_eq!(
+            suggest_units("backup.service", refs.iter().copied()),
+            ["backup.path", "backup.socket", "backup.timer"]
+        );
+
+        // Template instances match and are capped at 5; bare `worker@.service` and
+        // `worker-extra.service` are excluded.
+        assert_eq!(
+            suggest_units("worker.service", refs.iter().copied()),
+            [
+                "worker@1.service",
+                "worker@2.service",
+                "worker@3.service",
+                "worker@4.service",
+                "worker@5.service",
+            ]
+        );
+
+        // Case-insensitive match.
+        assert_eq!(
+            suggest_units("nginx.service", refs.iter().copied()),
+            ["Nginx.service"]
+        );
+
+        // Command builders request all four supported unit types.
+        let list_cmd = list_units_for_suggestions_cmd(Scope::User);
+        assert!(list_cmd.args.contains(&"--user".to_owned()));
+        assert!(
+            list_cmd
+                .args
+                .contains(&"--type=service,timer,socket,path".to_owned())
+        );
+        let files_cmd = list_unit_files_for_suggestions_cmd(Scope::System);
+        assert!(
+            files_cmd
+                .args
+                .contains(&"--type=service,timer,socket,path".to_owned())
         );
     }
 }
