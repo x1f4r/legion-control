@@ -17,7 +17,7 @@ const SAMPLE_TOOLS = [
   { name: 'fleet.add', effect: 'admin' },
 ];
 
-test('buildActionGroups groups actions and marks disallowed ones with plain reasons', () => {
+test('buildActionGroups hides groups with no allowed actions and marks partial disallowed ones cleanly', () => {
   const allowed = new Set(['power.sleep', 'power.wake', 'power.restart', 'power.shutdown', 'fs.list', 'exec.run']);
   const groups = buildActionGroups({
     tools: SAMPLE_TOOLS,
@@ -26,12 +26,19 @@ test('buildActionGroups groups actions and marks disallowed ones with plain reas
   });
   assert.deepEqual(
     groups.map((g) => g.group),
-    ['Power', 'Files', 'Run', 'Projects', 'Services', 'Fleet'],
+    ['Power', 'Files', 'Run'],
   );
   const runGroup = groups.find((g) => g.group === 'Run');
   const update = runGroup.items.find((i) => i.id === 'update');
   assert.equal(update.allowed, false);
   assert.equal(update.reason, 'Only an owner can do this');
+
+  const none = buildActionGroups({
+    tools: SAMPLE_TOOLS,
+    allowedSet: new Set(['meta.whoami']),
+    whoami: { role: 'guest' },
+  });
+  assert.deepEqual(none, []);
 });
 
 test('buildActionGroups filters by plain words and by tool name in technical mode', () => {

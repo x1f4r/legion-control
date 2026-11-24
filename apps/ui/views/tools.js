@@ -330,6 +330,8 @@ export function ToolDetail({
         title: copy.title,
         summary: copy.summary,
         jobs: tool.effect === 'power' && tool.name !== 'power.wake' ? targetJobs : [],
+        targetName: where,
+        args,
         tool: tool.name,
         effect: tool.effect,
         confirmLabel: copy.confirmLabel,

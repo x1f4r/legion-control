@@ -1,16 +1,20 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  describeDryRunSummary,
   describePlainPermissions,
+  describeRolePlain,
   formatActivityDuration,
   formatActivitySubtitle,
   formatCommandMeta,
+  formatInviteValidity,
   formatMachineDetailSubtitle,
   formatMachineStatusPhrase,
   formatMachinesHeaderSubtitle,
   friendlyJobName,
   friendlyJobState,
   groupActivity,
+  plainRefusalParts,
 } from '../activity.js';
 
 test('friendlyJobName hides raw commands and preserves meaningful names', () => {
@@ -146,4 +150,52 @@ test('describePlainPermissions and formatCommandMeta summarize cleanly', () => {
   );
   assert.equal(formatCommandMeta({ exitCode: 0, durationMs: 38 }, false), 'Finished · 38 ms');
   assert.equal(formatCommandMeta({ exitCode: 0, durationMs: 38 }, true), 'exit 0 · 38 ms');
+});
+
+test('wakePending phrases, dry-run summaries, refusal splitting, and invite copy read plainly', () => {
+  assert.equal(
+    formatMachineStatusPhrase({ reachable: false, lastSeenAt: null }, Date.now(), { wakePending: true }),
+    'Wake sent · waiting for it to answer',
+  );
+  assert.equal(
+    formatMachineDetailSubtitle({ reachable: false, lastSeenAt: null }, Date.now(), { wakePending: true }),
+    'Wake sent · waiting for it to answer',
+  );
+  assert.equal(
+    formatMachineStatusPhrase({ reachable: true, busy: false, runningJobs: 0 }, Date.now(), { wakePending: true }),
+    'Idle',
+  );
+
+  assert.equal(describeDryRunSummary('power.sleep', 'tower'), 'tower would go to sleep.');
+  assert.equal(
+    describeDryRunSummary('power.restart', 'tower', { into: 'windows' }),
+    'tower would restart into Windows.',
+  );
+  assert.equal(describeDryRunSummary('power.shutdown', 'tower'), 'tower would switch off.');
+  assert.equal(
+    describeDryRunSummary('power.wake', 'tower', { machine: 'laptop' }),
+    'A wake signal would be sent to laptop.',
+  );
+
+  const busyCheckRefusal = plainRefusalParts({
+    message: 'node.toml does not say what keeps this machine busy. Add busy = "none" or a probe.',
+    hint: 'Edit node.toml to configure busy detection.',
+  });
+  assert.equal(busyCheckRefusal.first, 'this machine does not have a busy check set up yet.');
+  assert.match(busyCheckRefusal.detailMessage, /node\.toml/);
+  assert.match(busyCheckRefusal.detailHint, /busy detection/);
+
+  const genericRefusal = plainRefusalParts({
+    message: 'Refused to power.sleep: agents is busy. Wait for it to finish.',
+    hint: 'Pass force = true to override.',
+  });
+  assert.equal(genericRefusal.first, 'agents is busy.');
+  assert.match(genericRefusal.detailMessage, /Wait for it to finish/);
+
+  assert.equal(describeRolePlain('owner'), 'do everything on this machine');
+  assert.equal(describeRolePlain('operator'), 'do everything except change permissions');
+  assert.equal(describeRolePlain('observer'), 'look only');
+  assert.equal(formatInviteValidity(15), '15 minutes');
+  assert.equal(formatInviteValidity(60), '1 hour');
+  assert.equal(formatInviteValidity(1440), '1 day');
 });

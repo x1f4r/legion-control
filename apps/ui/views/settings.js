@@ -4,7 +4,11 @@
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { CopyButton, Notice, QrCode, SwipeRow } from './common.js';
 import { ToolDetail } from './tools.js';
-import { describePlainPermissions } from '../lib/activity.js';
+import {
+  describePlainPermissions,
+  describeRolePlain,
+  formatInviteValidity,
+} from '../lib/activity.js';
 import { formatRelativeTime } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
 import { describeRoleAccess } from '../lib/schema.js';
@@ -178,8 +182,8 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
   return html`
     <div>
       <p class="lede">
-        On the other machine, create an invite (or run <code>legion pair</code>), then
-        scan its code or paste the invite below.
+        On the other machine, create an invite (or run <code>legion pair</code>), then scan its
+        code or paste the invite below.
       </p>
       <label class="field">
         <span>Name for this device</span>
@@ -220,14 +224,16 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
   `;
 }
 
-function InviteDeviceSubpage({ link, tools, nodeInfo }) {
+function InviteDeviceSubpage({ link, tools, nodeInfo, technical }) {
   const inviteSpec = useMemo(() => (tools || []).find((t) => t.name === 'device.invite'), [tools]);
-  const roleProp = inviteSpec?.input_schema?.properties?.role || null;
-  const nameProp = inviteSpec?.input_schema?.properties?.name || null;
-  const allowOwnerProp = inviteSpec?.input_schema?.properties?.allow_owner || null;
+  const inviteProps = inviteSpec?.input_schema?.properties || {};
+  const roleProp = inviteProps.role || null;
+  const hasNameProp = Boolean(inviteProps.name);
+  const hasAllowOwner = Boolean(inviteProps.allow_owner);
   const roleChoices = Array.isArray(roleProp?.enum) ? roleProp.enum : null;
+  const defaultIdentity = nodeInfo?.whoami?.principal || 'phone';
 
-  const [principal, setPrincipal] = useState('phone');
+  const [principal, setPrincipal] = useState(defaultIdentity);
   const [validMinutes, setValidMinutes] = useState(15);
   const [role, setRole] = useState(roleProp?.default || (roleChoices ? roleChoices[0] : ''));
   const [allowOwner, setAllowOwner] = useState(false);
@@ -235,10 +241,8 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
   const [error, setError] = useState(null);
   const [inviteRes, setInviteRes] = useState(null);
 
-  const wantsOwner =
-    Boolean(allowOwnerProp) &&
-    (String(role || '').trim() === 'owner' ||
-      (!String(role || '').trim() && String(principal || '').trim() === 'owner'));
+  const usesRoleName = Boolean(hasNameProp && roleProp && role.trim());
+  const wantsOwner = Boolean(hasAllowOwner && role.trim() === 'owner');
 
   async function onCreate(e) {
     e.preventDefault();
@@ -254,7 +258,7 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
         allowOwner: wantsOwner && allowOwner,
       });
       const res = await link.call('device.invite', args);
-      setInviteRes(res);
+      setInviteRes({ ...res, validMinutes });
     } catch (err) {
       setError(err);
     } finally {
@@ -271,18 +275,30 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
 
       <form onSubmit=${onCreate}>
         <label class="field">
-          <span>Name for the device</span>
+          <span>
+            ${usesRoleName
+              ? technical
+                ? 'Device name'
+                : 'Name for this device'
+              : technical
+                ? 'Principal'
+                : 'Use the identity'}
+          </span>
           <input
             type="text"
             value=${principal}
             onInput=${(e) => setPrincipal(e.target.value)}
-            placeholder="phone"
+            placeholder=${defaultIdentity}
             required
           />
           <small>
-            ${nameProp && roleProp
-              ? 'With a role below, pairs a new device under that name; leave Role blank to match an existing principal in policy.toml.'
-              : 'Matches a principal in policy.toml (for example phone or tablet).'}
+            ${usesRoleName
+              ? technical
+                ? 'Creates a dedicated device:<name> principal in policy.toml for this device.'
+                : 'Gives this device its own identity on this machine.'
+              : technical
+                ? 'Matches a principal in policy.toml (for example phone or tablet).'
+                : 'A name this machine already knows, such as the one this device uses.'}
           </small>
         </label>
 
@@ -292,7 +308,14 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
                 <span>Role</span>
                 ${roleChoices
                   ? html`
-                      <select value=${role} onChange=${(e) => setRole(e.target.value)}>
+                      <select
+                        value=${role}
+                        onChange=${(e) => {
+                          const next = e.target.value;
+                          setRole(next);
+                          if (next.trim() !== 'owner') setAllowOwner(false);
+                        }}
+                      >
                         ${roleChoices.map(
                           (opt) => html`<option key=${opt} value=${opt}>${opt}</option>`,
                         )}
@@ -302,10 +325,23 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
                       <input
                         type="text"
                         value=${role}
-                        onInput=${(e) => setRole(e.target.value)}
+                        onInput=${(e) => {
+                          const next = e.target.value;
+                          setRole(next);
+                          if (next.trim() !== 'owner') setAllowOwner(false);
+                        }}
                         placeholder="observer"
                       />
                     `}
+                ${hasNameProp
+                  ? html`
+                      <small>
+                        ${technical
+                          ? 'Leave blank to reuse an existing principal instead of creating device:<name>.'
+                          : 'Leave blank to share an existing identity instead.'}
+                      </small>
+                    `
+                  : null}
               </label>
             `
           : null}
@@ -316,7 +352,11 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
                 <label class="row switch row-switch">
                   <span class="body">
                     <span class="title">Allow full owner access</span>
-                    <span class="sub">Required to pair a device with the owner role</span>
+                    <span class="sub">
+                      ${technical
+                        ? 'Passes allow_owner=true, required to invite a device with the owner role.'
+                        : 'Lets this device change permissions and manage other devices.'}
+                    </span>
                   </span>
                   <input
                     type="checkbox"
@@ -351,7 +391,11 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
         ${error ? html`<${Notice} error=${error} />` : null}
 
         <div class="actions">
-          <button type="submit" class="btn primary full" disabled=${busy || !principal.trim()}>
+          <button
+            type="submit"
+            class="btn primary full"
+            disabled=${busy || !principal.trim() || (wantsOwner && !allowOwner)}
+          >
             ${busy ? 'Making invite…' : inviteRes ? 'Make a new invite' : 'Make invite'}
           </button>
         </div>
@@ -368,8 +412,13 @@ function InviteDeviceSubpage({ link, tools, nodeInfo }) {
                 <${CopyButton} text=${inviteRes.invite} label="Copy invite" iconOnly=${true} />
               </div>
               <p class="lede spaced">
-                Works once for <code>${inviteRes.principal}</code>
-                ${inviteRes.role ? ` (${inviteRes.role})` : ''}.
+                ${technical
+                  ? html`
+                      Works once, for the next ${formatInviteValidity(inviteRes.validMinutes)}, as
+                      <code>${inviteRes.principal}</code>
+                      ${inviteRes.role ? ` (${inviteRes.role})` : ''}.
+                    `
+                  : `Works once, for the next ${formatInviteValidity(inviteRes.validMinutes)}. The device will be able to: ${describeRolePlain(inviteRes.role)}.`}
               </p>
             </div>
           `
@@ -494,12 +543,12 @@ function IncomingDeviceSubpage({
         <dl class=${technical ? 'kv' : 'kv plain'}>
           <dt>${technical ? 'name' : 'Device'}</dt>
           <dd>${device.name}</dd>
-          <dt>${technical ? 'principal' : 'Principal'}</dt>
+          <dt>${technical ? 'principal' : 'Identity'}</dt>
           <dd>${device.principal || 'Unknown'}</dd>
           ${device.role
             ? html`
-                <dt>${technical ? 'role' : 'Role'}</dt>
-                <dd>${device.role}</dd>
+                <dt>${technical ? 'role' : 'Access'}</dt>
+                <dd>${technical ? device.role : describeRolePlain(device.role)}</dd>
               `
             : null}
           ${device.added
@@ -652,7 +701,14 @@ function ConnectionsPage({
   }
 
   if (route.sub === 'invite' && canInvite) {
-    return html`<${InviteDeviceSubpage} link=${link} tools=${tools} nodeInfo=${nodeInfo} />`;
+    return html`
+      <${InviteDeviceSubpage}
+        link=${link}
+        tools=${tools}
+        nodeInfo=${nodeInfo}
+        technical=${technical}
+      />
+    `;
   }
 
   if (route.sub === 'add' && canFleetAdd) {
@@ -763,6 +819,13 @@ function ConnectionsPage({
 
       ${hasMakeSection
         ? html`
+            ${nodes.length === 1
+              ? html`
+                  <p class="lede spaced">
+                    Pair with a second machine so this device still works when ${nodes[0].node} is off.
+                  </p>
+                `
+              : null}
             <p class="label">Make a connection</p>
             <div class="list">
               ${link.kind === 'app'
@@ -844,7 +907,7 @@ function ConnectionsPage({
                           <span class="body">
                             <span class="title">${dev.name}</span>
                             <span class="sub">
-                              ${dev.role ? `${dev.role} · ` : ''}${dev.principal}
+                              ${dev.principal}
                               ${dev.added ? ` · paired ${formatRelativeTime(dev.added)}` : ''}
                             </span>
                           </span>
@@ -1220,7 +1283,9 @@ export function SettingsView({
     return html`
       <div class="split">
         ${indexPane}
-        <section>${renderPage(selectedPage)}</section>
+        <section>
+          <div class="settings-pane">${renderPage(selectedPage)}</div>
+        </section>
       </div>
     `;
   }

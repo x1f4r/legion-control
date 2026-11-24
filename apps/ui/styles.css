@@ -1069,9 +1069,10 @@ button.row:active {
 /* ── QR code ────────────────────────────────────────────────────────────────────────────────── */
 
 .qr-box {
-  display: grid;
+  display: inline-grid;
   justify-items: center;
-  padding: 18px;
+  max-width: 100%;
+  padding: 16px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #ffffff;
@@ -1079,10 +1080,16 @@ button.row:active {
 }
 
 .qr-box svg {
-  width: min(240px, 100%);
+  width: 220px;
+  max-width: 100%;
   height: auto;
+  aspect-ratio: 1;
   display: block;
   shape-rendering: crispEdges;
+}
+
+.settings-pane {
+  max-width: 560px;
 }
 
 /* ── Chips ──────────────────────────────────────────────────────────────────────────────────── */
@@ -1596,6 +1603,11 @@ button.row:active {
 .notice.bad {
   border-color: var(--bad);
   background: color-mix(in srgb, var(--bad) 9%, var(--surface));
+}
+
+.notice.neutral {
+  border-color: var(--line-strong);
+  background: var(--raised);
 }
 
 .notice strong {
