@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Encoding, cancelled_error, format_blake3, map_io_error, map_os_error, parse_unix_mode,
-    path_to_string, platform, run_blocking,
+    Encoding, acquire_write_lock, cancelled_error, format_blake3, map_io_error, map_os_error,
+    parse_unix_mode, path_to_string, platform, run_blocking,
 };
 
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
@@ -130,6 +130,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
 
     let checked = ctx.grant().check_path(&args.path, Access::Write)?;
     let grant = ctx.grant().clone();
+    let state_dir = ctx.paths().state_dir().to_path_buf();
     let mode = args.mode;
     let expect_hash = args.expect_hash;
     let parents = args.parents;
@@ -138,6 +139,15 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         if cancel.is_cancelled() {
             return Err(cancelled_error("fs.write"));
         }
+
+        // Hold the node-wide file-write lock across read-check-replace for `overwrite` (and
+        // `expect_hash`) so concurrent Legion calls cannot interleave. This guards against other
+        // Legion calls on this node, not against unrelated programs.
+        let _write_lock = if mode == WriteMode::Overwrite {
+            Some(acquire_write_lock(&state_dir, &cancel, "fs.write")?)
+        } else {
+            None
+        };
 
         let path = resolve_write_target(&grant, checked, mode == WriteMode::Create)?;
 
@@ -263,7 +273,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         let size = payload.len() as u64;
         let options = WriteOptions {
             mode: unix_mode,
-            no_replace: false,
+            no_replace: mode == WriteMode::Create,
         };
         write_atomic_cancellable(&path, &payload, options, &cancel, "fs.write")?;
         // `legion-os` preserves the existing file's mode on overwrite; honor an explicit
@@ -321,6 +331,7 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
     }
     let checked = ctx.grant().check_path(&args.path, Access::Write)?;
     let grant = ctx.grant().clone();
+    let state_dir = ctx.paths().state_dir().to_path_buf();
     let old = args.old;
     let new = args.new;
     let all = args.all;
@@ -330,6 +341,9 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
         if cancel.is_cancelled() {
             return Err(cancelled_error("fs.edit"));
         }
+        // Serialize read-check-replace across concurrent Legion calls on this node (guards against
+        // other Legion calls, not against external programs).
+        let _write_lock = acquire_write_lock(&state_dir, &cancel, "fs.edit")?;
         let path = resolve_write_target(&grant, checked, false)?;
         let meta = match fs::metadata(&path) {
             Ok(meta) => meta,

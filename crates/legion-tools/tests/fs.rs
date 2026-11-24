@@ -1824,3 +1824,116 @@ async fn cancelled_recursive_copy_and_remove_wait_for_worker_and_report_honest_c
     assert_eq!(err.code, ErrorCode::Cancelled);
     assert!(keep.join("one.txt").exists());
 }
+
+#[tokio::test]
+async fn concurrent_create_is_strictly_exclusive_and_expect_hash_and_edit_are_serialized() {
+    let f = Fixture::new();
+
+    // Sixteen concurrent `mode: "create"` calls racing on the same path: exactly one wins, the
+    // other fifteen fail with `exists`, and the file holds the winner's content.
+    let target = f.work.join("exclusive.txt");
+    let mut create_tasks = Vec::new();
+    for idx in 0..16 {
+        let node = f.node.clone();
+        let path = f.p(&target);
+        create_tasks.push(tokio::spawn(async move {
+            let content = format!("writer-{idx:02}");
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "fs.write",
+                    json!({"path": path, "content": content, "mode": "create"}),
+                ))
+                .await;
+            (content, res)
+        }));
+    }
+    let mut winners = Vec::new();
+    let mut exists_errors = 0;
+    for task in create_tasks {
+        let (content, res) = task.await.unwrap();
+        match res {
+            Ok(_) => winners.push(content),
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::Exists, "{err}");
+                exists_errors += 1;
+            }
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    assert_eq!(exists_errors, 15);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), winners[0]);
+
+    // Eight concurrent `expect_hash` writes sharing the initial hash: exactly one succeeds and the
+    // other seven see `conflict`.
+    let raced = f.work.join("raced.txt");
+    let init = f
+        .call("fs.write", json!({"path": f.p(&raced), "content": "v0"}))
+        .await
+        .unwrap();
+    let initial_hash = init["hash"].as_str().unwrap().to_owned();
+    let mut hash_tasks = Vec::new();
+    for idx in 0..8 {
+        let node = f.node.clone();
+        let path = f.p(&raced);
+        let expect = initial_hash.clone();
+        hash_tasks.push(tokio::spawn(async move {
+            node.call(Call::new(
+                Door::Cli,
+                "fs.write",
+                json!({
+                    "path": path,
+                    "content": format!("v-{idx}"),
+                    "expect_hash": expect,
+                }),
+            ))
+            .await
+        }));
+    }
+    let mut ok_count = 0;
+    let mut conflict_count = 0;
+    for task in hash_tasks {
+        match task.await.unwrap() {
+            Ok(_) => ok_count += 1,
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::Conflict, "{err}");
+                conflict_count += 1;
+            }
+        }
+    }
+    assert_eq!(ok_count, 1);
+    assert_eq!(conflict_count, 7);
+
+    // Six concurrent disjoint `fs.edit` calls on the same file are serialized by the node-wide
+    // write lock so none clobbers another's edit.
+    let shared = f.work.join("shared.txt");
+    std::fs::write(&shared, "a\nb\nc\nd\ne\nf\n").unwrap();
+    let mut edit_tasks = Vec::new();
+    for (old, new) in [
+        ("a", "A"),
+        ("b", "B"),
+        ("c", "C"),
+        ("d", "D"),
+        ("e", "E"),
+        ("f", "F"),
+    ] {
+        let node = f.node.clone();
+        let path = f.p(&shared);
+        edit_tasks.push(tokio::spawn(async move {
+            node.call(Call::new(
+                Door::Cli,
+                "fs.edit",
+                json!({"path": path, "old": old, "new": new}),
+            ))
+            .await
+            .unwrap()
+        }));
+    }
+    for task in edit_tasks {
+        task.await.unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(&shared).unwrap(),
+        "A\nB\nC\nD\nE\nF\n"
+    );
+}

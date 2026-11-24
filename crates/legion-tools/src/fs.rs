@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind};
 use legion_core::{CancellationToken, Ctx, Grant, Place, Registry, ToolError};
 use legion_os::OsError;
+use legion_os::lock::FileLock;
 use same_file::Handle;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -224,6 +225,37 @@ pub(crate) fn map_io_error(action: &str, path: &Path, error: io::Error) -> Error
     }
 }
 
+/// Acquires the node-wide file-write lock in `state_dir` while watching `cancel`.
+///
+/// Holding this lock from reading the current file until after its atomic replacement prevents two
+/// Legion `fs.write` / `fs.edit` calls on this node from interleaving across an `expect_hash`
+/// check or read-modify-write cycle. It serializes Legion calls only and does not guard against
+/// other programs outside Legion modifying the same file concurrently.
+pub(crate) fn acquire_write_lock(
+    state_dir: &Path,
+    cancel: &CancellationToken,
+    tool: &str,
+) -> Result<FileLock, ToolError> {
+    if let Err(error) = std::fs::create_dir_all(state_dir) {
+        return Err(map_io_error("prepare state directory", state_dir, error));
+    }
+    let lock_path = state_dir.join("fs-write.lock");
+    let mut pause = Duration::from_millis(5);
+    loop {
+        if cancel.is_cancelled() {
+            return Err(cancelled_error(tool));
+        }
+        match FileLock::try_lock_exclusive(&lock_path) {
+            Ok(guard) => return Ok(guard),
+            Err(OsError::WouldBlock { .. }) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(25));
+            }
+            Err(error) => return Err(map_os_error("lock", &lock_path, error)),
+        }
+    }
+}
+
 /// Maps a [`legion_os::OsError`] on `path` into the nearest closed [`ErrorCode`].
 pub(crate) fn map_os_error(action: &str, path: &Path, error: OsError) -> ErrorBody {
     match error {
@@ -231,6 +263,11 @@ pub(crate) fn map_os_error(action: &str, path: &Path, error: OsError) -> ErrorBo
             ErrorCode::NotFound,
             format!("{} does not exist ({detail}).", path.display()),
         ),
+        OsError::AlreadyExists { path: existing } => ErrorBody::new(
+            ErrorCode::Exists,
+            format!("{} already exists.", existing.display()),
+        )
+        .with_hint("Use mode \"overwrite\" or \"append\" to modify an existing file."),
         OsError::PermissionDenied { detail, .. } => ErrorBody::new(
             ErrorCode::Denied,
             format!("Cannot {action} {}: {detail}.", path.display()),
