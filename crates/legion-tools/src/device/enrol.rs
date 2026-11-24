@@ -329,6 +329,41 @@ fn process_enrol_blocking(
         }
     };
 
+    // Refuse enrolling the invite's own temporary key (its private seed was carried in the QR and
+    // transcripts) or any key already present on any line of authorized_keys (managed or foreign).
+    let matches_invite_key = validated_key.fingerprint == invite.fingerprint
+        || auth_keys.lines.iter().any(|line| {
+            matches!(&line.kind, LineKind::Invite { id, key_b64, .. } if id == forced_id && key_b64 == &validated_key.key_b64)
+        });
+    if matches_invite_key {
+        persist_sweep(&auth_keys, &state);
+        return (
+            Some(principal),
+            base_args,
+            Err(ErrorBody::new(
+                ErrorCode::Denied,
+                "The device public key cannot be the temporary key from the pairing invite.",
+            )
+            .with_hint(
+                "Generate a fresh Ed25519 key pair on the device and send its public key instead.",
+            )),
+        );
+    }
+    if auth_keys.contains_key_blob(&validated_key.wire_blob) {
+        persist_sweep(&auth_keys, &state);
+        return (
+            Some(principal),
+            base_args,
+            Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "That public key is already present in authorized_keys.",
+            )
+            .with_hint(
+                "Generate a fresh, dedicated Ed25519 key pair for this device and try again.",
+            )),
+        );
+    }
+
     // Resolve the principal's current role from policy.toml.
     let policy = match node.config().get::<Policy>() {
         Ok(policy) => policy,

@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use common::Home;
-use legion_tools::device::keys::InvitePayload;
+use legion_tools::device::keys::{InvitePayload, ed25519_public_key_from_seed};
 use legion_tools::testing::sshd::{
     TestSshd, generate_ed25519_keypair, key_fingerprint, write_known_hosts,
     write_openssh_ed25519_private_key,
@@ -63,7 +63,8 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     let legion_home = home.state().parent().unwrap().to_path_buf();
     let auth_keys = home.home().join("test_authorized_keys");
     let foreign_comment = "# foreign key kept verbatim\n";
-    let foreign_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockForeignKeyMaterialDoNotRemove1234567890 foreign@host\n";
+    let foreign_pub = ed25519_public_key_from_seed(&[7_u8; 32]);
+    let foreign_key = format!("{foreign_pub} foreign@host\n");
     std::fs::write(&auth_keys, format!("{foreign_comment}{foreign_key}")).unwrap();
 
     let legion_home_str = legion_home.to_string_lossy().into_owned();
@@ -168,7 +169,41 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         generate_ed25519_keypair(sshd.ssh_keygen_bin(), &device_key, "phone@controller").unwrap();
     let expected_fp = key_fingerprint(sshd.ssh_keygen_bin(), &device_pub_path).unwrap();
 
-    // 3. Connect over real ssh using the temporary key and pass an arbitrary remote command (`id`)
+    // 3a. Refusal checks over real ssh: enrolling the invite's own temporary key or an already-present
+    //     foreign key must fail cleanly and leave the invite usable.
+    let temp_pub = ed25519_public_key_from_seed(&seed);
+    for (bad_pub, expected_code) in [(&temp_pub, "denied"), (&foreign_pub, "conflict")] {
+        let bad_line = json!({
+            "enrol": 1,
+            "id": payload.id,
+            "public_key": bad_pub,
+            "name": "Rejected Key",
+        })
+        .to_string();
+        let mut child = sshd
+            .ssh_command(&temp_key, &known_hosts)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{bad_line}").unwrap();
+            stdin.flush().unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            !out.status.success(),
+            "enrolment unexpectedly accepted {bad_pub}"
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        assert_eq!(reply["ok"], json!(false));
+        assert_eq!(reply["error"]["code"], json!(expected_code));
+    }
+
+    // 3b. Connect over real ssh using the temporary key and pass an arbitrary remote command (`id`)
     //    to confirm `legion gate --enrol` ignores SSH_ORIGINAL_COMMAND and completes enrolment.
     let enrol_line = json!({
         "enrol": 1,
@@ -212,12 +247,20 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         })
     );
 
-    // Check enrolment audit record (door: ssh, tool: device.enrol, no secrets).
+    // Check enrolment audit records (denied temp key, conflict foreign key, then ok; door: ssh).
     let audit = home.audit();
-    let enrol_entry = audit
+    let enrol_entries: Vec<&Value> = audit
         .iter()
-        .find(|e| e["tool"] == json!("device.enrol"))
-        .expect("missing device.enrol audit entry");
+        .filter(|e| e["tool"] == json!("device.enrol"))
+        .collect();
+    assert_eq!(
+        enrol_entries.len(),
+        3,
+        "enrol audit entries: {enrol_entries:?}"
+    );
+    assert_eq!(enrol_entries[0]["outcome"], json!("denied"));
+    assert_eq!(enrol_entries[1]["outcome"], json!("conflict"));
+    let enrol_entry = enrol_entries[2];
     assert_eq!(enrol_entry["door"], json!("ssh"));
     assert_eq!(enrol_entry["principal"], json!("phone"));
     assert_eq!(enrol_entry["outcome"], json!("ok"));

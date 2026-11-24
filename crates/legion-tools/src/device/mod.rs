@@ -730,8 +730,9 @@ role = "owner"
     #[tokio::test]
     async fn full_invite_enrol_duplicate_name_list_and_remove_flow() {
         let h = Harness::new();
-        let foreign = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop";
-        std::fs::write(&h.auth_keys, foreign).unwrap();
+        let foreign_key = generate_ephemeral_ed25519().unwrap();
+        let foreign = format!("{} me@laptop", foreign_key.public_key);
+        std::fs::write(&h.auth_keys, &foreign).unwrap();
 
         let inv = h
             .call(
@@ -749,6 +750,7 @@ role = "owner"
         let invite_text = inv["invite"].as_str().unwrap();
         let id = inv["id"].as_str().unwrap();
         let decoded = InvitePayload::decode(invite_text).unwrap();
+        let temp_pub = keys::ed25519_public_key_from_seed(&decoded.decode_seed().unwrap());
         assert_eq!(decoded.v, 1);
         assert_eq!(decoded.id, id);
         assert_eq!(decoded.node, "tower");
@@ -790,6 +792,27 @@ role = "owner"
         let bad_key_reply = run_enrol(&h.node, id, bad_key_req.as_bytes()).await;
         assert!(!bad_key_reply.is_ok());
 
+        // Enrolling the invite's own temporary key is refused and leaves the invite untouched.
+        let self_key_req = format!(
+            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{temp_pub}\",\"name\":\"Reused Temp\"}}\n",
+        );
+        let self_key_reply = run_enrol(&h.node, id, self_key_req.as_bytes()).await;
+        assert!(matches!(
+            self_key_reply,
+            EnrolReply::Err { ref error, .. } if error.code == ErrorCode::Denied
+        ));
+
+        // Enrolling a key already present on a foreign line in authorized_keys is refused.
+        let foreign_key_req = format!(
+            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{}\",\"name\":\"Foreign Key\"}}\n",
+            foreign_key.public_key
+        );
+        let foreign_key_reply = run_enrol(&h.node, id, foreign_key_req.as_bytes()).await;
+        assert!(matches!(
+            foreign_key_reply,
+            EnrolReply::Err { ref error, .. } if error.code == ErrorCode::Conflict
+        ));
+
         // Valid enrolment succeeds.
         let req1 = format!(
             "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{} pixel@phone\",\"name\":\"My Pixel!\"}}\n",
@@ -820,6 +843,16 @@ role = "owner"
             .await
             .unwrap();
         let id2 = inv2["id"].as_str().unwrap();
+        // Enrolling an already-paired device's key is also refused.
+        let dup_device_req = format!(
+            "{{\"enrol\":1,\"id\":\"{id2}\",\"public_key\":\"{}\",\"name\":\"Duplicate Key\"}}\n",
+            device_key1.public_key
+        );
+        let dup_device_reply = run_enrol(&h.node, id2, dup_device_req.as_bytes()).await;
+        assert!(matches!(
+            dup_device_reply,
+            EnrolReply::Err { ref error, .. } if error.code == ErrorCode::Conflict
+        ));
         let device_key2 = generate_ephemeral_ed25519().unwrap();
         let req2 = format!(
             "{{\"enrol\":1,\"id\":\"{id2}\",\"public_key\":\"{}\",\"name\":\"My Pixel!\"}}\n",
@@ -866,7 +899,7 @@ role = "owner"
         assert_eq!(removed["kind"], json!("device"));
         assert_eq!(removed["removed"], json!(true));
         let auth_after = std::fs::read_to_string(&h.auth_keys).unwrap();
-        assert!(auth_after.contains(foreign));
+        assert!(auth_after.contains(&foreign));
         assert!(!auth_after.contains("legion-device:my-pixel\n"));
         assert!(auth_after.contains("legion-device:my-pixel-2\n"));
     }

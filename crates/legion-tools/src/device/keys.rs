@@ -217,8 +217,17 @@ pub struct ValidatedEd25519Key {
     pub canonical: String,
     /// Canonical standard base64 of the 51-byte SSH wire blob.
     pub key_b64: String,
+    /// Raw 51-byte OpenSSH wire blob (`u32(11) || "ssh-ed25519" || u32(32) || pk`).
+    pub wire_blob: [u8; ED25519_WIRE_BLOB_LEN],
     /// `SHA256:...` fingerprint matching `ssh-keygen -l`.
     pub fingerprint: String,
+}
+
+/// Computes the canonical `"ssh-ed25519 <base64>"` public key string for a 32-byte Ed25519 seed.
+pub fn ed25519_public_key_from_seed(seed: &[u8; 32]) -> String {
+    let signing = SigningKey::from_bytes(seed);
+    let blob = encode_ed25519_wire_blob(&signing.verifying_key().to_bytes());
+    format!("ssh-ed25519 {}", STANDARD.encode(blob))
 }
 
 /// Strictly validates a caller-supplied `ssh-ed25519` public key for enrolment.
@@ -314,9 +323,13 @@ pub fn validate_ed25519_public_key(raw: &str) -> Result<ValidatedEd25519Key, Err
         }
     }
 
+    let mut wire_blob = [0_u8; ED25519_WIRE_BLOB_LEN];
+    wire_blob.copy_from_slice(&blob);
+
     Ok(ValidatedEd25519Key {
         canonical: format!("ssh-ed25519 {canonical_b64}"),
         key_b64: canonical_b64,
+        wire_blob,
         fingerprint: fingerprint_blob(&blob),
     })
 }

@@ -15,6 +15,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use jiff::Timestamp;
 use legion_core::Paths;
 use legion_core::config::NodeFile;
@@ -551,6 +553,37 @@ impl AuthKeysFile {
         }
         out
     }
+
+    /// Returns `true` if any key line in the file (managed by Legion or foreign) carries a public
+    /// key whose decoded SSH wire blob equals `target_blob`.
+    pub fn contains_key_blob(&self, target_blob: &[u8]) -> bool {
+        self.lines
+            .iter()
+            .filter_map(|line| extract_line_key_blob(&line.raw))
+            .any(|blob| blob == target_blob)
+    }
+}
+
+/// Extracts and base64-decodes the SSH key wire blob from any `authorized_keys` line (foreign or
+/// Legion-managed), returning `None` for comments, blank lines, or unparseable lines.
+fn extract_line_key_blob(raw: &[u8]) -> Option<Vec<u8>> {
+    let body = raw
+        .strip_suffix(b"\n")
+        .unwrap_or(raw)
+        .strip_suffix(b"\r")
+        .unwrap_or_else(|| raw.strip_suffix(b"\n").unwrap_or(raw));
+    let text = std::str::from_utf8(body).ok()?;
+    let trimmed = text.trim_start_matches([' ', '\t']);
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (_, rest) = split_options_and_rest(trimmed);
+    let (key_type, after_type) = split_ws_token(rest)?;
+    if !is_known_ssh_key_type(key_type) {
+        return None;
+    }
+    let (key_b64, _) = split_ws_token(after_type)?;
+    STANDARD.decode(key_b64).ok()
 }
 
 /// Reads `path`, returning an empty [`AuthKeysFile`] when the file does not exist yet.
