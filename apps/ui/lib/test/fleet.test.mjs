@@ -54,11 +54,81 @@ test('serializeFleetCache keeps only non-secret machine fields and hydrateFleetC
   assert.equal(hydrated.machines[0].name, 'tower');
   assert.equal(hydrated.machines[0].status, 'asking');
   assert.equal(hydrated.machines[1].name, 'laptop');
+  assert.equal(hydrated.machines[1].status, 'offline');
+  assert.equal(hydrated.machines[1].asking, false);
   assert.equal(hydrated.machines[1].canWake, true);
   assert.equal(hydrated.machines[1].lastSeenAt, 1699990000000);
 
   // Different node does not reuse another node's cached fleet.
   assert.equal(hydrateFleetCache(saved, 'other'), null);
+});
+
+test('refreshFleetProgressive keeps previously-off machines offline without asking and throttles rechecks', async () => {
+  const pinged = [];
+  const link = {
+    async call(tool, args = {}) {
+      if (tool === 'fleet.list') {
+        return {
+          node: 'tower',
+          machines: [
+            { name: 'tower', this_node: true, systems: [], wake_via: [] },
+            { name: 'laptop', this_node: false, systems: [], wake_via: ['pi'] },
+          ],
+        };
+      }
+      if (tool === 'meta.version') return { version: '0.1.0', os: 'linux', arch: 'x86_64' };
+      if (tool === 'sys.info') return { os: { family: 'linux', arch: 'x86_64' }, uptime_s: 10, cpu: { usage_pct: 5 }, memory: { total: 100, used: 10 }, disks: [], gpus: [] };
+      if (tool === 'job.list') return { jobs: [] };
+      if (tool === 'power.status') return { system: 'linux', busy: { state: 'idle', reasons: [] } };
+      if (tool === 'fleet.ping') {
+        pinged.push(...(args.machines || []));
+        return { results: [{ machine: 'laptop', reachable: false, error: { code: 'unreachable', message: 'Off' } }] };
+      }
+      throw new Error(`unexpected ${tool}`);
+    },
+  };
+
+  const t0 = 1_700_000_000_000;
+  const cached = serializeFleetCache(
+    'tower',
+    [
+      { name: 'tower', thisNode: true, reachable: true, lastSeenAt: t0 },
+      { name: 'laptop', thisNode: false, reachable: false, lastSeenAt: t0 - 86_400_000, lastCheckedAt: t0 },
+    ],
+    t0,
+  );
+  const hydrated = hydrateFleetCache(cached, 'tower');
+
+  // Within 2 minutes and not forced: laptop stays offline and is not pinged.
+  const seenStatuses = [];
+  await refreshFleetProgressive({
+    link,
+    localNode: 'tower',
+    initialMachines: hydrated.machines,
+    now: () => t0 + 30_000,
+    onUpdate(snap) {
+      const m = snap.machines.find((x) => x.name === 'laptop');
+      if (m) seenStatuses.push(m.status);
+    },
+  });
+  assert.deepEqual(pinged, []);
+  assert.ok(seenStatuses.every((s) => s === 'offline'));
+
+  // Explicit pull-to-refresh (forceOffline: true) checks quietly while staying offline (never asking).
+  seenStatuses.length = 0;
+  await refreshFleetProgressive({
+    link,
+    localNode: 'tower',
+    initialMachines: hydrated.machines,
+    forceOffline: true,
+    now: () => t0 + 35_000,
+    onUpdate(snap) {
+      const m = snap.machines.find((x) => x.name === 'laptop');
+      if (m) seenStatuses.push(m.status);
+    },
+  });
+  assert.deepEqual(pinged, ['laptop']);
+  assert.ok(seenStatuses.every((s) => s === 'offline'));
 });
 
 test('refreshFleetProgressive shows local node first, pings once per remote, and skips detail calls for offline machines', async () => {

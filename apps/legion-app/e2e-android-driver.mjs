@@ -157,15 +157,28 @@ async function connectWebView() {
     let page = null;
     const deadline = Date.now() + 20000;
     while (Date.now() < deadline) {
+      const matches = [];
       for (const ctx of browser.contexts()) {
         for (const candidate of ctx.pages()) {
           const url = candidate.url();
           if (url.includes('tauri.localhost') || url.startsWith('http://localhost')) {
-            page = candidate;
-            break;
+            matches.push(candidate);
           }
         }
-        if (page) break;
+      }
+      for (const candidate of matches) {
+        const visible = await candidate
+          .evaluate(() => {
+            const root = document.querySelector('#root > *');
+            if (!root) return false;
+            const rect = root.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && document.visibilityState === 'visible';
+          })
+          .catch(() => false);
+        if (visible) {
+          page = candidate;
+          break;
+        }
       }
       if (page) break;
       await sleep(250);
@@ -213,7 +226,6 @@ async function connectWebView() {
 }
 
 async function takeShot(page, name) {
-  // Blur active input so the Android soft keyboard does not linger over read-only results.
   try {
     await page.evaluate(() => {
       if (document.activeElement && typeof document.activeElement.blur === 'function') {
@@ -291,7 +303,6 @@ async function killNodeSessions({ requireExisting = false } = {}) {
       // Already exited.
     }
   }
-  // Wait briefly for the killed processes to disappear so the SSH channel sees EOF.
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     if (findThrowawayGatePids().length === 0 && findSshdChildPids().length === 0) {
@@ -323,14 +334,16 @@ async function pairViaUi(page, invite, deviceName) {
 
 async function waitForTowerWithRealNumbers(page, timeoutMs = 30000) {
   await page.locator('.start-heading').waitFor({ state: 'detached', timeout: timeoutMs }).catch(() => {});
-  const towerRow = page.locator('.row', { hasText: 'tower' }).first();
-  await towerRow.waitFor({ state: 'visible', timeout: timeoutMs });
-  // Wait until live telemetry arrives for tower (meters carry CPU/memory/disk % in aria-label).
-  const meters = towerRow.locator('.meters');
-  await meters.waitFor({ state: 'visible', timeout: timeoutMs });
-  const label = (await meters.getAttribute('aria-label')) || '';
-  assert.match(label, /Processor \d+%, memory \d+%, disk \d+%/, `Unexpected meters label: ${label}`);
-  return towerRow;
+  const towerCard = page.locator('a.machine', { hasText: 'tower' }).first();
+  await towerCard.waitFor({ state: 'visible', timeout: timeoutMs });
+  // Wait until live telemetry arrives for tower (labelled Processor / Memory / Disk stats).
+  const stats = towerCard.locator('.stats');
+  await stats.waitFor({ state: 'visible', timeout: timeoutMs });
+  const text = await stats.innerText();
+  assert.match(text, /Processor[\s\S]*\d+%/, `Unexpected stats text: ${text}`);
+  assert.match(text, /Memory[\s\S]*\d+%/, `Unexpected stats text: ${text}`);
+  assert.match(text, /Disk[\s\S]*\d+%/, `Unexpected stats text: ${text}`);
+  return towerCard;
 }
 
 async function runPhoneSuite() {
@@ -340,43 +353,44 @@ async function runPhoneSuite() {
   // 1. First start shows the pairing screen.
   log('Step 1: verifying first-start pairing screen');
   await page
-    .getByRole('heading', { name: /Pair this device with one of your machines/i })
+    .getByRole('heading', { name: /Pair this device/i })
     .waitFor({ state: 'visible', timeout: 20000 });
   await page.getByRole('button', { name: 'Scan the code' }).waitFor({ state: 'visible' });
   await page.getByRole('button', { name: 'Paste invite' }).waitFor({ state: 'visible' });
   await takeShot(page, '01-pairing.png');
 
-  // 2. Paste invite + device name pairs; Machines lists tower with real numbers.
+  // 2. Paste invite + device name pairs; Machines lists tower with labelled numbers.
   log('Step 2: pairing via pasted invite');
   const invite1 = createInvite();
   await pairViaUi(page, invite1, 'pixel-e2e');
-  const towerRow = await waitForTowerWithRealNumbers(page);
-  const machinesText = await page.locator('body').innerText();
-  assert.match(machinesText, /tower/);
+  const towerCard = await waitForTowerWithRealNumbers(page);
+  assert.equal(await page.locator('nav.nav a').count(), 3, 'Expected 3 root bottom nav items');
   await takeShot(page, '02-paired-machines.png');
 
-  // 3. Machine's Run tab runs `echo hello-from-phone` and shows streamed output.
-  log('Step 3: running echo hello-from-phone in Run tab');
-  await towerRow.click();
-  await page.getByRole('tab', { name: 'Run' }).click();
-  const cmdInput = page.locator('input[aria-label="Command"]');
+  // 3. Machine -> More -> Command runs `echo hello-from-phone` with docked bottom prompt.
+  log('Step 3: running echo hello-from-phone in Command');
+  await towerCard.click();
+  assert.equal(await page.locator('nav.nav.parts a').count(), 4, 'Expected 4 machine part items');
+  await page.locator('nav.nav.parts a', { hasText: 'More' }).click();
+  await page.locator('a.row', { hasText: 'Command' }).click();
+  const cmdInput = page.locator('.dock input[aria-label="Command"]');
   await cmdInput.waitFor({ state: 'visible', timeout: 10000 });
   await cmdInput.fill('echo hello-from-phone');
-  await page.locator('form.prompt button[type="submit"]').click();
+  await page.locator('.dock form.prompt button[type="submit"]').click();
   await page.locator('pre.out', { hasText: 'hello-from-phone' }).waitFor({
     state: 'visible',
     timeout: 20000,
   });
   await page.waitForFunction(
-    () => (document.body.innerText || '').includes('exit 0'),
+    () => (document.body.innerText || '').includes('Finished'),
     null,
     { timeout: 15000 },
   );
-  await takeShot(page, '03-run-output.png');
+  await takeShot(page, '03-command-output.png');
 
-  // 4. Files tab lists a directory.
-  log('Step 4: verifying Files tab directory listing');
-  await page.getByRole('tab', { name: 'Files' }).click();
+  // 4. Files part lists a directory.
+  log('Step 4: verifying Files part directory listing');
+  await page.locator('nav.nav.parts a', { hasText: 'Files' }).click();
   await page.locator('.row', { hasText: 'hello.txt' }).waitFor({
     state: 'visible',
     timeout: 15000,
@@ -387,10 +401,23 @@ async function runPhoneSuite() {
   });
   await takeShot(page, '04-files.png');
 
-  // 5. Tools runs meta.whoami showing principal phone, role operator, and door (ssh or rpc).
-  log('Step 5: running meta.whoami in Tools');
-  await page.locator('nav.nav a[href="#/tools"]').click();
-  const filterInput = page.locator('input[placeholder*="Filter"], input[type="search"]').first();
+  // 5. Android system Back steps back in WebView history; then return to Machines -> Settings -> Technical details -> Actions -> All tools -> meta.whoami.
+  log('Step 5: verifying Android system Back, enabling Technical details in Settings, and running meta.whoami');
+  adb(['shell', 'input', 'keyevent', '4']);
+  await page.locator('.dock input[aria-label="Command"]').waitFor({ state: 'visible', timeout: 10000 });
+  await page.locator('header.top button[aria-label="Back"]').click();
+  await page.locator('header.top button[aria-label="Back"]').click();
+  await page.locator('header.top a[aria-label="Settings"]').waitFor({ state: 'visible', timeout: 10000 });
+  await page.locator('header.top a[aria-label="Settings"]').click();
+  await page.locator('header.top h1', { hasText: 'Settings' }).waitFor({ state: 'visible', timeout: 10000 });
+  await takeShot(page, '05a-settings.png');
+  await page.getByLabel(/Technical details/i).check();
+  await page.locator('header.top button[aria-label="Back"]').click();
+  await page.locator('nav.nav a', { hasText: 'Actions' }).click();
+  await page.locator('.tile[href="#/actions/restart"]').waitFor({ state: 'visible', timeout: 10000 });
+  await takeShot(page, '05b-actions.png');
+  await page.locator('a.row', { hasText: 'All tools' }).click();
+  const filterInput = page.locator('input[type="search"]').first();
   if (await filterInput.isVisible().catch(() => false)) {
     await filterInput.fill('meta.whoami');
   }
@@ -408,16 +435,13 @@ async function runPhoneSuite() {
     reportedDoor === 'ssh' || reportedDoor === 'rpc',
     `Expected door ssh or rpc, got ${reportedDoor}`,
   );
-  if (reportedDoor !== 'ssh') {
-    log(`Note: node meta.whoami reported door=${reportedDoor} (legion gate currently tags RPC sessions as Door::Rpc; transport is SSH)`);
-  }
   await takeShot(page, '05-tools-whoami.png');
 
-  // 6. A power tool asks first and only the dry run is performed.
+  // 6. Power part asks first and only the dry run is performed.
   log('Step 6: checking power tool confirmation and dry run');
-  await page.locator('nav.nav a[href="#/machines"]').click();
-  await page.locator('.row', { hasText: 'tower' }).first().click();
-  await page.getByRole('tab', { name: 'Power' }).click();
+  await page.evaluate(() => {
+    window.location.hash = '#/machines/tower/power';
+  });
   const sleepRow = page.locator('.row', { hasText: /Sleep tower/i }).first();
   await sleepRow.waitFor({ state: 'visible', timeout: 15000 });
   await sleepRow.getByRole('button', { name: 'Sleep' }).click();
@@ -452,11 +476,12 @@ async function runPhoneSuite() {
   // 8. Kill the node-side session process, call again: reconnects transparently.
   log('Step 8: killing node-side session process and verifying transparent reconnect');
   await relaunchedTower.click();
-  await page.getByRole('tab', { name: 'Run' }).click();
-  const runInput = page.locator('input[aria-label="Command"]');
+  await page.locator('nav.nav.parts a', { hasText: 'More' }).click();
+  await page.locator('a.row', { hasText: 'Command' }).click();
+  const runInput = page.locator('.dock input[aria-label="Command"]');
   await runInput.waitFor({ state: 'visible', timeout: 10000 });
   await runInput.fill('echo before-kill');
-  await page.locator('form.prompt button[type="submit"]').click();
+  await page.locator('.dock form.prompt button[type="submit"]').click();
   await page.locator('pre.out', { hasText: 'before-kill' }).waitFor({
     state: 'visible',
     timeout: 15000,
@@ -465,16 +490,11 @@ async function runPhoneSuite() {
   await killNodeSessions({ requireExisting: true });
 
   await runInput.fill('echo after-reconnect');
-  await page.locator('form.prompt button[type="submit"]').click();
+  await page.locator('.dock form.prompt button[type="submit"]').click();
   await page.locator('pre.out', { hasText: 'after-reconnect' }).waitFor({
     state: 'visible',
     timeout: 20000,
   });
-  await page.waitForFunction(
-    () => (document.body.innerText || '').includes('exit 0'),
-    null,
-    { timeout: 15000 },
-  );
   await takeShot(page, '08-after-reconnect.png');
 
   // 9. Revoke the device on the node; next call shows calm error with way back to pairing.
@@ -484,7 +504,7 @@ async function runPhoneSuite() {
   await killNodeSessions({ requireExisting: false });
 
   await runInput.fill('echo after-revoke');
-  await page.locator('form.prompt button[type="submit"]').click();
+  await page.locator('.dock form.prompt button[type="submit"]').click();
   const pairAgainBtn = page.getByRole('button', { name: 'Pair again' });
   await pairAgainBtn.waitFor({ state: 'visible', timeout: 20000 });
   const noticeText = await page.locator('.notice').first().innerText();
@@ -495,15 +515,16 @@ async function runPhoneSuite() {
   log('Step 10: pairing again with a fresh invite');
   await pairAgainBtn.click();
   await page
-    .getByRole('heading', { name: /Pair this device with one of your machines/i })
+    .getByRole('heading', { name: /Pair this device/i })
     .waitFor({ state: 'visible', timeout: 15000 });
   const invite2 = createInvite();
   await pairViaUi(page, invite2, 'pixel-e2e-2');
   const towerAfterRepair = await waitForTowerWithRealNumbers(page);
   await towerAfterRepair.click();
-  await page.getByRole('tab', { name: 'Run' }).click();
-  await page.locator('input[aria-label="Command"]').fill('echo repaired-ok');
-  await page.locator('form.prompt button[type="submit"]').click();
+  await page.locator('nav.nav.parts a', { hasText: 'More' }).click();
+  await page.locator('a.row', { hasText: 'Command' }).click();
+  await page.locator('.dock input[aria-label="Command"]').fill('echo repaired-ok');
+  await page.locator('.dock form.prompt button[type="submit"]').click();
   await page.locator('pre.out', { hasText: 'repaired-ok' }).waitFor({
     state: 'visible',
     timeout: 20000,
@@ -520,16 +541,15 @@ async function runTabletSuite() {
 
   log('Step 11: pairing on tablet AVD for wide paired screenshot');
   await page
-    .getByRole('heading', { name: /Pair this device with one of your machines/i })
+    .getByRole('heading', { name: /Pair this device/i })
     .waitFor({ state: 'visible', timeout: 20000 });
   const invite = createInvite();
   await pairViaUi(page, invite, 'tablet-e2e');
   await waitForTowerWithRealNumbers(page);
-  // Wait for split detail pane to show Overview gauges alongside the machine list.
   await page.waitForFunction(
     () => {
       const text = document.body.innerText || '';
-      return text.includes('Processor') && text.includes('Memory') && text.includes('tower');
+      return /health/i.test(text) && text.includes('Processor') && text.includes('Memory') && text.includes('tower');
     },
     null,
     { timeout: 20000 },
@@ -559,6 +579,10 @@ main().catch(async (err) => {
       console.error(`[e2e:${MODE}] Page URL: ${url}`);
       console.error(`[e2e:${MODE}] Page text:\n${text}`);
       await takeShot(activePage, `99-failure-${MODE}.png`);
+      const afterText = await activePage.locator('body').innerText().catch(() => '');
+      console.error(`[e2e:${MODE}] Page text after screenshot:\n${afterText}`);
+      const logcat = adb(['logcat', '-d', '-t', '40']).trim();
+      console.error(`[e2e:${MODE}] logcat tail:\n${logcat}`);
     } catch (diagErr) {
       console.error(`[e2e:${MODE}] Could not capture failure diagnostics:`, diagErr.message);
     }

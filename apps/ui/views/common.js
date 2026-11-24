@@ -1,8 +1,10 @@
-// Shared UI primitives: meters, notices, confirmation sheets, copy button, and JSON result viewer.
+// Shared UI primitives: meters, notices, sheets, copy button, QR code, swipe rows, and result viewer.
 
-import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import { clampPct, meterLevel, tokenizeCode } from '../lib/format.js';
+import { classifyRowSwipe } from '../lib/gestures.js';
+import { qrSvgData } from '../lib/qr.js';
 import { classifyResult, fanOutEntries, isFanOut } from '../lib/result.js';
 
 // Renders text with single-backtick spans turned into inline <code> elements (text nodes only).
@@ -92,6 +94,103 @@ export function CopyButton({ text, label = 'Copy', iconOnly = false }) {
     <button type="button" class="btn small" onClick=${onCopy}>
       ${copied ? 'Copied' : label}
     </button>
+  `;
+}
+
+// In-page SVG QR code (no network requests, no inline styles).
+export function QrCode({ text, label = 'Invite QR code' }) {
+  const data = useMemo(() => {
+    if (!text) return null;
+    try {
+      return qrSvgData(String(text));
+    } catch {
+      return null;
+    }
+  }, [text]);
+
+  if (!data) return null;
+
+  return html`
+    <div class="qr-box">
+      <svg
+        viewBox=${`0 0 ${data.viewBoxSize} ${data.viewBoxSize}`}
+        role="img"
+        aria-label=${label}
+      >
+        <path d=${data.path} fill="currentColor" />
+      </svg>
+    </div>
+  `;
+}
+
+// Wraps a list row so a leftward pointer swipe reveals a destructive/secondary action button.
+export function SwipeRow({ actionLabel, onAction, disabled = false, children }) {
+  const [open, setOpen] = useState(false);
+  const startRef = useRef(null);
+  const suppressClickRef = useRef(false);
+
+  function onPointerDown(e) {
+    if (disabled || e.button > 0) return;
+    startRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
+  }
+
+  function onPointerUp(e) {
+    const start = startRef.current;
+    startRef.current = null;
+    if (!start || start.id !== e.pointerId) return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    const decision = classifyRowSwipe({ dx, dy, currentlyOpen: open });
+    if (decision === 'reveal') {
+      e.stopPropagation();
+      suppressClickRef.current = true;
+      setOpen(true);
+    } else if (decision === 'close') {
+      e.stopPropagation();
+      suppressClickRef.current = true;
+      setOpen(false);
+    }
+  }
+
+  function onPointerCancel() {
+    startRef.current = null;
+  }
+
+  function onClickCapture(e) {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }
+
+  return html`
+    <div
+      class="swipe-row"
+      data-no-swipe="true"
+      onPointerDown=${onPointerDown}
+      onPointerUp=${onPointerUp}
+      onPointerCancel=${onPointerCancel}
+      onClickCapture=${onClickCapture}
+    >
+      ${children}
+      ${open && !disabled
+        ? html`
+            <button
+              type="button"
+              class="swipe-action"
+              onClick=${(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setOpen(false);
+                if (onAction) onAction();
+              }}
+            >
+              ${actionLabel}
+            </button>
+          `
+        : null}
+    </div>
   `;
 }
 
