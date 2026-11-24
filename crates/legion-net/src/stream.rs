@@ -16,7 +16,7 @@
 //! | `get` | `{path, offset?}` | `{size}`, then the bytes from `offset` to the end |
 //! | `put` | `{path, size, hash, offset?, mode?}` | `{offset}`; reads the rest; `{ok, size, hash}` |
 //! | `pack` | `{root, names}` | `{ready, skipped}`, then a tar stream of those names |
-//! | `unpack` | `{root}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
+//! | `unpack` | `{root, names}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
 //! | `delete` | `{root, names}` | `{removed, skipped}` |
 //!
 //! Each operation is authorised as the file tool it amounts to would be (`fs.read` for the first
@@ -29,6 +29,7 @@
 //! ends and the reason goes to stderr. A receiver that refuses replies and returns at once, which
 //! closes its input, so a sender writing to it is never left blocked.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -40,7 +41,7 @@ use legion_core::policy::Policy;
 use legion_core::{Access, Door, Grant, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
-use legion_xfer::{Entry, Hash, ManifestOptions, SkippedEntry, resolve_relative_path};
+use legion_xfer::{Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, resolve_relative_path};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -123,8 +124,11 @@ pub(crate) enum Op {
         root: String,
         names: Vec<String>,
     },
+    /// `names` are the entries planned for this archive; anything else in it is refused, so a
+    /// source can only deliver what the destination agreed to take.
     Unpack {
         root: String,
+        names: Vec<String>,
     },
     Delete {
         root: String,
@@ -227,6 +231,9 @@ pub(crate) struct UnpackDone {
     pub bytes: u64,
     #[serde(default)]
     pub skipped: Vec<SkippedEntry>,
+    /// Entries the archive carried that were not planned, refused and drained unread.
+    #[serde(default)]
+    pub unplanned: Vec<String>,
 }
 
 /// The line that ends a `delete`.
@@ -448,7 +455,7 @@ fn run<R: BufRead, W: Write>(
             mode,
         } => put(grant, &path, size, &hash, mode, input, output),
         Op::Pack { root, names } => pack(grant, &root, &names, output),
-        Op::Unpack { root } => unpack(grant, &root, input, output),
+        Op::Unpack { root, names } => unpack(grant, &root, &names, input, output),
         Op::Delete { root, names } => delete(grant, &root, &names, output),
     }
 }
@@ -694,10 +701,22 @@ fn pack<W: Write>(
 fn unpack<R: BufRead, W: Write>(
     grant: &Grant,
     root: &str,
+    names: &[String],
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Write)?;
+    let mut planned = HashSet::with_capacity(names.len());
+    let mut ancestors = HashSet::new();
+    for name in names {
+        let name = legion_xfer::validate_relative_path(name).map_err(xfer_error)?;
+        let mut parent = name.as_str();
+        while let Some((above, _)) = parent.rsplit_once('/') {
+            ancestors.insert(above.to_owned());
+            parent = above;
+        }
+        planned.insert(name);
+    }
     if fs::metadata(&root).is_ok_and(|meta| !meta.is_dir()) {
         return Err(Failure::Reply(
             ErrorBody::new(
@@ -712,7 +731,18 @@ fn unpack<R: BufRead, W: Write>(
     }
     reply(output, &UnpackReady { ready: true })?;
     let mut refused: Vec<SkippedEntry> = Vec::new();
-    let report = legion_xfer::unpack_filtered(&root, &mut *input, |rel, _| {
+    let mut unplanned: Vec<String> = Vec::new();
+    let report = legion_xfer::unpack_filtered(&root, &mut *input, |rel, kind| {
+        // A directory on the way to a planned entry may come along; nothing else may.
+        let expected = planned.contains(rel) || (kind == EntryKind::Dir && ancestors.contains(rel));
+        if !expected {
+            unplanned.push(rel.to_owned());
+            refused.push(SkippedEntry {
+                path: rel.to_owned(),
+                reason: "it was not among the entries planned for this transfer".to_owned(),
+            });
+            return false;
+        }
         match checked(grant, &root, rel, Access::Write) {
             Ok(_) => true,
             Err(error) => {
@@ -751,6 +781,7 @@ fn unpack<R: BufRead, W: Write>(
             symlinks: report.symlinks.len() as u64,
             bytes: report.bytes,
             skipped,
+            unplanned,
         },
     )
 }

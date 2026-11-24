@@ -403,7 +403,7 @@ fn pack_names_what_it_leaves_out_then_unpack_writes_the_tree() {
 
     let ran = node.run(
         None,
-        &json!({"op": "unpack", "root": "~/projects/dst"}),
+        &json!({"op": "unpack", "root": "~/projects/dst", "names": ["nested", "nested/a.txt", "nested/empty", "odd name #1.txt"]}),
         &archive,
     );
     let lines = ran.ok().lines();
@@ -445,7 +445,9 @@ fn unpack_checks_where_each_entry_lands_and_leaves_legions_own_files_alone() {
     fs::write(staging.path().join("fine.txt"), b"fine").unwrap();
     let archive = tar_of(staging.path(), &[".legion/config/policy.toml", "fine.txt"]);
 
-    let mut input = b"{\"op\":\"unpack\",\"root\":\"~\"}\n".to_vec();
+    let mut input =
+        b"{\"op\":\"unpack\",\"root\":\"~\",\"names\":[\".legion/config/policy.toml\",\"fine.txt\"]}\n"
+            .to_vec();
     input.extend_from_slice(&archive);
     let mut output = Vec::new();
     serve(&host, Some("writer"), Cursor::new(input), &mut output).unwrap();
@@ -533,7 +535,7 @@ fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     );
     node.run(
         Some("reader"),
-        &json!({"op": "unpack", "root": "~/projects/x"}),
+        &json!({"op": "unpack", "root": "~/projects/x", "names": []}),
         b"",
     )
     .refused(ErrorCode::Denied);
@@ -600,7 +602,7 @@ fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     );
     node.run(
         Some("writer"),
-        &json!({"op": "unpack", "root": node.config()}),
+        &json!({"op": "unpack", "root": node.config(), "names": []}),
         b"",
     )
     .refused(ErrorCode::Denied);
@@ -673,10 +675,36 @@ fn a_header_that_cannot_be_read_is_refused_on_the_first_line() {
 }
 
 #[test]
+fn unpack_takes_only_the_planned_entries_and_the_directories_on_their_way() {
+    let node = Node::new();
+    let staging = tempfile::tempdir().unwrap();
+    fs::create_dir_all(staging.path().join("a/b")).unwrap();
+    fs::create_dir_all(staging.path().join("stray")).unwrap();
+    fs::write(staging.path().join("a/b/wanted.txt"), b"w").unwrap();
+    fs::write(staging.path().join(".env"), b"SECRET").unwrap();
+    let archive = tar_of(
+        staging.path(),
+        &["a", "a/b", "a/b/wanted.txt", ".env", "stray"],
+    );
+    let ran = node.run(
+        None,
+        &json!({"op": "unpack", "root": "~/projects/dst", "names": ["a/b/wanted.txt"]}),
+        &archive,
+    );
+    let done = &ran.ok().lines()[1];
+    assert_eq!(done["files"], 1, "{done}");
+    assert_eq!(done["unplanned"], json!([".env", "stray"]), "{done}");
+    let dst = node.home().join("projects/dst");
+    assert!(dst.join("a/b/wanted.txt").exists());
+    assert!(!dst.join(".env").exists());
+    assert!(!dst.join("stray").exists());
+}
+
+#[test]
 fn a_refused_unpack_reads_nothing_of_what_follows() {
     let node = Node::new();
     node.policy(CONFINED);
-    let mut input = b"{\"op\":\"unpack\",\"root\":\"~/projects/x\"}\n".to_vec();
+    let mut input = b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"names\":[]}\n".to_vec();
     input.extend(std::iter::repeat_n(0u8, 1 << 20));
     let mut cursor = Cursor::new(input);
     let mut output = Vec::new();

@@ -11,6 +11,7 @@
 //! tree is listed at both ends, [`legion_xfer::plan::plan`] decides what differs, and only that is
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -546,7 +547,13 @@ impl Transfer<'_> {
             source = again;
         }
         let mut meter = Meter::new(self.ctx, self.sent, size - offset, 1, false);
-        let relayed = relay(&mut source, &mut dest, Some(size - offset), &mut meter).await;
+        let relayed = relay(
+            &mut source,
+            &mut dest,
+            Amount::Exactly(size - offset),
+            &mut meter,
+        )
+        .await;
         if let Err(broken) = relayed {
             return Err(broken.explain(source, dest).await);
         }
@@ -657,9 +664,15 @@ impl Transfer<'_> {
         if rounds.is_empty() && missing {
             rounds.push(&[]);
         }
+        let listed: HashMap<&str, &Entry> = source
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
         for names in rounds {
+            let budget = archive_budget(names, &listed);
             let done = self
-                .pack_unpack(from, to, names, &mut meter, &mut skipped)
+                .pack_unpack(from, to, names, budget, &mut meter, &mut skipped)
                 .await?;
             report.files_sent += done.files;
             report.bytes_sent += done.bytes;
@@ -676,6 +689,7 @@ impl Transfer<'_> {
         from: &End,
         to: &End,
         names: &[String],
+        budget: u64,
         meter: &mut Meter<'_>,
         skipped: &mut Vec<SkippedEntry>,
     ) -> Result<UnpackDone, ErrorBody> {
@@ -694,7 +708,7 @@ impl Transfer<'_> {
         };
         skipped.extend(on(&from.machine, ready.skipped));
         let mut dest = match self
-            .open(to, json!({"op": "unpack", "root": to.path}))
+            .open(to, json!({"op": "unpack", "root": to.path, "names": names}))
             .await
         {
             Ok(dest) => dest,
@@ -708,7 +722,7 @@ impl Transfer<'_> {
             dest.abort().await;
             return Err(error);
         }
-        if let Err(broken) = relay(&mut source, &mut dest, None, meter).await {
+        if let Err(broken) = relay(&mut source, &mut dest, Amount::AtMost(budget), meter).await {
             return Err(broken.explain(source, dest).await);
         }
         // The archive ended; it is whole only if the source says it finished.
@@ -719,7 +733,27 @@ impl Transfer<'_> {
         dest.end_input().await;
         let done = dest.first::<UnpackDone>().await;
         dest.close().await;
-        done
+        let done = done?;
+        if !done.unplanned.is_empty() {
+            let shown: Vec<&String> = done.unplanned.iter().take(MOST_LISTED).collect();
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "{} sent {} entries that were not planned for this transfer, and {} refused them: {}.",
+                    from.machine,
+                    done.unplanned.len(),
+                    to.machine,
+                    shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            )
+            .with_hint(format!(
+                "legion on {} is not behaving as it should; what was planned arrived, and nothing else was written.",
+                from.machine
+            ))
+            .with_details(json!({"unplanned": shown, "files_sent": done.files}))
+            .with_machine(from.machine.clone()));
+        }
+        Ok(done)
     }
 
     async fn manifest(&self, end: &End, args: &TransferArgs) -> Result<Manifest, ErrorBody> {
@@ -1134,6 +1168,8 @@ fn with_machine(error: ErrorBody, machine: &str) -> ErrorBody {
 enum Broken {
     /// The source's output failed or ended before it should have.
     Source(String),
+    /// The source sent more than it may: the limit it went past.
+    Excess(u64),
     /// The destination stopped taking input.
     Destination(String),
 }
@@ -1147,6 +1183,19 @@ impl Broken {
                 source.abort().await;
                 dest.abort().await;
                 error
+            }
+            Broken::Excess(limit) => {
+                let machine = source.machine.clone();
+                source.abort().await;
+                dest.abort().await;
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "{machine} sent more than the {limit} bytes that were planned, so the transfer was stopped there."
+                    ),
+                )
+                .with_hint("The source may have grown while it was sent; run the transfer again. If it keeps happening, legion there is not behaving as it should.")
+                .with_machine(machine)
             }
             Broken::Destination(what) => {
                 // A destination that refused mid-way says why on its output before it exits.
@@ -1162,21 +1211,37 @@ impl Broken {
     }
 }
 
-/// Copies the source's output to the destination's input in fixed chunks: `exact` bytes, or to
-/// the end of the source's output.
+/// How much a relay may move.
+#[derive(Clone, Copy, Debug)]
+enum Amount {
+    /// A file's bytes from the offset on, exactly as many as its source announced.
+    Exactly(u64),
+    /// An archive, which ends when its source ends it and is cut off once it passes this many
+    /// bytes: what the planned entries can take, headers included.
+    AtMost(u64),
+}
+
+/// Copies the source's output to the destination's input in fixed chunks, never more than
+/// `amount` allows: a source that sends more is stopped before the excess reaches the destination.
 async fn relay(
     source: &mut Conn,
     dest: &mut Conn,
-    exact: Option<u64>,
+    amount: Amount,
     meter: &mut Meter<'_>,
 ) -> Result<(), Broken> {
     let mut buf = vec![0u8; CHUNK];
     let mut copied = 0u64;
+    let limit = match amount {
+        Amount::Exactly(total) | Amount::AtMost(total) => total,
+    };
     loop {
-        let want = match exact {
-            Some(total) => usize::try_from(total - copied).unwrap_or(CHUNK).min(CHUNK),
-            None => CHUNK,
+        // An archive is read one byte past its limit, to tell an archive that ends there from one
+        // that goes on.
+        let room = match amount {
+            Amount::Exactly(_) => limit - copied,
+            Amount::AtMost(_) => limit - copied + 1,
         };
+        let want = usize::try_from(room).unwrap_or(CHUNK).min(CHUNK);
         if want == 0 {
             break;
         }
@@ -1186,12 +1251,15 @@ async fn relay(
             .await
             .map_err(|error| Broken::Source(format!("while it sent ({error})")))?;
         if read == 0 {
-            if exact.is_some() {
+            if let Amount::Exactly(_) = amount {
                 return Err(Broken::Source(format!(
                     "after {copied} bytes, before the rest"
                 )));
             }
             break;
+        }
+        if copied + read as u64 > limit {
+            return Err(Broken::Excess(limit));
         }
         dest.write(&buf[..read])
             .await
@@ -1199,7 +1267,38 @@ async fn relay(
         copied += read as u64;
         meter.add(&buf[..read]);
     }
+    if let Amount::Exactly(_) = amount {
+        // All that was announced has passed; a source that has more is not behaving.
+        let mut more = [0u8; 1];
+        if let Ok(Ok(read)) = tokio::time::timeout(EXIT_WAIT, source.reader.read(&mut more)).await
+            && read > 0
+        {
+            return Err(Broken::Excess(limit));
+        }
+    }
     Ok(())
+}
+
+/// The most bytes an archive of `names` can take: each entry's content padded to whole tar
+/// blocks, and room for its headers, a long name or link target and an extended header for a
+/// time before 1970, then the blocks that end an archive. A source that sends more is not sending
+/// what was planned.
+fn archive_budget(names: &[String], listed: &HashMap<&str, &Entry>) -> u64 {
+    const BLOCK: u64 = 512;
+    let padded = |len: u64| len.div_ceil(BLOCK) * BLOCK;
+    let entries: u64 = names
+        .iter()
+        .map(|name| {
+            let (size, target) = listed.get(name.as_str()).map_or((0, 0), |entry| {
+                (
+                    entry.size,
+                    entry.link_target.as_ref().map_or(0, String::len),
+                )
+            });
+            4 * BLOCK + padded(size) + 2 * padded(name.len() as u64 + 1) + padded(target as u64 + 1)
+        })
+        .sum();
+    entries + 20 * BLOCK
 }
 
 /// Counts what passes and tells the caller a few times a second.

@@ -67,6 +67,10 @@ fn main() -> ExitCode {
             ends_are_parsed_and_unknown_machines_named,
         ),
         (
+            "a_source_cannot_send_what_was_not_planned",
+            a_source_cannot_send_what_was_not_planned,
+        ),
+        (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
             gate_serves_only_the_connectors_commands_pinned_to_its_principal,
         ),
@@ -166,12 +170,69 @@ fn helper(args: &[String]) -> ExitCode {
             drop(child_in);
             exit_of(child.wait().unwrap())
         }
-        "cut" | "slow" => exit_of(command.status().unwrap()),
+        // A source that does not keep to the protocol, in the way `extra[0]` names.
+        "evil" if subcommand == "stream" => evil(&extra[0], command),
+        "cut" | "slow" | "evil" => exit_of(command.status().unwrap()),
         other => {
             eprintln!("unknown helper mode {other}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Runs `legion stream` behind a source that misbehaves: it rewrites the header it passes on and
+/// the replies it passes back.
+fn evil(behaviour: &str, mut command: Command) -> ExitCode {
+    let mut input = BufReader::new(std::io::stdin());
+    let mut line = String::new();
+    input.read_line(&mut line).unwrap();
+    let mut header: Value = serde_json::from_str(&line).unwrap();
+    let op = header["op"].as_str().unwrap().to_owned();
+    match (behaviour, op.as_str()) {
+        // Packs more than it was asked for: files it never listed.
+        ("extra-entries", "pack") => header["names"] = json!(["readme.txt", ".env", "other.txt"]),
+        ("oversized", "pack") => header["names"] = json!(["readme.txt", "big.bin"]),
+        _ => {}
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_in = child.stdin.take().unwrap();
+    writeln!(child_in, "{header}").unwrap();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut input, &mut child_in);
+    });
+    let mut replies = BufReader::new(child.stdout.take().unwrap());
+    let mut out = std::io::stdout().lock();
+    match (behaviour, op.as_str()) {
+        // Lists only readme.txt, whatever is there.
+        ("extra-entries" | "oversized", "manifest") => {
+            let mut kept = 0;
+            for line in replies.lines() {
+                let mut reply: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if reply.get("done").is_some() {
+                    reply["entries"] = json!(kept);
+                } else if reply["path"] != "readme.txt" {
+                    continue;
+                } else {
+                    kept += 1;
+                }
+                writeln!(out, "{reply}").unwrap();
+            }
+        }
+        // Sends more than the size it announced.
+        ("extra-bytes", "get") => {
+            std::io::copy(&mut replies, &mut out).unwrap();
+            out.write_all(b"and then some").unwrap();
+        }
+        _ => {
+            std::io::copy(&mut replies, &mut out).unwrap();
+        }
+    }
+    out.flush().unwrap();
+    exit_of(child.wait().unwrap())
 }
 
 fn exit_of(status: std::process::ExitStatus) -> ExitCode {
@@ -946,7 +1007,7 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
     // A receiver that refuses answers and exits while the sender still has megabytes to send.
     for header in [
         json!({"op": "put", "path": "~/projects/x.bin", "size": 64 << 20, "hash": format!("blake3:{}", "0".repeat(64)), "as": "reader"}),
-        json!({"op": "unpack", "root": "~/projects/x", "as": "reader"}),
+        json!({"op": "unpack", "root": "~/projects/x", "names": [], "as": "reader"}),
     ] {
         let mut child = pi
             .command(&["stream"])
@@ -1176,5 +1237,74 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
             .contains("command=\"/home/me/.local/bin/legion gate --as agent:example\",restrict"),
         "{}",
         help.stdout
+    );
+}
+
+fn a_source_cannot_send_what_was_not_planned() {
+    let laptop = node("laptop");
+    let evil = node("evil");
+    fleet(
+        &laptop,
+        &[
+            ("evil", &evil, "evil", vec!["extra-entries".to_owned()]),
+            ("huge", &evil, "evil", vec!["oversized".to_owned()]),
+            ("chatty", &evil, "evil", vec!["extra-bytes".to_owned()]),
+        ],
+    );
+    let export = evil.home().join("export");
+    fs::create_dir_all(&export).unwrap();
+    fs::write(export.join("readme.txt"), b"read me").unwrap();
+    fs::write(export.join(".env"), b"SECRET=from-the-source").unwrap();
+    fs::write(export.join("other.txt"), b"never listed").unwrap();
+    fs::write(export.join("big.bin"), data(2 * 1024 * 1024, 21)).unwrap();
+    let work = laptop.home().join("projects/work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(work.join(".env"), b"SECRET=mine").unwrap();
+
+    // Entries it never listed are refused, the transfer fails and says which machine sent them.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "evil:~/export", "to": "~/projects/work", "exclude": [".env"]}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("evil")),
+        "{error}"
+    );
+    assert!(error.to_string().contains("other.txt"), "{error}");
+    assert_eq!(fs::read(work.join(".env")).unwrap(), b"SECRET=mine");
+    assert!(!work.join("other.txt").exists());
+    assert_eq!(fs::read(work.join("readme.txt")).unwrap(), b"read me");
+
+    // More bytes than the plan allows are cut off before they arrive.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "huge:~/export", "to": "~/projects/huge"}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("huge")),
+        "{error}"
+    );
+    assert!(!laptop.home().join("projects/huge/big.bin").exists());
+
+    // A file's source may not send more than the size it announced; nothing past it is passed on.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "chatty:~/export/readme.txt", "to": "~/readme.txt"}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("chatty")),
+        "{error}"
+    );
+    // Whatever arrived is exactly what was announced and hashed.
+    assert!(
+        fs::read(laptop.home().join("readme.txt"))
+            .ok()
+            .is_none_or(|bytes| bytes == b"read me")
     );
 }
