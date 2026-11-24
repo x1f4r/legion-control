@@ -5,93 +5,19 @@
 //! command shapes built from a fixed [`Subcommand`] and, optionally, a strictly validated program
 //! name or path.
 
-use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+pub use legion_link::{RemoteOs, StderrTail, Subcommand, TransportHandle, remote_command};
 use legion_proto::{ErrorBody, ErrorCode};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
-use crate::config::{RemoteOs, validate_program, validate_ssh_target};
-
-/// Maximum number of recent stderr lines retained for diagnostics.
-const MAX_STDERR_LINES: usize = 20;
-/// Maximum bytes kept from any single stderr line.
-const MAX_STDERR_LINE_BYTES: usize = 1024;
-/// Maximum total bytes kept across all retained stderr lines.
-const MAX_STDERR_TOTAL_BYTES: usize = 8 * 1024;
-
-/// Fixed subcommand a connector can ask the remote `legion` binary to run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Subcommand {
-    /// Newline-delimited JSON-RPC 2.0 session (`legion rpc`).
-    Rpc,
-    /// Raw bulk-data pipe (`legion stream`), used by file transfer.
-    Stream,
-}
-
-impl Subcommand {
-    /// The fixed subcommand word passed to the remote `legion` binary.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Subcommand::Rpc => "rpc",
-            Subcommand::Stream => "stream",
-        }
-    }
-}
-
-/// Builds the remote command passed as the final argument to `ssh`.
-///
-/// The remote string is always one of two fixed shapes:
-/// - Unix: invokes `sh -c '...'` so it works identically regardless of whether the remote login
-///   shell is `sh`, `bash`, `zsh` or `fish`. Without a path override, it checks `PATH` first and
-///   falls back to `$HOME/.local/bin/<program>` because non-interactive SSH rarely loads user PATH
-///   entries.
-/// - Windows: invokes `<program> <subcommand>` directly, since the Windows installer adds `legion`
-///   to `PATH`.
-pub fn remote_command(
-    os: RemoteOs,
-    subcommand: Subcommand,
-    program: Option<&str>,
-) -> Result<String, ErrorBody> {
-    let sub = subcommand.as_str();
-    match program {
-        None => Ok(match os {
-            RemoteOs::Unix => format!(
-                "sh -c 'command -v legion >/dev/null 2>&1 && exec legion {sub} || exec \"$HOME/.local/bin/legion\" {sub}'"
-            ),
-            RemoteOs::Windows => format!("legion {sub}"),
-        }),
-        Some(prog) => {
-            validate_program(prog).map_err(|reason| {
-                ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}."))
-                    .with_hint("Use a program path with no spaces or shell metacharacters.")
-            })?;
-            Ok(match os {
-                RemoteOs::Windows => format!("{prog} {sub}"),
-                RemoteOs::Unix => {
-                    if is_explicit_path(prog) {
-                        format!("sh -c 'exec {prog} {sub}'")
-                    } else {
-                        format!(
-                            "sh -c 'command -v {prog} >/dev/null 2>&1 && exec {prog} {sub} || exec \"$HOME/.local/bin/{prog}\" {sub}'"
-                        )
-                    }
-                }
-            })
-        }
-    }
-}
-
-fn is_explicit_path(program: &str) -> bool {
-    program.contains('/')
-        || program.contains('\\')
-        || program.contains(':')
-        || program.starts_with('~')
-}
+use crate::config::validate_ssh_target;
 
 /// Builds the exact argument vector passed to `ssh` (excluding `"ssh"` itself).
 pub fn ssh_args(
@@ -153,69 +79,6 @@ pub(crate) fn command_argv_for_subcommand(
             }
         }
     }
-}
-
-/// Bounded ring buffer holding the last lines written to a connector process's stderr.
-#[derive(Debug, Default)]
-pub struct StderrTail {
-    inner: Mutex<StderrBuf>,
-}
-
-#[derive(Debug, Default)]
-struct StderrBuf {
-    lines: VecDeque<String>,
-    total_bytes: usize,
-}
-
-impl StderrTail {
-    fn push_line(&self, raw: &str) {
-        let trimmed = raw.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            return;
-        }
-        let line = truncate_utf8(trimmed, MAX_STDERR_LINE_BYTES);
-        let mut buf = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        buf.total_bytes += line.len();
-        buf.lines.push_back(line);
-        while buf.lines.len() > MAX_STDERR_LINES || buf.total_bytes > MAX_STDERR_TOTAL_BYTES {
-            let Some(dropped) = buf.lines.pop_front() else {
-                break;
-            };
-            buf.total_bytes = buf.total_bytes.saturating_sub(dropped.len());
-        }
-    }
-
-    /// Joins the retained stderr lines for inclusion in error hints.
-    pub fn text(&self) -> String {
-        let buf = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        buf.lines.iter().cloned().collect::<Vec<_>>().join(" | ")
-    }
-
-    /// Whether any non-empty stderr line has been collected.
-    pub fn is_empty(&self) -> bool {
-        let buf = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        buf.lines.is_empty()
-    }
-}
-
-fn truncate_utf8(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &text[..end])
 }
 
 /// A live connector process whose stdin and stdout are piped to a remote Legion subcommand.
@@ -308,6 +171,23 @@ impl PipeHandle {
         if let Some(task) = self.stderr_task.take() {
             task.abort();
         }
+    }
+}
+
+impl TransportHandle for PipeHandle {
+    fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
+        Some(Arc::clone(&self.stderr))
+    }
+
+    fn collect_exit_info(
+        &mut self,
+        wait_limit: Duration,
+    ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+        Box::pin(PipeHandle::collect_exit_info(self, wait_limit))
+    }
+
+    fn close(self: Box<Self>, grace: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(PipeHandle::close(*self, grace))
     }
 }
 
@@ -523,6 +403,6 @@ mod tests {
         let text = tail.text();
         assert!(!text.contains("line-0"), "{text}");
         assert!(text.contains("line-49"), "{text}");
-        assert!(text.len() <= MAX_STDERR_TOTAL_BYTES + 200);
+        assert!(text.len() <= 8 * 1024 + 200);
     }
 }

@@ -44,6 +44,8 @@ neither touches the other's files.
     Cargo.toml                 workspace, shared dependency versions and lints
     crates/
       legion-proto/            wire types only: requests, replies, errors, tool specs (serde)
+      legion-link/             client side of the wire: sessions over any pipe, shared ssh commands,
+                               invites, device keys, and optional in-process ssh / local pipes
       legion-os/               the one place platforms differ: shells, process trees, detaching,
                                process identity, atomic files, locks
       legion-xfer/             the transfer engine: hashes, tree listings, plans, tar streams,
@@ -54,7 +56,7 @@ neither touches the other's files.
       legion-doors/            MCP (stdio and HTTP) and the JSON HTTP API
       legion-cli/              the `legion` binary: argument parsing and wiring
 
-Dependencies point one way: `proto, os, xfer ← core ← tools ← net ← doors ← cli`. `legion-os`
+Dependencies point one way: `proto ← link`, `proto, os, xfer ← core ← tools`, and `link, tools ← net ← doors ← cli`. `legion-os`
 and `legion-xfer` know nothing about tools or policy, and `legion-tools` never knows a call came
 from another machine; `legion-net` wraps a local registry and adds the tools that only make sense
 across machines.

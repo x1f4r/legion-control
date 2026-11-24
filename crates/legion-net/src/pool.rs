@@ -16,6 +16,7 @@ use legion_core::{
     BoxFuture, Call, CancellationToken, Ctx, EventSink, MachineEffects, Node, Paths, RouteOutcome,
     Router, VERSION,
 };
+pub use legion_proto::MAX_HOPS;
 use legion_proto::{CallParams, Effect, ErrorBody, ErrorCode, Target};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -23,11 +24,8 @@ use tokio::task::JoinSet;
 
 use crate::config::{FleetFile, MachineEntry, RemoteOs, ResolvedSystem, Transport};
 use crate::connector::{Pipe, Subcommand};
-use crate::session::{CallError, OpenError, Session};
+use crate::session::{self, CallError, OpenError, Session};
 use crate::state::StateStore;
-
-/// Maximum number of node-to-node forwards allowed for one call so routing loops cannot spin.
-pub const MAX_HOPS: u32 = 3;
 
 /// Maximum number of new remote connections opened concurrently during a fan-out or ping.
 const MAX_CONCURRENT_CONNECTS: usize = 8;
@@ -1095,7 +1093,7 @@ impl Fleet {
                     }
                 })?;
                 let session =
-                    Session::open_pipe(pipe, machine, reported_system, timeout, cancel).await?;
+                    session::open_pipe(pipe, machine, reported_system, timeout, cancel).await?;
                 Ok((session, None))
             }
             Transport::Ssh {
@@ -1127,7 +1125,7 @@ impl Fleet {
                         error: err.with_machine(machine),
                         retry_other_os: false,
                     })?;
-                    match Session::open_pipe(
+                    match session::open_pipe(
                         pipe,
                         machine,
                         reported_system.clone(),
