@@ -698,15 +698,16 @@ What happens during pairing:
 
 1. `device.invite` generates a fresh single-use Ed25519 key pair and appends one line to
    `authorized_keys` carrying `restrict`, a portable 12-digit `expiry-time` upper bound (compatible
-   with OpenSSH 8.9+), and `command="<legion> gate --enrol <id>"` (pinning `--home` when
-   `LEGION_HOME` is non-default and `--account` on Windows's shared
-   `administrators_authorized_keys`). The invite carries the node's detected Tailscale MagicDNS
-   name and Tailscale addresses (or the system hostname when Tailscale is absent), the account and
-   port, the node's sshd public host keys (pinned — scanned from local `sshd` via `ssh-keyscan`
-   first, falling back to host `.pub` files, with `host_keys_source` noting where they came from
-   and whether scanned keys differed from the files; invites without a usable host key are
-   refused), and the temporary key. Neither the invite text nor the temporary key is logged or
-   audited.
+   with OpenSSH 8.9+), and `command="<legion> gate --enrol <id> ..."` (always pinning the node's
+   resolved `--home` or `--config-dir`/`--state-dir` so SSH environment variables cannot redirect
+   the gate, plus `--account` on Windows's shared `administrators_authorized_keys`). The invite
+   carries the node's detected Tailscale MagicDNS name and Tailscale addresses (or the system
+   hostname when Tailscale is absent), the account and port, the node's sshd public host keys
+   (pinned — when `[devices] host_keys` is unset, `ssh-keyscan` against local `sshd` is intersected
+   with readable default host `.pub` files as `ssh-keyscan+files`, refusing disjoint results with a
+   `[devices] host_keys` hint, and falling back to scan alone or files alone only when the other is
+   unavailable; invites without a usable host key are refused), and the temporary key. Neither the
+   invite text nor the temporary key is logged or audited.
    **Keep the invite secret until used:** `device.invite` returns the invite text (which carries
    the temporary private key seed) in its tool result, so invoking `device.invite` through an AI
    agent puts the live invite into that agent's conversation transcript. Run `legion pair` directly
@@ -718,19 +719,27 @@ What happens during pairing:
    temporary key stops working at its exact expiry because `legion gate --enrol` refuses it and
    the expired line is swept on the next `device.*` command), refuses enrolling the invite's own
    temporary key or any key already present in `authorized_keys`, replaces the temporary line with
-   a permanent `restrict,command="<legion> gate --as phone --device <name>"` line, records the
-   device in `state/devices.json`, and writes an audit record (`door: "ssh"`,
-   `tool: "device.enrol"`). The temporary key immediately stops working.
+   a permanent `restrict,command="<legion> gate --as phone --device <name> ..."` line pinning the
+   node's config and state directories, records the device in `state/devices.json`, and writes an
+   audit record (`door: "ssh"`, `tool: "device.enrol"`, `device: "<name>"`). The temporary key
+   immediately stops working. Every subsequent call served through `legion gate` is reported and
+   audited with `door: "ssh"` (and `device: "<name>"` when `--device` is set).
 
 Inspect paired devices and pending invites, or revoke one at once (removing a paired device also
-terminates any active sessions and same-account SSH connections for that device immediately and
-reports `sessions_ended`; detached background jobs the device started keep running and their IDs are
-reported in `jobs_left_running`, so cancel them separately with `job.cancel` if needed):
+terminates any active sessions and same-account parent `sshd` connections — including multiplexed
+`ControlMaster` connections — immediately and reports `sessions_ended`, while `legion gate`
+re-checks `authorized_keys` after registering so a newly opened channel on an already-open
+connection is refused too; detached background jobs the device started keep running and their IDs
+are reported in `jobs_left_running`, so cancel them separately with `job.cancel` if needed). For
+owner callers, `device.list` also shows Legion lines pointing at another or deleted Legion home
+(`foreign: true`, `missing_home: true`, `home`), `meta.doctor` warns about orphaned keys, and
+`device.remove ... foreign=true` cleans them up:
 
 ```sh
 legion device.list
 legion device.remove name=my-phone
 legion device.remove id=<invite-id>
+legion device.remove name=old-phone foreign=true
 ```
 
 ### Overriding `authorized_keys` and host keys (`[devices]`)
@@ -740,10 +749,11 @@ By default Legion edits `~/.ssh/authorized_keys` (on Windows, when the account i
 `%ProgramData%\ssh\administrators_authorized_keys`, sets its owner to `BUILTIN\Administrators`
 alongside the `Administrators` and `SYSTEM` ACL, pins `--account` on forced commands so each
 administrator sees and manages only their own entries, and quotes forced commands for the shell
-configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` — `cmd.exe` by default or PowerShell when set).
-Host keys prefer `ssh-keyscan` against local `sshd` on the invite's port, falling back to
-`/etc/ssh/ssh_host_*_key.pub` (or `%ProgramData%\ssh\ssh_host_*_key.pub` on Windows). To override
-either for a custom sshd setup, set `[devices]` in `node.toml`:
+configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` — `cmd.exe` by default, PowerShell, or a POSIX
+shell such as Git Bash, refusing unrecognised shells clearly). Host keys intersect `ssh-keyscan`
+against local `sshd` on the invite's port with `/etc/ssh/ssh_host_*_key.pub` (or
+`%ProgramData%\ssh\ssh_host_*_key.pub` on Windows), refusing disjoint keys unless configured
+explicitly. To override either for a custom sshd setup, set `[devices]` in `node.toml`:
 
 ```toml
 [devices]

@@ -118,7 +118,7 @@ Validate and atomically replace one shared configuration document (fleet.toml, p
 | --- | --- | --- |
 | `device.invite` | `admin` | Create a single-use pairing invite for a remote device to connect over SSH, pinned to one principal that policy.toml names and the caller could act as itself. |
 | `device.list` | `admin` | List paired devices and pending pairing invites for principals the caller could act as, reading authorized_keys as the source of truth joined with recorded metadata, and sweeping any expired or used invites. |
-| `device.remove` | `admin` | Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions for a removed device. |
+| `device.remove` | `admin` | Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions and same-account SSH connections for a removed device. |
 
 ### `device.invite`
 
@@ -139,7 +139,7 @@ Create a single-use pairing invite for a remote device to connect over SSH, pinn
 
 Effect: `admin`
 
-List paired devices and pending pairing invites for principals the caller could act as, reading authorized_keys as the source of truth joined with recorded metadata, and sweeping any expired or used invites.
+List paired devices and pending pairing invites for principals the caller could act as, reading authorized_keys as the source of truth joined with recorded metadata, and sweeping any expired or used invites. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).
 
 Takes no arguments.
 
@@ -147,12 +147,13 @@ Takes no arguments.
 
 Effect: `admin`
 
-Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions for a removed device.
+Remove a paired device by name or revoke a pending pairing invite by id for a principal the caller could act as, deleting its authorized_keys line(s) and recorded metadata and immediately ending any live sessions and same-account SSH connections for a removed device. Detached background jobs the device started keep running and are listed in `jobs_left_running` (stop them separately with `job.cancel` if needed). Pass `foreign=true` (owner role only) to remove a Legion line belonging to another or missing Legion home.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `name` | `string` | no | - | Paired device name to remove, as `device.list` shows it. Give `name` or `id`, not both. |
 | `id` | `string` | no | - | Pending invite id to revoke, as `device.list` shows it. Give `name` or `id`, not both. |
+| `foreign` | `boolean` | no | `false` | Remove a Legion device or invite line belonging to another or missing Legion home (owner role only). Off unless given as true. |
 
 ## exec
 

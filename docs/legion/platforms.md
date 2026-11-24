@@ -89,23 +89,27 @@ leaves it.
    temporary key, adds it to `authorized_keys` with a forced command that can only enrol a device
    and with a portable 12-digit `expiry-time` bound (compatible with OpenSSH 8.9+), and prints an
    invite as a QR code and as text. The invite carries where to connect (the Tailscale name when
-   there is one), the account, the node's ssh host keys (scanned from local `sshd` via
-   `ssh-keyscan` when available, falling back to host `.pub` files), and the temporary key. The
-   invite text is a secret until used: run `legion pair` in your own terminal rather than letting
-   an AI agent call `device.invite`, which would place the invite in the agent's transcript.
+   there is one), the account, the node's ssh host keys (when `[devices] host_keys` is unset,
+   intersecting `ssh-keyscan` with readable host `.pub` files and refusing disjoint results), and
+   the temporary key. The invite text is a secret until used: run `legion pair` in your own terminal
+   rather than letting an AI agent call `device.invite`, which would place the invite in the agent's
+   transcript.
 2. In the app: scan or paste the invite. The app connects, checks the host key against the
    invite (there is no trust on first use), and hands over its public key and a name.
 3. The node enforces exact UTC expiry against `state/devices.json` (and refuses the temporary key
    or any key already present in `authorized_keys`), replaces the temporary line with a permanent
-   one that forces `legion gate --as <principal> --device <name>` (plus `--account` on Windows's
-   shared `administrators_authorized_keys` and `--home` when `LEGION_HOME` is non-default),
-   records the device, and audits it. From then on the device can only speak the Legion protocol as
-   that principal, with that principal's role.
+   one that forces `legion gate --as <principal> --device <name>` (always pinning `--home` or
+   `--config-dir`/`--state-dir`, plus `--account` on Windows's shared
+   `administrators_authorized_keys`), records the device, and audits it with `door: "ssh"`. From
+   then on the device can only speak the Legion protocol as that principal, with that principal's
+   role, and every call it makes is reported and audited with `door: "ssh"` and its device name.
 
-`device.list` shows paired devices (and sweeps expired invites recorded by this home) and
-`device.remove` removes the key and immediately terminates any live sessions for that device.
-Making an invite needs the `admin` effect and follows the token rule: only for a principal the
-caller could act as, and never via a forwarded or local expiring credential.
+`device.list` shows paired devices (and sweeps expired invites recorded by this home, plus reports
+foreign or orphaned Legion lines for owner callers) and `device.remove` removes the key, immediately
+terminates any live sessions and same-account parent `sshd` connections for that device, and reports
+any background jobs the device left running in `jobs_left_running` without killing them. Making an
+invite needs the `admin` effect and follows the token rule: only for a principal the caller could
+act as, and never via a forwarded or local expiring credential.
 
 The key is kept in the app's private storage, like the earlier Android app did. Wrapping it with
 the platform's hardware keystore is a later step.

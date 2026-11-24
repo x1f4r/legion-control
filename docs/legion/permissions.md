@@ -183,21 +183,27 @@ command="/home/me/.local/bin/legion gate --as script:backup",restrict ssh-ed2551
 Use the absolute path to `legion`. `restrict` disables port forwarding, agent forwarding, X11
 forwarding, and PTY allocation. Whatever command the SSH client asks for, `sshd` starts
 `legion gate --as <principal>` and passes the client's request in `SSH_ORIGINAL_COMMAND`. `gate`
-never invokes a shell and never executes `SSH_ORIGINAL_COMMAND`: it compares it byte-for-byte
-against the exact command shapes Legion's SSH connector sends for `legion rpc` and `legion stream`,
-serves the session directly pinned to `<principal>`, and refuses anything else with exit code 1.
+ignores `LEGION_HOME`, `XDG_CONFIG_HOME`, and `XDG_STATE_HOME` from the SSH environment (relying
+only on explicit `--home` or `--config-dir`/`--state-dir` flags or the account's standard paths, and
+refusing to serve if a pinned home is missing rather than recreating it), never invokes a shell, and
+never executes `SSH_ORIGINAL_COMMAND`: it compares it byte-for-byte against the exact command shapes
+Legion's SSH connector sends for `legion rpc` and `legion stream`, serves the session directly
+pinned to `<principal>` with `door: "ssh"`, and refuses anything else with exit code 1.
 
 ### Paired devices
 
 A device paired with `legion pair` (`device.invite`) receives its own `authorized_keys` line forced
-through `legion gate --as <principal> --device <name>` with `restrict` (plus `--home` when
-`LEGION_HOME` is non-default and `--account` on Windows's shared
-`administrators_authorized_keys`). Once paired, it can only speak `legion rpc` and `legion stream`
-pinned to `<principal>` — never an interactive shell, arbitrary command, PTY, or forwarding — and
-may do only what `<principal>`'s role in `policy.toml` allows (a real wall for roles without
-`exec`, and still as strong as the OS account if given `exec`). Requests naming a different `as`
-are ignored, and calls forwarded to other nodes with `on` are re-checked by each target node's own
-`policy.toml`.
+through `legion gate --as <principal> --device <name>` with `restrict`, always pinning the node's
+resolved `--home` or `--config-dir`/`--state-dir` (plus `--account` on Windows's shared
+`administrators_authorized_keys`). Legion only classifies a line as managed when it carries
+`restrict`, an exact `legion gate` command with matching `--device`/`--enrol`, and the matching
+`legion-device:`/`legion-invite:` comment, leaving every other line untouched byte for byte. Once
+paired, the device can only speak `legion rpc` and `legion stream` pinned to `<principal>` (reported
+and audited with `door: "ssh"` and `device: "<name>"`) — never an interactive shell, arbitrary
+command, PTY, or forwarding — and may do only what `<principal>`'s role in `policy.toml` allows (a
+real wall for roles without `exec`, and still as strong as the OS account if given `exec`). Requests
+naming a different `as` are ignored, and calls forwarded to other nodes with `on` are re-checked by
+each target node's own `policy.toml`.
 
 During pairing itself, the temporary key in the invite is single-use, carries a portable 12-digit
 `expiry-time` upper bound for OpenSSH 8.9+ compatibility, and is forced to
@@ -214,10 +220,16 @@ follows the same caller-scoping and `allow_owner` rules as `token.*`, and refuse
 permanent SSH key from an expiring HTTP bearer token — both locally and across remote hops (a
 forwarding node refuses to forward `device.invite` or `token.add` when the caller arrived with an
 expiring credential). Removing a device with `legion device.remove` deletes its `authorized_keys`
-line and immediately terminates any live sessions registered by `legion gate --device <name>`
-(reporting `sessions_ended`). On Windows, forced commands on shared
-`administrators_authorized_keys` pin `--account`, set file ownership to `BUILTIN\Administrators`,
-and scope `device.list` / `device.remove` to the caller's own account.
+line, immediately terminates any live gate processes and verified same-account parent `sshd`
+connections (including multiplexed `ControlMaster` connections, reporting `sessions_ended`), and
+reports any still-running background jobs started by that device in `jobs_left_running` without
+killing them. After registering its session record, `legion gate` also re-checks `authorized_keys`
+before serving so a newly opened channel on an already-authenticated connection is refused once the
+line is gone. Owner callers can inspect foreign or orphaned Legion lines in `device.list` and remove
+them explicitly with `device.remove ... foreign=true` (`meta.doctor` warns when any exist). On
+Windows, forced commands on shared `administrators_authorized_keys` pin `--account`, set file
+ownership to `BUILTIN\Administrators`, and scope `device.list` / `device.remove` to the caller's own
+account.
 
 ### HTTP bearer tokens and MCP sessions
 
