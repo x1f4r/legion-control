@@ -74,14 +74,14 @@ pub fn register(registry: &mut Registry) {
     );
     registry.add_fn(
         "proj.clone",
-        Effect::Write,
-        "Clone a project's `repo` onto this machine and record where it went. The destination is `path` when given, else the path already recorded for this machine, else ~/projects/<name>; it must not exist or must be an empty directory. Reports git's progress as progress events and returns the commit checked out. Git never prompts: a repository that needs credentials git cannot find on its own fails instead of waiting.",
+        Effect::Exec,
+        "Clone a project's `repo` onto this machine and record where it went. The destination is `path` when given, else the path already recorded for this machine, else ~/projects/<name>; it must not exist or must be an empty directory. Reports git's progress as progress events and returns the commit checked out. Git never prompts: a repository that needs credentials git cannot find on its own fails instead of waiting. Git may run hooks and helpers (credential helpers, ssh) that the repository or the user configured.",
         clone,
     );
     registry.add_fn(
         "proj.pull",
-        Effect::Write,
-        "Update a project on this machine from its upstream with `git pull --ff-only`, which only ever moves the branch forward. When the branches have diverged or local changes are in the way, nothing changes and the call fails with `conflict`, carrying git's own explanation in the hint. Returns the commit before and after and a summary of what changed.",
+        Effect::Exec,
+        "Update a project on this machine from its upstream with `git pull --ff-only`, which only ever moves the branch forward. When the branches have diverged or local changes are in the way, nothing changes and the call fails with `conflict`, carrying git's own explanation in the hint. Returns the commit before and after and a summary of what changed. Git may run hooks and helpers (credential helpers, ssh) that the repository or the user configured.",
         pull,
     );
     registry.add_fn(
@@ -1293,6 +1293,25 @@ mod tests {
         let refused =
             task_command(&task(Some("npm test"), None), "t", &extra, "windows").unwrap_err();
         assert_eq!(refused.code, ErrorCode::InvalidArgs);
+    }
+
+    #[test]
+    fn tools_that_let_git_run_programs_are_exec() {
+        let mut registry = Registry::new();
+        register(&mut registry);
+        let effect = |name: &str| registry.get(name).map(|tool| tool.spec().effect);
+        for name in ["proj.clone", "proj.pull", "proj.run"] {
+            assert_eq!(effect(name), Some(Effect::Exec), "{name}");
+            let spec = registry
+                .get(name)
+                .map(|tool| tool.spec().description.clone());
+            if name != "proj.run" {
+                assert!(spec.unwrap_or_default().contains("hooks"), "{name}");
+            }
+        }
+        for name in ["proj.list", "proj.status", "proj.discover"] {
+            assert_eq!(effect(name), Some(Effect::Read), "{name}");
+        }
     }
 
     #[test]
