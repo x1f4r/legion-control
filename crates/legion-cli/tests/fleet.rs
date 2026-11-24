@@ -51,6 +51,10 @@ fn main() -> ExitCode {
             forwards_events_and_cancellation_to_remote_node,
         ),
         (
+            "sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly",
+            sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly,
+        ),
+        (
             "multiplexes_concurrent_calls_and_reuses_one_session",
             multiplexes_concurrent_calls_and_reuses_one_session,
         ),
@@ -261,6 +265,16 @@ fn run_helper(args: &[String]) -> ExitCode {
             });
             println!("{reply}");
             let _ = std::io::stdout().flush();
+            ExitCode::SUCCESS
+        }
+        // hold <pid_file>
+        // Writes its own PID then waits up to 30s so signal tests can verify remote child cleanup.
+        "hold" => {
+            let pid_file = Path::new(&rest[0]);
+            fs::write(pid_file, std::process::id().to_string()).unwrap();
+            for _ in 0..600 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             ExitCode::SUCCESS
         }
         // fail <log_file> <stderr_message>
@@ -1500,3 +1514,179 @@ allow = ["effect:read"]
     assert_eq!(discover_add_denied.code, 1);
     assert_eq!(discover_add_denied.json()["code"], json!("denied"));
 }
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .args([&format!("-{signal}"), &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill -{signal} {pid} failed: {status}");
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(unix)]
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child {} did not exit within {timeout:?}",
+            child.id()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {
+    let laptop = Home::new();
+    let pi = Home::new();
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n",
+            toml_argv(&run_argv(&pi, None))
+        ),
+    );
+
+    // 1. One-shot CLI `exec.run` forwarded to `pi`, killed with SIGTERM: cancels remote work,
+    //    stops the remote child process, audits `cancelled` on `pi`, and exits promptly.
+    let pid_file = pi.state().join("remote-hold.pid");
+    fs::create_dir_all(pi.state()).unwrap();
+    let hold_argv = helper_argv("hold", &[pid_file.to_string_lossy().into_owned()]);
+    let argv_json = serde_json::to_string(&hold_argv).unwrap();
+    let mut cli = laptop
+        .command(&["exec.run", &format!("argv={argv_json}"), "--on", "pi"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + PATIENCE;
+    let remote_pid: u32 = loop {
+        if let Ok(text) = fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote hold process never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    send_signal(cli.id(), "TERM");
+    let status = wait_for_exit(&mut cli, PATIENCE);
+    assert!(!status.success(), "cancelled CLI should exit non-zero");
+
+    // Wait briefly for OS reaping and confirm the remote child is dead and audited as cancelled.
+    let dead_deadline = Instant::now() + Duration::from_secs(5);
+    while pid_alive(remote_pid) {
+        assert!(
+            Instant::now() < dead_deadline,
+            "remote child {remote_pid} survived SIGTERM on caller"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pi_audit = pi.audit();
+    assert!(
+        pi_audit
+            .iter()
+            .any(|e| e["tool"] == json!("exec.run") && e["outcome"] == json!("cancelled")),
+        "{pi_audit:?}"
+    );
+
+    // 2. `legion rpc` with an in-flight forwarded call killed with SIGHUP.
+    let mut rpc = laptop.session(&[]);
+    rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "test.sleep", "args": {"seconds": 30}, "on": "pi"}),
+    ));
+    loop {
+        let msg = rpc.next();
+        if msg["method"] == json!("event") && msg["params"]["id"] == json!(1) {
+            break;
+        }
+    }
+    send_signal(rpc.pid(), "HUP");
+    let _ = rpc.wait_exit(PATIENCE);
+
+    let audit_deadline = Instant::now() + PATIENCE;
+    loop {
+        let count = pi
+            .audit()
+            .iter()
+            .filter(|e| e["tool"] == json!("test.sleep") && e["outcome"] == json!("cancelled"))
+            .count();
+        if count >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < audit_deadline,
+            "pi did not record cancelled test.sleep after rpc SIGHUP"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 3. `legion mcp` with an in-flight forwarded call killed with SIGTERM.
+    let mut mcp = McpClient::start(&laptop, &[]);
+    mcp.next_id += 1;
+    let call_id = json!(mcp.next_id);
+    mcp.send(&json!({
+        "jsonrpc": "2.0",
+        "id": call_id,
+        "method": "tools/call",
+        "params": {
+            "name": "test_sleep",
+            "arguments": {"seconds": 30, "on": "pi"},
+            "_meta": {"progressToken": "sig-tok"}
+        }
+    }));
+    loop {
+        let line = mcp.lines.recv_timeout(PATIENCE).unwrap();
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        if msg["method"] == json!("notifications/progress") {
+            break;
+        }
+    }
+    send_signal(mcp.child.id(), "TERM");
+    let _ = wait_for_exit(&mut mcp.child, PATIENCE);
+
+    let audit_deadline = Instant::now() + PATIENCE;
+    loop {
+        let count = pi
+            .audit()
+            .iter()
+            .filter(|e| e["tool"] == json!("test.sleep") && e["outcome"] == json!("cancelled"))
+            .count();
+        if count >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < audit_deadline,
+            "pi did not record cancelled test.sleep after mcp SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(unix))]
+fn sigterm_and_sighup_cancel_remote_work_and_shut_down_cleanly() {}

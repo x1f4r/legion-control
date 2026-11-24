@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -153,6 +153,24 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "legion rpc did not exit within {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn send(&mut self, line: &str) {
         let stdin = self.stdin.as_mut().expect("stdin is already closed");
         stdin.write_all(line.as_bytes()).unwrap();

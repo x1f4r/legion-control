@@ -12,7 +12,7 @@ legion-core.workspace = true
 rmcp = { workspace = true, features = ["server"] }
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 # rt for the task tracker that lets a session wait for its cancelled calls to reach the audit log.
 tokio-util = { workspace = true, features = ["rt"] }
 
