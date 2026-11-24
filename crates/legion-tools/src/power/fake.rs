@@ -361,7 +361,12 @@ impl Actuator for RecordingActuator {
 /// and prints nothing.
 pub fn permissive(argv: &[String]) -> Ran {
     if argv.len() > 4 && argv[..4] == ["sudo", "-n", "-l", "-l"] {
-        let command = argv[4..].join(" ");
+        // sudo shows the command by its full path, as it resolved it.
+        let command = if argv[4].starts_with('/') {
+            argv[4..].join(" ")
+        } else {
+            format!("/usr/bin/{}", argv[4..].join(" "))
+        };
         return Ran::exited(
             0,
             format!(
