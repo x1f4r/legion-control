@@ -1,0 +1,285 @@
+name: Legion e2e
+# The workspace's own tests reach "another machine" through a local `command` connector. This run
+# reaches one over real ssh: the system ssh client, a real sshd, the far side's login shell, the
+# fixed remote command strings, scp for fleet.install and `legion gate` behind a forced key, on each
+# platform GitHub can lend us, Windows included, where no owner's machine is on to try it.
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - crates/**
+      - install/**
+      - scripts/legion-e2e.mjs
+      - .github/workflows/legion-e2e.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: legion-e2e-${{ github.ref }}
+  cancel-in-progress: true
+# Every action is pinned to the commit of the release named beside it, as in checks.yml.
+jobs:
+  e2e:
+    name: Legion e2e (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+          # Windows OpenSSH hands a session's command to cmd unless the DefaultShell registry
+          # value names another shell, and owners do switch it to PowerShell. The remote command
+          # shapes have to survive both, so both get a leg.
+          - name: Windows, cmd
+            os: windows-latest
+            shell: cmd
+          - name: Windows, PowerShell
+            os: windows-latest
+            shell: powershell
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The driver runs on Node, and the far node runs this same node binary for the programs it
+      # starts, since both nodes live on this runner.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-e2e-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-e2e-${{ runner.os }}-
+      - name: Build legion
+        run: cargo build --release --locked -p legion-cli
+
+      # Linux and macOS: a second sshd of the system's own, started for this job on a loopback
+      # port with a configuration, host key and authorized_keys made here, so nothing about the
+      # runner's own ssh setup matters and nothing listens beyond 127.0.0.1. The far node is this
+      # same account: a second user would need a home, a shell and, on macOS, directory services
+      # and SSH group membership set up first, while what makes a node a node is its LEGION_HOME,
+      # which sshd's SetEnv gives every session, the gated key's included. Its `~` is the
+      # account's real home, so fleet.install lands in ~/.local/bin as it would anywhere else; the
+      # near node lives under the work directory and is told its LEGION_HOME by the driver.
+      - name: Start a loopback sshd for the far node (Linux and macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          e2e="$RUNNER_TEMP/legion-e2e"
+          keys="$e2e/ssh"
+          far_home="$e2e/far"
+          far_bin="$HOME/.local/bin/legion"
+          mkdir -p "$keys" "$far_home"
+          chmod 700 "$e2e" "$keys"
+          if [ ! -x /usr/sbin/sshd ]; then
+            # The package would start its own sshd on every interface; policy-rc.d keeps it down.
+            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+            sudo chmod 755 /usr/sbin/policy-rc.d
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends openssh-server
+            sudo rm -f /usr/sbin/policy-rc.d
+          fi
+          for key in host far gate; do
+            ssh-keygen -q -t ed25519 -N '' -C "legion-e2e-$key" -f "$keys/$key"
+          done
+          # The gated key may only ever start `legion gate`, with the binary where fleet.install
+          # will put it; the driver checks that fleet.install agrees.
+          {
+            cat "$keys/far.pub"
+            printf 'command="%s gate --as e2e:gate",restrict %s\n' "$far_bin" "$(cat "$keys/gate.pub")"
+          } > "$keys/authorized_keys"
+          chmod 600 "$keys/authorized_keys"
+          cat > "$keys/sshd_config" <<EOF
+          ListenAddress 127.0.0.1
+          Port 2222
+          HostKey $keys/host
+          PidFile $keys/sshd.pid
+          AuthorizedKeysFile $keys/authorized_keys
+          AllowUsers $(id -un)
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          UsePAM yes
+          SetEnv LEGION_HOME=$far_home
+          Subsystem sftp internal-sftp
+          LogLevel VERBOSE
+          EOF
+          if [ "$RUNNER_OS" = Linux ]; then sudo mkdir -p /run/sshd; fi
+          sudo /usr/sbin/sshd -t -f "$keys/sshd_config"
+          sudo /usr/sbin/sshd -f "$keys/sshd_config" -E "$e2e/sshd.log"
+          printf '[127.0.0.1]:2222 %s\n' "$(cut -d' ' -f1,2 "$keys/host.pub")" > "$keys/known_hosts"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          cat >> ~/.ssh/config <<EOF
+          Host legion-e2e-far legion-e2e-gate
+            HostName 127.0.0.1
+            Port 2222
+            User $(id -un)
+            IdentitiesOnly yes
+            UserKnownHostsFile $keys/known_hosts
+            StrictHostKeyChecking yes
+          Host legion-e2e-far
+            IdentityFile $keys/far
+          Host legion-e2e-gate
+            IdentityFile $keys/gate
+          EOF
+          chmod 600 ~/.ssh/config
+          ssh -T -o BatchMode=yes legion-e2e-far 'printf "far session: LEGION_HOME=%s\n" "$LEGION_HOME"'
+          {
+            echo "E2E_DIR=$e2e"
+            echo "E2E_FAR_HOME=$far_home"
+            echo "E2E_FAR_BIN=$far_bin"
+            echo "E2E_SSHD_LOG=$e2e/sshd.log"
+          } >> "$GITHUB_ENV"
+
+      # Windows: the OpenSSH Server capability and its service, as an owner would enable it, bound
+      # to 127.0.0.1. The runner's account is an administrator, so sshd reads its keys from
+      # administrators_authorized_keys, which it ignores unless only Administrators and SYSTEM may
+      # touch it. The far node is this same account. Windows OpenSSH builds a session's
+      # environment from the account's registry, the way a logon does, so LEGION_HOME set there
+      # reaches every session while the steps of this job, started before, keep their own; that is
+      # also how a real Windows machine would set it, and how the installers' PATH entry arrives.
+      - name: Start a loopback sshd for the far node (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          E2E_SHELL: ${{ matrix.shell }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $e2e = Join-Path $env:RUNNER_TEMP 'legion-e2e'
+          $farHome = Join-Path $e2e 'far'
+          $farBin = Join-Path $env:LOCALAPPDATA 'legion\legion.exe'
+          New-Item -ItemType Directory -Force -Path $e2e, $farHome | Out-Null
+          if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+          }
+          $programData = Join-Path $env:ProgramData 'ssh'
+          New-Item -ItemType Directory -Force -Path $programData | Out-Null
+          @(
+            'ListenAddress 127.0.0.1'
+            'PubkeyAuthentication yes'
+            'PasswordAuthentication no'
+            'AuthorizedKeysFile .ssh/authorized_keys'
+            'Subsystem sftp sftp-server.exe'
+            'SyslogFacility LOCAL0'
+            'LogLevel VERBOSE'
+            'Match Group administrators'
+            '    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
+          ) | Set-Content -Path (Join-Path $programData 'sshd_config') -Encoding ascii
+          $sshDir = Join-Path $env:USERPROFILE '.ssh'
+          New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+          foreach ($name in 'legion_e2e_far', 'legion_e2e_gate') {
+            $key = Join-Path $sshDir $name
+            & ssh-keygen -q -t ed25519 -N '' -C $name -f $key
+            if ($LASTEXITCODE -ne 0) { throw "ssh-keygen failed for $name" }
+            & icacls $key /inheritance:r /grant:r "$($env:USERNAME):F" | Out-Null
+          }
+          $farPub = (Get-Content (Join-Path $sshDir 'legion_e2e_far.pub') -Raw).Trim()
+          $gatePub = (Get-Content (Join-Path $sshDir 'legion_e2e_gate.pub') -Raw).Trim()
+          $auth = Join-Path $programData 'administrators_authorized_keys'
+          @($farPub, "command=""$farBin gate --as e2e:gate"",restrict $gatePub") | Set-Content -Path $auth -Encoding ascii
+          & icacls $auth /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+          # Each leg sets the shell it tests rather than taking the image's: the cmd leg removes any
+          # DefaultShell, and both check below, through ssh, which shell sshd actually used.
+          if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) { New-Item -Path 'HKLM:\SOFTWARE\OpenSSH' | Out-Null }
+          if ($env:E2E_SHELL -eq 'powershell') {
+            New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -PropertyType String -Force `
+              -Value (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') | Out-Null
+          } else {
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name DefaultShell -ErrorAction SilentlyContinue
+          }
+          [Environment]::SetEnvironmentVariable('LEGION_HOME', $farHome, 'User')
+          Set-Service -Name sshd -StartupType Manual
+          Start-Service -Name sshd
+          $hostKey = (Get-Content (Join-Path $programData 'ssh_host_ed25519_key.pub') -Raw).Trim() -split ' '
+          $knownHosts = Join-Path $sshDir 'legion_e2e_known_hosts'
+          "127.0.0.1 $($hostKey[0]) $($hostKey[1])" | Set-Content -Path $knownHosts -Encoding ascii
+          $slashed = { param($p) $p -replace '\\', '/' }
+          @(
+            'Host legion-e2e-far legion-e2e-gate'
+            '  HostName 127.0.0.1'
+            "  User $env:USERNAME"
+            '  IdentitiesOnly yes'
+            "  UserKnownHostsFile $(& $slashed $knownHosts)"
+            '  StrictHostKeyChecking yes'
+            'Host legion-e2e-far'
+            "  IdentityFile $(& $slashed (Join-Path $sshDir 'legion_e2e_far'))"
+            'Host legion-e2e-gate'
+            "  IdentityFile $(& $slashed (Join-Path $sshDir 'legion_e2e_gate'))"
+          ) | Add-Content -Path (Join-Path $sshDir 'config') -Encoding ascii
+          Get-Command ssh, scp | Format-Table -AutoSize Source | Out-String | Write-Output
+          & ssh -T -o BatchMode=yes legion-e2e-far 'echo far session: LEGION_HOME=%LEGION_HOME% $env:LEGION_HOME'
+          if ($LASTEXITCODE -ne 0) { throw 'ssh to the far node failed' }
+          # cmd's echo prints `$PSVersionTable.PSEdition` as it stands; Windows PowerShell prints its
+          # edition, Desktop. Anything else means the leg is not testing the shell it is named for.
+          $probe = (& ssh -T -o BatchMode=yes legion-e2e-far 'echo $PSVersionTable.PSEdition' | Out-String).Trim()
+          $expected = if ($env:E2E_SHELL -eq 'powershell') { 'Desktop' } else { '$PSVersionTable.PSEdition' }
+          if ($probe -ne $expected) { throw "sshd did not run the session in $($env:E2E_SHELL); the probe printed '$probe', expected '$expected'" }
+          Write-Output "far sessions run in $($env:E2E_SHELL), as the probe shows: '$probe'"
+          @(
+            "E2E_DIR=$e2e"
+            "E2E_FAR_HOME=$farHome"
+            "E2E_FAR_BIN=$farBin"
+            "E2E_SSHD_LOG=$(Join-Path $programData 'logs\sshd.log')"
+          ) | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+
+      - name: Run the scenario (Linux and macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          node scripts/legion-e2e.mjs --bin target/release/legion --work "$E2E_DIR/work"
+          --far legion-e2e-far --gate legion-e2e-gate --far-home "$E2E_FAR_HOME" --far-bin "$E2E_FAR_BIN"
+      # From PowerShell rather than Git's bash, whose PATH would put Git's own ssh ahead of the
+      # Windows OpenSSH client people use.
+      - name: Run the scenario (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          node scripts/legion-e2e.mjs --bin target/release/legion.exe --work "$env:E2E_DIR/work"
+          --far legion-e2e-far --gate legion-e2e-gate --far-home "$env:E2E_FAR_HOME" --far-bin "$env:E2E_FAR_BIN"
+
+      # What there is to read when it fails: both audit logs, the doctor's answers, every call the
+      # driver made, and sshd's log. None of it is key material, and the check below makes sure.
+      - name: Gather what the failure left
+        if: failure()
+        shell: bash
+        run: |
+          set -u
+          # A run that failed before the sshd step exported E2E_DIR has nothing of its own to keep.
+          if [ -z "${E2E_DIR:-}" ]; then
+            echo 'The run stopped before the far node was set up; there is nothing to gather.'
+            exit 0
+          fi
+          out="$E2E_DIR/work/artifacts"
+          mkdir -p "$out"
+          if [ "$RUNNER_OS" = Windows ]; then
+            powershell -NoProfile -Command "Get-Content -LiteralPath \$env:E2E_SSHD_LOG -ErrorAction SilentlyContinue" > "$out/sshd.log" || true
+          else
+            sudo cat "$E2E_SSHD_LOG" > "$out/sshd.log" || true
+          fi
+          if grep -rIl -e 'PRIVATE KEY' "$out"; then
+            echo 'A private key ended up among the artifacts; not uploading them.'
+            rm -rf "$out"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: legion-e2e-${{ matrix.os }}-${{ matrix.shell || 'default' }}
+          path: ${{ env.E2E_DIR }}/work/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

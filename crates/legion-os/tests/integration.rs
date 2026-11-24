@@ -54,6 +54,9 @@ fn main() -> ExitCode {
         ("run_shell_string_works_on_platform_shell", || {
             Box::pin(test_run_shell_string_works_on_platform_shell())
         }),
+        ("run_shell_string_round_trips_non_ascii_stdin", || {
+            Box::pin(test_run_shell_string_round_trips_non_ascii_stdin())
+        }),
         ("run_live_streaming_and_head_tail_truncation", || {
             Box::pin(test_run_live_streaming_and_head_tail_truncation())
         }),
@@ -917,6 +920,24 @@ async fn test_run_shell_string_works_on_platform_shell() {
     .unwrap();
     assert!(out.success(), "shell command failed: {out:?}");
     assert_eq!(out.stdout.text.trim(), "hello-from-shell");
+}
+
+/// What a command reads on stdin through the platform shell arrives as the UTF-8 that was sent.
+/// Windows PowerShell decoded it in the OEM code page until the wrapper set the input encoding.
+async fn test_run_shell_string_round_trips_non_ascii_stdin() {
+    let copy = if cfg!(windows) {
+        "[Console]::Out.Write([Console]::In.ReadToEnd())"
+    } else {
+        "cat"
+    };
+    let text = "caf\u{e9} \u{2713} Stra\u{df}e \u{65e5}\u{672c}\u{8a9e} \u{1f600}\nsecond line\n";
+    let out = run(RunOptions::new(CommandSpec::shell(copy))
+        .stdin(text.as_bytes().to_vec())
+        .timeout(Duration::from_secs(30)))
+    .await
+    .unwrap();
+    assert!(out.success(), "shell command failed: {out:?}");
+    assert_eq!(out.stdout.text, text);
 }
 
 async fn test_run_live_streaming_and_head_tail_truncation() {

@@ -2242,10 +2242,14 @@ fn is_windows_reserved_device_name(comp: &[u8]) -> bool {
     {
         return true;
     }
-    if stem.len() > 3
-        && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
-    {
-        let mut chars = stem[3..].chars();
+    // `get` rather than slicing: the third byte of a name such as `naïve` falls inside a
+    // character, and a slice there panics.
+    let suffix = stem
+        .get(..3)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+        .and_then(|_| stem.get(3..));
+    if let Some(suffix) = suffix {
+        let mut chars = suffix.chars();
         if let (Some(digit), None) = (chars.next(), chars.next()) {
             return matches!(digit, '1'..='9' | '\u{00B9}' | '\u{00B2}' | '\u{00B3}');
         }
@@ -3541,6 +3545,26 @@ role = "wide"
                 assert!(check(path, non_windows).is_ok(), "{non_windows:?} {path}");
             }
         }
+    }
+
+    #[test]
+    fn windows_device_name_check_takes_names_whose_third_byte_is_inside_a_character() {
+        let check =
+            |raw: &str| validate_platform_path(raw.as_bytes(), Path::new(raw), Platform::Windows);
+        for name in [
+            "naïve & “quoted” $name %x%.txt",
+            "coñ",
+            "coñ1.txt",
+            "lpτ1",
+            "über",
+            "日本語.txt",
+            "Ελληνικά",
+            "😀",
+        ] {
+            let raw = format!(r"C:\Users\me\projects\{name}");
+            assert!(check(&raw).is_ok(), "{raw}");
+        }
+        assert!(check("C:\\Users\\me\\projects\\COM\u{00B2}.txt").is_err());
     }
 
     #[test]

@@ -891,6 +891,9 @@ fn parse_opencode_list(lines: &[&str]) -> Registered {
                     | ' '
             )
         });
+        // Whitespace the symbols above left in front, such as a tab, goes too: the first word has
+        // to start the string for `first.len()` to be where the rest begins.
+        let stripped = stripped.trim_start();
         let had_prefix = stripped.len() < line.len();
         let Some(first) = stripped.split_whitespace().next() else {
             continue;
@@ -1171,6 +1174,19 @@ mod tests {
         );
         let opencode_err = build_remove_command(AgentKind::Opencode, None).unwrap_err();
         assert_eq!(opencode_err.code, ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn mcp_list_parsers_take_a_first_word_after_a_tab_without_cutting_a_character() {
+        for agent in AgentKind::ALL {
+            // Before the tab was trimmed, `éé`'s length ended inside its second `é`.
+            let state = parse_mcp_list(agent, "\u{25cf}\t\u{e9}\u{e9} connected\n");
+            assert_ne!(state, Registered::Yes, "{agent:?}");
+        }
+        assert_eq!(
+            parse_mcp_list(AgentKind::Opencode, "\u{25cf}\tlegion connected\n"),
+            Registered::Yes
+        );
     }
 
     #[test]

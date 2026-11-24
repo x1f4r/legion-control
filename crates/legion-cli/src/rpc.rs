@@ -506,10 +506,19 @@ impl Session {
             return;
         };
         self.running().remove(&id);
+        // What the panic said goes into the reply: on a node reached over ssh, its stderr is
+        // somebody else's terminal, and the caller would otherwise learn nothing at all. The
+        // reply gets it short and redacted; the full text went to this node's stderr.
         let message = if failure.is_panic() {
-            "The call failed inside legion before it could reply."
+            match panic_text(failure.into_panic().as_ref()) {
+                Some(text) => format!(
+                    "The call failed inside legion before it could reply: {}",
+                    shown_panic_text(text)
+                ),
+                None => "The call failed inside legion before it could reply.".to_owned(),
+            }
         } else {
-            "The call was stopped before it could reply."
+            "The call was stopped before it could reply.".to_owned()
         };
         self.reply(
             Some(id),
@@ -520,6 +529,38 @@ impl Session {
             )),
         )
         .await;
+    }
+}
+
+/// The message a panic was raised with, when it was text.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+}
+
+/// The most of a panic's message a reply carries.
+const MOST_PANIC_TEXT: usize = 500;
+
+/// A panic's message as a caller, perhaps on another machine and perhaps a confined principal,
+/// may be shown it. Slice and unwrap panics print the value they choked on, which can be anything
+/// a caller sent or a file held, so the text is cut to [`MOST_PANIC_TEXT`] bytes and, when the
+/// audit log's rules would hide it, not shown at all.
+fn shown_panic_text(text: &str) -> String {
+    let mut end = text.len().min(MOST_PANIC_TEXT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = if end < text.len() {
+        format!("{}...", &text[..end])
+    } else {
+        text.to_owned()
+    };
+    match legion_core::audit::redact_message(&cut) {
+        Value::String(kept) => kept,
+        _ => "its message is not repeated here because it may hold a secret; this node's stderr has it."
+            .to_owned(),
     }
 }
 
@@ -610,6 +651,14 @@ mod tests {
         panic!("t.panic panics on purpose");
     }
 
+    async fn panics_at_length(_ctx: &Ctx, _args: Args) -> Result<Args, ToolError> {
+        panic!("{}", "\u{e9}".repeat(200_000));
+    }
+
+    async fn panics_with_a_secret(_ctx: &Ctx, _args: Args) -> Result<Args, ToolError> {
+        panic!("could not parse password=hunter2-correct-horse");
+    }
+
     /// Waits without a word until it is cancelled.
     async fn wait(ctx: &Ctx, _args: Args) -> Result<Args, ToolError> {
         ctx.cancelled().await;
@@ -647,6 +696,18 @@ mod tests {
             let mut registry = Registry::new();
             registry.add_fn("t.echo", Effect::Read, "Echoes.", echo);
             registry.add_fn("t.panic", Effect::Read, "Panics.", panics);
+            registry.add_fn(
+                "t.panic_long",
+                Effect::Read,
+                "Panics at length.",
+                panics_at_length,
+            );
+            registry.add_fn(
+                "t.panic_secret",
+                Effect::Read,
+                "Panics with a secret.",
+                panics_with_a_secret,
+            );
             registry.add_fn("t.wait", Effect::Read, "Waits.", wait);
             registry.add_fn("t.chatter", Effect::Read, "Chatters.", chatter);
             let node = Node::new(Paths::under(dir.path()), registry);
@@ -733,8 +794,29 @@ mod tests {
         let reply = client.reply_to(1).await;
         assert_eq!(reply["error"]["code"], json!(INTERNAL_ERROR));
         assert_eq!(reply["error"]["data"]["code"], json!("internal"));
+        let message = reply["error"]["data"]["message"].as_str().unwrap();
+        assert!(
+            message.ends_with(": t.panic panics on purpose"),
+            "{message}"
+        );
         client.call(1, "t.echo").await;
         assert_eq!(client.reply_to(1).await["result"], json!({}));
+        client.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_panic_message_is_cut_short_and_kept_back_when_it_looks_secret() {
+        let mut client = Client::start();
+        client.call(1, "t.panic_long").await;
+        let long = client.reply_to(1).await;
+        let message = long["error"]["data"]["message"].as_str().unwrap();
+        assert!(message.len() < 700, "{} bytes", message.len());
+        assert!(message.ends_with("\u{e9}..."), "{message}");
+        client.call(2, "t.panic_secret").await;
+        let secret = client.reply_to(2).await;
+        let message = secret["error"]["data"]["message"].as_str().unwrap();
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(message.contains("may hold a secret"), "{message}");
         client.finish().await.unwrap();
     }
 
