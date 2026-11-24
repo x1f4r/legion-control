@@ -2,8 +2,25 @@
 
 `apps/legion-app` is the Tauri 2 native shell for Legion on Android, iOS, iPadOS, macOS, Windows
 and Linux ([design](../../docs/legion/platforms.md)). It ships the static frontend from `apps/ui`
-directly (no npm or bundler step) and exposes a small Rust command surface over an internal
-`Backend` trait.
+directly (no npm or bundler step) and connects to Legion nodes through `crates/legion-link` behind
+an internal `Backend` trait.
+
+## What the app does
+
+- **Pairing and SSH transport:** On every platform, the app enrols with a node from a single-use
+  `legion pair` invite (via camera QR scan on Android or pasted invite text), generates an Ed25519
+  device key on first use, and keeps its configuration (`LinkConfig`, active node, and node
+  metadata) in `legion-app.json` inside the platform app data directory.
+- **Desktop local pipe:** On Linux, macOS and Windows, if a `legion` binary is present on `PATH`
+  or in a standard user/system install location, the app is ready immediately over a local
+  `legion rpc` child process without pairing, while still allowing additional SSH nodes to be
+  paired.
+- **Streaming, failover, and reconnect:** Tool calls stream live output over Tauri IPC channels
+  with caller-scoped cancellation, fail over to another configured node on unreachable/timeout
+  errors, and reconnect transparently after backgrounding or a dropped node-side session.
+- **Revocation and unpairing:** If a node revokes the device (`legion device.remove`), the app
+  shows a calm error with a direct path back to pairing. Unpairing forgets the node locally and
+  prints the `legion device.remove` command to revoke the key on the node as well.
 
 Its Rust crate (`apps/legion-app/src-tauri`) is its own Cargo workspace with its own `Cargo.lock`,
 excluded from the root workspace so building the `legion` node binary never pulls in a web view.
@@ -50,19 +67,18 @@ harmless one-time log.
 
 ### QR invite scanning (`scan_invite`)
 
-`scan_invite` returns a tagged JSON object (`kind`):
+`scan_invite` returns a tagged JSON object (`mode`):
 
-- **Android:** `{ "kind": "scanned", "content": "<invite>" }`. The Rust command checks and
+- **Android:** `{ "mode": "scanned", "content": "<invite>" }`. The Rust command checks and
   requests camera permission, runs `tauri-plugin-barcode-scanner` natively, and returns the trimmed
   QR payload (or a structured `AppError` with `denied`, `cancelled`, `invalid_args`, or `failed`).
-- **iOS and iPadOS:** `{ "kind": "use_plugin", "plugin": "barcode-scanner", "formats": ["QR_CODE"], "camera_direction": "back", "windowed": false }`.
+- **iOS and iPadOS:** `{ "mode": "use_plugin", "plugin": "barcode-scanner", "formats": ["QR_CODE"], "camera_direction": "back", "windowed": false }`.
   `tauri-plugin-barcode-scanner` `2.5.3` keeps its iOS `PluginHandle` private and registering a
   second iOS plugin handle requires `unsafe` FFI (`tauri::ios_plugin_binding!`), which this crate
   forbids. The plugin is registered and permitted in `src-tauri/capabilities/mobile.json`
   (`barcode-scanner:allow-check-permissions`, `allow-request-permissions`, `allow-scan`,
-  `allow-cancel`), so when `scan_invite` returns `kind: "use_plugin"`, the interface invokes
-  `plugin:barcode-scanner|check_permissions`, `plugin:barcode-scanner|request_permissions`, and
-  `plugin:barcode-scanner|scan` (or `window.__TAURI__.barcodeScanner`) directly with those options.
+  `allow-cancel`), so when `scan_invite` returns `mode: "use_plugin"`, the interface invokes
+  `plugin:barcode-scanner|scan` directly.
 - **Desktop:** `scan_invite` is not registered; desktop users paste invite text or use the local
   `legion rpc` pipe.
 
@@ -145,28 +161,22 @@ cargo tauri ios build --target aarch64 --no-sign --ci
 The simulator build writes `src-tauri/gen/apple/build/arm64-sim/Legion.app` for `xcrun simctl`.
 The device build writes an unsigned `.ipa` under `src-tauri/gen/apple/build/arm64/`.
 
-### Installing onto a real iPhone or iPad with your own Apple ID
+### Installing onto a real iPhone or iPad
 
-CI cannot sign iOS builds because Apple requires a signing identity and provisioning profile tied
-to an Apple account. To install Legion on your own iPhone or iPad from a Mac with Xcode:
+Installing the native app on a real iPhone or iPad requires an Apple developer account and is not
+supported for now. Use the browser door (`legion serve`, addable to the home screen) to reach
+Legion from an iPhone or iPad.
 
-1. Make sure Rust (`1.100.0` with target `aarch64-apple-ios`) and `tauri-cli` `2.12.6` are
-   installed, and clone the repository.
-2. Open `apps/legion-app/src-tauri/gen/apple/legion-app.xcodeproj` in Xcode.
-3. Select the **legion-app** project in the navigator, choose the **legion-app_iOS** target, and
-   open the **Signing & Capabilities** tab.
-4. Tick **Automatically manage signing** and pick your Apple ID (**Personal Team** or paid
-   Developer team) in the **Team** menu. If Xcode reports that `com.x1f4r.legion` is already taken
-   for your account, change **Bundle Identifier** locally (for example `com.example.me.legion`)
-   without committing that change.
-5. Connect your iPhone or iPad over USB, unlock it, and choose it in Xcode's destination bar. On
-   iOS 16 or later, enable **Settings -> Privacy & Security -> Developer Mode** if prompted.
-6. Press **Run** (Cmd+R). Xcode builds the Rust library, signs the bundle with your Apple ID, and
-   installs it on the device.
-7. On the first install with a free Apple ID, open **Settings -> General -> VPN & Device Management**
-   on the phone or tablet and trust your developer profile. (Free Apple ID signatures expire after
-   7 days and can be refreshed by pressing Run again; for devices without Xcode, use the browser
-   door served by `legion serve`.)
+### Known gaps on iOS
+
+- **QR scanner bridge:** `scan_invite` hands off to `tauri-plugin-barcode-scanner` from JavaScript
+  (`mode: "use_plugin"`) rather than a native Swift bridge from Rust, and the camera flow has not
+  been tested on a physical iPhone or iPad.
+- **Backup exclusion:** The app sets the Apple backup-exclusion extended attribute via
+  `rustix::fs::setxattr` (checked via Foundation's `NSURLIsExcludedFromBackupKey` on the
+  simulator) rather than a native `NSURL` call verified against a real iCloud backup.
+- **Edge-swipe back gesture:** `WKWebView.allowsBackForwardNavigationGestures` remains off because
+  `tauri` `2.12.7` does not expose `wry`'s flag without `unsafe` pointer access.
 
 ### Android debug APK
 
@@ -229,3 +239,25 @@ and screenshots. The default AVD is `legion-test`; pass `--avd legion-tablet` fo
 ./apps/legion-app/emulator.sh logcat
 ./apps/legion-app/emulator.sh stop
 ```
+
+## End-to-end Android test (`e2e-android.sh`)
+
+`apps/legion-app/e2e-android.sh` proves the full Android path against a real throwaway Legion node
+and loopback `sshd` (`127.0.0.1` on an ephemeral high port):
+
+```sh
+./apps/legion-app/e2e-android.sh
+./apps/legion-app/e2e-android.sh --node-ref origin/link/pairing --shots-dir /home/me/shots/e2e
+./apps/legion-app/e2e-android.sh --skip-tablet
+```
+
+The script builds a release `legion` binary from `--node-ref` (default `origin/link/pairing`) in a
+cache checkout under `${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, creates a throwaway
+`LEGION_HOME` node named `tower` with principal `phone` in role `operator`, starts a loopback
+`sshd` using a throwaway host key and `authorized_keys` file, builds a WebView-debuggable `x86_64`
+debug APK (used only by this test), installs it on `legion-test`, and drives the real UI over
+`adb forward` + Chrome DevTools Protocol (`playwright-core` from `apps/ui/test`). It verifies
+first-start pairing, live machine metrics, streamed command execution, file listing, `meta.whoami`,
+power confirmation with dry run only, force-stop/relaunch persistence, transparent reconnect after
+killing the node-side session, revocation recovery and re-pairing, plus a wide paired screenshot on
+`legion-tablet`. It never touches `~/.ssh`, the system `sshd`, `~/.config/legion`, or `/tmp`.

@@ -22,6 +22,8 @@ test('sign-legion-release signs draft SHA256SUMS, uploads SHA256SUMS.sig, and pr
       [
         `${'a'.repeat(64)}  legion-0.2.0-x86_64-unknown-linux-musl`,
         `${'b'.repeat(64)}  legion-0.2.0-aarch64-apple-darwin`,
+        `${'c'.repeat(64)}  legion_0.2.0-1_amd64.deb`,
+        `${'d'.repeat(64)}  legion_0.2.0-1_arm64.deb`,
         '',
       ].join('\n'),
       'utf8',
@@ -64,9 +66,10 @@ if (args[0] === 'release' && args[1] === 'view') {
     });
 
     assert.equal(result.version, '0.2.0');
-    assert.equal(result.entries.length, 2);
+    assert.equal(result.entries.length, 4);
     assert.equal(result.publishCommand, 'gh release edit legion-v0.2.0 --draft=false --latest=false');
     assert.ok(lines.some((line) => line.includes('legion-0.2.0-x86_64-unknown-linux-musl')));
+    assert.ok(lines.some((line) => line.includes('legion_0.2.0-1_amd64.deb')));
     assert.ok(lines.some((line) => line.includes('--draft=false --latest=false')));
 
     const sigBytes = fs.readFileSync(uploadedSig);
@@ -105,6 +108,10 @@ test('legion release workflow enforces main ancestry, --latest=false, and --prer
   assert.doesNotMatch(workflow, /actions\/cache/);
   const buildRevMatches = workflow.match(/LEGION_BUILD_REV:\s*\$\{\{\s*github\.sha\s*\}\}/g) ?? [];
   assert.equal(buildRevMatches.length, 3, 'every release build step must set LEGION_BUILD_REV from github.sha');
+  assert.match(workflow, /deb_arch:\s*amd64/);
+  assert.match(workflow, /deb_arch:\s*arm64/);
+  assert.match(workflow, /bash packaging\/deb\/build-deb\.sh/);
+  assert.match(workflow, /sha256sum legion-\* legion_\*\.deb > SHA256SUMS/);
 });
 
 test('install scripts enforce HTTPS-only TLS 1.2 downloads and silent PowerShell progress', () => {

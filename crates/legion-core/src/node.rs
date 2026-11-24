@@ -3,8 +3,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+pub use legion_proto::{CANCEL_GRACE, VERSION};
 use legion_proto::{ErrorBody, ErrorCode, HelloParams, HelloResult, PROTOCOL, ToolSpec};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -17,9 +18,6 @@ use crate::policy::Policy;
 use crate::registry::{Registry, SourceCheck};
 use crate::tool::Tool;
 
-/// The version of legion this is; every crate in the workspace shares it.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 /// The source revision this binary was built from (for example `a59ec0d12345` or
 /// `a59ec0d12345, modified`), or `None` when built outside git without `LEGION_BUILD_REV`.
 pub const BUILD: Option<&str> = option_env!("LEGION_BUILD_ID");
@@ -31,15 +29,6 @@ pub fn format_version_line(version: &str, build: Option<&str>) -> String {
         None => format!("legion {version}"),
     }
 }
-
-/// How long a cancelled tool has to stop on its own before its future is dropped.
-///
-/// Dropping a future stops only the part of the work that runs inside it: a blocking thread it
-/// started, a child process or a call it forwarded carry on, and would still be changing things
-/// after the call was reported as cancelled. So a cancel first cancels the context's token, and
-/// whatever the tool returns within this time is the call's result. Long enough to stop a process
-/// tree or pass the cancel on, short enough that a tool that never looks does not hold the caller.
-pub const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 /// One call, as a door hands it to [`Node::call`].
 #[derive(Debug)]

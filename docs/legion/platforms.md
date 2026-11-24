@@ -120,17 +120,19 @@ and Android, which is the way onto an iPhone or iPad without an Apple developer 
 | Android | none: a controller | `.apk`, arm64 |
 | iOS, iPadOS | none: a controller | the app (needs Apple signing to reach a real device), the browser door meanwhile |
 
-Packages never start anything or change configuration on install: `legion init` stays the
-first step, and the user unit is enabled by the user.
+Packages are named `legion` (and `legion-bin` for the prebuilt Arch binary). They never start
+anything or change configuration on install: `legion init` stays the first step, and the user unit
+is enabled by the user. When installed from a package, `meta.update` and `fleet.install` refuse
+in-place replacement and point at `apt` or `pacman` instead.
 
 ## How it is verified
 
 - Each Linux distribution above installs its package in a clean container, and then runs the
   real-ssh end-to-end script against it, on every change.
 - The Android app is built as a universal debug APK, installed and launched in a KVM emulator in CI
-  until the interface reports ready (capturing dark and light screenshots); once `legion-link` is
-  wired in, the emulator run also pairs with a real `sshd` through a real invite and drives
-  listing machines and running a tool.
+  until the interface reports ready (capturing dark and light screenshots); the full end-to-end
+  pairing and SSH test (`apps/legion-app/e2e-android.sh`) runs against a real node and loopback
+  `sshd` locally (and can move into CI once `legion pair` merges to `main`).
 - The iOS app is built for the simulator, installed and launched on a current iPhone and iPad
   simulator in CI until the interface reports ready (verifying iCloud backup exclusion on the app
   data directory and capturing dark and light screenshots on both), alongside an unsigned device

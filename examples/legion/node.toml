@@ -49,7 +49,9 @@ arm = ["sudo", "-n", "grub-reboot", "Rescue"]
 verify = ["sh", "-c", "grub-editenv list | grep -qx 'next_entry=Rescue'"]
 disarm = ["sudo", "-n", "grub-editenv", "-", "unset", "next_entry"]
 
-# Extra hosts and browser origins accepted by `legion serve` (for example behind Tailscale Serve).
+# Extra hosts, browser origins, and web interface toggle for `legion serve` (for example behind Tailscale Serve).
 [serve]
 hosts = ["tower.example.ts.net"]
 origins = ["https://app.example.net"]
+# Set false to turn off the built-in web interface at `/`.
+ui = true

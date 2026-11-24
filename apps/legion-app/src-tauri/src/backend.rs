@@ -1,12 +1,13 @@
 //! The internal seam between Tauri commands and the Legion client implementation.
 //!
-//! Stage one provides [`Unpaired`], which reports honest unpaired responses. Stage two supplies a
-//! real implementation backed by `legion-link` without changing the command surface.
+//! [`Backend`] is implemented by [`crate::link_backend::LinkBackend`] over `legion-link`, and by
+//! [`Unpaired`] for lightweight tests.
 
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -22,12 +23,24 @@ pub enum ErrorCode {
     NotPaired,
     /// One or more arguments were invalid.
     InvalidArgs,
-    /// Permission or policy denied the request.
+    /// No tool has that name on the node that was asked.
+    UnknownTool,
+    /// The named resource does not exist.
+    NotFound,
+    /// The resource already exists.
+    Exists,
+    /// Concurrent modification or duplicate call identifier.
+    Conflict,
+    /// Permission, authentication, or policy denied the request.
     Denied,
     /// The target node cannot be reached.
     Unreachable,
+    /// The operation timed out.
+    Timeout,
     /// The operation was cancelled by the caller or user.
     Cancelled,
+    /// The target machine is busy.
+    Busy,
     /// This platform or build does not support the operation.
     Unsupported,
     /// The operation failed after being attempted.
@@ -36,10 +49,30 @@ pub enum ErrorCode {
     Internal,
 }
 
+impl From<ProtoErrorCode> for ErrorCode {
+    fn from(code: ProtoErrorCode) -> Self {
+        match code {
+            ProtoErrorCode::InvalidArgs => Self::InvalidArgs,
+            ProtoErrorCode::UnknownTool => Self::UnknownTool,
+            ProtoErrorCode::NotFound => Self::NotFound,
+            ProtoErrorCode::Exists => Self::Exists,
+            ProtoErrorCode::Conflict => Self::Conflict,
+            ProtoErrorCode::Denied => Self::Denied,
+            ProtoErrorCode::Unreachable => Self::Unreachable,
+            ProtoErrorCode::Timeout => Self::Timeout,
+            ProtoErrorCode::Cancelled => Self::Cancelled,
+            ProtoErrorCode::Busy => Self::Busy,
+            ProtoErrorCode::Unsupported => Self::Unsupported,
+            ProtoErrorCode::Failed => Self::Failed,
+            ProtoErrorCode::Internal => Self::Internal,
+        }
+    }
+}
+
 /// Structured error object returned by every Tauri command.
 ///
-/// Errors always serialize as `{ code, message, hint }`, never as bare strings.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Errors always serialize as `{ code, message, hint, ... }`, never as bare strings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppError {
     /// Machine-readable error code.
     pub code: ErrorCode,
@@ -47,6 +80,12 @@ pub struct AppError {
     pub message: String,
     /// Optional actionable next step, always present in JSON as a string or `null`.
     pub hint: Option<String>,
+    /// Machine the error came from, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// Structured error details from the node or SSH transport (e.g. `reason: "auth_failed"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 impl AppError {
@@ -56,6 +95,8 @@ impl AppError {
             code,
             message: message.into(),
             hint: None,
+            machine: None,
+            details: None,
         }
     }
 
@@ -75,6 +116,18 @@ impl AppError {
         .with_hint(
             "Run `legion pair --as phone` on one of your machines and scan or paste the invite.",
         )
+    }
+}
+
+impl From<ProtoErrorBody> for AppError {
+    fn from(body: ProtoErrorBody) -> Self {
+        Self {
+            code: body.code.into(),
+            message: body.message,
+            hint: body.hint,
+            machine: body.machine,
+            details: body.details,
+        }
     }
 }
 
@@ -107,7 +160,7 @@ pub struct NodeLink {
     pub principal: String,
     /// Role granted to that principal.
     pub role: String,
-    /// Transport used to reach the node (for example `ssh` or `local`).
+    /// Transport used to reach the node (`ssh` or `local`).
     pub via: String,
 }
 
@@ -116,13 +169,13 @@ pub struct NodeLink {
 pub struct AppState {
     /// True once at least one node link is ready to accept calls.
     pub ready: bool,
-    /// Known node links.
+    /// Known node links, with the active node first.
     pub nodes: Vec<NodeLink>,
     /// What setup step is still required, or `null` when ready.
     pub needs: Option<Needs>,
 }
 
-/// Identifier of an in-flight call for cancellation and streaming events.
+/// Identifier of an in-flight call for cancellation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CallId {
@@ -132,23 +185,21 @@ pub enum CallId {
     Number(i64),
 }
 
-/// Streamed event delivered through a [`tauri::ipc::Channel`] during `call`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CallEvent {
-    /// Identifier of the call producing the event.
-    pub id: CallId,
-    /// Event kind (`stdout`, `stderr`, `progress`, or `log`).
-    pub kind: String,
-    /// Event payload.
-    pub data: Value,
-    /// Machine that produced the event, when forwarded or fanned out.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub machine: Option<String>,
+impl CallId {
+    /// Converts the call identifier to its canonical string key.
+    pub fn as_key(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Number(n) => n.to_string(),
+        }
+    }
 }
 
 /// Parameters for `call`.
 #[derive(Clone, Debug)]
 pub struct CallRequest {
+    /// Optional caller-chosen call identifier used by `cancel`.
+    pub id: Option<CallId>,
     /// Tool name.
     pub tool: String,
     /// Tool arguments object.
@@ -157,18 +208,15 @@ pub struct CallRequest {
     pub on: Option<Value>,
 }
 
-/// Result of `pair`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairResult {
-    /// The newly paired node link.
-    pub node: NodeLink,
-}
-
 /// Result of `unpair`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnpairResult {
-    /// Name of the node that was unpaired.
+    /// Name of the node that was unpaired locally.
     pub node: String,
+    /// Device name recorded when this device was paired with the node.
+    pub device: String,
+    /// Plain reminder that the node keeps the device until revoked there.
+    pub message: String,
 }
 
 /// Result of `cancel`.
@@ -181,26 +229,29 @@ pub trait Backend: Send + Sync {
     fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>>;
 
     /// Lists tool specifications offered on `on` (or the default node when `None`).
-    fn tools(&self, on: Option<String>) -> BoxFuture<'_, Result<Vec<Value>, AppError>>;
+    fn tools(&self, on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>>;
 
-    /// Invokes a tool, streaming incremental events to `channel`.
+    /// Invokes a tool, streaming live events to `on_event` when supplied.
     fn call(
         &self,
         request: CallRequest,
-        channel: Channel<CallEvent>,
+        on_event: Option<Channel<Value>>,
     ) -> BoxFuture<'_, Result<Value, AppError>>;
 
     /// Requests cancellation of an in-flight call.
     fn cancel(&self, id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>>;
 
-    /// Enrols this device with a node using a pairing invite.
-    fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<PairResult, AppError>>;
+    /// Enrols this device with a node using a pairing invite and returns the updated state.
+    fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>>;
 
-    /// Removes a paired node from this device.
+    /// Removes a paired node from this device's local state.
     fn unpair(&self, node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>>;
+
+    /// Selects which configured node calls go through by default and returns the updated state.
+    fn select_node(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>>;
 }
 
-/// Stage-one backend implementation used before `legion-link` is plugged in.
+/// Fallback backend returning honest unpaired responses.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unpaired;
 
@@ -215,14 +266,14 @@ impl Backend for Unpaired {
         })
     }
 
-    fn tools(&self, _on: Option<String>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+    fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
         Box::pin(async { Err(AppError::not_paired()) })
     }
 
     fn call(
         &self,
         _request: CallRequest,
-        _channel: Channel<CallEvent>,
+        _on_event: Option<Channel<Value>>,
     ) -> BoxFuture<'_, Result<Value, AppError>> {
         Box::pin(async { Err(AppError::not_paired()) })
     }
@@ -231,7 +282,7 @@ impl Backend for Unpaired {
         Box::pin(async { Err(AppError::not_paired()) })
     }
 
-    fn pair(&self, invite: String, _name: String) -> BoxFuture<'_, Result<PairResult, AppError>> {
+    fn pair(&self, invite: String, _name: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
             if invite.trim().is_empty() {
                 return Err(
@@ -243,13 +294,16 @@ impl Backend for Unpaired {
             }
             Err(AppError::new(
                 ErrorCode::Unsupported,
-                "Pairing is not connected yet in this shell build.",
-            )
-            .with_hint("The Legion client link is not wired into this preview build yet."))
+                "Pairing is not connected in the unpaired stub backend.",
+            ))
         })
     }
 
     fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+        Box::pin(async { Err(AppError::not_paired()) })
+    }
+
+    fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async { Err(AppError::not_paired()) })
     }
 }
@@ -272,6 +326,20 @@ mod tests {
         assert_eq!(bare_json["code"], "failed");
         assert_eq!(bare_json["message"], "Something failed.");
         assert!(bare_json["hint"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn proto_error_preserves_details_and_machine() -> Result<(), Box<dyn std::error::Error>> {
+        let proto = ProtoErrorBody::new(ProtoErrorCode::Denied, "Key rejected.")
+            .with_hint("Pair again.")
+            .with_machine("tower")
+            .with_details(serde_json::json!({ "reason": "auth_failed" }));
+        let err = AppError::from(proto);
+        let json = serde_json::to_value(&err)?;
+        assert_eq!(json["code"], "denied");
+        assert_eq!(json["machine"], "tower");
+        assert_eq!(json["details"]["reason"], "auth_failed");
         Ok(())
     }
 

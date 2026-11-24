@@ -725,11 +725,16 @@ Add the Tailscale host name (and any browser origins, if a web page will call it
 [serve]
 hosts = ["tower.example.ts.net"]
 origins = ["https://app.example.net"]
+ui = true
 ```
 
+`legion serve` serves the built-in web interface at `/` (no token is needed to load the static page
+itself; every `/v1/*` and `/mcp` request still requires a bearer token). Set `ui = false` under
+`[serve]` to serve only the HTTP API and MCP endpoints.
+
 Requests with any unlisted `Host` are refused (stopping DNS rebinding), and requests with an
-unlisted `Origin` are refused with `403` (stopping random browser tabs from calling the loopback
-port).
+unlisted cross-origin `Origin` are refused with `403` (stopping random browser tabs from calling the
+loopback port).
 
 ### Calling the HTTP API with `curl`
 

@@ -93,6 +93,52 @@ jobs:
             crate="$(basename "$dir")"
             cargo test -p "$crate" --no-run --locked
           done
+      # Check legion-link with all features (including the in-process SSH and local desktop pipes)
+      # and verify the node binary does not pull russh in.
+      - name: Check legion-link with all features
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo clippy -p legion-link --all-targets --all-features --locked -- -D warnings
+          cargo test -p legion-link --all-features --locked
+          if cargo tree -p legion-cli --locked | grep -qi russh; then
+            echo "russh must not be in legion-cli's dependency tree" >&2
+            exit 1
+          fi
+      # Cross-check legion-link with in-process SSH for Android targets using the runner's NDK.
+      - name: Cross-check legion-link for Android
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "Android NDK not found in ANDROID_NDK_LATEST_HOME or ANDROID_NDK_HOME" >&2
+            exit 1
+          fi
+          toolchain="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          rustup target add aarch64-linux-android x86_64-linux-android
+          CC_aarch64_linux_android="$toolchain/aarch64-linux-android24-clang" \
+          AR_aarch64_linux_android="$toolchain/llvm-ar" \
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android24-clang" \
+            cargo build --lib -p legion-link --no-default-features --locked --target aarch64-linux-android
+          CC_aarch64_linux_android="$toolchain/aarch64-linux-android24-clang" \
+          AR_aarch64_linux_android="$toolchain/llvm-ar" \
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android24-clang" \
+            cargo build --lib -p legion-link --features ssh --locked --target aarch64-linux-android
+          CC_x86_64_linux_android="$toolchain/x86_64-linux-android24-clang" \
+          AR_x86_64_linux_android="$toolchain/llvm-ar" \
+          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$toolchain/x86_64-linux-android24-clang" \
+            cargo build --lib -p legion-link --features ssh --locked --target x86_64-linux-android
+      # Cross-check legion-link with in-process SSH for iOS device and simulator targets.
+      - name: Cross-check legion-link for iOS
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            cargo build --lib -p legion-link --features ssh --locked --target aarch64-apple-ios
+          IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+            cargo build --lib -p legion-link --features ssh --locked --target aarch64-apple-ios-sim
       # Exercise the Unix install script's offline path against the freshly built binary, including
       # idempotent re-installation over an existing copy, inside a throwaway HOME.
       - name: Test install/legion.sh with --from
@@ -310,3 +356,32 @@ jobs:
           persist-credentials: false
       - name: Build the Mac app without installing it
         run: bash mac/build.sh --no-install
+
+  ui-browser:
+    name: UI browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+      - name: Build release legion binary
+        run: cargo build --release --locked --bin legion
+      - name: Install browser test driver
+        run: npm --prefix apps/ui/test ci
+      - name: Run headless browser end-to-end test
+        run: node --test apps/ui/test/browser.test.mjs

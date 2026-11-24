@@ -18,6 +18,7 @@ if [[ "$component" == all || "$component" == agent ]]; then
   node scripts/check-versions.mjs
   npm --prefix agent test
   node --test tests/*.test.mjs
+  node --test apps/ui/lib/test/*.test.mjs
   # The contract: its documents against their schemas, the generated files against what the
   # generators write today, and the references and vectors against the contract's own tests.
   node contract/validate.mjs
