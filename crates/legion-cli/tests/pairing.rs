@@ -2993,8 +2993,24 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
     legion_tools::device::store::save_state(&paths_c, &c_state).unwrap();
     assert!(!home_c_root.join("config").join("devices.toml").exists());
 
-    // Wire `c` into A's `fleet.toml` and pull `devices.toml` from C -> bidirectional merge adopts
-    // C's legacy device onto A AND pushes A's fleet devices onto C!
+    // `config.read devices.toml` on C before adoption must report exists=false (never synthesize
+    // an unsaved adopted list). Running `device.list` on C adopts the state-matched line to disk.
+    let c_read_before = node_c.run(&["config.read", "document=devices.toml"]).json();
+    assert_eq!(c_read_before["exists"], json!(false), "{c_read_before}");
+    let list_c_initial = node_c.run(&["device.list"]).json();
+    assert!(
+        list_c_initial["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["name"] == json!("untracked-local") && d["local_only"] == json!(true)),
+        "expected untracked-local marked local_only in C's device.list: {list_c_initial}"
+    );
+    assert!(home_c_root.join("config").join("devices.toml").is_file());
+
+    // Wire `c` into A's `fleet.toml`. Under the one-way trust rule:
+    // - `pull from=c` imports C's adopted `legacy-phone` onto A without pushing to C.
+    // - `push machines=["c"]` sends A's `field-phone` onto C without importing live devices back.
     node_a.write_config(
         "fleet.toml",
         &format!(
@@ -3013,6 +3029,17 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
     assert_eq!(
         pull_c.json()["results"]["c"]["devices.toml"]["status"],
         json!("pulled")
+    );
+    let push_c = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"c\"]",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(push_c.code, 0, "push to c failed: {}", push_c.stderr);
+    assert_eq!(
+        push_c.json()["results"]["c"]["devices.toml"]["status"],
+        json!("pushed")
     );
 
     // Legacy device from C now works directly against A, and field-phone from A now works against C!
@@ -3044,9 +3071,7 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
         json!("device:phone-offline")
     );
     assert_eq!(field_on_c["result"]["role"], json!("editor"));
-    // And C's devices.toml now exists on disk (adopted + merged), while untracked-local stayed
-    // local-only on C (working on C, refused on A, marked local_only in C's device.list).
-    assert!(home_c_root.join("config").join("devices.toml").is_file());
+    // untracked-local stayed local-only on C (working on C, refused on A).
     let local_on_c = rpc_call_direct(
         &local_only_key,
         &fleet_kh_c,
@@ -3067,13 +3092,157 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
         !local_refused_on_a.status.success(),
         "local-only line from C must never be adopted onto A"
     );
-    let list_c = node_c.run(&["device.list"]).json();
-    assert!(
-        list_c["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["name"] == json!("untracked-local") && d["local_only"] == json!(true)),
-        "expected untracked-local marked local_only in C's device.list: {list_c}"
+
+    // === Scenario 7: Planted-owner trust-rule probe against real sshd ===
+    // Plant a rogue `principal = "owner"` device entry directly on B. Neither manual `push` nor
+    // any automatic push (`pair`/enrol, `device.set`, `device.remove`) from A may EVER import B's
+    // live owner entry onto A, while tombstones from B DO flow back to A on push, `status` reports
+    // the difference without importing, and explicit `pull from=b` DOES import it.
+    let rogue_key = client_dir.path().join("planted_owner_key");
+    let rogue_pub_raw =
+        generate_ed25519_keypair(sshd_b.ssh_keygen_bin(), &rogue_key, "planted@b").unwrap();
+    let rogue_pub = legion_tools::device::keys::validate_ed25519_public_key(&rogue_pub_raw)
+        .unwrap()
+        .canonical;
+    let rogue_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    {
+        let b_devices_path = home_b_root.join("config").join("devices.toml");
+        let mut b_devices: legion_tools::device::registry::DevicesFile =
+            legion_core::config::parse(&b_devices_path, &std::fs::read(&b_devices_path).unwrap())
+                .unwrap();
+        let now_str = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
+        b_devices.devices.insert(
+            rogue_id.to_owned(),
+            legion_tools::device::registry::FleetDevice {
+                name: "planted-owner".to_owned(),
+                public_key: rogue_pub,
+                principal: "owner".to_owned(),
+                role: Some("owner".to_owned()),
+                paired_at: now_str.clone(),
+                paired_on: "b".to_owned(),
+                updated_at: now_str,
+                updated_on: "b".to_owned(),
+            },
+        );
+        std::fs::write(&b_devices_path, b_devices.to_toml_string()).unwrap();
+        assert_eq!(node_b.run(&["device.list"]).code, 0);
+    }
+
+    let assert_rogue_refused_on_a = |step: &str| {
+        let a_devices_text =
+            std::fs::read_to_string(home_a_root.join("config").join("devices.toml")).unwrap();
+        assert!(
+            !a_devices_text.contains(rogue_id),
+            "{step}: A imported planted owner entry from B:\n{a_devices_text}"
+        );
+        let refused = sshd_a
+            .ssh_command(&rogue_key, &fleet_kh_a)
+            .arg("legion rpc")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "{step}: planted owner key from B unexpectedly authenticated to A"
+        );
+    };
+
+    // 7a. `fleet.sync direction=status` shows difference without importing.
+    let status_ab = node_a
+        .run(&[
+            "fleet.sync",
+            "direction=status",
+            "machines=[\"b\"]",
+            "documents=[\"devices.toml\"]",
+        ])
+        .json();
+    assert_ne!(
+        status_ab["results"]["b"]["devices.toml"]["status"],
+        json!("same"),
+        "{status_ab}"
     );
+    assert_rogue_refused_on_a("status");
+
+    // 7b. Manual `fleet.sync direction=push` does NOT import B's planted owner entry.
+    let manual_push = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"b\"]",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(manual_push.code, 0, "{}", manual_push.stderr);
+    assert_rogue_refused_on_a("manual push");
+
+    // 7c. Automatic push on `pair` / enrol does NOT import B's planted owner entry.
+    let inv_probe = node_a.run(&[
+        "pair",
+        "--name",
+        "probe-dev",
+        "--role",
+        "observer",
+        "--json",
+    ]);
+    assert_eq!(inv_probe.code, 0, "{}", inv_probe.stderr);
+    let (_probe_key, probe_enrol) = enrol_from_invite(
+        inv_probe.json()["invite"].as_str().unwrap(),
+        &sshd_a,
+        "probe_dev",
+        "ignored",
+    );
+    assert_eq!(probe_enrol["ok"], json!(true));
+    assert_rogue_refused_on_a("auto push after enrol");
+
+    // 7d. Automatic push on `device.set` does NOT import B's planted owner entry.
+    let set_probe = node_a.run(&["device.set", "name=probe-dev", "rename=probe-dev-2"]);
+    assert_eq!(set_probe.code, 0, "{}", set_probe.stderr);
+    assert_rogue_refused_on_a("auto push after device.set");
+
+    // 7e. Automatic push on `device.remove` does NOT import B's planted owner entry.
+    let rem_probe = node_a.run(&["device.remove", "name=probe-dev-2"]);
+    assert_eq!(rem_probe.code, 0, "{}", rem_probe.stderr);
+    assert_rogue_refused_on_a("auto push after device.remove");
+
+    // 7f. Tombstone created on B (while B does NOT push to A) DOES flow back to A during A's
+    //     `fleet.sync direction=push`, while B's planted owner entry is STILL NOT imported onto A.
+    node_b.write_config("fleet.toml", "[machines]\n");
+    let rem_field_on_b = node_b.run(&["device.remove", "name=field-phone"]);
+    assert_eq!(rem_field_on_b.code, 0, "{}", rem_field_on_b.stderr);
+    let push_gets_tomb = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"b\"]",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(push_gets_tomb.code, 0, "{}", push_gets_tomb.stderr);
+    let field_refused_on_a = sshd_a
+        .ssh_command(&phone_off_key, &fleet_kh_a)
+        .arg("legion rpc")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !field_refused_on_a.status.success(),
+        "tombstone from B should have flowed back to A during push"
+    );
+    assert_rogue_refused_on_a("push returning tombstone");
+
+    // 7g. Explicit `fleet.sync direction=pull from=b` run by owner on A DOES import B's live entry.
+    let explicit_pull = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=b",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(explicit_pull.code, 0, "{}", explicit_pull.stderr);
+    let rogue_now_on_a = rpc_call_direct(
+        &rogue_key,
+        &fleet_kh_a,
+        sshd_a.port(),
+        sshd_a.user(),
+        "meta.whoami",
+        json!({}),
+        None,
+    );
+    assert_eq!(rogue_now_on_a["result"]["node"], json!("a"), "{rogue_now_on_a}");
+    assert_eq!(rogue_now_on_a["result"]["principal"], json!("owner"));
 }

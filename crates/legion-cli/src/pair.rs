@@ -447,6 +447,16 @@ pub fn format_human(
         text,
         "Remove a device:      legion device.remove name=<device>{on_flag}"
     );
+    if let Some(peers) = result.get("fleet_peers").and_then(Value::as_array) {
+        let peer_names: Vec<&str> = peers.iter().filter_map(Value::as_str).collect();
+        if !peer_names.is_empty() {
+            let _ = writeln!(
+                text,
+                "Sync offline peers:   legion fleet.sync direction=push documents='[\"devices.toml\"]'{on_flag}  (fleet peers: {})",
+                peer_names.join(", ")
+            );
+        }
+    }
     Ok(text)
 }
 

@@ -74,6 +74,12 @@ pub enum EnrolReply {
         /// Omitted when no other machines are configured.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         fleet: BTreeMap<String, FleetPushOutcome>,
+        /// Fleet machines that did not receive this device yet during enrolment push.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        not_synced_to: Vec<String>,
+        /// Exact command to bring unsynced machines up to date, when `not_synced_to` is non-empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sync_command: Option<String>,
     },
     /// Enrolment failed; nothing on disk was changed (beyond sweeping already-expired invites).
     Err {
@@ -146,8 +152,24 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
         }
     };
 
-    if let Ok(EnrolReply::Ok { ref mut fleet, .. }) = outcome {
+    if let Ok(EnrolReply::Ok {
+        ref mut fleet,
+        ref mut not_synced_to,
+        ref mut sync_command,
+        ..
+    }) = outcome
+    {
         *fleet = push_devices_to_fleet(node, None, created_by.as_deref()).await;
+        let pending: Vec<String> = fleet
+            .iter()
+            .filter(|(_, outcome)| outcome.status != "synced")
+            .map(|(machine, _)| machine.clone())
+            .collect();
+        if !pending.is_empty() {
+            *not_synced_to = pending;
+            *sync_command =
+                Some("legion fleet.sync direction=push documents='[\"devices.toml\"]'".to_owned());
+        }
     }
 
     let enrolled_device = outcome.as_ref().ok().and_then(|reply| match reply {
@@ -767,6 +789,8 @@ fn process_enrol_blocking(
             role,
             device: device_name,
             fleet: BTreeMap::new(),
+            not_synced_to: Vec::new(),
+            sync_command: None,
         }),
     )
 }

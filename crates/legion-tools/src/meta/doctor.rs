@@ -113,8 +113,14 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
         ));
     }
 
+    let unsynced = crate::device::registry::unsynced_fleet_peers_summary(ctx.paths(), ctx.node_name());
+    if let Some(check) = check_unsynced_fleet_devices(&unsynced) {
+        checks.push(check);
+    }
+
     if !quick
         && let Some(ping_tool) = ctx.node().registry().get("fleet.ping")
+        && ctx.grant().allows(ping_tool.spec())
         && let Ok(value) = ping_tool
             .call(ctx, json!({"timeout_s": FLEET_PING_TIMEOUT_S}))
             .await
@@ -125,6 +131,7 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
 
     if !quick
         && let Some(sync_tool) = ctx.node().registry().get("fleet.sync")
+        && ctx.grant().allows(sync_tool.spec())
         && let Ok(value) = sync_tool
             .call(
                 ctx,
@@ -233,13 +240,36 @@ pub fn check_policy_unmarked_device_principals(policy: &Policy) -> Option<Check>
     })
 }
 
+/// Builds a `meta.doctor` warning when local `devices.toml` has entries or tombstones that have
+/// not yet been acknowledged by every machine in `fleet.toml`.
+pub fn check_unsynced_fleet_devices(unsynced_peers: &[String]) -> Option<Check> {
+    if unsynced_peers.is_empty() {
+        return None;
+    }
+    Some(Check {
+        name: "unsynced fleet devices".to_owned(),
+        ok: true,
+        warning: true,
+        detail: format!(
+            "These machine(s) have not received this node's latest paired devices yet: {}.",
+            unsynced_peers.join(", ")
+        ),
+        hint: Some(
+            "Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` to push local devices to them."
+                .to_owned(),
+        ),
+    })
+}
+
 /// Builds a `meta.doctor` warning when any reachable fleet peer has a different paired-device list
-/// (`devices.toml`) from this node. Unreachable peers are ignored because `fleet.ping` already
-/// reports them.
+/// (`devices.toml`) from this node. Unreachable peers and `Denied` responses (when the caller does
+/// not have admin permission on the peer) are ignored rather than reported as drift.
 pub fn check_fleet_device_drift(
     results: &BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
 ) -> Option<Check> {
     let mut drifted: Vec<String> = Vec::new();
+    let mut need_push = false;
+    let mut pull_from: Vec<String> = Vec::new();
     for (machine, docs) in results {
         let Some(entry) = docs.get("devices.toml") else {
             continue;
@@ -247,15 +277,37 @@ pub fn check_fleet_device_drift(
         if entry.status == "same" {
             continue;
         }
-        if entry.status == "error" && is_unreachable_warning(entry.error.as_ref()) {
+        if entry.status == "error"
+            && (is_unreachable_warning(entry.error.as_ref())
+                || entry
+                    .error
+                    .as_ref()
+                    .is_some_and(|err| err.code == ErrorCode::Denied))
+        {
             continue;
         }
         let label = match entry.status.as_str() {
-            "only_here" => format!("{machine} (only here)"),
-            "only_there" => format!("{machine} (only there)"),
-            "changed_here" => format!("{machine} (ahead here)"),
-            "changed_there" => format!("{machine} (ahead there)"),
-            "both" => format!("{machine} (changes on both)"),
+            "only_here" => {
+                need_push = true;
+                format!("{machine} (only here)")
+            }
+            "only_there" => {
+                pull_from.push(machine.clone());
+                format!("{machine} (only there)")
+            }
+            "changed_here" => {
+                need_push = true;
+                format!("{machine} (ahead here)")
+            }
+            "changed_there" => {
+                pull_from.push(machine.clone());
+                format!("{machine} (ahead there)")
+            }
+            "both" => {
+                need_push = true;
+                pull_from.push(machine.clone());
+                format!("{machine} (changes on both)")
+            }
             other => format!("{machine} ({other})"),
         };
         drifted.push(label);
@@ -265,6 +317,28 @@ pub fn check_fleet_device_drift(
         return None;
     }
 
+    let mut commands = Vec::new();
+    if need_push {
+        commands.push(
+            "push local devices with `legion fleet.sync direction=push documents='[\"devices.toml\"]'`"
+                .to_owned(),
+        );
+    }
+    for peer in &pull_from {
+        commands.push(format!(
+            "pull live devices from {peer} with `legion fleet.sync direction=pull from={peer} documents='[\"devices.toml\"]'`"
+        ));
+    }
+    let hint = if commands.is_empty() {
+        "Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` to push local devices, or `legion fleet.sync direction=pull from=<machine> documents='[\"devices.toml\"]'` to import a peer's live devices."
+            .to_owned()
+    } else {
+        format!(
+            "Push sends local devices (never importing a peer's live entries): {}.",
+            commands.join("; ")
+        )
+    };
+
     Some(Check {
         name: "fleet devices".to_owned(),
         ok: true,
@@ -273,9 +347,7 @@ pub fn check_fleet_device_drift(
             "Paired device list (devices.toml) differs from reachable peer(s): {}.",
             drifted.join(", ")
         ),
-        hint: Some(
-            "Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` to merge paired devices across the fleet.".to_owned(),
-        ),
+        hint: Some(hint),
     })
 }
 
@@ -1275,9 +1347,44 @@ deny = [\"effect:power\", \"effect:admin\"]
         assert!(
             warn.hint
                 .as_deref()
-                .is_some_and(|h| h.contains("fleet.sync")),
+                .is_some_and(|h| h.contains("direction=push") && h.contains("direction=pull from=tower")),
             "{:?}",
             warn.hint
+        );
+
+        // Denied `config.read` must NEVER be reported as drift.
+        let mut denied_only: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>> =
+            BTreeMap::new();
+        denied_only.insert(
+            "secret-box".to_owned(),
+            BTreeMap::from([(
+                "devices.toml".to_owned(),
+                FleetDeviceSyncEntry {
+                    status: "error".to_owned(),
+                    error: Some(ErrorBody::new(
+                        ErrorCode::Denied,
+                        "observer may not use config.read",
+                    )),
+                },
+            )]),
+        );
+        assert!(
+            check_fleet_device_drift(&denied_only).is_none(),
+            "Denied config.read must not be reported as drift"
+        );
+
+        // Unsynced local fleet devices check names missing peers and the exact push command.
+        assert!(check_unsynced_fleet_devices(&[]).is_none());
+        let unsynced = check_unsynced_fleet_devices(&["pi".to_owned(), "nas".to_owned()]).unwrap();
+        assert!(unsynced.ok && unsynced.warning);
+        assert!(unsynced.detail.contains("pi") && unsynced.detail.contains("nas"));
+        assert!(
+            unsynced
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("legion fleet.sync direction=push")),
+            "{:?}",
+            unsynced.hint
         );
     }
 }

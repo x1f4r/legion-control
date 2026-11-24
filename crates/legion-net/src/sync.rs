@@ -30,8 +30,8 @@ use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::{
-    DevicesFile, MergeApplyError, MergeChange, apply_devices_merge_blocking, merge_devices,
-    read_devices_for_sync_blocking,
+    DEVICES_VERSION, DevicesFile, MergeApplyError, MergeChange, apply_devices_merge_blocking,
+    merge_devices, record_peer_device_ack,
 };
 use legion_tools::device::sessions::{
     DEFAULT_TERMINATE_GRACE, terminate_device_sessions_for_target,
@@ -89,7 +89,7 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
         "fleet.sync",
         Effect::Admin,
-        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there. Paired devices (devices.toml) merge cleanly across machines in both directions with tombstones always winning, reconciling device:* principals and authorized_keys and ending active sessions for newly removed devices. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
+        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push (including automatic pushes after pair, device.set, and device.remove) sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by a caller this node authorises, or when that peer pushes to this node with credentials this node accepts. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_sync(fleet, ctx, args)),
     ));
@@ -266,7 +266,7 @@ impl SharedDocument {
         is_builtin: &dyn Fn(&str) -> bool,
     ) -> Result<(), ErrorBody> {
         if content.len() > MAX_DOCUMENT_BYTES {
-            return Err(ErrorBody::new(
+            let err = ErrorBody::new(
                 ErrorCode::InvalidArgs,
                 format!(
                     "{} exceeds the {} byte configuration limit ({} bytes given).",
@@ -274,7 +274,14 @@ impl SharedDocument {
                     MAX_DOCUMENT_BYTES,
                     content.len()
                 ),
-            ));
+            );
+            return Err(if *self == Self::Devices {
+                err.with_hint(
+                    "Sync devices.toml to every machine in fleet.toml (`legion fleet.sync direction=push documents='[\"devices.toml\"]'`), then run `legion device.list prune_tombstones=true` as owner to drop tombstones older than 400 days that every peer has acknowledged.",
+                )
+            } else {
+                err
+            });
         }
         match self {
             Self::Devices => {
@@ -774,38 +781,6 @@ async fn read_local_document_for_ctx(
     ctx: &Ctx,
     doc: &SharedDocument,
 ) -> Result<ConfigReadResult, ErrorBody> {
-    if *doc == SharedDocument::Devices {
-        let paths = ctx.paths().clone();
-        let node_name = ctx.node_name().to_owned();
-        let node_file = ctx.config().get::<NodeFile>().ok();
-        return tokio::task::spawn_blocking(move || {
-            let content = read_devices_for_sync_blocking(&paths, &node_name, node_file.as_deref())?;
-            match content {
-                Some(text) => {
-                    let hash = hash_bytes(text.as_bytes()).to_string();
-                    Ok(ConfigReadResult {
-                        document: SharedDocument::Devices.canonical_name(),
-                        exists: true,
-                        hash: Some(hash),
-                        content: Some(text),
-                    })
-                }
-                None => Ok(ConfigReadResult {
-                    document: SharedDocument::Devices.canonical_name(),
-                    exists: false,
-                    hash: None,
-                    content: None,
-                }),
-            }
-        })
-        .await
-        .map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Internal,
-                format!("Reading devices.toml stopped unexpectedly: {error}."),
-            )
-        })?;
-    }
     let config_dir = ctx.paths().config_dir().to_path_buf();
     let doc = doc.clone();
     tokio::task::spawn_blocking(move || read_local_document(&config_dir, &doc))
@@ -842,6 +817,9 @@ async fn apply_local_write(
                     "devices.toml exceeds the {MAX_DOCUMENT_BYTES} byte configuration limit ({} bytes given).",
                     content.len()
                 ),
+            )
+            .with_hint(
+                "Sync devices.toml to every machine in fleet.toml (`legion fleet.sync direction=push documents='[\"devices.toml\"]'`), then run `legion device.list prune_tombstones=true` as owner to drop tombstones older than 400 days that every peer has acknowledged.",
             ));
         }
         if let Some(ref expected) = expect_hash {
@@ -2028,8 +2006,6 @@ async fn sync_devices_document(
 
     let merged = merge_devices(&local_devices, &remote_devices);
     let merged_is_empty = merged.devices.is_empty() && merged.removed.is_empty();
-    let merged_toml = merged.to_toml_string();
-    let merged_hash = hash_bytes(merged_toml.as_bytes()).to_string();
 
     if direction == SyncDirection::Status {
         let (status, detail) = classify_devices_status(
@@ -2038,6 +2014,7 @@ async fn sync_devices_document(
             &merged,
             local.exists,
             remote.exists,
+            machine,
         );
         return DocSyncOutcome {
             status,
@@ -2051,70 +2028,348 @@ async fn sync_devices_document(
         };
     }
 
-    let local_up_to_date = local_devices == merged && (merged_is_empty || local_file_exists);
-    let remote_up_to_date = remote_devices == merged && (merged_is_empty || remote.exists);
+    match direction {
+        SyncDirection::Push => {
+            // Trust rule: push sends local entries to the peer and imports ONLY tombstones back —
+            // never live device entries from the peer.
+            let remote_tombstones_only = DevicesFile {
+                version: DEVICES_VERSION,
+                devices: BTreeMap::new(),
+                removed: remote_devices.removed.clone(),
+            };
+            let local_after_tombstones = merge_devices(&local_devices, &remote_tombstones_only);
+            let local_needs_tombstones = local_after_tombstones != local_devices;
 
-    if local_up_to_date && remote_up_to_date {
-        if !dry_run && !merged_is_empty && last_synced_hash.as_deref() != Some(merged_hash.as_str())
-        {
-            let _ = record_sidecar_async(&state_dir, &doc, machine, &merged_hash).await;
-        }
-        return DocSyncOutcome {
-            status: SyncStatus::Same,
-            local_hash: local.hash,
-            remote_hash: remote.hash,
-            last_synced_hash,
-            backup: None,
-            detail: None,
-            warnings: Vec::new(),
-            error: None,
-        };
-    }
+            let remote_after_push = merge_devices(&remote_devices, &local_after_tombstones);
+            let local_after_is_empty = local_after_tombstones.devices.is_empty()
+                && local_after_tombstones.removed.is_empty();
+            let remote_needs_push = remote_after_push != remote_devices
+                || (!remote.exists && !local_after_is_empty);
 
-    let applied_status = match direction {
-        SyncDirection::Push => SyncStatus::Pushed,
-        SyncDirection::Pull => SyncStatus::Pulled,
-        SyncDirection::Status => SyncStatus::Same,
-    };
+            if !local_needs_tombstones && !remote_needs_push {
+                if !dry_run {
+                    let paths = ctx.paths().clone();
+                    let peer_name = machine.to_owned();
+                    let confirmed = local_after_tombstones.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        record_peer_device_ack(&paths, &peer_name, &confirmed)
+                    })
+                    .await;
+                    if local.hash == remote.hash
+                        && let Some(ref lh) = local.hash
+                        && last_synced_hash.as_deref() != Some(lh.as_str())
+                    {
+                        let _ = record_sidecar_async(&state_dir, &doc, machine, lh).await;
+                    }
+                }
+                let extra_remote = remote_devices != local_after_tombstones;
+                let detail = extra_remote.then(|| {
+                    format!(
+                        "{machine} has additional live device(s) not imported by push; run `legion fleet.sync direction=pull from={machine} documents='[\"devices.toml\"]'` to import them."
+                    )
+                });
+                return DocSyncOutcome {
+                    status: SyncStatus::Same,
+                    local_hash: local.hash,
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: None,
+                    detail,
+                    warnings: Vec::new(),
+                    error: None,
+                };
+            }
 
-    if dry_run {
-        return DocSyncOutcome {
-            status: applied_status,
-            local_hash: local.hash,
-            remote_hash: remote.hash,
-            last_synced_hash,
-            backup: None,
-            detail: Some("Would merge devices.toml on both machines (dry_run).".to_owned()),
-            warnings: Vec::new(),
-            error: None,
-        };
-    }
+            if dry_run {
+                return DocSyncOutcome {
+                    status: SyncStatus::Pushed,
+                    local_hash: local.hash,
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: None,
+                    detail: Some(
+                        "Would push local devices.toml to remote and import only tombstones back (dry_run)."
+                            .to_owned(),
+                    ),
+                    warnings: Vec::new(),
+                    error: None,
+                };
+            }
 
-    let mut current_toml = merged_toml;
-    let mut current_hash = merged_hash.clone();
-    let mut local_backup = None;
-    let mut warnings = Vec::new();
+            let mut current_local = local_devices.clone();
+            let mut current_local_toml = local_devices.to_toml_string();
+            let mut current_local_hash = local
+                .hash
+                .clone()
+                .unwrap_or_else(|| hash_bytes(current_local_toml.as_bytes()).to_string());
+            let mut local_backup = None;
+            let mut warnings = Vec::new();
 
-    if !local_up_to_date {
-        match apply_local_write(
-            ctx,
-            SharedDocument::Devices,
-            current_toml.clone(),
-            None,
-            false,
-        )
-        .await
-        {
-            Ok(written) => {
-                local_backup = written.backup;
-                current_hash = written.hash_after;
-                warnings.extend(written.warnings);
-                if let Some(canonical) = written.canonical_content {
-                    current_toml = canonical;
+            // 1. Apply ONLY remote tombstones locally (never remote live entries).
+            if local_needs_tombstones {
+                match apply_local_write(
+                    ctx,
+                    SharedDocument::Devices,
+                    remote_tombstones_only.to_toml_string(),
+                    None,
+                    false,
+                )
+                .await
+                {
+                    Ok(written) => {
+                        local_backup = written.backup;
+                        current_local_hash = written.hash_after;
+                        warnings.extend(written.warnings);
+                        if let Some(canonical) = written.canonical_content {
+                            if let Ok(parsed) = parse::<DevicesFile>(&local_path, canonical.as_bytes())
+                            {
+                                current_local = parsed;
+                            }
+                            current_local_toml = canonical;
+                        }
+                    }
+                    Err(error) => {
+                        return DocSyncOutcome {
+                            status: SyncStatus::Error,
+                            local_hash: local.hash,
+                            remote_hash: remote.hash,
+                            last_synced_hash,
+                            backup: None,
+                            detail: None,
+                            warnings: Vec::new(),
+                            error: Some(error),
+                        };
+                    }
                 }
             }
-            Err(error) => {
+
+            // 2. Push our local devices.toml to the peer.
+            let mut final_remote_hash = remote.hash.clone();
+            let mut remote_has_extra_live = remote_after_push.devices.len() > current_local.devices.len()
+                || remote_after_push
+                    .devices
+                    .iter()
+                    .any(|(id, dev)| current_local.devices.get(id) != Some(dev));
+
+            let should_write_remote = remote_needs_push
+                || merge_devices(&remote_devices, &current_local) != remote_devices;
+            if should_write_remote && !(current_local.devices.is_empty() && current_local.removed.is_empty()) {
+                match fleet
+                    .call_remote(
+                        ctx,
+                        machine,
+                        "config.write",
+                        json!({
+                            "document": "devices.toml",
+                            "content": current_local_toml,
+                        }),
+                        EventSink::discard(),
+                    )
+                    .await
+                {
+                    Ok(val) => {
+                        let written: ConfigWriteResult = match serde_json::from_value(val) {
+                            Ok(parsed) => parsed,
+                            Err(error) => {
+                                return error_outcome(ErrorBody::new(
+                                    ErrorCode::Failed,
+                                    format!("Remote config.write returned an unexpected shape: {error}."),
+                                ));
+                            }
+                        };
+                        final_remote_hash = Some(written.hash.clone());
+                        warnings.extend(written.warnings);
+                        // If the remote hash differs from ours, read back ONLY tombstones from
+                        // the peer (never live device entries!).
+                        if written.hash != current_local_hash
+                            && let Ok(again_val) = fleet
+                                .call_remote(
+                                    ctx,
+                                    machine,
+                                    "config.read",
+                                    json!({"document": "devices.toml"}),
+                                    EventSink::discard(),
+                                )
+                                .await
+                            && let Ok(again) = serde_json::from_value::<ConfigReadResult>(again_val)
+                            && let Some(again_content) = again.content
+                            && let Ok(again_devices) =
+                                parse::<DevicesFile>(Path::new("devices.toml"), again_content.as_bytes())
+                        {
+                            let again_tombs = DevicesFile {
+                                version: DEVICES_VERSION,
+                                devices: BTreeMap::new(),
+                                removed: again_devices.removed.clone(),
+                            };
+                            if merge_devices(&current_local, &again_tombs) != current_local
+                                && let Ok(final_local) = apply_local_write(
+                                    ctx,
+                                    SharedDocument::Devices,
+                                    again_tombs.to_toml_string(),
+                                    None,
+                                    false,
+                                )
+                                .await
+                            {
+                                current_local_hash = final_local.hash_after;
+                                warnings.extend(final_local.warnings);
+                                if let Some(canonical) = final_local.canonical_content
+                                    && let Ok(parsed) =
+                                        parse::<DevicesFile>(&local_path, canonical.as_bytes())
+                                {
+                                    current_local = parsed;
+                                }
+                            }
+                            remote_has_extra_live = again_devices
+                                .devices
+                                .iter()
+                                .any(|(id, dev)| current_local.devices.get(id) != Some(dev));
+                        }
+                    }
+                    Err(error) => {
+                        return DocSyncOutcome {
+                            status: SyncStatus::Error,
+                            local_hash: Some(current_local_hash),
+                            remote_hash: remote.hash,
+                            last_synced_hash,
+                            backup: local_backup,
+                            detail: None,
+                            warnings,
+                            error: Some(error),
+                        };
+                    }
+                }
+            }
+
+            // Record that `machine` has now acknowledged all entries in `current_local`.
+            let paths = ctx.paths().clone();
+            let peer_name = machine.to_owned();
+            let confirmed = current_local.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                record_peer_device_ack(&paths, &peer_name, &confirmed)
+            })
+            .await;
+
+            let converged = final_remote_hash.as_deref() == Some(current_local_hash.as_str());
+            if converged
+                && let Err(error) =
+                    record_sidecar_async(&state_dir, &doc, machine, &current_local_hash).await
+            {
+                return error_outcome(error);
+            }
+
+            let detail = remote_has_extra_live.then(|| {
+                format!(
+                    "{machine} has additional live device(s) not imported by push; run `legion fleet.sync direction=pull from={machine} documents='[\"devices.toml\"]'` to import them."
+                )
+            });
+
+            DocSyncOutcome {
+                status: SyncStatus::Pushed,
+                local_hash: Some(current_local_hash.clone()),
+                remote_hash: final_remote_hash,
+                last_synced_hash: converged.then_some(current_local_hash).or(last_synced_hash),
+                backup: local_backup,
+                detail,
+                warnings,
+                error: None,
+            }
+        }
+        SyncDirection::Pull => {
+            // Explicit pull: merges the peer's live devices and tombstones into local `devices.toml`
+            // without writing back to the peer.
+            let local_up_to_date =
+                local_devices == merged && (merged_is_empty || local_file_exists);
+            if local_up_to_date {
+                if !dry_run {
+                    let paths = ctx.paths().clone();
+                    let peer_name = machine.to_owned();
+                    let confirmed = remote_devices.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        record_peer_device_ack(&paths, &peer_name, &confirmed)
+                    })
+                    .await;
+                    if local.hash == remote.hash
+                        && let Some(ref lh) = local.hash
+                        && last_synced_hash.as_deref() != Some(lh.as_str())
+                    {
+                        let _ = record_sidecar_async(&state_dir, &doc, machine, lh).await;
+                    }
+                }
                 return DocSyncOutcome {
+                    status: SyncStatus::Same,
+                    local_hash: local.hash,
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: None,
+                    detail: None,
+                    warnings: Vec::new(),
+                    error: None,
+                };
+            }
+
+            let Some(remote_content) = remote.content else {
+                return DocSyncOutcome {
+                    status: SyncStatus::OnlyHere,
+                    local_hash: local.hash,
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: None,
+                    detail: Some(format!(
+                        "devices.toml does not exist on {machine}; run `legion fleet.sync direction=push machines='[\"{machine}\"]' documents='[\"devices.toml\"]'` to push local devices."
+                    )),
+                    warnings: Vec::new(),
+                    error: None,
+                };
+            };
+
+            if dry_run {
+                return DocSyncOutcome {
+                    status: SyncStatus::Pulled,
+                    local_hash: local.hash,
+                    remote_hash: remote.hash,
+                    last_synced_hash,
+                    backup: None,
+                    detail: Some(format!(
+                        "Would merge devices.toml from {machine} into this node (dry_run)."
+                    )),
+                    warnings: Vec::new(),
+                    error: None,
+                };
+            }
+
+            match apply_local_write(ctx, SharedDocument::Devices, remote_content, None, false).await
+            {
+                Ok(written) => {
+                    let paths = ctx.paths().clone();
+                    let peer_name = machine.to_owned();
+                    let confirmed = remote_devices.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        record_peer_device_ack(&paths, &peer_name, &confirmed)
+                    })
+                    .await;
+                    let converged = remote.hash.as_deref() == Some(written.hash_after.as_str());
+                    if converged
+                        && let Err(error) =
+                            record_sidecar_async(&state_dir, &doc, machine, &written.hash_after)
+                                .await
+                    {
+                        return error_outcome(error);
+                    }
+                    DocSyncOutcome {
+                        status: SyncStatus::Pulled,
+                        local_hash: Some(written.hash_after.clone()),
+                        remote_hash: remote.hash,
+                        last_synced_hash: converged
+                            .then_some(written.hash_after)
+                            .or(last_synced_hash),
+                        backup: written.backup,
+                        detail: None,
+                        warnings: written.warnings,
+                        error: None,
+                    }
+                }
+                Err(error) => DocSyncOutcome {
                     status: SyncStatus::Error,
                     local_hash: local.hash,
                     remote_hash: remote.hash,
@@ -2123,89 +2378,10 @@ async fn sync_devices_document(
                     detail: None,
                     warnings: Vec::new(),
                     error: Some(error),
-                };
+                },
             }
         }
-    }
-
-    let need_remote_write = !remote_up_to_date || current_hash != merged_hash;
-    let mut final_remote_hash = remote.hash.clone();
-    if need_remote_write {
-        match fleet
-            .call_remote(
-                ctx,
-                machine,
-                "config.write",
-                json!({
-                    "document": "devices.toml",
-                    "content": current_toml,
-                }),
-                EventSink::discard(),
-            )
-            .await
-        {
-            Ok(val) => {
-                let written: ConfigWriteResult = match serde_json::from_value(val) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        return error_outcome(ErrorBody::new(
-                            ErrorCode::Failed,
-                            format!("Remote config.write returned an unexpected shape: {error}."),
-                        ));
-                    }
-                };
-                final_remote_hash = Some(written.hash.clone());
-                warnings.extend(written.warnings);
-                // If the remote concurrently merged another change while accepting our write,
-                // pull the remote's merged state once more so both machines converge identically.
-                if written.hash != current_hash
-                    && let Ok(again_val) = fleet
-                        .call_remote(
-                            ctx,
-                            machine,
-                            "config.read",
-                            json!({"document": "devices.toml"}),
-                            EventSink::discard(),
-                        )
-                        .await
-                    && let Ok(again) = serde_json::from_value::<ConfigReadResult>(again_val)
-                    && let Some(again_content) = again.content
-                    && let Ok(final_local) =
-                        apply_local_write(ctx, SharedDocument::Devices, again_content, None, false)
-                            .await
-                {
-                    current_hash = final_local.hash_after;
-                    warnings.extend(final_local.warnings);
-                }
-            }
-            Err(error) => {
-                return DocSyncOutcome {
-                    status: SyncStatus::Error,
-                    local_hash: Some(current_hash),
-                    remote_hash: remote.hash,
-                    last_synced_hash,
-                    backup: local_backup,
-                    detail: None,
-                    warnings,
-                    error: Some(error),
-                };
-            }
-        }
-    }
-
-    if let Err(error) = record_sidecar_async(&state_dir, &doc, machine, &current_hash).await {
-        return error_outcome(error);
-    }
-
-    DocSyncOutcome {
-        status: applied_status,
-        local_hash: Some(current_hash.clone()),
-        remote_hash: final_remote_hash.or_else(|| Some(current_hash.clone())),
-        last_synced_hash: Some(current_hash),
-        backup: local_backup,
-        detail: None,
-        warnings,
-        error: None,
+        SyncDirection::Status => unreachable!(),
     }
 }
 
@@ -2215,25 +2391,48 @@ fn classify_devices_status(
     merged: &DevicesFile,
     local_exists: bool,
     remote_exists: bool,
+    machine: &str,
 ) -> (SyncStatus, Option<String>) {
     if local == remote {
         return (SyncStatus::Same, None);
     }
     if !local_exists && remote_exists {
-        return (SyncStatus::OnlyThere, None);
+        return (
+            SyncStatus::OnlyThere,
+            Some(format!(
+                "Run `legion fleet.sync direction=pull from={machine} documents='[\"devices.toml\"]'` to import devices from {machine}."
+            )),
+        );
     }
     if local_exists && !remote_exists {
-        return (SyncStatus::OnlyHere, None);
+        return (
+            SyncStatus::OnlyHere,
+            Some(format!(
+                "Run `legion fleet.sync direction=push machines='[\"{machine}\"]' documents='[\"devices.toml\"]'` to push local devices to {machine}."
+            )),
+        );
     }
     if merged == local && merged != remote {
-        return (SyncStatus::ChangedHere, None);
+        return (
+            SyncStatus::ChangedHere,
+            Some(format!(
+                "Run `legion fleet.sync direction=push machines='[\"{machine}\"]' documents='[\"devices.toml\"]'` to bring {machine} up to date."
+            )),
+        );
     }
     if merged == remote && merged != local {
-        return (SyncStatus::ChangedThere, None);
+        return (
+            SyncStatus::ChangedThere,
+            Some(format!(
+                "Run `legion fleet.sync direction=pull from={machine} documents='[\"devices.toml\"]'` to import devices from {machine} (push never imports a peer's live devices)."
+            )),
+        );
     }
     (
         SyncStatus::Both,
-        Some("Both machines have device changes; push or pull will merge them cleanly.".to_owned()),
+        Some(format!(
+            "Both machines have device changes: push sends local devices to {machine} and imports only tombstones back; run `legion fleet.sync direction=pull from={machine} documents='[\"devices.toml\"]'` to import {machine}'s live devices here."
+        )),
     )
 }
 
@@ -2742,7 +2941,7 @@ mod tests {
 
         let empty = DevicesFile::default();
         assert_eq!(
-            classify_devices_status(&empty, &empty, &empty, false, false).0,
+            classify_devices_status(&empty, &empty, &empty, false, false, "node-b").0,
             SyncStatus::Same
         );
 
@@ -2776,22 +2975,22 @@ mod tests {
         let both = merge_devices(&only_a, &only_b);
 
         assert_eq!(
-            classify_devices_status(&only_a, &empty, &only_a, true, false).0,
+            classify_devices_status(&only_a, &empty, &only_a, true, false, "node-b").0,
             SyncStatus::OnlyHere
         );
         assert_eq!(
-            classify_devices_status(&empty, &only_b, &only_b, false, true).0,
+            classify_devices_status(&empty, &only_b, &only_b, false, true, "node-b").0,
             SyncStatus::OnlyThere
         );
         assert_eq!(
-            classify_devices_status(&both, &only_a, &both, true, true).0,
+            classify_devices_status(&both, &only_a, &both, true, true, "node-b").0,
             SyncStatus::ChangedHere
         );
         assert_eq!(
-            classify_devices_status(&only_a, &both, &both, true, true).0,
+            classify_devices_status(&only_a, &both, &both, true, true, "node-b").0,
             SyncStatus::ChangedThere
         );
-        let (st, detail) = classify_devices_status(&only_a, &only_b, &both, true, true);
+        let (st, detail) = classify_devices_status(&only_a, &only_b, &both, true, true, "node-b");
         assert_eq!(st, SyncStatus::Both);
         assert!(detail.is_some());
     }
@@ -3357,6 +3556,91 @@ role = \"phone_admin\"
         assert!(
             !marker_session.exists(),
             "session termination/sweep must run after devices.toml save even when authorized_keys fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_read_devices_does_not_expose_unsaved_adopted_list_and_size_limit_has_way_out() {
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::authkeys::{ForcedCommandShell, PinnedHome, format_device_line};
+        use legion_tools::device::keys::{ed25519_public_key_from_seed, validate_ed25519_public_key};
+        use legion_tools::device::store::{DeviceRecord, DevicesState, save_state};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+
+        // Write a matching legacy line + state/devices.json WITHOUT creating devices.toml.
+        let id = "ab".repeat(16);
+        let key = ed25519_public_key_from_seed(&[81u8; 32]);
+        let fp = validate_ed25519_public_key(&key).unwrap().fingerprint;
+        let line = format_device_line(
+            &legion_core::current_exe().unwrap(),
+            "owner",
+            &key,
+            "legacy-box",
+            &id,
+            &PinnedHome::from_paths(&paths),
+            None,
+            ForcedCommandShell::host().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&auth_keys, format!("{line}\n")).unwrap();
+        let mut st = DevicesState::default();
+        st.devices.insert(
+            "legacy-box".to_owned(),
+            DeviceRecord {
+                name: "legacy-box".to_owned(),
+                principal: "owner".to_owned(),
+                added: "2026-11-24T10:00:00Z".to_owned(),
+                fingerprint: fp,
+                pairing_id: Some(id),
+            },
+        );
+        save_state(&paths, &st).unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        // config.read devices.toml must NOT synthesize an unsaved adopted list.
+        let read = node
+            .call(Call::new(
+                Door::Cli,
+                "config.read",
+                json!({"document": "devices.toml"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read["exists"], json!(false), "{read}");
+        assert!(read["content"].is_null(), "{read}");
+
+        // Exceeding MAX_DOCUMENT_BYTES on devices.toml gives a clear error with prune hint.
+        let huge = "a".repeat(MAX_DOCUMENT_BYTES + 16);
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": huge}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("prune_tombstones") && h.contains("400")),
+            "expected prune hint on size limit error: {err:?}"
         );
     }
 }
