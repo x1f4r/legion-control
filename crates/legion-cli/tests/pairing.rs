@@ -831,11 +831,7 @@ fn gate_account_pinning_refuses_other_accounts_and_scopes_list_and_remove() {
     let my_pub = ed25519_public_key_from_seed(&[21_u8; 32]);
     let other_pub = ed25519_public_key_from_seed(&[22_u8; 32]);
     let exe = Path::new(env!("CARGO_BIN_EXE_legion"));
-    let shell = if cfg!(windows) {
-        legion_tools::device::authkeys::ForcedCommandShell::WindowsCmd
-    } else {
-        legion_tools::device::authkeys::ForcedCommandShell::Posix
-    };
+    let shell = legion_tools::device::authkeys::ForcedCommandShell::host().unwrap();
     let pinned_home = legion_tools::device::authkeys::PinnedHome::Root(
         home.state().parent().unwrap().to_path_buf(),
     );
@@ -1886,6 +1882,52 @@ fn real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels(
         serde_json::from_str(String::from_utf8_lossy(&new_ok.stdout).trim()).unwrap();
     assert_eq!(new_reply["result"]["principal"], json!("phone"));
 
+    // 5. A transient non-Denied error during the gate re-check (e.g. a temporarily unreadable or
+    //    corrupt node.toml returning ErrorCode::Failed) must refuse only that session without
+    //    terminating the parent sshd ControlMaster connection, so restoring node.toml lets the
+    //    next channel on the same ControlMaster succeed.
+    let node_toml_path = home
+        .state()
+        .parent()
+        .unwrap()
+        .join("config")
+        .join("node.toml");
+    let original_node_toml = std::fs::read_to_string(&node_toml_path).unwrap();
+    std::fs::write(&node_toml_path, "name = [invalid toml\n").unwrap();
+    let during_transient = run_whoami_via_ctl(&new_ctl.ctl_path);
+    std::fs::write(&node_toml_path, &original_node_toml).unwrap();
+    assert!(
+        !during_transient.status.success(),
+        "gate unexpectedly served while node.toml was corrupt: stdout={}",
+        String::from_utf8_lossy(&during_transient.stdout)
+    );
+    assert!(
+        during_transient.stdout.is_empty(),
+        "refused gate must not write RPC output on transient error: {:?}",
+        String::from_utf8_lossy(&during_transient.stdout)
+    );
+    let transient_stderr = String::from_utf8_lossy(&during_transient.stderr);
+    assert!(
+        transient_stderr.contains("legion gate:"),
+        "expected gate error on stderr during transient failure, got: {transient_stderr:?}"
+    );
+    // Give any wrongful parent-termination signal a moment to take effect, then verify the
+    // ControlMaster survived and answers normally once node.toml is restored.
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        ctl_is_alive(&new_ctl.ctl_path),
+        "transient non-Denied error killed the parent sshd ControlMaster connection"
+    );
+    let after_transient = run_whoami_via_ctl(&new_ctl.ctl_path);
+    assert!(
+        after_transient.status.success(),
+        "ControlMaster failed after restoring node.toml: {}",
+        String::from_utf8_lossy(&after_transient.stderr)
+    );
+    let after_transient_reply: Value =
+        serde_json::from_str(String::from_utf8_lossy(&after_transient.stdout).trim()).unwrap();
+    assert_eq!(after_transient_reply["result"]["principal"], json!("phone"));
+
     // Unrelated bystander ControlMaster and the sshd listener must both remain intact.
     assert!(
         ctl_is_alive(&bystander_ctl.ctl_path),
@@ -1909,11 +1951,7 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
     let home_root = home.state().parent().unwrap().to_path_buf();
     let pinned_home = legion_tools::device::authkeys::PinnedHome::Root(home_root.clone());
     let exe = Path::new(env!("CARGO_BIN_EXE_legion"));
-    let shell = if cfg!(windows) {
-        legion_tools::device::authkeys::ForcedCommandShell::WindowsCmd
-    } else {
-        legion_tools::device::authkeys::ForcedCommandShell::Posix
-    };
+    let shell = legion_tools::device::authkeys::ForcedCommandShell::host().unwrap();
 
     let key_a = ed25519_public_key_from_seed(&[31_u8; 32]);
     let key_b = ed25519_public_key_from_seed(&[32_u8; 32]);
