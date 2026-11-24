@@ -64,7 +64,16 @@ async fn sleep(ctx: &Ctx, args: SleepArgs) -> Result<Slept, ToolError> {
     while waited < total {
         ctx.emit(EventKind::Progress, json!({"waited": waited.as_secs_f64()}));
         let step = tick.min(total - waited);
-        tokio::time::sleep(step).await;
+        // Woken early by a cancel, which it answers at once.
+        if tokio::time::timeout(step, ctx.cancelled()).await.is_ok() {
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!(
+                    "test.sleep was cancelled after {} seconds.",
+                    waited.as_secs_f64()
+                ),
+            ));
+        }
         waited += step;
     }
     Ok(Slept {

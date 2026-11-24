@@ -26,9 +26,14 @@ pub type ToolError = ErrorBody;
 /// [`Registry::add_fn`](crate::Registry::add_fn), which implements this trait for them. Implement it
 /// by hand only for a tool whose schema is not known at compile time, such as one a user defines.
 ///
-/// When a call is cancelled its future is dropped, so a tool that starts something outside the
-/// process (a child process, a temporary file) cleans it up in a `Drop` guard, or watches
-/// [`Ctx::cancelled`] to finish early on its own terms.
+/// When a call is cancelled the node cancels the tool's context and gives it
+/// [`CANCEL_GRACE`](crate::CANCEL_GRACE) to return on its own; whatever it returns by then is the
+/// call's result, and only after that is its future dropped. So a tool that runs for long, or
+/// starts something that outlives a dropped future (a child process tree, a forwarded call), waits
+/// on [`Ctx::cancelled`] alongside its work, stops that work, cleans up and returns. Work handed to
+/// `spawn_blocking` cannot be stopped from outside at all: it checks a clone of
+/// [`Ctx::cancel_token`] between steps itself. A `Drop` guard remains the last line for whatever a
+/// tool still holds when the grace runs out.
 pub trait Tool: Send + Sync + 'static {
     /// How the tool describes itself.
     fn spec(&self) -> &ToolSpec;

@@ -120,7 +120,7 @@ impl McpDoor {
         let principal = policy
             .resolve(None, self.options.pinned.as_deref())
             .map_err(here)?;
-        Ok(policy.grant(&principal, self.node.paths().home()))
+        Ok(policy.grant(&principal, self.node.paths()))
     }
 
     /// The tool a client names, when the principal may use it. A tool beyond its role is treated
