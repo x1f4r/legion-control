@@ -91,6 +91,10 @@ fn main() -> ExitCode {
             "shutting_down_cancels_and_records_calls",
             shutting_down_cancels_and_records_calls,
         ),
+        (
+            "a_token_gives_no_one_more_than_they_have",
+            a_token_gives_no_one_more_than_they_have,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -1252,4 +1256,89 @@ fn shutting_down_cancels_and_records_calls() {
         assert_eq!(line["outcome"], json!("cancelled"));
         assert!(server.stderr().contains("legion serve: stopped"));
     }
+}
+
+fn a_token_gives_no_one_more_than_they_have() {
+    let home = Home::new();
+    home.write_config(
+        "policy.toml",
+        &format!("{POLICY}\n[principals.keeper]\nrole = \"keeper\"\n\n[roles.keeper]\nallow = [\"effect:admin\"]\n"),
+    );
+    let refused = |line: &[&str], says: &str| {
+        let mut line = line.to_vec();
+        line.push("--json");
+        let run = home.run(&line);
+        assert_eq!(run.code, 1, "{line:?}: {}", run.stdout);
+        let error = run.json();
+        assert_eq!(error["code"], json!("denied"), "{line:?}: {error}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(says), "{line:?}: {message}");
+    };
+    // A role that may only administer cannot mint its way to more.
+    refused(
+        &[
+            "token",
+            "add",
+            "x",
+            "owner",
+            "allow_owner=true",
+            "--as",
+            "keeper",
+        ],
+        "only owner may",
+    );
+    refused(
+        &["token", "add", "x", "phone", "--as", "keeper"],
+        "unless the caller's role, keeper, delegates",
+    );
+    refused(
+        &[
+            "token",
+            "add",
+            "x",
+            "owner",
+            "allow_owner=true",
+            "--as",
+            "admin",
+        ],
+        "only owner may",
+    );
+    let keeper = make_token(&home, &["keeper", "keeper", "--as", "keeper"]);
+    make_token(&home, &["phone", "phone", "--as", "admin"]);
+    make_token(&home, &["root", "owner", "allow_owner=true"]);
+
+    let names = |line: &[&str]| -> Vec<String> {
+        let mut line = line.to_vec();
+        line.push("--json");
+        home.run(&line).json()["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|token| token["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(names(&["token", "list", "--as", "keeper"]), ["keeper"]);
+    assert_eq!(
+        names(&["token", "list", "--as", "admin"]),
+        ["keeper", "phone"]
+    );
+    assert_eq!(names(&["token", "list"]), ["keeper", "phone", "root"]);
+    for (name, caller) in [("phone", "keeper"), ("root", "admin")] {
+        let removed = home.run(&["token", "remove", name, "--as", caller, "--json"]);
+        assert_eq!(
+            removed.json()["code"],
+            json!("not_found"),
+            "{name} as {caller}"
+        );
+    }
+
+    // The way it was found: over HTTP, with the keeper's own token.
+    let server = Server::start(&home);
+    let minted = server.call(
+        &keeper,
+        json!({"tool": "token.add", "args": {"name": "x", "principal": "owner", "allow_owner": true}}),
+    );
+    assert_eq!(minted.status, 403, "{}", minted.text());
+    assert!(!minted.text().contains("lgn_"));
+    assert_eq!(names(&["token", "list"]), ["keeper", "phone", "root"]);
 }
