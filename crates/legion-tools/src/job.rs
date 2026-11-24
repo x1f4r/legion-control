@@ -18,10 +18,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Access, Ctx, Paths, Registry, ToolError};
+use legion_core::{Access, BoxFuture, Ctx, Paths, Registry, ToolError};
 use legion_os::OsError;
 use legion_os::detach::{
-    DetachHandle, DetachOptions, detached_active, spawn_detached, stop_detached,
+    DetachHandle, DetachOptions, WINDOWS_WMI_LAUNCH_DEADLINE, detached_active, spawn_detached,
+    stop_detached,
 };
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid;
@@ -35,11 +36,11 @@ pub use supervise::try_supervise_cli;
 
 use logs::{DEFAULT_LOG_LIMIT, DEFAULT_TAIL_LINES, MAX_LOG_LIMIT, MAX_TAIL_LINES};
 use store::{
-    ExitOutcome, ExitRecord, JobRecord, command_summary, compare_newest_first, default_job_name,
-    derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir, jobs_lock_path,
-    load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record, read_job_record,
-    remove_env_file, validate_job_id, write_cancel_request, write_env_file, write_exit_record,
-    write_job_record,
+    ExitOutcome, ExitRecord, JobRecord, LaunchingState, command_summary, compare_newest_first,
+    default_job_name, derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir,
+    jobs_lock_path, load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record,
+    read_job_record, remove_env_file, validate_job_id, write_cancel_request, write_env_file,
+    write_exit_record, write_job_record,
 };
 
 /// Default and maximum `limit` for `job.list`.
@@ -51,7 +52,12 @@ const MAX_KEY_BYTES: usize = 256;
 /// Maximum time `job.start` waits for the node-wide jobs lock.
 const JOBS_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time `job.start` waits for the detached supervisor to acquire the job lock or finish.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Explicit launch-state deadline window written into `job.json` before spawning the detached
+/// supervisor: covers the full 60 s detached-launch budget plus supervisor startup and margin so
+/// `job.status` reports `starting` and idempotency `key` retries match the in-flight launch.
+const LAUNCH_DEADLINE_WINDOW: Duration =
+    Duration::from_secs(WINDOWS_WMI_LAUNCH_DEADLINE.as_secs() + STARTUP_TIMEOUT.as_secs() + 10);
 /// Poll interval while `job.start` waits for supervisor readiness.
 const STARTUP_POLL: Duration = Duration::from_millis(20);
 /// Cooperative grace period `job.cancel` gives the supervisor before escalating to `stop_detached`.
@@ -59,7 +65,7 @@ const CANCEL_GRACE: Duration = Duration::from_secs(6);
 /// Poll interval during `job.cancel`.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 /// Settle window waiting for the kernel to release `lock` after `stop_detached`.
-const LOCK_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const LOCK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Initial and maximum poll interval for `job.wait`.
 const WAIT_INITIAL_POLL: Duration = Duration::from_millis(25);
 const WAIT_MAX_POLL: Duration = Duration::from_millis(100);
@@ -382,6 +388,13 @@ pub struct CancelledJob {
 }
 
 pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolError> {
+    start_with_launcher(ctx, args, |options| Box::pin(spawn_detached(options))).await
+}
+
+async fn start_with_launcher<F>(ctx: &Ctx, args: StartArgs, launch: F) -> Result<Started, ToolError>
+where
+    F: FnOnce(DetachOptions) -> BoxFuture<'static, Result<DetachHandle, OsError>>,
+{
     validate_command(args.cmd.as_deref(), args.argv.as_deref())?;
     let env = args.env.unwrap_or_default();
     validate_env(&env)?;
@@ -493,6 +506,11 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
                 format!("Cannot determine the system boot id: {err}."),
             )
         })?;
+        let launch_deadline = now
+            .checked_add(
+                jiff::SignedDuration::try_from(LAUNCH_DEADLINE_WINDOW).unwrap_or_default(),
+            )
+            .unwrap_or(now);
         let record = JobRecord {
             id,
             name,
@@ -506,6 +524,9 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
             created: store::format_timestamp(now),
             boot_id,
             exclusive: args.exclusive,
+            launching: Some(LaunchingState {
+                deadline: store::format_timestamp(launch_deadline),
+            }),
             detach: None,
         };
 
@@ -545,7 +566,7 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
         ],
     );
 
-    let handle = match spawn_detached(DetachOptions::new(supervisor_cmd).name(&record.id)).await {
+    let handle = match launch(DetachOptions::new(supervisor_cmd).name(&record.id)).await {
         Ok(handle) => handle,
         Err(err) => {
             let message = format!("Could not launch the detached job supervisor: {err}.");
@@ -557,6 +578,14 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
 
     let warnings = handle.warnings.clone();
     record.detach = Some(handle.clone());
+    if let Ok(wait_deadline) = jiff::Timestamp::now().checked_add(
+        jiff::SignedDuration::try_from(STARTUP_TIMEOUT + Duration::from_secs(5))
+            .unwrap_or_default(),
+    ) {
+        record.launching = Some(LaunchingState {
+            deadline: store::format_timestamp(wait_deadline),
+        });
+    }
     let dir_for_update = dir.clone();
     let record_for_update = record.clone();
     blocking("job.start", move || {
@@ -742,10 +771,11 @@ async fn finish_startup_timeout(
         return Ok(JobState::from(exit.outcome));
     }
 
+    let timeout_secs = STARTUP_TIMEOUT.as_secs();
     if stop_err.is_none() && survivors.is_empty() && !tree_active && !lock_held {
-        let message =
-            "The detached job supervisor did not become ready within 10 seconds and was stopped."
-                .to_owned();
+        let message = format!(
+            "The detached job supervisor did not become ready within {timeout_secs} seconds and was stopped."
+        );
         record_start_failure(dir, &message).await;
         return Err(ErrorBody::new(ErrorCode::Timeout, message)
             .with_hint("Retry `job.start` or check system load with `sys.info`.")
@@ -758,13 +788,13 @@ async fn finish_startup_timeout(
 
     let detail = match stop_err {
         Some(err) => format!(
-            "The detached job supervisor for {id} did not become ready within 10 seconds and stopping it failed ({err}); the job is still running."
+            "The detached job supervisor for {id} did not become ready within {timeout_secs} seconds and stopping it failed ({err}); the job is still running."
         ),
         None if !survivors.is_empty() => format!(
-            "The detached job supervisor for {id} did not become ready within 10 seconds and could not be stopped; the job is still running (surviving pids: {survivors:?})."
+            "The detached job supervisor for {id} did not become ready within {timeout_secs} seconds and could not be stopped; the job is still running (surviving pids: {survivors:?})."
         ),
         None => format!(
-            "The detached job supervisor for {id} did not become ready within 10 seconds and is still running."
+            "The detached job supervisor for {id} did not become ready within {timeout_secs} seconds and is still running."
         ),
     };
     Err(ErrorBody::new(ErrorCode::Timeout, detail)
@@ -1431,6 +1461,7 @@ mod tests {
                 pid: u32::MAX,
                 start_time: 1,
             },
+            root_start_key: None,
             systemd_unit: None,
             windows_job: None,
             marker: None,
@@ -1517,5 +1548,149 @@ mod tests {
         let exit = read_exit_record(tmp4.path()).expect("exit.json should be written");
         assert_eq!(exit.outcome, ExitOutcome::Failed);
         assert_eq!(err.details.unwrap()["state"], json!("failed"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_job_start_with_same_key_while_launching_returns_same_id_and_starts_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path());
+        let state_dir = paths.state_dir().to_path_buf();
+
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let launch_entered = Arc::new(Notify::new());
+        let release_launch = Arc::new(Notify::new());
+
+        struct TestStartTool {
+            spec: legion_core::proto::ToolSpec,
+            count: Arc<AtomicUsize>,
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+            state_dir: PathBuf,
+        }
+
+        impl legion_core::Tool for TestStartTool {
+            fn spec(&self) -> &legion_core::proto::ToolSpec {
+                &self.spec
+            }
+
+            fn call<'a>(
+                &'a self,
+                ctx: &'a Ctx,
+                args: serde_json::Value,
+            ) -> BoxFuture<'a, Result<serde_json::Value, ToolError>> {
+                Box::pin(async move {
+                    let parsed: StartArgs = legion_core::parse_args("job.start_test", args)?;
+                    let count = Arc::clone(&self.count);
+                    let entered = Arc::clone(&self.entered);
+                    let release = Arc::clone(&self.release);
+                    let state = self.state_dir.clone();
+                    let started = start_with_launcher(ctx, parsed, move |options| {
+                        Box::pin(async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            let job_id = options.name.expect("job.start sets name to job id");
+                            let dir = job_dir(&state, &job_id);
+                            entered.notify_one();
+                            release.notified().await;
+                            let exit = ExitRecord {
+                                outcome: ExitOutcome::Succeeded,
+                                exit_code: Some(0),
+                                signal: None,
+                                finished: now_rfc3339(),
+                                forced: false,
+                                startup_failed: false,
+                                detail: None,
+                            };
+                            write_exit_record(&dir, &exit).unwrap();
+                            Ok(DetachHandle {
+                                process: procid::current().unwrap(),
+                                root_start_key: None,
+                                systemd_unit: None,
+                                windows_job: None,
+                                marker: None,
+                                warnings: Vec::new(),
+                            })
+                        })
+                    })
+                    .await?;
+                    Ok(serde_json::to_value(started).unwrap())
+                })
+            }
+        }
+
+        let mut registry = Registry::new();
+        register(&mut registry);
+        registry.add(TestStartTool {
+            spec: legion_core::proto::ToolSpec {
+                name: "job.start_test".to_owned(),
+                description: "test-only job.start with controllable launcher".to_owned(),
+                effect: Effect::Exec,
+                input_schema: legion_core::input_schema::<StartArgs>(),
+            },
+            count: Arc::clone(&launch_count),
+            entered: Arc::clone(&launch_entered),
+            release: Arc::clone(&release_launch),
+            state_dir,
+        });
+
+        let node = Arc::new(legion_core::Node::new(paths, registry));
+        let args = json!({
+            "cmd": "echo hello",
+            "key": "same-launch-key",
+        });
+
+        // Start call #1 in the background; wait until it has written `job.json` with its explicit
+        // launching state and paused inside the detached launcher.
+        let node1 = Arc::clone(&node);
+        let args1 = args.clone();
+        let first_task = tokio::spawn(async move {
+            node1
+                .call(legion_core::Call::new(
+                    legion_core::Door::Cli,
+                    "job.start_test",
+                    args1,
+                ))
+                .await
+        });
+        launch_entered.notified().await;
+
+        // While call #1 is still launching, call #2 with the same key must return the exact same
+        // job id with `existing: true` and `state: "starting"` without invoking a second launcher.
+        let second = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "job.start_test",
+                args,
+            ))
+            .await
+            .unwrap();
+        let second_id = second["id"].as_str().unwrap().to_owned();
+        assert_eq!(second["existing"], json!(true), "{second:#}");
+        assert_eq!(second["state"], json!("starting"), "{second:#}");
+
+        // `job.status` also reports `"starting"` (not `"interrupted"`) while call #1 is launching.
+        let mid_status = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "job.status",
+                json!({ "id": &second_id }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mid_status["state"], json!("starting"), "{mid_status:#}");
+
+        // Release call #1 and verify both calls returned the same id and only one supervisor ran.
+        release_launch.notify_one();
+        let first = first_task.await.unwrap().unwrap();
+        assert_eq!(first["id"].as_str().unwrap(), second_id);
+        assert_eq!(first["existing"], json!(false), "{first:#}");
+        assert_eq!(
+            launch_count.load(Ordering::SeqCst),
+            1,
+            "exactly one supervisor should have been launched"
+        );
     }
 }

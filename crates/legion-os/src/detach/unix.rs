@@ -268,6 +268,7 @@ pub(super) async fn spawn_detached(
 
     Ok(DetachHandle {
         process,
+        root_start_key: None,
         systemd_unit,
         windows_job: None,
         marker: Some(marker),

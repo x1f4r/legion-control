@@ -33,8 +33,8 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +94,12 @@ pub struct DetachOptions {
     pub stdout_path: Option<PathBuf>,
     /// File path to append standard error to; redirected to null when `None`.
     pub stderr_path: Option<PathBuf>,
+    /// Windows only: allow falling back to launching inside the caller's Job Object when job
+    /// breakaway is refused and WMI `Win32_Process.Create` is provably unavailable.
+    ///
+    /// Defaults to `false` because launching inside an SSH session's job object causes the process
+    /// to die when the session closes. Production callers must leave this `false`.
+    pub allow_in_job_fallback: bool,
 }
 
 impl DetachOptions {
@@ -107,6 +113,7 @@ impl DetachOptions {
             env_remove: Vec::new(),
             stdout_path: None,
             stderr_path: None,
+            allow_in_job_fallback: false,
         }
     }
 
@@ -176,6 +183,16 @@ impl DetachOptions {
         self.stderr_path = Some(p);
         self
     }
+
+    /// Opt in to launching inside the caller's Windows Job Object when breakaway is refused and
+    /// WMI `Win32_Process.Create` is provably unavailable.
+    ///
+    /// Processes started this way may be terminated when the parent session closes, so callers
+    /// that promise survival across SSH disconnect should leave this `false` (the default).
+    pub fn allow_in_job_fallback(mut self, allow: bool) -> Self {
+        self.allow_in_job_fallback = allow;
+        self
+    }
 }
 
 /// Persistent handle for a detached process, serializable for storage in a job record.
@@ -188,6 +205,11 @@ impl DetachOptions {
 pub struct DetachHandle {
     /// Process identity (`pid` and full-precision kernel start time) of the detached target.
     pub process: ProcessId,
+    /// Monotonic kernel process creation key (`ProcessStartKey` on Windows) captured for
+    /// `process` at launch time so lineage checks remain immune to PID reuse even after the root
+    /// process exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_start_key: Option<u64>,
     /// Transient Linux systemd user scope unit name (for example `legion-job-<name>.scope`) when
     /// the process was started inside a systemd user scope; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +249,16 @@ pub enum ScopeProbeOverride {
 /// to the configured files (or connected to null when omitted). Returns a serializable
 /// [`DetachHandle`] carrying the target's [`ProcessId`], its Linux systemd scope unit name when
 /// a scope was used, and any non-fatal launch warnings.
+///
+/// # Late starts after timeout or ambiguous errors
+///
+/// When launching through an out-of-process helper (such as Windows WMI `Win32_Process.Create`
+/// under a breakaway-forbidding Job Object), a process may still finish starting *after*
+/// `spawn_detached` returns a timeout or ambiguous error (for example if the WMI provider host
+/// created the process before hanging or dropping the RPC reply). Callers that record state on
+/// disk before calling `spawn_detached` (such as background job supervisors and delayed power
+/// runners) must mark the record failed/abandoned on error and have the detached process refuse
+/// to act if it starts late.
 pub async fn spawn_detached(options: DetachOptions) -> Result<DetachHandle> {
     spawn_detached_for_test(options, ScopeProbeOverride::Auto).await
 }
@@ -443,6 +475,244 @@ pub(crate) fn cgroup_matches_unit(contents: &str, full_unit: &str) -> bool {
 /// lingering is disabled for the current account.
 #[allow(dead_code)]
 pub(crate) const LINGER_DISABLED_WARNING: &str = "systemd user lingering is disabled for this account, so the process was detached with setsid instead of a systemd user scope and may be stopped on logout; run `loginctl enable-linger` to keep user scopes alive across sessions";
+
+/// Warning recorded on [`DetachHandle::warnings`] when Windows `CREATE_BREAKAWAY_FROM_JOB` was
+/// refused, WMI `Win32_Process.Create` was unavailable, and the caller explicitly opted into
+/// [`DetachOptions::allow_in_job_fallback`], so the process started inside the caller's Job Object
+/// without breaking away.
+#[allow(dead_code)]
+pub(crate) const WMI_FALLBACK_WARNING: &str = "Windows Job Object breakaway was refused and WMI Win32_Process.Create was unavailable, so the process started inside the caller's Job Object and may stop if the parent session ends; ensure the Windows Management Instrumentation (Winmgmt) service is running";
+
+/// Single overall deadline for a Windows WMI detached launch across all COM attempts, retry
+/// backoffs, PowerShell CIM fallback, and hand-off wait.
+#[allow(dead_code)]
+pub const WINDOWS_WMI_LAUNCH_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Maximum share of [`WINDOWS_WMI_LAUNCH_DEADLINE`] granted to a single WMI call so a hung DCOM
+/// or PowerShell call still leaves budget inside the 60 s overall deadline to wait for hand-off.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_WMI_SINGLE_CALL_CAP: Duration = Duration::from_secs(30);
+
+/// Single overall launch deadline budget shared across every step of a detached WMI launch.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub(crate) struct LaunchBudget {
+    deadline: Instant,
+}
+
+#[allow(dead_code)]
+impl LaunchBudget {
+    pub(crate) fn from_now(total: Duration) -> Self {
+        Self::starting_at(Instant::now(), total)
+    }
+
+    pub(crate) fn starting_at(start: Instant, total: Duration) -> Self {
+        Self {
+            deadline: start + total,
+        }
+    }
+
+    /// Remaining time before the overall launch deadline, or `None` once expired.
+    pub(crate) fn remaining_at(self, now: Instant) -> Option<Duration> {
+        self.deadline
+            .checked_duration_since(now)
+            .filter(|d| !d.is_zero())
+    }
+
+    pub(crate) fn remaining(self) -> Option<Duration> {
+        self.remaining_at(Instant::now())
+    }
+
+    /// Time budget for one WMI RPC/CIM invocation: capped at `cap` and bounded by remaining time.
+    pub(crate) fn call_budget_at(self, now: Instant, cap: Duration) -> Option<Duration> {
+        self.remaining_at(now).map(|rem| rem.min(cap))
+    }
+
+    pub(crate) fn call_budget(self, cap: Duration) -> Option<Duration> {
+        self.call_budget_at(Instant::now(), cap)
+    }
+
+    /// Sleep duration for a retry backoff, or `None` if sleeping would exhaust the overall budget.
+    pub(crate) fn backoff_at(self, now: Instant, desired: Duration) -> Option<Duration> {
+        let rem = self.remaining_at(now)?;
+        (rem > desired).then_some(desired)
+    }
+
+    pub(crate) fn backoff(self, desired: Duration) -> Option<Duration> {
+        self.backoff_at(Instant::now(), desired)
+    }
+}
+
+/// Process-wide guard preventing piled-up blocked DCOM worker threads when WMI stops answering.
+///
+/// The guard is moved into the worker thread and released only when the WMI call actually returns,
+/// even if the caller already timed out. While held, subsequent callers fail fast instead of
+/// spawning additional blocked threads.
+#[allow(dead_code)]
+pub(crate) struct InFlightGuard {
+    flag: &'static AtomicBool,
+}
+
+#[allow(dead_code)]
+impl InFlightGuard {
+    pub(crate) fn try_acquire(flag: &'static AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { flag })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+/// Build the error returned when a previous WMI worker thread is still blocked waiting for
+/// Windows to answer an earlier detached launch request.
+#[allow(dead_code)]
+pub(crate) fn wmi_in_flight_error() -> OsError {
+    OsError::TimedOut {
+        detail: "still waiting for Windows to answer an earlier detached launch request; check system load and the Windows Management Instrumentation service (Winmgmt) with `Get-Service Winmgmt`, and inspect `job.status` before retrying".into(),
+    }
+}
+
+/// Build the error returned when Windows Job Object breakaway is refused, WMI is provably
+/// unavailable, and [`DetachOptions::allow_in_job_fallback`] is `false` (the default).
+#[allow(dead_code)]
+pub(crate) fn wmi_unavailable_error(reason: &str) -> OsError {
+    OsError::Platform {
+        detail: format!(
+            "cannot detach process outside the current session because the Windows Management Instrumentation service (Winmgmt) is not answering ({reason}); refusing to start inside the session job where it would stop on disconnect. Check the service with `Get-Service Winmgmt` (or `sc query winmgmt`) and start it from an elevated prompt with `Start-Service Winmgmt` (or `sc start winmgmt`), then retry"
+        ),
+    }
+}
+
+/// Resolve the full path to Windows PowerShell 5.1 under `SystemRoot` when available, falling back
+/// to `"powershell.exe"` on `PATH`.
+#[allow(dead_code)]
+pub(crate) fn resolve_windows_powershell_exe(system_root: Option<&str>) -> String {
+    match system_root.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(root) => format!(
+            r"{}\System32\WindowsPowerShell\v1.0\powershell.exe",
+            root.trim_end_matches(['\\', '/'])
+        ),
+        None => "powershell.exe".to_owned(),
+    }
+}
+
+/// Windows WMI / COM HRESULT values used to classify pre-dispatch vs ambiguous failures.
+#[allow(dead_code)]
+pub(crate) mod wmi_hresult {
+    pub(crate) const WBEM_E_NOT_FOUND: i32 = 0x8004_1002_u32 as i32;
+    pub(crate) const WBEM_E_ACCESS_DENIED: i32 = 0x8004_1003_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_PARAMETER: i32 = 0x8004_1008_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_NAMESPACE: i32 = 0x8004_100E_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_OBJECT: i32 = 0x8004_100F_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_CLASS: i32 = 0x8004_1010_u32 as i32;
+    pub(crate) const WBEM_E_TRANSPORT_FAILURE: i32 = 0x8004_1015_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_METHOD: i32 = 0x8004_102E_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_METHOD_PARAMETERS: i32 = 0x8004_102F_u32 as i32;
+    pub(crate) const WBEM_E_SHUTTING_DOWN: i32 = 0x8004_1033_u32 as i32;
+    pub(crate) const WBEM_E_INVALID_OBJECT_PATH: i32 = 0x8004_103A_u32 as i32;
+    pub(crate) const WBEM_E_SERVER_TOO_BUSY: i32 = 0x8004_1045_u32 as i32;
+    pub(crate) const RPC_E_DISCONNECTED: i32 = 0x8001_0108_u32 as i32;
+    pub(crate) const RPC_S_SERVER_UNAVAILABLE_HR: i32 = 0x8007_06BA_u32 as i32;
+}
+
+/// Classification of an HRESULT returned from `IWbemServices::ExecMethod("Win32_Process", "Create")`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WmiExecMethodClass {
+    /// Definitive pre-dispatch rejection: WMI provably did not start the process.
+    NotStarted { transient: bool },
+    /// Ambiguous post-dispatch or transport error: the WMI provider host may have started the
+    /// process before disconnecting or failing, so callers must wait for handoff and never retry.
+    MaybeStarted,
+}
+
+/// Classification of a non-zero `Win32_Process.Create` `ReturnValue` when `ProcessId == 0`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WmiReturnValueClass {
+    /// Documented pre-launch rejection that provably did not create a process.
+    NotStarted { reason: &'static str },
+    /// Ambiguous failure (including `ReturnValue == 8` "unknown failure" and unrecognized codes)
+    /// that cannot prove no process was started.
+    MaybeStarted { reason: &'static str },
+}
+
+/// Return `true` when an HRESULT returned *before* `ExecMethod` (during `CoCreateInstance`,
+/// `ConnectServer`, `GetObject`, or `GetMethod`) is a transient connectivity/service-startup
+/// error safe to retry because `Win32_Process.Create` has not been invoked yet.
+#[allow(dead_code)]
+pub(crate) const fn classify_wmi_connect_hresult(hr: i32) -> bool {
+    matches!(
+        hr,
+        wmi_hresult::WBEM_E_TRANSPORT_FAILURE
+            | wmi_hresult::WBEM_E_SERVER_TOO_BUSY
+            | wmi_hresult::WBEM_E_SHUTTING_DOWN
+            | wmi_hresult::RPC_E_DISCONNECTED
+            | wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR
+    )
+}
+
+/// Classify an HRESULT returned *from* `IWbemServices::ExecMethod("Win32_Process", "Create")`.
+///
+/// Only definitive pre-dispatch rejections are classified as [`WmiExecMethodClass::NotStarted`].
+/// Transport/provider-host disconnect errors (`RPC_E_DISCONNECTED`, `RPC_S_SERVER_UNAVAILABLE`,
+/// `WBEM_E_SHUTTING_DOWN`, `WBEM_E_TRANSPORT_FAILURE`) mean the reply was lost — `wmiprvse.exe`
+/// may have created the process and then died over a quota — so they are classified as
+/// [`WmiExecMethodClass::MaybeStarted`].
+#[allow(dead_code)]
+pub(crate) const fn classify_wmi_exec_method_hresult(hr: i32) -> WmiExecMethodClass {
+    match hr {
+        wmi_hresult::WBEM_E_SERVER_TOO_BUSY => WmiExecMethodClass::NotStarted { transient: true },
+        wmi_hresult::WBEM_E_ACCESS_DENIED
+        | wmi_hresult::WBEM_E_NOT_FOUND
+        | wmi_hresult::WBEM_E_INVALID_NAMESPACE
+        | wmi_hresult::WBEM_E_INVALID_OBJECT
+        | wmi_hresult::WBEM_E_INVALID_CLASS
+        | wmi_hresult::WBEM_E_INVALID_METHOD
+        | wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS
+        | wmi_hresult::WBEM_E_INVALID_PARAMETER
+        | wmi_hresult::WBEM_E_INVALID_OBJECT_PATH => {
+            WmiExecMethodClass::NotStarted { transient: false }
+        }
+        _ => WmiExecMethodClass::MaybeStarted,
+    }
+}
+
+/// Classify a non-zero `Win32_Process.Create` `ReturnValue` (when `ProcessId == 0`).
+///
+/// Per Microsoft's `Win32_Process.Create` documentation:
+/// - `2` (access denied), `3` (insufficient privilege), `9` (path not found), and `21` (invalid
+///   parameter) are definitive pre-creation rejections.
+/// - `8` (unknown failure) and any undocumented code cannot prove no process was created and are
+///   treated as [`WmiReturnValueClass::MaybeStarted`].
+#[allow(dead_code)]
+pub(crate) const fn classify_wmi_return_value(code: u32) -> WmiReturnValueClass {
+    match code {
+        2 => WmiReturnValueClass::NotStarted {
+            reason: "access denied",
+        },
+        3 => WmiReturnValueClass::NotStarted {
+            reason: "insufficient privilege",
+        },
+        8 => WmiReturnValueClass::MaybeStarted {
+            reason: "unknown failure",
+        },
+        9 => WmiReturnValueClass::NotStarted {
+            reason: "path not found",
+        },
+        21 => WmiReturnValueClass::NotStarted {
+            reason: "invalid parameter",
+        },
+        _ => WmiReturnValueClass::MaybeStarted {
+            reason: "unrecognized error",
+        },
+    }
+}
 
 /// Return `true` when `linger_dir/<username>` exists as a file.
 #[allow(dead_code)]
@@ -1070,12 +1340,120 @@ fn is_safe_cmd_batch_arg(arg: &str) -> bool {
     })
 }
 
+/// Machine-readable stdout prefix emitted by the PowerShell `Invoke-CimMethod` fallback script:
+/// `LEGION_WMI_RESULT:<return_value>:<process_id>`.
+#[allow(dead_code)]
+pub(crate) const WMI_CIM_RESULT_PREFIX: &str = "LEGION_WMI_RESULT:";
+
+/// Parsed outcome of a PowerShell `Invoke-CimMethod` (`Win32_Process.Create`) invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum WmiCimResult {
+    /// `ReturnValue == 0` and `ProcessId > 0`.
+    Started(u32),
+    /// Output proved a non-zero `ReturnValue` that cannot have started a process (`2`, `3`, `9`,
+    /// `21`) with `ProcessId == 0`.
+    NotStarted { return_value: u32, detail: String },
+    /// Anything else (transport failure, non-zero exit without a machine-readable result line,
+    /// `ReturnValue == 0` with `ProcessId == 0`, `ReturnValue == 8`, or any non-zero `ProcessId`
+    /// paired with a non-zero `ReturnValue`). Callers must wait for handoff and never fall back.
+    MaybeStarted { detail: String },
+}
+
+/// Parse stdout/stderr from [`build_wmi_create_script_for_cmdline`] into a strict [`WmiCimResult`].
+#[allow(dead_code)]
+pub(crate) fn parse_wmi_cim_output(stdout: &str, stderr: &str, exit_success: bool) -> WmiCimResult {
+    let result_line = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix(WMI_CIM_RESULT_PREFIX));
+
+    if let Some(payload) = result_line {
+        let mut parts = payload.split(':');
+        let rv = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+        let pid = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+        let extra = parts.next();
+
+        if let (Some(return_value), Some(process_id), None) = (rv, pid, extra) {
+            if return_value == 0 && process_id > 0 {
+                return WmiCimResult::Started(process_id);
+            }
+            if return_value != 0 && process_id == 0 {
+                return match classify_wmi_return_value(return_value) {
+                    WmiReturnValueClass::NotStarted { reason } => WmiCimResult::NotStarted {
+                        return_value,
+                        detail: format!(
+                            "Invoke-CimMethod Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
+                        ),
+                    },
+                    WmiReturnValueClass::MaybeStarted { reason } => WmiCimResult::MaybeStarted {
+                        detail: format!(
+                            "Invoke-CimMethod Win32_Process.Create returned ambiguous ReturnValue={return_value} ({reason})"
+                        ),
+                    },
+                };
+            }
+            return WmiCimResult::MaybeStarted {
+                detail: format!(
+                    "Invoke-CimMethod Win32_Process.Create returned ambiguous result (ReturnValue={return_value}, ProcessId={process_id})"
+                ),
+            };
+        }
+        return WmiCimResult::MaybeStarted {
+            detail: format!("Invoke-CimMethod emitted malformed WMI result line: {payload:?}"),
+        };
+    }
+
+    let stderr_trimmed = stderr.trim();
+    let stdout_trimmed = stdout.trim();
+    let detail = if !stderr_trimmed.is_empty() {
+        format!("Invoke-CimMethod failed without a WMI result line: {stderr_trimmed}")
+    } else if !exit_success {
+        "Invoke-CimMethod exited with an error without a WMI result line".to_owned()
+    } else {
+        format!("Invoke-CimMethod exited without a WMI result line (stdout={stdout_trimmed:?})")
+    };
+    WmiCimResult::MaybeStarted { detail }
+}
+
+/// `CREATE_BREAKAWAY_FROM_JOB` (`0x0100_0000`, decimal `16777216`), passed in
+/// `Win32_ProcessStartup.CreateFlags` so processes launched via `Win32_Process.Create` leave the
+/// WMI provider host's (`wmiprvse.exe`) job object and do not count against its quotas.
+#[allow(dead_code)]
+pub(crate) const WINDOWS_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// Return `true` when a proven-not-started `Win32_Process.Create` `ReturnValue` could indicate
+/// that `CREATE_BREAKAWAY_FROM_JOB` in `ProcessStartupInformation` was refused (`2` access denied,
+/// `3` insufficient privilege, or `21` invalid parameter), warranting one retry without the flag.
+#[allow(dead_code)]
+pub(crate) const fn wmi_breakaway_return_value_rejected(code: u32) -> bool {
+    matches!(code, 2 | 3 | 21)
+}
+
+/// Return `true` when an `ExecMethod` HRESULT could indicate a pre-dispatch rejection of the
+/// `ProcessStartupInformation` breakaway parameter, warranting one retry without it.
+#[allow(dead_code)]
+pub(crate) const fn wmi_breakaway_hresult_rejected(hr: i32) -> bool {
+    matches!(
+        hr,
+        wmi_hresult::WBEM_E_ACCESS_DENIED
+            | wmi_hresult::WBEM_E_INVALID_PARAMETER
+            | wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS
+    )
+}
+
 /// Build the outer PowerShell script that invokes `Win32_Process.Create` via `Invoke-CimMethod`
-/// for a pre-built `command_line` and prints the created wrapper PID to stdout.
+/// for a pre-built `command_line` and writes a machine-readable
+/// `LEGION_WMI_RESULT:<ReturnValue>:<ProcessId>` line to stdout.
+///
+/// When `breakaway_from_job` is `true`, passes a client-only `Win32_ProcessStartup` instance with
+/// `CreateFlags = CREATE_BREAKAWAY_FROM_JOB` (`0x01000000`) as `ProcessStartupInformation`.
 #[allow(dead_code)]
 pub(crate) fn build_wmi_create_script_for_cmdline(
     command_line: &str,
     cwd: Option<&str>,
+    breakaway_from_job: bool,
 ) -> Result<String> {
     if command_line.len() > WINDOWS_WMI_MAX_CMDLINE {
         return Err(OsError::InvalidArgument {
@@ -1099,12 +1477,22 @@ pub(crate) fn build_wmi_create_script_for_cmdline(
             powershell_single_quote(dir)
         ));
     }
+    if breakaway_from_job {
+        lines.push(format!(
+            "$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{{ CreateFlags = [uint32]{WINDOWS_CREATE_BREAKAWAY_FROM_JOB} }}"
+        ));
+        lines.push("$cimArgs['ProcessStartupInformation'] = $startup".to_owned());
+    }
     lines.extend([
         "$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments $cimArgs"
             .to_owned(),
-        "if ($created.ReturnValue -ne 0 -or $created.ProcessId -le 0) { throw \"Win32_Process.Create failed with ReturnValue=$($created.ReturnValue)\" }"
+        "$rv = if ($null -ne $created.ReturnValue) { [string]$created.ReturnValue } else { '' }"
             .to_owned(),
-        "[Console]::Out.Write([string]$created.ProcessId)".to_owned(),
+        "$pidVal = if ($null -ne $created.ProcessId) { [string]$created.ProcessId } else { '0' }"
+            .to_owned(),
+        format!(
+            "[Console]::Out.WriteLine('{WMI_CIM_RESULT_PREFIX}' + $rv + ':' + $pidVal)"
+        ),
     ]);
     Ok(lines.join("\n"))
 }
@@ -1117,7 +1505,7 @@ pub(crate) fn build_wmi_create_script(launcher_script: &str, cwd: Option<&str>) 
     let command_line = format!(
         "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
     );
-    build_wmi_create_script_for_cmdline(&command_line, cwd)
+    build_wmi_create_script_for_cmdline(&command_line, cwd, true)
 }
 
 #[cfg(test)]
@@ -1152,7 +1540,28 @@ mod tests {
         let cim = build_wmi_create_script(&launcher, Some(r"C:\Users\me\work")).unwrap();
         assert!(cim.contains("Invoke-CimMethod -ClassName Win32_Process -MethodName Create"));
         assert!(cim.contains("$cimArgs['CurrentDirectory'] = 'C:\\Users\\me\\work'"));
+        assert!(cim.contains("Win32_ProcessStartup"));
+        assert!(cim.contains("CreateFlags = [uint32]16777216"));
+        assert!(cim.contains("$cimArgs['ProcessStartupInformation'] = $startup"));
         assert!(!cim.contains("$args ="));
+
+        let cim_no_breakaway =
+            build_wmi_create_script_for_cmdline("cmd.exe /c echo hi", None, false).unwrap();
+        assert!(!cim_no_breakaway.contains("ProcessStartupInformation"));
+        assert!(wmi_breakaway_return_value_rejected(2));
+        assert!(wmi_breakaway_return_value_rejected(3));
+        assert!(wmi_breakaway_return_value_rejected(21));
+        assert!(!wmi_breakaway_return_value_rejected(8));
+        assert!(!wmi_breakaway_return_value_rejected(9));
+        assert!(wmi_breakaway_hresult_rejected(
+            wmi_hresult::WBEM_E_ACCESS_DENIED
+        ));
+        assert!(wmi_breakaway_hresult_rejected(
+            wmi_hresult::WBEM_E_INVALID_PARAMETER
+        ));
+        assert!(!wmi_breakaway_hresult_rejected(
+            wmi_hresult::RPC_E_DISCONNECTED
+        ));
     }
 
     #[test]
@@ -1382,6 +1791,7 @@ mod tests {
     fn detach_handle_serializes_cleanly_for_job_records() {
         let with_scope = DetachHandle {
             process: ProcessId::new(9001, 42_000),
+            root_start_key: None,
             systemd_unit: Some("legion-job-build-1.scope".into()),
             windows_job: None,
             marker: Some("abc-1".into()),
@@ -1390,6 +1800,7 @@ mod tests {
         let json = serde_json::to_string(&with_scope).unwrap();
         assert!(json.contains("\"systemd_unit\":\"legion-job-build-1.scope\""));
         assert!(json.contains("\"marker\":\"abc-1\""));
+        assert!(!json.contains("\"root_start_key\""));
         assert!(!json.contains("\"windows_job\""));
         assert!(!json.contains("\"warnings\""));
         let decoded: DetachHandle = serde_json::from_str(&json).unwrap();
@@ -1397,6 +1808,7 @@ mod tests {
 
         let with_job = DetachHandle {
             process: ProcessId::new(9002, 42_001),
+            root_start_key: Some(0x0001_0000_0000_0042),
             systemd_unit: None,
             windows_job: Some(r"Local\legion-job-abc-2".into()),
             marker: Some("abc-2".into()),
@@ -1404,18 +1816,20 @@ mod tests {
         };
         let json2 = serde_json::to_string(&with_job).unwrap();
         assert!(!json2.contains("systemd_unit"));
+        assert!(json2.contains("\"root_start_key\""));
         assert!(json2.contains("\"windows_job\""));
         let decoded2: DetachHandle = serde_json::from_str(&json2).unwrap();
         assert_eq!(decoded2, with_job);
 
-        // Backward compatibility: handles persisted before `marker` and `windows_job` existed
-        // must deserialize cleanly with those fields defaulting to `None`.
+        // Backward compatibility: handles persisted before `marker`, `windows_job`, and
+        // `root_start_key` existed must deserialize cleanly with those fields defaulting to `None`.
         let legacy_json = r#"{"process":{"pid":9003,"start_time":42002}}"#;
         let legacy: DetachHandle = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(
             legacy,
             DetachHandle {
                 process: ProcessId::new(9003, 42_002),
+                root_start_key: None,
                 systemd_unit: None,
                 windows_job: None,
                 marker: None,
@@ -1548,6 +1962,7 @@ mod tests {
     async fn detached_active_reports_false_for_absent_handle() {
         let absent = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
+            root_start_key: None,
             systemd_unit: None,
             windows_job: None,
             marker: None,
@@ -1557,6 +1972,7 @@ mod tests {
 
         let absent_scope = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
+            root_start_key: None,
             systemd_unit: Some("legion-job-definitely-absent-0.scope".into()),
             windows_job: None,
             marker: Some("absent-marker-0".into()),
@@ -1583,6 +1999,144 @@ mod tests {
 
         assert!(LINGER_DISABLED_WARNING.contains("loginctl enable-linger"));
         assert!(LINGER_DISABLED_WARNING.contains("setsid"));
+        assert!(WMI_FALLBACK_WARNING.contains("Winmgmt"));
+        let opts = DetachOptions::new(CommandSpec::argv("cmd", Vec::<&str>::new()));
+        assert!(!opts.allow_in_job_fallback);
+        assert!(opts.allow_in_job_fallback(true).allow_in_job_fallback);
+        let unavail = wmi_unavailable_error("access denied").to_string();
+        assert!(unavail.contains("Winmgmt"), "{unavail}");
+        assert!(unavail.contains("Get-Service Winmgmt"), "{unavail}");
+        assert!(unavail.contains("Start-Service Winmgmt"), "{unavail}");
+        assert_eq!(
+            resolve_windows_powershell_exe(Some(r"C:\Windows\")),
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+        assert_eq!(resolve_windows_powershell_exe(None), "powershell.exe");
+    }
+
+    #[test]
+    fn wmi_error_classification_treats_post_dispatch_and_unknown_failures_as_maybe_started() {
+        // Pre-ExecMethod (connect/lookup) transport and shutdown errors are safely transient.
+        for hr in [
+            wmi_hresult::WBEM_E_TRANSPORT_FAILURE,
+            wmi_hresult::WBEM_E_SERVER_TOO_BUSY,
+            wmi_hresult::WBEM_E_SHUTTING_DOWN,
+            wmi_hresult::RPC_E_DISCONNECTED,
+            wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR,
+        ] {
+            assert!(classify_wmi_connect_hresult(hr), "hr={hr:#x}");
+        }
+        assert!(!classify_wmi_connect_hresult(
+            wmi_hresult::WBEM_E_ACCESS_DENIED
+        ));
+
+        // From ExecMethod, disconnect/shutdown/transport errors mean the reply was lost and the
+        // provider host may have already created the process -> MaybeStarted (never retry).
+        for hr in [
+            wmi_hresult::RPC_E_DISCONNECTED,
+            wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR,
+            wmi_hresult::WBEM_E_SHUTTING_DOWN,
+            wmi_hresult::WBEM_E_TRANSPORT_FAILURE,
+            0x8000_4005_u32 as i32, // E_FAIL
+        ] {
+            assert_eq!(
+                classify_wmi_exec_method_hresult(hr),
+                WmiExecMethodClass::MaybeStarted,
+                "ExecMethod hr={hr:#x} must be MaybeStarted"
+            );
+        }
+
+        // Only definitive pre-dispatch rejections are NotStarted from ExecMethod.
+        assert_eq!(
+            classify_wmi_exec_method_hresult(wmi_hresult::WBEM_E_SERVER_TOO_BUSY),
+            WmiExecMethodClass::NotStarted { transient: true }
+        );
+        for hr in [
+            wmi_hresult::WBEM_E_ACCESS_DENIED,
+            wmi_hresult::WBEM_E_NOT_FOUND,
+            wmi_hresult::WBEM_E_INVALID_NAMESPACE,
+            wmi_hresult::WBEM_E_INVALID_OBJECT,
+            wmi_hresult::WBEM_E_INVALID_CLASS,
+            wmi_hresult::WBEM_E_INVALID_METHOD,
+            wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS,
+            wmi_hresult::WBEM_E_INVALID_PARAMETER,
+            wmi_hresult::WBEM_E_INVALID_OBJECT_PATH,
+        ] {
+            assert_eq!(
+                classify_wmi_exec_method_hresult(hr),
+                WmiExecMethodClass::NotStarted { transient: false },
+                "ExecMethod hr={hr:#x} should be non-transient NotStarted"
+            );
+        }
+
+        // ReturnValue 8 ("unknown failure") and unrecognized codes must be MaybeStarted.
+        assert_eq!(
+            classify_wmi_return_value(8),
+            WmiReturnValueClass::MaybeStarted {
+                reason: "unknown failure"
+            }
+        );
+        assert_eq!(
+            classify_wmi_return_value(99),
+            WmiReturnValueClass::MaybeStarted {
+                reason: "unrecognized error"
+            }
+        );
+        for (code, reason) in [
+            (2, "access denied"),
+            (3, "insufficient privilege"),
+            (9, "path not found"),
+            (21, "invalid parameter"),
+        ] {
+            assert_eq!(
+                classify_wmi_return_value(code),
+                WmiReturnValueClass::NotStarted { reason }
+            );
+        }
+    }
+
+    #[test]
+    fn wmi_cim_output_parser_treats_only_proven_nonzero_return_values_as_not_started() {
+        assert_eq!(
+            parse_wmi_cim_output("LEGION_WMI_RESULT:0:4321\r\n", "", true),
+            WmiCimResult::Started(4321)
+        );
+        // Definitive pre-creation rejections with ProcessId=0 -> NotStarted.
+        for code in [2u32, 3, 9, 21] {
+            let line = format!("LEGION_WMI_RESULT:{code}:0\n");
+            assert!(
+                matches!(
+                    parse_wmi_cim_output(&line, "", true),
+                    WmiCimResult::NotStarted { return_value, .. } if return_value == code
+                ),
+                "code={code}"
+            );
+        }
+        // ReturnValue=8 ("unknown failure"), ReturnValue=0 with ProcessId=0, non-zero ReturnValue
+        // with ProcessId>0, transport exceptions with no result line, and malformed lines must all
+        // be MaybeStarted.
+        for (stdout, stderr, ok) in [
+            ("LEGION_WMI_RESULT:8:0\n", "", true),
+            ("LEGION_WMI_RESULT:0:0\n", "", true),
+            ("LEGION_WMI_RESULT:2:4321\n", "", true),
+            ("LEGION_WMI_RESULT:99:0\n", "", true),
+            ("LEGION_WMI_RESULT::0\n", "", true),
+            (
+                "",
+                "Invoke-CimMethod : The RPC server is unavailable.",
+                false,
+            ),
+            ("", "", false),
+            ("4321\n", "", true),
+        ] {
+            assert!(
+                matches!(
+                    parse_wmi_cim_output(stdout, stderr, ok),
+                    WmiCimResult::MaybeStarted { .. }
+                ),
+                "stdout={stdout:?} stderr={stderr:?} ok={ok} must be MaybeStarted"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1607,5 +2161,57 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, OsError::NotFound { .. }));
+    }
+
+    #[test]
+    fn launch_budget_draws_down_single_overall_deadline() {
+        let start = Instant::now();
+        let budget = LaunchBudget::starting_at(start, WINDOWS_WMI_LAUNCH_DEADLINE);
+
+        assert_eq!(budget.remaining_at(start), Some(Duration::from_secs(60)));
+        assert_eq!(
+            budget.call_budget_at(start, WINDOWS_WMI_SINGLE_CALL_CAP),
+            Some(Duration::from_secs(30))
+        );
+        // After 40 s, only 20 s remain across both calls and hand-off wait.
+        let at_40 = start + Duration::from_secs(40);
+        assert_eq!(budget.remaining_at(at_40), Some(Duration::from_secs(20)));
+        assert_eq!(
+            budget.call_budget_at(at_40, WINDOWS_WMI_SINGLE_CALL_CAP),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            budget.backoff_at(at_40, Duration::from_millis(750)),
+            Some(Duration::from_millis(750))
+        );
+        // If sleeping would consume the remaining budget, backoff returns None so we do not sleep
+        // past the deadline.
+        let at_59_5 = start + Duration::from_millis(59_500);
+        assert_eq!(budget.backoff_at(at_59_5, Duration::from_millis(750)), None);
+        // At or after the deadline, all remaining/call/backoff queries return None.
+        let at_60 = start + Duration::from_secs(60);
+        assert_eq!(budget.remaining_at(at_60), None);
+        assert_eq!(
+            budget.call_budget_at(at_60, WINDOWS_WMI_SINGLE_CALL_CAP),
+            None
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_rejects_concurrent_acquire_and_releases_on_drop() {
+        static TEST_FLAG: AtomicBool = AtomicBool::new(false);
+        let guard = InFlightGuard::try_acquire(&TEST_FLAG).expect("first acquire should succeed");
+        assert!(
+            InFlightGuard::try_acquire(&TEST_FLAG).is_none(),
+            "second concurrent acquire must fail fast while guard is held"
+        );
+        let err = wmi_in_flight_error();
+        assert!(matches!(err, OsError::TimedOut { .. }));
+        assert!(err.to_string().contains("earlier"));
+        assert!(err.to_string().contains("Winmgmt"));
+        drop(guard);
+        let second =
+            InFlightGuard::try_acquire(&TEST_FLAG).expect("acquire after drop should succeed");
+        drop(second);
     }
 }

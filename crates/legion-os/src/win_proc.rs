@@ -16,22 +16,32 @@ use std::sync::Mutex;
 use windows::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemTimeOfDayInformation,
 };
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+use windows::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessTelemetryIdInformation,
+};
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS, DuplicateHandle,
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
     ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, STILL_ACTIVE,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, RPC_E_DISCONNECTED, STATUS_BUFFER_TOO_SMALL,
+    STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE,
 };
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
 };
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CoSetProxyBlanket, CoUninitialize, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
+    RPC_C_IMP_LEVEL_IMPERSONATE,
+};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
+#[cfg(test)]
+use windows::Win32::System::JobObjects::IsProcessInJob;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_PROCESS_ID_LIST,
     JobObjectBasicProcessIdList, OpenJobObjectW, QueryInformationJobObject, TerminateJobObject,
@@ -39,6 +49,7 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
 };
+use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_S_SERVER_UNAVAILABLE};
 use windows::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
@@ -51,7 +62,15 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW, RTL_USER_PROCESS_PARAMETERS, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
-use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Wmi::{
+    IWbemClassObject, IWbemLocator, IWbemServices, WBEM_E_ACCESS_DENIED, WBEM_E_INVALID_CLASS,
+    WBEM_E_INVALID_METHOD, WBEM_E_INVALID_METHOD_PARAMETERS, WBEM_E_INVALID_NAMESPACE,
+    WBEM_E_INVALID_OBJECT, WBEM_E_INVALID_OBJECT_PATH, WBEM_E_INVALID_PARAMETER, WBEM_E_NOT_FOUND,
+    WBEM_E_SERVER_TOO_BUSY, WBEM_E_SHUTTING_DOWN, WBEM_E_TRANSPORT_FAILURE, WBEM_GENERIC_FLAG_TYPE,
+    WbemLocator,
+};
+use windows::core::{BOOL, BSTR, HRESULT, IUnknown, Interface, PCWSTR, PWSTR};
 
 use crate::procid::{EnvMarkerCheck, ProcessId, windows_env_utf16_has_marker};
 use crate::{OsError, Result};
@@ -108,6 +127,9 @@ pub(crate) struct PinnedProcess {
     handle: OwnedHandle,
     pub(crate) id: ProcessId,
     pub(crate) parent_pid: u32,
+    /// Monotonic kernel process creation key (`ProcessStartKey` from
+    /// `ProcessTelemetryIdInformation`), immune to wall-clock adjustments.
+    pub(crate) start_key: Option<u64>,
     can_terminate: bool,
 }
 
@@ -118,6 +140,27 @@ impl PinnedProcess {
             Ok((_, exit_ft)) => is_still_running(self.handle.0, exit_ft),
             Err(_) => false,
         }
+    }
+
+    /// Return `true` when this pinned process runs under the same user SID as the current process.
+    pub(crate) fn same_user_as_current(&self) -> bool {
+        same_user_sid_as_current(self.handle.0)
+    }
+
+    /// Return `true` when this pinned process is PID 4 (`System`), marked critical by the kernel,
+    /// or one of the core Windows session executables.
+    pub(crate) fn is_protected_system(&self) -> bool {
+        if self.id.pid == 4 {
+            return true;
+        }
+        let mut critical = BOOL::default();
+        // SAFETY: `self.handle.0` has at least `PROCESS_QUERY_LIMITED_INFORMATION`.
+        if unsafe { IsProcessCritical(self.handle.0, &mut critical) }.is_ok() && critical.as_bool()
+        {
+            return true;
+        }
+        query_image_name_raw(self.handle.0)
+            .is_some_and(|image| crate::procid::is_windows_core_session_image(&image))
     }
 
     /// Terminate this pinned process through its already-verified handle.
@@ -187,6 +230,93 @@ fn query_parent_pid_raw(handle: HANDLE) -> Result<u32> {
     })
 }
 
+/// Fixed-size header of Windows `PROCESS_TELEMETRY_ID_INFORMATION` (class 64), available on
+/// Windows 10+ with `PROCESS_QUERY_LIMITED_INFORMATION`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessTelemetryIdHeader {
+    header_size: u32,
+    process_id: u32,
+    process_start_key: u64,
+    create_time: u64,
+    create_interrupt_time: u64,
+    create_unbiased_interrupt_time: u64,
+    process_sequence_number: u64,
+    session_create_time: u64,
+    session_id: u32,
+    boot_id: u32,
+    image_checksum: u32,
+    image_time_date_stamp: u32,
+    user_sid_offset: u32,
+    image_path_offset: u32,
+    package_name_offset: u32,
+    relative_app_name_offset: u32,
+    command_line_offset: u32,
+}
+
+/// Query the monotonic kernel `ProcessStartKey` directly from a held process handle via
+/// `NtQueryInformationProcess(ProcessTelemetryIdInformation)`.
+///
+/// Starts with an 80 KiB buffer (large enough for a maximum-length Windows command line plus
+/// image/package metadata in one syscall) and grows on `STATUS_BUFFER_TOO_SMALL` /
+/// `STATUS_INFO_LENGTH_MISMATCH`. Never substitutes `ProcessSequenceNumber` for `ProcessStartKey`:
+/// returns `None` if `ProcessStartKey` is zero, the OS does not support this class, or the
+/// returned header does not match `expected_pid`.
+fn query_process_start_key_raw(handle: HANDLE, expected_pid: u32) -> Option<u64> {
+    const INITIAL_TELEMETRY_BYTES: usize = 80 * 1024;
+    const MAX_TELEMETRY_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_GROW_ATTEMPTS: usize = 8;
+
+    let header_bytes = size_of::<ProcessTelemetryIdHeader>();
+    let mut words = vec![0u64; INITIAL_TELEMETRY_BYTES.div_ceil(size_of::<u64>())];
+
+    for _ in 0..MAX_GROW_ATTEMPTS {
+        let byte_len = (words.len() * size_of::<u64>()) as u32;
+        // Initialize `HeaderSize` at offset 0 of the buffer before calling the kernel.
+        // SAFETY: `words` is 8-byte aligned and larger than `ProcessTelemetryIdHeader`.
+        unsafe {
+            (*words.as_mut_ptr().cast::<ProcessTelemetryIdHeader>()).header_size =
+                header_bytes as u32;
+        }
+        let mut returned = 0u32;
+        // SAFETY: `handle` has at least `PROCESS_QUERY_LIMITED_INFORMATION`, `words` has exact
+        // size `byte_len` bytes, and `returned` is a valid mutable `u32`.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessTelemetryIdInformation,
+                words.as_mut_ptr().cast::<c_void>(),
+                byte_len,
+                &mut returned,
+            )
+        };
+        if status.is_ok() {
+            if (returned as usize) < header_bytes {
+                return None;
+            }
+            // SAFETY: `words` is 8-byte aligned and `returned >= size_of::<ProcessTelemetryIdHeader>()`.
+            let header = unsafe { *words.as_ptr().cast::<ProcessTelemetryIdHeader>() };
+            if header.process_id != expected_pid {
+                return None;
+            }
+            return (header.process_start_key != 0).then_some(header.process_start_key);
+        }
+        if status == STATUS_BUFFER_TOO_SMALL || status == STATUS_INFO_LENGTH_MISMATCH {
+            let current_bytes = words.len() * size_of::<u64>();
+            let next_bytes = (returned as usize)
+                .max(current_bytes.saturating_mul(2))
+                .min(MAX_TELEMETRY_BYTES);
+            if next_bytes <= current_bytes {
+                return None;
+            }
+            words.resize(next_bytes.div_ceil(size_of::<u64>()), 0);
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
 /// Open `pid` with `PROCESS_QUERY_LIMITED_INFORMATION` only (strictly read-only) and read both
 /// its creation time and its `parent_pid` directly from the held handle.
 pub(crate) fn open_pinned_query_only(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
@@ -212,11 +342,13 @@ pub(crate) fn open_pinned_query_only(pid: u32, include_exited: bool) -> OpenPinn
     let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
         return OpenPinnedOutcome::Failed;
     };
+    let start_key = query_process_start_key_raw(handle.0, pid);
 
     OpenPinnedOutcome::Pinned(PinnedProcess {
         handle,
         id: ProcessId::new(pid, creation),
         parent_pid,
+        start_key,
         can_terminate: false,
     })
 }
@@ -260,11 +392,13 @@ pub(crate) fn open_pinned(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
     let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
         return OpenPinnedOutcome::Failed;
     };
+    let start_key = query_process_start_key_raw(handle.0, pid);
 
     OpenPinnedOutcome::Pinned(PinnedProcess {
         handle,
         id: ProcessId::new(pid, creation),
         parent_pid,
+        start_key,
         can_terminate,
     })
 }
@@ -570,7 +704,70 @@ pub(crate) fn spawn_detached_direct(
     stdout_path: Option<&Path>,
     stderr_path: Option<&Path>,
     job_name: Option<&str>,
-) -> std::result::Result<(ProcessId, Option<String>), DirectSpawnError> {
+) -> std::result::Result<(ProcessId, Option<u64>, Option<String>), DirectSpawnError> {
+    spawn_detached_with_breakaway(
+        program_display,
+        application_name,
+        command_line,
+        cwd,
+        env_remove,
+        env_overrides,
+        stdout_path,
+        stderr_path,
+        job_name,
+        true,
+    )
+}
+
+/// Spawn a detached Windows process via `CreateProcessW` without `CREATE_BREAKAWAY_FROM_JOB`,
+/// used only when the caller explicitly opted into in-job fallback after breakaway was refused
+/// and WMI `Win32_Process.Create` was provably unavailable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_detached_in_current_job(
+    program_display: &str,
+    application_name: Option<&str>,
+    command_line: &str,
+    cwd: Option<&Path>,
+    env_remove: &[OsString],
+    env_overrides: &BTreeMap<OsString, OsString>,
+    stdout_path: Option<&Path>,
+    stderr_path: Option<&Path>,
+    job_name: Option<&str>,
+) -> Result<(ProcessId, Option<u64>, Option<String>)> {
+    match spawn_detached_with_breakaway(
+        program_display,
+        application_name,
+        command_line,
+        cwd,
+        env_remove,
+        env_overrides,
+        stdout_path,
+        stderr_path,
+        job_name,
+        false,
+    ) {
+        Ok(res) => Ok(res),
+        Err(DirectSpawnError::BreakawayRefused) => Err(OsError::PermissionDenied {
+            detail: format!("CreateProcessW refused to launch `{program_display}`"),
+            source: None,
+        }),
+        Err(DirectSpawnError::Other(err)) => Err(err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_detached_with_breakaway(
+    program_display: &str,
+    application_name: Option<&str>,
+    command_line: &str,
+    cwd: Option<&Path>,
+    env_remove: &[OsString],
+    env_overrides: &BTreeMap<OsString, OsString>,
+    stdout_path: Option<&Path>,
+    stderr_path: Option<&Path>,
+    job_name: Option<&str>,
+    breakaway: bool,
+) -> std::result::Result<(ProcessId, Option<u64>, Option<String>), DirectSpawnError> {
     // Open base stdio handles non-inheritable before taking the spawn lock.
     let stdin_base = open_non_inheritable_nul(GENERIC_READ.0).map_err(DirectSpawnError::Other)?;
 
@@ -638,11 +835,13 @@ pub(crate) fn spawn_detached_direct(
         ptr: attr_ptr,
     };
 
-    let mut flags = CREATE_BREAKAWAY_FROM_JOB
-        | CREATE_NO_WINDOW
+    let mut flags = CREATE_NO_WINDOW
         | CREATE_NEW_PROCESS_GROUP
         | CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT;
+    if breakaway {
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
     if job_base.is_some() {
         // Start suspended so we assign the child into the named Job Object before it can spawn
         // any descendants or exit.
@@ -743,7 +942,7 @@ pub(crate) fn spawn_detached_direct(
     drop(stdin_base);
 
     if let Err(err) = create_res {
-        if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
+        if breakaway && err.code() == ERROR_ACCESS_DENIED.to_hresult() {
             return Err(DirectSpawnError::BreakawayRefused);
         }
         if err.code() == ERROR_FILE_NOT_FOUND.to_hresult()
@@ -780,7 +979,464 @@ pub(crate) fn spawn_detached_direct(
 
     let (creation, _) = query_times_raw(proc_handle.0, "detached child process")
         .map_err(DirectSpawnError::Other)?;
-    Ok((ProcessId::new(pi.dwProcessId, creation), assigned_job_name))
+    let start_key = query_process_start_key_raw(proc_handle.0, pi.dwProcessId);
+    Ok((
+        ProcessId::new(pi.dwProcessId, creation),
+        start_key,
+        assigned_job_name,
+    ))
+}
+
+/// Outcome of an in-process COM WMI `Win32_Process.Create` attempt.
+pub(crate) enum WmiCreateError {
+    /// WMI provably did not start the target process, so retrying (when `transient`) or falling
+    /// back cannot start a duplicate copy.
+    NotStarted { transient: bool, detail: String },
+    /// `ExecMethod("Win32_Process", "Create")` returned an ambiguous result after invoking the
+    /// method; callers must NOT retry or fall back to avoid starting the same process twice.
+    MaybeStarted { detail: String },
+}
+
+struct ComMtaGuard;
+
+impl Drop for ComMtaGuard {
+    fn drop(&mut self) {
+        // SAFETY: Matches the successful `CoInitializeEx` on this thread.
+        unsafe { CoUninitialize() };
+    }
+}
+
+// Verify at compile time that our cross-platform WMI HRESULT table matches the Windows SDK.
+const _: () = {
+    use crate::detach::wmi_hresult;
+    assert!(WBEM_E_NOT_FOUND.0 == wmi_hresult::WBEM_E_NOT_FOUND);
+    assert!(WBEM_E_ACCESS_DENIED.0 == wmi_hresult::WBEM_E_ACCESS_DENIED);
+    assert!(WBEM_E_INVALID_PARAMETER.0 == wmi_hresult::WBEM_E_INVALID_PARAMETER);
+    assert!(WBEM_E_INVALID_NAMESPACE.0 == wmi_hresult::WBEM_E_INVALID_NAMESPACE);
+    assert!(WBEM_E_INVALID_OBJECT.0 == wmi_hresult::WBEM_E_INVALID_OBJECT);
+    assert!(WBEM_E_INVALID_CLASS.0 == wmi_hresult::WBEM_E_INVALID_CLASS);
+    assert!(WBEM_E_TRANSPORT_FAILURE.0 == wmi_hresult::WBEM_E_TRANSPORT_FAILURE);
+    assert!(WBEM_E_INVALID_METHOD.0 == wmi_hresult::WBEM_E_INVALID_METHOD);
+    assert!(WBEM_E_INVALID_METHOD_PARAMETERS.0 == wmi_hresult::WBEM_E_INVALID_METHOD_PARAMETERS);
+    assert!(WBEM_E_SHUTTING_DOWN.0 == wmi_hresult::WBEM_E_SHUTTING_DOWN);
+    assert!(WBEM_E_INVALID_OBJECT_PATH.0 == wmi_hresult::WBEM_E_INVALID_OBJECT_PATH);
+    assert!(WBEM_E_SERVER_TOO_BUSY.0 == wmi_hresult::WBEM_E_SERVER_TOO_BUSY);
+    assert!(RPC_E_DISCONNECTED.0 == wmi_hresult::RPC_E_DISCONNECTED);
+    assert!(
+        HRESULT::from_win32(RPC_S_SERVER_UNAVAILABLE.0 as u32).0
+            == wmi_hresult::RPC_S_SERVER_UNAVAILABLE_HR
+    );
+};
+
+fn is_transient_wmi_connect_hresult(hr: HRESULT) -> bool {
+    crate::detach::classify_wmi_connect_hresult(hr.0)
+}
+
+fn classify_exec_method_hresult(hr: HRESULT) -> crate::detach::WmiExecMethodClass {
+    crate::detach::classify_wmi_exec_method_hresult(hr.0)
+}
+
+fn variant_to_u32(val: &VARIANT) -> Option<u32> {
+    u32::try_from(val)
+        .ok()
+        .or_else(|| i32::try_from(val).ok().and_then(|n| u32::try_from(n).ok()))
+}
+
+fn build_wmi_startup_info_breakaway(
+    service: &IWbemServices,
+) -> std::result::Result<IWbemClassObject, WmiCreateError> {
+    let startup_class_name = BSTR::from("Win32_ProcessStartup");
+    let mut startup_class: Option<IWbemClassObject> = None;
+    // SAFETY: `service` is connected and `startup_class` is a valid out-pointer.
+    unsafe {
+        service.GetObject(
+            &startup_class_name,
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            Some(&mut startup_class),
+            None,
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: is_transient_wmi_connect_hresult(err.code()),
+        detail: format!("IWbemServices::GetObject(Win32_ProcessStartup) failed: {err}"),
+    })?;
+    let startup_class = startup_class.ok_or_else(|| WmiCreateError::NotStarted {
+        transient: false,
+        detail: "IWbemServices::GetObject(Win32_ProcessStartup) returned null object".into(),
+    })?;
+
+    // SAFETY: `startup_class` is a valid WMI class definition object.
+    let startup_instance =
+        unsafe { startup_class.SpawnInstance(0) }.map_err(|err| WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::SpawnInstance(Win32_ProcessStartup) failed: {err}"),
+        })?;
+
+    // Per Microsoft's `IWbemClassObject::Put` rules, CIM `uint32` (`CreateFlags`) accepts `VT_I4`.
+    // `CREATE_BREAKAWAY_FROM_JOB` (`0x0100_0000` = 16_777_216) fits cleanly in positive `i32`.
+    let flags_name = to_wide_null(OsStr::new("CreateFlags"));
+    let flags_var = VARIANT::from(CREATE_BREAKAWAY_FROM_JOB.0 as i32);
+    // SAFETY: `flags_name` is NUL-terminated UTF-16 and `flags_var` is a valid `VT_I4` VARIANT.
+    unsafe { startup_instance.Put(PCWSTR::from_raw(flags_name.as_ptr()), 0, &flags_var, 0) }
+        .map_err(|err| WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::Put(CreateFlags) failed: {err}"),
+        })?;
+
+    Ok(startup_instance)
+}
+
+/// Outcome of a single `Win32_Process.Create` `ExecMethod` call on an established WMI connection.
+enum WmiExecOutcome {
+    Started(u32),
+    /// Proven pre-launch rejection that may be caused specifically by `CREATE_BREAKAWAY_FROM_JOB`.
+    BreakawayRejected(WmiCreateError),
+    Failed(WmiCreateError),
+}
+
+fn exec_wmi_create_once(
+    service: &IWbemServices,
+    class_name: &BSTR,
+    in_sig: &IWbemClassObject,
+    command_line: &str,
+    cwd: Option<&str>,
+    startup_info: Option<&IWbemClassObject>,
+) -> WmiExecOutcome {
+    // SAFETY: `in_sig` is a valid method input parameter class object.
+    let in_params = match unsafe { in_sig.SpawnInstance(0) } {
+        Ok(params) => params,
+        Err(err) => {
+            return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+                transient: false,
+                detail: format!("IWbemClassObject::SpawnInstance failed: {err}"),
+            });
+        }
+    };
+
+    let cmdline_name = to_wide_null(OsStr::new("CommandLine"));
+    let cmdline_var = VARIANT::from(command_line);
+    // SAFETY: `cmdline_name` is NUL-terminated UTF-16 and `cmdline_var` is a valid BSTR VARIANT.
+    if let Err(err) =
+        unsafe { in_params.Put(PCWSTR::from_raw(cmdline_name.as_ptr()), 0, &cmdline_var, 0) }
+    {
+        return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("IWbemClassObject::Put(CommandLine) failed: {err}"),
+        });
+    }
+
+    if let Some(dir) = cwd {
+        let cwd_name = to_wide_null(OsStr::new("CurrentDirectory"));
+        let cwd_var = VARIANT::from(dir);
+        // SAFETY: `cwd_name` is NUL-terminated UTF-16 and `cwd_var` is a valid BSTR VARIANT.
+        if let Err(err) =
+            unsafe { in_params.Put(PCWSTR::from_raw(cwd_name.as_ptr()), 0, &cwd_var, 0) }
+        {
+            return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+                transient: false,
+                detail: format!("IWbemClassObject::Put(CurrentDirectory) failed: {err}"),
+            });
+        }
+    }
+
+    if let Some(startup) = startup_info {
+        // Per Microsoft's `IWbemClassObject::Put` contract, embedded WMI objects must be passed as
+        // `VT_UNKNOWN` obtained by querying `IID_IUnknown`.
+        let startup_unk: IUnknown = match startup.cast() {
+            Ok(unk) => unk,
+            Err(err) => {
+                return WmiExecOutcome::Failed(WmiCreateError::NotStarted {
+                    transient: false,
+                    detail: format!(
+                        "QueryInterface(IUnknown) on Win32_ProcessStartup failed: {err}"
+                    ),
+                });
+            }
+        };
+        let startup_name = to_wide_null(OsStr::new("ProcessStartupInformation"));
+        let startup_var = VARIANT::from(startup_unk);
+        // SAFETY: `startup_name` is NUL-terminated UTF-16 and `startup_var` is a valid
+        // `VT_UNKNOWN` VARIANT that releases its COM ref on drop via `VariantClear`.
+        if let Err(err) =
+            unsafe { in_params.Put(PCWSTR::from_raw(startup_name.as_ptr()), 0, &startup_var, 0) }
+        {
+            return WmiExecOutcome::BreakawayRejected(WmiCreateError::NotStarted {
+                transient: false,
+                detail: format!("IWbemClassObject::Put(ProcessStartupInformation) failed: {err}"),
+            });
+        }
+    }
+
+    let method_bstr = BSTR::from("Create");
+    let mut out_params: Option<IWbemClassObject> = None;
+    // SAFETY: All COM objects and BSTR arguments are valid; `out_params` is a valid out-pointer.
+    if let Err(err) = unsafe {
+        service.ExecMethod(
+            class_name,
+            &method_bstr,
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            &in_params,
+            Some(&mut out_params),
+            None,
+        )
+    } {
+        let detail = format!("IWbemServices::ExecMethod(Win32_Process.Create) failed: {err}");
+        let hr = err.code();
+        return match classify_exec_method_hresult(hr) {
+            crate::detach::WmiExecMethodClass::NotStarted { transient } => {
+                let wmi_err = WmiCreateError::NotStarted { transient, detail };
+                if startup_info.is_some() && crate::detach::wmi_breakaway_hresult_rejected(hr.0) {
+                    WmiExecOutcome::BreakawayRejected(wmi_err)
+                } else {
+                    WmiExecOutcome::Failed(wmi_err)
+                }
+            }
+            crate::detach::WmiExecMethodClass::MaybeStarted => {
+                WmiExecOutcome::Failed(WmiCreateError::MaybeStarted { detail })
+            }
+        };
+    }
+
+    let Some(out_params) = out_params else {
+        return WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+            detail: "Win32_Process.Create returned no output parameters".into(),
+        });
+    };
+
+    let ret_name = to_wide_null(OsStr::new("ReturnValue"));
+    let mut ret_var = VARIANT::default();
+    // SAFETY: `ret_name` is NUL-terminated UTF-16 and `ret_var` is a valid mutable `VARIANT`.
+    if let Err(err) = unsafe {
+        out_params.Get(
+            PCWSTR::from_raw(ret_name.as_ptr()),
+            0,
+            &mut ret_var,
+            None,
+            None,
+        )
+    } {
+        return WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+            detail: format!("reading Win32_Process.Create ReturnValue failed: {err}"),
+        });
+    }
+    let Some(return_value) = variant_to_u32(&ret_var) else {
+        return WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+            detail: "Win32_Process.Create ReturnValue was not an integer".into(),
+        });
+    };
+
+    let pid_name = to_wide_null(OsStr::new("ProcessId"));
+    let mut pid_var = VARIANT::default();
+    let pid = unsafe {
+        out_params.Get(
+            PCWSTR::from_raw(pid_name.as_ptr()),
+            0,
+            &mut pid_var,
+            None,
+            None,
+        )
+    }
+    .ok()
+    .and_then(|()| variant_to_u32(&pid_var))
+    .unwrap_or(0);
+
+    if return_value == 0 && pid > 0 {
+        return WmiExecOutcome::Started(pid);
+    }
+
+    if return_value != 0 && pid == 0 {
+        return match crate::detach::classify_wmi_return_value(return_value) {
+            crate::detach::WmiReturnValueClass::NotStarted { reason } => {
+                let wmi_err = WmiCreateError::NotStarted {
+                    transient: false,
+                    detail: format!(
+                        "Win32_Process.Create failed with ReturnValue={return_value} ({reason})"
+                    ),
+                };
+                if startup_info.is_some()
+                    && crate::detach::wmi_breakaway_return_value_rejected(return_value)
+                {
+                    WmiExecOutcome::BreakawayRejected(wmi_err)
+                } else {
+                    WmiExecOutcome::Failed(wmi_err)
+                }
+            }
+            crate::detach::WmiReturnValueClass::MaybeStarted { reason } => {
+                WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+                    detail: format!(
+                        "Win32_Process.Create failed with ambiguous ReturnValue={return_value} ({reason})"
+                    ),
+                })
+            }
+        };
+    }
+
+    WmiExecOutcome::Failed(WmiCreateError::MaybeStarted {
+        detail: format!(
+            "Win32_Process.Create returned ambiguous result (ReturnValue={return_value}, ProcessId={pid})"
+        ),
+    })
+}
+
+/// Invoke `Win32_Process.Create` directly via COM (`IWbemLocator` -> `ROOT\CIMV2`) without
+/// spawning an outer `powershell.exe` / `Invoke-CimMethod` process.
+///
+/// Requests `CREATE_BREAKAWAY_FROM_JOB` via `Win32_ProcessStartup.CreateFlags` so the created
+/// process leaves the WMI provider host's job object and does not count against its quotas. Falls
+/// back once without `ProcessStartupInformation` only when WMI provably rejects the breakaway
+/// request before creating a process.
+///
+/// Must be called on a dedicated OS thread so it always initializes a clean MTA apartment.
+pub(crate) fn wmi_create_process(
+    command_line: &str,
+    cwd: Option<&str>,
+) -> std::result::Result<u32, WmiCreateError> {
+    wmi_create_process_with_breakaway(command_line, cwd, true)
+}
+
+fn wmi_create_process_with_breakaway(
+    command_line: &str,
+    cwd: Option<&str>,
+    try_breakaway: bool,
+) -> std::result::Result<u32, WmiCreateError> {
+    // SAFETY: Standard per-thread COM MTA initialization paired with `ComMtaGuard`.
+    let init_hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if init_hr.is_err() {
+        return Err(WmiCreateError::NotStarted {
+            transient: false,
+            detail: format!("CoInitializeEx failed: {init_hr:?}"),
+        });
+    }
+    let _com_guard = ComMtaGuard;
+
+    // Avoid calling process-wide `CoInitializeSecurity` with a null security descriptor; rely on
+    // `CoSetProxyBlanket` on the `IWbemServices` proxy returned by local `ROOT\CIMV2` instead.
+
+    // SAFETY: `WbemLocator` is a standard system COM class returning `IWbemLocator`.
+    let locator: IWbemLocator = unsafe {
+        CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: is_transient_wmi_connect_hresult(err.code()),
+        detail: format!("CoCreateInstance(WbemLocator) failed: {err}"),
+    })?;
+
+    let namespace = BSTR::from(r"ROOT\CIMV2");
+    let empty = BSTR::new();
+    // SAFETY: Valid `IWbemLocator` and BSTR arguments.
+    let service: IWbemServices =
+        unsafe { locator.ConnectServer(&namespace, &empty, &empty, &empty, 0, &empty, None) }
+            .map_err(|err| WmiCreateError::NotStarted {
+                transient: is_transient_wmi_connect_hresult(err.code()),
+                detail: format!("IWbemLocator::ConnectServer(ROOT\\CIMV2) failed: {err}"),
+            })?;
+
+    // SAFETY: `service` is a valid COM proxy returned by `ConnectServer`.
+    unsafe {
+        CoSetProxyBlanket(
+            &service,
+            RPC_C_AUTHN_WINNT,
+            RPC_C_AUTHZ_NONE,
+            None,
+            RPC_C_AUTHN_LEVEL_CALL,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: false,
+        detail: format!("CoSetProxyBlanket failed: {err}"),
+    })?;
+
+    let class_name = BSTR::from("Win32_Process");
+    let mut class_obj: Option<IWbemClassObject> = None;
+    // SAFETY: `service` is connected and `class_obj` is a valid out-pointer.
+    unsafe {
+        service.GetObject(
+            &class_name,
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None,
+            Some(&mut class_obj),
+            None,
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: is_transient_wmi_connect_hresult(err.code()),
+        detail: format!("IWbemServices::GetObject(Win32_Process) failed: {err}"),
+    })?;
+    let class_obj = class_obj.ok_or_else(|| WmiCreateError::NotStarted {
+        transient: false,
+        detail: "IWbemServices::GetObject(Win32_Process) returned null object".into(),
+    })?;
+
+    let method_wide = to_wide_null(OsStr::new("Create"));
+    let mut in_sig: Option<IWbemClassObject> = None;
+    // SAFETY: `method_wide` is NUL-terminated UTF-16 and `in_sig` is a valid out-pointer.
+    unsafe {
+        class_obj.GetMethod(
+            PCWSTR::from_raw(method_wide.as_ptr()),
+            0,
+            &mut in_sig,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(|err| WmiCreateError::NotStarted {
+        transient: false,
+        detail: format!("IWbemClassObject::GetMethod(Create) failed: {err}"),
+    })?;
+    let in_sig = in_sig.ok_or_else(|| WmiCreateError::NotStarted {
+        transient: false,
+        detail: "IWbemClassObject::GetMethod(Create) returned null signature".into(),
+    })?;
+
+    if try_breakaway {
+        let startup_info = build_wmi_startup_info_breakaway(&service).ok();
+        if let Some(ref startup) = startup_info {
+            match exec_wmi_create_once(
+                &service,
+                &class_name,
+                &in_sig,
+                command_line,
+                cwd,
+                Some(startup),
+            ) {
+                WmiExecOutcome::Started(pid) => return Ok(pid),
+                WmiExecOutcome::Failed(err) => return Err(err),
+                WmiExecOutcome::BreakawayRejected(_) => {
+                    // Breakaway was provably rejected before process creation; fall back once
+                    // without `ProcessStartupInformation` on the same WMI connection.
+                }
+            }
+        }
+    }
+
+    match exec_wmi_create_once(&service, &class_name, &in_sig, command_line, cwd, None) {
+        WmiExecOutcome::Started(pid) => Ok(pid),
+        WmiExecOutcome::BreakawayRejected(err) | WmiExecOutcome::Failed(err) => Err(err),
+    }
+}
+
+/// Return `true` when live process `pid` is currently associated with any Windows Job Object.
+#[cfg(test)]
+pub(crate) fn is_process_in_any_job(pid: u32) -> Result<bool> {
+    // SAFETY: `OpenProcess` takes plain integer arguments and returns an owned handle.
+    let handle = OwnedHandle(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.map_err(|err| {
+            OsError::Platform {
+                detail: format!("OpenProcess failed for pid {pid}: {err}"),
+            }
+        })?,
+    );
+    let mut in_job = BOOL::default();
+    // SAFETY: `handle.0` has `PROCESS_QUERY_LIMITED_INFORMATION` (the minimum right documented
+    // for `IsProcessInJob`), `None` checks membership in any job, and `in_job` is a valid out-ptr.
+    unsafe { IsProcessInJob(handle.0, None, &mut in_job) }.map_err(|err| OsError::Platform {
+        detail: format!("IsProcessInJob failed for pid {pid}: {err}"),
+    })?;
+    Ok(in_job.as_bool())
 }
 
 /// Query all PIDs currently assigned to the named Job Object `job_name`.
@@ -1040,11 +1696,12 @@ pub(crate) fn check_process_env_marker(pid: u32, key: &str, expected: &str) -> E
     windows_env_utf16_has_marker(&units, key, expected, truncated || env_bytes_read < to_read)
 }
 
-/// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) for `pid`.
-///
-/// Returns `Ok(None)` when no process with `pid` exists or when it has already exited and
-/// `include_exited` is `false`.
-pub(crate) fn query_process_identity(pid: u32, include_exited: bool) -> Result<Option<ProcessId>> {
+/// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) and monotonic
+/// kernel `ProcessStartKey` for `pid` through a single held handle.
+pub(crate) fn query_process_identity_with_start_key(
+    pid: u32,
+    include_exited: bool,
+) -> Result<Option<(ProcessId, Option<u64>)>> {
     // SAFETY: `OpenProcess` takes only plain integer flags and returns an owned handle or an error.
     let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
         Ok(h) => OwnedHandle(h),
@@ -1066,7 +1723,16 @@ pub(crate) fn query_process_identity(pid: u32, include_exited: bool) -> Result<O
     if !include_exited && !is_still_running(handle.0, exit_ft) {
         return Ok(None);
     }
-    Ok(Some(ProcessId::new(pid, creation)))
+    let start_key = query_process_start_key_raw(handle.0, pid);
+    Ok(Some((ProcessId::new(pid, creation), start_key)))
+}
+
+/// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) for `pid`.
+///
+/// Returns `Ok(None)` when no process with `pid` exists or when it has already exited and
+/// `include_exited` is `false`.
+pub(crate) fn query_process_identity(pid: u32, include_exited: bool) -> Result<Option<ProcessId>> {
+    Ok(query_process_identity_with_start_key(pid, include_exited)?.map(|(id, _)| id))
 }
 
 /// Capture a snapshot of all `(pid, parent_pid)` entries currently in the Windows process table.
@@ -1187,6 +1853,7 @@ fn query_image_name_raw(handle: HANDLE) -> Option<String> {
 /// session ancestor or target.
 pub(crate) struct WindowsProcSshdInfo {
     pub(crate) id: ProcessId,
+    pub(crate) start_key: Option<u64>,
     pub(crate) image_path: String,
     pub(crate) same_account: bool,
     pub(crate) cmdline: Option<String>,
@@ -1353,6 +2020,7 @@ pub(crate) fn inspect_process_for_sshd(pid: u32) -> Option<WindowsProcSshdInfo> 
     };
     Some(WindowsProcSshdInfo {
         id: pinned.id,
+        start_key: pinned.start_key,
         image_path,
         same_account,
         cmdline,
@@ -1433,5 +2101,102 @@ pub(crate) fn open_verify_terminate(identity: &ProcessId) -> Result<TerminateOut
         Err(err) => Err(OsError::Platform {
             detail: format!("TerminateProcess failed for pid {}: {err}", identity.pid),
         }),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_telemetry_start_key_is_monotonic_across_parent_and_child() {
+        let OpenPinnedOutcome::Pinned(me) = open_pinned_query_only(std::process::id(), false)
+        else {
+            panic!("failed to open current process");
+        };
+        let my_key = me.start_key.expect(
+            "ProcessTelemetryIdInformation should return a non-zero start key on Windows 10+",
+        );
+        assert!(my_key > 0);
+
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn child cmd.exe");
+
+        let OpenPinnedOutcome::Pinned(child_proc) = open_pinned_query_only(child.id(), false)
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("failed to open child process");
+        };
+        let child_key = child_proc
+            .start_key
+            .expect("child process should also have a non-zero start key");
+        let full_query_key = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, child.id()) }
+            .ok()
+            .map(OwnedHandle)
+            .and_then(|h| query_process_start_key_raw(h.0, child.id()));
+        eprintln!(
+            "windows-telemetry-diagnostic: limited_right_key_present={} full_right_key_present={} limited_matches_full={}",
+            child_proc.start_key.is_some(),
+            full_query_key.is_some(),
+            child_proc.start_key == full_query_key
+        );
+        assert_eq!(child_proc.start_key, full_query_key);
+        assert!(
+            child_key > my_key,
+            "expected child start_key ({child_key}) > parent start_key ({my_key})"
+        );
+        assert!(child_proc.same_user_as_current());
+        assert!(!child_proc.is_protected_system());
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn wmi_create_process_breaks_away_from_wmiprvse_job_and_supports_no_breakaway_fallback() {
+        let spawn_on_mta = |try_breakaway: bool| -> u32 {
+            std::thread::spawn(move || {
+                wmi_create_process_with_breakaway("ping.exe -n 30 127.0.0.1", None, try_breakaway)
+            })
+            .join()
+            .expect("WMI worker thread panicked")
+            .unwrap_or_else(|err| match err {
+                WmiCreateError::NotStarted { detail, .. }
+                | WmiCreateError::MaybeStarted { detail } => {
+                    panic!("wmi_create_process(try_breakaway={try_breakaway}) failed: {detail}")
+                }
+            })
+        };
+
+        let breakaway_pid = spawn_on_mta(true);
+        let breakaway_id = query_process_identity(breakaway_pid, false)
+            .expect("query breakaway child identity")
+            .expect("breakaway child should be running");
+        let in_job_breakaway =
+            is_process_in_any_job(breakaway_pid).expect("IsProcessInJob for breakaway child");
+        let _ = open_verify_terminate(&breakaway_id);
+
+        let plain_pid = spawn_on_mta(false);
+        let plain_id = query_process_identity(plain_pid, false)
+            .expect("query plain child identity")
+            .expect("plain child should be running");
+        let in_job_plain =
+            is_process_in_any_job(plain_pid).expect("IsProcessInJob for plain child");
+        let _ = open_verify_terminate(&plain_id);
+
+        eprintln!(
+            "windows-wmi-job-diagnostic: breakaway_in_any_job={in_job_breakaway} plain_in_any_job={in_job_plain}"
+        );
+        assert!(
+            !in_job_breakaway,
+            "process created via WMI with CREATE_BREAKAWAY_FROM_JOB should not remain in wmiprvse.exe's job object (plain_in_any_job={in_job_plain})"
+        );
     }
 }

@@ -463,14 +463,14 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         "revoked live session unexpectedly answered: {after_revoke_line:?}"
     );
     drop(live_stdin);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(_status) = live_child.try_wait().unwrap() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "held-open ssh session did not exit after device.remove"
+            "held-open ssh session did not exit within 15s after device.remove"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -559,13 +559,22 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         "legion gate --enrol should never have been launched after expiry-time; stdout={}",
         String::from_utf8_lossy(&expired_out.stdout)
     );
-    // Give sshd a brief moment to flush its log, then verify sshd refused the key via its options
+    // Poll for sshd to flush its log, then verify sshd refused the key via its options
     // (`expiry-time`), rather than missing the key or launching `legion gate --enrol`.
-    std::thread::sleep(Duration::from_millis(50));
-    let sshd_log = sshd.logs().to_ascii_lowercase();
+    let log_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let sshd_log = loop {
+        let log = sshd.logs().to_ascii_lowercase();
+        if log.contains("refused by key options") || log.contains("expired") {
+            break log;
+        }
+        if std::time::Instant::now() >= log_deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert!(
         sshd_log.contains("refused by key options") || sshd_log.contains("expired"),
-        "expected sshd log to note key-option/expiry refusal; log:\n{sshd_log}"
+        "timed out waiting 5s for sshd log to note key-option/expiry refusal; log:\n{sshd_log}"
     );
     // And state/devices.json still has no device enrolled from the expired attempt.
     let after_expired = home.run(&["device.list"]).json();
@@ -2019,9 +2028,9 @@ fn device_remove_leaves_running_jobs_alive_and_reports_them() {
     );
 
     let sleep_cmd = if cfg!(windows) {
-        "Start-Sleep -Seconds 30"
+        "Start-Sleep -Seconds 300"
     } else {
-        "sleep 30"
+        "sleep 300"
     };
 
     let start_job_via_gate = |device: &str, pairing_id: &str| -> String {

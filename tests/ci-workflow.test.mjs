@@ -70,7 +70,7 @@ test('the scripts and Rust legs run across Linux, macOS and Windows, and UI brow
   assert.match(scripts, /bash scripts\/check\.sh scripts/);
 
   const rust = job('rust');
-  assert.match(rust, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  assert.match(rust, /'?\["ubuntu-latest", "macos-latest", "windows-latest"\]'?|\[ubuntu-latest, macos-latest, windows-latest\]/);
   assert.match(rust, /bash scripts\/check\.sh rust/);
   assert.match(rust, /node scripts\/legion-tools-doc\.mjs --bin target\/debug\/legion --check/);
   assert.match(rust, /cargo build --lib -p legion-link --features ssh --locked --target aarch64-linux-android/);

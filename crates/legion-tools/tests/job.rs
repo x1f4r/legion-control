@@ -316,6 +316,28 @@ async fn job_outlives_the_process_that_started_it() {
         assert!(alive(pid), "process {pid} did not outlive starter process");
     }
 
+    // `family` renames `pids_file` before flushing `"ready"` through the supervisor's stdout pipe,
+    // so wait for the captured output log to become non-empty instead of racing it.
+    let output_log = fixture
+        .node
+        .paths()
+        .state_dir()
+        .join("jobs")
+        .join(&id)
+        .join("output.log");
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            fs::metadata(&output_log)
+                .ok()
+                .filter(|m| m.len() > 0)
+                .map(|_| ())
+        })
+        .await
+        .is_some(),
+        "timed out waiting 30s for job {id} output.log ({}) to become non-empty",
+        output_log.display()
+    );
+
     let status = fixture.call("job.status", json!({"id": id})).await.unwrap();
     assert_eq!(status["state"], json!("running"), "{status:#}");
     assert!(status["output_bytes"].as_u64().unwrap() > 0);

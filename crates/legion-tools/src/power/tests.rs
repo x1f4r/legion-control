@@ -1215,3 +1215,58 @@ async fn cancelling_a_restart_into_a_custom_target_clears_it_only_with_its_disar
         [strings(&["disarm-rescue"]), strings(&["verify-rescue"])]
     );
 }
+
+#[tokio::test]
+async fn a_late_starting_power_runner_refuses_to_act_after_schedule_failure() {
+    use std::sync::Mutex;
+
+    struct RecordingCommands {
+        ran: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl delay::Commands for RecordingCommands {
+        fn pause(&self, _duration: Duration) {}
+        fn run(&self, argv: &[String], _timeout: Duration) -> delay::Finished {
+            self.ran.lock().unwrap().push(argv.to_vec());
+            delay::Finished {
+                exit_code: Some(0),
+                ..delay::Finished::default()
+            }
+        }
+        fn busy(&self, _record: &Pending, _dir: &std::path::Path) -> Option<String> {
+            None
+        }
+    }
+
+    // `power.sleep` always uses the delayed runner on every platform (including Windows when a
+    // sleep command is configured).
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new().refusing_schedules(),
+        "busy = \"none\"\n[power]\nsudo = true\nsleep = [\"fake-sleep\"]\n",
+    );
+    let err = fixture.call("power.sleep", json!({})).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Failed, "{err:?}");
+
+    let power_dir = pending::dir(fixture.node.paths());
+    let record = pending::read_pending(&power_dir).expect("pending.json should exist");
+    assert!(
+        record.abandoned,
+        "failed schedule must mark pending.json abandoned before returning"
+    );
+
+    // Simulate the detached runner starting late after `spawn_detached` timed out or failed:
+    // it must see the abandoned flag and exit without running the power command.
+    let commands = RecordingCommands {
+        ran: Mutex::new(Vec::new()),
+    };
+    let exit_code = delay::carry_out(&power_dir, &record.id, &commands);
+    assert_ne!(
+        exit_code, 0,
+        "late runner must refuse to run abandoned action"
+    );
+    assert!(
+        commands.ran.lock().unwrap().is_empty(),
+        "late-starting power runner executed an abandoned command: {:?}",
+        commands.ran.lock().unwrap()
+    );
+}

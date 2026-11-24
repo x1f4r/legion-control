@@ -52,6 +52,57 @@ pub(crate) const fn child_not_older_than_parent(
     child_start.saturating_add(backward_tolerance) >= parent_start
 }
 
+/// Pure Windows parent/child causal-ordering check shared between `procid/windows.rs` and
+/// cross-platform unit tests.
+///
+/// Enforces:
+/// 1. `child_parent_pid == parent_pid`
+/// 2. Whenever both `child_start_key` and `max_start_key` (the recycled-root upper bound) are
+///    known, `child_start_key < max_start_key` — even when `parent_start_key` is `None`.
+/// 3. Whenever both `child_start_key` and `parent_start_key` are known, strictly
+///    `child_start_key > parent_start_key` (immune to wall-clock adjustments and PID reuse).
+/// 4. Otherwise falls back to `FILETIME` comparison, enforcing `max_start_time` when known and
+///    restricting backward wall-clock tolerance to non-protected same-user processes.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) const fn windows_child_causally_valid(
+    child_parent_pid: u32,
+    parent_pid: u32,
+    child_start_time: u64,
+    parent_start_time: u64,
+    child_start_key: Option<u64>,
+    parent_start_key: Option<u64>,
+    max_start_time: Option<u64>,
+    max_start_key: Option<u64>,
+    child_is_protected_system: bool,
+    child_same_user: bool,
+) -> bool {
+    if child_parent_pid != parent_pid {
+        return false;
+    }
+    if let (Some(ck), Some(limit)) = (child_start_key, max_start_key)
+        && ck >= limit
+    {
+        return false;
+    }
+    if let (Some(ck), Some(pk)) = (child_start_key, parent_start_key) {
+        return ck > pk;
+    }
+    if let Some(limit) = max_start_time
+        && child_start_time >= limit
+    {
+        return false;
+    }
+    if child_start_time >= parent_start_time {
+        return true;
+    }
+    child_not_older_than_parent(
+        child_start_time,
+        parent_start_time,
+        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+    ) && !child_is_protected_system
+        && child_same_user
+}
+
 #[cfg(unix)]
 #[path = "procid/unix.rs"]
 mod platform;
@@ -390,6 +441,19 @@ pub(crate) async fn kill_tree_with_marker(
     marker: Option<&str>,
     grace: Duration,
 ) -> Result<KillTreeReport> {
+    kill_tree_with_marker_and_start_key(identity, None, marker, grace).await
+}
+
+/// Internal variant of [`kill_tree_with_marker`] that also passes a root `ProcessStartKey`
+/// captured at spawn time (Windows) so lineage checks retain monotonic key bounds even after the
+/// root exits or its PID is recycled.
+#[allow(dead_code)]
+pub(crate) async fn kill_tree_with_marker_and_start_key(
+    identity: &ProcessId,
+    root_start_key: Option<u64>,
+    marker: Option<&str>,
+    grace: Duration,
+) -> Result<KillTreeReport> {
     if identity.pid == 0 {
         return Err(OsError::InvalidArgument {
             detail: "cannot terminate pid 0".into(),
@@ -400,7 +464,7 @@ pub(crate) async fn kill_tree_with_marker(
             detail: "refusing to terminate the current process".into(),
         });
     }
-    kill_tree_impl(identity, marker, grace).await
+    kill_tree_impl(identity, root_start_key, marker, grace).await
 }
 
 #[cfg(any(unix, windows))]
@@ -532,18 +596,30 @@ async fn kill_process_impl(_identity: &ProcessId, _force: bool, _grace: Duration
     })
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 async fn kill_tree_impl(
     identity: &ProcessId,
+    _root_start_key: Option<u64>,
     marker: Option<&str>,
     grace: Duration,
 ) -> Result<KillTreeReport> {
     platform::kill_tree(identity, marker, grace).await
 }
 
+#[cfg(windows)]
+async fn kill_tree_impl(
+    identity: &ProcessId,
+    root_start_key: Option<u64>,
+    marker: Option<&str>,
+    grace: Duration,
+) -> Result<KillTreeReport> {
+    platform::kill_tree(identity, root_start_key, marker, grace).await
+}
+
 #[cfg(not(any(unix, windows)))]
 async fn kill_tree_impl(
     _identity: &ProcessId,
+    _root_start_key: Option<u64>,
     _marker: Option<&str>,
     _grace: Duration,
 ) -> Result<KillTreeReport> {
@@ -1632,5 +1708,88 @@ mod tests {
         assert!(!verify_same_account_sshd(&me));
         assert!(!verify_same_account_sshd(&ProcessId::new(0, 1)));
         assert!(!verify_same_account_sshd(&ProcessId::new(1, 1)));
+    }
+
+    #[test]
+    fn windows_child_causal_check_enforces_start_keys_and_recycled_root_upper_bound() {
+        let parent_ft = 134_400_177_070_000_000u64;
+        let older_ft = parent_ft - 7 * 60 * 10_000_000; // 7 minutes older (boot-time system proc)
+        let newer_ft = parent_ft + 10_000_000;
+
+        // With both start keys known, strictly monotonic key order wins over wall clock.
+        assert!(windows_child_causally_valid(
+            100,
+            100,
+            older_ft, // even after a backward wall-clock step
+            parent_ft,
+            Some(50),
+            Some(40),
+            None,
+            Some(60),
+            false,
+            true,
+        ));
+        // Equal or older start key is rejected (recycled PID pointing to pre-existing process).
+        assert!(!windows_child_causally_valid(
+            100,
+            100,
+            newer_ft,
+            parent_ft,
+            Some(30),
+            Some(40),
+            None,
+            None,
+            false,
+            true,
+        ));
+        // Start key at or above recycled-root upper bound is rejected even when parent_start_key
+        // is None (legacy handle whose root exited and had its PID recycled).
+        assert!(!windows_child_causally_valid(
+            100,
+            100,
+            newer_ft,
+            parent_ft,
+            Some(60),
+            None,
+            None,
+            Some(60),
+            false,
+            true,
+        ));
+        assert!(!windows_child_causally_valid(
+            100,
+            100,
+            newer_ft,
+            parent_ft,
+            Some(61),
+            None,
+            None,
+            Some(60),
+            false,
+            true,
+        ));
+        // Below the recycled-root upper bound with missing parent_start_key falls back cleanly.
+        assert!(windows_child_causally_valid(
+            100,
+            100,
+            newer_ft,
+            parent_ft,
+            Some(55),
+            None,
+            Some(newer_ft + 1),
+            Some(60),
+            false,
+            true,
+        ));
+        // When keys are absent, backward wall-clock tolerance rejects protected or other-user procs.
+        assert!(!windows_child_causally_valid(
+            100, 100, older_ft, parent_ft, None, None, None, None, true, true,
+        ));
+        assert!(!windows_child_causally_valid(
+            100, 100, older_ft, parent_ft, None, None, None, None, false, false,
+        ));
+        assert!(windows_child_causally_valid(
+            100, 100, older_ft, parent_ft, None, None, None, None, false, true,
+        ));
     }
 }
