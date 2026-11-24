@@ -104,16 +104,17 @@ stores, AI agents' credential files, and browser profiles — for every role tha
 
 `legion init` writes a starter `policy.toml` with `default = "owner"` and three roles:
 
-- **`observer`**: may inspect the machine and read files under `paths = ["~/projects/**"]`
-  (`effect:read`, denying `audit.*`). Cannot change anything. A real boundary when paired with a
-  pinned door.
-- **`editor`**: may read and modify files under `paths = ["~/projects/**"]` (`effect:read`,
-  `effect:write`, denying `audit.*`), without `exec`, `destroy`, `power`, or `admin`. A real
-  boundary for file work.
-- **`operator`**: everything except power and administration (`allow = ["*"]` or read/write/exec
-  and related tools, denying `power.*`, `effect:power`, `effect:admin`). Because `operator` can run
-  commands, it is as strong as the OS account and could change Legion's own files through a shell:
-  treat it as a guard rail and an audit trail, not a wall.
+- **`observer`**: `allow = ["effect:read"]`, `deny = ["audit.*"]`, `paths = ["~/projects/**"]`.
+  May look without changing anything (system facts, job/service/project status, and files under
+  `paths`, never Legion's audit log). A real boundary when paired with a pinned door.
+- **`editor`**: `allow = ["effect:read", "effect:write"]`, `paths = ["~/projects/**"]`. May read
+  and modify files inside `paths`, with no `exec`, `destroy`, `power`, or `admin`. A real boundary
+  for file work through a pinned door.
+- **`operator`**: `allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]`,
+  `deny = ["effect:power", "effect:admin"]`. Everything except power and administration. Because
+  `operator` can run commands, it is as strong as the OS account and could change Legion's own
+  files (including `policy.toml` and `tools.d/`) through a shell: treat it as a guard rail and an
+  audit trail, not a wall.
 
 `legion meta.doctor` warns about every role in `policy.toml` that may run commands, so roles with
 `exec` never look like confined sandboxes by accident.
@@ -306,8 +307,8 @@ or `admin` calls and gives every call its own principal in `audit.jsonl`, not an
 
 ```toml
 [roles.operator]
-allow = ["*"]
-deny  = ["power.*", "effect:power", "effect:admin"]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny  = ["effect:power", "effect:admin"]
 
 [principals."agent:claude"]
 role = "operator"

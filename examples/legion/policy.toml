@@ -21,8 +21,8 @@ paths = ["~/projects/**"]
 # Because `exec` can run any command as the OS user, treat this as a guard rail and audit trail,
 # not a filesystem sandbox.
 [roles.operator]
-allow = ["*"]
-deny = ["power.*", "effect:power", "effect:admin"]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny = ["effect:power", "effect:admin"]
 
 # Narrow role for a phone over HTTP (status checks and waking sleeping machines only).
 [roles.phone_remote]
