@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use legion_core::config::{NodeFile, NodeName};
-use legion_core::policy::{OWNER, Policy};
+use legion_core::policy::{NOBODY, OWNER, Policy};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::{Door, Node};
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,8 @@ use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_inv
 use super::registry::{
     DEVICE_PRINCIPAL_PREFIX, DevicesFile, FleetDevice, FleetPushOutcome,
     adopt_legacy_devices_from_auth_keys, format_precise_rfc3339, load_devices_raw, lock_config,
-    push_devices_to_fleet, reconcile_authorized_keys_in_memory, save_devices_locked,
+    push_devices_to_fleet, reconcile_authorized_keys_in_memory, remove_policy_principal_locked,
+    save_devices_locked, upsert_policy_principal_locked,
 };
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
@@ -309,6 +310,7 @@ fn process_enrol_blocking(
             principal: String,
             created_by: Option<String>,
             role: String,
+            create_principal: bool,
             device_name: String,
             fingerprint: String,
             state: super::store::DevicesState,
@@ -374,31 +376,78 @@ fn process_enrol_blocking(
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
 
-        // Resolve the principal's current role from policy.toml.
+        // Resolve and verify the principal's role against policy.toml under the config lock.
         let policy = match node.config().get::<Policy>() {
             Ok(policy) => policy,
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
         };
-        let (role, _) = policy.role_of(&principal);
-        if role != OWNER
-            && !policy
-                .principals
-                .keys()
-                .any(|known| known.as_str() == principal)
-        {
-            return fail_with_sweep(
-                Some(principal.clone()),
-                ErrorBody::new(
-                    ErrorCode::Denied,
-                    format!(
-                        "policy.toml no longer names {principal}, so this device cannot be enrolled."
-                    ),
-                )
-                .with_hint("Restore the principal in policy.toml and create a new invite."),
-                auth_keys,
-                state,
-            );
-        }
+        let principal_exists_in_policy = policy
+            .principals
+            .keys()
+            .any(|known| known.as_str() == principal);
+        let role = if invite.create_principal {
+            let Some(invite_role) = invite.role.as_deref() else {
+                return fail_with_sweep(
+                    Some(principal),
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        "This pairing invite is missing its recorded role and cannot be enrolled.",
+                    )
+                    .with_hint("Create a new invite on the node with `legion pair`."),
+                    auth_keys,
+                    state,
+                );
+            };
+            let known_role = invite_role == OWNER
+                || invite_role == NOBODY
+                || policy.roles.contains_key(invite_role);
+            if !known_role {
+                return fail_with_sweep(
+                    Some(principal),
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "policy.toml no longer defines role {invite_role:?}, so this device cannot be enrolled."
+                        ),
+                    )
+                    .with_hint("Restore the role in policy.toml and create a new invite."),
+                    auth_keys,
+                    state,
+                );
+            }
+            if principal_exists_in_policy {
+                return fail_with_sweep(
+                    Some(principal.clone()),
+                    ErrorBody::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            "policy.toml already defines {principal}, so this invite cannot create a dedicated device principal for it."
+                        ),
+                    )
+                    .with_hint("Create a new invite with a different device name, or remove the conflicting principal from policy.toml."),
+                    auth_keys,
+                    state,
+                );
+            }
+            invite_role.to_owned()
+        } else {
+            let (resolved_role, _) = policy.role_of(&principal);
+            if resolved_role != OWNER && !principal_exists_in_policy {
+                return fail_with_sweep(
+                    Some(principal.clone()),
+                    ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "policy.toml no longer names {principal}, so this device cannot be enrolled."
+                        ),
+                    )
+                    .with_hint("Restore the principal in policy.toml and create a new invite."),
+                    auth_keys,
+                    state,
+                );
+            }
+            resolved_role
+        };
 
         let pinned_account: Option<String> = auth_keys
             .lines
@@ -479,6 +528,28 @@ fn process_enrol_blocking(
                 state,
             );
         }
+        if invite.create_principal
+            && devices.devices.values().any(|dev| {
+                dev.principal == principal
+                    || invite
+                        .device_name
+                        .as_deref()
+                        .is_some_and(|slug| dev.name == slug)
+            })
+        {
+            return fail_with_sweep(
+                Some(principal.clone()),
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!("A paired device for {principal} already exists in devices.toml."),
+                )
+                .with_hint(
+                    "Create a new invite with a different device name, or remove the existing device first.",
+                ),
+                auth_keys,
+                state,
+            );
+        }
 
         let exe = match legion_core::current_exe() {
             Ok(exe) => exe,
@@ -528,7 +599,9 @@ fn process_enrol_blocking(
         };
 
         let precise_now = format_precise_rfc3339(now);
-        let recorded_role = if principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+        let recorded_role = if invite.create_principal {
+            Some(role.clone())
+        } else if principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
             invite.role.clone().or_else(|| Some(role.clone()))
         } else {
             None
@@ -583,6 +656,7 @@ fn process_enrol_blocking(
                 principal,
                 created_by: invite.created_by,
                 role,
+                create_principal: invite.create_principal,
                 device_name,
                 fingerprint: validated_key.fingerprint,
                 state,
@@ -594,37 +668,49 @@ fn process_enrol_blocking(
         Err(error) => return (None, None, base_args, Err(error)),
     };
 
-    let (principal, created_by, role, device_name, fingerprint, state, devices) = match attempt {
-        EnrolAttempt::Succeeded {
-            principal,
-            created_by,
-            role,
-            device_name,
-            fingerprint,
-            state,
-            devices,
-        } => (
-            principal,
-            created_by,
-            role,
-            device_name,
-            fingerprint,
-            state,
-            devices,
-        ),
-        EnrolAttempt::Failed {
-            principal,
-            error,
-            swept_state,
-        } => {
-            if let Some(state) = swept_state {
-                let _ = save_state(paths, &state);
+    let (principal, created_by, role, create_principal, device_name, fingerprint, state, devices) =
+        match attempt {
+            EnrolAttempt::Succeeded {
+                principal,
+                created_by,
+                role,
+                create_principal,
+                device_name,
+                fingerprint,
+                state,
+                devices,
+            } => (
+                principal,
+                created_by,
+                role,
+                create_principal,
+                device_name,
+                fingerprint,
+                state,
+                devices,
+            ),
+            EnrolAttempt::Failed {
+                principal,
+                error,
+                swept_state,
+            } => {
+                if let Some(state) = swept_state {
+                    let _ = save_state(paths, &state);
+                }
+                return (principal, None, base_args, Err(error));
             }
-            return (principal, None, base_args, Err(error));
-        }
-    };
+        };
+
+    if create_principal
+        && let Err(error) = upsert_policy_principal_locked(paths, &principal, &role)
+    {
+        return (Some(principal), created_by, base_args, Err(error));
+    }
 
     if let Err(error) = save_devices_locked(paths, &devices) {
+        if create_principal {
+            let _ = remove_policy_principal_locked(paths, &principal);
+        }
         return (Some(principal), created_by, base_args, Err(error));
     }
 

@@ -19,7 +19,7 @@ pub mod store;
 use std::collections::BTreeMap;
 
 use jiff::{SignedDuration, Timestamp};
-use legion_core::config::{NodeFile, NodeName};
+use legion_core::config::{Document, NodeFile, NodeName};
 use legion_core::policy::{NOBODY, OWNER, Policy, Principal};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Ctx, NoArgs, Registry, ToolError};
@@ -68,7 +68,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "device.invite",
         Effect::Admin,
-        "Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: creates principal `device:<name>` in policy.toml with that role if absent) or `principal` (an existing principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true.",
+        "Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves `device:<name>` and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true.",
         invite,
     );
     registry.add_fn(
@@ -449,6 +449,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         id: id.clone(),
         principal: principal.clone(),
         role: invite_role,
+        create_principal: create_device_principal,
         device_name: invite_device_name.clone(),
         created_by: Some(ctx.principal().to_owned()),
         created,
@@ -459,9 +460,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let paths = ctx.paths().clone();
     let id_for_write = id.clone();
     let principal_for_write = principal.clone();
-    let role_for_write = role.clone();
     let node_name_for_write = ctx.node_name().to_owned();
-    let policy_for_adopt = ctx.config().get::<Policy>()?;
     blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
@@ -475,22 +474,65 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
 
-        if create_device_principal {
+        let precheck = |auth_keys: &self::authkeys::AuthKeysFile,
+                        state: &store::DevicesState|
+         -> Result<(), ErrorBody> {
+            if !create_device_principal {
+                return Ok(());
+            }
+            let policy_path = paths.config_file(Policy::FILE);
+            let live_policy = match std::fs::read(&policy_path) {
+                Ok(bytes) => legion_core::config::parse::<Policy>(&policy_path, &bytes)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
+                Err(error) => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("{} cannot be read: {error}.", policy_path.display()),
+                    ));
+                }
+            };
+            if live_policy
+                .principals
+                .keys()
+                .any(|known| known.as_str() == principal_for_write)
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!("policy.toml already defines principal {principal_for_write}."),
+                )
+                .with_hint(
+                    "Choose a different device name, or remove the existing device/principal first.",
+                ));
+            }
+            if let Some(slug) = invite_device_name.as_deref()
+                && let Some(existing_inv) = state.invites.values().find(|inv| {
+                    inv.principal == principal_for_write
+                        || inv.device_name.as_deref() == Some(slug)
+                })
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "A pending pairing invite ({}) already exists for device name {slug}.",
+                        existing_inv.id
+                    ),
+                )
+                .with_hint(format!(
+                    "Use or revoke the existing invite with `legion device.remove id={}`, or choose a different device name.",
+                    existing_inv.id
+                )));
+            }
             let devices_file = match load_devices_raw(&paths)? {
                 Some(file) => file,
-                None => {
-                    let auth_keys = self::authkeys::read_auth_keys(&write_path)?;
-                    let state = load_state(&paths).unwrap_or_default();
-                    adopt_legacy_devices_from_auth_keys(
-                        &paths,
-                        &node_name_for_write,
-                        &auth_keys,
-                        &target,
-                        caller_account.as_deref(),
-                        &state,
-                        &policy_for_adopt,
-                    )
-                }
+                None => adopt_legacy_devices_from_auth_keys(
+                    &paths,
+                    &node_name_for_write,
+                    auth_keys,
+                    &target,
+                    caller_account.as_deref(),
+                    state,
+                    &live_policy,
+                ),
             };
             if let Some(slug) = invite_device_name.as_deref()
                 && devices_file
@@ -506,10 +548,10 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                     "Choose a different device name, or remove the existing device first with `legion device.remove`.",
                 ));
             }
-            upsert_policy_principal_locked(&paths, &principal_for_write, &role_for_write)?;
-        }
+            Ok(())
+        };
 
-        commit_invite_and_state(
+        commit_invite_and_state_checked(
             &paths,
             &target,
             &write_path,
@@ -517,6 +559,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
             &invite_line,
             record,
             now,
+            precheck,
             save_state,
         )
     })
@@ -1860,6 +1903,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     Ok(removed)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn commit_invite_and_state(
     paths: &legion_core::Paths,
@@ -1871,9 +1915,35 @@ fn commit_invite_and_state(
     now: Timestamp,
     save_fn: impl FnOnce(&legion_core::Paths, &store::DevicesState) -> Result<(), ErrorBody>,
 ) -> Result<(), ErrorBody> {
+    commit_invite_and_state_checked(
+        paths,
+        target,
+        write_path,
+        invite_id,
+        invite_line,
+        record,
+        now,
+        |_, _| Ok(()),
+        save_fn,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_invite_and_state_checked(
+    paths: &legion_core::Paths,
+    target: &AuthKeysTarget,
+    write_path: &std::path::Path,
+    invite_id: &str,
+    invite_line: &str,
+    record: InviteRecord,
+    now: Timestamp,
+    precheck: impl Fn(&self::authkeys::AuthKeysFile, &store::DevicesState) -> Result<(), ErrorBody>,
+    save_fn: impl FnOnce(&legion_core::Paths, &store::DevicesState) -> Result<(), ErrorBody>,
+) -> Result<(), ErrorBody> {
     let mut state = edit_auth_keys_with_retry(target, write_path, |mut auth_keys| {
         let mut state = load_state(paths)?;
         sweep(&mut auth_keys, &mut state, now);
+        precheck(&auth_keys, &state)?;
         auth_keys.append_line(invite_line);
         Ok((Some(auth_keys), state))
     })?;
@@ -2928,6 +2998,7 @@ role = "owner"
                 id: id.clone(),
                 principal: "phone".to_owned(),
                 role: None,
+                create_principal: false,
                 device_name: None,
                 created_by: None,
                 created: format_rfc3339(now),
@@ -3045,7 +3116,7 @@ role = "owner"
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Denied);
 
-        // Role + name creates `device:my-phone` in policy.toml and enrols under it.
+        // Role + name reserves `device:my-phone` without touching policy.toml until enrolment.
         let inv = h
             .call(
                 "device.invite",
@@ -3055,8 +3126,13 @@ role = "owner"
             .unwrap();
         assert_eq!(inv["principal"], json!("device:my-phone"));
         assert_eq!(inv["role"], json!("observer"));
-        let policy_after = h.node.config().get::<Policy>().unwrap();
-        assert_eq!(policy_after.role_of("device:my-phone").0, "observer");
+        let policy_before_enrol = h.node.config().get::<Policy>().unwrap();
+        assert!(
+            !policy_before_enrol
+                .principals
+                .keys()
+                .any(|p| p.as_str() == "device:my-phone")
+        );
 
         let id = inv["id"].as_str().unwrap();
         let dev_key = generate_ephemeral_ed25519().unwrap();
@@ -3076,6 +3152,8 @@ role = "owner"
                 fleet: BTreeMap::new(),
             }
         );
+        let policy_after = h.node.config().get::<Policy>().unwrap();
+        assert_eq!(policy_after.role_of("device:my-phone").0, "observer");
 
         // Non-owner admin cannot change a device's role via `device.set`.
         let err = h
@@ -3131,6 +3209,134 @@ role = "owner"
                 .principals
                 .keys()
                 .any(|p| p.as_str() == "device:my-phone")
+        );
+    }
+
+    #[tokio::test]
+    async fn role_invite_does_not_write_policy_refuses_duplicate_pending_and_checks_policy_at_enrol()
+    {
+        let h = Harness::new();
+
+        // 1. Invite `pixel` as `observer` — policy.toml must NOT be touched at invite time.
+        let inv1 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "pixel", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv1_id = inv1["id"].as_str().unwrap().to_owned();
+        let policy_before = h.node.config().get::<Policy>().unwrap();
+        assert!(
+            !policy_before
+                .principals
+                .keys()
+                .any(|p| p.as_str() == "device:pixel"),
+            "invite must not create device:pixel in policy.toml before enrolment"
+        );
+
+        // 2. Second invite for the same name (`pixel`) as `owner` must be refused.
+        let dup_err = h
+            .call(
+                "device.invite",
+                json!({
+                    "role": "owner",
+                    "name": "pixel",
+                    "allow_owner": true,
+                    "host": "tower.example",
+                    "user": "me"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(dup_err.code, ErrorCode::Conflict, "{dup_err:?}");
+
+        // 3. Enrolling the first invite creates `device:pixel` with `observer` (never `owner`).
+        let key1 = generate_ephemeral_ed25519().unwrap();
+        let req1 = format!(
+            "{{\"enrol\":1,\"id\":\"{inv1_id}\",\"public_key\":\"{}\",\"name\":\"ignored\"}}\n",
+            key1.public_key
+        );
+        let reply1 = run_enrol(&h.node, &inv1_id, req1.as_bytes()).await;
+        assert_eq!(
+            reply1,
+            EnrolReply::Ok {
+                ok: true,
+                node: "tower".to_owned(),
+                principal: "device:pixel".to_owned(),
+                role: "observer".to_owned(),
+                device: "pixel".to_owned(),
+                fleet: BTreeMap::new(),
+            }
+        );
+        assert_eq!(
+            h.node.config().get::<Policy>().unwrap().role_of("device:pixel").0,
+            "observer"
+        );
+
+        // 4. An unused/revoked invite leaves nothing behind in policy.toml.
+        let inv_unused = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "unused", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let unused_id = inv_unused["id"].as_str().unwrap();
+        h.call("device.remove", json!({"id": unused_id}))
+            .await
+            .unwrap();
+        assert!(
+            !h.node
+                .config()
+                .get::<Policy>()
+                .unwrap()
+                .principals
+                .keys()
+                .any(|p| p.as_str() == "device:unused"),
+            "unused invite must leave nothing behind in policy.toml"
+        );
+
+        // 5. Invite for a name whose `device:*` principal already exists in policy.toml is refused.
+        let policy_path = h.node.paths().config_file("policy.toml");
+        let mut policy_text = std::fs::read_to_string(&policy_path).unwrap();
+        policy_text.push_str("\n[principals.\"device:taken\"]\nrole = \"observer\"\n");
+        std::fs::write(&policy_path, &policy_text).unwrap();
+        let taken_err = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "taken", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(taken_err.code, ErrorCode::Conflict, "{taken_err:?}");
+
+        // 6. If policy.toml disagrees at enrolment time, enrolment refuses and leaves policy.toml untouched.
+        let inv_race = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "raced", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let race_id = inv_race["id"].as_str().unwrap();
+        let mut policy_text = std::fs::read_to_string(&policy_path).unwrap();
+        policy_text.push_str("\n[principals.\"device:raced\"]\nrole = \"owner\"\n");
+        std::fs::write(&policy_path, &policy_text).unwrap();
+
+        let key_race = generate_ephemeral_ed25519().unwrap();
+        let req_race = format!(
+            "{{\"enrol\":1,\"id\":\"{race_id}\",\"public_key\":\"{}\",\"name\":\"ignored\"}}\n",
+            key_race.public_key
+        );
+        let reply_race = run_enrol(&h.node, race_id, req_race.as_bytes()).await;
+        assert!(
+            !reply_race.is_ok(),
+            "enrol must fail when policy.toml already disagrees: {reply_race:?}"
+        );
+        assert_eq!(
+            h.node.config().get::<Policy>().unwrap().role_of("device:raced").0,
+            "owner"
         );
     }
 }
