@@ -36,8 +36,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, HeaderValue, ORIGIN, VARY,
-    WWW_AUTHENTICATE,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, CONTENT_TYPE, HeaderValue,
+    ORIGIN, VARY, WWW_AUTHENTICATE,
 };
 use axum::http::{Method, Response, StatusCode};
 use axum::middleware::{self, Next};
@@ -88,6 +88,10 @@ const REFUSAL_DELAY: Duration = Duration::from_millis(200);
 /// How long shutting down waits for connections to close and calls to be recorded: the time a
 /// cancelled call has to stop, and a little more.
 const DRAIN: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(2));
+
+/// How often an event stream with nothing to say says so, so that a client that went away is
+/// noticed, and its call cancelled, within this long.
+pub(crate) const KEEP_ALIVE: Duration = Duration::from_secs(3);
 
 /// How often sessions are checked for a token that went and for idleness.
 const SWEEP: Duration = Duration::from_secs(10);
@@ -186,7 +190,9 @@ impl HttpDoor {
                 .disable_allowed_hosts()
                 .disable_allowed_origins()
                 .with_cancellation_token(link.shutdown.child_token())
-                .with_max_request_body_bytes(MAX_BODY);
+                .with_max_request_body_bytes(MAX_BODY)
+                // Something is written this often, so a client that vanished is noticed.
+                .with_sse_keep_alive(Some(KEEP_ALIVE));
             let mut sessions = LocalSessionManager::default();
             sessions.session_config.keep_alive = Some(sessions::IDLE);
             let sessions = Arc::new(sessions);
@@ -532,7 +538,15 @@ async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Respo
         &shared.mcp_full
     };
     let response = service.handle(request).await;
-    if let (Some(id), Some(request_id)) = (&session, request_id) {
+    // Only a successful event stream answers the request; any other reply (a 406 or a 400 for a
+    // request that reused an id) is not the running call's, and leaving it cancels nothing.
+    let streaming = response.status() == StatusCode::OK
+        && response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|kind| kind.to_str().ok())
+            .is_some_and(|kind| kind.starts_with("text/event-stream"));
+    if let (Some(id), Some(request_id), true) = (&session, request_id, streaming) {
         // A client that goes away while a request in its session is answered has cancelled it.
         let manager = Arc::clone(&shared.managers[usize::from(compact)]);
         let id: SessionId = id.as_str().into();

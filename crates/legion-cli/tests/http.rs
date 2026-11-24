@@ -100,6 +100,10 @@ fn main() -> ExitCode {
             a_burst_of_sessions_stays_within_the_cap,
         ),
         (
+            "only_a_dropped_stream_cancels_its_call",
+            only_a_dropped_stream_cancels_its_call,
+        ),
+        (
             "an_mcp_session_belongs_to_its_token",
             an_mcp_session_belongs_to_its_token,
         ),
@@ -482,21 +486,32 @@ impl Events {
         }
     }
 
-    /// The next event's name and data, or `None` once the stream has ended.
+    /// The next event's name and data, or `None` once the stream has ended. Comments, which keep
+    /// a quiet stream alive, are skipped.
     fn next(&mut self) -> Option<(String, Value)> {
         loop {
-            if let Some(end) = self.buffered.find("\n\n") {
-                let event: String = self.buffered.drain(..end + 2).collect();
-                let mut name = String::new();
-                let mut data = String::new();
-                for line in event.lines() {
-                    if let Some(value) = line.strip_prefix("event:") {
-                        name = value.trim().to_owned();
-                    } else if let Some(value) = line.strip_prefix("data:") {
-                        data.push_str(value.trim());
-                    }
+            let event = self.next_block()?;
+            if event.lines().all(|line| line.starts_with(':')) {
+                continue;
+            }
+            let mut name = String::new();
+            let mut data = String::new();
+            for line in event.lines() {
+                if let Some(value) = line.strip_prefix("event:") {
+                    name = value.trim().to_owned();
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data.push_str(value.trim());
                 }
-                return Some((name, serde_json::from_str(&data).unwrap()));
+            }
+            return Some((name, serde_json::from_str(&data).unwrap()));
+        }
+    }
+
+    /// The next block of the stream as it was sent, comments included.
+    fn next_block(&mut self) -> Option<String> {
+        loop {
+            if let Some(end) = self.buffered.find("\n\n") {
+                return Some(self.buffered.drain(..end + 2).collect());
             }
             let mut size = String::new();
             if self.reader.read_line(&mut size).ok()? == 0 {
@@ -1875,4 +1890,87 @@ fn a_burst_of_sessions_stays_within_the_cap() {
         in_session(&server, &fixture.admin, &session, "POST").status,
         404
     );
+}
+
+fn only_a_dropped_stream_cancels_its_call() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    let session = open_session(&server, &fixture.phone);
+    let mcp = Mcp {
+        server: &server,
+        token: &fixture.phone,
+        path: "/mcp",
+        session: Some(session),
+        inline: false,
+        next_id: 0,
+    };
+    let headers = mcp.headers("tools/call", Some("test_sleep"));
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"_meta": {"progressToken": "p"}, "name": "test_sleep", "arguments": {"seconds": 60}}
+    });
+    let stream = send(
+        server.port,
+        "POST",
+        "/mcp",
+        &headers,
+        call.to_string().as_bytes(),
+    );
+    let mut reader = BufReader::new(stream);
+    assert_eq!(read_head(&mut reader).0, 200);
+    let mut progress = || loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "the call's stream ended"
+        );
+        assert!(!line.contains("\"result\""), "the call ended: {line}");
+        if line.contains("notifications/progress") {
+            return;
+        }
+    };
+    progress();
+
+    // A request that reuses the running call's id, refused for asking for JSON alone.
+    let mut refused = headers.clone();
+    refused.retain(|(name, _)| *name != "Accept");
+    refused.push(("Accept", "application/json".to_owned()));
+    let reply = http(
+        server.port,
+        "POST",
+        "/mcp",
+        &refused,
+        call.to_string().as_bytes(),
+    );
+    assert_eq!(reply.status, 406, "{}", reply.text());
+    // The call goes on: two seconds more of progress, and no result.
+    for _ in 0..40 {
+        progress();
+    }
+    drop(reader);
+    let line = audited(&fixture.home, |line| line["tool"] == json!("test.sleep"));
+    assert_eq!(line["outcome"], json!("cancelled"));
+
+    // The JSON API's stream says something every few seconds while its call is quiet, so a
+    // client that vanished is noticed.
+    let marker = fixture.home.home().join("quiet-started");
+    let argv = [
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        HELPER_FLAG.to_owned(),
+        "wait".to_owned(),
+        marker.to_string_lossy().into_owned(),
+    ];
+    let mut events = Events::open(
+        server.port,
+        &fixture.admin,
+        &json!({"tool": "exec.run", "args": {"argv": argv}}),
+    );
+    assert_eq!(events.status, 200);
+    let block = events.next_block().expect("the quiet stream said nothing");
+    assert!(block.starts_with(':'), "{block}");
 }

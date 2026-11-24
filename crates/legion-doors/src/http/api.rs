@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::DropGuard;
 
-use super::{Shared, read_body, reply};
+use super::{KEEP_ALIVE, Shared, read_body, reply};
 use crate::mcp::catalog;
 use crate::{Authenticated, too_many_calls};
 
@@ -154,9 +154,15 @@ pub(crate) async fn call(State(shared): State<Arc<Shared>>, request: Request) ->
     let (frames, stream) = mpsc::channel::<Bytes>(QUEUE);
     shared.calls.spawn(async move {
         tokio::pin!(running);
+        let mut quiet = tokio::time::interval(KEEP_ALIVE);
+        quiet.reset();
         let outcome = loop {
             tokio::select! {
                 outcome = &mut running => break outcome.unwrap_or_else(|error| stopped(&error)),
+                _ = quiet.tick() => {
+                    // A comment, which clients skip: writing it is how a vanished client is found.
+                    let _ = frames.send(Bytes::from_static(b": keep-alive\n\n")).await;
+                }
                 Some(event) = queue.recv() => {
                     // A client that has gone away has nobody to tell; its stream's guard has
                     // cancelled the call, which ends this loop.

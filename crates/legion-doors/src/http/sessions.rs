@@ -252,7 +252,9 @@ impl<B: Body + Unpin> Body for Abandonable<B> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<B::Data>, B::Error>>> {
         let polled = Pin::new(&mut self.inner).poll_frame(cx);
-        if matches!(polled, Poll::Ready(None)) {
+        // A server stops polling a body that says it has ended, and drops it: that is not
+        // abandoning it.
+        if matches!(polled, Poll::Ready(None)) || self.inner.is_end_stream() {
             self.on_abandon = None;
         }
         polled
