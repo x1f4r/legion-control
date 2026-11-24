@@ -36,8 +36,8 @@ use crate::config::{FleetFile, validate_machine_name};
 use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
-    self, DeleteDone, GetReady, Host, ManifestDone, PackReady, PutDone, PutReady, StatReply,
-    UnpackDone, UnpackReady,
+    self, DeleteDone, GetReady, Host, ManifestDone, PackReady, Planned, PutDone, PutReady,
+    StatReply, UnpackDone, UnpackReady,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -778,7 +778,8 @@ impl Transfer<'_> {
                     Round {
                         names,
                         budget,
-                        expected: args.checksum.then_some(&listed),
+                        listed: &listed,
+                        checksum: args.checksum,
                     },
                     &mut meter,
                     &mut skipped,
@@ -831,7 +832,8 @@ impl Transfer<'_> {
         let Round {
             names,
             budget,
-            expected,
+            listed,
+            checksum,
         } = round;
         let mut source = self
             .open(
@@ -846,11 +848,26 @@ impl Transfer<'_> {
                 return Err(error);
             }
         };
+        // What the destination agrees to take: each name as the source listed it, less what the
+        // source has just said it leaves out.
+        let left_out: HashSet<&str> = ready.skipped.iter().map(|e| e.path.as_str()).collect();
+        let entries: Vec<Planned> = names
+            .iter()
+            .filter(|name| !left_out.contains(name.as_str()))
+            .filter_map(|name| listed.get(name.as_str()))
+            .map(|entry| Planned {
+                path: entry.path.clone(),
+                kind: entry.kind,
+                size: (entry.kind == EntryKind::File).then_some(entry.size),
+                hash: if checksum { entry.hash } else { None },
+                target: entry.link_target.clone(),
+            })
+            .collect();
         skipped.extend(on(&from.machine, ready.skipped));
         let mut dest = match self
             .open(
                 to,
-                json!({"op": "unpack", "root": to.path, "names": names, "hash": expected.is_some()}),
+                json!({"op": "unpack", "root": to.path, "entries": entries}),
             )
             .await
         {
@@ -866,7 +883,7 @@ impl Transfer<'_> {
             return Err(error);
         }
         if let Err(broken) = relay(&mut source, &mut dest, Amount::AtMost(budget), meter).await {
-            return Err(broken.explain(source, dest).await);
+            return Err(blame(broken.explain(source, dest).await, from));
         }
         // The archive ended; it is whole only if the source says it finished.
         if let Err(error) = source.finish().await {
@@ -876,56 +893,7 @@ impl Transfer<'_> {
         dest.end_input().await;
         let done = dest.first::<UnpackDone>().await;
         dest.close().await;
-        let done = done?;
-        if !done.unplanned.is_empty() {
-            let shown: Vec<&String> = done.unplanned.iter().take(MOST_LISTED).collect();
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!(
-                    "{} sent {} entries that were not planned for this transfer, and {} refused them: {}.",
-                    from.machine,
-                    done.unplanned.len(),
-                    to.machine,
-                    shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
-                ),
-            )
-            .with_hint(format!(
-                "legion on {} is not behaving as it should; what was planned arrived, and nothing else was written.",
-                from.machine
-            ))
-            .with_details(json!({"unplanned": shown, "files_sent": done.files}))
-            .with_machine(from.machine.clone()));
-        }
-        if let Some(expected) = expected {
-            // What arrived must be what the source listed: a file edited in place while it was
-            // packed arrives whole and well formed, and only its hash tells.
-            let mismatched: Vec<&String> = done
-                .hashes
-                .iter()
-                .filter(|(path, arrived)| {
-                    let listed = expected.get(path.as_str()).and_then(|entry| entry.hash);
-                    listed.is_none() || **arrived != listed
-                })
-                .map(|(path, _)| path)
-                .collect();
-            if !mismatched.is_empty() {
-                let shown: Vec<&String> = mismatched.iter().copied().take(MOST_LISTED).collect();
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!(
-                        "{} files that arrived on {} are not what {} listed: {}.",
-                        mismatched.len(),
-                        to.machine,
-                        from.machine,
-                        shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
-                    ),
-                )
-                .with_hint("They probably changed while they were sent; run the transfer again once they stop changing.")
-                .with_details(json!({"mismatched": shown}))
-                .with_machine(from.machine.clone()));
-            }
-        }
-        Ok(done)
+        done.map_err(|error| blame(error, from))
     }
 
     async fn manifest(&self, end: &End, args: &TransferArgs) -> Result<Manifest, ErrorBody> {
@@ -1060,12 +1028,39 @@ fn left_in_place(error: ErrorBody, extras: usize, machine: &str) -> ErrorBody {
     error
 }
 
-/// One archive's worth of a tree: its names, the most bytes the archive may take, and, with
-/// `checksum`, what the source listed, to check what arrives against.
+/// One archive's worth of a tree: its names, the most bytes the archive may take, what the source
+/// listed for each, and whether their hashes are checked.
 struct Round<'a> {
     names: &'a [String],
     budget: u64,
-    expected: Option<&'a HashMap<&'a str, &'a Entry>>,
+    listed: &'a HashMap<&'a str, &'a Entry>,
+    checksum: bool,
+}
+
+/// A destination that refused an archive for not being what was planned says which entry and
+/// why; the archive is the source's, so the error names the source.
+fn blame(error: ErrorBody, from: &End) -> ErrorBody {
+    let Some(violation) = error
+        .details
+        .as_ref()
+        .and_then(|d| d.get("violation"))
+        .cloned()
+    else {
+        return error;
+    };
+    ErrorBody::new(
+        ErrorCode::Failed,
+        format!(
+            "{} sent an archive that is not what was planned: {}",
+            from.machine, error.message
+        ),
+    )
+    .with_hint(format!(
+        "Nothing was renamed over what the destination had for that entry. If {} changed while it was sent, run the transfer again; if not, legion there is not behaving as it should.",
+        from.machine
+    ))
+    .with_details(json!({"violation": violation, "refused_by": error.machine}))
+    .with_machine(from.machine.clone())
 }
 
 fn changed(from: &End) -> ErrorBody {
