@@ -439,6 +439,7 @@ mod tests {
             fired: None,
             force: false,
             config_dir: None,
+            readback: None,
         };
         write_pending(dir, &record).unwrap();
         record

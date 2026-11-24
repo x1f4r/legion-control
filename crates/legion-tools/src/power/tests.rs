@@ -300,7 +300,7 @@ async fn a_restart_that_cannot_be_handed_over_says_the_firmware_stays_armed() {
     assert_eq!(error.code, ErrorCode::Failed);
     assert!(
         error.message.ends_with(
-            "The firmware stays set to start linux on the next boot, whatever causes it."
+            "The firmware stays set to start linux on the next boot, whatever causes it: [boot.linux] in node.toml gives no disarm command to clear it with."
         ),
         "{}",
         error.message
@@ -569,6 +569,7 @@ async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
         fired: None,
         force: false,
         config_dir: None,
+        readback: None,
     };
     pending::write_pending(&dir, &record).unwrap();
     let error = fixture.call("power.shutdown", json!({})).await.unwrap_err();
@@ -783,6 +784,8 @@ fn efi_armed() -> RecordingActuator {
             0,
             &format!("BootNext: 0000\n{EFI_LISTING}"),
         ))
+        // Read once more after a disarm: cleared.
+        .reply(Reply::new(&["efibootmgr"], 0, EFI_LISTING))
 }
 
 #[tokio::test]
@@ -810,14 +813,18 @@ async fn a_restart_into_another_system_tells_its_runner_how_to_disarm() {
         .unwrap_err();
     assert!(
         error.message.ends_with(
-            "The firmware's setting to start windows next was cleared again with `sudo -n efibootmgr --delete-bootnext`."
+            "The firmware's setting to start windows next was cleared again with `sudo -n efibootmgr --delete-bootnext`, and reads back cleared."
         ),
         "{}",
         error.message
     );
+    let runs = failing.fake.runs();
     assert_eq!(
-        failing.fake.runs().last(),
-        Some(&strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]))
+        runs[runs.len() - 2..],
+        [
+            strings(&["sudo", "-n", "efibootmgr", "--delete-bootnext"]),
+            strings(&["efibootmgr"])
+        ]
     );
 }
 
@@ -884,6 +891,7 @@ fn self_timed_restart(fixture: &Fixture, disarm: Option<Vec<String>>) -> Pending
         fired: None,
         force: false,
         config_dir: None,
+        readback: None,
     };
     pending::write_pending(&pending::dir(fixture.node.paths()), &record).unwrap();
     record
@@ -1068,6 +1076,7 @@ async fn a_command_the_runner_has_started_is_too_late_to_call_off() {
         fired: Some(pending::now()),
         force: false,
         config_dir: None,
+        readback: None,
     };
     pending::write_pending(&dir, &record).unwrap();
     let answer = fixture.call("power.cancel", json!({})).await.unwrap();
@@ -1157,4 +1166,52 @@ async fn sudo_that_lists_only_the_command_is_asked_for_its_rules() {
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
     assert!(password.fake.schedules().is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_a_restart_into_a_custom_target_clears_it_only_with_its_disarm() {
+    if expected(Action::Restart, 600, true).1 != Timing::Delayed {
+        return;
+    }
+    // No disarm command: the reply says the next boot still goes there.
+    let plain = Fixture::with_node_toml(
+        RecordingActuator::new(),
+        "busy = \"none\"\n[power]\nsudo = true\n[boot.rescue]\narm = [\"arm-rescue\"]\nverify = [\"verify-rescue\"]\n",
+    );
+    plain
+        .call("power.restart", json!({"into": "rescue", "delay_s": 600}))
+        .await
+        .unwrap();
+    let answer = plain.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(answer["cancelled"], json!(true), "{answer}");
+    assert!(
+        answer["detail"].as_str().unwrap().ends_with(
+            "The firmware stays set to start rescue on the next boot, whatever causes it: [boot.rescue] in node.toml gives no disarm command to clear it with."
+        ),
+        "{answer}"
+    );
+
+    // With one: it runs, and verify must stop saying the arming is there.
+    let with_disarm = Fixture::with_node_toml(
+        RecordingActuator::new()
+            .reply(Reply::new(&["verify-rescue"], 0, ""))
+            .reply(Reply::new(&["verify-rescue"], 1, "")),
+        "busy = \"none\"\n[power]\nsudo = true\n[boot.rescue]\narm = [\"arm-rescue\"]\nverify = [\"verify-rescue\"]\ndisarm = [\"disarm-rescue\"]\n",
+    );
+    with_disarm
+        .call("power.restart", json!({"into": "rescue", "delay_s": 600}))
+        .await
+        .unwrap();
+    let answer = with_disarm.call("power.cancel", json!({})).await.unwrap();
+    assert!(
+        answer["detail"].as_str().unwrap().ends_with(
+            "The firmware's setting to start rescue next was cleared again with `disarm-rescue`, and reads back cleared."
+        ),
+        "{answer}"
+    );
+    let runs = with_disarm.fake.runs();
+    assert_eq!(
+        runs[runs.len() - 2..],
+        [strings(&["disarm-rescue"]), strings(&["verify-rescue"])]
+    );
 }

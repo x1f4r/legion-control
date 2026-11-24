@@ -531,8 +531,12 @@ detail     Called off the restart handed over at 2026-11-24T10:00:00Z, which was
 
 On Linux and macOS the delayed runner that would have run the command is stopped, by the identity
 recorded when it started; on Windows, which times a restart or shutdown itself, Windows calls it
-off with `shutdown /a`, and its own answer decides what `power.cancel` reports. A restart into
-another system also has the firmware's one-time boot entry cleared again. Afterwards `power.status`
+off with `shutdown /a`, and its own answer decides what `power.cancel` reports. For a restart into
+another system, the one-time boot entry it armed is cleared again and read back: for an `efi_label`
+target with `efibootmgr --delete-bootnext` or `bcdedit /deletevalue`, for a target with `arm` and
+`verify` commands only when it also gives a `disarm` command (whose clearing `verify` must then stop
+confirming). Without one, the reply says the firmware stays set to start that system on the next
+boot, whatever causes it; the same happens when a restart fails after arming. Afterwards `power.status`
 shows no `pending` action and `last` with `fate: cancelled` and who cancelled it, and the next power
 call can go ahead.
 
@@ -547,8 +551,8 @@ calls off.
 
 `power.restart into=windows` resolves the firmware entry by label on every call (never cached),
 arms one-time boot (`efibootmgr --bootnext` on Linux, `bcdedit` on Windows, or your custom `arm`
-and `verify` commands), reads the setting back, and schedules the reboot only if the readback
-matches:
+and `verify` commands, with an optional `disarm` that clears it again), reads the setting back, and
+schedules the reboot only if the readback matches:
 
 ```sh
 legion power.restart into=windows dry_run=true

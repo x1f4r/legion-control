@@ -104,6 +104,10 @@ pub struct Pending {
     /// when the action is due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<PathBuf>,
+    /// For a restart into another system: how the firmware's next boot is read, so that clearing
+    /// it again can be read back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback: Option<super::boot::Readback>,
 }
 
 /// How a handed-over action ended, as its runner wrote it to `last.json`.
@@ -214,6 +218,7 @@ pub fn record(
         fired: None,
         force: false,
         config_dir: None,
+        readback: None,
     }
 }
 
@@ -687,6 +692,7 @@ mod tests {
             fired: None,
             force: false,
             config_dir: None,
+            readback: None,
         }
     }
 

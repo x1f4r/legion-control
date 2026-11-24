@@ -566,6 +566,7 @@ async fn act(
     );
     record.force = request.force;
     record.config_dir = Some(ctx.paths().config_dir().to_path_buf());
+    record.readback = arming.as_ref().map(|arming| arming.readback.clone());
     let handed = match plan.timing {
         Timing::Delayed => hand_over(actuator, &dir, &mut record).await,
         Timing::SelfTimed => match actuator.run(&plan.argv, COMMAND_TIMEOUT, cancel).await {
@@ -582,7 +583,15 @@ async fn act(
             (None, _) => return Err(error),
             // Armed but not restarted: whatever restarts the machine next would land there.
             (Some(name), disarm) => {
-                let after = disarm_after_failure(actuator, cancel, disarm.as_deref(), name).await;
+                let after = disarm_after_failure(
+                    actuator,
+                    cancel,
+                    (platform, sudo),
+                    disarm.as_deref(),
+                    record.readback.as_ref(),
+                    name,
+                )
+                .await;
                 return Err(ErrorBody {
                     message: format!("{} {after}", error.message),
                     ..error
@@ -595,23 +604,57 @@ async fn act(
     Ok(result)
 }
 
+/// What a restart into `name` armed and did not use leaves behind: said the same way when its
+/// hand-over fails and when it is called off.
+fn stays_armed(name: &str) -> String {
+    format!(
+        "The firmware stays set to start {name} on the next boot, whatever causes it: [boot.{name}] in node.toml gives no disarm command to clear it with."
+    )
+}
+
+/// After a disarm command succeeded, whether the next boot reads back cleared, in a sentence.
+async fn cleared(
+    actuator: &Arc<dyn Actuator>,
+    cancel: &legion_core::CancellationToken,
+    (platform, sudo): (Platform, bool),
+    disarm: &[String],
+    readback: Option<&boot::Readback>,
+    name: &str,
+) -> String {
+    let done = format!(
+        "The firmware's setting to start {name} next was cleared again with `{}`",
+        disarm.join(" ")
+    );
+    match readback {
+        None => format!("{done}."),
+        Some(readback) => {
+            match boot::read_back_cleared(actuator.as_ref(), cancel, platform, sudo, readback).await
+            {
+                Ok(()) => format!("{done}, and reads back cleared."),
+                Err(found) => format!(
+                    "{done}, but it does not read back cleared ({found}), so the next restart, whatever causes it, may start {name}."
+                ),
+            }
+        }
+    }
+}
+
 /// Clears an arming whose restart could not be handed over, saying how that went.
 async fn disarm_after_failure(
     actuator: &Arc<dyn Actuator>,
     cancel: &legion_core::CancellationToken,
+    platform: (Platform, bool),
     disarm: Option<&[String]>,
+    readback: Option<&boot::Readback>,
     name: &str,
 ) -> String {
     let stays =
         format!("The firmware stays set to start {name} on the next boot, whatever causes it.");
     let Some(disarm) = disarm else {
-        return stays;
+        return stays_armed(name);
     };
     match actuator.run(disarm, COMMAND_TIMEOUT, cancel).await {
-        Ok(ran) if ran.ok() => format!(
-            "The firmware's setting to start {name} next was cleared again with `{}`.",
-            disarm.join(" ")
-        ),
+        Ok(ran) if ran.ok() => cleared(actuator, cancel, platform, disarm, readback, name).await,
         Ok(ran) => format!(
             "Clearing it with `{}` failed ({}), so: {stays}",
             disarm.join(" "),
@@ -892,10 +935,21 @@ async fn disarm_after_cancel(
     ctx: &Ctx,
     record: &Pending,
 ) -> (Option<pending::Disarmed>, String) {
-    let Some(disarm) = &record.disarm else {
+    let Some(into) = record.into.as_deref() else {
         return (None, String::new());
     };
-    let into = record.into.as_deref().unwrap_or("the other system");
+    let Some(disarm) = &record.disarm else {
+        return (None, format!(" {}", stays_armed(into)));
+    };
+    let sudo = ctx
+        .config()
+        .get::<NodeFile>()
+        .is_ok_and(|file| file.power.sudo);
+    let platform = match Platform::of(ctx.os()) {
+        Ok(platform) => platform,
+        Err(error) => return (None, format!(" {}", error.message)),
+    };
+    let sudo = sudo && platform.has_sudo();
     match actuator
         .run(disarm, COMMAND_TIMEOUT, ctx.cancel_token())
         .await
@@ -903,8 +957,16 @@ async fn disarm_after_cancel(
         Ok(ran) => {
             let note = if ran.ok() {
                 format!(
-                    " The firmware's setting to start {into} next was cleared again with `{}`.",
-                    disarm.join(" ")
+                    " {}",
+                    cleared(
+                        actuator,
+                        ctx.cancel_token(),
+                        (platform, sudo),
+                        disarm,
+                        record.readback.as_ref(),
+                        into
+                    )
+                    .await
                 )
             } else {
                 format!(

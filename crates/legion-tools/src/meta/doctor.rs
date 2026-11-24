@@ -587,6 +587,7 @@ mod tests {
             fired: None,
             force: false,
             config_dir: None,
+            readback: None,
         };
         crate::power::pending::write_pending(&power, &record).unwrap();
         let pending = crate::power::pending::pending(&paths, Some("boot-1")).unwrap();
