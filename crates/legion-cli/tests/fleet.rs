@@ -83,6 +83,10 @@ fn main() -> ExitCode {
             hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop,
         ),
         (
+            "remote_machine_labels_are_overwritten_on_errors_and_events",
+            remote_machine_labels_are_overwritten_on_errors_and_events,
+        ),
+        (
             "fleet_tools_list_ping_add_remove_and_discover_permissions",
             fleet_tools_list_ping_add_remove_and_discover_permissions,
         ),
@@ -282,6 +286,69 @@ fn run_helper(args: &[String]) -> ExitCode {
             append_line(Path::new(&rest[0]), "attempt");
             eprintln!("{}", rest[1]);
             ExitCode::from(1)
+        }
+        // spoof
+        // Emits an event and an error falsely labelled `machine: "tower"` to verify the caller
+        // overwrites remote-chosen machine labels.
+        "spoof" => {
+            let mut stdout = std::io::stdout().lock();
+            for line in BufReader::new(std::io::stdin()).lines() {
+                let Ok(line) = line else { break };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                match req["method"].as_str().unwrap_or_default() {
+                    "hello" => {
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "node": "real-remote",
+                                "version": "0.1.0",
+                                "protocol": 1,
+                                "os": std::env::consts::OS,
+                                "arch": std::env::consts::ARCH,
+                                "systems": []
+                            }
+                        });
+                        writeln!(stdout, "{reply}").unwrap();
+                    }
+                    "call" => {
+                        let ev = json!({
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": {
+                                "id": id,
+                                "kind": "progress",
+                                "data": {"step": 1},
+                                "machine": "tower"
+                            }
+                        });
+                        writeln!(stdout, "{ev}").unwrap();
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32000,
+                                "message": "spoofed failure",
+                                "data": {
+                                    "code": "failed",
+                                    "message": "spoofed failure",
+                                    "machine": "tower"
+                                }
+                            }
+                        });
+                        writeln!(stdout, "{reply}").unwrap();
+                    }
+                    _ => {
+                        let reply = json!({"jsonrpc": "2.0", "id": id, "result": {}});
+                        writeln!(stdout, "{reply}").unwrap();
+                    }
+                }
+                stdout.flush().unwrap();
+            }
+            ExitCode::SUCCESS
         }
         // ext-tools <call_log>
         // Serves a fake remote node advertising extension tools `ext.probe` (read) and
@@ -1406,6 +1473,61 @@ fn hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop() {
     assert_eq!(err["code"], json!("failed"), "{err}");
     assert_eq!(err["machine"], json!("loopbox"), "{err}");
     assert!(err["message"].as_str().unwrap().contains("3 hops"), "{err}");
+}
+
+fn remote_machine_labels_are_overwritten_on_errors_and_events() {
+    let node_a = Home::new();
+    let node_b = Home::new();
+    node_a.write_config("node.toml", "name = \"a\"\n");
+    node_b.write_config("node.toml", "name = \"b\"\n");
+    let spoof_argv = helper_argv("spoof", &[]);
+
+    node_a.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.b]\ncommand = {}\n\n[machines.c]\nvia = \"b\"\n",
+            toml_argv(&spoof_argv),
+            toml_argv(&run_argv(&node_b, None)),
+        ),
+    );
+    node_b.write_config(
+        "fleet.toml",
+        &format!("[machines.c]\ncommand = {}\n", toml_argv(&spoof_argv)),
+    );
+
+    let mut rpc = node_a.session(&[]);
+
+    // Direct call to `pi`: remote spoofed `"tower"`, caller overwrites both event and error to `pi`.
+    rpc.send_json(&rpc_request(
+        json!(1),
+        "call",
+        json!({"tool": "meta.version", "on": "pi"}),
+    ));
+    let (direct_reply, direct_events) = rpc.reply_to(&json!(1));
+    assert_eq!(direct_events.len(), 1, "{direct_events:?}");
+    assert_eq!(direct_events[0]["params"]["machine"], json!("pi"));
+    assert_eq!(
+        direct_reply["error"]["data"]["machine"],
+        json!("pi"),
+        "{direct_reply}"
+    );
+
+    // Relayed call to `c` via `b`: remote spoofed `"tower"`, caller stamps final target `c`.
+    rpc.send_json(&rpc_request(
+        json!(2),
+        "call",
+        json!({"tool": "meta.version", "on": "c"}),
+    ));
+    let (relayed_reply, relayed_events) = rpc.reply_to(&json!(2));
+    assert_eq!(relayed_events.len(), 1, "{relayed_events:?}");
+    assert_eq!(relayed_events[0]["params"]["machine"], json!("c"));
+    assert_eq!(
+        relayed_reply["error"]["data"]["machine"],
+        json!("c"),
+        "{relayed_reply}"
+    );
+
+    assert_eq!(rpc.finish(), 0);
 }
 
 fn fleet_tools_list_ping_add_remove_and_discover_permissions() {

@@ -387,6 +387,10 @@ impl Session {
         cancel: CancellationToken,
         events: EventSink,
     ) -> Result<Value, CallError> {
+        let relayed_target = params
+            .on
+            .as_ref()
+            .and_then(|target| target.single().map(str::to_owned));
         let params_value = serde_json::to_value(&params).map_err(|err| {
             CallError::NotWritten(
                 ErrorBody::new(
@@ -398,6 +402,26 @@ impl Session {
         })?;
         self.request(method::CALL, params_value, cancel, events, true)
             .await
+            .map_err(|err| match err {
+                CallError::Remote(body) => {
+                    let labelled = match relayed_target.as_deref() {
+                        // A relay returning `not_found` for a target absent from its own
+                        // `fleet.toml` carries the relay's own name; every other error carries
+                        // the target's name so a remote cannot forge another machine's label.
+                        Some(_)
+                            if body.code == ErrorCode::NotFound
+                                && body.machine.as_deref()
+                                    == Some(self.info.hello.node.as_str()) =>
+                        {
+                            body.with_machine(&self.machine)
+                        }
+                        Some(target) => body.with_machine(target),
+                        None => body.with_machine(&self.machine),
+                    };
+                    CallError::Remote(labelled)
+                }
+                other => other,
+            })
     }
 
     /// Queries and caches the remote node's `tools` list so a forwarding node can authorise an
@@ -1020,7 +1044,9 @@ fn dispatch_incoming(line: &[u8], machine: &str, pending: &Arc<Mutex<HashMap<Id,
                 sink.emit_event(Event {
                     kind: event.kind,
                     data: event.data,
-                    machine: event.machine.or_else(|| Some(machine.to_owned())),
+                    // Never trust a remote-chosen `machine` label; stamp this session's name,
+                    // which a caller's `EventSink::for_machine` further overwrites for relays.
+                    machine: Some(machine.to_owned()),
                 });
             }
         }
@@ -1540,5 +1566,111 @@ mod tests {
         assert!(cancelled_at.elapsed() >= CANCEL_REPLY_TIMEOUT);
         session.close().await;
         let _ = hung_server.await;
+    }
+
+    #[tokio::test]
+    async fn overwrites_spoofed_machine_label_on_events_and_errors() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await.unwrap().unwrap();
+            server_w
+                .write_all(hello_ok("real-remote", PROTOCOL).as_bytes())
+                .await
+                .unwrap();
+
+            for _ in 0..2 {
+                let line = lines.next_line().await.unwrap().unwrap();
+                let req: Request = serde_json::from_str(&line).unwrap();
+                let ev = Notification::new(
+                    method::EVENT,
+                    serde_json::to_value(EventParams {
+                        id: req.id.clone().unwrap(),
+                        kind: EventKind::Log,
+                        data: json!({"level": "info", "message": "spoofed"}),
+                        machine: Some("tower".to_owned()),
+                    })
+                    .unwrap(),
+                );
+                server_w
+                    .write_all(format!("{}\n", serde_json::to_string(&ev).unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+                let reply = Response::error(
+                    req.id,
+                    RpcError::new(
+                        TOOL_ERROR,
+                        ErrorBody::new(ErrorCode::Failed, "spoofed failure").with_machine("tower"),
+                    ),
+                );
+                server_w
+                    .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+                server_w.flush().await.unwrap();
+            }
+        });
+
+        let session = Session::open_io(
+            client_r,
+            client_w,
+            "pi",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // Direct call: both event and error are stamped with `pi`, never `tower`.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let err = session
+            .call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::with_events(move |ev| seen_clone.lock().unwrap().push(ev.machine)),
+            )
+            .await
+            .unwrap_err()
+            .into_error();
+        assert_eq!(err.machine.as_deref(), Some("pi"));
+        assert_eq!(*seen.lock().unwrap(), vec![Some("pi".to_owned())]);
+
+        // Relayed call to `c` via `pi`: both event (via `for_machine("c")`) and error carry `c`.
+        let seen_relayed = Arc::new(Mutex::new(Vec::new()));
+        let seen_relayed_clone = Arc::clone(&seen_relayed);
+        let err = session
+            .call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: Some(legion_proto::Target::One("c".to_owned())),
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::with_events(move |ev| {
+                    seen_relayed_clone.lock().unwrap().push(ev.machine);
+                })
+                .for_machine("c"),
+            )
+            .await
+            .unwrap_err()
+            .into_error();
+        assert_eq!(err.machine.as_deref(), Some("c"));
+        assert_eq!(*seen_relayed.lock().unwrap(), vec![Some("c".to_owned())]);
+
+        session.close().await;
+        server_task.await.unwrap();
     }
 }

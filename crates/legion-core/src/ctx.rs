@@ -89,8 +89,8 @@ impl EventSink {
         EventSink::default()
     }
 
-    /// Returns a sink that tags emitted events with `machine` unless an event already carries a
-    /// machine from a deeper hop.
+    /// Returns a sink that stamps emitted events with `machine`, overwriting any label the emitter
+    /// supplied so a remote cannot forge another machine's name.
     #[must_use]
     pub fn for_machine(&self, machine: impl Into<Arc<str>>) -> EventSink {
         EventSink {
@@ -108,12 +108,12 @@ impl EventSink {
         });
     }
 
-    /// Delivers one [`Event`], preserving its `machine` when already set and otherwise using the
-    /// machine bound to this sink.
+    /// Delivers one [`Event`], overwriting its `machine` with the machine bound to this sink when
+    /// one is set.
     pub fn emit_event(&self, mut event: Event) {
         if let Some(deliver) = &self.deliver {
-            if event.machine.is_none() {
-                event.machine = self.machine.as_deref().map(str::to_owned);
+            if let Some(machine) = &self.machine {
+                event.machine = Some(machine.to_string());
             }
             deliver(event);
         }

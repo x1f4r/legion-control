@@ -178,6 +178,8 @@ impl Fleet {
         self.execute_on_machine(
             direct_machine,
             direct_entry,
+            machine,
+            relayed,
             params,
             ctx.cancel_token().clone(),
             events.for_machine(machine),
@@ -444,6 +446,8 @@ impl Fleet {
             let fut = self.execute_on_machine(
                 direct_machine,
                 direct_entry,
+                machine,
+                true,
                 params,
                 cancel,
                 EventSink::discard(),
@@ -661,6 +665,8 @@ impl Fleet {
         self.execute_on_machine(
             direct_machine,
             direct_entry,
+            machine,
+            relayed,
             params,
             call.cancel,
             call.events.for_machine(machine),
@@ -678,43 +684,59 @@ impl Fleet {
         let slot = self.slot(machine);
         let live = self
             .get_or_open(machine, entry, None, cancel.clone())
-            .await?;
+            .await
+            .map_err(|err| err.with_machine(machine))?;
         match live.session.tool_effect(tool, cancel.clone()).await {
             Ok(effect) => Ok(effect),
             Err(CallError::NotWritten(_)) => {
                 self.invalidate_if_same(&slot, &live.session);
                 let fresh = self
                     .get_or_open(machine, entry, None, cancel.clone())
-                    .await?;
+                    .await
+                    .map_err(|err| err.with_machine(machine))?;
                 match fresh.session.tool_effect(tool, cancel).await {
                     Ok(effect) => Ok(effect),
                     Err(CallError::LostInFlight(err) | CallError::NotWritten(err)) => {
                         self.invalidate_if_same(&slot, &fresh.session);
-                        Err(ensure_machine(err, machine))
+                        Err(err.with_machine(machine))
                     }
-                    Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+                    Err(CallError::Remote(err)) => Err(err.with_machine(machine)),
                 }
             }
             Err(CallError::LostInFlight(err)) => {
                 self.invalidate_if_same(&slot, &live.session);
-                Err(ensure_machine(err, machine))
+                Err(err.with_machine(machine))
             }
-            Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+            Err(CallError::Remote(err)) => Err(err.with_machine(machine)),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_on_machine(
         &self,
-        machine: &str,
-        entry: &MachineEntry,
+        direct_machine: &str,
+        direct_entry: &MachineEntry,
+        target_machine: &str,
+        relayed: bool,
         params: CallParams,
         cancel: CancellationToken,
         events: EventSink,
     ) -> Result<Value, ErrorBody> {
-        let slot = self.slot(machine);
+        let label_error = |err: ErrorBody| {
+            if relayed
+                && err.code == ErrorCode::NotFound
+                && err.machine.as_deref() == Some(direct_machine)
+            {
+                err.with_machine(direct_machine)
+            } else {
+                err.with_machine(target_machine)
+            }
+        };
+        let slot = self.slot(direct_machine);
         let live = self
-            .get_or_open(machine, entry, None, cancel.clone())
-            .await?;
+            .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+            .await
+            .map_err(&label_error)?;
 
         match live
             .session
@@ -726,22 +748,23 @@ impl Fleet {
                 // Request was never written to the dead session: reopen once and retry.
                 self.invalidate_if_same(&slot, &live.session);
                 let fresh = self
-                    .get_or_open(machine, entry, None, cancel.clone())
-                    .await?;
+                    .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+                    .await
+                    .map_err(&label_error)?;
                 match fresh.session.call(params, cancel, events).await {
                     Ok(value) => Ok(value),
                     Err(CallError::LostInFlight(err) | CallError::NotWritten(err)) => {
                         self.invalidate_if_same(&slot, &fresh.session);
-                        Err(ensure_machine(err, machine))
+                        Err(label_error(err))
                     }
-                    Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+                    Err(CallError::Remote(err)) => Err(label_error(err)),
                 }
             }
             Err(CallError::LostInFlight(err)) => {
                 self.invalidate_if_same(&slot, &live.session);
-                Err(ensure_machine(err, machine))
+                Err(label_error(err))
             }
-            Err(CallError::Remote(err)) => Err(ensure_machine(err, machine)),
+            Err(CallError::Remote(err)) => Err(label_error(err)),
         }
     }
 
