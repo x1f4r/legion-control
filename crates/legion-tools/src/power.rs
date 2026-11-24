@@ -10,7 +10,8 @@
 //!
 //! Everything that touches the machine goes through an [`Actuator`]; see [`actuator`] for why a
 //! test build can never act on the machine it runs on. The platform's commands are built in
-//! [`plan`] and the firmware arming in `boot`.
+//! [`plan`], the firmware arming in `boot`, and Wake-on-LAN, which the fleet tools in
+//! `legion-net` send through the same actuator, in [`wol`].
 
 mod actuator;
 mod boot;
@@ -19,6 +20,7 @@ mod delay;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
 pub mod plan;
+pub mod wol;
 
 use std::marker::PhantomData;
 use std::sync::Arc;
