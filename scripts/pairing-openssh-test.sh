@@ -268,7 +268,7 @@ echo "    legion rpc session verified"
 
 # 5. Arbitrary commands get legion gate refusal.
 set +e
-gate_stderr="$("${ssh_base[@]}" -i "$work/device_key" me@127.0.0.1 'whoami' 2>&1 >/dev/null)"
+gate_stderr="$("${ssh_base[@]}" -i "$work/device_key" me@127.0.0.1 'whoami' </dev/null 2>&1 >/dev/null)"
 gate_rc=$?
 set -e
 [[ "$gate_rc" -ne 0 ]] || { echo "arbitrary command unexpectedly succeeded" >&2; exit 1; }
