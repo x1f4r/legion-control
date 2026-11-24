@@ -1,8 +1,9 @@
 /*
  * The whole look of the Legion interface. One file, no preprocessor.
  *
- * Reading order: tokens, the shell (bar, navigation, main), then components from small to large.
- * Layout answers to the width of `.shell`, not of the window, so the same markup works in a phone,
+ * Reading order: tokens (theme, accent pairs, text size, density), the shell (top header, main,
+ * docked bottom bar, navigation), then components from small to large.
+ * Layout answers to the width of `.shell`, not of the window, so the same markup works on a phone,
  * in a split view on a tablet and in a desktop window.
  */
 
@@ -22,7 +23,14 @@
   --accent-ink: #11160a;
   --warn: #f2b84a;
   --bad: #ff6b5e;
-  /* What a tool does. The same six colours everywhere a tool is named. */
+  /* Accent swatch colours in dark theme (paired below for light theme). */
+  --sw-green: #b6f24a;
+  --sw-blue: #6fc7ff;
+  --sw-violet: #b79cf7;
+  --sw-amber: #ffb057;
+  --sw-rose: #ff7a9e;
+  --sw-neutral: #eceef0;
+  /* What a tool does (shown in technical mode). */
   --fx-read: #7fb2d9;
   --fx-write: #f2b84a;
   --fx-exec: #b79cf7;
@@ -36,6 +44,39 @@
   --radius-s: 9px;
   --pad: 16px;
   --tap: 46px;
+  --row-py: 11px;
+  --row-px: 14px;
+  --card-p: 14px;
+  --text-base: 15px;
+  --text-sub: 13px;
+  --text-small: 12px;
+  --safe-top: max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px));
+  --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+}
+
+:root[data-accent="blue"] {
+  --accent: #6fc7ff;
+  --accent-ink: #081722;
+}
+
+:root[data-accent="violet"] {
+  --accent: #b79cf7;
+  --accent-ink: #160e26;
+}
+
+:root[data-accent="amber"] {
+  --accent: #ffb057;
+  --accent-ink: #1f1305;
+}
+
+:root[data-accent="rose"] {
+  --accent: #ff7a9e;
+  --accent-ink: #220912;
+}
+
+:root[data-accent="neutral"] {
+  --accent: #eceef0;
+  --accent-ink: #0d0e10;
 }
 
 :root[data-theme="light"] {
@@ -52,12 +93,43 @@
   --accent-ink: #ffffff;
   --warn: #a86a00;
   --bad: #c8281b;
+  --sw-green: #3b7a00;
+  --sw-blue: #0b66a8;
+  --sw-violet: #623ec2;
+  --sw-amber: #9c5600;
+  --sw-rose: #b32652;
+  --sw-neutral: #17181a;
   --fx-read: #2d6f9e;
   --fx-write: #a86a00;
   --fx-exec: #6a45c9;
   --fx-destroy: #c8281b;
   --fx-power: #c25a00;
   --fx-admin: #b3327a;
+}
+
+:root[data-theme="light"][data-accent="blue"] {
+  --accent: #0b66a8;
+  --accent-ink: #ffffff;
+}
+
+:root[data-theme="light"][data-accent="violet"] {
+  --accent: #623ec2;
+  --accent-ink: #ffffff;
+}
+
+:root[data-theme="light"][data-accent="amber"] {
+  --accent: #9c5600;
+  --accent-ink: #ffffff;
+}
+
+:root[data-theme="light"][data-accent="rose"] {
+  --accent: #b32652;
+  --accent-ink: #ffffff;
+}
+
+:root[data-theme="light"][data-accent="neutral"] {
+  --accent: #17181a;
+  --accent-ink: #ffffff;
 }
 
 @media (prefers-color-scheme: light) {
@@ -75,6 +147,12 @@
     --accent-ink: #ffffff;
     --warn: #a86a00;
     --bad: #c8281b;
+    --sw-green: #3b7a00;
+    --sw-blue: #0b66a8;
+    --sw-violet: #623ec2;
+    --sw-amber: #9c5600;
+    --sw-rose: #b32652;
+    --sw-neutral: #17181a;
     --fx-read: #2d6f9e;
     --fx-write: #a86a00;
     --fx-exec: #6a45c9;
@@ -82,6 +160,51 @@
     --fx-power: #c25a00;
     --fx-admin: #b3327a;
   }
+
+  :root:not([data-theme="dark"])[data-accent="blue"] {
+    --accent: #0b66a8;
+    --accent-ink: #ffffff;
+  }
+
+  :root:not([data-theme="dark"])[data-accent="violet"] {
+    --accent: #623ec2;
+    --accent-ink: #ffffff;
+  }
+
+  :root:not([data-theme="dark"])[data-accent="amber"] {
+    --accent: #9c5600;
+    --accent-ink: #ffffff;
+  }
+
+  :root:not([data-theme="dark"])[data-accent="rose"] {
+    --accent: #b32652;
+    --accent-ink: #ffffff;
+  }
+
+  :root:not([data-theme="dark"])[data-accent="neutral"] {
+    --accent: #17181a;
+    --accent-ink: #ffffff;
+  }
+}
+
+:root[data-text="small"] {
+  --text-base: 14px;
+  --text-sub: 12px;
+  --text-small: 11px;
+  --tap: 44px;
+}
+
+:root[data-text="large"] {
+  --text-base: 17px;
+  --text-sub: 15px;
+  --text-small: 13.5px;
+  --tap: 52px;
+}
+
+:root[data-density="compact"] {
+  --row-py: 8px;
+  --row-px: 12px;
+  --card-p: 11px;
 }
 
 *,
@@ -99,7 +222,7 @@ body {
 body {
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.45 var(--sans);
+  font: var(--text-base) / 1.45 var(--sans);
   -webkit-font-smoothing: antialiased;
   -webkit-text-size-adjust: 100%;
   -webkit-tap-highlight-color: transparent;
@@ -133,8 +256,10 @@ textarea {
 .shell {
   position: relative;
   height: 100dvh;
+  padding-bottom: var(--ime-inset-bottom, 0px);
   container: shell / inline-size;
   background: var(--bg);
+  touch-action: pan-y;
 }
 
 .sprite {
@@ -150,56 +275,132 @@ textarea {
   grid-template: "bar" auto "main" minmax(0, 1fr) "nav" auto / minmax(0, 1fr);
 }
 
-.bar {
-  grid-area: bar;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 52px;
-  padding: calc(max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)) + 6px) var(--pad) 6px;
+.app.docked {
+  grid-template: "bar" auto "main" minmax(0, 1fr) "dock" auto "nav" auto / minmax(0, 1fr);
 }
 
-.bar h1 {
+.app.standalone {
+  grid-template: "bar" auto "main" minmax(0, 1fr) / minmax(0, 1fr);
+}
+
+.app.standalone.docked {
+  grid-template: "bar" auto "main" minmax(0, 1fr) "dock" auto / minmax(0, 1fr);
+}
+
+/* The top of a screen says where you are and nothing else. No product name. */
+.top {
+  grid-area: bar;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: calc(var(--safe-top) + 18px) var(--pad) 10px;
+}
+
+.top h1 {
   flex: 1;
   min-width: 0;
   margin: 0;
-  font: 600 17px/1.2 var(--mono);
-  letter-spacing: -0.01em;
+  font: 650 28px/1.1 var(--sans);
+  letter-spacing: -0.02em;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.bar .back {
-  margin-left: -10px;
-}
-
-.wordmark {
-  font: 600 13px/1 var(--mono);
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
+.top h1 small {
+  display: block;
+  margin-top: 5px;
+  font: 400 14px/1.3 var(--sans);
+  letter-spacing: 0;
   color: var(--dim);
 }
 
-.wordmark b {
-  color: var(--accent);
-  font-weight: 600;
+.top.sub {
+  align-items: center;
+  padding-top: calc(var(--safe-top) + 12px);
+}
+
+.top.sub h1 {
+  font-size: 20px;
+}
+
+.top .btn.icon {
+  margin: 0 -8px -6px 0;
+  color: var(--dim);
+}
+
+.top .back {
+  margin: 0 0 0 -12px;
 }
 
 .main {
   grid-area: main;
   min-height: 0;
   overflow-y: auto;
-  padding: 4px var(--pad) calc(28px + max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)));
+  padding: 4px var(--pad) calc(28px + var(--safe-bottom));
   scrollbar-width: thin;
+}
+
+.app.docked .main {
+  padding-bottom: 14px;
+}
+
+.main.command-stream {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.main.command-stream > :first-child {
+  margin-top: auto;
+}
+
+.dock {
+  grid-area: dock;
+  position: relative;
+  z-index: 2;
+  padding: 8px var(--pad) 10px;
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.app.standalone .dock {
+  padding-bottom: calc(10px + max(0px, var(--safe-bottom) - var(--ime-inset-bottom, 0px)));
+}
+
+.dock-switch {
+  margin: 4px 2px 0;
+  min-height: 36px;
+}
+
+.dock-switch > span {
+  font-size: var(--text-sub);
+  color: var(--dim);
+}
+
+.dock-name {
+  margin-top: 8px;
+}
+
+.pull-hint {
+  text-align: center;
+  color: var(--dim);
+  font-size: var(--text-small);
+  padding: 4px 0 8px;
+}
+
+.start-column {
+  max-width: 480px;
+  margin: 0 auto;
 }
 
 .nav {
   grid-area: nav;
+  position: relative;
+  z-index: 2;
   display: flex;
   border-top: 1px solid var(--line);
   background: var(--bg);
-  padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
+  padding-bottom: max(0px, calc(var(--safe-bottom) - var(--ime-inset-bottom, 0px)));
 }
 
 .nav a {
@@ -211,6 +412,10 @@ textarea {
   color: var(--faint);
   font-size: 11px;
   text-decoration: none;
+}
+
+.nav.parts a {
+  font-size: 12px;
 }
 
 .nav a svg {
@@ -237,8 +442,27 @@ textarea {
     grid-template: "nav bar" auto "nav main" minmax(0, 1fr) / 84px minmax(0, 1fr);
   }
 
+  .app.docked {
+    grid-template: "nav bar" auto "nav main" minmax(0, 1fr) "nav dock" auto / 84px minmax(0, 1fr);
+  }
+
   .app.standalone {
     grid-template: "bar" auto "main" minmax(0, 1fr) / minmax(0, 1fr);
+  }
+
+  .app.standalone.docked {
+    grid-template: "bar" auto "main" minmax(0, 1fr) "dock" auto / minmax(0, 1fr);
+  }
+
+  .top {
+    padding-left: 28px;
+    padding-right: 28px;
+  }
+
+  .dock {
+    padding-left: 28px;
+    padding-right: 28px;
+    padding-bottom: calc(12px + var(--safe-bottom));
   }
 
   .nav {
@@ -247,7 +471,7 @@ textarea {
     gap: 4px;
     border-top: 0;
     border-right: 1px solid var(--line);
-    padding: 64px 8px 8px;
+    padding: 64px 8px calc(12px + var(--safe-bottom));
   }
 
   .nav a {
@@ -260,13 +484,17 @@ textarea {
     background: var(--surface);
   }
 
+  .nav .last {
+    margin-top: auto;
+  }
+
   .main {
-    padding: 4px 28px calc(40px + max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)));
+    padding: 4px 28px 40px;
   }
 
   .split {
     display: grid;
-    grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+    grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
     gap: 28px;
     align-items: start;
   }
@@ -278,7 +506,7 @@ textarea {
   .split > section:last-child {
     position: sticky;
     top: 4px;
-    max-height: calc(100dvh - 88px);
+    max-height: calc(100dvh - 104px);
     overflow-y: auto;
     scrollbar-width: thin;
   }
@@ -317,7 +545,8 @@ textarea {
 .lede code,
 small code,
 .more code,
-.row .sub code {
+.row .sub code,
+.notice code {
   font-family: var(--mono);
   font-size: 0.92em;
   padding: 1px 5px;
@@ -335,20 +564,20 @@ small code,
 
 .field .more {
   margin: 2px 0 0;
-  font-size: 13px;
+  font-size: var(--text-sub);
 }
 
 .more summary {
   display: inline-flex;
   align-items: center;
-  min-height: 32px;
-  color: var(--faint);
-  font-size: 13px;
+  min-height: 36px;
+  color: var(--dim);
+  font-size: var(--text-sub);
   cursor: pointer;
 }
 
 .more summary:hover {
-  color: var(--dim);
+  color: var(--text);
 }
 
 .more p {
@@ -358,6 +587,113 @@ small code,
 .allows-lines {
   display: grid;
   gap: 6px;
+}
+
+/* ── Machines ───────────────────────────────────────────────────────────────────────────────── */
+
+/* A machine: its name, how it is in words, and three numbers that say what they are. */
+.machine {
+  display: grid;
+  gap: 12px;
+  padding: var(--card-p);
+  border-top: 1px solid var(--line);
+  text-decoration: none;
+  color: inherit;
+}
+
+.machine:first-child {
+  border-top: 0;
+}
+
+a.machine:active {
+  background: var(--raised);
+}
+
+.machine.selected {
+  background: var(--raised);
+}
+
+.machine header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.machine header strong {
+  font: 600 17px var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.machine header span:last-child {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: var(--text-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.stat {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.stat span {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: var(--text-small);
+  color: var(--dim);
+}
+
+.stat span b {
+  font: 500 var(--text-small) var(--mono);
+  color: var(--text);
+}
+
+.machine.off,
+.machine.asking {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  color: var(--dim);
+}
+
+.machine.off .machine-link,
+.machine.asking .machine-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  text-decoration: none;
+  color: inherit;
+}
+
+.machine.off strong,
+.machine.asking strong {
+  font: 500 17px var(--mono);
+}
+
+.machine.off .machine-link span:last-child,
+.machine.asking .machine-link span:last-child {
+  margin-left: auto;
+  color: var(--dim);
+  font-size: var(--text-sub);
+  white-space: nowrap;
+}
+
+.machine.asking .machine-link span:last-child {
+  color: var(--faint);
 }
 
 /* ── Lists and rows ─────────────────────────────────────────────────────────────────────────── */
@@ -375,7 +711,7 @@ small code,
   gap: 12px;
   width: 100%;
   min-height: var(--tap);
-  padding: 11px 14px;
+  padding: var(--row-py) var(--row-px);
   border: 0;
   border-top: 1px solid var(--line);
   background: none;
@@ -412,7 +748,7 @@ button.row:active {
 .row .sub {
   display: block;
   color: var(--dim);
-  font-size: 13px;
+  font-size: var(--text-sub);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -424,8 +760,18 @@ button.row:active {
 
 .row .end {
   color: var(--dim);
-  font: 13px var(--mono);
+  font: var(--text-sub) var(--mono);
   text-align: right;
+}
+
+.row .value {
+  color: var(--dim);
+  font-size: 14px;
+}
+
+.row .chev {
+  color: var(--faint);
+  font: 18px var(--mono);
 }
 
 .row.off,
@@ -446,6 +792,11 @@ button.row:active {
   background: var(--raised);
 }
 
+.row-switch {
+  margin: 0;
+  min-height: 0;
+}
+
 .row-actions {
   display: flex;
   flex-wrap: wrap;
@@ -453,7 +804,74 @@ button.row:active {
   margin-top: 10px;
 }
 
-/* Is it there? Filled: answered. Ring: did not. Amber: answered and busy. */
+.swipe-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  border-top: 1px solid var(--line);
+}
+
+.swipe-row:first-child {
+  border-top: 0;
+}
+
+.swipe-row > .row {
+  border-top: 0;
+}
+
+.swipe-action {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 14px;
+  border: 0;
+  background: var(--bad);
+  color: #fff;
+  font-weight: 600;
+  font-size: var(--text-sub);
+  cursor: pointer;
+}
+
+/* How a thing went, in one word with a mark. */
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sub);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.state::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.state.running {
+  color: var(--text);
+}
+
+.state.running::before {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.state.done::before {
+  background: var(--dim);
+}
+
+.state.failed {
+  color: var(--bad);
+}
+
+.state.failed::before {
+  background: var(--bad);
+}
+
+/* Is it there? Filled: on. Amber: on and busy. Ring: off. Faint ring: never seen, checking. */
 .dot {
   flex: none;
   width: 9px;
@@ -478,16 +896,10 @@ button.row:active {
   box-shadow: inset 0 0 0 1.5px var(--line-strong);
 }
 
-/* Three thin bars: processor, memory, disk. Read at a glance, exact numbers live on the machine. */
-.meters {
-  display: grid;
-  gap: 4px;
-  width: 54px;
-}
-
+/* Bars for machine stats and gauges. */
 .meter {
   display: block;
-  height: 3px;
+  height: 4px;
   border-radius: 2px;
   background: var(--line);
   overflow: hidden;
@@ -528,7 +940,7 @@ button.row:active {
 
 .gauge header span:last-child {
   color: var(--dim);
-  font: 13px var(--mono);
+  font: var(--text-sub) var(--mono);
 }
 
 .gauge .meter {
@@ -538,6 +950,139 @@ button.row:active {
 
 .gauge .meter i {
   background: var(--text);
+}
+
+/* ── Tiles (Actions) ────────────────────────────────────────────────────────────────────────── */
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@container shell (min-width: 820px) {
+  .tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.tile {
+  display: grid;
+  gap: 4px;
+  align-content: start;
+  min-height: 86px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  text-align: left;
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+.tile:active:not(.na) {
+  background: var(--raised);
+}
+
+.tile strong {
+  font-weight: 600;
+}
+
+.tile span {
+  color: var(--dim);
+  font-size: var(--text-sub);
+  line-height: 1.35;
+}
+
+.tile .tile-tool {
+  margin-top: 2px;
+  font: var(--text-small) var(--mono);
+  color: var(--faint);
+}
+
+.tile.na {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── Settings controls (segmented control & colour swatches) ────────────────────────────────── */
+
+.seg {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--raised);
+}
+
+.seg button {
+  min-height: 38px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 9px;
+  background: none;
+  color: var(--dim);
+  font-size: var(--text-sub);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--line-strong);
+}
+
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px;
+}
+
+.swatch {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--line-strong);
+  cursor: pointer;
+}
+
+.swatch[aria-pressed="true"] {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--text);
+}
+
+.swatch.green { --c: var(--sw-green); }
+.swatch.blue { --c: var(--sw-blue); }
+.swatch.violet { --c: var(--sw-violet); }
+.swatch.amber { --c: var(--sw-amber); }
+.swatch.rose { --c: var(--sw-rose); }
+.swatch.neutral { --c: var(--sw-neutral); }
+
+/* ── QR code ────────────────────────────────────────────────────────────────────────────────── */
+
+.qr-box {
+  display: grid;
+  justify-items: center;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #ffffff;
+  color: #0d0e10;
+}
+
+.qr-box svg {
+  width: min(240px, 100%);
+  height: auto;
+  display: block;
+  shape-rendering: crispEdges;
 }
 
 /* ── Chips ──────────────────────────────────────────────────────────────────────────────────── */
@@ -562,33 +1107,19 @@ button.row:active {
   color: var(--c);
 }
 
-.fx.write {
-  --c: var(--fx-write);
-}
+.fx.write { --c: var(--fx-write); }
+.fx.exec { --c: var(--fx-exec); }
+.fx.destroy { --c: var(--fx-destroy); }
+.fx.power { --c: var(--fx-power); }
+.fx.admin { --c: var(--fx-admin); }
 
-.fx.exec {
-  --c: var(--fx-exec);
-}
-
-.fx.destroy {
-  --c: var(--fx-destroy);
-}
-
-.fx.power {
-  --c: var(--fx-power);
-}
-
-.fx.admin {
-  --c: var(--fx-admin);
-}
-
-/* ── Tabs ───────────────────────────────────────────────────────────────────────────────────── */
+/* ── Tabs (wide machine view) ───────────────────────────────────────────────────────────────── */
 
 .tabs {
   display: flex;
-  gap: 4px;
-  margin: 0 calc(var(--pad) * -1) 6px;
-  padding: 0 var(--pad) 8px;
+  gap: 2px;
+  margin: 0 0 8px;
+  padding: 0 0 4px;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -600,12 +1131,14 @@ button.row:active {
 .tabs button {
   flex: none;
   height: 34px;
-  padding: 0 13px;
+  padding: 0 11px;
   border: 0;
   border-radius: 17px;
   background: none;
   color: var(--dim);
+  font-size: 14px;
   font-weight: 500;
+  cursor: pointer;
 }
 
 .tabs button[aria-selected="true"] {
@@ -660,7 +1193,7 @@ button.row:active {
   flex: none;
   min-height: 36px;
   padding: 0 12px;
-  font-size: 13px;
+  font-size: var(--text-sub);
   white-space: nowrap;
 }
 
@@ -708,18 +1241,18 @@ button.row:active {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  font: 500 13px var(--mono);
+  font: 500 var(--text-sub) var(--mono);
 }
 
 .field > span em,
 .field-label > span em {
-  font: 12px var(--sans);
+  font: var(--text-small) var(--sans);
   color: var(--faint);
 }
 
 .field small {
   color: var(--dim);
-  font-size: 13px;
+  font-size: var(--text-sub);
 }
 
 .input,
@@ -733,7 +1266,11 @@ button.row:active {
   border-radius: var(--radius-s);
   background: var(--surface);
   font-family: var(--mono);
-  font-size: 15px;
+  font-size: var(--text-base);
+}
+
+.input.plain {
+  font-family: var(--sans);
 }
 
 .field textarea {
@@ -764,6 +1301,7 @@ button.row:active {
   background: var(--line-strong);
   position: relative;
   transition: background 0.15s;
+  cursor: pointer;
 }
 
 .switch input::after {
@@ -787,16 +1325,16 @@ button.row:active {
 .switch .help {
   display: block;
   color: var(--dim);
-  font-size: 13px;
+  font-size: var(--text-sub);
 }
 
 .switch .mono {
-  font-size: 13px;
+  font-size: var(--text-sub);
 }
 
 .field-err {
   color: var(--bad);
-  font-size: 13px;
+  font-size: var(--text-sub);
 }
 
 .nested {
@@ -820,7 +1358,7 @@ button.row:active {
   border-radius: 19px;
   background: none;
   color: var(--dim);
-  font: 500 13px var(--mono);
+  font: 500 var(--text-sub) var(--mono);
   cursor: pointer;
 }
 
@@ -830,22 +1368,11 @@ button.row:active {
   color: var(--text);
 }
 
-.chip-action {
-  border: 0;
-  cursor: pointer;
-}
-
-.start-column {
-  width: 100%;
-  max-width: 540px;
-  margin: 0 auto;
-}
-
 .start-heading {
   font-size: 26px;
   line-height: 1.15;
   letter-spacing: -0.02em;
-  margin: 36px 2px 10px;
+  margin: 24px 2px 10px;
 }
 
 .spaced {
@@ -873,7 +1400,7 @@ button.row:active {
   overflow-x: auto;
   white-space: nowrap;
   scrollbar-width: none;
-  font: 13px var(--mono);
+  font: var(--text-sub) var(--mono);
   color: var(--dim);
 }
 
@@ -956,7 +1483,7 @@ button.row:active {
 .prompt::before {
   content: "$";
   color: var(--accent);
-  font: 600 15px var(--mono);
+  font: 600 var(--text-base) var(--mono);
 }
 
 .prompt input {
@@ -965,7 +1492,7 @@ button.row:active {
   min-height: var(--tap);
   border: 0;
   background: none;
-  font: 15px var(--mono);
+  font: var(--text-base) var(--mono);
   outline: none;
 }
 
@@ -987,6 +1514,10 @@ button.row:active {
   max-height: 60dvh;
   overflow: auto;
   tab-size: 4;
+}
+
+.main.command-stream .out {
+  margin: 0;
 }
 
 /* Prose-like output (a log line, a message) may wrap; tables from commands must not. */
@@ -1034,14 +1565,20 @@ button.row:active {
 .kv dt {
   color: var(--dim);
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: var(--text-sub);
 }
 
 .kv dd {
   margin: 0;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: var(--text-sub);
   overflow-wrap: anywhere;
+}
+
+.kv.plain dt,
+.kv.plain dd {
+  font-family: var(--sans);
+  font-size: var(--text-base);
 }
 
 /* ── Notices ────────────────────────────────────────────────────────────────────────────────── */
@@ -1084,6 +1621,7 @@ button.row:active {
 .scrim {
   position: absolute;
   inset: 0;
+  z-index: 30;
   display: grid;
   align-items: end;
   background: rgb(0 0 0 / 0.55);
@@ -1092,7 +1630,7 @@ button.row:active {
 .sheet {
   max-height: 86%;
   overflow-y: auto;
-  padding: 10px var(--pad) calc(max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px)) + 18px);
+  padding: 10px var(--pad) calc(var(--safe-bottom) + 18px);
   border-radius: 22px 22px 0 0;
   background: var(--raised);
   border-top: 1px solid var(--line-strong);

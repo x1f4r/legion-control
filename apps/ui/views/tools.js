@@ -1,4 +1,4 @@
-// Tools screen: searchable family catalog, JSON Schema form builder, target picker, and result view.
+// Technical All tools view and schema-driven tool runner (reused by Actions and Settings).
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { CodeText, Notice, ResultView } from './common.js';
@@ -145,13 +145,16 @@ function FieldInput({ field, value, onChange, error, idPrefix }) {
   `;
 }
 
-function ToolDetail({
+export function ToolDetail({
   tool,
   allowed,
+  initialTarget = 'local',
+  hideTargetPicker = false,
   nodeInfo,
   machines,
   runningJobs,
   link,
+  technical = true,
   onRequestConfirm,
 }) {
   const fields = useMemo(() => describeSchema(tool.input_schema), [tool.name]);
@@ -159,7 +162,7 @@ function ToolDetail({
   const [values, setValues] = useState(() => initialValues(tool.input_schema));
   const [rawMode, setRawMode] = useState(false);
   const [rawText, setRawText] = useState('{}');
-  const [targetMode, setTargetMode] = useState('local');
+  const [targetMode, setTargetMode] = useState(initialTarget || 'local');
   const [multiTargets, setMultiTargets] = useState([]);
   const [fieldErrors, setFieldErrors] = useState({});
   const [running, setRunning] = useState(false);
@@ -365,7 +368,7 @@ function ToolDetail({
       ${descParts.rest
         ? html`
             <details class="more">
-              <summary>More about this tool</summary>
+              <summary>More about this</summary>
               <p><${CodeText} text=${descParts.rest} /></p>
             </details>
           `
@@ -381,55 +384,60 @@ function ToolDetail({
           `
         : null}
 
-      <label class="field" htmlFor="tool-target-on">
-        <span>on <em>where to run it</em></span>
-        <select
-          id="tool-target-on"
-          value=${targetMode}
-          onChange=${(e) => {
-            setTargetMode(e.target.value);
-            setError(null);
-            setResult(null);
-          }}
-        >
-          <option value="local">${localNode} (this node)</option>
-          ${remoteMachines.map((m) => {
-            const suffix = m.status === 'asking' || m.asking
-              ? ' (asking…)'
-              : !m.reachable
-                ? ' (offline)'
-                : '';
-            return html`<option key=${m.name} value=${m.name}>${m.name}${suffix}</option>`;
-          })}
-          ${machineNames.length > 1
-            ? html`
-                <option value="all">
-                  ${skippedNames.length > 0
-                    ? `All answering machines (${answeringNames.length} of ${machineNames.length})`
-                    : 'All machines'}
-                </option>
-              `
-            : null}
-          ${machineNames.length > 1
-            ? html`<option value="multi">Choose several machines…</option>`
-            : null}
-        </select>
-        ${isSingleRemote
-          ? html`
-              <small>
-                ${`Showing tools from ${localNode}; ${targetMode} checks its own tools and permissions when you run.`}
-              </small>
-            `
-          : targetMode === 'all' && skippedNames.length > 0
-            ? html`
-                <small>
-                  ${`Running on answering machines only; skipping ${skippedNames.join(', ')}.`}
-                </small>
-              `
-            : null}
-      </label>
+      ${!hideTargetPicker
+        ? html`
+            <label class="field" htmlFor="tool-target-on">
+              <span>on <em>where to run it</em></span>
+              <select
+                id="tool-target-on"
+                value=${targetMode}
+                onChange=${(e) => {
+                  setTargetMode(e.target.value);
+                  setError(null);
+                  setResult(null);
+                }}
+              >
+                <option value="local">${localNode} (this machine)</option>
+                ${remoteMachines.map((m) => {
+                  const suffix =
+                    m.status === 'asking' || m.asking
+                      ? ' (checking…)'
+                      : !m.reachable
+                        ? ' (off)'
+                        : '';
+                  return html`<option key=${m.name} value=${m.name}>${m.name}${suffix}</option>`;
+                })}
+                ${machineNames.length > 1
+                  ? html`
+                      <option value="all">
+                        ${skippedNames.length > 0
+                          ? `All on machines (${answeringNames.length} of ${machineNames.length})`
+                          : 'All machines'}
+                      </option>
+                    `
+                  : null}
+                ${machineNames.length > 1
+                  ? html`<option value="multi">Choose several machines…</option>`
+                  : null}
+              </select>
+              ${isSingleRemote
+                ? html`
+                    <small>
+                      ${`Showing tools from ${localNode}; ${targetMode} checks its own tools and permissions when you run.`}
+                    </small>
+                  `
+                : targetMode === 'all' && skippedNames.length > 0
+                  ? html`
+                      <small>
+                        ${`Running on answering machines only; skipping ${skippedNames.join(', ')}.`}
+                      </small>
+                    `
+                  : null}
+            </label>
+          `
+        : null}
 
-      ${targetMode === 'multi'
+      ${!hideTargetPicker && targetMode === 'multi'
         ? html`
             <div class="chips" role="group" aria-label="Select target machines">
               ${machineList.map((m) => {
@@ -438,8 +446,8 @@ function ToolDetail({
                   m.name === localNode || m.reachable
                     ? ''
                     : m.status === 'asking' || m.asking
-                      ? ' · asking…'
-                      : ' · offline';
+                      ? ' · checking…'
+                      : ' · off';
                 return html`
                   <button
                     type="button"
@@ -456,14 +464,18 @@ function ToolDetail({
           `
         : null}
 
-      <label class="switch">
-        <span>Edit arguments as raw JSON</span>
-        <input
-          type="checkbox"
-          checked=${rawMode}
-          onChange=${(e) => toggleRaw(e.target.checked)}
-        />
-      </label>
+      ${technical
+        ? html`
+            <label class="switch">
+              <span>Edit arguments as raw JSON</span>
+              <input
+                type="checkbox"
+                checked=${rawMode}
+                onChange=${(e) => toggleRaw(e.target.checked)}
+              />
+            </label>
+          `
+        : null}
 
       <form
         onSubmit=${(e) => {
@@ -549,6 +561,7 @@ export function ToolsView({
   snapshot,
   link,
   wide,
+  technical = true,
   onRequestConfirm,
 }) {
   const [query, setQuery] = useState('');
@@ -568,7 +581,7 @@ export function ToolsView({
   const listPane = html`
     <section>
       <input
-        class="input"
+        class="input plain"
         type="search"
         value=${query}
         onInput=${(e) => setQuery(e.target.value)}
@@ -598,7 +611,7 @@ export function ToolsView({
                         <a
                           key=${tool.name}
                           class=${cls}
-                          href=${routeHref({ section: 'tools', tool: tool.name })}
+                          href=${routeHref({ section: 'actions', allTools: true, tool: tool.name })}
                           aria-current=${selected ? 'true' : undefined}
                         >
                           <span class="body">
@@ -642,6 +655,7 @@ export function ToolsView({
                   machines=${snapshot?.machines || []}
                   runningJobs=${snapshot?.runningJobs || []}
                   link=${link}
+                  technical=${technical}
                   onRequestConfirm=${onRequestConfirm}
                 />
               `
@@ -661,6 +675,7 @@ export function ToolsView({
         machines=${snapshot?.machines || []}
         runningJobs=${snapshot?.runningJobs || []}
         link=${link}
+        technical=${technical}
         onRequestConfirm=${onRequestConfirm}
       />
     `;

@@ -1,95 +1,82 @@
-// Machines screen: fleet at a glance, running jobs across machines, and wide split detail.
+// Machines screen: labelled metrics for on machines, calm Off section, and wide split detail.
 
 import { html } from '../vendor/preact-htm.js';
 import { Meter, Notice } from './common.js';
-import {
-  formatBusyReasonsShort,
-  formatDuration,
-  formatElapsed,
-  formatOfflineSubtext,
-  formatRelativeTime,
-  machineMetrics,
-  osLabel,
-} from '../lib/format.js';
+import { formatMachineStatusPhrase } from '../lib/activity.js';
+import { machineMetrics } from '../lib/format.js';
 import { routeHref } from '../lib/route.js';
 import { MachineDetail } from './machine.js';
 
-function machineSubtext(m) {
-  if (m.status === 'asking' || m.asking) {
-    const parts = [];
-    if (m.fromCache && m.os) parts.push(osLabel(m.os));
-    if (m.fromCache && m.lastSeenAt) {
-      const seen = formatRelativeTime(m.lastSeenAt);
-      if (seen) parts.push(`last seen ${seen}`);
-    }
-    parts.push('asking…');
-    return parts.join(' · ');
-  }
-  if (!m.reachable) {
-    return formatOfflineSubtext(m.lastSeenAt);
-  }
-  const parts = [];
-  if (m.os) parts.push(osLabel(m.os));
-  if (m.arch) parts.push(m.arch);
-  if (m.runningJobs > 0) {
-    parts.push(`${m.runningJobs} ${m.runningJobs === 1 ? 'job' : 'jobs'} running`);
-  } else if (m.busy) {
-    parts.push(formatBusyReasonsShort(m.busyReasons) || 'busy');
-  } else if (m.busyState === 'unmonitored') {
-    parts.push('unmonitored');
-  } else if (m.sys?.uptime_s != null) {
-    parts.push(`up ${formatDuration(m.sys.uptime_s)}`);
-  }
-  return parts.join(' · ') || 'Answering';
+function OnlineMachineCard({ machine, selected, showMetrics }) {
+  const metrics = machineMetrics(machine.sys);
+  const dotClass = machine.busy ? 'dot busy' : 'dot';
+  const cls = ['machine', selected ? 'selected' : ''].filter(Boolean).join(' ');
+  const href = routeHref({ section: 'machines', machine: machine.name, tab: 'overview' });
+
+  return html`
+    <a class=${cls} href=${href} aria-current=${selected ? 'true' : undefined}>
+      <header>
+        <span class=${dotClass} aria-hidden="true"></span>
+        <strong>${machine.name}</strong>
+        <span>${formatMachineStatusPhrase(machine)}</span>
+      </header>
+      ${showMetrics && metrics
+        ? html`
+            <div class="stats">
+              <div class="stat">
+                <span>Processor <b>${metrics.cpuPct}%</b></span>
+                <${Meter} value=${metrics.cpuPct} />
+              </div>
+              <div class="stat">
+                <span>Memory <b>${metrics.memPct}%</b></span>
+                <${Meter} value=${metrics.memPct} />
+              </div>
+              <div class="stat">
+                <span>Disk <b>${metrics.diskPct}%</b></span>
+                <${Meter} value=${metrics.diskPct} />
+              </div>
+            </div>
+          `
+        : null}
+    </a>
+  `;
 }
 
-function MachineRow({ machine, selected, canWake, onWake }) {
-  const metrics = machineMetrics(machine.sys);
+function OfflineMachineRow({ machine, selected, canWake, onWake }) {
   const isAsking = machine.status === 'asking' || machine.asking;
-  const dotClass = isAsking
-    ? 'dot asking'
-    : !machine.reachable
-      ? 'dot off'
-      : machine.busy
-        ? 'dot busy'
-        : 'dot';
-  const rowClass = [
-    'row',
-    isAsking ? 'asking' : !machine.reachable ? 'off' : '',
+  const cls = [
+    'machine',
+    isAsking ? 'asking' : 'off',
     selected ? 'selected' : '',
   ]
     .filter(Boolean)
     .join(' ');
   const href = routeHref({ section: 'machines', machine: machine.name, tab: 'overview' });
-
-  function handleWake(e) {
-    e.preventDefault();
-    e.stopPropagation();
-    if (onWake) onWake(machine);
-  }
+  const showWake = !isAsking && machine.canWake && canWake;
 
   return html`
-    <a class=${rowClass} href=${href} aria-current=${selected ? 'true' : undefined}>
-      <span class=${dotClass} aria-hidden="true"></span>
-      <span class="body">
-        <span class="title mono">${machine.name}</span>
-        <span class="sub">${machineSubtext(machine)}</span>
-      </span>
-      ${machine.reachable && metrics
+    <div class=${cls}>
+      <a class="machine-link" href=${href} aria-current=${selected ? 'true' : undefined}>
+        <span class=${isAsking ? 'dot asking' : 'dot off'} aria-hidden="true"></span>
+        <strong>${machine.name}</strong>
+        <span>${formatMachineStatusPhrase(machine)}</span>
+      </a>
+      ${showWake
         ? html`
-            <span
-              class="meters"
-              aria-label=${`Processor ${metrics.cpuPct}%, memory ${metrics.memPct}%, disk ${metrics.diskPct}%`}
+            <button
+              type="button"
+              class="btn small"
+              onClick=${(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (onWake) onWake(machine);
+              }}
             >
-              <${Meter} value=${metrics.cpuPct} />
-              <${Meter} value=${metrics.memPct} />
-              <${Meter} value=${metrics.diskPct} />
-            </span>
+              Wake
+            </button>
           `
-        : !isAsking && !machine.reachable && machine.canWake && canWake
-          ? html`<button type="button" class="chip chip-action" onClick=${handleWake}>wake</button>`
-          : null}
-    </a>
+        : null}
+    </div>
   `;
 }
 
@@ -103,93 +90,91 @@ export function MachinesView({
   nodeInfo,
   tools,
   allowedSet,
+  settings,
   onWakeMachine,
   onRequestConfirm,
   onRefresh,
-  runHistory,
-  onRecordRun,
+  commandRuns,
+  onCommandRunsChange,
 }) {
   const machines = snapshot?.machines || [];
-  const runningJobs = snapshot?.runningJobs || [];
-  const answering = machines.filter((m) => m.reachable).length;
   const canWake = allowedSet ? allowedSet.has('power.wake') : false;
-  const cachedAsOf = snapshot?.cachedAt ? formatRelativeTime(snapshot.cachedAt) : '';
+  const showMetrics = settings?.showMetrics !== false;
+  const showOffline = settings?.showOffline !== false;
+
+  const onlineMachines = machines.filter((m) => m.reachable);
+  const askingMachines = machines.filter((m) => !m.reachable && (m.status === 'asking' || m.asking));
+  const offMachines = machines.filter((m) => !m.reachable && m.status !== 'asking' && !m.asking);
 
   const selectedName = wide
-    ? route.machine || machines[0]?.name || null
+    ? route.machine || onlineMachines[0]?.name || machines[0]?.name || null
     : route.machine || null;
   const selectedMachine = machines.find((m) => m.name === selectedName) || null;
-
-  const heading =
-    machines.length > 0
-      ? cachedAsOf
-        ? answering > 0
-          ? `Machines · ${answering} of ${machines.length} answering · as of ${cachedAsOf}`
-          : `Machines · as of ${cachedAsOf}`
-        : `Machines · ${answering} of ${machines.length} answering`
-      : loading
-        ? 'Machines · loading…'
-        : 'Machines';
 
   const listColumn = html`
     <section>
       ${error ? html`<${Notice} error=${error} />` : null}
-      <p class="label">${heading}</p>
-      ${machines.length > 0
-        ? html`
-            <div class="list">
-              ${machines.map(
-                (m) => html`
-                  <${MachineRow}
-                    key=${m.name}
-                    machine=${m}
-                    selected=${wide && m.name === selectedName}
-                    canWake=${canWake}
-                    onWake=${onWakeMachine}
-                  />
-                `,
-              )}
-            </div>
-          `
-        : loading
-          ? html`<div class="empty">Loading machines…</div>`
-          : html`<div class="empty">No machines configured yet.</div>`}
 
-      ${runningJobs.length > 0
-        ? html`
-            <p class="label">Running now</p>
-            <div class="list">
-              ${runningJobs.map((job) => {
-                const elapsed =
-                  job.duration_s != null
-                    ? formatElapsed(job.duration_s)
-                    : job.created
-                      ? formatElapsed(Math.max(0, (Date.now() - Date.parse(job.created)) / 1000))
-                      : '';
-                return html`
-                  <a
-                    key=${`${job.machine}:${job.id}`}
-                    class="row"
-                    href=${routeHref({
-                      section: 'machines',
-                      machine: job.machine,
-                      tab: 'jobs',
-                      jobId: job.id,
-                    })}
-                  >
-                    <span class="body">
-                      <span class="title mono">${job.command || job.name || job.id}</span>
-                      <span class="sub">
-                        ${job.machine}${job.created ? ` · started ${formatRelativeTime(job.created)}` : ''}
-                      </span>
-                    </span>
-                    <span class="end">${elapsed}</span>
-                  </a>
-                `;
-              })}
-            </div>
-          `
-        : null}
+      ${machines.length === 0
+        ? loading
+          ? html`<div class="empty">Checking machines…</div>`
+          : html`<div class="empty">No machines configured yet.</div>`
+        : html`
+            ${onlineMachines.length > 0
+              ? html`
+                  <div class="list">
+                    ${onlineMachines.map(
+                      (m) => html`
+                        <${OnlineMachineCard}
+                          key=${m.name}
+                          machine=${m}
+                          selected=${wide && m.name === selectedName}
+                          showMetrics=${showMetrics}
+                        />
+                      `,
+                    )}
+                  </div>
+                `
+              : null}
+
+            ${askingMachines.length > 0
+              ? html`
+                  ${onlineMachines.length > 0 ? html`<p class="label">Checking</p>` : null}
+                  <div class="list">
+                    ${askingMachines.map(
+                      (m) => html`
+                        <${OfflineMachineRow}
+                          key=${m.name}
+                          machine=${m}
+                          selected=${wide && m.name === selectedName}
+                          canWake=${false}
+                          onWake=${onWakeMachine}
+                        />
+                      `,
+                    )}
+                  </div>
+                `
+              : null}
+
+            ${showOffline && offMachines.length > 0
+              ? html`
+                  <p class="label">Off</p>
+                  <div class="list">
+                    ${offMachines.map(
+                      (m) => html`
+                        <${OfflineMachineRow}
+                          key=${m.name}
+                          machine=${m}
+                          selected=${wide && m.name === selectedName}
+                          canWake=${canWake}
+                          onWake=${onWakeMachine}
+                        />
+                      `,
+                    )}
+                  </div>
+                `
+              : null}
+          `}
     </section>
   `;
 
@@ -204,15 +189,17 @@ export function MachinesView({
                   machine=${selectedMachine}
                   tab=${route.tab || 'overview'}
                   jobId=${route.jobId || null}
-                  showPaneTitle=${true}
+                  wide=${true}
                   link=${link}
                   nodeInfo=${nodeInfo}
                   tools=${tools}
                   allowedSet=${allowedSet}
+                  settings=${settings}
+                  onWakeMachine=${onWakeMachine}
                   onRequestConfirm=${onRequestConfirm}
                   onRefreshFleet=${onRefresh}
-                  runHistory=${runHistory}
-                  onRecordRun=${onRecordRun}
+                  commandRuns=${commandRuns}
+                  onCommandRunsChange=${onCommandRunsChange}
                 />
               `
             : html`<div class="empty">Select a machine to inspect it.</div>`}
@@ -227,15 +214,17 @@ export function MachinesView({
         machine=${selectedMachine}
         tab=${route.tab || 'overview'}
         jobId=${route.jobId || null}
-        showPaneTitle=${false}
+        wide=${false}
         link=${link}
         nodeInfo=${nodeInfo}
         tools=${tools}
         allowedSet=${allowedSet}
+        settings=${settings}
+        onWakeMachine=${onWakeMachine}
         onRequestConfirm=${onRequestConfirm}
         onRefreshFleet=${onRefresh}
-        runHistory=${runHistory}
-        onRecordRun=${onRecordRun}
+        commandRuns=${commandRuns}
+        onCommandRunsChange=${onCommandRunsChange}
       />
     `;
   }

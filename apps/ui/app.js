@@ -1,7 +1,13 @@
-// Legion interface entry point: startup, hash routing, polling, confirmation sheet, and shell.
+// Legion interface entry point: startup, hash routing, settings, gestures, polling, and shell.
 
 import { html, render, useCallback, useEffect, useMemo, useRef, useState } from './vendor/preact-htm.js';
 import { Icon, IconSprite } from './icons.js';
+import { findActionById } from './lib/actions.js';
+import {
+  formatMachineDetailSubtitle,
+  formatMachinesHeaderSubtitle,
+  friendlyJobName,
+} from './lib/activity.js';
 import { createCache } from './lib/cache.js';
 import {
   hydrateFleetCache,
@@ -9,42 +15,36 @@ import {
   serializeFleetCache,
 } from './lib/fleet.js';
 import { formatRelativeTime } from './lib/format.js';
-import { extractHashToken, parseRoute } from './lib/route.js';
+import {
+  classifyHorizontalSwipe,
+  classifyPullRefresh,
+  hasNativeEdgeBack,
+  PULL_REFRESH_PX,
+  shouldIgnoreSwipeTarget,
+  stepTab,
+} from './lib/gestures.js';
+import {
+  extractHashToken,
+  MACHINE_PARTS,
+  parseRoute,
+  ROOT_SECTIONS,
+  routeHref,
+} from './lib/route.js';
 import { describePowerConfirm } from './lib/schema.js';
+import {
+  applySettingsToRoot,
+  detectDeviceNoun,
+  readSettings,
+  writeSettings,
+} from './lib/settings.js';
 import { createLink } from './link/index.js';
+import { ActionsView } from './views/actions.js';
+import { ActivityView } from './views/activity.js';
 import { Notice, Sheet } from './views/common.js';
-import { DeviceView } from './views/device.js';
-import { JobsView } from './views/jobs.js';
+import { CommandComposer } from './views/machine.js';
 import { MachinesView } from './views/machines.js';
+import { SettingsView } from './views/settings.js';
 import { StartView } from './views/start.js';
-import { ToolsView } from './views/tools.js';
-
-const THEME_KEY = 'legion.theme';
-const POLL_MS = 15_000;
-
-function readTheme() {
-  try {
-    const saved = localStorage.getItem(THEME_KEY);
-    if (saved === 'light' || saved === 'dark' || saved === 'system') return saved;
-  } catch {
-    // Ignore.
-  }
-  return 'system';
-}
-
-function applyTheme(theme) {
-  const root = document.documentElement;
-  if (theme === 'light' || theme === 'dark') {
-    root.dataset.theme = theme;
-  } else {
-    delete root.dataset.theme;
-  }
-  try {
-    localStorage.setItem(THEME_KEY, theme);
-  } catch {
-    // Ignore.
-  }
-}
 
 function createSessionCache() {
   try {
@@ -62,7 +62,15 @@ function createPersistentCache() {
   }
 }
 
-function ConfirmSheet({ request, onClose }) {
+function safeLocalStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function ConfirmSheet({ request, technical, onClose }) {
   const [dryResult, setDryResult] = useState(null);
   const [dryError, setDryError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -107,7 +115,9 @@ function ConfirmSheet({ request, onClose }) {
                 (j) => html`
                   <div class="row" key=${`${j.machine}:${j.id}`}>
                     <span class="body">
-                      <span class="title mono">${j.command || j.name || j.id}</span>
+                      <span class=${technical ? 'title mono' : 'title'}>
+                        ${technical ? j.command || j.name || j.id : friendlyJobName(j)}
+                      </span>
                       <span class="sub">
                         running${j.created ? ` · started ${formatRelativeTime(j.created)}` : ''}
                       </span>
@@ -167,9 +177,17 @@ function App() {
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
+  const swipeRef = useRef(null);
 
-  const [theme, setTheme] = useState(() => readTheme());
-  const [wide, setWide] = useState(() => window.innerWidth >= 820);
+  const [settings, setSettings] = useState(() => {
+    const loaded = readSettings(safeLocalStorage());
+    if (link.mockFlags?.has('tech')) {
+      return { ...loaded, technical: true };
+    }
+    return loaded;
+  });
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const wide = viewportWidth >= 820;
   const [route, setRoute] = useState(() => parseRoute(window.location.hash));
   const [booting, setBooting] = useState(true);
   const [linkState, setLinkState] = useState(null);
@@ -177,8 +195,17 @@ function App() {
   const [snapshot, setSnapshot] = useState(null);
   const [fleetError, setFleetError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [pullState, setPullState] = useState(''); // '' | 'pull' | 'release' | 'refreshing'
   const [confirmRequest, setConfirmRequest] = useState(null);
-  const [runHistory, setRunHistory] = useState([]);
+  const [actionsQuery, setActionsQuery] = useState('');
+  const [commandRunsByMachine, setCommandRunsByMachine] = useState({});
+  const [commandDraft, setCommandDraft] = useState({
+    cmd: '',
+    asJob: false,
+    jobName: '',
+    running: false,
+    error: null,
+  });
   const [pairingOpen, setPairingOpen] = useState(false);
   const sheetHistoryRef = useRef(false);
 
@@ -189,29 +216,47 @@ function App() {
   snapshotRef.current = snapshot;
   const wideRef = useRef(wide);
   wideRef.current = wide;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
   const allowedSet = useMemo(
     () => (nodeInfo?.whoami?.tools ? new Set(nodeInfo.whoami.tools) : null),
     [nodeInfo],
   );
 
+  const deviceNoun = useMemo(
+    () => detectDeviceNoun(link.kind, typeof navigator !== 'undefined' ? navigator.userAgent : '', viewportWidth),
+    [link.kind, viewportWidth],
+  );
+
+  const updateSettings = useCallback((patch) => {
+    setSettings((prev) => {
+      const next = writeSettings(safeLocalStorage(), { ...prev, ...patch });
+      applySettingsToRoot(document.documentElement, next);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
-    applyTheme(theme);
-  }, [theme]);
+    applySettingsToRoot(document.documentElement, settings);
+  }, [settings]);
 
   useEffect(() => {
     if (mainRef.current) mainRef.current.scrollTop = 0;
   }, [route.section]);
 
   useEffect(() => {
-    if (!wide && mainRef.current) mainRef.current.scrollTop = 0;
-  }, [wide, route.machine, route.tab, route.tool, route.jobId]);
+    if (!wide && mainRef.current && route.tab !== 'command') {
+      mainRef.current.scrollTop = 0;
+    }
+  }, [wide, route.machine, route.tab, route.tool, route.action, route.jobId, route.page, route.sub]);
 
   useEffect(() => {
     const el = shellRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        setWide(entry.contentRect.width >= 820);
+        setViewportWidth(entry.contentRect.width);
       }
     });
     ro.observe(el);
@@ -274,6 +319,8 @@ function App() {
           localNode: targetNode.node,
           initialMachines: baseSnap?.machines || [],
           cachedAt: baseSnap?.cachedAt ?? null,
+          forceOffline: Boolean(options.forceOffline),
+          checkOffline: settingsRef.current.checkOffline !== false,
           signal: ctrl.signal,
           onUpdate(next) {
             if (ctrl.signal.aborted) return;
@@ -293,6 +340,7 @@ function App() {
           refreshAbortRef.current = null;
           refreshInFlightRef.current = false;
           setRefreshing(false);
+          setPullState('');
         }
       }
     },
@@ -313,14 +361,14 @@ function App() {
       }
       const primary = nextState.nodes[0];
       let cachedSnap = null;
-      if (link.kind !== 'mock') {
+      if (typeof link.initialFleetCache === 'function') {
+        cachedSnap = hydrateFleetCache(link.initialFleetCache(), primary.node);
+        if (cachedSnap) setSnapshot(cachedSnap);
+      } else if (link.kind !== 'mock') {
         const stored = persistentCache.get('fleet')?.value;
         cachedSnap = hydrateFleetCache(stored, primary.node);
-        if (cachedSnap) {
-          setSnapshot(cachedSnap);
-        }
+        if (cachedSnap) setSnapshot(cachedSnap);
       }
-      // Paint immediately with cached list or this node; never block first paint on remote peers.
       setBooting(false);
 
       link
@@ -370,9 +418,7 @@ function App() {
     };
   }, [link, hydrate]);
 
-  // Poll every 15 s while visible and refresh on resume/focus. On mobile resume from background,
-  // tear down cached SSH sessions before refreshing so waking a phone does not stall on half-open
-  // TCP sockets.
+  // Poll on the user's configured interval while visible and refresh on resume/focus.
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
     let wasHidden = document.visibilityState === 'hidden';
@@ -400,24 +446,28 @@ function App() {
     };
 
     const onFocus = () => {
-      if (document.visibilityState === 'visible' && !wasHidden && !resuming) {
+      if (document.visibilityState === 'visible' && !wasHidden && !resuming && settings.refreshSeconds > 0) {
         refreshFleet(nodeInfo, { background: true });
       }
     };
 
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible' && !resuming) {
-        refreshFleet(nodeInfo, { background: true });
-      }
-    }, POLL_MS);
+    const timer =
+      settings.refreshSeconds > 0
+        ? window.setInterval(() => {
+            if (document.visibilityState === 'visible' && !resuming) {
+              refreshFleet(nodeInfo, { background: true });
+            }
+          }, settings.refreshSeconds * 1000)
+        : null;
+
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
-      window.clearInterval(timer);
+      if (timer !== null) window.clearInterval(timer);
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [link, linkState?.ready, nodeInfo, refreshFleet]);
+  }, [link, linkState?.ready, nodeInfo, refreshFleet, settings.refreshSeconds]);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {
@@ -435,9 +485,29 @@ function App() {
     }
   }, []);
 
-  const recordRun = useCallback((machine, entry) => {
-    setRunHistory((prev) => [{ machine, ...entry }, ...prev].slice(0, 20));
-  }, []);
+  const commandRunsApi = useMemo(
+    () => ({
+      setDraft(patch) {
+        setCommandDraft((prev) => ({ ...prev, ...patch }));
+      },
+      appendRun(machineName, entry) {
+        setCommandRunsByMachine((prev) => ({
+          ...prev,
+          [machineName]: [...(prev[machineName] || []), entry].slice(-25),
+        }));
+      },
+      updateRun(machineName, runId, updater) {
+        setCommandRunsByMachine((prev) => {
+          const list = prev[machineName] || [];
+          return {
+            ...prev,
+            [machineName]: list.map((item) => (item.id === runId ? updater(item) : item)),
+          };
+        });
+      },
+    }),
+    [],
+  );
 
   const onWakeMachine = useCallback(
     (machine) => {
@@ -454,29 +524,190 @@ function App() {
         },
         async onConfirm() {
           await link.call('power.wake', { machine: machine.name });
-          refreshFleet(nodeInfo);
+          refreshFleet(nodeInfo, { forceOffline: true });
         },
       });
     },
     [link, openConfirm, refreshFleet, nodeInfo],
   );
 
+  const machines = snapshot?.machines || [];
+  const selectedMachine = route.machine
+    ? machines.find((m) => m.name === route.machine) || null
+    : null;
+
+  const isRootPlace =
+    (route.section === 'machines' && !route.machine) ||
+    (route.section === 'activity' && !route.jobId) ||
+    (route.section === 'actions' && !route.action && !route.allTools);
+
+  const inMachinePhone = !wide && route.section === 'machines' && Boolean(route.machine);
+  const isPhoneCommand =
+    inMachinePhone && route.tab === 'command' && Boolean(selectedMachine?.reachable);
+  const isActionsRoot =
+    route.section === 'actions' && !route.action && !route.allTools;
+  const hasDock = isActionsRoot || isPhoneCommand;
+
+  // Hide bottom bar on phone for Settings and single-item detail pages so Settings feels like a real page.
+  const showBottomNav = wide || isRootPlace || inMachinePhone;
+
   function goBack() {
+    if (route.section === 'machines' && route.machine) {
+      if (route.jobId) {
+        window.location.hash = routeHref({ section: 'machines', machine: route.machine, tab: 'activity' });
+        return;
+      }
+      if (['command', 'services', 'projects', 'activity'].includes(route.tab)) {
+        window.location.hash = routeHref({ section: 'machines', machine: route.machine, tab: 'more' });
+        return;
+      }
+      window.location.hash = '#/machines';
+      return;
+    }
+    if (route.section === 'activity' && route.jobId) {
+      window.location.hash = '#/activity';
+      return;
+    }
+    if (route.section === 'actions') {
+      if (route.allTools && route.tool) {
+        window.location.hash = '#/actions/all';
+        return;
+      }
+      window.location.hash = '#/actions';
+      return;
+    }
+    if (route.section === 'settings') {
+      if (route.sub) {
+        window.location.hash = routeHref({ section: 'settings', page: route.page });
+        return;
+      }
+      if (route.page) {
+        window.location.hash = '#/settings';
+        return;
+      }
+      window.location.hash = '#/machines';
+      return;
+    }
     if (window.history.length > 1) {
       window.history.back();
-    } else if (route.section === 'machines') {
+    } else {
       window.location.hash = '#/machines';
-    } else if (route.section === 'jobs') {
-      window.location.hash = '#/jobs';
-    } else if (route.section === 'tools') {
-      window.location.hash = '#/tools';
     }
   }
 
+  // Pointer-event gestures: root-place swipe, machine-part swipe, pull-to-refresh, non-Android edge back.
+  function onMainPointerDown(e) {
+    if (e.button > 0) return;
+    if (shouldIgnoreSwipeTarget(e.target, mainRef.current)) return;
+    swipeRef.current = {
+      id: e.pointerId,
+      x: e.clientX,
+      y: e.clientY,
+      t: Date.now(),
+      scrollTop: mainRef.current ? mainRef.current.scrollTop : 0,
+    };
+  }
+
+  function onMainPointerMove(e) {
+    const start = swipeRef.current;
+    if (!start || start.id !== e.pointerId) return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    const canPull =
+      (route.section === 'machines' && (!route.machine || route.tab === 'overview')) ||
+      (route.section === 'activity' && !route.jobId);
+    if (canPull && start.scrollTop <= 2 && dy > 20 && dy > Math.abs(dx) * 1.5) {
+      setPullState(dy >= PULL_REFRESH_PX ? 'release' : 'pull');
+    } else if (pullState === 'pull' || pullState === 'release') {
+      setPullState('');
+    }
+  }
+
+  function onMainPointerUp(e) {
+    const start = swipeRef.current;
+    swipeRef.current = null;
+    if (!start || start.id !== e.pointerId) return;
+
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    const elapsedMs = Date.now() - start.t;
+
+    const canPull =
+      (route.section === 'machines' && (!route.machine || route.tab === 'overview')) ||
+      (route.section === 'activity' && !route.jobId);
+    if (canPull && classifyPullRefresh({ dx, dy, scrollTop: start.scrollTop })) {
+      setPullState('refreshing');
+      refreshFleet(nodeInfo, { forceOffline: true });
+      return;
+    }
+    if (pullState === 'pull' || pullState === 'release') {
+      setPullState('');
+    }
+
+    if (wide) return;
+
+    const allowEdgeBack = !isRootPlace && !hasNativeEdgeBack();
+    const swipe = classifyHorizontalSwipe({
+      dx,
+      dy,
+      elapsedMs,
+      startX: start.x,
+      allowEdgeBack,
+    });
+    if (!swipe) return;
+
+    if (swipe === 'edge-back') {
+      goBack();
+      return;
+    }
+
+    if (isRootPlace) {
+      const nextSection = stepTab(ROOT_SECTIONS, route.section, swipe);
+      if (nextSection) {
+        window.location.hash = routeHref({ section: nextSection });
+      }
+      return;
+    }
+
+    if (inMachinePhone && route.machine) {
+      const currentPart = MACHINE_PARTS.includes(route.tab) ? route.tab : 'more';
+      const nextPart = stepTab(MACHINE_PARTS, currentPart, swipe);
+      if (nextPart) {
+        window.location.hash = routeHref({
+          section: 'machines',
+          machine: route.machine,
+          tab: nextPart,
+        });
+      }
+    }
+  }
+
+  function onMainPointerCancel() {
+    swipeRef.current = null;
+    if (pullState === 'pull' || pullState === 'release') setPullState('');
+  }
+
+  function settingsHeaderTitle() {
+    if (!route.page) return 'Settings';
+    if (route.page === 'device') return `This ${deviceNoun}`;
+    if (route.page === 'connections') {
+      if (route.sub === 'pair') return 'Pair a machine';
+      if (route.sub === 'invite') return 'Let another device in';
+      if (route.sub === 'add') return 'Add a machine';
+      if (route.sub === 'node' && route.item) return route.item;
+      if (route.sub === 'incoming' && route.item) return route.item;
+      return 'Connections';
+    }
+    if (route.page === 'appearance') return 'Appearance';
+    if (route.page === 'refreshing') return 'Refreshing';
+    if (route.page === 'about') return 'About';
+    return 'Settings';
+  }
+
   function renderHeader() {
-    // Narrow sub-pages get a Back button and item title in the top bar.
-    if (!wide && route.section === 'machines' && route.machine) {
-      const m = (snapshot?.machines || []).find((item) => item.name === route.machine);
+    // Phone inside a machine.
+    if (inMachinePhone && route.machine) {
+      const m = selectedMachine;
       const dotClass =
         m?.status === 'asking' || m?.asking
           ? 'dot asking'
@@ -485,64 +716,262 @@ function App() {
             : m.busy
               ? 'dot busy'
               : 'dot';
+      const subTabNames = {
+        command: 'Command',
+        services: 'Services',
+        projects: 'Projects',
+        activity: 'Activity',
+      };
+      if (subTabNames[route.tab]) {
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>
+              ${subTabNames[route.tab]}
+              <small>${route.machine}</small>
+            </h1>
+          </header>
+        `;
+      }
       return html`
-        <header class="bar">
+        <header class="top sub">
           <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
             <${Icon} name="back" />
           </button>
           <span class=${dotClass} aria-hidden="true"></span>
-          <h1>${route.machine}</h1>
-          <button
-            type="button"
-            class="btn icon"
-            aria-label="Refresh"
-            onClick=${() => refreshFleet(nodeInfo)}
-          >
-            <${Icon} name="refresh" />
-          </button>
+          <h1>
+            ${route.machine}
+            ${m ? html`<small>${formatMachineDetailSubtitle(m)}</small>` : null}
+          </h1>
         </header>
       `;
     }
 
-    if (!wide && route.section === 'tools' && route.tool) {
-      const spec = (tools || []).find((t) => t.name === route.tool);
+    // Phone Activity detail.
+    if (!wide && route.section === 'activity' && route.jobId) {
       return html`
-        <header class="bar">
+        <header class="top sub">
           <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
             <${Icon} name="back" />
           </button>
-          <h1>${route.tool}</h1>
-          ${spec ? html`<span class=${`chip fx ${spec.effect}`}>${spec.effect}</span>` : null}
+          <h1>Activity</h1>
         </header>
       `;
     }
 
-    if (!wide && route.section === 'jobs' && route.jobId) {
+    // Actions sub-pages (All tools or one Action).
+    if (route.section === 'actions' && route.allTools) {
+      const spec = route.tool ? (tools || []).find((t) => t.name === route.tool) : null;
       return html`
-        <header class="bar">
+        <header class="top sub">
           <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
             <${Icon} name="back" />
           </button>
-          <h1>${route.jobId}</h1>
+          <h1>${!wide && route.tool ? route.tool : 'All tools'}</h1>
+          ${!wide && spec ? html`<span class=${`chip fx ${spec.effect}`}>${spec.effect}</span>` : null}
         </header>
       `;
     }
 
+    if (route.section === 'actions' && route.action) {
+      const act = findActionById(route.action, tools, allowedSet, nodeInfo?.whoami);
+      return html`
+        <header class="top sub">
+          <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+            <${Icon} name="back" />
+          </button>
+          <h1>${act ? act.title : 'Action'}</h1>
+        </header>
+      `;
+    }
+
+    // Settings (phone gets Back + title; wide gets big "Settings" title, or sub-back for deep connections flows).
+    if (route.section === 'settings') {
+      if (!wide || route.sub) {
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>${settingsHeaderTitle()}</h1>
+          </header>
+        `;
+      }
+      return html`
+        <header class="top">
+          <h1>Settings</h1>
+        </header>
+      `;
+    }
+
+    // Root places: Machines, Activity, Actions.
+    const gearBtn = !wide
+      ? html`
+          <a class="btn icon" href="#/settings" aria-label="Settings">
+            <${Icon} name="gear" />
+          </a>
+        `
+      : null;
+
+    if (route.section === 'activity') {
+      const runningCount = (snapshot?.runningJobs || []).length;
+      return html`
+        <header class="top">
+          <h1>
+            Activity
+            ${runningCount > 0 ? html`<small>${runningCount} running now</small>` : null}
+          </h1>
+          ${gearBtn}
+        </header>
+      `;
+    }
+
+    if (route.section === 'actions') {
+      return html`
+        <header class="top">
+          <h1>Actions</h1>
+          ${gearBtn}
+        </header>
+      `;
+    }
+
+    const machinesSub = formatMachinesHeaderSubtitle(machines, {
+      cachedAt: snapshot?.cachedAt ?? null,
+    });
     return html`
-      <header class="bar">
-        <h1 class="wordmark"><b>▍</b>Legion</h1>
-        ${nodeInfo?.role ? html`<span class="chip">${nodeInfo.role}</span>` : null}
-        <button
-          type="button"
-          class="btn icon"
-          aria-label="Refresh"
-          onClick=${() => refreshFleet(nodeInfo)}
-        >
-          <${Icon} name="refresh" />
-        </button>
+      <header class="top">
+        <h1>
+          Machines
+          ${machinesSub ? html`<small>${machinesSub}</small>` : null}
+        </h1>
+        ${gearBtn}
       </header>
     `;
   }
+
+  function renderDock() {
+    if (isActionsRoot) {
+      return html`
+        <div class="dock">
+          <input
+            class="input plain"
+            type="search"
+            value=${actionsQuery}
+            onInput=${(e) => setActionsQuery(e.target.value)}
+            placeholder="Find something to do"
+            aria-label="Find something to do"
+          />
+        </div>
+      `;
+    }
+    if (isPhoneCommand && selectedMachine) {
+      return html`
+        <div class="dock">
+          <${CommandComposer}
+            machine=${selectedMachine}
+            nodeInfo=${nodeInfo}
+            link=${link}
+            allowedSet=${allowedSet}
+            state=${commandDraft}
+            onStateChange=${commandRunsApi.setDraft}
+            onAppendRun=${commandRunsApi.appendRun}
+            onUpdateRun=${commandRunsApi.updateRun}
+            onOpenJob=${(id) => {
+              window.location.hash = routeHref({
+                section: 'machines',
+                machine: selectedMachine.name,
+                tab: 'activity',
+                jobId: id,
+              });
+            }}
+          />
+        </div>
+      `;
+    }
+    return null;
+  }
+
+  function renderNav() {
+    if (!showBottomNav) return null;
+
+    // Phone inside a machine: 4 parts of this machine.
+    if (inMachinePhone && route.machine) {
+      const moreActive = ['more', 'command', 'services', 'projects', 'activity'].includes(route.tab);
+      return html`
+        <nav class="nav parts" aria-label=${`${route.machine} sections`}>
+          <a
+            href=${routeHref({ section: 'machines', machine: route.machine, tab: 'overview' })}
+            aria-current=${route.tab === 'overview' ? 'page' : undefined}
+          >
+            <${Icon} name="overview" />Overview
+          </a>
+          <a
+            href=${routeHref({ section: 'machines', machine: route.machine, tab: 'files' })}
+            aria-current=${route.tab === 'files' ? 'page' : undefined}
+          >
+            <${Icon} name="files" />Files
+          </a>
+          <a
+            href=${routeHref({ section: 'machines', machine: route.machine, tab: 'power' })}
+            aria-current=${route.tab === 'power' ? 'page' : undefined}
+          >
+            <${Icon} name="power" />Power
+          </a>
+          <a
+            href=${routeHref({ section: 'machines', machine: route.machine, tab: 'more' })}
+            aria-current=${moreActive ? 'page' : undefined}
+          >
+            <${Icon} name="more" />More
+          </a>
+        </nav>
+      `;
+    }
+
+    // Root 3 places (plus Settings at the foot of the wide rail).
+    return html`
+      <nav class="nav" aria-label="Main">
+        <a
+          href="#/machines"
+          aria-current=${route.section === 'machines' ? 'page' : undefined}
+        >
+          <${Icon} name="machines" />Machines
+        </a>
+        <a
+          href="#/activity"
+          aria-current=${route.section === 'activity' ? 'page' : undefined}
+        >
+          <${Icon} name="activity" />Activity
+        </a>
+        <a
+          href="#/actions"
+          aria-current=${route.section === 'actions' ? 'page' : undefined}
+        >
+          <${Icon} name="actions" />Actions
+        </a>
+        ${wide
+          ? html`
+              <a
+                class="last"
+                href="#/settings"
+                aria-current=${route.section === 'settings' ? 'page' : undefined}
+              >
+                <${Icon} name="gear" />Settings
+              </a>
+            `
+          : null}
+      </nav>
+    `;
+  }
+
+  const appClasses = [
+    'app',
+    !showBottomNav ? 'standalone' : '',
+    hasDock ? 'docked' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   return html`
     <div ref=${shellRef} class="shell">
@@ -550,7 +979,7 @@ function App() {
       ${booting
         ? html`
             <div class="app standalone">
-              <header class="bar"><h1 class="wordmark"><b>▍</b>Legion</h1></header>
+              <header class="top"><h1>Machines</h1></header>
               <main class="main"><div class="empty">Connecting…</div></main>
             </div>
           `
@@ -568,9 +997,27 @@ function App() {
               />
             `
           : html`
-              <div class="app">
+              <div class=${appClasses}>
                 ${renderHeader()}
-                <main ref=${mainRef} class="main">
+                <main
+                  ref=${mainRef}
+                  class=${isPhoneCommand ? 'main command-stream' : 'main'}
+                  onPointerDown=${onMainPointerDown}
+                  onPointerMove=${onMainPointerMove}
+                  onPointerUp=${onMainPointerUp}
+                  onPointerCancel=${onMainPointerCancel}
+                >
+                  ${pullState
+                    ? html`
+                        <div class="pull-hint" role="status">
+                          ${pullState === 'refreshing'
+                            ? 'Refreshing…'
+                            : pullState === 'release'
+                              ? 'Release to refresh'
+                              : 'Pull to refresh'}
+                        </div>
+                      `
+                    : null}
                   ${route.section === 'machines'
                     ? html`
                         <${MachinesView}
@@ -583,48 +1030,61 @@ function App() {
                           nodeInfo=${nodeInfo}
                           tools=${tools}
                           allowedSet=${allowedSet}
+                          settings=${settings}
                           onWakeMachine=${onWakeMachine}
                           onRequestConfirm=${openConfirm}
-                          onRefresh=${() => refreshFleet(nodeInfo)}
-                          runHistory=${runHistory}
-                          onRecordRun=${recordRun}
+                          onRefresh=${() => refreshFleet(nodeInfo, { forceOffline: true })}
+                          commandRuns=${{ byMachine: commandRunsByMachine, draft: commandDraft }}
+                          onCommandRunsChange=${commandRunsApi}
                         />
                       `
-                    : route.section === 'jobs'
+                    : route.section === 'activity'
                       ? html`
-                          <${JobsView}
+                          <${ActivityView}
                             route=${route}
                             snapshot=${snapshot}
                             link=${link}
                             nodeInfo=${nodeInfo}
                             allowedSet=${allowedSet}
+                            settings=${settings}
                             wide=${wide}
                             onRefreshFleet=${() => refreshFleet(nodeInfo)}
                           />
                         `
-                      : route.section === 'tools'
+                      : route.section === 'actions'
                         ? html`
-                            <${ToolsView}
+                            <${ActionsView}
                               route=${route}
                               tools=${tools}
                               allowedSet=${allowedSet}
                               nodeInfo=${nodeInfo}
                               snapshot=${snapshot}
                               link=${link}
+                              settings=${settings}
                               wide=${wide}
+                              query=${actionsQuery}
                               onRequestConfirm=${openConfirm}
+                              onRefreshFleet=${() => refreshFleet(nodeInfo)}
                             />
                           `
                         : html`
-                            <${DeviceView}
+                            <${SettingsView}
+                              route=${route}
+                              wide=${wide}
+                              deviceNoun=${deviceNoun}
                               link=${link}
                               linkState=${linkState}
                               nodeInfo=${nodeInfo}
                               tools=${tools}
-                              theme=${theme}
-                              onChangeTheme=${setTheme}
+                              allowedSet=${allowedSet}
+                              snapshot=${snapshot}
+                              settings=${settings}
+                              onUpdateSettings=${updateSettings}
                               onRequestConfirm=${openConfirm}
-                              onOpenPairing=${link.kind === 'app' ? () => setPairingOpen(true) : null}
+                              onConnected=${(next) => {
+                                setFleetError(null);
+                                hydrate(next);
+                              }}
                               onSelectNode=${
                                 link.kind === 'app' && typeof link.selectNode === 'function'
                                   ? async (node) => {
@@ -658,36 +1118,18 @@ function App() {
                             />
                           `}
                 </main>
-                <nav class="nav" aria-label="Main">
-                  <a
-                    href="#/machines"
-                    aria-current=${route.section === 'machines' ? 'page' : undefined}
-                  >
-                    <${Icon} name="machines" />Machines
-                  </a>
-                  <a
-                    href="#/jobs"
-                    aria-current=${route.section === 'jobs' ? 'page' : undefined}
-                  >
-                    <${Icon} name="jobs" />Jobs
-                  </a>
-                  <a
-                    href="#/tools"
-                    aria-current=${route.section === 'tools' ? 'page' : undefined}
-                  >
-                    <${Icon} name="tools" />Tools
-                  </a>
-                  <a
-                    href="#/device"
-                    aria-current=${route.section === 'device' ? 'page' : undefined}
-                  >
-                    <${Icon} name="device" />${wide ? 'Device' : 'This device'}
-                  </a>
-                </nav>
+                ${renderDock()}
+                ${renderNav()}
               </div>
             `}
       ${confirmRequest
-        ? html`<${ConfirmSheet} request=${confirmRequest} onClose=${closeConfirm} />`
+        ? html`
+            <${ConfirmSheet}
+              request=${confirmRequest}
+              technical=${Boolean(settings.technical)}
+              onClose=${closeConfirm}
+            />
+          `
         : null}
     </div>
   `;

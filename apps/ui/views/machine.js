@@ -1,31 +1,35 @@
-// One machine screen with Overview, Run, Files, Jobs, Services, Projects, and Power tabs.
+// One machine screen: Overview, Files, Power, More, Command, Services, Projects, and Activity.
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { CopyButton, Meter, Notice } from './common.js';
+import { ActivityDetail, ActivityGroups, ActivityRow } from './activity.js';
+import {
+  formatCommandMeta,
+  formatFriendlyUptime,
+  formatMachineDetailSubtitle,
+  friendlyJobName,
+} from '../lib/activity.js';
 import {
   diskUsagePct,
   formatBusyReasonLines,
   formatBytePair,
   formatBytes,
-  formatDuration,
-  formatDurationMs,
-  formatElapsed,
   formatRelativeTime,
   machineMetrics,
   osLabel,
   realDisks,
 } from '../lib/format.js';
-import { MACHINE_TABS, routeHref } from '../lib/route.js';
+import { routeHref, WIDE_MACHINE_TABS } from '../lib/route.js';
 import { describePowerConfirm, unavailableReason } from '../lib/schema.js';
 
-const TAB_LABELS = {
+const WIDE_TAB_LABELS = {
   overview: 'Overview',
-  run: 'Run',
   files: 'Files',
-  jobs: 'Jobs',
+  power: 'Power',
+  command: 'Command',
   services: 'Services',
   projects: 'Projects',
-  power: 'Power',
+  activity: 'Activity',
 };
 
 function targetFor(machineName, nodeName) {
@@ -65,45 +69,54 @@ function splitCrumbs(fullPath) {
 
 // ── Overview tab ─────────────────────────────────────────────────────────────────────────────
 
-function OverviewTab({ machine, allowedSet, onWake }) {
+function OverviewTab({ machine, allowedSet, technical, onWake, onStopJob }) {
   if (machine.status === 'asking' || machine.asking) {
     return html`<div class="empty">Checking ${machine.name}…</div>`;
   }
 
   if (!machine.reachable) {
-    const err = machine.error || {
-      message: machine.reason || `${machine.name} did not answer.`,
-      hint: 'Check that the machine is awake and reachable.',
-    };
+    const sub = formatMachineDetailSubtitle(machine);
+    const canWake = machine.canWake && allowedSet?.has('power.wake');
     return html`
-      <${Notice}
-        kind="warn"
-        title=${err.message || `${machine.name} did not answer.`}
-        hint=${err.hint || null}
-      />
-      ${machine.canWake && allowedSet?.has('power.wake')
-        ? html`
-            <div class="actions">
-              <button type="button" class="btn primary" onClick=${() => onWake(machine)}>
-                Wake ${machine.name}
-              </button>
-            </div>
-          `
-        : null}
+      <div>
+        <div class="notice">
+          <strong>${machine.name} is off.</strong>
+          <span>
+            ${sub !== 'Off' ? `${sub}. ` : ''}
+            ${canWake
+              ? 'You can switch it on from here.'
+              : machine.canWake
+                ? 'This device is not allowed to wake machines.'
+                : 'Wake-on-LAN is not set up for this machine.'}
+          </span>
+        </div>
+        ${canWake
+          ? html`
+              <div class="actions">
+                <button type="button" class="btn primary" onClick=${() => onWake(machine)}>
+                  Wake ${machine.name}
+                </button>
+              </div>
+            `
+          : null}
+      </div>
     `;
   }
 
   const sys = machine.sys;
   const metrics = machineMetrics(sys);
   const disks = realDisks(sys?.disks);
+  const runningJobs = Array.isArray(machine.jobs) ? machine.jobs : [];
+  const canCancel = allowedSet ? allowedSet.has('job.cancel') : true;
+
   const loadText =
-    Array.isArray(sys?.cpu?.load) && sys.cpu.load.length > 0
+    technical && Array.isArray(sys?.cpu?.load) && sys.cpu.load.length > 0
       ? `load ${sys.cpu.load[0].toFixed(1)}`
       : null;
   const cpuDetail = [
     metrics ? `${metrics.cpuPct}%` : null,
     loadText,
-    sys?.cpu?.cores ? `${sys.cpu.cores} cores` : null,
+    technical && sys?.cpu?.cores ? `${sys.cpu.cores} cores` : null,
   ]
     .filter(Boolean)
     .join(' · ');
@@ -113,16 +126,16 @@ function OverviewTab({ machine, allowedSet, onWake }) {
     ? busyReasonLines.length > 0
       ? null
       : machine.runningJobs > 0
-        ? `yes: ${machine.runningJobs} ${machine.runningJobs === 1 ? 'job' : 'jobs'}`
-        : 'yes'
+        ? `${machine.runningJobs} ${machine.runningJobs === 1 ? 'thing' : 'things'} running`
+        : 'Busy'
     : machine.busyState === 'unmonitored'
-      ? 'unmonitored (no busy checks configured)'
-      : 'no';
+      ? 'Not monitored'
+      : 'Idle';
 
   const systemLine = [
     sys?.os?.family ? osLabel(sys.os.family) : null,
-    sys?.os?.kernel || sys?.os?.version || null,
-    sys?.os?.arch ? `· ${sys.os.arch}` : null,
+    technical ? sys?.os?.kernel || sys?.os?.version : sys?.os?.version || null,
+    technical && sys?.os?.arch ? `· ${sys.os.arch}` : null,
   ]
     .filter(Boolean)
     .join(' ')
@@ -130,6 +143,33 @@ function OverviewTab({ machine, allowedSet, onWake }) {
 
   return html`
     <div>
+      ${runningJobs.length > 0
+        ? html`
+            <p class="label">Running now</p>
+            <div class="list">
+              ${runningJobs.map(
+                (job) => html`
+                  <${ActivityRow}
+                    key=${job.id}
+                    job=${{ ...job, machine: machine.name }}
+                    href=${routeHref({
+                      section: 'machines',
+                      machine: machine.name,
+                      tab: 'activity',
+                      jobId: job.id,
+                    })}
+                    includeMachine=${false}
+                    technical=${technical}
+                    canCancel=${canCancel}
+                    onStop=${onStopJob}
+                  />
+                `,
+              )}
+            </div>
+          `
+        : null}
+
+      <p class="label">Health</p>
       ${metrics
         ? html`
             <div class="list">
@@ -150,10 +190,13 @@ function OverviewTab({ machine, allowedSet, onWake }) {
               ${disks.map((disk) => {
                 const used = Math.max(0, disk.total - (disk.available ?? 0));
                 const pct = diskUsagePct(disk);
+                const showMount = technical || disks.length > 1;
                 return html`
                   <div class="gauge" key=${disk.mount}>
                     <header>
-                      <span>Disk <span class="mono dim">${disk.mount}</span></span>
+                      <span>
+                        Disk${showMount ? html` <span class="mono dim">${disk.mount}</span>` : null}
+                      </span>
                       <span>${formatBytePair(used, disk.total)}</span>
                     </header>
                     <${Meter} value=${pct} />
@@ -173,26 +216,26 @@ function OverviewTab({ machine, allowedSet, onWake }) {
               )}
             </div>
           `
-        : html`<div class="empty">Loading system details…</div>`}
+        : html`<div class="empty">Loading health…</div>`}
 
       <p class="label">About</p>
       <div class="list">
-        <dl class="kv">
-          <dt>system</dt>
+        <dl class=${technical ? 'kv' : 'kv plain'}>
+          <dt>${technical ? 'system' : 'System'}</dt>
           <dd>${systemLine || 'Unknown'}</dd>
           ${sys?.uptime_s != null
             ? html`
-                <dt>up</dt>
-                <dd>${formatDuration(sys.uptime_s)}</dd>
+                <dt>${technical ? 'up' : 'On for'}</dt>
+                <dd>${formatFriendlyUptime(sys.uptime_s)}</dd>
               `
             : null}
-          ${machine.version
+          ${technical && machine.version
             ? html`
                 <dt>legion</dt>
                 <dd>${machine.version}</dd>
               `
             : null}
-          <dt>busy</dt>
+          <dt>${technical ? 'busy' : 'Status'}</dt>
           ${busyReasonLines.length > 0
             ? html`
                 <dd class="allows-lines">
@@ -206,18 +249,20 @@ function OverviewTab({ machine, allowedSet, onWake }) {
   `;
 }
 
-// ── Run tab ──────────────────────────────────────────────────────────────────────────────────
+// ── Command composer (docked at bottom on phone; bottom of pane on wide) ─────────────────────
 
-function RunTab({ machine, nodeInfo, link, allowedSet, history, onRecordRun, onOpenJob }) {
-  const [cmd, setCmd] = useState('');
-  const [asJob, setAsJob] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [chunks, setChunks] = useState([]);
-  const [metaLine, setMetaLine] = useState('');
-  const [error, setError] = useState(null);
-  const [startedJob, setStartedJob] = useState(null);
+export function CommandComposer({
+  machine,
+  nodeInfo,
+  link,
+  allowedSet,
+  state,
+  onStateChange,
+  onAppendRun,
+  onUpdateRun,
+  onOpenJob,
+}) {
   const abortRef = useRef(null);
-
   const canExec = allowedSet ? allowedSet.has('exec.run') : true;
   const canJob = allowedSet ? allowedSet.has('job.start') : true;
   const on = targetFor(machine.name, nodeInfo?.node);
@@ -228,22 +273,41 @@ function RunTab({ machine, nodeInfo, link, allowedSet, history, onRecordRun, onO
     };
   }, [machine.name]);
 
-  async function runCommand(line) {
-    const trimmed = String(line || '').trim();
-    if (!trimmed) return;
-    setError(null);
-    setStartedJob(null);
+  if (!canExec && !canJob) return null;
 
-    if (asJob) {
-      setRunning(true);
+  const cmd = state.cmd || '';
+  const asJob = Boolean(state.asJob);
+  const jobName = state.jobName || '';
+  const running = Boolean(state.running);
+
+  async function submit(e) {
+    e.preventDefault();
+    if (running && abortRef.current) {
+      abortRef.current.abort();
+      return;
+    }
+    const trimmed = cmd.trim();
+    if (!trimmed) return;
+
+    const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+    if (asJob && canJob) {
+      onStateChange({ running: true, error: null });
       try {
-        const res = await link.call('job.start', { cmd: trimmed }, { on });
-        setStartedJob(res);
-        onRecordRun(machine.name, { cmd: trimmed, jobId: res.id, at: Date.now() });
+        const args = { cmd: trimmed };
+        if (jobName.trim()) args.name = jobName.trim();
+        const res = await link.call('job.start', args, { on });
+        onAppendRun(machine.name, {
+          id: runId,
+          cmd: trimmed,
+          jobId: res.id,
+          jobName: res.name || jobName.trim() || '',
+          status: 'started',
+          at: Date.now(),
+        });
+        onStateChange({ cmd: '', jobName: '', running: false, error: null });
       } catch (err) {
-        setError(err);
-      } finally {
-        setRunning(false);
+        onStateChange({ running: false, error: err });
       }
       return;
     }
@@ -251,11 +315,19 @@ function RunTab({ machine, nodeInfo, link, allowedSet, history, onRecordRun, onO
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    setRunning(true);
-    setChunks([]);
-    setMetaLine(`${machine.name} · running…`);
-    let streamed = false;
 
+    onAppendRun(machine.name, {
+      id: runId,
+      cmd: trimmed,
+      status: 'running',
+      chunks: [],
+      exitCode: null,
+      durationMs: null,
+      at: Date.now(),
+    });
+    onStateChange({ cmd: '', running: true, error: null });
+
+    let streamed = false;
     try {
       const res = await link.call(
         'exec.run',
@@ -267,71 +339,49 @@ function RunTab({ machine, nodeInfo, link, allowedSet, history, onRecordRun, onO
             if (!evt) return;
             if (evt.kind === 'stdout' || evt.kind === 'stderr') {
               streamed = true;
-              setChunks((prev) => [...prev, { kind: evt.kind, text: String(evt.data ?? '') }]);
+              onUpdateRun(machine.name, runId, (prev) => ({
+                ...prev,
+                chunks: [...(prev.chunks || []), { kind: evt.kind, text: String(evt.data ?? '') }],
+              }));
             }
           },
         },
       );
-      if (!streamed) {
-        const fallback = [];
-        if (res.stdout) fallback.push({ kind: 'stdout', text: res.stdout });
-        if (res.stderr) fallback.push({ kind: 'stderr', text: res.stderr });
-        setChunks(fallback);
-      }
-      const statusText = res.timed_out
-        ? 'timed out'
-        : res.exit_code != null
-          ? `exit ${res.exit_code}`
-          : res.signal != null
-            ? `signal ${res.signal}`
-            : 'done';
-      setMetaLine(`${machine.name} · ${statusText} · ${formatDurationMs(res.duration_ms ?? 0)}`);
-      onRecordRun(machine.name, {
-        cmd: trimmed,
-        exitCode: res.exit_code,
-        durationMs: res.duration_ms,
-        at: Date.now(),
+      onUpdateRun(machine.name, runId, (prev) => {
+        const chunks = streamed
+          ? prev.chunks || []
+          : [
+              ...(res.stdout ? [{ kind: 'stdout', text: res.stdout }] : []),
+              ...(res.stderr ? [{ kind: 'stderr', text: res.stderr }] : []),
+            ];
+        return {
+          ...prev,
+          chunks,
+          status: res.timed_out ? 'timed_out' : res.exit_code === 0 ? 'succeeded' : 'failed',
+          exitCode: res.exit_code ?? null,
+          durationMs: res.duration_ms ?? 0,
+        };
       });
     } catch (err) {
       if (err?.code === 'cancelled') {
-        setMetaLine(`${machine.name} · cancelled`);
+        onUpdateRun(machine.name, runId, (prev) => ({ ...prev, status: 'cancelled' }));
       } else {
-        setError(err);
-        setMetaLine('');
+        onUpdateRun(machine.name, runId, (prev) => ({ ...prev, status: 'error', error: err }));
       }
     } finally {
       abortRef.current = null;
-      setRunning(false);
+      onStateChange({ running: false });
     }
   }
-
-  function onSubmit(e) {
-    e.preventDefault();
-    if (running && abortRef.current) {
-      abortRef.current.abort();
-      return;
-    }
-    runCommand(cmd);
-  }
-
-  if (!canExec && !canJob) {
-    return html`
-      <${Notice}
-        title="Running commands is not allowed."
-        hint=${unavailableReason({ name: 'exec.run', effect: 'exec' }, nodeInfo?.whoami)}
-      />
-    `;
-  }
-
-  const machineHistory = (history || []).filter((item) => item.machine === machine.name);
 
   return html`
     <div>
-      <form class="prompt" onSubmit=${onSubmit}>
+      ${state.error ? html`<${Notice} error=${state.error} />` : null}
+      <form class="prompt" onSubmit=${submit}>
         <input
           type="text"
           value=${cmd}
-          onInput=${(e) => setCmd(e.target.value)}
+          onInput=${(e) => onStateChange({ cmd: e.target.value })}
           placeholder="df -h /"
           aria-label="Command"
           autocomplete="off"
@@ -345,89 +395,156 @@ function RunTab({ machine, nodeInfo, link, allowedSet, history, onRecordRun, onO
           ${running ? 'Stop' : 'Run'}
         </button>
       </form>
-
       ${canJob
         ? html`
-            <label class="switch">
-              <span>
-                Keep running after I leave
-                <small class="help">Starts it as a job you can come back to.</small>
-              </span>
+            <label class="switch dock-switch">
+              <span>Keep running after I leave</span>
               <input
                 type="checkbox"
                 checked=${asJob}
-                onChange=${(e) => setAsJob(e.target.checked)}
+                onChange=${(e) => onStateChange({ asJob: e.target.checked })}
               />
             </label>
           `
         : null}
-
-      ${error ? html`<${Notice} error=${error} />` : null}
-
-      ${startedJob
+      ${canJob && asJob
         ? html`
-            <div class="notice">
-              <strong>Started job ${startedJob.name || startedJob.id}</strong>
-              <span>
-                Running in the background on ${machine.name}.
-              </span>
-              <div class="row-actions">
-                <button
-                  type="button"
-                  class="btn small primary"
-                  onClick=${() => onOpenJob(startedJob.id)}
-                >
-                  Follow output
-                </button>
-              </div>
+            <div class="dock-name">
+              <input
+                class="input plain"
+                type="text"
+                value=${jobName}
+                onInput=${(e) => onStateChange({ jobName: e.target.value })}
+                placeholder="Name it (optional, e.g. Photo backup)"
+                aria-label="Name for background task"
+                autocomplete="off"
+              />
             </div>
           `
         : null}
+    </div>
+  `;
+}
 
-      ${metaLine || chunks.length > 0
-        ? html`
-            <pre class="out">
-${metaLine ? html`<span class="meta">${metaLine}${'\n'}</span>` : null}${chunks.map(
-              (c, i) =>
+function CommandStream({ machine, runs, technical, allowedSet, nodeInfo, onOpenJob }) {
+  const endRef = useRef(null);
+  const canExec = allowedSet ? allowedSet.has('exec.run') : true;
+  const canJob = allowedSet ? allowedSet.has('job.start') : true;
+
+  useEffect(() => {
+    if (endRef.current && typeof endRef.current.scrollIntoView === 'function') {
+      endRef.current.scrollIntoView({ block: 'end', behavior: 'auto' });
+    }
+  }, [runs?.length, runs?.[runs.length - 1]?.chunks?.length]);
+
+  if (!canExec && !canJob) {
+    return html`
+      <${Notice}
+        title="Running commands is not allowed."
+        hint=${unavailableReason({ name: 'exec.run', effect: 'exec' }, nodeInfo?.whoami)}
+      />
+    `;
+  }
+
+  if (!machine.reachable) {
+    return html`<div class="empty">${machine.name} is off.</div>`;
+  }
+
+  if (!runs || runs.length === 0) {
+    return html`
+      <div class="empty">
+        Run a command on ${machine.name}. Output appears here above the input.
+      </div>
+    `;
+  }
+
+  return html`
+    ${runs.map((entry) => {
+      if (entry.jobId) {
+        const displayTitle = technical
+          ? entry.jobName || entry.cmd || entry.jobId
+          : friendlyJobName({ name: entry.jobName, command: entry.cmd });
+        return html`
+          <div class="notice" key=${entry.id}>
+            <strong>Started ${displayTitle}</strong>
+            <span>Running in the background on ${machine.name}.</span>
+            <div class="row-actions">
+              <button
+                type="button"
+                class="btn small primary"
+                onClick=${() => onOpenJob(entry.jobId)}
+              >
+                Follow output
+              </button>
+            </div>
+          </div>
+        `;
+      }
+      if (entry.error) {
+        return html`<${Notice} key=${entry.id} error=${entry.error} />`;
+      }
+      const meta = formatCommandMeta(entry, technical);
+      const chunks = entry.chunks || [];
+      return html`
+        <pre class="out" key=${entry.id}>
+<span class="meta">$ ${entry.cmd}${meta ? ` · ${meta}` : ''}${'\n'}</span>${chunks.length > 0
+            ? chunks.map((c, i) =>
                 c.kind === 'stderr'
                   ? html`<span key=${i} class="err">${c.text}</span>`
                   : html`<span key=${i}>${c.text}</span>`,
-            )}</pre>
-          `
-        : null}
+              )
+            : entry.status === 'running'
+              ? html`<span class="meta">Running…</span>`
+              : null}</pre>
+      `;
+    })}
+    <div ref=${endRef} aria-hidden="true"></div>
+  `;
+}
 
-      ${machineHistory.length > 0
-        ? html`
-            <p class="label">Earlier</p>
-            <div class="list">
-              ${machineHistory.map(
-                (item, idx) => html`
-                  <button
-                    type="button"
-                    key=${`${item.at}-${idx}`}
-                    class="row"
-                    onClick=${() => {
-                      setCmd(item.cmd);
-                      if (!item.jobId) runCommand(item.cmd);
-                      else onOpenJob(item.jobId);
-                    }}
-                  >
-                    <span class="body">
-                      <span class="title mono">${item.cmd}</span>
-                      <span class="sub">
-                        ${item.jobId
-                          ? `job ${item.jobId}`
-                          : item.exitCode != null
-                            ? `exit ${item.exitCode}`
-                            : 'ran'}${item.at ? ` · ${formatRelativeTime(item.at)}` : ''}
-                      </span>
-                    </span>
-                  </button>
-                `,
-              )}
-            </div>
-          `
-        : null}
+// ── More tab (phone 4th bottom part) ─────────────────────────────────────────────────────────
+
+function MoreTab({ machine }) {
+  const items = [
+    {
+      tab: 'command',
+      title: 'Command',
+      sub: 'Run a command and see what it says',
+    },
+    {
+      tab: 'services',
+      title: 'Services',
+      sub: 'Check, start or restart background services',
+    },
+    {
+      tab: 'projects',
+      title: 'Projects',
+      sub: 'Pull code and run tasks',
+    },
+    {
+      tab: 'activity',
+      title: `Activity on ${machine.name}`,
+      sub: 'Running and recent work on this machine',
+    },
+  ];
+
+  return html`
+    <div class="list">
+      ${items.map(
+        (item) => html`
+          <a
+            key=${item.tab}
+            class="row"
+            href=${routeHref({ section: 'machines', machine: machine.name, tab: item.tab })}
+          >
+            <span class="body">
+              <span class="title">${item.title}</span>
+              <span class="sub">${item.sub}</span>
+            </span>
+            <span class="chev" aria-hidden="true">›</span>
+          </a>
+        `,
+      )}
     </div>
   `;
 }
@@ -436,7 +553,7 @@ ${metaLine ? html`<span class="meta">${metaLine}${'\n'}</span>` : null}${chunks.
 
 const PREVIEW_CAP = 131072;
 
-function FilesTab({ machine, nodeInfo, link }) {
+function FilesTab({ machine, nodeInfo, link, technical }) {
   const initialPath = defaultRoot(nodeInfo?.whoami);
   const [dirPath, setDirPath] = useState(initialPath);
   const [listing, setListing] = useState(null);
@@ -479,8 +596,9 @@ function FilesTab({ machine, nodeInfo, link }) {
   }
 
   useEffect(() => {
+    if (!machine.reachable) return;
     loadDir(defaultRoot(nodeInfo?.whoami));
-  }, [machine.name]);
+  }, [machine.name, machine.reachable]);
 
   const currentPath = listing?.path || dirPath;
   const crumbs = splitCrumbs(currentPath);
@@ -491,11 +609,15 @@ function FilesTab({ machine, nodeInfo, link }) {
     }
   }, [currentPath]);
 
+  if (!machine.reachable) {
+    return html`<div class="empty">${machine.name} is off.</div>`;
+  }
+
   const filesHref = routeHref({ section: 'machines', machine: machine.name, tab: 'files' });
 
   return html`
     <div>
-      <div class="crumbs-bar">
+      <div class="crumbs-bar" data-no-swipe="true">
         <nav ref=${crumbsRef} class="crumbs" aria-label="Directory path">
           ${crumbs.map(
             (c, i) => html`
@@ -562,8 +684,13 @@ function FilesTab({ machine, nodeInfo, link }) {
                 ? html`<div class="empty">This folder is empty.</div>`
                 : html`
                     <div class="list">
-                      ${listing.entries.map(
-                        (entry) => html`
+                      ${listing.entries.map((entry) => {
+                        const kindLabel = technical
+                          ? `${entry.kind}${entry.mode ? ` · ${entry.mode}` : ''}`
+                          : entry.kind === 'dir'
+                            ? 'Folder'
+                            : 'File';
+                        return html`
                           <button
                             type="button"
                             key=${entry.path}
@@ -576,7 +703,7 @@ function FilesTab({ machine, nodeInfo, link }) {
                                 ${entry.kind === 'dir' ? `${entry.name}/` : entry.name}
                               </span>
                               <span class="sub">
-                                ${entry.kind}
+                                ${kindLabel}
                                 ${entry.mtime ? ` · ${formatRelativeTime(entry.mtime)}` : ''}
                               </span>
                             </span>
@@ -584,8 +711,8 @@ function FilesTab({ machine, nodeInfo, link }) {
                               ${entry.kind === 'file' ? formatBytes(entry.size) : ''}
                             </span>
                           </button>
-                        `,
-                      )}
+                        `;
+                      })}
                     </div>
                   `}
             `
@@ -596,143 +723,33 @@ function FilesTab({ machine, nodeInfo, link }) {
   `;
 }
 
-// ── Jobs tab (also reused by Jobs screen) ────────────────────────────────────────────────────
+// ── Machine Activity tab ─────────────────────────────────────────────────────────────────────
 
-export function JobFollowView({ machineName, nodeName, jobId, link, allowedSet, onBack, onChanged }) {
-  const [status, setStatus] = useState(null);
-  const [logText, setLogText] = useState('');
-  const [error, setError] = useState(null);
-  const [stopping, setStopping] = useState(false);
-  const offsetRef = useRef(0);
-  const on = targetFor(machineName, nodeName);
-  const canCancel = allowedSet ? allowedSet.has('job.cancel') : true;
-
-  useEffect(() => {
-    let alive = true;
-    let timer = null;
-    offsetRef.current = 0;
-    setLogText('');
-    setStatus(null);
-    setError(null);
-
-    async function poll() {
-      if (!alive) return;
-      try {
-        const [st, logs] = await Promise.all([
-          link.call('job.status', { id: jobId }, { on }),
-          link.call('job.logs', { id: jobId, offset: offsetRef.current }, { on }),
-        ]);
-        if (!alive) return;
-        setStatus(st);
-        if (logs?.content) {
-          setLogText((prev) => prev + logs.content);
-        }
-        if (typeof logs?.next_offset === 'number') {
-          offsetRef.current = logs.next_offset;
-        }
-        if (st.state === 'starting' || st.state === 'running') {
-          timer = window.setTimeout(poll, 900);
-        }
-      } catch (err) {
-        if (alive) setError(err);
-      }
-    }
-
-    poll();
-    return () => {
-      alive = false;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [machineName, jobId]);
-
-  async function onStop() {
-    setStopping(true);
-    setError(null);
-    try {
-      await link.call('job.cancel', { id: jobId }, { on });
-      const st = await link.call('job.status', { id: jobId }, { on });
-      setStatus(st);
-      if (onChanged) onChanged();
-    } catch (err) {
-      setError(err);
-    } finally {
-      setStopping(false);
-    }
-  }
-
-  const active = status && (status.state === 'starting' || status.state === 'running');
-
-  return html`
-    <div>
-      <div class="result-head">
-        <p class="label">${status?.name || jobId} · ${status?.state || 'loading…'}</p>
-        <div class="result-tools">
-          ${active && canCancel
-            ? html`
-                <button
-                  type="button"
-                  class="btn small danger"
-                  disabled=${stopping}
-                  onClick=${onStop}
-                >
-                  ${stopping ? 'Stopping…' : 'Stop job'}
-                </button>
-              `
-            : null}
-          ${onBack
-            ? html`<button type="button" class="btn small" onClick=${onBack}>All jobs</button>`
-            : null}
-        </div>
-      </div>
-
-      ${error ? html`<${Notice} error=${error} />` : null}
-
-      ${status
-        ? html`
-            <div class="list">
-              <dl class="kv">
-                <dt>machine</dt>
-                <dd>${machineName}</dd>
-                <dt>state</dt>
-                <dd>${status.state}${status.exit_code != null ? ` (exit ${status.exit_code})` : ''}</dd>
-                ${status.cmd || status.argv
-                  ? html`
-                      <dt>command</dt>
-                      <dd>${status.cmd || status.argv.join(' ')}</dd>
-                    `
-                  : null}
-                ${status.duration_s != null
-                  ? html`
-                      <dt>duration</dt>
-                      <dd>${formatElapsed(status.duration_s)}</dd>
-                    `
-                  : null}
-              </dl>
-            </div>
-          `
-        : null}
-
-      <p class="label">Output</p>
-      <pre class="out wrap">${logText || (active ? 'Waiting for output…' : 'No output recorded.')}</pre>
-    </div>
-  `;
-}
-
-function JobsTab({ machine, nodeInfo, link, allowedSet, jobId, onOpenJob, onCloseJob, onRefreshFleet }) {
+function MachineActivityTab({
+  machine,
+  nodeInfo,
+  link,
+  allowedSet,
+  technical,
+  jobId,
+  onRefreshFleet,
+}) {
   const [jobs, setJobs] = useState(null);
   const [error, setError] = useState(null);
   const on = targetFor(machine.name, nodeInfo?.node);
+  const canCancel = allowedSet ? allowedSet.has('job.cancel') : true;
 
   async function load() {
+    if (!machine.reachable) {
+      setJobs([]);
+      return;
+    }
     setError(null);
     try {
       const res = await link.call('job.list', { limit: 50 }, { on });
-      const list = Array.isArray(res?.jobs) ? res.jobs : [];
-      list.sort((a, b) => {
-        const aRun = a.state === 'running' || a.state === 'starting' ? 0 : 1;
-        const bRun = b.state === 'running' || b.state === 'starting' ? 0 : 1;
-        return aRun - bRun;
-      });
+      const list = Array.isArray(res?.jobs)
+        ? res.jobs.map((j) => ({ ...j, machine: machine.name }))
+        : [];
       setJobs(list);
     } catch (err) {
       setError(err);
@@ -741,17 +758,28 @@ function JobsTab({ machine, nodeInfo, link, allowedSet, jobId, onOpenJob, onClos
 
   useEffect(() => {
     load();
-  }, [machine.name, jobId]);
+  }, [machine.name, machine.reachable, jobId]);
+
+  async function handleStop(job) {
+    setError(null);
+    try {
+      await link.call('job.cancel', { id: job.id }, { on });
+      await load();
+      if (onRefreshFleet) onRefreshFleet();
+    } catch (err) {
+      setError(err);
+    }
+  }
 
   if (jobId) {
     return html`
-      <${JobFollowView}
+      <${ActivityDetail}
         machineName=${machine.name}
         nodeName=${nodeInfo?.node}
         jobId=${jobId}
         link=${link}
         allowedSet=${allowedSet}
-        onBack=${onCloseJob}
+        technical=${technical}
         onChanged=${() => {
           load();
           if (onRefreshFleet) onRefreshFleet();
@@ -763,35 +791,16 @@ function JobsTab({ machine, nodeInfo, link, allowedSet, jobId, onOpenJob, onClos
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
-      ${jobs === null
-        ? html`<div class="empty">Loading jobs…</div>`
-        : jobs.length === 0
-          ? html`<div class="empty">No jobs recorded on ${machine.name}.</div>`
-          : html`
-              <div class="list">
-                ${jobs.map((job) => {
-                  const active = job.state === 'running' || job.state === 'starting';
-                  return html`
-                    <button
-                      type="button"
-                      key=${job.id}
-                      class="row"
-                      onClick=${() => onOpenJob(job.id)}
-                    >
-                      <span class=${active ? 'dot busy' : 'dot off'} aria-hidden="true"></span>
-                      <span class="body">
-                        <span class="title mono">${job.command || job.name || job.id}</span>
-                        <span class="sub">
-                          ${job.state}
-                          ${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}
-                          ${job.created ? ` · ${formatRelativeTime(job.created)}` : ''}
-                        </span>
-                      </span>
-                    </button>
-                  `;
-                })}
-              </div>
-            `}
+      <${ActivityGroups}
+        jobs=${jobs}
+        includeMachine=${false}
+        technical=${technical}
+        canCancel=${canCancel}
+        hrefForJob=${(job) =>
+          routeHref({ section: 'machines', machine: machine.name, tab: 'activity', jobId: job.id })}
+        onStopJob=${handleStop}
+        emptyText=${`Nothing has run on ${machine.name} yet.`}
+      />
     </div>
   `;
 }
@@ -808,6 +817,10 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
   const on = targetFor(machine.name, nodeInfo?.node);
 
   async function load(q = filter) {
+    if (!machine.reachable) {
+      setServices([]);
+      return;
+    }
     setError(null);
     try {
       const args = { limit: 100 };
@@ -823,7 +836,7 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
     setSelected(null);
     setLogs(null);
     load('');
-  }, [machine.name]);
+  }, [machine.name, machine.reachable]);
 
   async function openService(svc) {
     setSelected(svc);
@@ -851,6 +864,10 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
     }
   }
 
+  if (!machine.reachable) {
+    return html`<div class="empty">${machine.name} is off.</div>`;
+  }
+
   return html`
     <div>
       <form
@@ -861,7 +878,7 @@ function ServicesTab({ machine, nodeInfo, link, allowedSet }) {
         }}
       >
         <input
-          class="input"
+          class="input plain"
           type="search"
           value=${filter}
           onInput=${(e) => {
@@ -981,6 +998,10 @@ function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
   const on = targetFor(machine.name, nodeInfo?.node);
 
   async function load() {
+    if (!machine.reachable) {
+      setProjects([]);
+      return;
+    }
     setError(null);
     try {
       const [listed, statuses] = await Promise.all([
@@ -1001,7 +1022,7 @@ function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
   useEffect(() => {
     setOutput('');
     load();
-  }, [machine.name]);
+  }, [machine.name, machine.reachable]);
 
   async function pull(project) {
     setBusyKey(`pull:${project.name}`);
@@ -1050,13 +1071,17 @@ function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
           },
         },
       );
-      if (res?.stdout && !output) setOutput(res.stdout + (res.stderr || ''));
-      else if (res?.id) setOutput(`Started job ${res.id}`);
+      if (res?.stdout) setOutput(res.stdout + (res.stderr || ''));
+      else if (res?.id) setOutput(`Started background task ${res.id}`);
     } catch (err) {
       setError(err);
     } finally {
       setBusyKey('');
     }
+  }
+
+  if (!machine.reachable) {
+    return html`<div class="empty">${machine.name} is off.</div>`;
   }
 
   return html`
@@ -1136,7 +1161,15 @@ function ProjectsTab({ machine, nodeInfo, link, allowedSet }) {
 
 // ── Power tab ────────────────────────────────────────────────────────────────────────────────
 
-function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRefreshFleet }) {
+function PowerTab({
+  machine,
+  nodeInfo,
+  link,
+  allowedSet,
+  technical,
+  onRequestConfirm,
+  onRefreshFleet,
+}) {
   const [status, setStatus] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -1166,7 +1199,8 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
     setError(null);
     setResult(null);
     const liveJobs = Array.isArray(machine.jobs) ? machine.jobs : [];
-    const busyReasons = status?.busy?.state === 'busy' ? status.busy.reasons || [] : machine.busyReasons || [];
+    const busyReasons =
+      status?.busy?.state === 'busy' ? status.busy.reasons || [] : machine.busyReasons || [];
     const copy = describePowerConfirm(tool, machine.name, args, liveJobs, busyReasons);
     onRequestConfirm({
       title: copy.title,
@@ -1204,34 +1238,31 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
 
   if (!machine.reachable) {
     const canWake = allowedSet?.has('power.wake');
-    const err = machine.error || {
-      message: machine.reason || `${machine.name} did not answer.`,
-      hint: machine.canWake
-        ? 'You can send a Wake-on-LAN packet from a reachable helper.'
-        : 'No Wake-on-LAN address is configured for this machine in fleet.toml.',
-    };
+    const sub = formatMachineDetailSubtitle(machine);
     return html`
       <div>
-        <${Notice}
-          kind="warn"
-          title=${err.message || `${machine.name} did not answer.`}
-          hint=${err.hint || null}
-        />
+        <div class="notice">
+          <strong>${machine.name} is off.</strong>
+          <span>
+            ${sub !== 'Off' ? `${sub}. ` : ''}
+            ${machine.canWake
+              ? canWake
+                ? 'Send a Wake-on-LAN signal to turn it on.'
+                : unavailableReason({ name: 'power.wake', effect: 'power' }, nodeInfo?.whoami)
+              : 'Wake-on-LAN is not configured for this machine.'}
+          </span>
+        </div>
         ${machine.canWake
           ? html`
               <div class="list">
                 <div class=${canWake ? 'row' : 'row off'}>
                   <div class="body">
                     <div class="title">Wake ${machine.name}</div>
-                    <div class="sub wrap">
-                      ${canWake
-                        ? 'Send Wake-on-LAN magic packets for this machine.'
-                        : unavailableReason({ name: 'power.wake', effect: 'power' }, nodeInfo?.whoami)}
-                    </div>
+                    <div class="sub wrap">Switch it on over the network</div>
                   </div>
                   <button
                     type="button"
-                    class="btn small"
+                    class="btn small primary"
                     disabled=${!canWake || busy}
                     onClick=${() =>
                       runAction('power.wake', { machine: machine.name }, undefined, true)}
@@ -1243,7 +1274,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
             `
           : null}
         ${error ? html`<${Notice} error=${error} />` : null}
-        ${result ? html`<pre class="out wrap">${JSON.stringify(result, null, 2)}</pre>` : null}
+        ${result && technical ? html`<pre class="out wrap">${JSON.stringify(result, null, 2)}</pre>` : null}
       </div>
     `;
   }
@@ -1253,7 +1284,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
       tool: 'power.sleep',
       label: `Sleep ${machine.name}`,
       verb: 'Sleep',
-      desc: `Put ${machine.name} to sleep after about 3 seconds.`,
+      desc: `Put ${machine.name} to sleep after a few seconds.`,
       args: {},
       dry: true,
     },
@@ -1269,7 +1300,9 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
       tool: 'power.restart',
       label: `Restart into ${t.name}`,
       verb: `Restart into ${t.name}`,
-      desc: `Arm boot target "${t.name}" (${t.how}) once and restart ${machine.name}.`,
+      desc: technical
+        ? `Boot into "${t.name}" (${t.how}) once and restart ${machine.name}.`
+        : `Start ${machine.name} into ${t.name} once.`,
       args: { into: t.name },
       dry: true,
     })),
@@ -1277,7 +1310,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
       tool: 'power.shutdown',
       label: `Shut down ${machine.name}`,
       verb: 'Shut down',
-      desc: `Power off ${machine.name} after a short delay.`,
+      desc: `Switch ${machine.name} off after a short delay.`,
       args: {},
       dry: true,
     },
@@ -1326,29 +1359,37 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
             const powerReasons = formatBusyReasonLines(status.busy?.reasons);
             const stateLabel =
               status.busy?.state === 'unmonitored'
-                ? 'unmonitored (no busy checks configured)'
-                : status.busy?.state || 'unknown';
+                ? 'Not monitored'
+                : status.busy?.state === 'busy'
+                  ? 'Busy'
+                  : status.busy?.state === 'idle'
+                    ? 'Idle'
+                    : status.busy?.state || 'Unknown';
             return html`
               <div class="list">
-                <dl class="kv">
-                  <dt>state</dt>
+                <dl class=${technical ? 'kv' : 'kv plain'}>
+                  <dt>${technical ? 'state' : 'Status'}</dt>
                   <dd>${stateLabel}</dd>
                   ${powerReasons.length > 0
                     ? html`
-                        <dt>reasons</dt>
+                        <dt>${technical ? 'reasons' : 'Why'}</dt>
                         <dd class="allows-lines">
                           ${powerReasons.map((line, i) => html`<span key=${i}>${line}</span>`)}
                         </dd>
                       `
                     : null}
-                  ${status.system
+                  ${technical && status.system
                     ? html`
                         <dt>system</dt>
                         <dd>${status.system}</dd>
                       `
                     : null}
-                  <dt>sudo</dt>
-                  <dd>${status.sudo ? 'yes' : 'no'}</dd>
+                  ${technical
+                    ? html`
+                        <dt>sudo</dt>
+                        <dd>${status.sudo ? 'yes' : 'no'}</dd>
+                      `
+                    : null}
                 </dl>
               </div>
             `;
@@ -1357,7 +1398,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
           ? html`<div class="empty">Loading power state…</div>`
           : null}
 
-      <p class="label">Power actions</p>
+      <p class="label">Power</p>
       <div class="list">
         ${actions.map((item) => {
           const allowed = allowedSet ? allowedSet.has(item.tool) : true;
@@ -1366,7 +1407,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
               <div class="body">
                 <div class="title">
                   <span>${item.label}</span>
-                  <span class="chip fx power">power</span>
+                  ${technical ? html`<span class="chip fx power">power</span>` : null}
                 </div>
                 <div class="sub wrap">
                   ${allowed
@@ -1387,7 +1428,7 @@ function PowerTab({ machine, nodeInfo, link, allowedSet, onRequestConfirm, onRef
         })}
       </div>
 
-      ${result ? html`<pre class="out wrap">${JSON.stringify(result, null, 2)}</pre>` : null}
+      ${result && technical ? html`<pre class="out wrap">${JSON.stringify(result, null, 2)}</pre>` : null}
     </div>
   `;
 }
@@ -1398,15 +1439,19 @@ export function MachineDetail({
   machine,
   tab,
   jobId,
-  showPaneTitle,
+  wide,
   link,
   nodeInfo,
   allowedSet,
+  settings,
+  onWakeMachine,
   onRequestConfirm,
   onRefreshFleet,
-  runHistory,
-  onRecordRun,
+  commandRuns,
+  onCommandRunsChange,
 }) {
+  const technical = Boolean(settings?.technical);
+  const effectiveTab = wide && tab === 'more' ? 'overview' : tab || 'overview';
   const dotClass =
     machine.status === 'asking' || machine.asking
       ? 'dot asking'
@@ -1424,99 +1469,154 @@ export function MachineDetail({
     window.location.hash = routeHref({
       section: 'machines',
       machine: machine.name,
-      tab: 'jobs',
+      tab: 'activity',
       jobId: id,
     });
   }
 
-  function closeJob() {
-    window.location.hash = routeHref({ section: 'machines', machine: machine.name, tab: 'jobs' });
+  async function handleStopJob(job) {
+    const on = targetFor(machine.name, nodeInfo?.node);
+    await link.call('job.cancel', { id: job.id }, { on });
+    if (onRefreshFleet) onRefreshFleet();
+  }
+
+  const runs = commandRuns?.byMachine?.[machine.name] || [];
+
+  // On phone, CommandTab renders directly into `.main.command-stream` while `app.js` renders the
+  // docked composer in `.dock`.
+  if (!wide && effectiveTab === 'command') {
+    return html`
+      <${CommandStream}
+        machine=${machine}
+        runs=${runs}
+        technical=${technical}
+        allowedSet=${allowedSet}
+        nodeInfo=${nodeInfo}
+        onOpenJob=${openJob}
+      />
+    `;
   }
 
   return html`
     <div>
-      ${showPaneTitle
-        ? html`<h2 class="pane-title"><span class=${dotClass} aria-hidden="true"></span>${machine.name}</h2>`
+      ${wide
+        ? html`
+            <h2 class="pane-title">
+              <span class=${dotClass} aria-hidden="true"></span>
+              ${machine.name}
+            </h2>
+            <div class="tabs" role="tablist" aria-label=${`${machine.name} sections`}>
+              ${WIDE_MACHINE_TABS.map(
+                (id) => html`
+                  <button
+                    type="button"
+                    key=${id}
+                    role="tab"
+                    aria-selected=${effectiveTab === id ? 'true' : 'false'}
+                    onClick=${() => selectTab(id)}
+                  >
+                    ${WIDE_TAB_LABELS[id]}
+                  </button>
+                `,
+              )}
+            </div>
+          `
         : null}
-      <div class="tabs" role="tablist" aria-label=${`${machine.name} sections`}>
-        ${MACHINE_TABS.map(
-          (id) => html`
-            <button
-              type="button"
-              key=${id}
-              role="tab"
-              aria-selected=${tab === id ? 'true' : 'false'}
-              onClick=${() => selectTab(id)}
-            >
-              ${TAB_LABELS[id]}
-            </button>
-          `,
-        )}
-      </div>
 
-      ${tab === 'overview'
+      ${effectiveTab === 'overview'
         ? html`
             <${OverviewTab}
               machine=${machine}
               allowedSet=${allowedSet}
-              onWake=${() => selectTab('power')}
+              technical=${technical}
+              onWake=${onWakeMachine || (() => selectTab('power'))}
+              onStopJob=${handleStopJob}
             />
           `
-        : tab === 'run'
-          ? html`
-              <${RunTab}
-                machine=${machine}
-                nodeInfo=${nodeInfo}
-                link=${link}
-                allowedSet=${allowedSet}
-                history=${runHistory}
-                onRecordRun=${onRecordRun}
-                onOpenJob=${openJob}
-              />
-            `
-          : tab === 'files'
-            ? html`<${FilesTab} machine=${machine} nodeInfo=${nodeInfo} link=${link} />`
-            : tab === 'jobs'
+        : effectiveTab === 'more'
+          ? html`<${MoreTab} machine=${machine} />`
+          : effectiveTab === 'command'
+            ? html`
+                <div class="spaced">
+                  <div class="main command-stream">
+                    <${CommandStream}
+                      machine=${machine}
+                      runs=${runs}
+                      technical=${technical}
+                      allowedSet=${allowedSet}
+                      nodeInfo=${nodeInfo}
+                      onOpenJob=${openJob}
+                    />
+                  </div>
+                  ${machine.reachable && commandRuns
+                    ? html`
+                        <div class="spaced">
+                          <${CommandComposer}
+                            machine=${machine}
+                            nodeInfo=${nodeInfo}
+                            link=${link}
+                            allowedSet=${allowedSet}
+                            state=${commandRuns.draft}
+                            onStateChange=${onCommandRunsChange.setDraft}
+                            onAppendRun=${onCommandRunsChange.appendRun}
+                            onUpdateRun=${onCommandRunsChange.updateRun}
+                            onOpenJob=${openJob}
+                          />
+                        </div>
+                      `
+                    : null}
+                </div>
+              `
+            : effectiveTab === 'files'
               ? html`
-                  <${JobsTab}
+                  <${FilesTab}
                     machine=${machine}
                     nodeInfo=${nodeInfo}
                     link=${link}
-                    allowedSet=${allowedSet}
-                    jobId=${jobId}
-                    onOpenJob=${openJob}
-                    onCloseJob=${closeJob}
-                    onRefreshFleet=${onRefreshFleet}
+                    technical=${technical}
                   />
                 `
-              : tab === 'services'
+              : effectiveTab === 'activity'
                 ? html`
-                    <${ServicesTab}
+                    <${MachineActivityTab}
                       machine=${machine}
                       nodeInfo=${nodeInfo}
                       link=${link}
                       allowedSet=${allowedSet}
+                      technical=${technical}
+                      jobId=${jobId}
+                      onRefreshFleet=${onRefreshFleet}
                     />
                   `
-                : tab === 'projects'
+                : effectiveTab === 'services'
                   ? html`
-                      <${ProjectsTab}
+                      <${ServicesTab}
                         machine=${machine}
                         nodeInfo=${nodeInfo}
                         link=${link}
                         allowedSet=${allowedSet}
                       />
                     `
-                  : html`
-                      <${PowerTab}
-                        machine=${machine}
-                        nodeInfo=${nodeInfo}
-                        link=${link}
-                        allowedSet=${allowedSet}
-                        onRequestConfirm=${onRequestConfirm}
-                        onRefreshFleet=${onRefreshFleet}
-                      />
-                    `}
+                  : effectiveTab === 'projects'
+                    ? html`
+                        <${ProjectsTab}
+                          machine=${machine}
+                          nodeInfo=${nodeInfo}
+                          link=${link}
+                          allowedSet=${allowedSet}
+                        />
+                      `
+                    : html`
+                        <${PowerTab}
+                          machine=${machine}
+                          nodeInfo=${nodeInfo}
+                          link=${link}
+                          allowedSet=${allowedSet}
+                          technical=${technical}
+                          onRequestConfirm=${onRequestConfirm}
+                          onRefreshFleet=${onRefreshFleet}
+                        />
+                      `}
     </div>
   `;
 }

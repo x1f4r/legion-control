@@ -1,6 +1,14 @@
 import { formatBusyReasonLines } from '../lib/format.js';
 
 // Deterministic mock link (?mock) shaped like real Legion tool results.
+// Mode flags (comma-separated, e.g. ?mock=multi,tech):
+//   token   - unauthenticated HTTP token start screen
+//   pair    - unauthenticated app pairing start screen
+//   repair  - damaged state file recovery screen
+//   limited - observer role (no exec, write, power, destroy, admin)
+//   multi   - native app mode with two paired nodes (tower, pi)
+//   first   - adds a never-seen machine ("mini") that starts in asking state
+//   tech    - starts with Technical details turned on
 
 const isoAgo = (sec) => new Date(Date.now() - sec * 1000).toISOString();
 
@@ -25,6 +33,37 @@ const MOCK_TOOLS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'device.invite',
+    effect: 'admin',
+    description: 'Create a one-time pairing invite so another device can connect to this machine.',
+    input_schema: {
+      type: 'object',
+      required: ['principal'],
+      properties: {
+        principal: { type: 'string', description: 'Name in policy.toml for the new device (for example phone or tablet).' },
+        valid_minutes: { type: 'integer', default: 15, minimum: 1, maximum: 1440, description: 'Minutes before the invite expires.' },
+      },
+    },
+  },
+  {
+    name: 'device.list',
+    effect: 'admin',
+    description: 'List paired devices and pending invites accepted by this machine.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'device.remove',
+    effect: 'admin',
+    description: 'Revoke a paired device or cancel a pending invite on this machine.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Paired device name to remove.' },
+        id: { type: 'string', description: 'Pending invite id to cancel.' },
+      },
+    },
+  },
+  {
     name: 'exec.run',
     effect: 'exec',
     description: 'Run a command that finishes and return its exit code and output.',
@@ -35,6 +74,22 @@ const MOCK_TOOLS = [
         argv: { type: 'array', items: { type: 'string' }, description: 'Program and arguments with no shell.' },
         cwd: { type: 'string', description: 'Directory to run in.' },
         timeout_s: { type: 'number', description: 'Seconds before the command is stopped (default 120).' },
+      },
+    },
+  },
+  {
+    name: 'fleet.add',
+    effect: 'admin',
+    description: 'Add a machine to fleet.toml on this node.',
+    input_schema: {
+      type: 'object',
+      required: ['name', 'host'],
+      properties: {
+        name: { type: 'string', description: 'Short name for the machine (for example studio).' },
+        host: { type: 'string', description: 'Hostname or tailnet address to connect to.' },
+        user: { type: 'string', description: 'SSH user name when different from this machine.' },
+        system: { type: 'string', default: 'linux', description: 'System label (linux, macos, or windows).' },
+        mac: { type: 'string', description: 'Optional MAC address for Wake-on-LAN.' },
       },
     },
   },
@@ -97,6 +152,20 @@ const MOCK_TOOLS = [
         path: { type: 'string', description: 'Path to remove.' },
         recursive: { type: 'boolean', default: false, description: 'Remove a directory and everything inside it.' },
         dry_run: { type: 'boolean', default: false, description: 'Report what would be removed without changing the file system.' },
+      },
+    },
+  },
+  {
+    name: 'fs.transfer',
+    effect: 'write',
+    description: 'Copy a file or folder from one machine in the fleet to another.',
+    input_schema: {
+      type: 'object',
+      required: ['from', 'to'],
+      properties: {
+        from: { type: 'string', description: 'Source machine and path (for example tower:/home/me/notes.txt).' },
+        to: { type: 'string', description: 'Destination machine and path (for example studio:/home/me/notes.txt).' },
+        dry_run: { type: 'boolean', default: false, description: 'Preview what would be copied without changing anything.' },
       },
     },
   },
@@ -164,6 +233,17 @@ const MOCK_TOOLS = [
       type: 'object',
       required: ['id'],
       properties: { id: { type: 'string', description: 'The job identifier.' } },
+    },
+  },
+  {
+    name: 'meta.update',
+    effect: 'admin',
+    description: 'Check for a newer Legion release or update this node.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        check: { type: 'boolean', default: true, description: 'Only check whether a newer build is available.' },
+      },
     },
   },
   {
@@ -398,11 +478,51 @@ const MOCK_TOOLS = [
 ];
 
 export function createMockLink(mode = '') {
-  let authed = mode !== 'token' && mode !== 'pair';
-  const kind = mode === 'pair' ? 'app' : 'mock';
-  let jobCounter = 10;
+  const flags = new Set(
+    String(mode || '')
+      .split(/[,\s+]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const isLimited = flags.has('limited');
+  const isMulti = flags.has('multi');
+  const isFirst = flags.has('first');
+  const isRepair = flags.has('repair');
+  const isPair = flags.has('pair');
+  const isToken = flags.has('token');
 
-  const allowedTools = MOCK_TOOLS.filter((t) => t.effect !== 'admin').map((t) => t.name);
+  let authed = !isToken && !isPair && !isRepair;
+  let repaired = false;
+  const kind = isPair || isMulti || isRepair ? 'app' : 'mock';
+  let jobCounter = 10;
+  let inviteCounter = 1;
+  let activeNode = 'tower';
+  let pairedNodes = isMulti ? ['tower', 'pi'] : ['tower'];
+
+  const role = isLimited ? 'observer' : 'owner';
+  const allowedTools = isLimited
+    ? MOCK_TOOLS.filter((t) => t.effect === 'read').map((t) => t.name)
+    : MOCK_TOOLS.map((t) => t.name);
+
+  let incomingDevices = [
+    {
+      name: 'Pixel 10',
+      principal: 'phone',
+      fingerprint: 'SHA256:4kP9vR2mN8xQ1wL6tY3bZ5cH7jD0sF9eA2uK4mV8nX0',
+      added: isoAgo(86400 * 12),
+      foreign: false,
+      missing_home: false,
+    },
+    {
+      name: 'Work laptop',
+      principal: 'laptop',
+      fingerprint: 'SHA256:9mB2nC4vX6zL8kJ0hG2fD4sA6pO8iU0yT2rE4wQ6aS8',
+      added: isoAgo(86400 * 3),
+      foreign: false,
+      missing_home: false,
+    },
+  ];
+  let pendingInvites = [];
 
   const machines = {
     tower: {
@@ -420,32 +540,65 @@ export function createMockLink(mode = '') {
       },
       jobs: [
         {
-          id: 'j-build-1',
-          name: 'cargo build --release',
+          id: 'j-backup-1',
+          name: 'Photo backup',
           state: 'running',
-          created: isoAgo(252),
-          command: 'cargo build --release',
-          duration_s: 252,
-          logs: '   Compiling legion-core v0.1.0\n   Compiling legion-doors v0.1.0\n   Compiling legion-cli v0.1.0\n',
-        },
-        {
-          id: 'j-rsync-2',
-          name: 'rsync photos/ nas:',
-          state: 'running',
-          created: isoAgo(3820),
-          command: 'rsync -av photos/ nas:/volume1/photos/',
-          duration_s: 3820,
+          created: isoAgo(240),
+          command: 'rsync -av /home/me/photos/ nas:/volume1/photos/',
+          duration_s: 240,
           logs: 'sending incremental file list\n2026/autumn/IMG_4012.JPG\n2026/autumn/IMG_4013.JPG\n',
         },
         {
-          id: 'j-test-3',
-          name: 'cargo test',
+          id: 'j-build-2',
+          name: 'Build',
+          state: 'running',
+          created: isoAgo(720),
+          command: 'cargo build --release --workspace',
+          duration_s: 720,
+          logs: '   Compiling legion-core v0.1.0\n   Compiling legion-doors v0.1.0\n   Compiling legion-cli v0.1.0\n',
+        },
+        {
+          id: 'j-cmd-3',
+          name: 'df',
           state: 'succeeded',
-          created: isoAgo(7200),
-          command: 'cargo test --workspace',
+          created: isoAgo(2100),
+          finished: isoAgo(2097),
+          command: 'df -h /',
           exit_code: 0,
-          duration_s: 41.2,
-          logs: 'test result: ok. 142 passed; 0 failed\n',
+          duration_s: 3.0,
+          logs: 'Filesystem      Size  Used Avail Use% Mounted on\n/dev/nvme0n1p5  2.8T  247G  2.5T   9% /\n',
+        },
+        {
+          id: 'j-tests-4',
+          name: 'proj:website:tests',
+          state: 'failed',
+          created: isoAgo(7200),
+          finished: isoAgo(7080),
+          command: 'npm test -- --runInBand',
+          exit_code: 1,
+          duration_s: 120,
+          logs: 'FAIL src/nav.test.js\n  expected 3 tabs to match snapshot\n',
+        },
+        {
+          id: 'j-cancel-5',
+          name: 'sleep',
+          state: 'cancelled',
+          created: isoAgo(14400),
+          finished: isoAgo(14340),
+          command: 'sleep 600',
+          duration_s: 60,
+          logs: '',
+        },
+        {
+          id: 'j-restart-6',
+          name: 'power.restart',
+          state: 'succeeded',
+          created: isoAgo(86400 + 3600),
+          finished: isoAgo(86400 + 3595),
+          command: 'power.restart',
+          exit_code: 0,
+          duration_s: 5,
+          logs: 'Restarted cleanly.\n',
         },
       ],
       services: [
@@ -484,8 +637,8 @@ export function createMockLink(mode = '') {
           reasons: [
             {
               source: 'job',
-              name: 'cargo build --release',
-              detail: 'exclusive job j-build-1',
+              name: 'Build',
+              detail: 'exclusive job j-build-2',
             },
           ],
         },
@@ -558,7 +711,6 @@ export function createMockLink(mode = '') {
           state: 'busy',
           reasons: [
             { source: 'probe', name: 'agents', detail: 'busy: 1239887 worker' },
-            { source: 'probe', name: 'render', detail: 'blender frame 42/120' },
           ],
         },
         targets: [],
@@ -568,15 +720,38 @@ export function createMockLink(mode = '') {
     },
     laptop: {
       reachable: false,
+      lastSeenAt: Date.now() - 14 * 86400 * 1000,
       error: {
         code: 'unreachable',
-        message:
-          "None of laptop's systems answered (linux: Could not connect to laptop.example:22: timed out after 4 s; windows: Could not connect to laptop-win.example:22: timed out after 4 s).",
+        message: "laptop did not answer.",
         hint: 'Check that laptop is powered on and reachable on your tailnet, or wake it via pi.',
         machine: 'laptop',
       },
     },
+    nas: {
+      reachable: false,
+      lastSeenAt: null,
+      error: {
+        code: 'unreachable',
+        message: 'nas did not answer.',
+        hint: 'Check that nas is powered on and reachable on your tailnet.',
+        machine: 'nas',
+      },
+    },
   };
+
+  if (isFirst) {
+    machines.mini = {
+      reachable: false,
+      neverSeen: true,
+      error: {
+        code: 'unreachable',
+        message: 'mini did not answer.',
+        hint: 'Check that mini is powered on and reachable on your tailnet.',
+        machine: 'mini',
+      },
+    };
+  }
 
   const fsTree = {
     '/home/me': [
@@ -605,10 +780,10 @@ export function createMockLink(mode = '') {
   };
 
   function resolveOne(target, tool, args, onEvent) {
-    const name = target || 'tower';
+    const name = target || activeNode;
     const m = machines[name];
     if (!m) {
-      throw { code: 'not_found', message: `There is no machine called ${name} in fleet.toml.`, hint: null, machine: 'tower' };
+      throw { code: 'not_found', message: `There is no machine called ${name} in fleet.toml.`, hint: null, machine: activeNode };
     }
     if (!m.reachable) {
       throw m.error;
@@ -618,17 +793,9 @@ export function createMockLink(mode = '') {
     if (spec && !allowedTools.includes(tool)) {
       throw {
         code: 'denied',
-        message: `Principal "phone" (role "operator") may not call ${tool}.`,
+        message: `Principal "phone" (role "${role}") may not call ${tool}.`,
         hint: 'Ask the machine owner to grant access in policy.toml.',
         machine: name,
-      };
-    }
-    if (name === 'pi' && tool === 'audit.tail') {
-      throw {
-        code: 'denied',
-        message: 'Principal "phone" may not call audit.tail on pi.',
-        hint: 'Each machine checks its own policy.toml before running a tool.',
-        machine: 'pi',
       };
     }
 
@@ -643,44 +810,111 @@ export function createMockLink(mode = '') {
           os: m.sys.os.family,
           arch: m.sys.os.arch,
         };
+      case 'meta.update':
+        return {
+          current: '0.1.0',
+          latest: '0.1.0',
+          up_to_date: true,
+          checked: true,
+        };
       case 'meta.whoami':
         return {
           principal: 'phone',
-          role: 'operator',
-          door: 'http',
+          role,
+          door: kind === 'app' ? 'ssh' : 'http',
           node: name,
           delegate: false,
           paths: null,
           tools: allowedTools,
         };
-      case 'fleet.list':
-        return {
-          node: 'tower',
-          machines: [
-            { name: 'tower', this_node: true, systems: [{ name: 'linux', via: 'ssh', target: 'tower.example' }], wake_via: [] },
-            { name: 'pi', this_node: false, systems: [{ name: 'linux', via: 'ssh', target: 'pi.example' }], wake_via: [] },
-            { name: 'studio', this_node: false, systems: [{ name: 'macos', via: 'ssh', target: 'studio.example' }], wake_via: [] },
-            {
-              name: 'laptop',
-              this_node: false,
-              systems: [{ name: 'linux', via: 'ssh', target: 'laptop.example' }],
-              mac: '02:00:00:00:00:04',
-              wake_via: ['pi'],
-            },
-          ],
-        };
+      case 'fleet.list': {
+        const list = [
+          { name: 'tower', this_node: activeNode === 'tower', systems: [{ name: 'linux', via: 'ssh', target: 'tower.example' }], wake_via: [] },
+          { name: 'pi', this_node: activeNode === 'pi', systems: [{ name: 'linux', via: 'ssh', target: 'pi.example' }], wake_via: [] },
+          { name: 'studio', this_node: false, systems: [{ name: 'macos', via: 'ssh', target: 'studio.example' }], wake_via: [] },
+          {
+            name: 'laptop',
+            this_node: false,
+            systems: [{ name: 'linux', via: 'ssh', target: 'laptop.example' }],
+            mac: '02:00:00:00:00:04',
+            wake_via: ['pi'],
+          },
+          {
+            name: 'nas',
+            this_node: false,
+            systems: [{ name: 'linux', via: 'ssh', target: 'nas.example' }],
+            wake_via: [],
+          },
+        ];
+        if (isFirst) {
+          list.push({
+            name: 'mini',
+            this_node: false,
+            systems: [{ name: 'linux', via: 'ssh', target: 'mini.example' }],
+            wake_via: [],
+          });
+        }
+        return { node: activeNode, machines: list };
+      }
       case 'fleet.ping': {
         const all = [
           { machine: 'tower', reachable: true, node: 'tower', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 0 },
           { machine: 'pi', reachable: true, node: 'pi', system: 'linux', version: '0.1.0', os: 'linux', arch: 'aarch64', latency_ms: 4 },
           { machine: 'studio', reachable: true, node: 'studio', system: 'macos', version: '0.1.0', os: 'macos', arch: 'aarch64', latency_ms: 11 },
           { machine: 'laptop', reachable: false, error: machines.laptop.error },
+          { machine: 'nas', reachable: false, error: machines.nas.error },
         ];
+        if (isFirst) {
+          all.push({ machine: 'mini', reachable: false, error: machines.mini.error });
+        }
         if (Array.isArray(args?.machines) && args.machines.length > 0) {
           const wanted = new Set(args.machines);
           return { results: all.filter((entry) => wanted.has(entry.machine)) };
         }
-        return { results: all.filter((entry) => entry.machine !== 'tower') };
+        return { results: all.filter((entry) => entry.machine !== activeNode) };
+      }
+      case 'fleet.add': {
+        const addedName = String(args?.name || '').trim();
+        const addedHost = String(args?.host || '').trim();
+        if (!addedName || !addedHost) {
+          throw { code: 'invalid_args', message: 'Enter both a machine name and host.', hint: null, machine: name };
+        }
+        return { added: true, machine: addedName, host: addedHost, system: args?.system || 'linux' };
+      }
+      case 'device.list':
+        return { devices: incomingDevices, invites: pendingInvites };
+      case 'device.invite': {
+        const principal = String(args?.principal || 'phone').trim() || 'phone';
+        const validMin = Number(args?.valid_minutes) || 15;
+        const id = `inv-mock-${inviteCounter++}`;
+        const expires = new Date(Date.now() + validMin * 60_000).toISOString();
+        const invite = `legion-invite-1.mock.${id}.${name}.${principal}.example`;
+        pendingInvites = [
+          { id, principal, fingerprint: 'SHA256:pending-invite', expires, created: new Date().toISOString() },
+          ...pendingInvites,
+        ];
+        return {
+          invite,
+          id,
+          node: name,
+          principal,
+          role: principal === 'owner' ? 'owner' : 'operator',
+          expires,
+          hosts: [`${name}.example.ts.net`],
+          port: 22,
+          user: 'me',
+        };
+      }
+      case 'device.remove': {
+        if (args?.name) {
+          incomingDevices = incomingDevices.filter((d) => d.name !== args.name);
+          return { removed: true, name: args.name };
+        }
+        if (args?.id) {
+          pendingInvites = pendingInvites.filter((inv) => inv.id !== args.id);
+          return { removed: true, id: args.id };
+        }
+        throw { code: 'invalid_args', message: 'Specify a device name or invite id.', hint: null, machine: name };
       }
       case 'sys.info':
         return m.sys;
@@ -726,6 +960,14 @@ export function createMockLink(mode = '') {
           eof: true,
         };
       }
+      case 'fs.transfer':
+        return {
+          transferred: !args?.dry_run,
+          dry_run: Boolean(args?.dry_run) || undefined,
+          from: args?.from,
+          to: args?.to,
+          bytes: 124,
+        };
       case 'job.list': {
         const jobs = args?.state ? m.jobs.filter((j) => j.state === args.state) : m.jobs;
         return {
@@ -738,7 +980,7 @@ export function createMockLink(mode = '') {
         const cmd = args?.cmd || (Array.isArray(args?.argv) ? args.argv.join(' ') : 'job');
         const job = {
           id,
-          name: args?.name || cmd.split(/\s+/)[0] || 'job',
+          name: (args?.name && String(args.name).trim()) || cmd.split(/\s+/)[0] || 'job',
           state: 'running',
           created: new Date().toISOString(),
           command: cmd,
@@ -757,6 +999,7 @@ export function createMockLink(mode = '') {
           cmd: job.command,
           state: job.state,
           created: job.created,
+          finished: job.finished,
           exit_code: job.exit_code,
           duration_s: job.duration_s,
           output_bytes: job.logs.length,
@@ -886,6 +1129,10 @@ export function createMockLink(mode = '') {
 
   async function call(tool, args = {}, options = {}) {
     const { on, onEvent } = options || {};
+    if (isFirst && tool === 'fleet.ping' && Array.isArray(args?.machines) && args.machines.includes('mini')) {
+      // Keep the never-seen machine briefly in asking state so tests & screenshots can observe it.
+      await new Promise((r) => setTimeout(r, 120));
+    }
     if (on === 'all' || Array.isArray(on)) {
       const targets = on === 'all' ? Object.keys(machines) : on;
       const results = {};
@@ -898,35 +1145,68 @@ export function createMockLink(mode = '') {
       }
       return { results };
     }
-    return resolveOne(on || 'tower', tool, args, onEvent);
+    return resolveOne(on || activeNode, tool, args, onEvent);
   }
 
   async function state() {
+    if (isRepair && !repaired) {
+      return {
+        ready: false,
+        nodes: [],
+        needs: 'repair',
+        repair: {
+          message: 'Saved device state could not be decoded.',
+          path: '/home/me/.config/legion/device.json',
+        },
+        health: { ok: true, node: activeNode, version: '0.1.0' },
+      };
+    }
     if (!authed) {
       return {
         ready: false,
         nodes: [],
-        needs: mode === 'pair' ? 'pairing' : 'token',
-        health: { ok: true, node: 'tower', version: '0.1.0' },
+        needs: isPair || isRepair ? 'pairing' : 'token',
+        can_scan: true,
+        health: { ok: true, node: activeNode, version: '0.1.0' },
       };
     }
-    const whoami = resolveOne('tower', 'meta.whoami', {});
+    const ordered = [activeNode, ...pairedNodes.filter((n) => n !== activeNode)];
+    const nodes = ordered.map((nodeName) => {
+      const whoami = resolveOne(nodeName, 'meta.whoami', {});
+      return {
+        node: nodeName,
+        principal: whoami.principal,
+        role: whoami.role,
+        via: kind === 'app' ? 'ssh' : 'mock',
+        origin: typeof window !== 'undefined' ? window.location.origin : `https://${nodeName}.example.ts.net`,
+        version: '0.1.0',
+        build: 'mock00000000',
+        protocol: 1,
+        whoami,
+      };
+    });
     return {
       ready: true,
       needs: null,
-      health: { ok: true, node: 'tower', version: '0.1.0' },
-      nodes: [
-        {
-          node: 'tower',
-          principal: whoami.principal,
-          role: whoami.role,
-          via: kind,
-          origin: typeof window !== 'undefined' ? window.location.origin : 'https://tower.example.ts.net',
-          version: '0.1.0',
-          build: 'mock00000000',
-          protocol: 1,
-          whoami,
-        },
+      can_scan: kind === 'app',
+      health: { ok: true, node: activeNode, version: '0.1.0' },
+      nodes,
+    };
+  }
+
+  // Seeds initial cached offline history for mock mode so previously-off machines stay calmly Off.
+  function initialFleetCache() {
+    const now = Date.now();
+    return {
+      version: 1,
+      localNode: activeNode,
+      cachedAt: now - 30_000,
+      machines: [
+        { name: 'tower', thisNode: activeNode === 'tower', reachable: true, status: 'online', os: 'linux', arch: 'x86_64', lastSeenAt: now - 30_000, lastCheckedAt: now - 30_000, canWake: false },
+        { name: 'pi', thisNode: activeNode === 'pi', reachable: true, status: 'online', os: 'linux', arch: 'aarch64', lastSeenAt: now - 30_000, lastCheckedAt: now - 30_000, canWake: false },
+        { name: 'studio', thisNode: false, reachable: true, status: 'online', os: 'macos', arch: 'aarch64', lastSeenAt: now - 30_000, lastCheckedAt: now - 30_000, canWake: false },
+        { name: 'laptop', thisNode: false, reachable: false, status: 'offline', os: 'linux', lastSeenAt: machines.laptop.lastSeenAt, lastCheckedAt: now - 30_000, canWake: true },
+        { name: 'nas', thisNode: false, reachable: false, status: 'offline', lastSeenAt: null, lastCheckedAt: now - 30_000, canWake: false },
       ],
     };
   }
@@ -949,11 +1229,34 @@ export function createMockLink(mode = '') {
 
   async function pair() {
     authed = true;
+    if (!pairedNodes.includes('tower')) pairedNodes.push('tower');
     return state();
   }
 
-  async function unpair() {
-    authed = false;
+  async function unpair(node) {
+    pairedNodes = pairedNodes.filter((n) => n !== node);
+    if (pairedNodes.length === 0) {
+      authed = false;
+      return { message: `Removed ${node}.` };
+    }
+    if (activeNode === node) activeNode = pairedNodes[0];
+    return { message: `Removed ${node}.` };
+  }
+
+  async function selectNode(node) {
+    if (pairedNodes.includes(node)) {
+      activeNode = node;
+    }
+    return state();
+  }
+
+  async function repairStore() {
+    repaired = true;
+    return {
+      archived_to: '/home/me/.config/legion/device.json.broken-20261124',
+      message: 'Moved aside unreadable state.',
+      state: await state(),
+    };
   }
 
   async function deviceName() {
@@ -961,11 +1264,12 @@ export function createMockLink(mode = '') {
   }
 
   async function scanInvite() {
-    return 'legion-invite:mock';
+    return 'legion-invite-1.mock.scanned';
   }
 
   return {
     kind,
+    mockFlags: flags,
     state,
     tools,
     call,
@@ -974,6 +1278,9 @@ export function createMockLink(mode = '') {
     deviceName,
     pair,
     unpair,
+    selectNode,
+    repairStore,
     scanInvite,
+    initialFleetCache,
   };
 }
