@@ -24,6 +24,7 @@ import {
   extractInviteRoles,
   findIncomingDevice,
   formatDeviceRemovedNotice,
+  formatDisagreementNotice,
   formatInvitedDeviceSyncNotice,
   formatPairSyncNotice,
   isInviteOwnerStrength,
@@ -1394,6 +1395,7 @@ function ConnectionsPage({
   const nodes = linkState?.nodes || [];
   const relayed = link.kind === 'app' ? buildRelayedConnections(linkState, snapshot) : [];
   const identityChangedNodes = nodes.filter((n) => Boolean(n.identity_changed));
+  const disagreements = Array.isArray(linkState?.disagreements) ? linkState.disagreements : [];
   const syncBanner = formatPairSyncNotice(pairNotice, technical);
   const hasMakeSection = link.kind === 'app' || canInvite || canFleetAdd;
   const incomingDevices = incoming?.devices || [];
@@ -1451,6 +1453,21 @@ function ConnectionsPage({
                 Review
               </a>
             </div>
+          </div>
+        `;
+      })}
+
+      ${disagreements.map((d) => {
+        const formatted = formatDisagreementNotice(d, technical);
+        if (!formatted) return null;
+        return html`
+          <div class="notice" key=${`disagree:${formatted.machine}`} role="status">
+            <strong>${formatted.title}</strong>
+            ${technical && formatted.details.length > 0
+              ? formatted.details.map(
+                  (line, i) => html`<span class="mono" key=${i}>${line}</span>`,
+                )
+              : html`<span>Pair with ${formatted.machine} directly to connect to it without relying on another machine.</span>`}
           </div>
         `;
       })}

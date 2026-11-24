@@ -372,6 +372,24 @@ pub struct PendingIdentityChange {
     pub conflicts: Vec<ConflictingIdentityReport>,
 }
 
+/// One paired introducer's description of a machine involved in a [`LearnDisagreement`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisagreementReport {
+    /// Directly paired node that reported this endpoint.
+    pub reported_by: String,
+    /// Endpoint target reported by `reported_by`.
+    pub target: SshTarget,
+}
+
+/// Two or more directly paired introducers returned differing endpoint descriptions for `machine`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnDisagreement {
+    /// Machine name that was not pinned because paired introducers disagreed.
+    pub machine: String,
+    /// Conflicting endpoint reports, sorted by `reported_by`.
+    pub reports: Vec<DisagreementReport>,
+}
+
 /// Summary returned by [`Link::learn`] and [`Link::learn_from`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearnReport {
@@ -388,10 +406,13 @@ pub struct LearnReport {
     /// route changed via a different introducer); old pins were kept and the entries were marked
     /// with [`NodeLink::identity_changed`].
     pub identity_changed: Vec<String>,
-    /// New machines that were not pinned because reachable paired introducers disagreed on their
-    /// host keys (or did not all report them).
+    /// New machines that were not pinned because two or more paired introducers reported
+    /// differing endpoints or host keys for them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disagreements: Vec<String>,
+    /// Detailed per-introducer reports for each machine listed in [`LearnReport::disagreements`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disagreement_details: Vec<LearnDisagreement>,
     /// Machines that returned an error during `device.endpoint` fan-out.
     pub unreachable: Vec<String>,
     /// Machines whose `device.endpoint` reply failed validation (for example mismatched node name,
@@ -1268,15 +1289,28 @@ impl Link {
                     rejected_set.insert(machine);
                     continue;
                 }
-                // When two or more paired introducers are reachable, pin a brand-new machine ONLY
-                // when all reachable paired introducers report it and agree on its host keys.
-                if total_introducers >= 2 {
-                    let first_keys = canonical_host_keys(&reports[0].1.host_keys);
-                    let all_agree = reports.len() == total_introducers
-                        && reports
-                            .iter()
-                            .all(|(_, t)| canonical_host_keys(&t.host_keys) == first_keys);
+                // When two or more paired introducers report this brand-new machine, pin it only
+                // if all reports agree. An error/unreachable reply from another paired node is an
+                // abstention, not a disagreement, so a single reporting paired node pins on its
+                // own when no other paired node can see the machine.
+                if reports.len() >= 2 {
+                    let first_target = reports[0].1;
+                    let all_agree = reports
+                        .iter()
+                        .all(|(_, t)| same_endpoint_target(first_target, t));
                     if !all_agree {
+                        let mut detail_reports: Vec<DisagreementReport> = reports
+                            .iter()
+                            .map(|(intro, target)| DisagreementReport {
+                                reported_by: (*intro).to_owned(),
+                                target: (*target).clone(),
+                            })
+                            .collect();
+                        detail_reports.sort_by(|a, b| a.reported_by.cmp(&b.reported_by));
+                        report.disagreement_details.push(LearnDisagreement {
+                            machine: machine.clone(),
+                            reports: detail_reports,
+                        });
                         report.disagreements.push(machine);
                         continue;
                     }
@@ -1307,6 +1341,9 @@ impl Link {
         report.updated.sort();
         report.identity_changed.sort();
         report.disagreements.sort();
+        report
+            .disagreement_details
+            .sort_by(|a, b| a.machine.cmp(&b.machine));
         report.unreachable = unreachable_set.into_iter().collect();
         report.rejected = rejected_set.into_iter().collect();
         report
@@ -6209,5 +6246,177 @@ mod tests {
                 reported_by: "e".to_owned()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn partial_reachability_abstention_learns_while_differing_reports_disagree() {
+        let key_tower = test_host_key(120);
+        let key_pi = test_host_key(121);
+        let key_edge = test_host_key(122);
+        let key_studio_a = test_host_key(123);
+        let key_studio_b = test_host_key(124);
+
+        let answers: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+        let answers_c = Arc::clone(&answers);
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let answers_c = Arc::clone(&answers_c);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        let resp = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            )
+                        } else {
+                            let body = answers_c
+                                .lock()
+                                .unwrap()
+                                .get(&node_name)
+                                .cloned()
+                                .unwrap_or_else(|| json!({ "results": {} }));
+                            Response::ok(req.id, body)
+                        };
+                        let _ = server_w
+                            .write_all(
+                                format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes(),
+                            )
+                            .await;
+                        let _ = server_w.flush().await;
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        {
+            let mut map = answers.lock().unwrap();
+            map.insert(
+                "tower".to_owned(),
+                json!({
+                    "results": {
+                        "edge": {
+                            "ok": {
+                                "node": "edge",
+                                "hosts": ["edge.example.net"],
+                                "port": 22,
+                                "user": "me",
+                                "host_keys": [key_edge],
+                            }
+                        },
+                        "studio": {
+                            "ok": {
+                                "node": "studio",
+                                "hosts": ["studio.example.net"],
+                                "port": 22,
+                                "user": "me",
+                                "host_keys": [key_studio_a],
+                            }
+                        }
+                    }
+                }),
+            );
+            map.insert(
+                "pi".to_owned(),
+                json!({
+                    "results": {
+                        // pi cannot reach edge: honest abstention (error), NOT a disagreement!
+                        "edge": {
+                            "error": {
+                                "code": "unreachable",
+                                "message": "edge did not answer."
+                            }
+                        },
+                        // pi returns a differing report for studio: REAL disagreement!
+                        "studio": {
+                            "ok": {
+                                "node": "studio",
+                                "hosts": ["studio-other.example.net"],
+                                "port": 2222,
+                                "user": "me",
+                                "host_keys": [key_studio_b],
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![
+                    NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["tower.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![key_tower],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                    NodeLink::ssh(
+                        "pi",
+                        SshTarget {
+                            hosts: vec!["pi.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![key_pi],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                ],
+                forgotten_nodes: Vec::new(),
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        let report = link.learn().await.unwrap();
+        // edge was reported by tower and abstained on by pi -> learned cleanly!
+        assert_eq!(report.added, vec!["edge".to_owned()]);
+        assert!(link.config().node("edge").is_some());
+        assert_eq!(
+            link.config().node("edge").unwrap().learned_from.as_deref(),
+            Some("tower")
+        );
+        // studio had two differing reports -> NOT pinned, recorded as disagreement with details!
+        assert_eq!(report.disagreements, vec!["studio".to_owned()]);
+        assert_eq!(report.disagreement_details.len(), 1);
+        assert_eq!(report.disagreement_details[0].machine, "studio");
+        assert_eq!(report.disagreement_details[0].reports.len(), 2);
+        assert_eq!(report.disagreement_details[0].reports[0].reported_by, "pi");
+        assert_eq!(
+            report.disagreement_details[0].reports[1].reported_by,
+            "tower"
+        );
+        assert!(link.config().node("studio").is_none());
+        link.close().await;
     }
 }

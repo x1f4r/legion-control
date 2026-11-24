@@ -324,6 +324,31 @@ pub struct NodeLink {
     pub identity_changed: Option<IdentityChangedInfo>,
 }
 
+/// One paired introducer's description inside a [`DisagreementView`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisagreementEntryView {
+    /// Directly paired node that reported this endpoint.
+    pub reported_by: String,
+    /// Candidate host names / addresses reported.
+    pub hosts: Vec<String>,
+    /// SSH port reported.
+    pub port: u16,
+    /// SSH user reported.
+    pub user: String,
+    /// SHA-256 fingerprints of the reported host keys.
+    #[serde(default)]
+    pub fingerprints: Vec<String>,
+}
+
+/// Two or more directly paired introducers described a new machine differently; it was not pinned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisagreementView {
+    /// Machine name that was not pinned.
+    pub machine: String,
+    /// Differing reports sorted by `reported_by`.
+    pub reports: Vec<DisagreementEntryView>,
+}
+
 /// Snapshot returned by the `state` command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppState {
@@ -342,6 +367,9 @@ pub struct AppState {
     /// Observed route for every known or relayed machine.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, MachineRouteView>,
+    /// New machines not pinned because paired introducers disagreed on their endpoints or keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disagreements: Vec<DisagreementView>,
     /// Fleet delivery summary from the most recent pairing in this session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_paired: Option<PairSummary>,
@@ -457,6 +485,7 @@ impl Backend for Unpaired {
                 repair: None,
                 can_scan: cfg!(any(target_os = "android", target_os = "ios")),
                 routes: BTreeMap::new(),
+                disagreements: Vec::new(),
                 last_paired: None,
             })
         })
@@ -577,6 +606,7 @@ mod tests {
             repair: None,
             can_scan: true,
             routes: BTreeMap::new(),
+            disagreements: Vec::new(),
             last_paired: None,
         };
         let json = serde_json::to_value(&unpaired)?;
@@ -603,6 +633,7 @@ mod tests {
             repair: None,
             can_scan: false,
             routes: BTreeMap::new(),
+            disagreements: Vec::new(),
             last_paired: None,
         };
         let ready_json = serde_json::to_value(&ready)?;

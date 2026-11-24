@@ -20,8 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
-    ConflictingIdentityInfo, ErrorCode, IdentityChangedInfo, LearnResult, MachineRouteView, Needs,
-    NodeLink, PairPendingPeer, PairSummary, RepairInfo, RepairResult, UnpairResult,
+    ConflictingIdentityInfo, DisagreementEntryView, DisagreementView, ErrorCode,
+    IdentityChangedInfo, LearnResult, MachineRouteView, Needs, NodeLink, PairPendingPeer,
+    PairSummary, RepairInfo, RepairResult, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -123,6 +124,7 @@ struct BackendState {
     /// offline. Never changes `active_node` and never acts as a target for machine calls.
     preferred_relay: Option<(String, Instant)>,
     last_paired: Option<PairSummary>,
+    disagreements: Vec<DisagreementView>,
     link: Link,
 }
 
@@ -189,6 +191,7 @@ impl LinkBackend {
                 active_node,
                 preferred_relay: None,
                 last_paired: None,
+                disagreements: Vec::new(),
                 link,
             }),
             mutate_lock: AsyncMutex::new(()),
@@ -482,9 +485,10 @@ impl Backend for LinkBackend {
                 updated_data.current_node = Some(node_name.clone());
                 self.store.save(&updated_data)?;
                 guard.data = updated_data;
-                guard.active_node = Some(node_name);
+                guard.active_node = Some(node_name.clone());
                 guard.preferred_relay = None;
                 guard.last_paired = Some(pair_summary);
+                guard.disagreements.retain(|d| d.machine != node_name);
                 build_app_state(&guard, self.store.path())
             };
 
@@ -562,6 +566,13 @@ impl Backend for LinkBackend {
                 guard.data = next;
                 guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
                 guard.preferred_relay = None;
+                guard.disagreements.retain_mut(|d| {
+                    if d.machine == trimmed {
+                        return false;
+                    }
+                    d.reports.retain(|r| r.reported_by != trimmed);
+                    d.reports.len() >= 2
+                });
                 (device, guard.link.clone())
             };
 
@@ -664,6 +675,7 @@ impl Backend for LinkBackend {
                 guard.active_node = active;
                 guard.preferred_relay = None;
                 guard.last_paired = None;
+                guard.disagreements.clear();
                 (old, build_app_state(&guard, self.store.path()))
             };
 
@@ -731,6 +743,29 @@ impl Backend for LinkBackend {
                     self.store.save(&updated)?;
                     guard.data = updated;
                 }
+                guard.disagreements = report
+                    .disagreement_details
+                    .iter()
+                    .map(|d| DisagreementView {
+                        machine: d.machine.clone(),
+                        reports: d
+                            .reports
+                            .iter()
+                            .map(|r| DisagreementEntryView {
+                                reported_by: r.reported_by.clone(),
+                                hosts: r.target.hosts.clone(),
+                                port: r.target.port,
+                                user: r.target.user.clone(),
+                                fingerprints: r
+                                    .target
+                                    .host_keys
+                                    .iter()
+                                    .filter_map(|k| public_key_fingerprint(k))
+                                    .collect(),
+                            })
+                            .collect(),
+                    })
+                    .collect();
                 build_app_state(&guard, self.store.path())
             };
 
@@ -920,6 +955,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             }),
             can_scan,
             routes: BTreeMap::new(),
+            disagreements: Vec::new(),
             last_paired: None,
         };
     }
@@ -1088,6 +1124,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         repair: None,
         can_scan,
         routes,
+        disagreements: state.disagreements.clone(),
         last_paired: state.last_paired.clone(),
     }
 }

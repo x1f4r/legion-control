@@ -41,9 +41,12 @@
 //! # Introducer trust
 //!
 //! Only directly paired machines may act as introducers or preferred relays; learned machines never
-//! introduce other machines. When only one paired node is reachable, you trust it to supply the
-//! host keys pinned for brand-new machines it reports, though it can never alter a paired machine's
-//! pins or silently replace an already known machine's keys or route.
+//! introduce other machines. When two or more paired nodes report a brand-new machine with
+//! differing endpoints or host keys, it is recorded as a disagreement and not pinned. When another
+//! paired node cannot reach a brand-new machine (returns an error), that counts as an abstention
+//! rather than a disagreement, so a single reporting paired node pins the new machine on its own
+//! when no other paired node can see it; it can never alter a paired machine's pins or silently
+//! replace an already known machine's keys or route.
 //!
 //! # Stable error reasons
 //!
@@ -148,11 +151,11 @@ pub use invite::{
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    ConflictingIdentityReport, DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, LearnReport, Link,
-    LinkConfig, LinkOptions, MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN,
-    MAX_ENDPOINT_HOST_KEY_LEN, MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS, MachineRouteStatus,
-    NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue, SessionOpener,
-    parse_optional_target, public_key_fingerprint,
+    ConflictingIdentityReport, DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, DisagreementReport,
+    LearnDisagreement, LearnReport, Link, LinkConfig, LinkOptions, MAX_CONFIGURED_NODES,
+    MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN, MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS,
+    MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
+    SessionOpener, parse_optional_target, public_key_fingerprint,
 };
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,

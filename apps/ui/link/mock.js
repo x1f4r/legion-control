@@ -497,6 +497,7 @@ export function createMockLink(mode = '') {
   const isPairedChange = flags.has('pairedchg');
   const isPartial = flags.has('partial');
   const isPrimaryOffline = flags.has('aoff');
+  const isDisagree = flags.has('disagree');
   const isAutoEnrol = flags.has('enrol');
   const isFirst = flags.has('first');
   const isRepair = flags.has('repair');
@@ -1494,6 +1495,29 @@ export function createMockLink(mode = '') {
             : { kind: 'direct' },
         }
       : {};
+    const disagreements = isDisagree
+      ? [
+          {
+            machine: 'studio',
+            reports: [
+              {
+                reported_by: 'tower',
+                hosts: ['studio.example.net'],
+                port: 22,
+                user: 'me',
+                fingerprints: ['SHA256:studioTowerKey111111111111111111111111111'],
+              },
+              {
+                reported_by: 'pi',
+                hosts: ['studio-alt.example.net'],
+                port: 2222,
+                user: 'me',
+                fingerprints: ['SHA256:studioPiKey222222222222222222222222222222'],
+              },
+            ],
+          },
+        ]
+      : [];
     return {
       ready: true,
       needs: null,
@@ -1501,6 +1525,7 @@ export function createMockLink(mode = '') {
       health: { ok: true, node: activeNode, version: '0.1.0' },
       nodes,
       routes,
+      disagreements,
       last_paired: lastPaired,
     };
   }

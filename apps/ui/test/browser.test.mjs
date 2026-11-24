@@ -1047,6 +1047,20 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText('tower (unreachable)').waitFor();
     await assertNoToolNames(p, 'offline selected node device page plain');
 
+    // 8. Real introducer disagreement (`disagree`): plain wording in Connections, with per-reporter
+    //    host/port/fingerprint detail in technical mode.
+    await p.goto(`${server.url}/?mock=fleet,disagree#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('tower and pi describe studio differently; not connecting to it directly').waitFor();
+    await assertNoToolNames(p, 'fleet connections disagreement plain');
+    await p.goto(`${server.url}/?mock=fleet,disagree,tech#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('tower and pi describe studio differently; not connecting to it directly').waitFor();
+    await p.getByText(/SHA256:studioTowerKey1111/).waitFor();
+    await p.getByText(/SHA256:studioPiKey2222/).waitFor();
+
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);
