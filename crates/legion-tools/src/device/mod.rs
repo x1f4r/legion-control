@@ -486,6 +486,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         device_name: invite_device_name.clone(),
         created_by: Some(ctx.principal().to_owned()),
         created_by_device,
+        created_by_device_name: ctx.device().map(str::to_owned),
         created,
         expires: expires.clone(),
         fingerprint: ephemeral.fingerprint,
@@ -813,6 +814,10 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
 
     let node_file = ctx.config().get::<NodeFile>()?;
     let policy = ctx.config().get::<Policy>()?;
+    let caller_device_id = ctx
+        .pairing_id()
+        .map(str::to_owned)
+        .or_else(|| policy.device_owner(ctx.principal()).map(str::to_owned));
     let node_name = ctx.node_name().to_owned();
     let valid_node_name = NodeName::try_from(node_name)
         .map(|n| n.as_str().to_owned())
@@ -1141,7 +1146,15 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
     .await?;
 
     if should_push_fleet {
-        result.fleet = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
+        let trigger = registry::DeviceRegistryPushAudit {
+            trigger: "device.set".to_owned(),
+            principal: Some(ctx.principal().to_owned()),
+            device: ctx.device().map(str::to_owned),
+            pairing_id: caller_device_id,
+            source_node: Some(ctx.node_name().to_owned()),
+        };
+        result.fleet =
+            push_devices_to_fleet(ctx.node(), ctx.door(), trigger, ctx.credential_expires()).await;
     }
     Ok(result)
 }
@@ -1596,6 +1609,7 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         .pairing_id()
         .map(str::to_owned)
         .or_else(|| policy.device_owner(ctx.principal()).map(str::to_owned));
+    let caller_device_id_for_push = caller_device_id_for_tomb.clone();
     let node_name = ctx.node_name().to_owned();
     let valid_node_name = NodeName::try_from(node_name.clone())
         .map(|n| n.as_str().to_owned())
@@ -2472,7 +2486,16 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         .unwrap_or_default();
 
         if push_to_fleet {
-            let fleet_outcomes = push_devices_to_fleet(ctx.node(), Some(ctx), None).await;
+            let trigger = registry::DeviceRegistryPushAudit {
+                trigger: "device.remove".to_owned(),
+                principal: Some(ctx.principal().to_owned()),
+                device: ctx.device().map(str::to_owned),
+                pairing_id: caller_device_id_for_push,
+                source_node: Some(ctx.node_name().to_owned()),
+            };
+            let fleet_outcomes =
+                push_devices_to_fleet(ctx.node(), ctx.door(), trigger, ctx.credential_expires())
+                    .await;
             let still_trusted: Vec<String> = fleet_outcomes
                 .iter()
                 .filter(|(_, outcome)| outcome.status != "synced")
@@ -3625,6 +3648,7 @@ role = "owner"
                 device_name: None,
                 created_by: None,
                 created_by_device: None,
+                created_by_device_name: None,
                 created: format_rfc3339(now),
                 expires: format_rfc3339(exp),
                 fingerprint: eph.fingerprint.clone(),

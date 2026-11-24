@@ -61,12 +61,15 @@ pub struct InviteRecord {
     /// Preferred device label when chosen at invite creation time (`--name`, optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
-    /// Principal that created this invite, used when pushing the enrolled device to the fleet.
+    /// Principal that created this invite, recorded in `paired_by` and device-registry push audit logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
     /// Pairing identifier of the device that created this invite, when created by a paired device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_device: Option<String>,
+    /// Name of the paired device that created this invite, when created by a paired device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_device_name: Option<String>,
     /// RFC 3339 UTC creation timestamp.
     pub created: String,
     /// RFC 3339 UTC expiry timestamp.
@@ -433,6 +436,7 @@ mod tests {
                         device_name: None,
                         created_by: None,
                         created_by_device: None,
+                        created_by_device_name: None,
                         created: "2026-11-24T11:44:00Z".to_owned(),
                         expires: format_rfc3339(past),
                         fingerprint: key1.fingerprint,
@@ -448,6 +452,7 @@ mod tests {
                         device_name: None,
                         created_by: None,
                         created_by_device: None,
+                        created_by_device_name: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: key3.fingerprint,
@@ -463,6 +468,7 @@ mod tests {
                         device_name: None,
                         created_by: None,
                         created_by_device: None,
+                        created_by_device_name: None,
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: "SHA256:abc".to_owned(),

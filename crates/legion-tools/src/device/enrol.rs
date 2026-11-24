@@ -25,9 +25,10 @@ use super::authkeys::{
 };
 use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
 use super::registry::{
-    DevicesFile, FleetDevice, FleetPushOutcome, PairedBy, adopt_legacy_devices_from_auth_keys,
-    format_precise_rfc3339, load_devices_raw, lock_config, push_devices_to_fleet,
-    reconcile_authorized_keys_in_memory, save_devices_locked, upsert_device_principal_locked,
+    DeviceRegistryPushAudit, DevicesFile, FleetDevice, FleetPushOutcome, PairedBy,
+    adopt_legacy_devices_from_auth_keys, format_precise_rfc3339, load_devices_raw, lock_config,
+    push_devices_to_fleet, reconcile_authorized_keys_in_memory, save_devices_locked,
+    upsert_device_principal_locked,
 };
 use super::store::{
     DeviceRecord, format_rfc3339, load_state, lock_auth_keys, parse_rfc3339, save_state, sweep,
@@ -127,7 +128,7 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
     let target_node = node.name();
     let forced_id_owned = forced_id.to_owned();
 
-    let (principal, created_by, audit_args, mut outcome) = match read_request_line(input).await {
+    let (principal, push_audit, audit_args, mut outcome) = match read_request_line(input).await {
         Err(error) => (None, None, json!({ "id": forced_id }), Err(error)),
         Ok(request) => {
             let node_clone = node.clone();
@@ -158,7 +159,14 @@ pub async fn run_enrol(node: &Node, forced_id: &str, input: impl AsyncRead + Unp
         ..
     }) = outcome
     {
-        *fleet = push_devices_to_fleet(node, None, created_by.as_deref()).await;
+        let trigger = push_audit.unwrap_or_else(|| DeviceRegistryPushAudit {
+            trigger: "device.enrol".to_owned(),
+            principal: principal.clone(),
+            device: None,
+            pairing_id: None,
+            source_node: Some(target_node.clone()),
+        });
+        *fleet = push_devices_to_fleet(node, Door::Ssh, trigger, None).await;
         let pending: Vec<String> = fleet
             .iter()
             .filter(|(_, outcome)| outcome.status != "synced")
@@ -258,7 +266,7 @@ fn process_enrol_blocking(
     request: EnrolRequest,
 ) -> (
     Option<String>,
-    Option<String>,
+    Option<DeviceRegistryPushAudit>,
     serde_json::Value,
     Result<EnrolReply, ErrorBody>,
 ) {
@@ -677,13 +685,13 @@ fn process_enrol_blocking(
     if invite.create_principal
         && let Err(error) = upsert_device_principal_locked(paths, &principal, &role, &pairing_id)
     {
-        return (Some(principal), invite.created_by, base_args, Err(error));
+        return (Some(principal), None, base_args, Err(error));
     }
     if let Err(error) = save_devices_locked(paths, &devices) {
         if invite.create_principal {
             restore_file_snapshot(&policy_path, policy_before.as_deref());
         }
-        return (Some(principal), invite.created_by, base_args, Err(error));
+        return (Some(principal), None, base_args, Err(error));
     }
 
     let live_policy = match std::fs::read(&policy_path) {
@@ -694,7 +702,7 @@ fn process_enrol_blocking(
                 if invite.create_principal {
                     restore_file_snapshot(&policy_path, policy_before.as_deref());
                 }
-                return (Some(principal), invite.created_by, base_args, Err(error));
+                return (Some(principal), None, base_args, Err(error));
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Policy::default(),
@@ -705,7 +713,7 @@ fn process_enrol_blocking(
             }
             return (
                 Some(principal),
-                invite.created_by,
+                None,
                 base_args,
                 Err(ErrorBody::new(
                     ErrorCode::Failed,
@@ -756,10 +764,20 @@ fn process_enrol_blocking(
         if invite.create_principal {
             restore_file_snapshot(&policy_path, policy_before.as_deref());
         }
-        return (Some(principal), invite.created_by, base_args, Err(error));
+        return (Some(principal), None, base_args, Err(error));
     }
 
-    let created_by = invite.created_by;
+    let push_audit = Some(DeviceRegistryPushAudit {
+        trigger: "device.enrol".to_owned(),
+        principal: invite.created_by,
+        device: invite
+            .created_by_device_name
+            .or_else(|| Some(device_name.clone())),
+        pairing_id: invite
+            .created_by_device
+            .or_else(|| Some(pairing_id.clone())),
+        source_node: Some(node.name()),
+    });
     let fingerprint = validated_key.fingerprint;
 
     // authorized_keys, devices.toml, and policy.toml already hold the permanent device (with the
@@ -781,7 +799,7 @@ fn process_enrol_blocking(
     }
     (
         Some(principal.clone()),
-        created_by,
+        push_audit,
         audit_args,
         Ok(EnrolReply::Ok {
             ok: true,

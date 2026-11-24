@@ -17,9 +17,10 @@ use legion_core::config::{Document, NodeFile, NodeName, parse, write_atomically}
 use legion_core::policy::{NOBODY, OWNER, Policy, Principal};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
-use legion_core::{Call, Ctx, Door, Node, Paths};
+use legion_core::{Call, Door, Node, Paths};
 use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
@@ -2304,62 +2305,37 @@ pub enum MergeApplyError {
     },
 }
 
-/// Collects `pairing_id -> principal` for local-only Legion device lines belonging to THIS home
-/// and OS account in `authorized_keys` (lines not present in `local.devices` or `local.removed`).
-/// Read-only: never creates files or fails when `authorized_keys` is absent or not a regular file.
-fn collect_local_only_pairing_principals(
-    paths: &Paths,
-    node_file: &NodeFile,
-    local: &DevicesFile,
-) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let Ok(target) = resolve_target(paths, node_file) else {
-        return out;
-    };
-    let Ok(write_path) = resolve_safe_write_path(&target, paths.home()) else {
-        return out;
-    };
-    if !write_path.is_file() {
-        return out;
-    }
-    let Ok(caller_account) = caller_account_for_target(&target) else {
-        return out;
-    };
-    let Ok(auth_keys) = read_auth_keys(&write_path) else {
-        return out;
-    };
-    for line in &auth_keys.lines {
-        if let LineKind::Device {
-            principal,
-            pairing_id,
-            home,
-            account,
-            ..
-        } = &line.kind
-            && !local.devices.contains_key(pairing_id.as_str())
-            && !local.removed.contains_key(pairing_id.as_str())
-            && line_matches_home(home.as_ref(), paths)
-            && line_matches_account(
-                account.as_deref(),
-                caller_account.as_deref(),
-                target.windows_admin_acl,
-                cfg!(windows),
-            )
-        {
-            out.entry(pairing_id.clone())
-                .or_insert_with(|| principal.clone());
-        }
-    }
-    out
+/// Audit metadata attached to an automatic node-to-node `devices.toml` push after a local device
+/// tool (`device.enrol`, `device.set`, or `device.remove`) succeeded.
+///
+/// Carried in the `config.write` call so both the sending node and the receiving peer record who
+/// triggered the push and that it was a device-registry push. Grants no additional permission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceRegistryPushAudit {
+    /// Local device tool that triggered this push (`device.enrol`, `device.set`, or `device.remove`).
+    pub trigger: String,
+    /// Principal that triggered the local device tool (or created the invite, for `device.enrol`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// Paired device name that triggered the local device tool, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// Pairing identifier of the paired device that triggered the local device tool, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_id: Option<String>,
+    /// Node name where the local device tool ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<String>,
 }
 
-/// Applies an incoming `DevicesFile` (e.g. from `fleet.sync` or `config.write`) by merging it with
-/// this node's current `devices.toml` (after adopting any legacy lines when `devices.toml` is
-/// absent), verifying preconditions, preparing/validating incoming entries against the live
-/// `policy.toml`, `devices.toml`, and local-only `authorized_keys` lines, enforcing registry-owned
-/// principal uniqueness for every caller, checking caller authorization, saving the merged
-/// `devices.toml` FIRST, then updating registry-owned `device:*` principals in `policy.toml` and
-/// reconciling `authorized_keys`.
+/// Applies an incoming `DevicesFile` (from an owner-authorised `fleet.sync` or `config.write`) by
+/// merging it with this node's current `devices.toml` (after adopting any legacy lines when
+/// `devices.toml` is absent), verifying preconditions, validating incoming entries against the
+/// live `policy.toml` and `devices.toml`, rewriting tombstones that match local entries from the
+/// local entry, enforcing registry-owned principal uniqueness, checking caller authorization,
+/// saving the merged `devices.toml` FIRST, then updating registry-owned `device:*` principals in
+/// `policy.toml` and reconciling `authorized_keys`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_devices_merge_blocking(
     paths: &Paths,
@@ -2367,12 +2343,7 @@ pub fn apply_devices_merge_blocking(
     node_file: &NodeFile,
     incoming: &DevicesFile,
     check_precondition: impl FnOnce(Option<&[u8]>) -> Result<(), ErrorBody>,
-    prepare_incoming: impl FnOnce(
-        &DevicesFile,
-        &Policy,
-        &BTreeMap<String, String>,
-        &mut DevicesFile,
-    ) -> Result<(), ErrorBody>,
+    prepare_incoming: impl FnOnce(&DevicesFile, &Policy, &mut DevicesFile) -> Result<(), ErrorBody>,
     authorize_change: impl Fn(MergeChange<'_>) -> Result<(), ErrorBody>,
 ) -> Result<MergeApplyOutcome, MergeApplyError> {
     let _cfg_guard = lock_config(paths).map_err(MergeApplyError::BeforeSave)?;
@@ -2433,15 +2404,9 @@ pub fn apply_devices_merge_blocking(
         }
     };
 
-    let local_only_ids = collect_local_only_pairing_principals(paths, node_file, &local);
     let mut prepared_incoming = incoming.clone();
-    prepare_incoming(
-        &local,
-        &live_policy,
-        &local_only_ids,
-        &mut prepared_incoming,
-    )
-    .map_err(MergeApplyError::BeforeSave)?;
+    prepare_incoming(&local, &live_policy, &mut prepared_incoming)
+        .map_err(MergeApplyError::BeforeSave)?;
 
     // For every caller including owner, any tombstone replacing a local live entry (or matching an
     // existing local tombstone) takes its identity and pairing provenance from the local entry so
@@ -2691,18 +2656,24 @@ pub fn fleet_peer_names(paths: &Paths, here: &str) -> Vec<String> {
     names
 }
 
-/// Pushes `devices.toml` to every peer listed in `fleet.toml` in parallel with a short timeout,
-/// returning a per-machine [`FleetPushOutcome`] map.
+/// Pushes `devices.toml` node-to-node to every peer listed in `fleet.toml` in parallel with a
+/// short timeout, returning a per-machine [`FleetPushOutcome`] map.
+///
+/// Called ONLY after a local device tool (`device.enrol`, `device.set`, or `device.remove`)
+/// succeeded on this node. Runs with the node's own owner authority (the same authority a node
+/// uses to forward calls and sync for its owner) while recording `trigger` (principal, device,
+/// pairing id, and triggering tool) in the audit logs on both sides. When `credential_expires` is
+/// set (for example `device.remove` called through an expiring HTTP token), only tombstones are
+/// pushed.
 ///
 /// Returns an empty map ONLY when `fleet.toml` lists no other machines. Whenever `fleet.toml`
-/// names peers and the push cannot run (for example `fleet.sync` is absent, the invite did not
-/// record a creator principal, the caller lacks permission, or `fleet.sync` fails), every peer is
-/// explicitly reported as `"not_reached"` with the reason — never silently omitted as `{}` — and
-/// an invite without a recorded creator never falls back to `owner`.
+/// names peers and the push cannot run, every peer is explicitly reported as `"not_reached"` with
+/// the reason — never silently omitted as `{}`.
 pub async fn push_devices_to_fleet(
     node: &Node,
-    ctx_opt: Option<&Ctx>,
-    acting_principal: Option<&str>,
+    door: Door,
+    trigger: DeviceRegistryPushAudit,
+    credential_expires: Option<Timestamp>,
 ) -> BTreeMap<String, FleetPushOutcome> {
     let peers = fleet_peer_names(node.paths(), &node.name());
     if peers.is_empty() {
@@ -2714,36 +2685,22 @@ pub async fn push_devices_to_fleet(
             .map(|peer| (peer.clone(), FleetPushOutcome::not_reached(reason)))
             .collect()
     };
-    let Some(sync_tool) = node.registry().get("fleet.sync") else {
+    if node.registry().get("fleet.sync").is_none() {
         return all_not_reached(
             "fleet.sync is not available on this node; run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` manually",
         );
-    };
+    }
     let args = json!({
         "direction": "push",
         "documents": [DevicesFile::FILE],
         "timeout_s": DEVICE_PUSH_TIMEOUT_S,
+        "device_registry_push": trigger,
     });
-    let reply = match ctx_opt {
-        Some(ctx) => {
-            if !ctx.grant().allows(sync_tool.spec()) {
-                return all_not_reached(
-                    "caller is not permitted to run fleet.sync; run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` manually",
-                );
-            }
-            sync_tool.call(ctx, args).await
-        }
-        None => {
-            let Some(creator) = acting_principal else {
-                return all_not_reached(
-                    "cannot push automatically because this invite did not record who created it; run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` manually",
-                );
-            };
-            let mut call = Call::new(Door::Ssh, "fleet.sync", args);
-            call.pinned = Some(creator.to_owned());
-            node.call(call).await
-        }
-    };
+    let mut call = Call::new(door, "fleet.sync", args);
+    call.pinned = Some(OWNER.to_owned());
+    call.device = trigger.device;
+    call.credential_expires = credential_expires;
+    let reply = node.call(call).await;
     match reply {
         Ok(value) => {
             let mut outcomes = parse_fleet_push_outcomes(&value);
@@ -3485,7 +3442,7 @@ role = "editor"
                 &node_file,
                 &incoming,
                 |_| Ok(()),
-                |_, _, _, _| Ok(()),
+                |_, _, _| Ok(()),
                 |_| Ok(()),
             ) {
                 Err(MergeApplyError::BeforeSave(err)) => err,
@@ -3638,7 +3595,7 @@ role = \"observer\"
     }
 
     #[tokio::test]
-    async fn failed_push_and_missing_creator_report_every_fleet_machine_not_reached() {
+    async fn failed_push_reports_every_fleet_machine_not_reached_and_passes_audit_trigger() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path().join("legion"));
         std::fs::create_dir_all(paths.config_dir()).unwrap();
@@ -3649,10 +3606,18 @@ role = \"observer\"
         )
         .unwrap();
 
+        let trigger = DeviceRegistryPushAudit {
+            trigger: "device.remove".to_owned(),
+            principal: Some("tablet".to_owned()),
+            device: Some("my-tablet".to_owned()),
+            pairing_id: Some(sample_id(0x33)),
+            source_node: Some("tower".to_owned()),
+        };
+
         let node = Node::new(paths.clone(), crate::registry());
-        // No `fleet.sync` registered AND no recorded creator -> must report EVERY fleet peer as
-        // `not_reached` with a reason, never an empty map `{}`.
-        let outcomes = push_devices_to_fleet(&node, None, None).await;
+        // No `fleet.sync` registered -> must report EVERY fleet peer as `not_reached` with a
+        // reason, never an empty map `{}`.
+        let outcomes = push_devices_to_fleet(&node, Door::Ssh, trigger.clone(), None).await;
         assert_eq!(
             outcomes.len(),
             2,
@@ -3667,11 +3632,13 @@ role = \"observer\"
             );
         }
 
-        // Even when `fleet.sync` IS registered, a missing creator principal (`acting_principal = None`)
-        // MUST refuse to push (never assuming `owner`) and report every peer as `not_reached`.
+        // When `fleet.sync` IS registered, push runs with the node's own owner authority and
+        // attaches `device_registry_push` carrying the triggering principal/device; if it fails,
+        // every peer is still reported as `not_reached` carrying the error message.
         struct StubFailingSync {
             spec: legion_core::proto::ToolSpec,
-            invoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            seen_principal: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+            seen_args: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
         }
         impl legion_core::Tool for StubFailingSync {
             fn spec(&self) -> &legion_core::proto::ToolSpec {
@@ -3679,14 +3646,14 @@ role = \"observer\"
             }
             fn call<'a>(
                 &'a self,
-                _ctx: &'a Ctx,
-                _args: Value,
+                ctx: &'a legion_core::Ctx,
+                args: Value,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<Value, ErrorBody>> + Send + 'a>,
             > {
-                let flag = std::sync::Arc::clone(&self.invoked);
+                *self.seen_principal.lock().unwrap() = Some(ctx.principal().to_owned());
+                *self.seen_args.lock().unwrap() = Some(args);
                 Box::pin(async move {
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     Err(ErrorBody::new(
                         ErrorCode::Failed,
                         "simulated fleet.sync failure",
@@ -3695,7 +3662,8 @@ role = \"observer\"
             }
         }
         let mut reg_with_sync = crate::registry();
-        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_principal = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_args = std::sync::Arc::new(std::sync::Mutex::new(None));
         reg_with_sync.add(StubFailingSync {
             spec: legion_core::proto::ToolSpec {
                 name: "fleet.sync".to_owned(),
@@ -3703,31 +3671,18 @@ role = \"observer\"
                 effect: legion_core::proto::Effect::Admin,
                 input_schema: json!({"type": "object"}),
             },
-            invoked: std::sync::Arc::clone(&invoked),
+            seen_principal: std::sync::Arc::clone(&seen_principal),
+            seen_args: std::sync::Arc::clone(&seen_args),
         });
         let node_with_sync = Node::new(paths.clone(), reg_with_sync);
-        let no_creator = push_devices_to_fleet(&node_with_sync, None, None).await;
-        assert!(
-            !invoked.load(std::sync::atomic::Ordering::SeqCst),
-            "push_devices_to_fleet must NOT invoke fleet.sync when acting_principal is None"
+        let failed = push_devices_to_fleet(&node_with_sync, Door::Ssh, trigger.clone(), None).await;
+        assert_eq!(
+            seen_principal.lock().unwrap().as_deref(),
+            Some(OWNER),
+            "node-to-node push must run with owner authority"
         );
-        assert_eq!(no_creator.len(), 2, "{no_creator:?}");
-        for peer in ["pi", "nas"] {
-            let entry = no_creator.get(peer).expect("peer must be present");
-            assert_eq!(entry.status, "not_reached", "{peer}: {entry:?}");
-            assert!(
-                entry
-                    .reason
-                    .as_deref()
-                    .is_some_and(|r| r.contains("did not record who created it")),
-                "{peer}: {entry:?}"
-            );
-        }
-
-        // When `acting_principal` IS present and `fleet.sync` returns an error, every peer is still
-        // reported as `not_reached` carrying the error message (never silently omitted as `{}`).
-        let failed = push_devices_to_fleet(&node_with_sync, None, Some("owner")).await;
-        assert!(invoked.load(std::sync::atomic::Ordering::SeqCst));
+        let captured = seen_args.lock().unwrap().clone().unwrap();
+        assert_eq!(captured["device_registry_push"], json!(trigger));
         assert_eq!(failed.len(), 2, "{failed:?}");
         for peer in ["pi", "nas"] {
             let entry = failed.get(peer).expect("peer must be present");
@@ -3836,7 +3791,7 @@ device = \"{id_victim}\"
             &node_file,
             &crafted,
             |_| Ok(()),
-            |_, _, _, _| Ok(()),
+            |_, _, _| Ok(()),
             |_| Ok(()),
         )
         .expect("merge should succeed while rewriting forged tombstone identity from local live x");
@@ -3907,7 +3862,7 @@ device = \"{id_victim}\"
             &node_file,
             &second_forged,
             |_| Ok(()),
-            |_, _, _, _| Ok(()),
+            |_, _, _| Ok(()),
             |_| Ok(()),
         )
         .expect("second merge should succeed without corrupting local tombstone");

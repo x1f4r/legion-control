@@ -30,8 +30,8 @@ use legion_os::OsError;
 use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::{
-    DEVICES_VERSION, DevicesFile, MergeApplyError, MergeChange, PairedBy,
-    apply_devices_merge_blocking, merge_devices,
+    DEVICES_VERSION, DeviceRegistryPushAudit, DevicesFile, MergeApplyError, MergeChange,
+    apply_devices_merge_blocking, merge_devices, rewrite_tombstones_from_local,
 };
 use legion_tools::device::sessions::{
     DEFAULT_TERMINATE_GRACE, terminate_device_sessions_for_target,
@@ -83,13 +83,13 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add_fn(
         "config.write",
         Effect::Admin,
-        "Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml merges incoming entries with local paired devices (tombstones always win), reconciles registry-owned device:* principals (marked with `device = \"<pairing id>\"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine, so any role allowed to call config.write (including effect:admin) is as strong as owner. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
+        "Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml directly requires the owner role on this node: it merges incoming entries with local paired devices (tombstones always win and rewrite identity fields from matching local entries), reconciles registry-owned device:* principals (marked with `device = \"<pairing id>\"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine, so any role allowed to call config.write (including effect:admin) is as strong as owner. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.",
         config_write,
     );
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
         "fleet.sync",
         Effect::Admin,
-        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push (including automatic pushes after pair, device.set, and device.remove) sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by a caller this node authorises, or when that peer pushes to this node with credentials this node accepts. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
+        "Compare, push, or pull shared configuration documents (devices.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the node doing the writing (for non-owner callers, fleet.sync syncs the other documents and reports devices.toml as skipped with the reason; propagation after local device tools runs node to node with the node's own authority). Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by an owner, or when that peer pushes to this node with owner authority. Tombstones always win and may flow in every direction. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs node.toml or tokens.toml.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_sync(fleet, ctx, args)),
     ));
@@ -797,6 +797,7 @@ async fn apply_local_write(
     content: String,
     expect_hash: Option<String>,
     expect_absent: bool,
+    device_registry_push: Option<DeviceRegistryPushAudit>,
 ) -> Result<WriteOutcome, ErrorBody> {
     if expect_hash.is_some() && expect_absent {
         return Err(ErrorBody::new(
@@ -805,9 +806,24 @@ async fn apply_local_write(
         )
         .with_hint("Pass `expect_hash` when replacing an existing file, or `expect_absent=true` when creating a new one."));
     }
+    if device_registry_push.is_some() && doc != SharedDocument::Devices {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "`device_registry_push` may only be attached when writing devices.toml.",
+        ));
+    }
     let started = Instant::now();
 
     if doc == SharedDocument::Devices {
+        if ctx.grant().role() != OWNER {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                "Writing devices.toml directly requires the owner role on this node.",
+            )
+            .with_hint(
+                "Run `config.write devices.toml` as the owner, or manage paired devices through `device.invite`, `device.set`, and `device.remove`.",
+            ));
+        }
         if content.len() > MAX_DOCUMENT_BYTES {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
@@ -835,10 +851,6 @@ async fn apply_local_write(
         let paths = ctx.paths().clone();
         let paths_for_sessions = paths.clone();
         let node_name = ctx.node_name().to_owned();
-        let caller_is_owner = ctx.grant().role() == OWNER;
-        let caller_principal = ctx.principal().to_owned();
-        let caller_role = ctx.grant().role().to_owned();
-        let caller_pairing_id = ctx.pairing_id().map(str::to_owned);
         let credential_expires = ctx.credential_expires();
 
         let merge_result = tokio::task::spawn_blocking(move || {
@@ -882,198 +894,60 @@ async fn apply_local_write(
                 }
                 Ok(())
             };
-            let caller_principal_prep = caller_principal.clone();
-            let caller_role_prep = caller_role.clone();
-            let prepare_incoming = |local: &DevicesFile,
-                                    live_policy: &Policy,
-                                    local_only_ids: &BTreeMap<String, String>,
-                                    incoming_mut: &mut DevicesFile|
-             -> Result<(), ErrorBody> {
-                let caller_device_id: Option<String> = caller_pairing_id.clone().or_else(|| {
-                    live_policy
-                        .device_owner(&caller_principal_prep)
-                        .map(str::to_owned)
-                });
-                for (id, inc) in &mut incoming_mut.devices {
-                    if local.removed.contains_key(id) {
-                        continue;
-                    }
-                    if let Some(prev) = local.devices.get(id) {
-                        // Confirmation is ONLY allowed through `device.set confirm=true`, never
-                        // through `config.write` (even for owner callers).
-                        if (inc.confirmed_by.is_some() || inc.confirmed_at.is_some())
-                            && (inc.confirmed_by != prev.confirmed_by
-                                || inc.confirmed_at != prev.confirmed_at)
-                        {
-                            return Err(ErrorBody::new(
-                                ErrorCode::Denied,
-                                "Setting confirmed_by or confirmed_at through `config.write devices.toml` is not allowed.",
-                            )
-                            .with_hint("Confirm a quarantined device with `legion device.set id=<pairing_id> confirm=true`."));
+            let prepare_incoming =
+                |local: &DevicesFile,
+                 _live_policy: &Policy,
+                 incoming_mut: &mut DevicesFile|
+                 -> Result<(), ErrorBody> {
+                    for (id, inc) in &mut incoming_mut.devices {
+                        if local.removed.contains_key(id) {
+                            continue;
                         }
-                        // Dropping creator metadata on an existing entry is refused even for owner
-                        // callers so quarantine provenance cannot be stripped through `config.write`.
-                        let drops_paired_by = prev.paired_by.is_some() && inc.paired_by.is_none();
-                        let drops_creator_device = prev
-                            .paired_by
-                            .as_ref()
-                            .and_then(|p| p.device.as_ref())
-                            .is_some()
-                            && inc
+                        if let Some(prev) = local.devices.get(id) {
+                            // Confirmation is ONLY allowed through `device.set confirm=true`,
+                            // never through `config.write` (even for owner callers).
+                            if (inc.confirmed_by.is_some() || inc.confirmed_at.is_some())
+                                && (inc.confirmed_by != prev.confirmed_by
+                                    || inc.confirmed_at != prev.confirmed_at)
+                            {
+                                return Err(ErrorBody::new(
+                                    ErrorCode::Denied,
+                                    "Setting confirmed_by or confirmed_at through `config.write devices.toml` is not allowed.",
+                                )
+                                .with_hint("Confirm a quarantined device with `legion device.set id=<pairing_id> confirm=true`."));
+                            }
+                            // Dropping creator metadata on an existing entry is refused even for
+                            // owner callers so quarantine provenance cannot be stripped through
+                            // `config.write`.
+                            let drops_paired_by =
+                                prev.paired_by.is_some() && inc.paired_by.is_none();
+                            let drops_creator_device = prev
                                 .paired_by
                                 .as_ref()
                                 .and_then(|p| p.device.as_ref())
-                                .is_none();
-                        if drops_paired_by || drops_creator_device {
-                            return Err(ErrorBody::new(
-                                ErrorCode::Denied,
-                                "Removing paired_by provenance from an existing paired device via `config.write` is not allowed.",
-                            )
-                            .with_hint("Keep the existing paired_by metadata intact, or confirm a quarantined device with `device.set confirm=true`."));
-                        }
-
-                        if !caller_is_owner {
-                            if inc != prev && prev.principal != caller_principal_prep {
+                                .is_some()
+                                && inc
+                                    .paired_by
+                                    .as_ref()
+                                    .and_then(|p| p.device.as_ref())
+                                    .is_none();
+                            if drops_paired_by || drops_creator_device {
                                 return Err(ErrorBody::new(
                                     ErrorCode::Denied,
-                                    format!(
-                                        "As {caller_principal_prep}, you may not modify a paired device owned by {}.",
-                                        prev.principal
-                                    ),
+                                    "Removing paired_by provenance from an existing paired device via `config.write` is not allowed.",
                                 )
-                                .with_hint("Modify other principals' devices as the owner of this machine."));
+                                .with_hint("Keep the existing paired_by metadata intact, or confirm a quarantined device with `device.set confirm=true`."));
                             }
-                            if inc.paired_at != prev.paired_at {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "paired_at for device {id} is immutable once written for non-owner callers."
-                                    ),
-                                ));
-                            }
-                            if inc.paired_on != prev.paired_on {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "paired_on for device {id} is immutable once written for non-owner callers."
-                                    ),
-                                ));
-                            }
-                            if inc.paired_by != prev.paired_by {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "paired_by for device {id} is immutable once written for non-owner callers."
-                                    ),
-                                ));
-                            }
-                            if inc.public_key != prev.public_key {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "public_key for device {id} is immutable once written for non-owner callers."
-                                    ),
-                                ));
-                            }
-                            if inc.confirmed_by != prev.confirmed_by
-                                || inc.confirmed_at != prev.confirmed_at
-                            {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    "Only a caller with the owner role may confirm a quarantined paired device.",
-                                )
-                                .with_hint("Run `device.set confirm=true` as the owner of this machine."));
-                            }
-                            if inc.principal != prev.principal {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "As {caller_principal_prep}, you may not change a paired device's principal from {} to {}.",
-                                        prev.principal, inc.principal
-                                    ),
-                                ));
-                            }
-                            if inc.role != prev.role
-                                && inc.role.as_deref() != Some(caller_role_prep.as_str())
-                            {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "As {caller_principal_prep} ({caller_role_prep}), you may not assign role {:?} to a paired device.",
-                                        inc.role
-                                    ),
-                                )
-                                .with_hint("Only a caller with the owner role may assign or change device roles."));
-                            }
-                        }
-                    } else {
-                        // Brand-new live entry: confirmation is never allowed via `config.write`.
-                        if inc.confirmed_by.is_some() || inc.confirmed_at.is_some() {
+                        } else if inc.confirmed_by.is_some() || inc.confirmed_at.is_some() {
                             return Err(ErrorBody::new(
                                 ErrorCode::Denied,
                                 "Setting confirmed_by or confirmed_at through `config.write devices.toml` is not allowed.",
                             )
                             .with_hint("Confirm a quarantined device with `legion device.set id=<pairing_id> confirm=true`."));
                         }
-                        if !caller_is_owner {
-                            // A local-only line's pairing id counts as an existing entry owned by
-                            // that line's principal; a non-owner caller cannot add or replace an
-                            // entry with the same pairing id.
-                            if let Some(local_owner_principal) = local_only_ids.get(id) {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "Pairing {id} already exists as a local-only device owned by {local_owner_principal} in authorized_keys and cannot be added or replaced by {caller_principal_prep}."
-                                    ),
-                                )
-                                .with_hint(
-                                    "Remove the local-only line or pair the device with a new pairing id.",
-                                ));
-                            }
-                            // For a non-owner adding a live entry, `paired_by` must match the
-                            // caller's principal (and its pairing id when the caller is itself a
-                            // paired device); fill omitted fields from call context and reject any
-                            // entry claiming otherwise.
-                            match &mut inc.paired_by {
-                                None => {
-                                    inc.paired_by = Some(PairedBy {
-                                        principal: caller_principal_prep.clone(),
-                                        device: caller_device_id.clone(),
-                                    });
-                                }
-                                Some(pb) => {
-                                    if pb.principal != caller_principal_prep {
-                                        return Err(ErrorBody::new(
-                                            ErrorCode::Denied,
-                                            format!(
-                                                "As {caller_principal_prep}, you may not record paired_by.principal as {}.",
-                                                pb.principal
-                                            ),
-                                        ));
-                                    }
-                                    if let Some(ref expected_dev) = caller_device_id {
-                                        match pb.device.as_deref() {
-                                            None => {
-                                                pb.device = Some(expected_dev.clone());
-                                            }
-                                            Some(given) if given == expected_dev => {}
-                                            Some(other) => {
-                                                return Err(ErrorBody::new(
-                                                    ErrorCode::Denied,
-                                                    format!(
-                                                        "As paired device {expected_dev}, you may not record paired_by.device as {other}."
-                                                    ),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
-                }
-                Ok(())
-            };
+                    Ok(())
+                };
             let authorize_change = |change: MergeChange<'_>| -> Result<(), ErrorBody> {
                 if let Some(limit) = credential_expires
                     && matches!(change, MergeChange::Live { .. })
@@ -1088,100 +962,6 @@ async fn apply_local_write(
                     .with_hint(
                         "Use a local shell or a non-expiring credential to add or change paired devices. Removing (tombstoning) devices is still allowed.",
                     ));
-                }
-                if caller_is_owner {
-                    return Ok(());
-                }
-                match change {
-                    MergeChange::Live { entry, previous } => {
-                        if let Some(prev) = previous {
-                            if prev.principal != caller_principal {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "As {caller_principal}, you may not modify a paired device owned by {}.",
-                                        prev.principal
-                                    ),
-                                )
-                                .with_hint("Modify other principals' devices as the owner of this machine."));
-                            }
-                            if entry.confirmed_by != prev.confirmed_by
-                                || entry.confirmed_at != prev.confirmed_at
-                            {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    "Only a caller with the owner role may confirm a quarantined paired device.",
-                                )
-                                .with_hint("Run `device.set confirm=true` as the owner of this machine."));
-                            }
-                            if entry.paired_by != prev.paired_by {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    "Only a caller with the owner role may change a paired device's creator metadata.",
-                                ));
-                            }
-                        } else {
-                            if entry.confirmed_by.is_some() || entry.confirmed_at.is_some() {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    "Only a caller with the owner role may mark a paired device as confirmed.",
-                                ));
-                            }
-                            if let Some(ref paired_by) = entry.paired_by
-                                && paired_by.principal != caller_principal
-                            {
-                                return Err(ErrorBody::new(
-                                    ErrorCode::Denied,
-                                    format!(
-                                        "As {caller_principal}, you may not record paired_by.principal as {}.",
-                                        paired_by.principal
-                                    ),
-                                ));
-                            }
-                        }
-                        if entry.principal != caller_principal {
-                            return Err(ErrorBody::new(
-                                ErrorCode::Denied,
-                                format!(
-                                    "As {caller_principal}, you may only sync paired devices pinned to {caller_principal}, not {}.",
-                                    entry.principal
-                                ),
-                            )
-                            .with_hint("Sync devices for other principals as the owner of this machine."));
-                        }
-                        if let Some(ref role) = entry.role
-                            && role != &caller_role
-                        {
-                            return Err(ErrorBody::new(
-                                ErrorCode::Denied,
-                                format!(
-                                    "As {caller_principal} ({caller_role}), you may not assign role {role:?} to a paired device."
-                                ),
-                            )
-                            .with_hint("Only a caller with the owner role may assign or change device roles."));
-                        }
-                    }
-                    MergeChange::Removed { previous_live, .. } => {
-                        let Some(prev) = previous_live else {
-                            return Err(ErrorBody::new(
-                                ErrorCode::Denied,
-                                format!(
-                                    "As {caller_principal}, you may only revoke paired devices that are live on this machine and pinned to {caller_principal}."
-                                ),
-                            )
-                            .with_hint("Only the owner may record tombstones for devices that are not live on this node."));
-                        };
-                        if prev.principal != caller_principal {
-                            return Err(ErrorBody::new(
-                                ErrorCode::Denied,
-                                format!(
-                                    "As {caller_principal}, you may only revoke paired devices pinned to {caller_principal}, not {}.",
-                                    prev.principal
-                                ),
-                            )
-                            .with_hint("Revoke other principals' devices as the owner of this machine."));
-                        }
-                    }
                 }
                 Ok(())
             };
@@ -1242,6 +1022,11 @@ async fn apply_local_write(
             "hash_after": hash_after,
             "backup": merge_outcome.backup,
         });
+        if let Some(ref push_audit) = device_registry_push
+            && let Some(obj) = audit_args.as_object_mut()
+        {
+            obj.insert("device_registry_push".to_owned(), json!(push_audit));
+        }
         if !merge_outcome.warnings.is_empty()
             && let Some(obj) = audit_args.as_object_mut()
         {
@@ -1377,6 +1162,11 @@ struct ConfigWriteArgs {
     /// Require that the document does not currently exist; fails with `conflict` if already present.
     #[serde(default)]
     expect_absent: bool,
+    /// Optional audit metadata attached during a node-to-node device-registry push after a local
+    /// device tool (`device.enrol`, `device.set`, or `device.remove`). Valid only for `devices.toml`
+    /// and grants no additional permission.
+    #[serde(default)]
+    device_registry_push: Option<DeviceRegistryPushAudit>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1391,8 +1181,15 @@ struct ConfigWriteResult {
 
 async fn config_write(ctx: &Ctx, args: ConfigWriteArgs) -> Result<ConfigWriteResult, ToolError> {
     let doc = SharedDocument::parse(&args.document)?;
-    let outcome =
-        apply_local_write(ctx, doc, args.content, args.expect_hash, args.expect_absent).await?;
+    let outcome = apply_local_write(
+        ctx,
+        doc,
+        args.content,
+        args.expect_hash,
+        args.expect_absent,
+        args.device_registry_push,
+    )
+    .await?;
     Ok(ConfigWriteResult {
         document: outcome.document,
         hash: outcome.hash_after,
@@ -1436,6 +1233,8 @@ pub enum SyncStatus {
     OnlyThere,
     /// The destination changed since the last recorded sync with this peer (or existed without one).
     Conflict,
+    /// Skipped for this caller (for example `devices.toml` when the caller does not hold the `owner` role); see `detail`.
+    Skipped,
     /// Reading, validating, or writing failed; see `error`.
     Error,
 }
@@ -1465,6 +1264,11 @@ struct SyncArgs {
     /// Optional per-machine timeout in seconds (up to 300).
     #[serde(default)]
     timeout_s: Option<f64>,
+    /// Optional audit metadata attached by this node during an automatic device-registry push after
+    /// `device.enrol`, `device.set`, or `device.remove`. Valid only with `direction="push"` and
+    /// `documents=["devices.toml"]` as owner.
+    #[serde(default)]
+    device_registry_push: Option<DeviceRegistryPushAudit>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1526,6 +1330,23 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
         None => None,
     };
 
+    if args.device_registry_push.is_some() {
+        if ctx.grant().role() != OWNER {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                "`device_registry_push` requires the owner role on this node.",
+            ));
+        }
+        if args.direction != SyncDirection::Push
+            || explicit_docs.as_deref() != Some(&[SharedDocument::Devices])
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "`device_registry_push` may only be used with direction=\"push\" and documents=[\"devices.toml\"].",
+            ));
+        }
+    }
+
     let targets = resolve_sync_targets(&fleet_file, &here, &args)?;
 
     let local_docs = {
@@ -1540,6 +1361,7 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
             })??
     };
 
+    let device_push_ref = args.device_registry_push.as_ref();
     let mut results = BTreeMap::new();
     match args.direction {
         SyncDirection::Pull => {
@@ -1555,6 +1377,7 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                     args.force,
                     args.dry_run,
                     per_machine_timeout,
+                    device_push_ref,
                 )
                 .await;
                 results.insert(machine, per_doc);
@@ -1577,6 +1400,7 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                             args.force,
                             args.dry_run,
                             per_machine_timeout,
+                            device_push_ref,
                         )
                         .await;
                         (machine, per_doc)
@@ -1614,6 +1438,7 @@ async fn sync_one_machine_with_timeout(
     force: bool,
     dry_run: bool,
     timeout: Option<Duration>,
+    device_registry_push: Option<&DeviceRegistryPushAudit>,
 ) -> BTreeMap<String, DocSyncOutcome> {
     let fut = sync_one_machine(
         fleet,
@@ -1624,6 +1449,7 @@ async fn sync_one_machine_with_timeout(
         local_docs,
         force,
         dry_run,
+        device_registry_push,
     );
     let Some(limit) = timeout else {
         return fut.await;
@@ -1730,6 +1556,7 @@ async fn sync_one_machine(
     local_docs: &[String],
     force: bool,
     dry_run: bool,
+    device_registry_push: Option<&DeviceRegistryPushAudit>,
 ) -> BTreeMap<String, DocSyncOutcome> {
     let docs = match determine_documents_for_machine(fleet, ctx, machine, explicit_docs, local_docs)
         .await
@@ -1748,7 +1575,17 @@ async fn sync_one_machine(
     let mut outcomes = BTreeMap::new();
     for doc in docs {
         let name = doc.canonical_name();
-        let outcome = sync_one_document(fleet, ctx, machine, &doc, direction, force, dry_run).await;
+        let outcome = sync_one_document(
+            fleet,
+            ctx,
+            machine,
+            &doc,
+            direction,
+            force,
+            dry_run,
+            device_registry_push,
+        )
+        .await;
         outcomes.insert(name, outcome);
     }
     outcomes
@@ -1841,6 +1678,7 @@ fn default_doc_list(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_one_document(
     fleet: &Fleet,
     ctx: &Ctx,
@@ -1849,9 +1687,18 @@ async fn sync_one_document(
     direction: SyncDirection,
     force: bool,
     dry_run: bool,
+    device_registry_push: Option<&DeviceRegistryPushAudit>,
 ) -> DocSyncOutcome {
     if *doc == SharedDocument::Devices {
-        return sync_devices_document(fleet, ctx, machine, direction, dry_run).await;
+        return sync_devices_document(
+            fleet,
+            ctx,
+            machine,
+            direction,
+            dry_run,
+            device_registry_push,
+        )
+        .await;
     }
 
     let config_dir = ctx.paths().config_dir().to_path_buf();
@@ -2112,8 +1959,15 @@ async fn sync_one_document(
                     None => (None, true),
                 }
             };
-            match apply_local_write(ctx, doc.clone(), remote_content, expect_hash, expect_absent)
-                .await
+            match apply_local_write(
+                ctx,
+                doc.clone(),
+                remote_content,
+                expect_hash,
+                expect_absent,
+                None,
+            )
+            .await
             {
                 Ok(written) => {
                     if let Err(error) =
@@ -2163,7 +2017,24 @@ async fn sync_devices_document(
     machine: &str,
     direction: SyncDirection,
     dry_run: bool,
+    device_registry_push: Option<&DeviceRegistryPushAudit>,
 ) -> DocSyncOutcome {
+    if direction != SyncDirection::Status && ctx.grant().role() != OWNER {
+        return DocSyncOutcome {
+            status: SyncStatus::Skipped,
+            local_hash: None,
+            remote_hash: None,
+            last_synced_hash: None,
+            backup: None,
+            detail: Some(
+                "Syncing devices.toml requires the owner role on this node; skipped for non-owner callers."
+                    .to_owned(),
+            ),
+            warnings: Vec::new(),
+            error: None,
+        };
+    }
+
     let doc = SharedDocument::Devices;
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let local_file_exists = ctx.paths().config_file("devices.toml").is_file();
@@ -2228,7 +2099,9 @@ async fn sync_devices_document(
         None => DevicesFile::default(),
     };
 
-    let merged = merge_devices(&local_devices, &remote_devices);
+    let mut remote_for_status = remote_devices.clone();
+    rewrite_tombstones_from_local(&local_devices, &mut remote_for_status);
+    let merged = merge_devices(&local_devices, &remote_for_status);
 
     if direction == SyncDirection::Status {
         let (status, detail) = classify_devices_status(
@@ -2256,131 +2129,52 @@ async fn sync_devices_document(
             // Trust rule: push sends local entries to the peer and imports ONLY tombstones back —
             // never live device entries from the peer.
             //
-            // Non-owner callers scope their outgoing push and incoming tombstones to their own
-            // principal, and outgoing writes run BEFORE local tombstone import (with a tombstone-
-            // only fallback if a live entry is refused), so a peer's refusal of an unrelated entry
-            // never blocks revocation.
-            let caller_is_owner = ctx.grant().role() == OWNER;
-            let caller_principal = ctx.principal();
-            let caller_role = ctx.grant().role();
-
             // Confirmations (`confirmed_by`/`confirmed_at`) are node-local and only accepted via
             // `device.set confirm=true`, so align outgoing confirmation fields with what the peer
             // already holds (never smuggling a confirmation over `config.write` or failing sync of
             // unrelated entries).
-            let mut outgoing = if caller_is_owner {
-                let mut aligned = local_devices.clone();
-                for (id, entry) in &mut aligned.devices {
-                    match remote_devices.devices.get(id) {
-                        Some(prev_remote) => {
-                            entry.confirmed_by = prev_remote.confirmed_by.clone();
-                            entry.confirmed_at = prev_remote.confirmed_at.clone();
-                        }
-                        None => {
-                            entry.confirmed_by = None;
-                            entry.confirmed_at = None;
-                        }
+            let mut outgoing = local_devices.clone();
+            for (id, entry) in &mut outgoing.devices {
+                match remote_devices.devices.get(id) {
+                    Some(prev_remote) => {
+                        entry.confirmed_by = prev_remote.confirmed_by.clone();
+                        entry.confirmed_at = prev_remote.confirmed_at.clone();
+                    }
+                    None => {
+                        entry.confirmed_by = None;
+                        entry.confirmed_at = None;
                     }
                 }
-                aligned
-            } else {
-                let mut scoped = DevicesFile::default();
-                for (id, entry) in &local_devices.devices {
-                    if remote_devices.removed.contains_key(id) {
-                        continue;
-                    }
-                    let prev_remote = remote_devices.devices.get(id);
-                    if prev_remote == Some(entry) {
-                        continue;
-                    }
-                    let mut candidate = entry.clone();
-                    match prev_remote {
-                        Some(p) => {
-                            candidate.confirmed_by = p.confirmed_by.clone();
-                            candidate.confirmed_at = p.confirmed_at.clone();
-                        }
-                        None => {
-                            candidate.confirmed_by = None;
-                            candidate.confirmed_at = None;
-                        }
-                    }
-                    if prev_remote == Some(&candidate) {
-                        continue;
-                    }
-                    let prev_ok = prev_remote.is_none_or(|p| {
-                        p.principal == caller_principal
-                            && p.paired_at == candidate.paired_at
-                            && p.paired_on == candidate.paired_on
-                            && p.paired_by == candidate.paired_by
-                            && p.public_key == candidate.public_key
-                    });
-                    let new_ok = prev_remote.is_some()
-                        || candidate
-                            .paired_by
-                            .as_ref()
-                            .is_none_or(|pb| pb.principal == caller_principal);
-                    let role_ok = candidate.role.as_deref().is_none_or(|r| r == caller_role);
-                    if candidate.principal == caller_principal && prev_ok && new_ok && role_ok {
-                        scoped.devices.insert(id.clone(), candidate);
-                    }
-                }
-                for (id, tomb) in &local_devices.removed {
-                    if remote_devices
-                        .devices
-                        .get(id)
-                        .is_some_and(|prev| prev.principal == caller_principal)
-                    {
-                        scoped.removed.insert(id.clone(), tomb.clone());
-                    }
-                }
-                scoped
-            };
+            }
 
             // An expiring credential may push ONLY tombstones to peers (never live device
             // entries), so revocations made with an expiring credential still reach the fleet.
             let mut skipped_live_due_to_expiry = false;
             if ctx.credential_expires().is_some() && !outgoing.devices.is_empty() {
-                let full_after = merge_devices(&remote_devices, &outgoing);
+                let mut full_preview = outgoing.clone();
+                rewrite_tombstones_from_local(&remote_devices, &mut full_preview);
+                let full_after = merge_devices(&remote_devices, &full_preview);
                 let mut tombs_only = outgoing.clone();
                 tombs_only.devices.clear();
-                let tombs_after = merge_devices(&remote_devices, &tombs_only);
+                let mut tombs_preview = tombs_only.clone();
+                rewrite_tombstones_from_local(&remote_devices, &mut tombs_preview);
+                let tombs_after = merge_devices(&remote_devices, &tombs_preview);
                 skipped_live_due_to_expiry = full_after != tombs_after;
                 outgoing = tombs_only;
             }
 
-            let filter_remote_tombstones = |remote_removed: &BTreeMap<
-                String,
-                legion_tools::device::registry::DeviceTombstone,
-            >,
-                                            local_now: &DevicesFile|
-             -> DevicesFile {
-                let removed = if caller_is_owner {
-                    remote_removed.clone()
-                } else {
-                    remote_removed
-                        .iter()
-                        .filter(|(id, _)| {
-                            local_now
-                                .devices
-                                .get(*id)
-                                .is_some_and(|prev| prev.principal == caller_principal)
-                        })
-                        .map(|(id, tomb)| (id.clone(), tomb.clone()))
-                        .collect()
-                };
-                DevicesFile {
-                    version: DEVICES_VERSION,
-                    devices: BTreeMap::new(),
-                    removed,
-                }
+            let mut remote_tombstones_only = DevicesFile {
+                version: DEVICES_VERSION,
+                devices: BTreeMap::new(),
+                removed: remote_devices.removed.clone(),
             };
-
-            let remote_tombstones_only =
-                filter_remote_tombstones(&remote_devices.removed, &local_devices);
+            rewrite_tombstones_from_local(&local_devices, &mut remote_tombstones_only);
             let local_after_tombstones = merge_devices(&local_devices, &remote_tombstones_only);
             let local_needs_tombstones = local_after_tombstones != local_devices;
 
-            let remote_after_push = merge_devices(&remote_devices, &outgoing);
+            let mut outgoing_preview = outgoing.clone();
+            rewrite_tombstones_from_local(&remote_devices, &mut outgoing_preview);
+            let remote_after_push = merge_devices(&remote_devices, &outgoing_preview);
             let outgoing_is_empty = outgoing.devices.is_empty() && outgoing.removed.is_empty();
             let remote_needs_push =
                 remote_after_push != remote_devices || (!remote.exists && !outgoing_is_empty);
@@ -2460,15 +2254,21 @@ async fn sync_devices_document(
             //    node even if a local step or an unrelated entry fails.
             if remote_needs_push && !outgoing_is_empty {
                 let outgoing_toml = outgoing.to_toml_string();
+                let mut write_args = json!({
+                    "document": "devices.toml",
+                    "content": outgoing_toml,
+                });
+                if let Some(push_audit) = device_registry_push
+                    && let Some(obj) = write_args.as_object_mut()
+                {
+                    obj.insert("device_registry_push".to_owned(), json!(push_audit));
+                }
                 let write_res = fleet
                     .call_remote(
                         ctx,
                         machine,
                         "config.write",
-                        json!({
-                            "document": "devices.toml",
-                            "content": outgoing_toml,
-                        }),
+                        write_args,
                         EventSink::discard(),
                     )
                     .await;
@@ -2506,8 +2306,12 @@ async fn sync_devices_document(
                                 again_content.as_bytes(),
                             )
                         {
-                            let extra_tombs =
-                                filter_remote_tombstones(&again_devices.removed, &current_local);
+                            let mut extra_tombs = DevicesFile {
+                                version: DEVICES_VERSION,
+                                devices: BTreeMap::new(),
+                                removed: again_devices.removed,
+                            };
+                            rewrite_tombstones_from_local(&current_local, &mut extra_tombs);
                             tombstones_to_import =
                                 merge_devices(&tombstones_to_import, &extra_tombs);
                             remote_has_extra_live = again_devices
@@ -2526,15 +2330,21 @@ async fn sync_devices_document(
                                 devices: BTreeMap::new(),
                                 removed: outgoing.removed.clone(),
                             };
+                            let mut retry_args = json!({
+                                "document": "devices.toml",
+                                "content": tombs_only.to_toml_string(),
+                            });
+                            if let Some(push_audit) = device_registry_push
+                                && let Some(obj) = retry_args.as_object_mut()
+                            {
+                                obj.insert("device_registry_push".to_owned(), json!(push_audit));
+                            }
                             if let Ok(val) = fleet
                                 .call_remote(
                                     ctx,
                                     machine,
                                     "config.write",
-                                    json!({
-                                        "document": "devices.toml",
-                                        "content": tombs_only.to_toml_string(),
-                                    }),
+                                    retry_args,
                                     EventSink::discard(),
                                 )
                                 .await
@@ -2571,6 +2381,7 @@ async fn sync_devices_document(
                     tombstones_to_import.to_toml_string(),
                     None,
                     false,
+                    device_registry_push.cloned(),
                 )
                 .await
                 {
@@ -2636,6 +2447,7 @@ async fn sync_devices_document(
                     }
                 }
             }
+            rewrite_tombstones_from_local(&local_devices, &mut sanitized_remote);
             let sanitized_merged = merge_devices(&local_devices, &sanitized_remote);
             let sanitized_empty =
                 sanitized_merged.devices.is_empty() && sanitized_merged.removed.is_empty();
@@ -2697,6 +2509,7 @@ async fn sync_devices_document(
                 sanitized_remote.to_toml_string(),
                 None,
                 false,
+                None,
             )
             .await
             {
@@ -4208,10 +4021,8 @@ role = \"ops\"
             "owner merge claiming marked device:d for id_e must fail: {owner_hijack_err:?}"
         );
 
-        // 2. Non-owner paired device `s` on shared principal `shared_ops` adding a new live entry:
-        //    - claiming another `paired_by.principal` -> refused;
-        //    - claiming another `paired_by.device` -> refused;
-        //    - omitting `paired_by` -> node fills `{ principal: "shared_ops", device: Some(id_s) }`!
+        // 2. Non-owner paired devices cannot write `devices.toml` at all under the two-writers
+        //    rule (only the node's own device tools or an owner-authorised write may write it).
         let make_child = |paired_by: Option<PairedBy>| {
             let mut f = DevicesFile::default();
             f.devices.insert(
@@ -4232,72 +4043,48 @@ role = \"ops\"
             );
             f
         };
-        let mut wrong_principal = Call::new(
-            Door::Ssh,
-            "config.write",
-            json!({
-                "document": "devices.toml",
-                "content": make_child(Some(PairedBy {
-                    principal: "owner".to_owned(),
-                    device: None,
-                })).to_toml_string()
-            }),
-        );
-        wrong_principal.pinned = Some("shared_ops".to_owned());
-        wrong_principal.device = Some("shared-parent".to_owned());
-        wrong_principal.pairing_id = Some(id_s.clone());
-        assert_eq!(
-            node.call(wrong_principal).await.unwrap_err().code,
-            ErrorCode::Denied
-        );
-
-        let mut wrong_device = Call::new(
+        let mut non_owner_add = Call::new(
             Door::Ssh,
             "config.write",
             json!({
                 "document": "devices.toml",
                 "content": make_child(Some(PairedBy {
                     principal: "shared_ops".to_owned(),
-                    device: Some(id_d.clone()),
+                    device: Some(id_s.clone()),
                 })).to_toml_string()
             }),
         );
-        wrong_device.pinned = Some("shared_ops".to_owned());
-        wrong_device.device = Some("shared-parent".to_owned());
-        wrong_device.pairing_id = Some(id_s.clone());
+        non_owner_add.pinned = Some("shared_ops".to_owned());
+        non_owner_add.device = Some("shared-parent".to_owned());
+        non_owner_add.pairing_id = Some(id_s.clone());
         assert_eq!(
-            node.call(wrong_device).await.unwrap_err().code,
+            node.call(non_owner_add).await.unwrap_err().code,
             ErrorCode::Denied
         );
 
-        let mut omitted_paired_by = Call::new(
-            Door::Ssh,
+        // Seed `id_child` through an owner write so we can verify owner-level invariants below.
+        node.call(Call::new(
+            Door::Cli,
             "config.write",
-            json!({"document": "devices.toml", "content": make_child(None).to_toml_string()}),
-        );
-        omitted_paired_by.pinned = Some("shared_ops".to_owned());
-        omitted_paired_by.device = Some("shared-parent".to_owned());
-        omitted_paired_by.pairing_id = Some(id_s.clone());
-        node.call(omitted_paired_by).await.unwrap();
+            json!({
+                "document": "devices.toml",
+                "content": make_child(Some(PairedBy {
+                    principal: "shared_ops".to_owned(),
+                    device: Some(id_s.clone()),
+                })).to_toml_string()
+            }),
+        ))
+        .await
+        .unwrap();
 
         let saved: DevicesFile = parse(
             &paths.config_file("devices.toml"),
             &std::fs::read(paths.config_file("devices.toml")).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            saved.devices[&id_child].paired_by,
-            Some(PairedBy {
-                principal: "shared_ops".to_owned(),
-                device: Some(id_s.clone()),
-            }),
-            "node must fill paired_by from call context when omitted"
-        );
-
-        // 3. Reproduced attack #2: child tries to rewrite its own immutable fields (`paired_at`,
-        //    `paired_on`, `paired_by`, `public_key`), both with newer `updated_at` AND with an
-        //    older `updated_at` that would lose a CRDT tie. Every attempt must be refused!
         let base_child = saved.devices[&id_child].clone();
+
+        // 3. Non-owner child cannot rewrite its own fields (even with older or newer updated_at).
         for (label, mutate) in [
             (
                 "paired_at newer",
@@ -4307,30 +4094,16 @@ role = \"ops\"
                 }) as Box<dyn Fn(&mut FleetDevice)>,
             ),
             (
-                "paired_at older tie-loser (must still be refused, not silently ignored)",
+                "paired_at older",
                 Box::new(|d: &mut FleetDevice| {
                     d.paired_at = t_backdated.clone();
                     d.updated_at = t_older.clone();
                 }),
             ),
             (
-                "paired_on",
-                Box::new(|d: &mut FleetDevice| {
-                    d.paired_on = "other-node".to_owned();
-                    d.updated_at = t2.clone();
-                }),
-            ),
-            (
                 "paired_by",
                 Box::new(|d: &mut FleetDevice| {
                     d.paired_by = None;
-                    d.updated_at = t2.clone();
-                }),
-            ),
-            (
-                "public_key",
-                Box::new(|d: &mut FleetDevice| {
-                    d.public_key = ed25519_public_key_from_seed(&[0xfe; 32]);
                     d.updated_at = t2.clone();
                 }),
             ),
@@ -4474,11 +4247,11 @@ updated_on = \"box-a\"
     }
 
     #[tokio::test]
-    async fn s4_non_owner_cannot_add_entry_matching_local_only_pairing_id() {
+    async fn two_writers_rule_refuses_non_owner_config_write_and_skips_devices_in_fleet_sync() {
+        use jiff::SignedDuration;
         use legion_core::{Call, Door, Node, Paths};
-        use legion_tools::device::authkeys::{ForcedCommandShell, PinnedHome, format_device_line};
         use legion_tools::device::keys::ed25519_public_key_from_seed;
-        use legion_tools::device::registry::{FleetDevice, PairedBy};
+        use legion_tools::device::registry::{DeviceTombstone, FleetDevice, PairedBy};
 
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -4490,6 +4263,11 @@ updated_on = \"box-a\"
         std::fs::write(
             paths.config_file("node.toml"),
             format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.box-b]\ncommand = [\"/nonexistent/legion-does-not-exist\"]\n",
         )
         .unwrap();
         std::fs::write(
@@ -4505,81 +4283,129 @@ role = \"ops\"
 ",
         )
         .unwrap();
-        std::fs::write(paths.config_file("devices.toml"), "version = 1\n").unwrap();
+        let id_x = "61".repeat(16);
+        let now = Timestamp::now();
+        let now_str = now.to_string();
+        let backdated = (now - SignedDuration::from_hours(2)).to_string();
 
-        // Two local-only lines in authorized_keys (neither present in devices.toml):
-        // one owned by `owner` and one owned by `tablet`.
-        let local_owner_id = "f1".repeat(16);
-        let local_tablet_id = "f2".repeat(16);
-        let exe = legion_core::current_exe().unwrap();
-        let shell = ForcedCommandShell::host().unwrap();
-        let pinned_home = PinnedHome::from_paths(&paths);
-        let line_owner = format_device_line(
-            &exe,
-            "owner",
-            &ed25519_public_key_from_seed(&[0xf1; 32]),
-            "local-owner",
-            &local_owner_id,
-            &pinned_home,
-            None,
-            shell,
-        )
-        .unwrap();
-        let line_tablet = format_device_line(
-            &exe,
-            "tablet",
-            &ed25519_public_key_from_seed(&[0xf2; 32]),
-            "local-tablet",
-            &local_tablet_id,
-            &pinned_home,
-            None,
-            shell,
-        )
-        .unwrap();
-        let auth_before = format!("{line_owner}\n{line_tablet}\n");
-        std::fs::write(&auth_keys, &auth_before).unwrap();
+        let mut initial = DevicesFile::default();
+        initial.devices.insert(
+            id_x.clone(),
+            FleetDevice {
+                name: "x".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0x61; 32]),
+                principal: "tablet".to_owned(),
+                role: None,
+                paired_at: now_str.clone(),
+                paired_on: "box-a".to_owned(),
+                paired_by: Some(PairedBy {
+                    principal: "owner".to_owned(),
+                    device: None,
+                }),
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: now_str.clone(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
 
         let mut reg = legion_tools::registry();
         let fleet = Fleet::new(&paths);
         register(&mut reg, fleet);
         let node = Node::new(paths.clone(), reg);
 
-        let now = Timestamp::now().to_string();
-        for (label, target_id, seed) in [
-            ("local-only owner id", &local_owner_id, 0xf3u8),
-            ("local-only tablet id", &local_tablet_id, 0xf4u8),
-        ] {
-            let mut attempt = DevicesFile::default();
-            attempt.devices.insert(
-                target_id.clone(),
-                FleetDevice {
-                    name: "hijack".to_owned(),
-                    public_key: ed25519_public_key_from_seed(&[seed; 32]),
+        // 1. Non-owner with effect:admin cannot write its own live entry (or backdated entry) via config.write.
+        let mut add_own = DevicesFile::default();
+        add_own.devices.insert(
+            "62".repeat(16),
+            FleetDevice {
+                name: "backdated-child".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0x62; 32]),
+                principal: "tablet".to_owned(),
+                role: None,
+                paired_at: backdated,
+                paired_on: "box-a".to_owned(),
+                paired_by: Some(PairedBy {
                     principal: "tablet".to_owned(),
-                    role: None,
-                    paired_at: now.clone(),
-                    paired_on: "box-a".to_owned(),
-                    paired_by: Some(PairedBy {
-                        principal: "tablet".to_owned(),
-                        device: None,
-                    }),
-                    confirmed_by: None,
-                    confirmed_at: None,
-                    updated_at: now.clone(),
-                    updated_on: "box-a".to_owned(),
-                },
-            );
-            let mut call = Call::new(
-                Door::Cli,
-                "config.write",
-                json!({"document": "devices.toml", "content": attempt.to_toml_string()}),
-            );
-            call.pinned = Some("tablet".to_owned());
-            let err = node.call(call).await.unwrap_err();
-            assert_eq!(err.code, ErrorCode::Denied, "{label}: {err:?}");
-        }
+                    device: Some(id_x.clone()),
+                }),
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: now_str.clone(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        let mut add_call = Call::new(
+            Door::Ssh,
+            "config.write",
+            json!({"document": "devices.toml", "content": add_own.to_toml_string()}),
+        );
+        add_call.pinned = Some("tablet".to_owned());
+        add_call.device = Some("x".to_owned());
+        add_call.pairing_id = Some(id_x.clone());
+        let add_err = node.call(add_call).await.unwrap_err();
+        assert_eq!(
+            add_err.code,
+            ErrorCode::Denied,
+            "non-owner config.write devices.toml must always be refused: {add_err:?}"
+        );
 
-        // authorized_keys must remain completely untouched.
-        assert_eq!(std::fs::read_to_string(&auth_keys).unwrap(), auth_before);
+        // 2. Non-owner cannot tombstone even its own live entry x (or name device:victim) via config.write.
+        let mut tomb_x = DevicesFile::default();
+        tomb_x.removed.insert(
+            id_x.clone(),
+            DeviceTombstone {
+                name: "victim".to_owned(),
+                principal: "device:victim".to_owned(),
+                fingerprint: None,
+                paired_at: None,
+                paired_on: None,
+                paired_by: None,
+                removed_by: None,
+                removed_at: now_str,
+                removed_on: "box-a".to_owned(),
+            },
+        );
+        let mut tomb_call = Call::new(
+            Door::Ssh,
+            "config.write",
+            json!({"document": "devices.toml", "content": tomb_x.to_toml_string()}),
+        );
+        tomb_call.pinned = Some("tablet".to_owned());
+        let tomb_err = node.call(tomb_call).await.unwrap_err();
+        assert_eq!(
+            tomb_err.code,
+            ErrorCode::Denied,
+            "non-owner tombstone config.write devices.toml must be refused: {tomb_err:?}"
+        );
+
+        // 3. Non-owner running fleet.sync (push or pull) reports devices.toml as skipped with reason.
+        for (dir_name, args) in [
+            (
+                "push",
+                json!({"direction": "push", "machines": ["box-b"], "documents": ["devices.toml"]}),
+            ),
+            (
+                "pull",
+                json!({"direction": "pull", "from": "box-b", "documents": ["devices.toml"]}),
+            ),
+        ] {
+            let mut sync_call = Call::new(Door::Cli, "fleet.sync", args);
+            sync_call.pinned = Some("tablet".to_owned());
+            let res = node.call(sync_call).await.unwrap();
+            let doc_res = &res["results"]["box-b"]["devices.toml"];
+            assert_eq!(
+                doc_res["status"],
+                json!("skipped"),
+                "{dir_name}: expected devices.toml to be skipped for non-owner: {res}"
+            );
+            assert!(
+                doc_res["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("owner")),
+                "{dir_name}: expected skip reason mentioning owner: {res}"
+            );
+        }
     }
 }

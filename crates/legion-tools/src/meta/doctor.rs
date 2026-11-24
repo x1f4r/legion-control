@@ -312,7 +312,7 @@ pub fn check_fleet_device_drift(
         let Some(entry) = docs.get("devices.toml") else {
             continue;
         };
-        if entry.status == "same" {
+        if entry.status == "same" || entry.status == "skipped" {
             continue;
         }
         if entry.status == "error"

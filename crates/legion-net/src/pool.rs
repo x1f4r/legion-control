@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use legion_core::config::{ConfigStore, Document};
-use legion_core::policy::{OWNER, Policy};
+use legion_core::config::ConfigStore;
+use legion_core::policy::Policy;
 use legion_core::{
     BoxFuture, Call, CancellationToken, Ctx, EventSink, MachineEffects, Node, Paths, RouteOutcome,
     Router, VERSION,
@@ -202,15 +202,6 @@ impl Fleet {
             ctx.device(),
             ctx.pairing_id(),
             tool,
-        )?;
-        check_paired_device_devices_write_forward(
-            node,
-            here,
-            machine,
-            principal,
-            ctx.pairing_id(),
-            tool,
-            args,
         )?;
         let next_hops = ctx.hops().saturating_add(1);
         if next_hops > MAX_HOPS {
@@ -535,17 +526,6 @@ impl Fleet {
                         call.device.as_deref(),
                         call.pairing_id.as_deref(),
                         &tool,
-                    )
-                })
-                .and_then(|()| {
-                    check_paired_device_devices_write_forward(
-                        node,
-                        &here,
-                        machine,
-                        &principal,
-                        call.pairing_id.as_deref(),
-                        &tool,
-                        &args,
                     )
                 })
                 .and_then(|()| {
@@ -1538,66 +1518,6 @@ fn check_paired_device_invite_forward(
         "Connect directly to {machine} over SSH (for example using its endpoint from `device.endpoint`) and run `device.invite` there."
     ))
     .with_machine(here))
-}
-
-/// Because the JSON-RPC wire format does not carry `pairing_id`, a non-owner paired device
-/// forwarding `config.write devices.toml` must explicitly stamp its own `paired_by` (principal
-/// and pairing id) on every other live entry it forwards, preventing it from omitting creator
-/// provenance via a remote hop on a shared principal.
-fn check_paired_device_devices_write_forward(
-    node: &Node,
-    here: &str,
-    machine: &str,
-    principal: &str,
-    pairing_id: Option<&str>,
-    tool: &str,
-    args: &Value,
-) -> Result<(), ErrorBody> {
-    if tool != "config.write"
-        || args.get("document").and_then(Value::as_str)
-            != Some(legion_tools::device::registry::DevicesFile::FILE)
-    {
-        return Ok(());
-    }
-    let Ok(policy) = node.config().get::<Policy>() else {
-        return Ok(());
-    };
-    if policy.role_of(principal).0 == OWNER {
-        return Ok(());
-    }
-    let Some(caller_dev_id) = pairing_id.or_else(|| policy.device_owner(principal)) else {
-        return Ok(());
-    };
-    let Some(content) = args.get("content").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    let Ok(parsed) = legion_core::config::parse::<legion_tools::device::registry::DevicesFile>(
-        std::path::Path::new(legion_tools::device::registry::DevicesFile::FILE),
-        content.as_bytes(),
-    ) else {
-        return Ok(());
-    };
-    for (id, entry) in &parsed.devices {
-        if id == caller_dev_id {
-            continue;
-        }
-        let valid_creator = entry.paired_by.as_ref().is_some_and(|pb| {
-            pb.principal == principal && pb.device.as_deref() == Some(caller_dev_id)
-        });
-        if !valid_creator {
-            return Err(ErrorBody::new(
-                ErrorCode::Denied,
-                format!(
-                    "As paired device {caller_dev_id}, forwarding `config.write devices.toml` to {machine} requires `paired_by = {{ principal = \"{principal}\", device = \"{caller_dev_id}\" }}` on live entry {id}."
-                ),
-            )
-            .with_hint(
-                "Record paired_by with your principal and pairing id, or write devices.toml on the machine you are connected to directly.",
-            )
-            .with_machine(here));
-        }
-    }
-    Ok(())
 }
 
 fn authorize_for_forward(

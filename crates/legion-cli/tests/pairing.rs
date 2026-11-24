@@ -3255,7 +3255,7 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
 }
 
 #[test]
-fn non_owner_removal_pushes_tombstone_independently_of_unrelated_entries() {
+fn non_owner_device_remove_pushes_with_node_authority_and_audits_both_sides() {
     use legion_tools::device::registry::{DeviceTombstone, DevicesFile, FleetDevice};
 
     let node_a = Home::new();
@@ -3275,6 +3275,7 @@ role = \"phone_admin\"
 ";
     node_a.write_config("policy.toml", policy);
     node_b.write_config("policy.toml", policy);
+    node_a.write_config("projects.toml", "[projects.demo]\ndescription = \"demo\"\n");
     node_a.write_config(
         "node.toml",
         &format!(
@@ -3291,45 +3292,53 @@ role = \"phone_admin\"
     );
 
     let bin = env!("CARGO_BIN_EXE_legion");
-    let fleet_a = if cfg!(windows) {
-        // Write a tiny batch wrapper rather than passing embedded quotes to `cmd.exe /C`, which
-        // Rust's Command quoting escapes as `\"` (unparsed by cmd.exe).
-        let script = node_b.home().join("run-b-rpc.cmd");
-        let body = format!(
-            "@echo off\r\n\
-             set \"LEGION_HOME={}\"\r\n\
-             set \"HOME={}\"\r\n\
-             set \"USERPROFILE={}\"\r\n\
-             set \"XDG_CONFIG_HOME=\"\r\n\
-             set \"XDG_STATE_HOME=\"\r\n\
-             \"{}\" rpc --as tablet\r\n",
-            home_b_legion.display(),
-            node_b.home().display(),
-            node_b.home().display(),
-            bin,
-        );
-        std::fs::write(&script, body).unwrap();
-        format!(
-            "[machines.b]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
-            toml_literal(&script),
-        )
-    } else {
-        let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
-        format!(
-            "[machines.b]\ncommand = [\"env\", {}, {}, \"rpc\", \"--as\", \"tablet\"]\n",
-            toml_literal(Path::new(&env_arg)),
-            toml_literal(Path::new(bin)),
-        )
+    let fleet_entry = |name: &str, extra_args: &[&str]| {
+        if cfg!(windows) {
+            let script = node_b.home().join(format!("run-{name}-rpc.cmd"));
+            let extra = if extra_args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", extra_args.join(" "))
+            };
+            let body = format!(
+                "@echo off\r\n\
+                 set \"LEGION_HOME={}\"\r\n\
+                 set \"HOME={}\"\r\n\
+                 set \"USERPROFILE={}\"\r\n\
+                 set \"XDG_CONFIG_HOME=\"\r\n\
+                 set \"XDG_STATE_HOME=\"\r\n\
+                 \"{}\" rpc{extra}\r\n",
+                home_b_legion.display(),
+                node_b.home().display(),
+                node_b.home().display(),
+                bin,
+            );
+            std::fs::write(&script, body).unwrap();
+            format!(
+                "[machines.{name}]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+                toml_literal(&script),
+            )
+        } else {
+            let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
+            let mut parts = vec![
+                "\"env\"".to_owned(),
+                toml_literal(Path::new(&env_arg)),
+                toml_literal(Path::new(bin)),
+                "\"rpc\"".to_owned(),
+            ];
+            for arg in extra_args {
+                parts.push(format!("\"{arg}\""));
+            }
+            format!("[machines.{name}]\ncommand = [{}]\n", parts.join(", "))
+        }
     };
-    node_a.write_config("fleet.toml", &fleet_a);
+    node_a.write_config("fleet.toml", &fleet_entry("b", &[]));
 
     let id_owner = "11".repeat(16);
     let id_tablet = "22".repeat(16);
     let id_old_owner = "33".repeat(16);
     let now_str = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
 
-    // Node A has an unrelated live `owner` device (which `tablet` cannot push to B) AND `tablet`'s
-    // own live device.
     let mut devices_a = DevicesFile::default();
     devices_a.devices.insert(
         id_owner.clone(),
@@ -3365,8 +3374,6 @@ role = \"phone_admin\"
     );
     node_a.write_config("devices.toml", &devices_a.to_toml_string());
 
-    // Node B has `tablet`'s live device AND an unrelated `owner` tombstone (which `tablet` cannot
-    // import onto A).
     let mut devices_b = DevicesFile::default();
     devices_b.devices.insert(
         id_tablet.clone(),
@@ -3407,8 +3414,58 @@ role = \"phone_admin\"
             .contains("legion-device:tablet-dev")
     );
 
-    // Non-owner `tablet` removes its own device on A: its tombstone MUST push cleanly to B
-    // despite A's unrelated `owner` device and B's unrelated `owner` tombstone!
+    // 1. Non-owner `tablet` running `fleet.sync direction=push` syncs `projects.toml` and skips
+    //    `devices.toml` with a clear owner-role reason.
+    let sync = node_a.run(&[
+        "fleet.sync",
+        "direction=push",
+        "machines=[\"b\"]",
+        "documents=[\"projects.toml\",\"devices.toml\"]",
+        "--as",
+        "tablet",
+    ]);
+    assert_eq!(sync.code, 0, "non-owner fleet.sync failed: {}", sync.stderr);
+    let sync_json = sync.json();
+    assert_eq!(
+        sync_json["results"]["b"]["projects.toml"]["status"],
+        json!("pushed"),
+        "{sync_json}"
+    );
+    assert_eq!(
+        sync_json["results"]["b"]["devices.toml"]["status"],
+        json!("skipped"),
+        "{sync_json}"
+    );
+    assert!(
+        sync_json["results"]["b"]["devices.toml"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("owner")),
+        "{sync_json}"
+    );
+
+    // 2. Non-owner `tablet` calling `config.write devices.toml` is refused both locally and on `b`.
+    let local_write = node_a.run(&[
+        "config.write",
+        "document=devices.toml",
+        "content=version = 1\n",
+        "--as",
+        "tablet",
+    ]);
+    assert_ne!(local_write.code, 0);
+    let remote_write = node_a.run(&[
+        "config.write",
+        "document=devices.toml",
+        "content=version = 1\n",
+        "--as",
+        "tablet",
+        "--on",
+        "b",
+    ]);
+    assert_ne!(remote_write.code, 0);
+
+    // 3. Non-owner `tablet` runs `device.remove` on A: node A pushes its registry to B with A's
+    //    own owner authority, B tombstones `tablet-dev`, strips its key, and BOTH nodes record
+    //    audit entries naming `device_registry_push` + triggering principal `tablet`.
     let rm = node_a.run(&["device.remove", "name=tablet-dev", "--as", "tablet"]);
     assert_eq!(rm.code, 0, "tablet remove failed: {}", rm.stderr);
     let rm_json = rm.json();
@@ -3420,8 +3477,6 @@ role = \"phone_admin\"
     );
     assert!(rm_json.get("still_trusted_by").is_none(), "{rm_json}");
 
-    // Verify B tombstoned `tablet-dev`, removed its authorized_keys line, and did NOT import A's
-    // `owner-laptop`.
     let b_saved: DevicesFile = legion_core::config::parse(
         &home_b_legion.join("config").join("devices.toml"),
         &std::fs::read(home_b_legion.join("config").join("devices.toml")).unwrap(),
@@ -3429,11 +3484,299 @@ role = \"phone_admin\"
     .unwrap();
     assert!(!b_saved.devices.contains_key(&id_tablet), "{b_saved:?}");
     assert!(b_saved.removed.contains_key(&id_tablet), "{b_saved:?}");
-    assert!(!b_saved.devices.contains_key(&id_owner), "{b_saved:?}");
     assert!(
         !std::fs::read_to_string(&auth_b)
             .unwrap()
             .contains("legion-device:tablet-dev")
+    );
+
+    let audit_a = std::fs::read_to_string(node_a.state().join("audit.jsonl")).unwrap();
+    assert!(
+        audit_a.contains("\"fleet.sync\"")
+            && audit_a.contains("\"device_registry_push\"")
+            && audit_a.contains("\"device.remove\"")
+            && audit_a.contains("\"tablet\""),
+        "expected sender audit record naming device_registry_push and trigger tablet: {audit_a}"
+    );
+    let audit_b = std::fs::read_to_string(node_b.state().join("audit.jsonl")).unwrap();
+    assert!(
+        audit_b.contains("\"config.write\"")
+            && audit_b.contains("\"config.write.applied\"")
+            && audit_b.contains("\"device_registry_push\"")
+            && audit_b.contains("\"device.remove\"")
+            && audit_b.contains("\"tablet\""),
+        "expected receiver audit records naming device_registry_push and trigger tablet: {audit_b}"
+    );
+
+    // 4. When the receiving peer's fleet pipe is pinned to a non-owner (`--as tablet`), the peer
+    //    refuses `config.write devices.toml` and A reports it in `still_trusted_by`.
+    node_a.write_config("fleet.toml", &fleet_entry("b", &["--as", "tablet"]));
+    let rm_owner = node_a.run(&["device.remove", "name=owner-laptop"]);
+    assert_eq!(rm_owner.code, 0, "owner remove failed: {}", rm_owner.stderr);
+    let rm_owner_json = rm_owner.json();
+    assert_eq!(
+        rm_owner_json["still_trusted_by"],
+        json!(["b"]),
+        "{rm_owner_json}"
+    );
+}
+
+#[test]
+fn stamping_records_owner_device_provenance_and_quarantines_backdated_non_owner_child() {
+    use legion_tools::device::registry::{DevicesFile, PairedBy};
+
+    let home = Home::new();
+    let auth = home.home().join("authorized_keys");
+    let host_key_path = home.home().join("host_ed25519.pub");
+    std::fs::write(
+        &host_key_path,
+        format!(
+            "{} host@stamp-box\n",
+            ed25519_public_key_from_seed(&[0x99; 32])
+        ),
+    )
+    .unwrap();
+    let legion_home = home.state().parent().unwrap().to_path_buf();
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"stamp-box\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth),
+            toml_literal(&host_key_path),
+        ),
+    );
+    home.write_config(
+        "policy.toml",
+        "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+",
+    );
+
+    // 1. Seed a paired device holding the `owner` role and an admin-capable non-owner paired device.
+    let id_owner_dev = "a1".repeat(16);
+    let id_non_owner_dev = "b1".repeat(16);
+    let t0 = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
+    let mut initial = DevicesFile::default();
+    initial.devices.insert(
+        id_owner_dev.clone(),
+        legion_tools::device::registry::FleetDevice {
+            name: "owner-phone".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0xa1; 32]),
+            principal: "owner".to_owned(),
+            role: Some("owner".to_owned()),
+            paired_at: t0.clone(),
+            paired_on: "stamp-box".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t0.clone(),
+            updated_on: "stamp-box".to_owned(),
+        },
+    );
+    initial.devices.insert(
+        id_non_owner_dev.clone(),
+        legion_tools::device::registry::FleetDevice {
+            name: "tablet-parent".to_owned(),
+            public_key: ed25519_public_key_from_seed(&[0xb1; 32]),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0.clone(),
+            paired_on: "stamp-box".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t0,
+            updated_on: "stamp-box".to_owned(),
+        },
+    );
+    home.write_config("devices.toml", &initial.to_toml_string());
+    assert_eq!(home.run(&["device.list"]).code, 0);
+
+    // Helper: invoke one RPC call through `legion gate --as <principal> --device <dev> --pairing <id>`.
+    let gate_call =
+        |principal: &str, dev_name: &str, pairing_id: &str, tool: &str, args: serde_json::Value| {
+            let req_hello = rpc_request(
+                json!(1),
+                "hello",
+                json!({"protocol": legion_core::proto::PROTOCOL, "client": "test", "version": "0"}),
+            );
+            let req_call = rpc_request(json!(2), "call", json!({"tool": tool, "args": args}));
+            let input = format!("{req_hello}\n{req_call}\n");
+            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_legion"));
+            cmd.args([
+                "gate",
+                "--home",
+                &legion_home.display().to_string(),
+                "--as",
+                principal,
+                "--device",
+                dev_name,
+                "--pairing",
+                pairing_id,
+            ])
+            .env("SSH_ORIGINAL_COMMAND", "legion rpc")
+            .env("HOME", home.home())
+            .env("USERPROFILE", home.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "gate failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            lines.into_iter().find(|v| v["id"] == json!(2)).unwrap()
+        };
+
+    let run_enrol_gate = |invite_id: &str, name: &str, pub_key: &str| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_legion"));
+        cmd.args([
+            "gate",
+            "--home",
+            &legion_home.display().to_string(),
+            "--enrol",
+            invite_id,
+        ])
+        .env("HOME", home.home())
+        .env("USERPROFILE", home.home())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let line = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": invite_id, "public_key": pub_key, "name": name})
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "gate --enrol failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply: Value =
+            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        assert_eq!(reply["ok"], json!(true), "enrol rejected: {reply}");
+        reply
+    };
+
+    // 2. Owner-role paired device creates an invite and enrols `owner-child`:
+    //    `paired_by` MUST record `{ principal: "owner", device: Some(id_owner_dev) }` and node-stamped metadata.
+    let inv_owner = gate_call(
+        "owner",
+        "owner-phone",
+        &id_owner_dev,
+        "device.invite",
+        json!({"name": "owner-child", "role": "owner", "allow_owner": true, "host": "127.0.0.1", "port": 22, "user": "tester"}),
+    );
+    let owner_inv_id = inv_owner["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{inv_owner}"))
+        .to_owned();
+    let owner_child_key = ed25519_public_key_from_seed(&[0xa2; 32]);
+    run_enrol_gate(&owner_inv_id, "owner-child", &owner_child_key);
+
+    let after_owner_enrol: DevicesFile = legion_core::config::parse(
+        &legion_home.join("config").join("devices.toml"),
+        &std::fs::read(legion_home.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let owner_child = after_owner_enrol
+        .devices
+        .values()
+        .find(|d| d.name == "owner-child")
+        .expect("owner-child missing");
+    assert_eq!(
+        owner_child.paired_by,
+        Some(PairedBy {
+            principal: "owner".to_owned(),
+            device: Some(id_owner_dev.clone()),
+        }),
+        "owner-role paired device creator must still record paired_by.device"
+    );
+    assert_eq!(owner_child.paired_on, "stamp-box");
+    assert_eq!(owner_child.updated_on, "stamp-box");
+    assert_eq!(owner_child.paired_at, owner_child.updated_at);
+
+    // 3. Reviewer's backdating case: admin-capable non-owner paired device creates a child via
+    //    invite + enrol (any attempt to backdate via config.write is refused). When the parent is
+    //    removed shortly afterwards, the child is quarantined regardless.
+    let inv_child = gate_call(
+        "tablet",
+        "tablet-parent",
+        &id_non_owner_dev,
+        "device.invite",
+        json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
+    );
+    let child_inv_id = inv_child["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{inv_child}"))
+        .to_owned();
+    let child_key = ed25519_public_key_from_seed(&[0xb2; 32]);
+    run_enrol_gate(&child_inv_id, "tablet-child", &child_key);
+
+    let backdate_res = gate_call(
+        "tablet",
+        "tablet-parent",
+        &id_non_owner_dev,
+        "config.write",
+        json!({"document": "devices.toml", "content": "version = 1\n"}),
+    );
+    assert_eq!(
+        backdate_res["error"]["data"]["code"],
+        json!("denied"),
+        "{backdate_res}"
+    );
+
+    let rm_parent = home.run(&["device.remove", "name=tablet-parent"]);
+    assert_eq!(
+        rm_parent.code, 0,
+        "remove tablet-parent failed: {}",
+        rm_parent.stderr
+    );
+
+    let list = home.run(&["device.list"]).json();
+    let child_entry = list["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == json!("tablet-child"))
+        .expect("tablet-child missing in device.list");
+    assert_eq!(child_entry["quarantined"], json!(true), "{child_entry}");
+    assert!(
+        !std::fs::read_to_string(&auth)
+            .unwrap()
+            .contains("legion-device:tablet-child"),
+        "quarantined child key must be absent from authorized_keys"
     );
 }
 
