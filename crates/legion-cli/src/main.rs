@@ -6,6 +6,7 @@
 
 mod args;
 mod cp;
+mod pair;
 mod render;
 mod rpc;
 mod serve;
@@ -23,11 +24,12 @@ use legion_core::{
 use legion_doors::mcp::{self, McpDoor};
 use legion_net::stream::Host;
 use legion_net::{Fleet, Subcommand};
+use legion_tools::device::enrol::EnrolReply;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::args::{ArgsSource, CallCommand, Command, USAGE, UsageError, command_help};
+use crate::args::{ArgsSource, CallCommand, Command, GateCommand, USAGE, UsageError, command_help};
 
 const FAILED: u8 = 1;
 const USAGE_ERROR: u8 = 2;
@@ -87,6 +89,7 @@ async fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::Call(call) => call.json,
         Command::Cp(cp) => cp.json,
+        Command::Pair(pair) => pair.json,
         Command::Tools { json } | Command::Help { json, .. } => *json,
         _ => false,
     };
@@ -100,19 +103,29 @@ async fn run(command: Command) -> ExitCode {
                 Arc::new(fleet) as Arc<dyn Router>,
             )
         }
-        // The stdout of `legion rpc`, `legion mcp` and `legion stream` carries protocol messages
-        // and nothing else; a stream says what went wrong as its one reply.
+        // The stdout of `legion rpc`, `legion mcp`, `legion stream` and `legion gate` carries
+        // protocol messages and nothing else; stream and gate --enrol report startup errors as
+        // their one JSON reply line.
         Err(error)
             if matches!(
                 command,
                 Command::Rpc { .. }
                     | Command::Mcp { .. }
                     | Command::Stream { .. }
-                    | Command::Gate { .. }
+                    | Command::Gate(_)
             ) =>
         {
-            if matches!(command, Command::Stream { .. }) {
-                out(&format!("{}\n", serde_json::json!({ "error": error })));
+            match command {
+                Command::Stream { .. } => {
+                    out(&format!("{}\n", serde_json::json!({ "error": error })));
+                }
+                Command::Gate(GateCommand::Enrol { .. }) => {
+                    let reply = EnrolReply::from_error(error.clone());
+                    if let Ok(line) = serde_json::to_string(&reply) {
+                        out(&format!("{line}\n"));
+                    }
+                }
+                _ => {}
             }
             err(&render::error(&error));
             return ExitCode::from(FAILED);
@@ -169,9 +182,19 @@ async fn run(command: Command) -> ExitCode {
             router.shutdown().await;
             code
         }
-        Command::Gate { pinned } => {
+        Command::Gate(GateCommand::As { pinned }) => {
             let shutdown = install_shutdown_token();
             gate(node, router, pinned, shutdown).await
+        }
+        Command::Gate(GateCommand::Enrol { id }) => {
+            let shutdown = install_shutdown_token();
+            enrol(node, router, id, shutdown).await
+        }
+        Command::Pair(command) => {
+            let shutdown = install_shutdown_token();
+            let code = pair::run(&node, router.as_ref(), command, shutdown).await;
+            router.shutdown().await;
+            code
         }
         Command::Serve { listen, help } => {
             let shutdown = install_shutdown_token();
@@ -276,6 +299,43 @@ async fn gate(
             err(&format!("{}\n", legion_net::gate::REFUSAL));
             ExitCode::from(FAILED)
         }
+    }
+}
+
+/// `legion gate --enrol <id>`: single-use enrolment forced command for a temporary invite key.
+/// Ignores `SSH_ORIGINAL_COMMAND` completely, reads one JSON line from stdin, and writes one JSON
+/// reply line on stdout.
+async fn enrol(
+    node: Node,
+    router: Arc<dyn Router>,
+    id: String,
+    shutdown: CancellationToken,
+) -> ExitCode {
+    let reply = tokio::select! {
+        reply = legion_tools::device::enrol::run_enrol(&node, &id, tokio::io::stdin()) => reply,
+        () = shutdown.cancelled() => EnrolReply::from_error(ErrorBody::new(
+            ErrorCode::Cancelled,
+            "Device enrolment was cancelled by signal.",
+        )),
+    };
+    router.shutdown().await;
+    match serde_json::to_string(&reply) {
+        Ok(line) => out(&format!("{line}\n")),
+        Err(error) => {
+            let fallback = EnrolReply::from_error(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("The enrolment reply cannot be written as JSON: {error}."),
+            ));
+            if let Ok(line) = serde_json::to_string(&fallback) {
+                out(&format!("{line}\n"));
+            }
+            return ExitCode::from(FAILED);
+        }
+    }
+    if reply.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(FAILED)
     }
 }
 
