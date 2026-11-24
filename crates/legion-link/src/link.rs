@@ -2559,12 +2559,17 @@ async fn default_open_session(
                 .with_machine(&entry.node)
             })?;
             let key = crate::key::DeviceKey::from_openssh(key_text)?;
-            return crate::ssh::open(
+            let policy = crate::ssh::ConnectPolicy {
+                restrict_resolved_addrs: entry.origin == NodeOrigin::Learned,
+                allow_loopback: options.allow_loopback_endpoints,
+            };
+            return crate::ssh::open_with_policy(
                 &entry.node,
                 _target,
                 &key,
                 crate::command::Subcommand::Rpc,
                 options.ssh_timeouts,
+                policy,
                 cancel,
             )
             .await;
@@ -2737,38 +2742,75 @@ fn is_allowed_ipv4(ip: std::net::Ipv4Addr, allow_loopback: bool) -> bool {
     true
 }
 
+pub(crate) fn is_allowed_ip(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_allowed_ipv4(v4, allow_loopback),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            if v6.is_loopback() {
+                return allow_loopback;
+            }
+            let segs = v6.segments();
+            if (segs[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_allowed_ipv4(v4, allow_loopback);
+            }
+            // IPv4-compatible IPv6 (`::a.b.c.d`, deprecated in RFC 4291 but still parsed by
+            // resolvers): treat as its embedded IPv4 address.
+            if segs[0..6] == [0, 0, 0, 0, 0, 0] {
+                let [a, b] = segs[6].to_be_bytes();
+                let [c, d] = segs[7].to_be_bytes();
+                return is_allowed_ipv4(std::net::Ipv4Addr::new(a, b, c, d), allow_loopback);
+            }
+            true
+        }
+    }
+}
+
+/// Returns `true` when `label` (already lowercased) would be parsed as an integer by the
+/// POSIX/BSD `inet_aton` IPv4 parser family (decimal, octal with leading `0`, or `0x` hex).
+fn is_numeric_ipv4_label(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    if label.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    if let Some(hex) = label.strip_prefix("0x") {
+        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    false
+}
+
 fn is_allowed_endpoint_host(raw: &str, allow_loopback: bool) -> bool {
     let stripped = raw
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(raw);
     // Scoped IPv6 literals (e.g. `fe80::1%eth0`) are link-local and rejected.
-    if let Some((addr_part, _zone)) = stripped.split_once('%') {
-        if addr_part.parse::<std::net::Ipv6Addr>().is_ok() {
-            return false;
-        }
+    if stripped.contains('%') {
         return false;
     }
     if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_allowed_ipv4(v4, allow_loopback),
-            std::net::IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    return is_allowed_ipv4(v4, allow_loopback);
-                }
-                let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-                if v6.is_unspecified() || is_link_local || v6.is_multicast() {
-                    return false;
-                }
-                if v6.is_loopback() && !allow_loopback {
-                    return false;
-                }
-                true
-            }
-        };
+        return is_allowed_ip(ip, allow_loopback);
     }
     let lowered = stripped.trim_end_matches('.').to_ascii_lowercase();
     if lowered.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = lowered.split('.').collect();
+    if labels.iter().any(|l| l.is_empty()) {
+        return false;
+    }
+    // Reject any non-canonical numeric IPv4 form (`2130706433`, `0x7f.1`, `0x7f000001`, `127.1`,
+    // `0177.0.0.1`, `0`, or any host ending in a numeric/hex label).
+    if labels.iter().all(|l| is_numeric_ipv4_label(l))
+        || labels.last().is_some_and(|l| is_numeric_ipv4_label(l))
+    {
         return false;
     }
     if !allow_loopback && (lowered == "localhost" || lowered.ends_with(".localhost")) {
@@ -5921,5 +5963,107 @@ mod tests {
         let key = crate::key::DeviceKey::from_seed([77u8; 32]);
         let line = key.public_key_line("host").unwrap();
         assert_eq!(public_key_fingerprint(&line), Some(key.fingerprint()));
+    }
+
+    #[test]
+    fn endpoint_host_filter_rejects_numeric_and_ipv4_compatible_bypasses() {
+        // Every non-canonical numeric/hex/octal/short IPv4 form and disallowed IPv6 form MUST be
+        // rejected when allow_loopback is false.
+        let rejected_default = [
+            "2130706433",
+            "0x7f.1",
+            "0x7f000001",
+            "0X7F000001",
+            "127.1",
+            "127.0.1",
+            "0177.0.0.1",
+            "0177.1",
+            "0x7f.0.0.1",
+            "0",
+            "0.0",
+            "0x0",
+            "00",
+            "foo.1",
+            "bar.0x1",
+            "::127.0.0.1",
+            "[::127.0.0.1]",
+            "::0:7f00:1",
+            "::ffff:127.0.0.1",
+            "[::ffff:127.0.0.1]",
+            "::0.0.0.0",
+            "::169.254.169.254",
+            "::224.0.0.1",
+            "::255.255.255.255",
+            "::ffff:169.254.1.1",
+            "::ffff:0.0.0.0",
+            "::ffff:224.0.0.1",
+            "::ffff:255.255.255.255",
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "sub.localhost",
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "fe80::1",
+            "fe80::1%eth0",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ];
+        for host in rejected_default {
+            assert!(
+                !is_allowed_endpoint_host(host, false),
+                "expected host {host:?} to be rejected with allow_loopback=false"
+            );
+        }
+
+        // Non-canonical numeric forms are also rejected even when allow_loopback=true.
+        for host in [
+            "2130706433",
+            "0x7f.1",
+            "0x7f000001",
+            "127.1",
+            "0177.0.0.1",
+            "0",
+        ] {
+            assert!(
+                !is_allowed_endpoint_host(host, true),
+                "expected non-canonical numeric host {host:?} to be rejected even with allow_loopback=true"
+            );
+        }
+
+        // Legitimate canonical loopback works ONLY when allow_loopback=true.
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "::127.0.0.1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                is_allowed_endpoint_host(host, true),
+                "expected loopback host {host:?} to be allowed with allow_loopback=true"
+            );
+        }
+
+        // Legitimate hosts and addresses are allowed.
+        for host in [
+            "10.0.2.2",
+            "100.64.0.1",
+            "192.0.2.10",
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "tower",
+            "pi",
+            "node-1",
+            "tower.example.net",
+            "node1.example.net.",
+        ] {
+            assert!(
+                is_allowed_endpoint_host(host, false),
+                "expected legitimate host {host:?} to be allowed"
+            );
+        }
     }
 }

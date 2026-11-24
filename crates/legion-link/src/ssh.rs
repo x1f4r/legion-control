@@ -133,6 +133,17 @@ impl Drop for SshPipeHandle {
     }
 }
 
+/// Policy applied to resolved socket addresses before opening a TCP connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConnectPolicy {
+    /// When `true` (used for learned entries), refuse connecting to loopback (unless
+    /// `allow_loopback`), unspecified, link-local, multicast, and broadcast addresses even if a
+    /// hostname resolves to them at connect time.
+    pub restrict_resolved_addrs: bool,
+    /// When `true`, allow loopback addresses under `restrict_resolved_addrs`.
+    pub allow_loopback: bool,
+}
+
 /// Opens a Legion [`Session`] over an in-process SSH exec channel to `target`.
 ///
 /// Always sends the fixed Unix remote command string for `subcommand`: `legion gate` never runs
@@ -147,7 +158,29 @@ pub async fn open(
     timeouts: SshTimeouts,
     cancel: CancellationToken,
 ) -> Result<Session, ErrorBody> {
-    let pipe = open_raw(target, key, subcommand, timeouts, cancel.clone())
+    open_with_policy(
+        machine,
+        target,
+        key,
+        subcommand,
+        timeouts,
+        ConnectPolicy::default(),
+        cancel,
+    )
+    .await
+}
+
+pub(crate) async fn open_with_policy(
+    machine: &str,
+    target: &SshTarget,
+    key: &DeviceKey,
+    subcommand: Subcommand,
+    timeouts: SshTimeouts,
+    policy: ConnectPolicy,
+    cancel: CancellationToken,
+) -> Result<Session, ErrorBody> {
+    let command = remote_command(RemoteOs::Unix, subcommand, None)?;
+    let pipe = open_exec_raw_with_policy(target, key, &command, timeouts, policy, cancel.clone())
         .await
         .map_err(|err| err.with_machine(machine))?;
     let (reader, writer, handle) = pipe.into_parts();
@@ -177,7 +210,15 @@ pub async fn open_raw(
     cancel: CancellationToken,
 ) -> Result<SshPipe, ErrorBody> {
     let command = remote_command(RemoteOs::Unix, subcommand, None)?;
-    open_exec_raw(target, key, &command, timeouts, cancel).await
+    open_exec_raw_with_policy(
+        target,
+        key,
+        &command,
+        timeouts,
+        ConnectPolicy::default(),
+        cancel,
+    )
+    .await
 }
 
 /// Opens a raw SSH exec channel running an exact `command` string on `target`.
@@ -186,6 +227,25 @@ pub async fn open_exec_raw(
     key: &DeviceKey,
     command: &str,
     timeouts: SshTimeouts,
+    cancel: CancellationToken,
+) -> Result<SshPipe, ErrorBody> {
+    open_exec_raw_with_policy(
+        target,
+        key,
+        command,
+        timeouts,
+        ConnectPolicy::default(),
+        cancel,
+    )
+    .await
+}
+
+async fn open_exec_raw_with_policy(
+    target: &SshTarget,
+    key: &DeviceKey,
+    command: &str,
+    timeouts: SshTimeouts,
+    policy: ConnectPolicy,
     cancel: CancellationToken,
 ) -> Result<SshPipe, ErrorBody> {
     let expected_keys = parse_host_keys(&target.host_keys)?;
@@ -227,6 +287,7 @@ pub async fn open_exec_raw(
             key,
             command,
             timeouts,
+            policy,
             cancel.clone(),
         )
         .await
@@ -306,6 +367,26 @@ fn combine_failures(mut attempts: Vec<(String, ErrorBody)>) -> ErrorBody {
         return combined;
     }
 
+    if let Some((_, disallowed)) = attempts
+        .iter()
+        .find(|(_, err)| error_reason(err) == Some("disallowed_address"))
+    {
+        let mut combined = ErrorBody::new(
+            ErrorCode::Denied,
+            format!("Refused connecting to disallowed address ({summary})."),
+        )
+        .with_details(
+            disallowed
+                .details
+                .clone()
+                .unwrap_or_else(|| json!({ "reason": "disallowed_address" })),
+        );
+        if let Some(hint) = &disallowed.hint {
+            combined = combined.with_hint(hint.clone());
+        }
+        return combined;
+    }
+
     let all_timeouts = !attempts.is_empty()
         && attempts
             .iter()
@@ -338,11 +419,43 @@ fn per_addr_connect_timeout(total: Duration, count: usize) -> Duration {
     (total / divisor).max(Duration::from_millis(500).min(total))
 }
 
+#[derive(Debug)]
 enum HostAttemptError {
     /// Caller cancelled connecting; abort remaining hosts immediately.
     Cancelled(ErrorBody),
     /// This host failed; record the error and continue trying remaining hosts.
     Failed(ErrorBody),
+}
+
+fn filter_resolved_addrs(
+    host: &str,
+    port: u16,
+    resolved: Vec<SocketAddr>,
+    allow_loopback: bool,
+) -> Result<Vec<SocketAddr>, HostAttemptError> {
+    let allowed: Vec<SocketAddr> = resolved
+        .into_iter()
+        .filter(|addr| crate::link::is_allowed_ip(addr.ip(), allow_loopback))
+        .collect();
+    if allowed.is_empty() {
+        return Err(HostAttemptError::Failed(
+            ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Refused connecting to learned host {host}:{port}: resolved only to disallowed address(es)."
+                ),
+            )
+            .with_hint(
+                "Learned machines may not resolve to loopback, link-local, unspecified, multicast, or broadcast addresses.",
+            )
+            .with_details(json!({
+                "reason": "disallowed_address",
+                "host": host,
+                "port": port,
+            })),
+        ));
+    }
+    Ok(allowed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -354,6 +467,7 @@ async fn connect_one_host(
     key: &DeviceKey,
     command: &str,
     timeouts: SshTimeouts,
+    policy: ConnectPolicy,
     cancel: CancellationToken,
 ) -> Result<SshPipe, HostAttemptError> {
     let resolved: Vec<SocketAddr> = tokio::select! {
@@ -415,9 +529,15 @@ async fn connect_one_host(
         ));
     }
 
-    let tcp_timeout = per_addr_connect_timeout(timeouts.connect, resolved.len());
+    let addrs = if policy.restrict_resolved_addrs {
+        filter_resolved_addrs(host, port, resolved, policy.allow_loopback)?
+    } else {
+        resolved
+    };
+
+    let tcp_timeout = per_addr_connect_timeout(timeouts.connect, addrs.len());
     let mut addr_failures: Vec<(String, ErrorBody)> = Vec::new();
-    for addr in resolved {
+    for addr in addrs {
         match connect_one_addr(
             host,
             port,
@@ -1238,5 +1358,105 @@ mod tests {
             per_addr_connect_timeout(Duration::from_secs(10), 4),
             Duration::from_millis(2500)
         );
+    }
+
+    #[tokio::test]
+    async fn learned_connect_policy_refuses_disallowed_resolved_addresses_before_tcp() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use tokio::net::TcpListener;
+
+        let bad_ips = [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6("fe80::1".parse().unwrap()),
+            IpAddr::V6("ff02::1".parse().unwrap()),
+            IpAddr::V6("::127.0.0.1".parse().unwrap()),
+            IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()),
+            IpAddr::V6("::169.254.169.254".parse().unwrap()),
+        ];
+        for ip in bad_ips {
+            let err = filter_resolved_addrs(
+                "rebind.example.net",
+                22,
+                vec![SocketAddr::new(ip, 22)],
+                false,
+            )
+            .unwrap_err();
+            let HostAttemptError::Failed(body) = err else {
+                panic!("expected Failed for {ip}");
+            };
+            assert_eq!(body.code, ErrorCode::Denied, "expected Denied for {ip}");
+            assert_eq!(body.details.unwrap()["reason"], json!("disallowed_address"));
+        }
+
+        // Mixed resolved list drops disallowed addresses and keeps allowed ones.
+        let kept = filter_resolved_addrs(
+            "dual.example.net",
+            22,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 22),
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                22
+            )]
+        );
+
+        // Live pre-connect check: bind a loopback listener and verify learned connect refuses
+        // `localhost` before accepting any TCP connection when allow_loopback is false.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted_bg = Arc::clone(&accepted);
+        let accept_task = tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                accepted_bg.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let key = DeviceKey::from_seed([9u8; 32]);
+        let host_key = DeviceKey::from_seed([10u8; 32])
+            .public_key_line("h")
+            .unwrap();
+        let target = SshTarget {
+            hosts: vec!["localhost".to_owned()],
+            port,
+            user: "me".to_owned(),
+            host_keys: vec![host_key],
+        };
+        let Err(err) = open_with_policy(
+            "rebind",
+            &target,
+            &key,
+            Subcommand::Rpc,
+            SshTimeouts::default(),
+            ConnectPolicy {
+                restrict_resolved_addrs: true,
+                allow_loopback: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        else {
+            panic!("expected learned loopback connect to be refused");
+        };
+        assert_eq!(err.code, ErrorCode::Denied, "{err}");
+        assert_eq!(err.details.unwrap()["reason"], json!("disallowed_address"));
+        assert!(
+            !accepted.load(std::sync::atomic::Ordering::SeqCst),
+            "TCP connection must never be opened to a disallowed resolved address"
+        );
+        accept_task.abort();
     }
 }
