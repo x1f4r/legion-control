@@ -274,8 +274,18 @@ fn cancel_and_event() {
             id: Id::String("c1".into()),
             kind: EventKind::Stdout,
             data: json!("hello\n"),
+            machine: None,
         },
         json!({"id": "c1", "kind": "stdout", "data": "hello\n"}),
+    );
+    pin(
+        EventParams {
+            id: Id::Number(2),
+            kind: EventKind::Progress,
+            data: json!({"step": 1}),
+            machine: Some("tower".into()),
+        },
+        json!({"id": 2, "kind": "progress", "data": {"step": 1}, "machine": "tower"}),
     );
     for (kind, word) in [
         (EventKind::Stdout, "stdout"),

@@ -3,10 +3,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use legion_core::proto::{ErrorBody, EventKind, Target};
-use legion_core::{BoxFuture, Call, Door, Node, Paths, Router};
+use legion_core::proto::{EventKind, Target};
+use legion_core::{BoxFuture, Call, Door, Node, Paths, RouteOutcome, Router};
 use legion_doors::mcp::{McpDoor, Options};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,7 +23,10 @@ struct Routed {
 }
 
 #[derive(Default)]
-struct Recorder(Mutex<Vec<Routed>>);
+struct Recorder {
+    routed: Mutex<Vec<Routed>>,
+    shut_down: AtomicBool,
+}
 
 impl Router for Recorder {
     fn call<'a>(
@@ -30,15 +34,20 @@ impl Router for Recorder {
         _node: &'a Node,
         call: Call,
         on: Option<Target>,
-    ) -> BoxFuture<'a, Result<Value, ErrorBody>> {
-        self.0.lock().unwrap().push(Routed {
+    ) -> BoxFuture<'a, RouteOutcome> {
+        self.routed.lock().unwrap().push(Routed {
             tool: call.tool,
             args: call.args,
             on,
             door: call.door,
             pinned: call.pinned,
         });
-        Box::pin(async { Ok(json!({"routed": true})) })
+        Box::pin(async { RouteOutcome::One(Ok(json!({"routed": true}))) })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        self.shut_down.store(true, Ordering::SeqCst);
+        Box::pin(async {})
     }
 }
 
@@ -96,7 +105,8 @@ async fn on_is_taken_out_of_the_arguments_and_handed_to_the_router() {
     client_out.shutdown().await.unwrap();
     serving.await.unwrap().unwrap();
 
-    let mut routed = std::mem::take(&mut *recorder.0.lock().unwrap());
+    let mut routed = std::mem::take(&mut *recorder.routed.lock().unwrap());
+    assert!(recorder.shut_down.load(Ordering::SeqCst));
     routed.sort_by(|a, b| a.tool.cmp(&b.tool));
     assert_eq!(
         routed,
@@ -128,10 +138,10 @@ impl Router for Chatty {
         _node: &'a Node,
         call: Call,
         _on: Option<Target>,
-    ) -> BoxFuture<'a, Result<Value, ErrorBody>> {
+    ) -> BoxFuture<'a, RouteOutcome> {
         call.events.emit(EventKind::Stdout, json!("compiling\n"));
         call.events.emit(EventKind::Log, json!("done"));
-        Box::pin(async { Ok(json!({"said": 2})) })
+        Box::pin(async { RouteOutcome::One(Ok(json!({"said": 2}))) })
     }
 }
 

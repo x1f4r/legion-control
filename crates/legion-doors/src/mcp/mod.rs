@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use legion_core::policy::Policy;
 use legion_core::proto::{ErrorBody, ErrorCode, Target};
-use legion_core::{Call, Door, EventSink, Grant, Node, Router, VERSION};
+use legion_core::{Call, Door, EventSink, Grant, Node, RouteOutcome, Router, VERSION};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
@@ -91,6 +91,7 @@ impl McpDoor {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let calls = self.calls.clone();
+        let router = Arc::clone(&self.router);
         let served = match rmcp::serve_server(self, (input, output)).await {
             Ok(running) => running
                 .waiting()
@@ -103,6 +104,7 @@ impl McpDoor {
         };
         calls.close();
         calls.wait().await;
+        router.shutdown().await;
         served
     }
 
@@ -150,7 +152,7 @@ impl McpDoor {
         args: Value,
         on: Option<Target>,
         context: &RequestContext<RoleServer>,
-    ) -> Result<Value, ErrorBody> {
+    ) -> RouteOutcome {
         let session_level = *self
             .log_level
             .lock()
@@ -184,10 +186,10 @@ impl McpDoor {
             _ => running.await,
         };
         joined.unwrap_or_else(|error| {
-            Err(ErrorBody::new(
+            RouteOutcome::One(Err(ErrorBody::new(
                 ErrorCode::Internal,
                 format!("The call to {tool} stopped before it replied: {error}."),
-            ))
+            )))
         })
     }
 
@@ -197,23 +199,23 @@ impl McpDoor {
         name: &str,
         mut args: JsonObject,
         context: &RequestContext<RoleServer>,
-    ) -> Result<Value, ErrorBody> {
+    ) -> RouteOutcome {
         let on = match args.remove(ON) {
             None | Some(Value::Null) => None,
-            Some(value) => Some(serde_json::from_value::<Target>(value).map_err(|error| {
-                self.door_error(ErrorCode::InvalidArgs, format!("on: {error}."))
-                    .with_hint("Give on as a machine's name, a list of names, or \"all\", or leave it out to run on this machine.")
-            })?),
+            Some(value) => match serde_json::from_value::<Target>(value) {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    return RouteOutcome::One(Err(self
+                        .door_error(ErrorCode::InvalidArgs, format!("on: {error}."))
+                        .with_hint("Give on as a machine's name, a list of names, or \"all\", or leave it out to run on this machine.")));
+                }
+            },
         };
         let tool = self.catalog.resolve(name);
-        self.run(tool, Value::Object(args), on, context)
-            .await
-            .map_err(|error| match error.code {
-                ErrorCode::UnknownTool => error.with_hint(
-                    "tools/list shows the tools here. Their names have an underscore where Legion's have a dot, such as meta_whoami for meta.whoami.",
-                ),
-                _ => error,
-            })
+        map_unknown_tool_hint(
+            self.run(tool, Value::Object(args), on, context).await,
+            "tools/list shows the tools here. Their names have an underscore where Legion's have a dot, such as meta_whoami for meta.whoami.",
+        )
     }
 
     /// A call to one of the three tools compact mode serves.
@@ -222,33 +224,32 @@ impl McpDoor {
         name: &str,
         args: JsonObject,
         context: &RequestContext<RoleServer>,
-    ) -> Result<Value, ErrorBody> {
+    ) -> RouteOutcome {
         match name {
-            compact::TOOLS => {
-                let args: compact::ToolsArgs = compact::parse(name, args)?;
-                self.list_compact(args.family.as_deref())
-            }
-            compact::DESCRIBE => {
-                let args: compact::DescribeArgs = compact::parse(name, args)?;
-                let spec = self
-                    .node
-                    .spec(self.catalog.resolve(&args.tool))
-                    .map_err(|error| error.with_hint("legion_tools lists the tools here."))?;
-                to_object(&spec)
-            }
-            compact::CALL => {
-                let args: compact::CallArgs = compact::parse(name, args)?;
-                let tool = self.catalog.resolve(&args.tool);
-                let tool_args = Value::Object(args.args.unwrap_or_default());
-                self.run(tool, tool_args, args.on, context)
-                    .await
-                    .map_err(|error| match error.code {
-                        ErrorCode::UnknownTool => {
-                            error.with_hint("legion_tools lists the tools here.")
-                        }
-                        _ => error,
-                    })
-            }
+            compact::TOOLS => RouteOutcome::One(
+                compact::parse::<compact::ToolsArgs>(name, args)
+                    .and_then(|args| self.list_compact(args.family.as_deref())),
+            ),
+            compact::DESCRIBE => RouteOutcome::One(
+                compact::parse::<compact::DescribeArgs>(name, args).and_then(|args| {
+                    let spec = self
+                        .node
+                        .spec(self.catalog.resolve(&args.tool))
+                        .map_err(|error| error.with_hint("legion_tools lists the tools here."))?;
+                    to_object(&spec)
+                }),
+            ),
+            compact::CALL => match compact::parse::<compact::CallArgs>(name, args) {
+                Ok(args) => {
+                    let tool = self.catalog.resolve(&args.tool);
+                    let tool_args = Value::Object(args.args.unwrap_or_default());
+                    map_unknown_tool_hint(
+                        self.run(tool, tool_args, args.on, context).await,
+                        "legion_tools lists the tools here.",
+                    )
+                }
+                Err(error) => RouteOutcome::One(Err(error)),
+            },
             other => {
                 let tool = self.catalog.resolve(other);
                 let hint = if self.node.spec(tool).is_ok() {
@@ -256,12 +257,12 @@ impl McpDoor {
                 } else {
                     "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned()
                 };
-                Err(self
+                RouteOutcome::One(Err(self
                     .door_error(
                         ErrorCode::UnknownTool,
                         format!("There is no tool called {other} in this session."),
                     )
-                    .with_hint(hint))
+                    .with_hint(hint)))
             }
         }
     }
@@ -326,15 +327,26 @@ impl McpDoor {
     }
 }
 
+/// Rewrites an `unknown_tool` hint on single-machine outcomes to point MCP callers at MCP listings.
+fn map_unknown_tool_hint(outcome: RouteOutcome, hint: &str) -> RouteOutcome {
+    match outcome {
+        RouteOutcome::One(Err(error)) if error.code == ErrorCode::UnknownTool => {
+            RouteOutcome::One(Err(error.with_hint(hint)))
+        }
+        other => other,
+    }
+}
+
 /// A tool's outcome as an MCP result: the JSON object as indented text, which every client shows
-/// the model, and as structured content for clients that read that instead. A failure is the
-/// error object the same two ways, marked as an error.
-fn tool_result(outcome: Result<Value, ErrorBody>) -> CallToolResult {
-    let (value, failed) = match outcome {
-        Ok(value) => (value, false),
+/// the model, and as structured content for clients that read that instead. A failure (or a
+/// fan-out where every machine failed) is marked as an error.
+fn tool_result(outcome: RouteOutcome) -> CallToolResult {
+    let failed = outcome.all_failed();
+    let value = match outcome.into_wire() {
+        Ok(value) => value,
         Err(error) => match serde_json::to_value(&error) {
-            Ok(value) => (value, true),
-            Err(_) => (json!({"code": "internal", "message": error.message}), true),
+            Ok(value) => value,
+            Err(_) => json!({"code": "internal", "message": error.message}),
         },
     };
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());

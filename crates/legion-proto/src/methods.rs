@@ -124,6 +124,9 @@ pub struct EventParams {
     pub kind: EventKind,
     /// Its content.
     pub data: Value,
+    /// The machine that produced the event, set on forwarded calls and fan-outs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
 }
 
 /// Where a call runs: one machine, several, or every machine in the fleet.

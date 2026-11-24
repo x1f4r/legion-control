@@ -17,12 +17,12 @@ mod route;
 mod tool;
 
 pub use config::{ConfigStore, Document};
-pub use ctx::{Ctx, Door, EventSink};
+pub use ctx::{Ctx, Door, Event, EventSink};
 pub use node::{Call, Node, VERSION};
 pub use paths::Paths;
 pub use policy::{Access, Grant, Policy};
 pub use registry::{DocumentInfo, Registry};
-pub use route::{Local, Router};
+pub use route::{Local, RouteOutcome, Router};
 pub use tool::{BoxFuture, Handler, NoArgs, Tool, ToolError, input_schema, parse_args};
 
 /// The wire types, so a tool family needs only this crate.
