@@ -69,6 +69,10 @@ fn main() -> ExitCode {
             "non_admin_cannot_create_or_link_secret_ancestors_in_any_tool",
             non_admin_cannot_create_or_link_secret_ancestors_in_any_tool,
         ),
+        (
+            "meta_update_from_local_binary_replaces_temp_copy_and_keeps_prev",
+            meta_update_from_local_binary_replaces_temp_copy_and_keeps_prev,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -1783,4 +1787,75 @@ role = \"wide\"
         assert_eq!(res.json()["code"], json!("denied"), "move {label}");
         assert!(fs::symlink_metadata(user_home.join(".codex")).is_err());
     }
+}
+
+fn meta_update_from_local_binary_replaces_temp_copy_and_keeps_prev() {
+    let dir = tempfile::tempdir().unwrap();
+    let install_dir = dir.path().join("install");
+    let build_dir = dir.path().join("build");
+    let legion_home = dir.path().join("legion-home");
+    let user_home = dir.path().join("user-home");
+    fs::create_dir_all(&install_dir).unwrap();
+    fs::create_dir_all(&build_dir).unwrap();
+    fs::create_dir_all(&user_home).unwrap();
+
+    let exe_name = if cfg!(windows) {
+        "legion.exe"
+    } else {
+        "legion"
+    };
+    let installed_bin = install_dir.join(exe_name);
+    let candidate_bin = build_dir.join(exe_name);
+    fs::copy(LEGION_BIN, &installed_bin).unwrap();
+    fs::copy(LEGION_BIN, &candidate_bin).unwrap();
+
+    let run_copy = |args: &[&str]| {
+        let out = Command::new(&installed_bin)
+            .args(args)
+            .env("LEGION_HOME", &legion_home)
+            .env("HOME", &user_home)
+            .env("USERPROFILE", &user_home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        (out.status.code().unwrap_or(1), stdout, stderr)
+    };
+
+    let from_arg = format!("from={}", candidate_bin.display());
+
+    // `from` and `version` together fail with invalid_args.
+    let (code, stdout, _) = run_copy(&["meta.update", &from_arg, "version=0.2.0"]);
+    assert_eq!(code, 1, "{stdout}");
+    let err: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(err["code"], json!("invalid_args"), "{err}");
+
+    // Dry run succeeds without writing `.prev`.
+    let (code, stdout, stderr) = run_copy(&["meta.update", &from_arg, "dry_run=true"]);
+    assert_eq!(code, 0, "stderr: {stderr}, stdout: {stdout}");
+    let dry: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(dry["dry_run"], json!(true), "{dry}");
+    assert_eq!(dry["updated"], json!(false), "{dry}");
+    assert_eq!(dry["installed_version"], json!(env!("CARGO_PKG_VERSION")));
+    assert!(!install_dir.join(format!("{exe_name}.prev")).exists());
+
+    // Real local update replaces the temp copy and keeps `.prev`.
+    let (code, stdout, stderr) = run_copy(&["meta.update", &from_arg]);
+    assert_eq!(code, 0, "stderr: {stderr}, stdout: {stdout}");
+    let updated: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(updated["dry_run"], json!(false), "{updated}");
+    assert_eq!(updated["updated"], json!(true), "{updated}");
+    assert_eq!(
+        updated["installed_version"],
+        json!(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(install_dir.join(format!("{exe_name}.prev")).is_file());
+    assert!(
+        legion_home
+            .join("state")
+            .join("version-floor.json")
+            .is_file()
+    );
 }
