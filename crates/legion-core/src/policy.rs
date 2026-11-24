@@ -708,23 +708,24 @@ impl Grant {
             )
             .with_hint("Write the path from the root of the file system, or from ~."));
         }
-        if names_a_stream(expanded.as_os_str().as_encoded_bytes(), Platform::HOST) {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!(
-                    "{} names an alternate data stream, which Legion does not open.",
-                    given.display()
-                ),
-            )
-            .with_hint("Name the file itself: on Windows a colon after the drive selects a stream inside a file."));
-        }
+        validate_platform_path(
+            expanded.as_os_str().as_encoded_bytes(),
+            given,
+            Platform::HOST,
+        )?;
 
         let Some(roots) = &self.rules.paths else {
             let resolved =
                 resolve_keeping_last(&expanded).map_err(|error| error.unconfined(given))?;
+            let resolved_path = resolved.path();
+            validate_platform_path(
+                resolved_path.as_os_str().as_encoded_bytes(),
+                given,
+                Platform::HOST,
+            )?;
             self.keep_out_of_own_dirs(&resolved, given, access)?;
             self.keep_out_of_secret_locations(&resolved, given, access, &[])?;
-            return Ok(resolved.path());
+            return Ok(resolved_path);
         };
         let denied = |reason: &str| {
             ErrorBody::new(
@@ -785,9 +786,15 @@ impl Grant {
                 return Err(outside());
             }
         }
+        let resolved_path = resolved.path();
+        validate_platform_path(
+            resolved_path.as_os_str().as_encoded_bytes(),
+            given,
+            Platform::HOST,
+        )?;
         self.keep_out_of_own_dirs(&resolved, given, access)?;
         self.keep_out_of_secret_locations(&resolved, given, access, &resolved_roots)?;
-        Ok(resolved.path())
+        Ok(resolved_path)
     }
 
     /// Whether a path is one of the places a tool must not remove, move or replace as a whole, or a
@@ -1763,6 +1770,104 @@ fn volume(path: &[u8], platform: Platform) -> (Vec<u8>, &[u8]) {
 /// Whether a path names an alternate data stream: on Windows, a colon anywhere after its volume.
 fn names_a_stream(path: &[u8], platform: Platform) -> bool {
     platform == Platform::Windows && volume(path, platform).1.contains(&b':')
+}
+
+/// Pure platform-specific path component check run by [`Grant::check_path`].
+///
+/// On Windows, Win32 silently strips trailing dots and spaces from path components (so `.kube.`
+/// opens `.kube` and `.ssh ` opens `.ssh`), treats a colon after the drive/share prefix as an NTFS
+/// alternate data stream, and redirects reserved DOS device names (`CON`, `NUL`, `COM1`..`COM9`,
+/// `LPT1`..`LPT9`, etc.) regardless of extension. Parameterised by [`Platform`] so every rule is
+/// tested on every host OS.
+fn validate_platform_path(
+    path: &[u8],
+    display: &Path,
+    platform: Platform,
+) -> Result<(), ErrorBody> {
+    if platform != Platform::Windows {
+        return Ok(());
+    }
+    if names_a_stream(path, platform) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "{} names an alternate data stream, which Legion does not open.",
+                display.display()
+            ),
+        )
+        .with_hint(
+            "Name the file itself: on Windows a colon after the drive selects a stream inside a file.",
+        ));
+    }
+    let (_, rest) = volume(path, platform);
+    for comp in rest
+        .split(|byte| platform.separates(*byte))
+        .filter(|part| !part.is_empty())
+    {
+        if comp == b"." || comp == b".." {
+            continue;
+        }
+        if comp.ends_with(b".") || comp.ends_with(b" ") {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "{} has path component {:?} ending in a dot or space, which Windows silently strips.",
+                    display.display(),
+                    String::from_utf8_lossy(comp)
+                ),
+            )
+            .with_hint("Remove trailing dots and spaces from every path component on Windows."));
+        }
+        if is_windows_reserved_device_name(comp) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "{} uses the reserved Windows device name {:?}.",
+                    display.display(),
+                    String::from_utf8_lossy(comp)
+                ),
+            )
+            .with_hint(
+                "Avoid reserved Windows device names (CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM1-COM9, LPT1-LPT9) in path components.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `comp` matches a Win32 reserved device name (case-insensitively, ignoring any extension
+/// or trailing dots/spaces).
+fn is_windows_reserved_device_name(comp: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(comp) else {
+        return false;
+    };
+    let stem = text
+        .trim_end_matches(['.', ' '])
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ');
+    if stem.is_empty() {
+        return false;
+    }
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+        || stem.eq_ignore_ascii_case("CONIN$")
+        || stem.eq_ignore_ascii_case("CONOUT$")
+    {
+        return true;
+    }
+    if stem.len() > 3
+        && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
+    {
+        let mut chars = stem[3..].chars();
+        if let (Some(digit), None) = (chars.next(), chars.next()) {
+            return matches!(digit, '1'..='9' | '\u{00B9}' | '\u{00B2}' | '\u{00B3}');
+        }
+    }
+    false
 }
 
 /// The volume of a resolved path and its names, from the top down.
@@ -2929,5 +3034,63 @@ role = "wide"
                 .check_create(&home.join(".codex"), CreateKind::Symlink, false)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn windows_path_validation_refuses_trailing_dot_space_and_reserved_devices_on_every_platform() {
+        let check = |raw: &str, platform: Platform| {
+            validate_platform_path(raw.as_bytes(), Path::new(raw), platform)
+        };
+
+        for bad in [
+            r"C:\Users\me\.kube.\config",
+            r"C:\Users\me\.ssh \authorized_keys",
+            r"C:\Users\me\projects\file.",
+            r"C:\Users\me\projects\file ",
+            r"C:\Users\me\projects\...",
+            r"\\?\C:\Users\me\.kube.\config",
+            r"\\server\share\.ssh \id_ed25519",
+            r"C:\Users\me\projects\CON",
+            r"C:\Users\me\projects\nul.txt",
+            r"C:\Users\me\projects\COM1.log",
+            "C:\\Users\\me\\projects\\com\u{00B9}",
+            r"C:\Users\me\projects\LPT9",
+            "C:\\Users\\me\\projects\\lpt\u{00B3}.dat",
+            r"C:\Users\me\projects\CONIN$",
+            r"C:\Users\me\projects\CONOUT$",
+            r"C:\Users\me\projects\aux .txt",
+            r"C:\Users\me\projects\prn",
+            r"C:\Users\me\projects\file.txt:stream",
+        ] {
+            let err = check(bad, Platform::Windows).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
+        }
+
+        for good_windows in [
+            r"C:\Users\me\.kube\config",
+            r"C:\Users\me\.ssh\authorized_keys",
+            r"C:\Users\me\projects\..\ok\file.txt",
+            r"C:\Users\me\projects\.\file.txt",
+            r"C:\Users\me\projects\console.txt",
+            r"C:\Users\me\projects\COM0",
+            r"\\?\C:\Users\me\projects\readme.md",
+        ] {
+            assert!(
+                check(good_windows, Platform::Windows).is_ok(),
+                "{good_windows}"
+            );
+        }
+
+        // Unix and macOS do not strip trailing dots/spaces or reserve DOS device names.
+        for non_windows in [Platform::Unix, Platform::Mac] {
+            for path in [
+                "/home/me/.kube./config",
+                "/home/me/.ssh /authorized_keys",
+                "/home/me/projects/CON",
+                "/home/me/projects/file:stream",
+            ] {
+                assert!(check(path, non_windows).is_ok(), "{non_windows:?} {path}");
+            }
+        }
     }
 }
