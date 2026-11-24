@@ -1,7 +1,7 @@
 //! Compact mode: three tools that list, describe and call the others, for agents that should not
 //! carry every tool's schema in their context.
 
-use legion_core::proto::{ErrorBody, Target};
+use legion_core::proto::ErrorBody;
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -106,7 +106,7 @@ pub(crate) struct CallArgs {
     pub(crate) args: Option<Map<String, Value>>,
     /// Where to run it.
     #[serde(default)]
-    pub(crate) on: Option<Target>,
+    pub(crate) on: Option<Value>,
 }
 
 /// Reads a compact tool's arguments, saying in an error how to find out what it takes.
@@ -147,6 +147,8 @@ mod tests {
         for tool in &tools {
             assert_eq!(tool.input_schema["type"], json!("object"));
             assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+            let schema = Value::Object((*tool.input_schema).clone());
+            assert_eq!(legion_core::schema::problems(&schema), Vec::<String>::new());
         }
         assert_eq!(tools[2].input_schema["required"], json!(["tool"]));
         assert_eq!(tools[2].input_schema["properties"]["on"], on_schema());
@@ -156,17 +158,14 @@ mod tests {
     fn arguments_are_checked() {
         let call: CallArgs = parse(
             CALL,
-            json!({"tool": "meta.version", "on": ["tower", "pi"]})
+            json!({"tool": "meta.version", "on": "tower,pi"})
                 .as_object()
                 .cloned()
                 .unwrap(),
         )
         .unwrap();
         assert_eq!(call.tool, "meta.version");
-        assert_eq!(
-            call.on,
-            Some(Target::Many(vec!["tower".into(), "pi".into()]))
-        );
+        assert_eq!(call.on, Some(json!("tower,pi")));
         assert!(call.args.is_none());
         let error = parse::<CallArgs>(CALL, Map::new()).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgs);

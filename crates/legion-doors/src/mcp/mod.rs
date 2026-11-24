@@ -219,13 +219,7 @@ impl McpDoor {
         mut args: JsonObject,
         context: &RequestContext<RoleServer>,
     ) -> Result<Value, ErrorBody> {
-        let on = match args.remove(ON) {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(serde_json::from_value::<Target>(value).map_err(|error| {
-                self.door_error(ErrorCode::InvalidArgs, format!("on: {error}."))
-                    .with_hint("Give on as a machine's name, a list of names, or \"all\", or leave it out to run on this machine.")
-            })?),
-        };
+        let on = self.on(args.remove(ON))?;
         let tool = self.catalog.resolve(name);
         self.run(tool, Value::Object(args), on, context)
             .await
@@ -270,7 +264,8 @@ impl McpDoor {
                 let args: compact::CallArgs = compact::parse(name, args)?;
                 let tool = self.catalog.resolve(&args.tool);
                 let tool_args = Value::Object(args.args.unwrap_or_default());
-                self.run(tool, tool_args, args.on, context)
+                let on = self.on(args.on)?;
+                self.run(tool, tool_args, on, context)
                     .await
                     .map_err(|error| match error.code {
                         ErrorCode::UnknownTool => error.with_hint(LIST_COMPACT),
@@ -347,6 +342,14 @@ impl McpDoor {
                 )));
         }
         to_object(&Listing { tools: chosen })
+    }
+
+    /// The machines an `on` argument names.
+    fn on(&self, on: Option<Value>) -> Result<Option<Target>, ErrorBody> {
+        catalog::target(on.unwrap_or(Value::Null)).map_err(|error| {
+            self.door_error(ErrorCode::InvalidArgs, format!("on: {error}."))
+                .with_hint("Give on as a machine's name, several names separated by commas, or \"all\", or leave it out to run on this machine.")
+        })
     }
 
     /// An error the door itself finds, before any call reaches the node, naming the node as the

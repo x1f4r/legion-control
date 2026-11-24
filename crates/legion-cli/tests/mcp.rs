@@ -266,10 +266,16 @@ fn the_handshake_revision_lists_and_calls_the_tools() {
             "{name}"
         );
     }
-    assert!(tools.iter().all(|tool| {
+    for tool in tools {
         let name = tool["name"].as_str().unwrap();
-        !name.contains('.') && tool["inputSchema"]["type"] == json!("object")
-    }));
+        assert!(!name.contains('.'), "{name}");
+        assert_eq!(tool["inputSchema"]["type"], json!("object"), "{name}");
+        assert_eq!(
+            legion_core::schema::problems(&tool["inputSchema"]),
+            Vec::<String>::new(),
+            "{name}"
+        );
+    }
 
     let version = mcp.call("meta_version", json!({}));
     assert_eq!(version.get("resultType"), None);
@@ -373,10 +379,15 @@ fn failures_are_tool_results_carrying_the_error_object() {
         let elsewhere = failed(&mcp.call("meta_version", json!({"on": "pi"})));
         assert_eq!(elsewhere["code"], json!("unreachable"));
         assert!(elsewhere["hint"].is_string());
-        let several = failed(&mcp.call("meta_version", json!({"on": ["tower", "pi"]})));
-        assert_eq!(several["code"], json!("unreachable"));
-        let bad_on = failed(&mcp.call("meta_version", json!({"on": 5})));
-        assert_eq!(bad_on["code"], json!("invalid_args"));
+        // The schema asks for one string, with commas between names; a list is taken too.
+        for several in [json!("tower,pi"), json!(["tower", "pi"])] {
+            let error = failed(&mcp.call("meta_version", json!({"on": several})));
+            assert_eq!(error["code"], json!("unreachable"), "{several}");
+        }
+        for bad in [json!(5), json!(""), json!("tower,,pi")] {
+            let bad_on = failed(&mcp.call("meta_version", json!({"on": bad})));
+            assert_eq!(bad_on["code"], json!("invalid_args"), "{bad}");
+        }
 
         // `on` naming this node runs here, and `on` never reaches the tool.
         assert_eq!(

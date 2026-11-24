@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use legion_core::proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, Target, ToolSpec};
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
 
@@ -181,15 +181,25 @@ fn add_on(schema: &mut JsonObject, spec: &ToolSpec) -> Result<(), ErrorBody> {
     Ok(())
 }
 
-/// The schema of `on`, the same in full and compact mode.
+/// The schema of `on`, the same in full and compact mode: one string, the type every client can
+/// send, naming several machines with commas the way the command line's `--on` does.
 pub(crate) fn on_schema() -> Value {
     json!({
-        "description": "Where to run: a machine's name, a list of machine names, or \"all\". Leave it out to run on this machine.",
-        "anyOf": [
-            {"type": "string"},
-            {"type": "array", "items": {"type": "string"}, "minItems": 1}
-        ]
+        "type": "string",
+        "description": "Where to run: a machine's name, several names separated by commas, or \"all\". Leave it out to run on this machine."
     })
+}
+
+/// The machines `on` names. A list of names is taken as well as the string the schema asks for,
+/// since it is what a client that knows the wire protocol sends.
+pub(crate) fn target(on: Value) -> Result<Option<Target>, String> {
+    match on {
+        Value::Null => Ok(None),
+        Value::String(text) => Target::parse(&text).map(Some),
+        other => serde_json::from_value(other)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+    }
 }
 
 /// The first sentence of a description, or its first line, for listings that show many tools.
@@ -203,6 +213,8 @@ pub(crate) fn summary(description: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use legion_core::schema::problems;
+
     use super::*;
 
     fn spec(name: &str, effect: Effect, schema: Value) -> ToolSpec {
@@ -370,6 +382,7 @@ mod tests {
             let schema = Value::Object((*tool.input_schema).clone());
             assert_eq!(schema["type"], json!("object"), "{name}: {schema}");
             assert_eq!(schema.get("$schema"), None, "{name}");
+            assert_eq!(problems(&schema), Vec::<String>::new(), "{name}");
             let properties = schema["properties"].as_object().unwrap();
             assert_eq!(properties[ON], on_schema(), "{name}");
             if let Some(required) = schema.get("required") {
@@ -404,6 +417,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn on_is_a_name_names_separated_by_commas_or_all() {
+        assert_eq!(target(Value::Null), Ok(None));
+        assert_eq!(
+            target(json!("tower")),
+            Ok(Some(Target::One("tower".into())))
+        );
+        assert_eq!(
+            target(json!("tower, pi")),
+            Ok(Some(Target::Many(vec!["tower".into(), "pi".into()])))
+        );
+        assert_eq!(target(json!("all")), Ok(Some(Target::All)));
+        assert_eq!(
+            target(json!(["tower", "pi"])),
+            Ok(Some(Target::Many(vec!["tower".into(), "pi".into()])))
+        );
+        assert!(target(json!("")).is_err());
+        assert!(target(json!(5)).is_err());
     }
 
     #[test]
