@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use legion_proto::{ErrorBody, ErrorCode};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Prefix of version 1 invite strings.
 pub const INVITE_PREFIX: &str = "legion-invite-1.";
@@ -147,25 +148,30 @@ impl Invite {
         Ok(format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json)))
     }
 
-    /// Extracts the 32-byte Ed25519 seed of the temporary enrolment key.
-    pub fn key_seed(&self) -> Result<[u8; 32], ErrorBody> {
-        let raw = STANDARD.decode(self.key.trim()).map_err(|err| {
+    /// Extracts the 32-byte Ed25519 seed of the temporary enrolment key, zeroizing the
+    /// intermediate decode buffer and wrapping the returned seed in [`Zeroizing`].
+    pub fn key_seed(&self) -> Result<Zeroizing<[u8; 32]>, ErrorBody> {
+        let mut raw = STANDARD.decode(self.key.trim()).map_err(|err| {
             ErrorBody::new(
                 ErrorCode::InvalidArgs,
                 format!("Invite temporary key is not valid base64: {err}."),
             )
             .with_hint("Generate a fresh invite with `legion pair`.")
         })?;
-        <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
-            ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!(
-                    "Invite temporary key must decode to 32 bytes, got {}.",
-                    raw.len()
-                ),
-            )
-            .with_hint("Generate a fresh invite with `legion pair`.")
-        })
+        let res = <[u8; 32]>::try_from(raw.as_slice())
+            .map(Zeroizing::new)
+            .map_err(|_| {
+                ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!(
+                        "Invite temporary key must decode to 32 bytes, got {}.",
+                        raw.len()
+                    ),
+                )
+                .with_hint("Generate a fresh invite with `legion pair`.")
+            });
+        raw.zeroize();
+        res
     }
 
     /// Returns the pinned [`SshTarget`] carried by this invite.
@@ -311,7 +317,8 @@ mod enrol_client {
             )
             .with_hint("Pass a short label such as `phone` or `tablet`."));
         }
-        let temp_key = DeviceKey::from_seed(invite.key_seed()?);
+        let seed = invite.key_seed()?;
+        let temp_key = DeviceKey::from_seed(*seed);
         let target = invite.target();
         let public_key = device_key.public_key_line(name)?;
 
@@ -575,7 +582,7 @@ mod tests {
         );
         let parsed = Invite::parse(&text).unwrap();
         assert_eq!(parsed, sample_invite());
-        assert_eq!(parsed.key_seed().unwrap(), [7u8; 32]);
+        assert_eq!(*parsed.key_seed().unwrap(), [7u8; 32]);
 
         let reencoded = parsed.encode().unwrap();
         assert_eq!(Invite::parse(&reencoded).unwrap(), parsed);

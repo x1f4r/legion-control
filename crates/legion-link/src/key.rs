@@ -1,8 +1,9 @@
 //! Device identity keys (Ed25519) in OpenSSH format.
 
 use legion_proto::{ErrorBody, ErrorCode};
-use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
+use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey};
+use zeroize::{Zeroize, Zeroizing};
 
 /// An Ed25519 SSH identity key owned by a controller device.
 ///
@@ -24,22 +25,22 @@ impl std::fmt::Debug for DeviceKey {
 impl DeviceKey {
     /// Generates a fresh Ed25519 device key using the operating system's CSPRNG.
     pub fn generate() -> Result<Self, ErrorBody> {
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|err| {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut *seed).map_err(|err| {
             ErrorBody::new(
                 ErrorCode::Internal,
                 format!("Could not read random bytes for a new device key: {err}."),
             )
             .with_hint("Retry on a platform with an available OS random source.")
         })?;
-        Ok(Self::from_seed(seed))
+        Ok(Self::from_seed(*seed))
     }
 
-    /// Builds an Ed25519 key deterministically from a 32-byte seed.
-    pub fn from_seed(seed: [u8; 32]) -> Self {
+    /// Builds an Ed25519 key deterministically from a 32-byte seed, zeroizing its local copy.
+    pub fn from_seed(mut seed: [u8; 32]) -> Self {
         let keypair = Ed25519Keypair::from_seed(&seed);
-        let inner = PrivateKey::new(KeypairData::Ed25519(keypair), String::new())
-            .unwrap_or_else(|_| PrivateKey::from(Ed25519Keypair::from_seed(&seed)));
+        seed.zeroize();
+        let inner = PrivateKey::from(keypair);
         DeviceKey { inner }
     }
 
