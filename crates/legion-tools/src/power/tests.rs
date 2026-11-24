@@ -52,7 +52,7 @@ impl Fixture {
     fn carried_out(&self, argv: &[String]) -> bool {
         self.fake.records().iter().any(|record| match record {
             Record::Schedule { argv: done, .. } | Record::Run { argv: done } => done == argv,
-            Record::Datagram { .. } => false,
+            Record::Datagram { .. } | Record::Stop { .. } => false,
         })
     }
 }
@@ -81,6 +81,7 @@ fn the_tools_are_registered_with_their_effects_and_closed_schemas() {
         ("power.sleep", Effect::Power),
         ("power.restart", Effect::Power),
         ("power.shutdown", Effect::Power),
+        ("power.cancel", Effect::Power),
     ] {
         let spec = registry.get(name).unwrap().spec();
         assert_eq!(spec.effect, effect, "{name}");
@@ -90,7 +91,7 @@ fn the_tools_are_registered_with_their_effects_and_closed_schemas() {
             "{name}"
         );
         assert!(spec.description.ends_with('.'), "{name}");
-        if effect == Effect::Power {
+        if effect == Effect::Power && name != "power.cancel" {
             assert!(spec.description.contains("dry_run"), "{name}");
             assert!(spec.description.contains("force: true"), "{name}");
             assert!(spec.description.contains("unmonitored"), "{name}");
@@ -99,7 +100,7 @@ fn the_tools_are_registered_with_their_effects_and_closed_schemas() {
     let restart = registry.get("power.restart").unwrap().spec();
     assert_eq!(
         restart.input_schema["properties"]["delay_s"]["maximum"],
-        json!(60)
+        json!(600)
     );
 }
 
@@ -551,6 +552,7 @@ async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
         taken: None,
         disarm: None,
         abandoned: false,
+        fired: None,
     };
     pending::write_pending(&dir, &record).unwrap();
     let error = fixture.call("power.shutdown", json!({})).await.unwrap_err();
@@ -739,6 +741,8 @@ async fn status_reports_the_last_action_and_how_it_ended() {
             exit_code: Some(0),
             said: String::new(),
         }),
+        cancelled_by: None,
+        cancelled_at: None,
     };
     let dir = pending::dir(fixture.node.paths());
     std::fs::create_dir_all(&dir).unwrap();
@@ -806,7 +810,8 @@ async fn arguments_are_checked() {
     let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
     for (tool, args) in [
         ("power.restart", json!({"delay_s": 0})),
-        ("power.restart", json!({"delay_s": 61})),
+        ("power.restart", json!({"delay_s": 601})),
+        ("power.cancel", json!({"id": "x"})),
         ("power.shutdown", json!({"into": "windows"})),
         ("power.sleep", json!({"delay_s": 3})),
         ("power.status", json!({"force": true})),
@@ -829,10 +834,262 @@ async fn a_role_without_the_power_effect_is_denied() {
         call.as_principal = Some("agent:test".to_owned());
         fixture.node.call(call)
     };
-    for tool in ["power.sleep", "power.restart", "power.shutdown"] {
+    for tool in [
+        "power.sleep",
+        "power.restart",
+        "power.shutdown",
+        "power.cancel",
+    ] {
         let error = as_agent(tool).await.unwrap_err();
         assert_eq!(error.code, ErrorCode::Denied, "{tool}");
     }
     assert!(as_agent("power.status").await.is_ok());
     assert!(fixture.fake.records().is_empty());
+}
+
+// --- power.cancel ---------------------------------------------------------------------------------
+
+/// A record of a restart Windows times itself, handed over now on this node's boot, as a real
+/// call on Windows writes it; `power.cancel` deals with it the same way on any host.
+fn self_timed_restart(fixture: &Fixture, disarm: Option<Vec<String>>) -> Pending {
+    let record = Pending {
+        id: pending::new_id(),
+        action: Action::Restart,
+        into: disarm.as_ref().map(|_| "linux".to_owned()),
+        argv: strings(&["shutdown", "/r", "/t", "600"]),
+        delay_s: 600,
+        hold_s: 0,
+        since: pending::now(),
+        boot_id: fixture.node.boot_id(),
+        runner: false,
+        taken: None,
+        disarm,
+        abandoned: false,
+        fired: None,
+    };
+    pending::write_pending(&pending::dir(fixture.node.paths()), &record).unwrap();
+    record
+}
+
+#[tokio::test]
+async fn cancel_calls_off_a_handed_over_restart_and_status_says_who() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let restart = fixture
+        .call("power.restart", json!({"delay_s": 600}))
+        .await
+        .unwrap();
+    assert_eq!(restart["scheduled"], json!(true));
+    let before = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(before["pending"]["action"], json!("restart"), "{before}");
+    let id = before["pending"]["id"].clone();
+
+    let cancelled = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(cancelled["cancelled"], json!(true), "{cancelled}");
+    assert_eq!(cancelled["action"], json!("restart"));
+    assert_eq!(cancelled["id"], id);
+    assert!(cancelled["was_due"].is_string(), "{cancelled}");
+    let (_, timing) = expected(Action::Restart, 600, true);
+    match timing {
+        Timing::Delayed => {
+            // The runner was stopped by its handle, and its lock went with it.
+            assert_eq!(fixture.fake.stops(), [fake::FAKE_RUNNER_PID]);
+            assert!(!pending::runner_holds(&pending::dir(fixture.node.paths())));
+        }
+        Timing::SelfTimed => {
+            assert_eq!(
+                fixture.fake.runs().last(),
+                Some(&strings(&["shutdown", "/a"]))
+            );
+        }
+    }
+
+    let after = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(after.get("pending"), None, "{after}");
+    assert_eq!(after["last"]["id"], id, "{after}");
+    assert_eq!(after["last"]["fate"], json!("cancelled"));
+    assert_eq!(after["last"]["cancelled_by"], json!("owner"));
+    assert!(after["last"]["cancelled_at"].is_string());
+
+    // The power lock is free again: the next action can be handed over.
+    let again = fixture
+        .call("power.shutdown", json!({"delay_s": 600}))
+        .await
+        .unwrap();
+    assert_eq!(again["scheduled"], json!(true), "{again}");
+}
+
+#[tokio::test]
+async fn cancel_with_nothing_pending_or_a_second_time_says_so() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let nothing = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(nothing["cancelled"], json!(false));
+    assert_eq!(
+        nothing["detail"],
+        json!(
+            "Nothing is pending on this machine: no sleep, restart or shutdown has been handed over."
+        )
+    );
+    assert_eq!(nothing.get("action"), None);
+
+    fixture
+        .call("power.restart", json!({"delay_s": 600}))
+        .await
+        .unwrap();
+    let first = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(first["cancelled"], json!(true), "{first}");
+    let records = fixture.fake.records().len();
+    let second = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(second["cancelled"], json!(false), "{second}");
+    let detail = second["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(
+            "Nothing is pending on this machine. The last action, a restart handed over at"
+        ),
+        "{detail}"
+    );
+    assert!(detail.contains("was called off by owner at"), "{detail}");
+    // Nothing was run or stopped a second time.
+    assert_eq!(fixture.fake.records().len(), records);
+}
+
+#[tokio::test]
+async fn a_restart_windows_times_itself_is_called_off_with_shutdown_a() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let record = self_timed_restart(&fixture, None);
+    let cancelled = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(cancelled["cancelled"], json!(true), "{cancelled}");
+    assert_eq!(cancelled["id"], json!(record.id));
+    assert_eq!(fixture.fake.runs(), [strings(&["shutdown", "/a"])]);
+    assert!(fixture.fake.stops().is_empty());
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status.get("pending"), None, "{status}");
+    assert_eq!(status["last"]["fate"], json!("cancelled"), "{status}");
+}
+
+#[tokio::test]
+async fn windows_with_nothing_to_abort_or_refusing_is_reported_as_it_said() {
+    let nothing = Fixture::with_node_toml(
+        RecordingActuator::new().reply(Reply {
+            stderr:
+                "Unable to abort the system shutdown because no shutdown was in progress.(1116)"
+                    .to_owned(),
+            ..Reply::new(&["shutdown", "/a"], 1116, "")
+        }),
+        IDLE_WITH_SUDO,
+    );
+    self_timed_restart(&nothing, None);
+    let answer = nothing.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(answer["cancelled"], json!(false), "{answer}");
+    let detail = answer["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("no shutdown was in progress.(1116)")
+            && detail.contains("already called off on the machine"),
+        "{detail}"
+    );
+    let status = nothing.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status.get("pending"), None, "{status}");
+    assert_eq!(status["last"]["fate"], json!("did_not_happen"), "{status}");
+
+    let refused = Fixture::with_node_toml(
+        RecordingActuator::new().reply(Reply::new(&["shutdown", "/a"], 5, "Access is denied.(5)")),
+        IDLE_WITH_SUDO,
+    );
+    self_timed_restart(&refused, None);
+    let error = refused.call("power.cancel", json!({})).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+    // Still pending: nothing was recorded as called off.
+    let status = refused.call("power.status", json!({})).await.unwrap();
+    assert_eq!(status["pending"]["action"], json!("restart"), "{status}");
+}
+
+#[tokio::test]
+async fn cancelling_a_restart_into_another_system_clears_the_firmware_again() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let disarm = strings(&["bcdedit", "/deletevalue", "{fwbootmgr}", "bootsequence"]);
+    self_timed_restart(&fixture, Some(disarm.clone()));
+    let cancelled = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(cancelled["cancelled"], json!(true), "{cancelled}");
+    assert!(
+        cancelled["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("The firmware's setting to start linux next was cleared again with `bcdedit /deletevalue {fwbootmgr} bootsequence`."),
+        "{cancelled}"
+    );
+    assert_eq!(
+        fixture.fake.runs(),
+        [strings(&["shutdown", "/a"]), disarm.clone()]
+    );
+    let status = fixture.call("power.status", json!({})).await.unwrap();
+    assert_eq!(
+        status["last"]["disarmed"]["argv"],
+        json!(disarm),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn a_command_the_runner_has_started_is_too_late_to_call_off() {
+    let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
+    let dir = pending::dir(fixture.node.paths());
+    std::fs::create_dir_all(&dir).unwrap();
+    let _runner = pending::take_runner_lock(&dir, std::time::Duration::from_secs(1)).unwrap();
+    let record = Pending {
+        id: pending::new_id(),
+        action: Action::Shutdown,
+        into: None,
+        argv: strings(&["sudo", "-n", "systemctl", "poweroff"]),
+        delay_s: 600,
+        hold_s: 0,
+        since: pending::now(),
+        boot_id: fixture.node.boot_id(),
+        runner: true,
+        taken: Some(pending::now()),
+        disarm: None,
+        abandoned: false,
+        fired: Some(pending::now()),
+    };
+    pending::write_pending(&dir, &record).unwrap();
+    let answer = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(answer["cancelled"], json!(false), "{answer}");
+    assert!(
+        answer["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("Too late: the shutdown handed over at"),
+        "{answer}"
+    );
+    assert!(fixture.fake.records().is_empty());
+    // Left as it was for the runner, which is carrying it out.
+    assert_eq!(pending::read_pending(&dir), Some(record));
+}
+
+#[tokio::test]
+async fn a_runner_that_cannot_be_stopped_is_still_called_off() {
+    let fixture =
+        Fixture::with_node_toml(RecordingActuator::new().surviving_stops(), IDLE_WITH_SUDO);
+    if expected(Action::Restart, 600, true).1 != Timing::Delayed {
+        return;
+    }
+    fixture
+        .call("power.restart", json!({"delay_s": 600}))
+        .await
+        .unwrap();
+    let answer = fixture.call("power.cancel", json!({})).await.unwrap();
+    assert_eq!(answer["cancelled"], json!(true), "{answer}");
+    let detail = answer["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("Its runner could not be stopped"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("find the action called off and run nothing"),
+        "{detail}"
+    );
+    // The record says called off, so the runner will not act; its lock holds the next call up
+    // until it is gone.
+    let next = fixture.call("power.restart", json!({})).await.unwrap_err();
+    assert_eq!(next.code, ErrorCode::Conflict, "{next:?}");
+    fixture.fake.finish_runners();
+    assert!(fixture.call("power.restart", json!({})).await.is_ok());
 }

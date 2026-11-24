@@ -4,8 +4,9 @@
 //! hears that it was accepted. A task inside the node would die with the session that asked, so
 //! the node re-executes its own binary, detached through `legion-os`, as this runner. It takes the
 //! runner lock first and holds it until its command has run (see [`super::pending`]), reads what
-//! to run from the pending record the call wrote, waits, looks once more that the record is still
-//! its own and not given up, and runs the command exactly as written: no shell, nothing quoted.
+//! to run from the pending record the call wrote, waits, and then, under the lock `power.cancel`
+//! takes too, looks once more that the record is still its own and not given up or called off and
+//! notes that it starts, and runs the command exactly as written: no shell, nothing quoted.
 //! What it prints, and the command's own output, go to `state/power/scheduled.log`.
 
 use std::ffi::OsString;
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use super::pending::{self, Disarmed, Outcome, Pending};
+use super::pending::{self, Disarmed, Outcome};
 
 /// The first argument that makes `legion` this runner instead of a command line.
 pub const DELAY_MODE: &str = "power-delay";
@@ -83,26 +84,34 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
         ));
         return NO_LOCK;
     };
-    let Some(mut record) = own(dir, id) else {
+    // The lock already says it was taken; the record says so too for a call that looks late.
+    let Some(record) = pending::take_over(dir, id) else {
         say(&format!(
             "legion power-delay {id}: the call gave this action up or replaced it; nothing was run"
         ));
         return NOTHING_TO_DO;
     };
-    record.taken = Some(pending::now());
-    // The lock already says it was taken; the record says so too for a call that looks late.
-    let _ = pending::write_pending(dir, &record);
     say(&format!(
         "legion power-delay {id}: running {:?} in {} s",
         record.argv, record.delay_s
     ));
     commands.pause(Duration::from_secs(u64::from(record.delay_s)));
-    if own(dir, id).is_none() {
-        say(&format!(
-            "legion power-delay {id}: given up during the delay; nothing was run"
-        ));
-        return NOTHING_TO_DO;
-    }
+    let record = match pending::fire(dir, id) {
+        pending::Fire::Go(record) => *record,
+        pending::Fire::Stop => {
+            say(&format!(
+                "legion power-delay {id}: given up or called off during the delay; nothing was run"
+            ));
+            return NOTHING_TO_DO;
+        }
+        pending::Fire::Unsure => {
+            say(&format!(
+                "legion power-delay {id}: {} could not be taken, so whether this action was called off is unknown; nothing was run",
+                dir.join("fire.lock").display()
+            ));
+            return NOTHING_TO_DO;
+        }
+    };
     let finished = commands.run(&record.argv, COMMAND_TIMEOUT);
     let succeeded = finished.exit_code == Some(0) && !finished.timed_out;
     // A restart into another system that did not happen leaves the firmware set to start it on
@@ -134,6 +143,8 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
         timed_out: finished.timed_out,
         said: finished.said.clone(),
         disarmed,
+        cancelled_by: None,
+        cancelled_at: None,
     };
     if let Err(error) = pending::write_outcome(dir, &outcome) {
         say(&format!(
@@ -164,11 +175,6 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
         Some(code) => u8::try_from(code.clamp(0, 255)).unwrap_or(1),
         None => 1,
     }
-}
-
-/// The pending record, when it is still `id`'s and not given up.
-fn own(dir: &Path, id: &str) -> Option<Pending> {
-    pending::read_pending(dir).filter(|record| record.id == id && !record.abandoned)
 }
 
 /// The machine's own processes.
@@ -270,6 +276,7 @@ mod tests {
         paused: Mutex<Vec<Duration>>,
         exit_code: Option<i32>,
         give_up_during_pause: bool,
+        cancel_during_pause: bool,
     }
 
     impl Commands for Recorded {
@@ -280,6 +287,12 @@ mod tests {
                 let mut record = read_pending(&self.dir).unwrap();
                 record.abandoned = true;
                 write_pending(&self.dir, &record).unwrap();
+            }
+            if self.cancel_during_pause {
+                assert!(matches!(
+                    pending::call_off(&self.dir, "a1"),
+                    pending::CallOff::CalledOff(_)
+                ));
             }
         }
 
@@ -318,6 +331,7 @@ mod tests {
             taken: None,
             disarm: None,
             abandoned: false,
+            fired: None,
         };
         write_pending(dir, &record).unwrap();
         record
@@ -384,6 +398,29 @@ mod tests {
         assert_eq!(carry_out(dir.path(), "a1", &giving_up), NOTHING_TO_DO);
         assert!(commands.ran.lock().unwrap().is_empty());
         assert!(giving_up.ran.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_runner_whose_action_is_called_off_during_the_delay_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        handed_over(dir.path());
+        let commands = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            cancel_during_pause: true,
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &commands), NOTHING_TO_DO);
+        assert!(commands.ran.lock().unwrap().is_empty());
+        // Once it has started the command, a cancel finds it too late.
+        handed_over(dir.path());
+        let started = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &started), 0);
+        assert_eq!(started.ran.lock().unwrap().len(), 1);
     }
 
     #[test]

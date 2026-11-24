@@ -17,11 +17,17 @@ use legion_core::{BoxFuture, CancellationToken};
 use legion_os::lock::FileLock;
 use serde::{Deserialize, Serialize};
 
-use super::actuator::{Actuator, Ran, Scheduled};
+use legion_os::detach::DetachHandle;
+use legion_os::procid::ProcessId;
+
+use super::actuator::{Actuator, Ran, Scheduled, Started, Stopped};
 use super::pending;
 
 /// The environment variable naming the directory a test binary's fake reads and writes.
 pub const TEST_POWER_DIR: &str = "LEGION_TEST_POWER";
+
+/// The process id in the handle of every runner the fake stands in for.
+pub const FAKE_RUNNER_PID: u32 = 4_000_000_001;
 
 /// One thing the fake was asked to do.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +44,11 @@ pub enum Record {
         argv: Vec<String>,
         /// The delay, in whole seconds.
         delay_s: u64,
+    },
+    /// A delayed runner stopped, by the process its handle names.
+    Stop {
+        /// The process id in the handle.
+        pid: u32,
     },
     /// A UDP datagram.
     Datagram {
@@ -111,6 +122,7 @@ pub struct RecordingActuator {
     file: Option<PathBuf>,
     refuse_datagrams: bool,
     refuse_schedules: bool,
+    survive_stops: bool,
     runners: Mutex<Vec<FileLock>>,
 }
 
@@ -163,6 +175,25 @@ impl RecordingActuator {
     pub fn refusing_schedules(mut self) -> RecordingActuator {
         self.refuse_schedules = true;
         self
+    }
+
+    /// Makes every runner this fake stands in for survive being stopped, as a process that cannot
+    /// be stopped would: it keeps the runner lock.
+    #[must_use]
+    pub fn surviving_stops(mut self) -> RecordingActuator {
+        self.survive_stops = true;
+        self
+    }
+
+    /// The process ids of the runners stopped so far.
+    pub fn stops(&self) -> Vec<u32> {
+        self.records()
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Stop { pid } => Some(pid),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Lets every runner this fake stands in for finish: their locks go, and so does the record of
@@ -250,7 +281,7 @@ impl Actuator for RecordingActuator {
         Box::pin(async move { outcome })
     }
 
-    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
+    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Started, ErrorBody>> {
         self.record(Record::Schedule {
             argv: job.argv.clone(),
             delay_s: job.delay.as_secs(),
@@ -266,9 +297,43 @@ impl Actuator for RecordingActuator {
             if let Some(held) = pending::take_runner_lock(&job.dir, Duration::from_secs(5)) {
                 lock(&self.runners).push(held);
             }
-            Ok(Vec::new())
+            // A handle no real process has: the marker says which runner lock it stands for.
+            Ok(Started {
+                runner: Some(DetachHandle {
+                    process: ProcessId::new(FAKE_RUNNER_PID, 1),
+                    systemd_unit: None,
+                    windows_job: None,
+                    marker: Some(job.dir.to_string_lossy().into_owned()),
+                    warnings: Vec::new(),
+                }),
+                warnings: Vec::new(),
+            })
         };
         Box::pin(async move { outcome })
+    }
+
+    fn stop_runner<'a>(
+        &'a self,
+        runner: &'a DetachHandle,
+    ) -> BoxFuture<'a, Result<Stopped, ErrorBody>> {
+        self.record(Record::Stop {
+            pid: runner.process.pid,
+        });
+        let stopped = if self.survive_stops {
+            Stopped {
+                all_gone: false,
+                survivors: vec![runner.process.pid],
+            }
+        } else {
+            // The runner this handle stands for lets go of its lock, as a stopped process does.
+            let dir = runner.marker.as_deref().map(PathBuf::from);
+            lock(&self.runners).retain(|held| held.path().parent() != dir.as_deref());
+            Stopped {
+                all_gone: true,
+                survivors: Vec::new(),
+            }
+        };
+        Box::pin(async move { Ok(stopped) })
     }
 
     fn send_datagram(&self, payload: &[u8], to: SocketAddrV4) -> Result<(), String> {

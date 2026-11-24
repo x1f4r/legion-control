@@ -44,6 +44,10 @@ fn main() -> ExitCode {
             one_power_action_at_a_time_on_a_long_lived_node,
         ),
         (
+            "cancel_calls_off_a_pending_restart_on_another_machine",
+            cancel_calls_off_a_pending_restart_on_another_machine,
+        ),
+        (
             "wake_asks_the_first_helper_that_answers_and_waits_for_the_machine",
             wake_asks_the_first_helper_that_answers_and_waits_for_the_machine,
         ),
@@ -477,8 +481,18 @@ impl Rpc {
 
     /// Calls `tool` and returns the reply's `result` or `error`.
     fn call(&mut self, tool: &str, args: Value) -> Value {
+        self.send(json!({"tool": tool, "args": args}))
+    }
+
+    /// Calls `tool` on the machine `on`, through this node's own session to it.
+    fn call_on(&mut self, tool: &str, args: Value, on: &str) -> Value {
+        self.send(json!({"tool": tool, "args": args, "on": on}))
+    }
+
+    fn send(&mut self, params: Value) -> Value {
         self.next += 1;
-        let request = json!({"jsonrpc": "2.0", "id": self.next, "method": "call", "params": {"tool": tool, "args": args}});
+        let request =
+            json!({"jsonrpc": "2.0", "id": self.next, "method": "call", "params": params});
         let stdin = self.child.stdin.as_mut().unwrap();
         std::io::Write::write_all(stdin, format!("{request}\n").as_bytes()).unwrap();
         loop {
@@ -501,6 +515,45 @@ impl Drop for Rpc {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn cancel_calls_off_a_pending_restart_on_another_machine() {
+    let laptop_machine = Machine::new("laptop", "boot-1");
+    let laptop = System::new("name = \"laptop\"\nbusy = \"none\"\n[power]\nsudo = true\n");
+    let desk_machine = Machine::new("desk", "boot-d");
+    let desk = System::new("name = \"desk\"\n");
+    desk.home.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.laptop]\ncommand = {}\n",
+            laptop.command(&laptop_machine, "laptop")
+        ),
+    );
+    // One long-lived session from desk to laptop, as an agent's MCP door keeps one: laptop's node
+    // and the runner its fake stands in for live as long as it does.
+    let mut desk_node = Rpc::start(&desk, &desk_machine);
+    let restart = desk_node.call_on("power.restart", json!({"delay_s": 600}), "laptop");
+    assert_eq!(restart["scheduled"], json!(true), "{restart}");
+    let pending = desk_node.call_on("power.status", json!({}), "laptop");
+    assert_eq!(pending["pending"]["action"], json!("restart"), "{pending}");
+
+    let cancelled = desk_node.call_on("power.cancel", json!({}), "laptop");
+    assert_eq!(cancelled["cancelled"], json!(true), "{cancelled}");
+    assert_eq!(cancelled["id"], pending["pending"]["id"]);
+    let after = desk_node.call_on("power.status", json!({}), "laptop");
+    assert_eq!(after.get("pending"), None, "{after}");
+    assert_eq!(after["last"]["fate"], json!("cancelled"), "{after}");
+    assert_eq!(after["last"]["cancelled_by"], json!("owner"), "{after}");
+    let again = desk_node.call_on("power.cancel", json!({}), "laptop");
+    assert_eq!(again["cancelled"], json!(false), "{again}");
+
+    // Laptop's fake called it off the platform's way; desk itself did nothing.
+    let called_off = laptop.actions().iter().any(|action| {
+        action["kind"] == json!("stop")
+            || (action["kind"] == json!("run") && action["argv"] == json!(["shutdown", "/a"]))
+    });
+    assert!(called_off, "{:?}", laptop.actions());
+    assert!(desk.actions().is_empty(), "{:?}", desk.actions());
 }
 
 fn one_power_action_at_a_time_on_a_long_lived_node() {

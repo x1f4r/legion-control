@@ -601,7 +601,7 @@ pub fn read_self_timed(argv: &[String], what: &str, ran: &Ran) -> Result<(), Err
                 "A restart or shutdown is already scheduled or under way on this machine ({said})."
             ),
         )
-        .with_hint("Wait for it, or cancel it on the machine with `shutdown /a` and ask again.")
+        .with_hint("Wait for it, or call it off with power.cancel (or `shutdown /a` on the machine for one Legion did not start) and ask again.")
         .with_details(details)),
         _ if looks_refused(&said) => Err(refused(Platform::Windows, what, false, argv, &said)),
         _ => Err(ErrorBody::new(

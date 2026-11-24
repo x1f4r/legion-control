@@ -148,7 +148,7 @@ are RFC 3339 UTC, durations are seconds.
 | `fs` (fleet) | `fs.transfer` | between any two machines, or to and from this one |
 | `proj` | `proj.list`, `proj.add`, `proj.remove`, `proj.status`, `proj.clone`, `proj.pull`, `proj.run`, `proj.discover` | named projects and where they live |
 | `svc` | `svc.list`, `svc.status`, `svc.start`, `svc.stop`, `svc.restart`, `svc.logs` | systemd, launchd, Windows services |
-| `power` | `power.status`, `power.sleep`, `power.restart`, `power.shutdown` | busy-gated; `restart` can name the system to land in |
+| `power` | `power.status`, `power.sleep`, `power.restart`, `power.shutdown`, `power.cancel` | busy-gated; `restart` can name the system to land in; `cancel` calls a pending one off |
 | `power` (fleet) | `power.wol`, `power.wake`, `power.switch` | wake a machine through a helper; restart one and confirm which system came back |
 | `fleet` | `fleet.list`, `fleet.ping`, `fleet.add`, `fleet.remove`, `fleet.discover`, `fleet.install`, `fleet.sync` | the machines, reachability, remote install, config sync |
 | `config` (fleet) | `config.list`, `config.read`, `config.write` | shared configuration documents (`fleet.toml`, `policy.toml`, `projects.toml`, `tools.d/*.toml`) |

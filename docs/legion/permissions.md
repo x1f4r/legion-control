@@ -63,7 +63,7 @@ Every tool declares one of six effects:
 | `write` | `fs.write`, `fs.edit`, `fs.copy`, `fs.move`, `fs.mkdir`, `fs.transfer`, `proj.add` | Creates or modifies files and project entries. **`write` can replace content**: denying `fs.remove` prevents deleting files, not overwriting their bytes with something else. |
 | `destroy` | `fs.remove`, `sys.kill` | Removes files or directories or terminates processes. Replacing a whole directory counts as destroying it. |
 | `exec` | `exec.run`, `job.start`, `job.cancel`, `svc.start`, `svc.stop`, `svc.restart`, `proj.run`, `proj.clone`, `proj.pull` | Runs programs on the machine. **`exec` is as strong as the account**: `paths` does not contain what a command reads, writes, or launches. |
-| `power` | `power.sleep`, `power.restart`, `power.shutdown`, `power.wol`, `power.wake`, `power.switch` | Changes machine power state or sends Wake-on-LAN packets. |
+| `power` | `power.sleep`, `power.restart`, `power.shutdown`, `power.cancel`, `power.wol`, `power.wake`, `power.switch` | Changes machine power state, calls a pending change off, or sends Wake-on-LAN packets. |
 | `admin` | `meta.init`, `meta.update`, `fleet.add`, `fleet.remove`, `fleet.install`, `fleet.sync`, `config.*`, `token.*`, `ext.define`, `ext.remove`, `agent.*` | Changes Legion itself: policy, tokens, fleet membership, extensions, synced config, agent registrations, and the binary. |
 
 ### Legion's own files belong to `admin`

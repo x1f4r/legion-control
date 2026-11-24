@@ -6,7 +6,8 @@
 //! happened; the action is scheduled a few seconds out so the reply still arrives; a restart into
 //! another system arms the firmware and reads it back before anything is scheduled; and a machine
 //! is not interrupted while it is busy, or while nobody has said what keeps it busy, unless the
-//! caller says `force`.
+//! caller says `force`. An action handed over and not yet carried out can be called off with
+//! `power.cancel`.
 //!
 //! Everything that touches the machine goes through an [`Actuator`]; see [`actuator`] for why a
 //! test build can never act on the machine it runs on. The platform's commands are built in
@@ -35,15 +36,19 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use self::actuator::{Actuator, Ran, Scheduled, SystemActuator, actuator};
+pub use self::actuator::{Actuator, Ran, Scheduled, Started, Stopped, SystemActuator, actuator};
 pub use self::delay::{DELAY_MODE, try_delay_cli};
 
 use self::busy::Busy;
 use self::pending::Pending;
 use self::plan::{Action, Answer, Check, Platform, SLEEP_DELAY_S, Timing};
 
-/// The delay `power.restart` and `power.shutdown` use when not given one, and their range.
-const DELAY_S: (u32, u32, u32) = (3, 1, 60);
+/// The delay `power.restart` and `power.shutdown` use when not given one, and their range. The
+/// default only lets the reply leave; the most, ten minutes, is for an owner who wants time to
+/// call a restart or shutdown off with power.cancel, from this machine or another, before it
+/// happens. Anything later is a schedule, which belongs in a job rather than a pending power
+/// action that holds every other power call up for hours.
+const DELAY_S: (u32, u32, u32) = (3, 1, 600);
 /// How long asking the system whether it would allow an action may take.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long each `before_sleep` command, and a command that schedules itself, may take.
@@ -94,7 +99,7 @@ pub fn register_with(registry: &mut Registry, actuator: Arc<dyn Actuator>) {
         "power.restart",
         Effect::Power,
         &format!(
-            "Restart this machine `delay_s` seconds (1 to 60, default 3) after this call replies, optionally into another of its systems: `into` names a boot target from node.toml ([boot.<name>]), the firmware is set to start it once and read back, and only when the setting reads back is the restart scheduled; otherwise nothing restarts. The reply means the restart was scheduled, not that it happened, and carries the current boot id to compare with later; to restart another machine and confirm which system came back, call power.switch from a different machine. {GATE}"
+            "Restart this machine `delay_s` seconds (1 to 600, default 3) after this call replies, optionally into another of its systems: `into` names a boot target from node.toml ([boot.<name>]), the firmware is set to start it once and read back, and only when the setting reads back is the restart scheduled; otherwise nothing restarts. The reply means the restart was scheduled, not that it happened, and carries the current boot id to compare with later; until it happens, power.cancel calls it off. To restart another machine and confirm which system came back, call power.switch from a different machine. {GATE}"
         ),
         Arc::clone(&actuator),
         |actuator, ctx, args: RestartArgs| {
@@ -120,9 +125,9 @@ pub fn register_with(registry: &mut Registry, actuator: Arc<dyn Actuator>) {
         "power.shutdown",
         Effect::Power,
         &format!(
-            "Power this machine off `delay_s` seconds (1 to 60, default 3) after this call replies. The reply means the shutdown was scheduled, not that it happened. Bringing the machine back takes Wake-on-LAN (power.wake from another machine) or someone at it. {GATE}"
+            "Power this machine off `delay_s` seconds (1 to 600, default 3) after this call replies. The reply means the shutdown was scheduled, not that it happened; until it happens, power.cancel calls it off. Bringing the machine back takes Wake-on-LAN (power.wake from another machine) or someone at it. {GATE}"
         ),
-        actuator,
+        Arc::clone(&actuator),
         |actuator, ctx, args: ShutdownArgs| {
             Box::pin(async move {
                 let delay_s = delay(args.delay_s)?;
@@ -141,6 +146,13 @@ pub fn register_with(registry: &mut Registry, actuator: Arc<dyn Actuator>) {
                 .await
             })
         },
+    ));
+    registry.add(PowerTool::new(
+        "power.cancel",
+        Effect::Power,
+        "Call off the sleep, restart or shutdown handed over on this machine and not yet carried out: on Linux and macOS the delayed runner is stopped before it runs the command, on Windows a restart or shutdown is called off with `shutdown /a`, and a one-time firmware boot entry the restart had armed is cleared again. power.status then shows the action as `last`, cancelled, with who cancelled it. `cancelled: false` with a `detail` when nothing is pending, or when the action has already started and can no longer be stopped. Not gated on the machine being busy.",
+        actuator,
+        |actuator, ctx, _args: NoArgs| Box::pin(cancel(actuator, ctx)),
     ));
 }
 
@@ -244,9 +256,9 @@ struct RestartArgs {
     /// through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere.
     #[serde(default)]
     ignore_inhibitors: bool,
-    /// Seconds between the reply and the restart, 1 to 60; 3 when absent.
+    /// Seconds between the reply and the restart, 1 to 600; 3 when absent.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 60))]
+    #[schemars(range(min = 1, max = 600))]
     delay_s: Option<u32>,
     /// Return the exact commands this call would run, without running them.
     #[serde(default)]
@@ -266,9 +278,9 @@ struct ShutdownArgs {
     /// through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere.
     #[serde(default)]
     ignore_inhibitors: bool,
-    /// Seconds between the reply and the shutdown, 1 to 60; 3 when absent.
+    /// Seconds between the reply and the shutdown, 1 to 600; 3 when absent.
     #[serde(default)]
-    #[schemars(range(min = 1, max = 60))]
+    #[schemars(range(min = 1, max = 600))]
     delay_s: Option<u32>,
     /// Return the exact commands this call would run, without running them.
     #[serde(default)]
@@ -284,7 +296,9 @@ fn delay(given: Option<u32>) -> Result<u32, ErrorBody> {
             ErrorCode::InvalidArgs,
             format!("delay_s must be {least} to {most} seconds, and {seconds} was given."),
         )
-        .with_hint("Leave it out for 3 seconds, enough for the reply to leave.")),
+        .with_hint(format!(
+            "Leave it out for {default} seconds, enough for the reply to leave; give more to keep time to call it off with power.cancel."
+        ))),
     }
 }
 
@@ -620,7 +634,23 @@ async fn hand_over(
         let _ = pending::write_pending(dir, record);
     };
     let warnings = match actuator.schedule(&job).await {
-        Ok(warnings) => warnings,
+        Ok(started) => {
+            let mut warnings = started.warnings;
+            match &started.runner {
+                Some(runner) => {
+                    if let Err(error) = pending::write_runner(dir, &record.id, runner) {
+                        warnings.push(format!(
+                            "{} power.cancel can still call the action off, but cannot stop its runner before it is due.",
+                            error.message
+                        ));
+                    }
+                }
+                None => warnings.push(
+                    "The delayed runner gave no handle, so power.cancel can call the action off but cannot stop its runner before it is due.".to_owned(),
+                ),
+            }
+            warnings
+        }
         Err(error) => {
             give_up(record);
             return Err(error);
@@ -641,6 +671,355 @@ async fn hand_over(
             delay::log_path(dir).display()
         )))
     }
+}
+
+/// What `power.cancel` returns.
+#[derive(Debug, Serialize)]
+struct CancelResult {
+    /// Whether a pending action was called off, so it will not happen.
+    cancelled: bool,
+    /// `sleep`, `restart` or `shutdown`: the action it was about, when there was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<Action>,
+    /// The hand-over's id, as power.status shows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    /// When it was to happen, RFC 3339.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    was_due: Option<String>,
+    /// What was done, or why nothing could be.
+    detail: String,
+}
+
+/// How long a cancel waits for a stopped runner's lock to go with it.
+const RUNNER_GONE_PATIENCE: Duration = Duration::from_secs(5);
+
+/// Windows' "no shutdown was in progress" (ERROR_NO_SHUTDOWN_IN_PROGRESS).
+const NO_SHUTDOWN_IN_PROGRESS: i32 = 1116;
+
+async fn cancel(actuator: &Arc<dyn Actuator>, ctx: &Ctx) -> Result<CancelResult, ToolError> {
+    Platform::of(ctx.os())?;
+    let paths = ctx.paths();
+    let dir = pending::dir(paths);
+    // A call still preparing its own action finishes first; a cancel then deals with what it left.
+    let _call = pending::begin_cancel(paths)?;
+    let boot_id = ctx.boot_id();
+    let record = pending::read_pending(&dir).filter(|record| {
+        pending::fate(
+            record,
+            jiff::Timestamp::now(),
+            boot_id.as_deref(),
+            pending::runner_holds(&dir),
+        ) == pending::Fate::Pending
+    });
+    let Some(record) = record else {
+        return Ok(nothing_pending(paths, boot_id.as_deref()));
+    };
+    if record.runner {
+        cancel_runner(actuator, ctx, &dir, record).await
+    } else {
+        cancel_self_timed(actuator, ctx, &dir, record).await
+    }
+}
+
+/// Calls off an action a delayed runner carries out: marked called off under `fire.lock`, so the
+/// runner can no longer start it, and then the runner itself stopped, so the power lock it holds
+/// goes with it.
+async fn cancel_runner(
+    actuator: &Arc<dyn Actuator>,
+    ctx: &Ctx,
+    dir: &std::path::Path,
+    record: Pending,
+) -> Result<CancelResult, ToolError> {
+    let record = match pending::call_off(dir, &record.id) {
+        pending::CallOff::CalledOff(record) => *record,
+        pending::CallOff::TooLate(record) => {
+            let fired = record.fired.clone().unwrap_or_default();
+            return Ok(CancelResult {
+                cancelled: false,
+                action: Some(record.action),
+                was_due: due_at(&record),
+                detail: format!(
+                    "Too late: {} started `{}` at {fired}, and a command that has started can no longer be called off from here.",
+                    describe_action(&record),
+                    record.argv.join(" ")
+                ),
+                id: Some(record.id),
+            });
+        }
+        pending::CallOff::Gone => {
+            return Ok(nothing_pending(ctx.paths(), ctx.boot_id().as_deref()));
+        }
+        pending::CallOff::Unsure => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "{} could not be taken, so whether the {} can still be called off is unknown; nothing was changed.",
+                    dir.join("fire.lock").display(),
+                    record.action.as_str()
+                ),
+            )
+            .with_hint("Try again in a moment; power.status shows whether it is still pending."));
+        }
+    };
+    // From here on the runner will not run it, whatever becomes of the runner itself.
+    let was_due = due_at(&record);
+    let due = was_due.clone().unwrap_or_else(|| "its time".to_owned());
+    let stopped = match pending::read_runner(dir, &record.id) {
+        Some(runner) => match actuator.stop_runner(&runner).await {
+            Ok(stopped) if stopped.all_gone => {
+                let deadline = tokio::time::Instant::now() + RUNNER_GONE_PATIENCE;
+                while pending::runner_holds(dir) && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                format!("Its runner (process {}) was stopped.", runner.process.pid)
+            }
+            Ok(stopped) => format!(
+                "Its runner could not be stopped (processes {:?} are still running); it will wake at {due}, find the action called off and run nothing, and until then the next power action waits for it.",
+                stopped.survivors
+            ),
+            Err(error) => format!(
+                "Its runner could not be stopped ({}); it will wake at {due}, find the action called off and run nothing, and until then the next power action waits for it.",
+                error.message
+            ),
+        },
+        None => format!(
+            "Its runner's handle was not recorded, so it was left to wake at {due}, find the action called off and run nothing; until then the next power action waits for it."
+        ),
+    };
+    let (disarmed, disarm_note) = disarm_after_cancel(actuator, ctx, &record).await;
+    record_cancelled(ctx, dir, &record, String::new(), disarmed);
+    Ok(CancelResult {
+        cancelled: true,
+        action: Some(record.action),
+        was_due,
+        detail: format!(
+            "Called off {}, which was due at {due}: it will not run. {stopped}{disarm_note}",
+            describe_action(&record)
+        ),
+        id: Some(record.id),
+    })
+}
+
+/// Calls off a restart or shutdown Windows times itself, with `shutdown /a`, and reads Windows'
+/// own answer.
+async fn cancel_self_timed(
+    actuator: &Arc<dyn Actuator>,
+    ctx: &Ctx,
+    dir: &std::path::Path,
+    record: Pending,
+) -> Result<CancelResult, ToolError> {
+    let abort = plan::strings(&["shutdown", "/a"]);
+    let ran = actuator
+        .run(&abort, COMMAND_TIMEOUT, ctx.cancel_token())
+        .await?;
+    let said = ran.said();
+    let was_due = due_at(&record);
+    if ran.ok() {
+        let (disarmed, disarm_note) = disarm_after_cancel(actuator, ctx, &record).await;
+        record_cancelled(ctx, dir, &record, said, disarmed);
+        return Ok(CancelResult {
+            cancelled: true,
+            action: Some(record.action),
+            detail: format!(
+                "Windows called off {}, which was due at {}: `shutdown /a` succeeded.{disarm_note}",
+                describe_action(&record),
+                was_due.as_deref().unwrap_or("its time")
+            ),
+            was_due,
+            id: Some(record.id),
+        });
+    }
+    match ran.exit_code {
+        Some(NO_SHUTDOWN_IN_PROGRESS) => {
+            // Nothing for Windows to call off on this boot: someone did it on the machine.
+            let outcome = pending::Outcome {
+                fate: Some(pending::Fate::DidNotHappen),
+                said: said.clone(),
+                ..outcome_of(&record)
+            };
+            let _ = pending::write_outcome(dir, &outcome);
+            pending::clear_pending(dir);
+            Ok(CancelResult {
+                cancelled: false,
+                action: Some(record.action),
+                was_due,
+                detail: format!(
+                    "Windows says there is nothing to call off ({said}): {} was already called off on the machine, so it will not happen; nothing was changed.",
+                    describe_action(&record)
+                ),
+                id: Some(record.id),
+            })
+        }
+        Some(5) => Err(plan::refused(
+            Platform::Windows,
+            "call off the pending restart or shutdown",
+            false,
+            &abort,
+            &said,
+        )),
+        _ => Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "`shutdown /a` did not call off {}: {}.",
+                describe_action(&record),
+                if said.is_empty() {
+                    "it said nothing"
+                } else {
+                    &said
+                }
+            ),
+        )
+        .with_hint("power.status shows whether it is still pending.")
+        .with_details(json!({"argv": abort, "exit_code": ran.exit_code, "said": said}))),
+    }
+}
+
+/// Clears a one-time firmware boot entry the called-off restart had armed, as the runner does
+/// when a restart fails; returns what to record and what to add to the detail.
+async fn disarm_after_cancel(
+    actuator: &Arc<dyn Actuator>,
+    ctx: &Ctx,
+    record: &Pending,
+) -> (Option<pending::Disarmed>, String) {
+    let Some(disarm) = &record.disarm else {
+        return (None, String::new());
+    };
+    let into = record.into.as_deref().unwrap_or("the other system");
+    match actuator
+        .run(disarm, COMMAND_TIMEOUT, ctx.cancel_token())
+        .await
+    {
+        Ok(ran) => {
+            let note = if ran.ok() {
+                format!(
+                    " The firmware's setting to start {into} next was cleared again with `{}`.",
+                    disarm.join(" ")
+                )
+            } else {
+                format!(
+                    " Clearing the firmware's setting to start {into} next with `{}` failed ({}), so the next restart, whatever causes it, may start {into}.",
+                    disarm.join(" "),
+                    describe_failure(&ran)
+                )
+            };
+            let disarmed = pending::Disarmed {
+                argv: disarm.clone(),
+                exit_code: ran.exit_code,
+                said: ran.said(),
+            };
+            (Some(disarmed), note)
+        }
+        Err(error) => (
+            None,
+            format!(
+                " Clearing the firmware's setting to start {into} next with `{}` failed ({}), so the next restart, whatever causes it, may start {into}.",
+                disarm.join(" "),
+                error.message
+            ),
+        ),
+    }
+}
+
+/// Writes the cancellation as the action's outcome and removes the pending record.
+fn record_cancelled(
+    ctx: &Ctx,
+    dir: &std::path::Path,
+    record: &Pending,
+    said: String,
+    disarmed: Option<pending::Disarmed>,
+) {
+    let outcome = pending::Outcome {
+        fate: Some(pending::Fate::Cancelled),
+        said,
+        disarmed,
+        cancelled_by: Some(ctx.principal().to_owned()),
+        cancelled_at: Some(pending::now()),
+        ..outcome_of(record)
+    };
+    // Unwritten, power.status would say only that the runner is gone; the action still will not
+    // run, which is what matters.
+    let _ = pending::write_outcome(dir, &outcome);
+    pending::clear_pending(dir);
+}
+
+fn outcome_of(record: &Pending) -> pending::Outcome {
+    pending::Outcome {
+        id: record.id.clone(),
+        action: record.action,
+        into: record.into.clone(),
+        argv: record.argv.clone(),
+        since: record.since.clone(),
+        ran_at: None,
+        fate: None,
+        exit_code: None,
+        timed_out: false,
+        said: String::new(),
+        disarmed: None,
+        cancelled_by: None,
+        cancelled_at: None,
+    }
+}
+
+/// The answer when there is nothing to call off, saying what became of the last action.
+fn nothing_pending(paths: &legion_core::Paths, boot_id: Option<&str>) -> CancelResult {
+    let detail = match pending::last_known(paths, boot_id) {
+        None => "Nothing is pending on this machine: no sleep, restart or shutdown has been handed over.".to_owned(),
+        Some(last) => {
+            let how = match (last.fate, &last.cancelled_by, &last.ran_at) {
+                (Some(pending::Fate::Cancelled), Some(by), _) => format!(
+                    "was called off by {by} at {}",
+                    last.cancelled_at.as_deref().unwrap_or("an unknown time")
+                ),
+                (Some(pending::Fate::Happened), ..) => "happened: the machine has booted since".to_owned(),
+                (Some(pending::Fate::DidNotHappen), ..) => "did not happen and is no longer due".to_owned(),
+                (Some(pending::Fate::GivenUp), ..) => "was given up by the call that handed it over".to_owned(),
+                (Some(pending::Fate::RunnerGone), ..) => "is no longer pending: its runner is gone".to_owned(),
+                (_, _, Some(ran_at)) => format!(
+                    "ran at {ran_at}{}",
+                    last.exit_code.map_or_else(String::new, |code| format!(" and exited {code}"))
+                ),
+                _ => "is no longer pending".to_owned(),
+            };
+            format!(
+                "Nothing is pending on this machine. The last action, a {} handed over at {}, {how}.",
+                last.action.as_str(),
+                last.since
+            )
+        }
+    };
+    CancelResult {
+        cancelled: false,
+        action: None,
+        id: None,
+        was_due: None,
+        detail,
+    }
+}
+
+/// "the restart into windows handed over at …", for messages.
+fn describe_action(record: &Pending) -> String {
+    match &record.into {
+        Some(into) => format!(
+            "the {} into {into} handed over at {}",
+            record.action.as_str(),
+            record.since
+        ),
+        None => format!(
+            "the {} handed over at {}",
+            record.action.as_str(),
+            record.since
+        ),
+    }
+}
+
+/// When a handed-over action was to happen: its hand-over time plus its delay.
+fn due_at(record: &Pending) -> Option<String> {
+    let since: jiff::Timestamp = record.since.parse().ok()?;
+    let due = since
+        .checked_add(jiff::SignedDuration::from_secs(i64::from(record.delay_s)))
+        .ok()?;
+    Some(due.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 fn find_target<'a>(file: &'a NodeFile, name: &str) -> Result<&'a BootTarget, ErrorBody> {
