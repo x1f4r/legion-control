@@ -987,6 +987,14 @@ async fn killed_supervisor_and_reboot_yield_interrupted() {
         .unwrap();
     assert!(gone(sup_pid).await);
 
+    // On Windows the command runs in a job object that closes with the supervisor, so its
+    // processes are already on their way out: wait for that instead of racing it.
+    if cfg!(windows) {
+        for &pid in &family {
+            let _ = gone(pid).await;
+        }
+    }
+
     if family.iter().any(|&pid| alive(pid)) {
         let unsupervised = fixture.call("job.status", json!({"id": id})).await.unwrap();
         assert_eq!(unsupervised["state"], json!("running"), "{unsupervised:#}");
