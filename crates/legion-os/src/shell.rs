@@ -296,6 +296,24 @@ pub(crate) fn windows_cmdline_escape(arg: &str) -> String {
     out
 }
 
+/// Wrap a PowerShell command string so stdout uses UTF-8 without a BOM and native executable
+/// exit codes survive intact instead of being collapsed to `0`/`1`.
+///
+/// With plain `-Command`, Windows PowerShell encodes stdout in the active OEM code page and
+/// collapses failing native exit codes to `1`. Running this wrapper through `-EncodedCommand`
+/// fixes both issues for Windows PowerShell 5.1 and PowerShell 7.
+#[allow(dead_code)]
+pub(crate) fn build_powershell_shell_wrapper(command: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n\
+         $OutputEncoding = [Console]::OutputEncoding\n\
+         $global:LASTEXITCODE = 0\n\
+         {command}\n\
+         if (!$?) {{ exit [Math]::Max(1, [int]$LASTEXITCODE) }}\n\
+         exit [int]$LASTEXITCODE"
+    )
+}
+
 /// Encode UTF-8 text as UTF-16LE Base64 for PowerShell's `-EncodedCommand` parameter.
 #[allow(dead_code)]
 pub(crate) fn encode_utf16le_base64(text: &str) -> String {
@@ -375,13 +393,15 @@ mod tests {
         }
         #[cfg(windows)]
         {
+            let expected_encoded =
+                encode_utf16le_base64(&build_powershell_shell_wrapper("echo hi"));
             assert_eq!(
                 resolved.args,
                 vec![
                     OsString::from("-NoProfile"),
                     OsString::from("-NonInteractive"),
-                    OsString::from("-Command"),
-                    OsString::from("echo hi"),
+                    OsString::from("-EncodedCommand"),
+                    OsString::from(expected_encoded),
                 ]
             );
             assert_eq!(resolved.env_remove, vec![OsString::from("PSModulePath")]);
@@ -439,5 +459,68 @@ mod tests {
         // Known PowerShell -EncodedCommand vector for "hi": 68 00 69 00 -> "aABpAA=="
         assert_eq!(encode_utf16le_base64("hi"), "aABpAA==");
         assert_eq!(encode_utf16le_base64(""), "");
+    }
+
+    #[test]
+    fn powershell_shell_wrapper_sets_utf8_preserves_exit_code_and_round_trips_base64() {
+        let cmd = "git status --short; echo 'caf\u{00e9}'";
+        let wrapper = build_powershell_shell_wrapper(cmd);
+        assert!(
+            wrapper.contains(
+                "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)"
+            )
+        );
+        assert!(wrapper.contains("$OutputEncoding = [Console]::OutputEncoding"));
+        assert!(wrapper.contains("$global:LASTEXITCODE = 0"));
+        assert!(wrapper.contains(cmd));
+        assert!(wrapper.contains("if (!$?) { exit [Math]::Max(1, [int]$LASTEXITCODE) }"));
+        assert!(wrapper.ends_with("exit [int]$LASTEXITCODE"));
+
+        let encoded = encode_utf16le_base64(&wrapper);
+        let decoded = decode_utf16le_base64(&encoded);
+        assert_eq!(decoded, wrapper);
+    }
+
+    fn decode_utf16le_base64(encoded: &str) -> String {
+        fn val(b: u8) -> u8 {
+            match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                other => panic!("unexpected base64 byte: {other}"),
+            }
+        }
+        let raw = encoded.as_bytes();
+        let (quads, rem) = raw.as_chunks::<4>();
+        assert!(rem.is_empty());
+        let mut bytes = Vec::with_capacity(quads.len() * 3);
+        for chunk in quads {
+            let v0 = val(chunk[0]) as u32;
+            let v1 = val(chunk[1]) as u32;
+            let v2 = if chunk[2] == b'=' {
+                0
+            } else {
+                val(chunk[2]) as u32
+            };
+            let v3 = if chunk[3] == b'=' {
+                0
+            } else {
+                val(chunk[3]) as u32
+            };
+            let triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+            bytes.push(((triple >> 16) & 0xff) as u8);
+            if chunk[2] != b'=' {
+                bytes.push(((triple >> 8) & 0xff) as u8);
+            }
+            if chunk[3] != b'=' {
+                bytes.push((triple & 0xff) as u8);
+            }
+        }
+        let (pairs, byte_rem) = bytes.as_chunks::<2>();
+        assert!(byte_rem.is_empty());
+        let units: Vec<u16> = pairs.iter().map(|&pair| u16::from_le_bytes(pair)).collect();
+        String::from_utf16(&units).unwrap()
     }
 }
