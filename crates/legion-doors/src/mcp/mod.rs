@@ -7,7 +7,7 @@
 //!
 //! In full mode every registry tool is an MCP tool of its own, named with an underscore for the
 //! dot (`fs.read` is `fs_read`) and taking one more optional argument, `on`, the machine or
-//! machines to run on. In compact mode three tools list, describe and call the others. Either way
+//! machines to run on. In compact mode four tools list, describe and run the others. Either way
 //! a failed call is a tool result with `isError` set and the error object as its text, so an agent
 //! reads the code and the hint instead of a protocol error it cannot see.
 
@@ -19,7 +19,7 @@ use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use legion_core::proto::{ErrorBody, ErrorCode, Target};
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, Target};
 use legion_core::{
     CANCEL_GRACE, Call, CancellationToken, Door, EventSink, Grant, Node, RouteOutcome, Router,
     VERSION,
@@ -59,8 +59,8 @@ pub struct Options {
     /// The principal every call in the session acts as, as `legion mcp --as` pins it. A pinned
     /// session cannot be talked into acting as anyone else.
     pub pinned: Option<String>,
-    /// Serve `legion_tools`, `legion_describe` and `legion_call` instead of one tool per registry
-    /// tool, so an agent carries three schemas rather than every one.
+    /// Serve `legion_tools`, `legion_describe`, `legion_read` and `legion_call` instead of one
+    /// tool per registry tool, so an agent carries four schemas rather than every one.
     pub compact: bool,
 }
 
@@ -293,8 +293,8 @@ impl McpDoor {
     fn instructions(&self) -> String {
         let (whoami, on) = if self.options.compact {
             (
-                "legion_tools lists the tools, legion_describe gives one tool's arguments, and legion_call runs one. Call legion_call with tool meta.whoami first",
-                "legion_call takes an optional `on`",
+                "legion_tools lists the tools, legion_describe gives one tool's arguments, legion_read runs a tool whose effect is read, and legion_call runs any tool. legion_read is marked read-only and refuses every other tool, so use it for tools that only read and legion_call for tools that change things. Call legion_read with tool meta.whoami first",
+                "legion_read and legion_call take an optional `on`",
             )
         } else {
             (
@@ -450,14 +450,19 @@ impl McpDoor {
                 }
                 Err(error) => RouteOutcome::One(Err(error)),
             },
+            compact::READ => match compact::parse::<compact::CallArgs>(name, args) {
+                Ok(args) => self.call_read(&catalog, args, context).await,
+                Err(error) => RouteOutcome::One(Err(error)),
+            },
             other => {
                 let hint = match self
                     .grant(context)
                     .ok()
-                    .and_then(|grant| Self::visible(&catalog, &grant, other).map(|entry| entry.spec.name.clone()))
+                    .and_then(|grant| Self::visible(&catalog, &grant, other).map(|entry| (entry.spec.name.clone(), entry.spec.effect)))
                 {
-                    Some(tool) => format!("Run it with legion_call, giving tool \"{tool}\"."),
-                    None => "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned(),
+                    Some((tool, Effect::Read)) => format!("Run it with legion_read, giving tool \"{tool}\"."),
+                    Some((tool, _)) => format!("Run it with legion_call, giving tool \"{tool}\"."),
+                    None => "This session serves legion_tools, legion_describe, legion_read and legion_call: legion_read runs any other tool whose effect is read, and legion_call runs any other tool.".to_owned(),
                 };
                 RouteOutcome::One(Err(self
                     .door_error(
@@ -467,6 +472,70 @@ impl McpDoor {
                     .with_hint(hint)))
             }
         }
+    }
+
+    /// `legion_read`: the call `legion_call` would make, when the tool's effect is read on every
+    /// machine it would run on, and otherwise a refusal before anything runs.
+    ///
+    /// The effect is the one the router learns to authorise the call: this node's own spec for a
+    /// tool that runs here or is built in, and for another machine's tool the effect that machine
+    /// reports. Where it cannot be established, the tool is treated as one that changes things.
+    /// A refusal is the door's, like a malformed `on`: nothing reaches the node, so nothing is
+    /// audited. A call that is run is authorised and audited by the node as every call is.
+    async fn call_read(
+        &self,
+        catalog: &Catalog,
+        args: compact::CallArgs,
+        context: &RequestContext<RoleServer>,
+    ) -> RouteOutcome {
+        let tool = catalog.resolve(&args.tool).to_owned();
+        let on = match self.on(args.on) {
+            Ok(on) => on,
+            Err(error) => return RouteOutcome::One(Err(error)),
+        };
+        // A policy that cannot be read, or a request without a principal, fails as a call would,
+        // and before any other machine is asked about the tool.
+        if let Err(error) = self.grant(context) {
+            return RouteOutcome::One(Err(error));
+        }
+        let effects = match self
+            .router
+            .effects(&self.node, &tool, on.as_ref(), context.ct.clone())
+            .await
+        {
+            Ok(effects) => effects,
+            Err(error) => return self.rewrite_outcome(RouteOutcome::One(Err(error)), &tool),
+        };
+        if let Some((machine, effect)) = effects
+            .into_iter()
+            .find(|(_, effect)| *effect != Some(Effect::Read))
+        {
+            return RouteOutcome::One(Err(self.not_read(&tool, &machine, effect)));
+        }
+        let tool_args = Value::Object(args.args.unwrap_or_default());
+        self.rewrite_outcome(self.run(&tool, tool_args, on, context).await, &tool)
+    }
+
+    /// Why `legion_read` did not run a tool.
+    fn not_read(&self, tool: &str, machine: &str, effect: Option<Effect>) -> ErrorBody {
+        let message = match effect {
+            Some(effect) => format!(
+                "legion_read runs only tools whose effect is read, and {tool} has the effect {effect} on {machine}, so it was not run."
+            ),
+            None => format!(
+                "legion_read runs only tools whose effect is read, and the effect of {tool} on {machine} cannot be established from {}, so it was not run.",
+                self.node.name()
+            ),
+        };
+        self.door_error(ErrorCode::Denied, message)
+            .with_hint(format!(
+                "Run it with legion_call, giving tool \"{tool}\": legion_call runs tools that change things."
+            ))
+            .with_details(json!({
+                "tool": tool,
+                "machine": machine,
+                "effect": effect.map(Effect::as_str),
+            }))
     }
 
     /// `legion_tools`: the tools the principal may use, optionally of one family.

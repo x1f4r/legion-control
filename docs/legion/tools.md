@@ -29,7 +29,7 @@ Register this `legion` binary as an MCP server named `legion` with an AI coding 
 | --- | --- | --- | --- | --- |
 | `agent` | `string` | yes | - | Which AI coding agent to register Legion with (`claude`, `codex`, `antigravity`, `opencode`). `claude`: Claude Code (`claude`). `codex`: OpenAI Codex CLI (`codex`). `antigravity`: Antigravity CLI (`agy`). `opencode`: OpenCode (`opencode`). Allowed values: `claude`, `codex`, `antigravity`, `opencode`. |
 | `as` | `string` | yes | - | Principal every MCP call from this agent acts as. Must be named in policy.toml, or `owner` with `allow_owner=true`. Prefer a named, limited principal so the agent is confined by its role and clearly identified in the audit log. |
-| `compact` | `boolean` | no | `true` | Pass `--compact` to `legion mcp` (exposes three meta-tools instead of one per registered tool). Defaults to true because every registered tool schema costs context on every conversation. |
+| `compact` | `boolean` | no | `true` | Pass `--compact` to `legion mcp` (exposes four meta-tools instead of one per registered tool). Defaults to true because every registered tool schema costs context on every conversation. |
 | `scope` | `string` | no | - | Scope for agents that support one (`local`, `user`, or `project` for `claude`, default `user`; `global`/`user` or `project`/`local` for `opencode`, default `global`). |
 | `allow_owner` | `boolean` | no | `false` | Allow registering the agent as `owner`, which grants unrestricted access. Off unless true. |
 | `dry_run` | `boolean` | no | `false` | Return the exact registration command without running it. |
