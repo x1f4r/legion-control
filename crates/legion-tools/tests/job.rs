@@ -705,12 +705,8 @@ async fn cancel_stops_the_whole_tree_and_reports_cancelled() {
 }
 
 async fn cancel_stops_setsid_descendants_even_after_exit() {
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Linux transient systemd user scopes contain `setsid` descendants; other platforms have
-        // no cgroup boundary for a child that creates a new session.
-        return;
-    }
+    // Linux transient systemd user scopes contain `setsid` descendants; other platforms have no
+    // cgroup boundary for a child that creates a new session, so there is nothing to assert there.
     #[cfg(target_os = "linux")]
     {
         use legion_os::detach::detached_active;
