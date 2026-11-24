@@ -112,6 +112,14 @@ export function emergencyAbort(isWindows, farHome) {
   return ['pkill', ['-f', '--', pattern]];
 }
 
+/**
+ * The step that keeps a step needing `needs` (prefixes of step names) from running: one that
+ * failed, or one that did not run itself, skipped as asked or for want of another.
+ */
+export function blockerOf(needs, failedNames, skippedNames) {
+  return [...failedNames, ...skippedNames].find(other => needs.some(prefix => other.startsWith(prefix)));
+}
+
 // Imported by its tests, the script does nothing but define; run, it parses its arguments and
 // goes. Compared through realpath, as scripts/check-syntax.mjs does.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
@@ -1072,10 +1080,10 @@ async function main() {
       process.stdout.write(`--- ${name}: skipped as asked\n`);
       continue;
     }
-    const blocker = failed.find(f => needs.some(prefix => f.name.startsWith(prefix)));
+    const blocker = blockerOf(needs, failed.map(f => f.name), skipped);
     if (blocker) {
       skipped.push(name);
-      process.stdout.write(`--- ${name}: skipped, it needs "${blocker.name}"\n`);
+      process.stdout.write(`--- ${name}: skipped, it needs "${blocker}"\n`);
       continue;
     }
     const started = Date.now();
