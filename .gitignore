@@ -1,30 +1,18 @@
 .DS_Store
-.build/
-build/
-*.app/
 node_modules/
-mac/Resources/AppIcon.iconset/
 
-# Signing keys, anywhere in the tree. The Android release key and its password live outside the
-# repository in ~/.legion-control and there is no reason for either to be in here, but a stray copy
-# is exactly the kind of thing that gets committed by accident, so it is refused repository wide.
-# See android/keystore.md. The Android build noise is handled by android/.gitignore.
+# Signing keys, keystores, and password files anywhere in the tree. They live outside the
+# repository and must never be committed by accident.
 *.jks
 *.keystore
 *.pw
 *.idsig
-android/local.properties
-android/.kotlin/
 
-# What scripts/release.sh builds on its way to a GitHub release. The artifacts belong on the
-# release, not in the history: they are two large binaries per version and every one of them can be
-# rebuilt from the tag it was cut from.
+# Staged release artifacts belong on GitHub releases, not in git history.
 dist/
 
-# Native desktop build outputs and local signing material.
+# Local build outputs and signing material.
 **/bin/
-**/obj/
-desktop/artifacts/
 *.key
 
 # What cargo builds for the Rust workspace at the root of the repository.

@@ -5,9 +5,7 @@ uniform, self-describing set of tools for the machine it runs on and for every o
 can reach: system state, commands and long-running jobs, files and file transfer, projects,
 services, power, and the fleet itself.
 
-This page is the design the Rust workspace is built to. It replaces the Node agent and the
-contract in this repository; until it reaches their feature set the two live side by side and
-neither touches the other's files.
+This page is the design the Rust workspace is built to.
 
 ## The idea in five sentences
 
