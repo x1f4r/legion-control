@@ -1,0 +1,393 @@
+//! `exec`: running a command that finishes, with its output captured and bounded.
+//!
+//! The process runs through `legion-os`, which contains it with everything it starts (a process
+//! group, a job object), so a timeout or a cancel stops the whole tree. The run is spawned onto
+//! the runtime rather than awaited in place: when a caller cancels, the node drops the tool's
+//! future at once, and an awaited run would be dropped with it, killing only the direct child and
+//! leaving its descendants behind. Spawned, the run sees the cancel, stops the tree the patient
+//! way, and only then finishes.
+
+mod text;
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind};
+use legion_core::{Access, Ctx, Registry, ToolError};
+use legion_os::OsError;
+use legion_os::run::{OutputChunk, OutputStream, RunOptions, RunOutput, run};
+use legion_os::shell::CommandSpec;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+
+/// Adds the `exec` tools.
+pub fn register(registry: &mut Registry) {
+    registry.add_fn(
+        "exec.run",
+        Effect::Exec,
+        "Run a command that finishes and return its exit code and output. Give `argv` to run a program with exactly these arguments, or `cmd` to hand one line to the platform shell (sh on Linux and macOS, PowerShell on Windows). The command is stopped, with everything it started, when `timeout_s` passes or the call is cancelled; a non-zero exit or a timeout is reported in the result, not as an error. Output is streamed as stdout and stderr events while it runs and capped at `max_output` bytes per stream, keeping the start and the end. Not for anything meant to keep running, such as a server or a watcher: that belongs to job.start.",
+        run_command,
+    );
+}
+
+/// Arguments of `exec.run`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RunArgs {
+    /// A command line handed whole to the platform shell: sh on Linux and macOS, PowerShell on
+    /// Windows. Give this or `argv`, not both.
+    #[serde(default)]
+    cmd: Option<String>,
+    /// The program and its arguments, run exactly as given with no shell in between. Give this
+    /// or `cmd`, not both.
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    /// The absolute directory to run in; legion's own when absent.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Environment variables to set on top of legion's own.
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
+    /// Text written to the command's standard input, which is then closed. Without it the command
+    /// reads end of input at once.
+    #[serde(default)]
+    stdin: Option<String>,
+    /// Seconds before the command is stopped, up to 3600; 120 when absent.
+    #[serde(default)]
+    timeout_s: Option<f64>,
+    /// Bytes of output kept per stream, up to 1048576; 65536 when absent. Beyond it the start and
+    /// the end are kept and the middle is replaced by a note of how much was left out.
+    #[serde(default)]
+    max_output: Option<u64>,
+}
+
+/// What `exec.run` returns.
+#[derive(Debug, Serialize)]
+pub struct Ran {
+    /// The exit code, when the command exited by itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The signal that ended it, on Linux and macOS, when one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Its standard output, as text.
+    pub stdout: String,
+    /// Its standard error, as text.
+    pub stderr: String,
+    /// Whether standard output was longer than `max_output` and its middle was left out.
+    pub stdout_truncated: bool,
+    /// Whether standard error was.
+    pub stderr_truncated: bool,
+    /// Whether it ran out of time and was stopped.
+    pub timed_out: bool,
+    /// How long it ran, in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// The default and the largest `timeout_s`.
+const TIMEOUT_S: (f64, f64) = (120.0, 3600.0);
+/// The default and the largest `max_output`.
+const MAX_OUTPUT: (u64, u64) = (64 * 1024, 1024 * 1024);
+
+async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
+    let (command, program) = command_of(args.cmd, args.argv)?;
+    let timeout = timeout_of(args.timeout_s)?;
+    let limit = max_output_of(args.max_output)?;
+    let env = env_of(args.env.unwrap_or_default())?;
+    let cwd = args
+        .cwd
+        .as_deref()
+        .map(|cwd| ctx.grant().check_path(cwd, Access::Read))
+        .transpose()?;
+
+    // Each stream is forwarded as events until `limit` bytes have gone out, so a flood of output
+    // costs the caller no more than the captured text does.
+    let (sender, mut receiver) = mpsc::unbounded_channel::<OutputChunk>();
+    let budgets = [
+        Arc::new(AtomicUsize::new(limit)),
+        Arc::new(AtomicUsize::new(limit)),
+    ];
+    let forward = {
+        let budgets = budgets.clone();
+        Arc::new(move |mut chunk: OutputChunk| {
+            let budget = &budgets[stream_index(chunk.stream)];
+            let allowed = take_budget(budget, chunk.bytes.len());
+            if allowed > 0 {
+                chunk.bytes.truncate(allowed);
+                let _ = sender.send(chunk);
+            }
+        })
+    };
+
+    // Dropped with this future, whether it finished or the node gave up on it, which cancels the
+    // run and so stops the process tree.
+    let cancel = ctx.cancel_token().child_token();
+    let _stop_on_drop = cancel.clone().drop_guard();
+    let mut options = RunOptions::new(command)
+        .envs(env)
+        .timeout(timeout)
+        .capture_limit(limit)
+        .cancel(cancel)
+        .on_output(forward);
+    if let Some(cwd) = &cwd {
+        options = options.cwd(cwd);
+    }
+    if let Some(stdin) = args.stdin {
+        options = options.stdin(stdin.into_bytes());
+    }
+    let mut running = tokio::spawn(run(options));
+
+    let mut decoders: [text::Decoder; 2] = Default::default();
+    let mut emit = |chunk: OutputChunk| {
+        let index = stream_index(chunk.stream);
+        let text = decoders[index].push(&chunk.bytes);
+        if !text.is_empty() {
+            let kind = match chunk.stream {
+                OutputStream::Stdout => EventKind::Stdout,
+                OutputStream::Stderr => EventKind::Stderr,
+            };
+            ctx.emit(kind, Value::String(text));
+        }
+    };
+    let finished = loop {
+        tokio::select! {
+            Some(chunk) = receiver.recv() => emit(chunk),
+            finished = &mut running => break finished,
+        }
+    };
+    // Everything read before the run returned is delivered before the result.
+    while let Ok(chunk) = receiver.try_recv() {
+        emit(chunk);
+    }
+
+    let output = finished
+        .map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Running the command stopped unexpectedly: {error}."),
+            )
+        })?
+        .map_err(|error| run_error(error, &program, cwd.as_deref()))?;
+    if output.cancelled {
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            "The call to exec.run was cancelled, and the command was stopped.",
+        ));
+    }
+    Ok(ran(output))
+}
+
+fn ran(output: RunOutput) -> Ran {
+    Ran {
+        exit_code: output.exit_code,
+        signal: output.signal,
+        stdout: output.stdout.text,
+        stderr: output.stderr.text,
+        stdout_truncated: output.stdout.truncated,
+        stderr_truncated: output.stderr.truncated,
+        timed_out: output.timed_out,
+        duration_ms: u64::try_from(output.duration.as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+fn stream_index(stream: OutputStream) -> usize {
+    match stream {
+        OutputStream::Stdout => 0,
+        OutputStream::Stderr => 1,
+    }
+}
+
+/// Takes up to `wanted` bytes from what is left of a stream's budget and returns how many it got.
+fn take_budget(budget: &AtomicUsize, wanted: usize) -> usize {
+    let mut left = budget.load(Ordering::Relaxed);
+    loop {
+        let taken = left.min(wanted);
+        match budget.compare_exchange_weak(left, left - taken, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return taken,
+            Err(now) => left = now,
+        }
+    }
+}
+
+/// The command to run and the program it names, for messages. Exactly one of `cmd` and `argv`.
+fn command_of(
+    cmd: Option<String>,
+    argv: Option<Vec<String>>,
+) -> Result<(CommandSpec, String), ErrorBody> {
+    let invalid = |message: &str| {
+        ErrorBody::new(ErrorCode::InvalidArgs, format!("exec.run: {message}")).with_hint(
+            "Give `argv`, such as [\"git\", \"status\"], to run a program exactly, or `cmd`, such as \"git status | head\", for the platform shell.",
+        )
+    };
+    match (cmd, argv) {
+        (Some(_), Some(_)) => Err(invalid("give `cmd` or `argv`, not both.")),
+        (None, None) => Err(invalid("give the command to run, as `cmd` or `argv`.")),
+        (Some(cmd), None) if cmd.trim().is_empty() => Err(invalid("`cmd` is empty.")),
+        (Some(cmd), None) => {
+            let program = cmd.split_whitespace().next().unwrap_or_default().to_owned();
+            Ok((CommandSpec::shell(cmd), program))
+        }
+        (None, Some(argv)) => match argv.first() {
+            None => Err(invalid("`argv` is empty.")),
+            Some(program) if program.is_empty() => {
+                Err(invalid("`argv` starts with an empty program name."))
+            }
+            Some(program) => {
+                let program = program.clone();
+                let spec =
+                    CommandSpec::from_argv(argv).map_err(|error| invalid(&format!("{error}.")))?;
+                Ok((spec, program))
+            }
+        },
+    }
+}
+
+fn timeout_of(seconds: Option<f64>) -> Result<Duration, ErrorBody> {
+    let seconds = seconds.unwrap_or(TIMEOUT_S.0);
+    if !(seconds > 0.0 && seconds <= TIMEOUT_S.1) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "exec.run: `timeout_s` must be more than 0 and at most {}, not {seconds}.",
+                TIMEOUT_S.1
+            ),
+        )
+        .with_hint("Anything that needs longer than an hour belongs to job.start."));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn max_output_of(bytes: Option<u64>) -> Result<usize, ErrorBody> {
+    let bytes = bytes.unwrap_or(MAX_OUTPUT.0);
+    if bytes > MAX_OUTPUT.1 {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "exec.run: `max_output` must be at most {} bytes, not {bytes}.",
+                MAX_OUTPUT.1
+            ),
+        )
+        .with_hint("Write long output to a file and read it with the fs tools."));
+    }
+    Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
+}
+
+fn env_of(env: BTreeMap<String, String>) -> Result<Vec<(OsString, OsString)>, ErrorBody> {
+    env.into_iter()
+        .map(|(name, value)| {
+            if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+                Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("exec.run: `env` cannot set {name:?}: a name is not empty and holds no `=`, and neither holds a NUL character."),
+                )
+                .with_details(json!({"field": format!("env.{name}")})))
+            } else {
+                Ok((OsString::from(name), OsString::from(value)))
+            }
+        })
+        .collect()
+}
+
+/// Why a command did not start, in the closed codes.
+fn run_error(error: OsError, program: &str, cwd: Option<&std::path::Path>) -> ErrorBody {
+    let cwd_text = || cwd.map_or_else(String::new, |cwd| cwd.display().to_string());
+    match error {
+        OsError::ProgramNotFound { program: missing } => ErrorBody::new(
+            ErrorCode::NotFound,
+            format!("There is no program called {missing} on this machine."),
+        )
+        .with_hint("Check the spelling, or give its full path; legion looks programs up on its own PATH, which over ssh is often shorter than a login shell's.")
+        .with_details(json!({"program": missing})),
+        OsError::NotFound { .. } => ErrorBody::new(
+            ErrorCode::NotFound,
+            format!("The directory {} does not exist, so the command was not run.", cwd_text()),
+        )
+        .with_hint("Give an existing directory as `cwd`."),
+        OsError::InvalidArgument { detail } if cwd.is_some() && detail.contains("directory") => {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("{} is not a directory, so the command cannot run in it.", cwd_text()),
+            )
+            .with_hint("Give a directory as `cwd`.")
+        }
+        OsError::PermissionDenied { detail, .. } => ErrorBody::new(
+            ErrorCode::Failed,
+            format!("The system refused to run {program}: {detail}."),
+        )
+        .with_hint("Check that it is executable and that the account legion runs as may run it."),
+        other => ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{program} could not be started: {other}."),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exactly_one_of_cmd_and_argv_is_taken() {
+        let code = |result: Result<(CommandSpec, String), ErrorBody>| result.map_err(|e| e.code);
+        assert_eq!(
+            code(command_of(None, None)).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            code(command_of(Some("x".into()), Some(vec!["x".into()]))).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            code(command_of(Some(" ".into()), None)).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            code(command_of(None, Some(vec![]))).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        assert_eq!(
+            code(command_of(None, Some(vec![String::new()]))).err(),
+            Some(ErrorCode::InvalidArgs)
+        );
+        let (spec, program) = command_of(None, Some(vec!["git".into(), "a b".into()])).unwrap();
+        assert_eq!(spec, CommandSpec::argv("git", ["a b"]));
+        assert_eq!(program, "git");
+        let (spec, program) = command_of(Some("git status | head".into()), None).unwrap();
+        assert_eq!(spec, CommandSpec::shell("git status | head"));
+        assert_eq!(program, "git");
+    }
+
+    #[test]
+    fn limits_are_checked() {
+        assert_eq!(timeout_of(None).unwrap(), Duration::from_secs(120));
+        assert_eq!(timeout_of(Some(0.5)).unwrap(), Duration::from_millis(500));
+        for wrong in [0.0, -1.0, 3600.5, f64::NAN, f64::INFINITY] {
+            assert!(timeout_of(Some(wrong)).is_err(), "{wrong}");
+        }
+        assert_eq!(max_output_of(None).unwrap(), 65536);
+        assert_eq!(max_output_of(Some(0)).unwrap(), 0);
+        assert!(max_output_of(Some(1024 * 1024 + 1)).is_err());
+        assert!(env_of(BTreeMap::from([("A=B".into(), "x".into())])).is_err());
+        assert!(env_of(BTreeMap::from([(String::new(), "x".into())])).is_err());
+        assert_eq!(
+            env_of(BTreeMap::from([("A".into(), "x=y".into())]))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_event_budget_is_shared_out_until_it_is_spent() {
+        let budget = AtomicUsize::new(10);
+        assert_eq!(take_budget(&budget, 4), 4);
+        assert_eq!(take_budget(&budget, 8), 6);
+        assert_eq!(take_budget(&budget, 1), 0);
+    }
+}
