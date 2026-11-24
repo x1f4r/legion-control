@@ -85,6 +85,10 @@ fn main() -> ExitCode {
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
             || Box::pin(test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time()),
         ),
+        (
+            "procid_kill_tree_stops_surviving_descendants_after_root_exits",
+            || Box::pin(test_procid_kill_tree_stops_surviving_descendants_after_root_exits()),
+        ),
         ("atomic_write_interrupted_leaves_no_partial_file", || {
             Box::pin(test_atomic_write_interrupted_leaves_no_partial_file())
         }),
@@ -171,6 +175,7 @@ fn run_helper(mode: &str) -> ExitCode {
         "detach_worker" => helper_detach_worker(&args),
         "lock_holder" => helper_lock_holder(&args),
         "count_sigterm" => helper_count_sigterm(),
+        "orphan_root_exit" => helper_orphan_root_exit(&args),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -466,6 +471,32 @@ fn helper_count_sigterm() -> ExitCode {
             }
         });
     }
+    ExitCode::SUCCESS
+}
+
+fn helper_orphan_root_exit(args: &[String]) -> ExitCode {
+    let root_id_file = Path::new(&args[0]);
+    let child_id_file = &args[1];
+
+    write_current_procid(root_id_file);
+
+    // Spawn a long-lived child and exit immediately while the child stays alive in our session
+    // (on Unix) or with our PID recorded as its parent_pid (on Windows).
+    #[allow(clippy::zombie_processes)]
+    let _child = Command::new(current_exe())
+        .env(HELPER_ENV, "sleep")
+        .args(["30000", child_id_file])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn surviving child");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(child_id_file).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
     ExitCode::SUCCESS
 }
 
@@ -945,6 +976,68 @@ async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time
     let _ = child.kill();
     let _ = child.wait();
     assert!(!procid::is_alive(&real_id));
+}
+
+async fn test_procid_kill_tree_stops_surviving_descendants_after_root_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_id_file = dir.path().join("orphan_root.pid");
+    let child_id_file = dir.path().join("orphan_child.pid");
+    let root_id_str = root_id_file.to_string_lossy().into_owned();
+    let child_id_str = child_id_file.to_string_lossy().into_owned();
+
+    #[cfg(unix)]
+    {
+        use process_wrap::std::{CommandWrap, ProcessSession};
+        let mut wrapped = CommandWrap::with_new(current_exe(), |cmd| {
+            cmd.env(HELPER_ENV, "orphan_root_exit")
+                .args([&root_id_str, &child_id_str])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        });
+        wrapped.wrap(ProcessSession);
+        let mut child = wrapped.spawn().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+    }
+    #[cfg(not(unix))]
+    {
+        let status = Command::new(current_exe())
+            .env(HELPER_ENV, "orphan_root_exit")
+            .args([&root_id_str, &child_id_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    let root_id = parse_procid(&wait_for_file(&root_id_file, Duration::from_secs(5)).await);
+    let child_id = parse_procid(&wait_for_file(&child_id_file, Duration::from_secs(5)).await);
+
+    // Confirm root is completely gone while its child is still running.
+    assert!(
+        !procid::is_alive(&root_id),
+        "root {root_id} should have exited before kill_tree"
+    );
+    assert!(
+        procid::is_alive(&child_id),
+        "child {child_id} should still be running after root exited"
+    );
+
+    let report = procid::kill_tree(&root_id, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(
+        report.all_gone,
+        "kill_tree left surviving descendants after root exit: {report:?}"
+    );
+    assert!(report.survivors.is_empty());
+    assert!(
+        !procid::is_alive(&child_id),
+        "surviving child {child_id} was not stopped by kill_tree after root exited"
+    );
 }
 
 async fn test_atomic_write_interrupted_leaves_no_partial_file() {

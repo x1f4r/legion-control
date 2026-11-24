@@ -179,13 +179,17 @@ fn parse_prefixed_u64(value: &str, prefix: &str) -> Option<u64> {
 
 /// Stop a process and all of its descendants when the root is not a direct child of this process.
 ///
-/// On Unix, signals both the target's process group (when the target leads its own group distinct
-/// from ours) and every discovered descendant with `SIGTERM`, waits up to `grace`, and escalates
-/// any survivors to `SIGKILL`. On Windows, opens each target and descendant handle with
-/// `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verifies its exact 100-ns `FILETIME`
-/// creation time while the held handle pins the PID, and calls `TerminateProcess` through that
-/// handle. Returns only once every tracked process has exited or the post-kill settle period
-/// elapses, reporting any survivors.
+/// Works even if the root process has already exited while descendants survive:
+/// - **Unix:** signals the target's isolated process group, any process still in the target's
+///   process group or session started at or after `identity.start_time`, and every discovered
+///   descendant with `SIGTERM`, waits up to `grace`, and escalates any survivors to `SIGKILL`.
+/// - **Windows:** walks the process tree starting from `identity.pid` (orphans retain their
+///   original `parent_pid`), verifies each candidate's `parent_pid` and 100-ns `FILETIME` creation
+///   time directly through an open handle (keeping handles pinned across bounded re-snapshot
+///   waves), and calls `TerminateProcess` through those handles.
+///
+/// Returns only once every tracked process has exited or the post-kill settle period elapses,
+/// reporting any survivors.
 pub async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     if identity.pid == 0 {
         return Err(OsError::InvalidArgument {

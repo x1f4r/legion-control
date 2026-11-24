@@ -36,23 +36,44 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::task::spawn_blocking(move || -> Result<Vec<ProcessId>> {
             let mut pinned: HashMap<u32, PinnedProcess> = HashMap::new();
             let mut root_pinned = false;
+            let mut root_live_unopened = false;
+            // Held open (never terminated) if `identity.pid` was already reused by a newer process
+            // so the PID stays pinned and direct orphan children of `identity` are upper-bounded
+            // by the recycled process's creation time.
+            let mut recycled_root_guard: Option<PinnedProcess> = None;
+            let mut direct_child_max_start: Option<u64> = None;
 
-            // Pin and verify the root first so its PID cannot be reused while we walk descendants.
             match win_proc::open_pinned(identity.pid, false) {
                 OpenPinnedOutcome::Pinned(root_proc) => {
-                    if !identity.matches(&root_proc.id) {
+                    if identity.matches(&root_proc.id) {
+                        let _ = root_proc.terminate();
+                        pinned.insert(root_proc.id.pid, root_proc);
+                        root_pinned = true;
+                    } else if root_proc.id.start_time > identity.start_time {
+                        // The original root exited and a newer process reused its PID. Orphans of
+                        // the original root still carry `parent_pid == identity.pid` with creation
+                        // times strictly earlier than the recycled process's creation time.
+                        direct_child_max_start = Some(root_proc.id.start_time);
+                        recycled_root_guard = Some(root_proc);
+                    } else {
+                        // The process currently holding `identity.pid` started before `identity`,
+                        // so `identity` cannot correspond to this PID or any orphan under it.
                         return Ok(Vec::new());
                     }
-                    let _ = root_proc.terminate();
-                    pinned.insert(root_proc.id.pid, root_proc);
-                    root_pinned = true;
                 }
-                OpenPinnedOutcome::Gone => return Ok(Vec::new()),
+                // Root exited and its PID is currently vacant; Windows orphans keep their original
+                // `parent_pid`, so keep walking from `(identity.pid, identity.start_time)`.
+                OpenPinnedOutcome::Gone => {}
                 OpenPinnedOutcome::AccessDenied | OpenPinnedOutcome::Failed => {
-                    // Could not open the root handle; check whether the exact root is still alive
-                    // so we can still attempt to discover its children and report it as a survivor.
-                    if !is_alive(&identity) {
-                        return Ok(Vec::new());
+                    match super::of_pid(identity.pid) {
+                        Ok(Some(observed)) if identity.matches(&observed) => {
+                            root_live_unopened = true;
+                        }
+                        Ok(Some(observed)) if observed.start_time > identity.start_time => {
+                            direct_child_max_start = Some(observed.start_time);
+                        }
+                        Ok(Some(_)) => return Ok(Vec::new()),
+                        Ok(None) | Err(_) => {}
                     }
                 }
             }
@@ -61,14 +82,32 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
             // keeping every previously opened handle alive so none of their PIDs can be reused
             // between passes.
             for pass in 0..MAX_WALK_PASSES {
-                let newly_found = discover_and_terminate_pass(&identity, own_pid, &mut pinned)?;
+                // If `identity.pid` was initially vacant and gets reused between passes, bound
+                // direct children by the new occupant's creation time without touching it.
+                if !root_pinned
+                    && direct_child_max_start.is_none()
+                    && let OpenPinnedOutcome::Pinned(occupant) =
+                        win_proc::open_pinned(identity.pid, false)
+                    && !identity.matches(&occupant.id)
+                {
+                    direct_child_max_start = Some(occupant.id.start_time);
+                    recycled_root_guard = Some(occupant);
+                }
+
+                let newly_found = discover_and_terminate_pass(
+                    &identity,
+                    direct_child_max_start,
+                    own_pid,
+                    &mut pinned,
+                )?;
                 if newly_found == 0 && (pass > 0 || !root_pinned) {
                     break;
                 }
             }
 
+            drop(recycled_root_guard);
             let mut tracked: Vec<ProcessId> = pinned.into_values().map(|p| p.id).collect();
-            if !root_pinned && !tracked.iter().any(|p| p.pid == identity.pid) {
+            if root_live_unopened && !tracked.iter().any(|p| p.pid == identity.pid) {
                 tracked.push(identity);
             }
             Ok(tracked)
@@ -129,6 +168,7 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
 /// pinned handles in `pinned` across passes.
 fn discover_and_terminate_pass(
     root: &ProcessId,
+    direct_child_max_start: Option<u64>,
     own_pid: u32,
     pinned: &mut HashMap<u32, PinnedProcess>,
 ) -> Result<usize> {
@@ -161,6 +201,11 @@ fn discover_and_terminate_pass(
         let Some(children) = children_by_parent.get(&parent.pid) else {
             continue;
         };
+        let max_start = if parent.pid == root.pid {
+            direct_child_max_start
+        } else {
+            None
+        };
         for &child_pid in children {
             if child_pid == own_pid || pinned.contains_key(&child_pid) {
                 continue;
@@ -172,9 +217,11 @@ fn discover_and_terminate_pass(
             match win_proc::open_pinned(child_pid, false) {
                 OpenPinnedOutcome::Pinned(child_proc) => {
                     // Validate parent_pid directly on the opened handle (not just the snapshot)
-                    // AND verify full 100-ns FILETIME parent-before-child ordering.
+                    // AND verify full 100-ns FILETIME parent-before-child ordering (plus the upper
+                    // bound when `root.pid` was recycled by a newer process).
                     if child_proc.parent_pid != parent.pid
                         || child_proc.id.start_time < parent.start_time
+                        || max_start.is_some_and(|limit| child_proc.id.start_time >= limit)
                     {
                         continue;
                     }

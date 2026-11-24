@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill, killpg};
-use nix::unistd::{Pid, getpgid, getpgrp};
+use nix::unistd::{Pid, getpgid, getpgrp, getsid};
 use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::{OsError, Result};
@@ -177,23 +177,55 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
     let identity = *identity;
     let own_pid = std::process::id();
 
-    // Run the initial liveness check, full-table descendant discovery, and SIGTERM wave off the
-    // async worker thread.
+    // Run the initial identity check, full-table descendant/session/group discovery, and SIGTERM
+    // wave off the async worker thread. Even if the root already exited, any surviving processes
+    // still in its session (`sid == root.pid`) or process group (`pgid == root.pid`) started at or
+    // after `root.start_time` are discovered and stopped.
     let (mut tracked, target_pgid) = tokio::task::spawn_blocking(move || {
-        if !is_alive(&identity) {
-            return (HashMap::new(), None);
-        }
+        let root_alive = match super::of_pid(identity.pid) {
+            Ok(Some(observed)) if identity.matches(&observed) => true,
+            // PID has already been recycled by a different process; per POSIX the kernel cannot
+            // reuse a PID while any process still has it as its pgid or sid, so nothing remains.
+            Ok(Some(_)) => return (HashMap::new(), None),
+            Ok(None) => false,
+            Err(_) => return (HashMap::new(), None),
+        };
 
         let own_pgid = getpgrp();
-        // Only signal the process group as a whole when the target leads its own group and that
-        // group is not ours; otherwise signaling the group would hit unrelated siblings or ourselves.
-        let target_pgid = getpgid(Some(root_nix_pid))
-            .ok()
-            .filter(|&pgid| pgid == root_nix_pid && pgid != own_pgid);
+        let own_sid = getsid(None).ok();
+        let allow_group = root_nix_pid != own_pgid;
+        let allow_session = Some(root_nix_pid) != own_sid;
 
         let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
-        tracked.insert(identity.pid, identity);
-        collect_tree_into(&identity, target_pgid, own_pid, &mut tracked);
+        if root_alive {
+            tracked.insert(identity.pid, identity);
+        }
+
+        let found_in_group = collect_tree_into(
+            &identity,
+            root_nix_pid,
+            allow_group,
+            allow_session,
+            own_pid,
+            &mut tracked,
+        );
+
+        // Only signal the process group as a whole when `root` led that distinct group (either
+        // observed live or confirmed via a surviving group member whose start_time >= root).
+        let target_pgid = if allow_group {
+            let live_leader = root_alive && getpgid(Some(root_nix_pid)).ok() == Some(root_nix_pid);
+            if live_leader || found_in_group {
+                Some(root_nix_pid)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if tracked.is_empty() && target_pgid.is_none() {
+            return (tracked, None);
+        }
 
         if let Some(pgid) = target_pgid
             && root_not_recycled(&identity)
@@ -208,7 +240,7 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         detail: format!("kill_tree worker task failed: {err}"),
     })?;
 
-    if tracked.is_empty() {
+    if tracked.is_empty() && target_pgid.is_none() {
         return Ok(KillTreeReport {
             all_gone: true,
             survivors: Vec::new(),
@@ -240,11 +272,20 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 
-    // Phase 2: one last descendant discovery pass to catch any child spawned during grace, then
-    // escalate all survivors to SIGKILL.
+    // Phase 2: one last descendant/session/group discovery pass to catch any child spawned during
+    // grace, then escalate all survivors to SIGKILL.
     tracked = tokio::task::spawn_blocking(move || {
         if root_not_recycled(&identity) {
-            collect_tree_into(&identity, target_pgid, own_pid, &mut tracked);
+            let own_pgid = getpgrp();
+            let own_sid = getsid(None).ok();
+            let _ = collect_tree_into(
+                &identity,
+                root_nix_pid,
+                root_nix_pid != own_pgid,
+                Some(root_nix_pid) != own_sid,
+                own_pid,
+                &mut tracked,
+            );
             if let Some(pgid) = target_pgid {
                 let _ = killpg(pgid, Signal::SIGKILL);
             }
@@ -336,19 +377,28 @@ fn signal_tracked(tracked: &HashMap<u32, ProcessId>, sig: Signal, own_pid: u32) 
     }
 }
 
+/// Discover descendants of `root` (and of any already-tracked members) as well as any live
+/// processes still belonging to `root`'s process group or session whose exact kernel start time
+/// is at least `root.start_time`. Returns `true` if at least one live member was found in
+/// process group `root_nix_pid`.
 fn collect_tree_into(
     root: &ProcessId,
-    target_pgid: Option<Pid>,
+    root_nix_pid: Pid,
+    allow_group: bool,
+    allow_session: bool,
     own_pid: u32,
     tracked: &mut HashMap<u32, ProcessId>,
-) {
+) -> bool {
     let Ok(mut system) = System::new() else {
-        return;
+        return false;
     };
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
     let mut children_by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
     let mut start_by_pid: HashMap<u32, u64> = HashMap::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut queue: VecDeque<(u32, u64)> = VecDeque::new();
+    let mut found_in_group = false;
 
     for (sys_pid, proc_info) in system.processes() {
         if matches!(
@@ -367,28 +417,45 @@ fn collect_tree_into(
                 .push((pid, started));
         }
 
-        // Also capture any process still in the target's isolated process group even if its
-        // direct parent exited and it was reparented to init.
-        if let Some(pgid) = target_pgid
-            && pid != own_pid
-            && let Ok(raw) = i32::try_from(pid)
-            && getpgid(Some(Pid::from_raw(raw))).ok() == Some(pgid)
-            && !tracked.contains_key(&pid)
+        if pid == own_pid || pid == root.pid {
+            continue;
+        }
+
+        // Capture any process still in `root`'s process group or session—even after `root` itself
+        // has exited and reparented its children to init—verified by `start_time >= root.start_time`.
+        let Ok(raw) = i32::try_from(pid) else {
+            continue;
+        };
+        let nix_p = Pid::from_raw(raw);
+        let in_group = allow_group && getpgid(Some(nix_p)).ok() == Some(root_nix_pid);
+        let in_session = allow_session && getsid(Some(nix_p)).ok() == Some(root_nix_pid);
+        if (in_group || in_session)
             && let Ok(Some(id)) = super::of_pid(pid)
+            && id.start_time >= root.start_time
         {
-            tracked.insert(pid, id);
+            if in_group {
+                found_in_group = true;
+            }
+            tracked.entry(pid).or_insert(id);
+            if visited.insert(pid) {
+                queue.push_back((pid, started));
+            }
         }
     }
 
-    if !is_alive(root) {
-        return;
+    if is_alive(root) && visited.insert(root.pid) {
+        let root_sys_start = start_by_pid.get(&root.pid).copied().unwrap_or(0);
+        queue.push_back((root.pid, root_sys_start));
     }
 
-    let mut visited: HashSet<u32> = HashSet::new();
-    let mut queue: VecDeque<(u32, u64)> = VecDeque::new();
-    let root_sys_start = start_by_pid.get(&root.pid).copied().unwrap_or(0);
-    visited.insert(root.pid);
-    queue.push_back((root.pid, root_sys_start));
+    // Also walk from any live already-tracked process so children spawned during grace are found
+    // even if the root itself exited earlier.
+    for (&pid, proc_id) in tracked.iter() {
+        if pid != own_pid && is_alive(proc_id) && visited.insert(pid) {
+            let sys_start = start_by_pid.get(&pid).copied().unwrap_or(0);
+            queue.push_back((pid, sys_start));
+        }
+    }
 
     while let Some((parent_pid, parent_start)) = queue.pop_front() {
         if let Some(children) = children_by_parent.get(&parent_pid) {
@@ -403,10 +470,15 @@ fn collect_tree_into(
                 if !tracked.contains_key(&child_pid)
                     && let Ok(Some(child_id)) = super::of_pid(child_pid)
                 {
+                    if child_id.start_time < root.start_time {
+                        continue;
+                    }
                     tracked.insert(child_pid, child_id);
                 }
                 queue.push_back((child_pid, child_start));
             }
         }
     }
+
+    found_in_group
 }
