@@ -199,12 +199,17 @@ PowerShell as sshd's shell), so a Linux node driving a Windows one, or any other
 covered. That run installs with the install script and covers `fleet.install`, routed calls with
 awkward arguments, file transfer, jobs started with an argument list and with a shell command that
 outlive their session, policy and both audit logs across the hop, a key forced to `legion gate`,
-services, MCP, and an extension tool; of power, only `power.status` and dry runs of
-`power.restart` and `power.shutdown`; it does not cover `via` relays or the HTTP door. By hand,
-Legion has run between real Linux and macOS machines, but the power tools only ever with
-`dry_run`: a real sleep, restart, shutdown, or wake of a physical machine and switching a
-dual-boot machine to its other system have never been tested, and neither has Legion between two
-separate Windows machines or user accounts.
+services, MCP, and an extension tool; it does not cover `via` relays or the HTTP door. Of power,
+that run schedules a real restart and a real shutdown on every leg, ten minutes out, calls each
+off with `power.cancel` and waits past the time to see the same boot: on Windows the operating
+system's own `shutdown /r /t` and `shutdown /a` (a second `shutdown /a` then finds nothing to
+abort), on macOS and Linux the delayed runner, started detached and stopped again; sleep only as
+`power.status`. By hand, Legion has run between real Linux and macOS machines, and its power tools
+have run for real on a disposable Linux virtual machine (a restart confirmed by boot id, sleep and
+resume, shutdown, a one-time firmware boot entry, the busy gate). An actual restart, shutdown,
+sleep or wake on Windows or macOS, and switching a dual-boot machine to its other system there,
+have never been tested, and neither has Legion between two separate Windows machines or user
+accounts.
 
 ## Documentation map
 

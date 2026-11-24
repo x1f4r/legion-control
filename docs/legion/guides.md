@@ -638,13 +638,13 @@ that `would_refuse` is absent:
      sudo = true`.
   2. Run one supervised `power.restart` and confirm `boot_id` changes in `power.status` when it
      returns.
-- **macOS** *(not run here; from code)*:
+- **macOS** *(a restart and a shutdown are scheduled and called off in CI; none has been carried out)*:
   1. `power.sleep` uses `pmset sleepnow` (no `sudo` required); `power.restart` and `power.shutdown`
      use `shutdown -r now` / `shutdown -h now` and need `[power] sudo = true` with `NOPASSWD`
      sudoers rules (or root).
   2. Verify `power.sleep dry_run=true` and `power.restart dry_run=true` have no `would_refuse`,
      then run one supervised sleep and one supervised restart.
-- **Windows** *(not run here; from code)*:
+- **Windows** *(a restart and a shutdown are scheduled and called off in CI; none has been carried out)*:
   1. `power.restart` and `power.shutdown` use `shutdown.exe /r /t <delay>` and `/s /t <delay>`, so
      Windows times the delay itself and `power.status` tracks `last.fate` across reboots.
   2. For `power.sleep`, place Sysinternals `psshutdown` on `PATH` (or set `[power] sleep` in
