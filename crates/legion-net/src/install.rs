@@ -31,7 +31,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{FleetFile, RemoteOs, Transport, validate_ssh_target};
+use crate::config::{FleetFile, RemoteOs, Transport, validate_program, validate_ssh_target};
 use crate::connector::ssh_args;
 use crate::pool::Fleet;
 
@@ -494,13 +494,168 @@ pub fn scp_remote_path(remote_os: RemoteOs, temp: &TempName) -> String {
     }
 }
 
-/// Fixed remote Unix command that marks `temp` executable and renames it atomically onto
-/// `$HOME/.local/bin/legion`.
-pub fn unix_finalize_command(temp: &TempName) -> String {
+fn is_explicit_program_path(program: &str) -> bool {
+    program.contains('/')
+        || program.contains('\\')
+        || program.contains(':')
+        || program.starts_with('~')
+}
+
+fn unix_dest_assignment(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok(
+            "p=$(command -v legion 2>/dev/null || true); d=\"${p:-$HOME/.local/bin/legion}\""
+                .to_owned(),
+        ),
+        Some(prog) => {
+            validate_program(prog).map_err(|reason| {
+                ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}."))
+                    .with_hint("Use a program path with no spaces or shell metacharacters.")
+            })?;
+            if let Some(rest) = prog.strip_prefix("~/") {
+                Ok(format!("d=\"$HOME/{rest}\""))
+            } else if is_explicit_program_path(prog) {
+                Ok(format!("d=\"{prog}\""))
+            } else {
+                Ok(format!(
+                    "p=$(command -v {prog} 2>/dev/null || true); d=\"${{p:-$HOME/.local/bin/{prog}}}\""
+                ))
+            }
+        }
+    }
+}
+
+fn windows_dest_assignment(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok("$c = Get-Command 'legion' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source; if ($c) { $dest = $c } else { $dest = Join-Path (Join-Path $env:LOCALAPPDATA 'legion') 'legion.exe' }".to_owned()),
+        Some(prog) => {
+            validate_program(prog).map_err(|reason| {
+                ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}."))
+                    .with_hint("Use a program path with no spaces or shell metacharacters.")
+            })?;
+            if is_explicit_program_path(prog) {
+                Ok(format!("$dest = '{prog}'"))
+            } else {
+                Ok(format!(
+                    "$c = Get-Command '{prog}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source; if ($c) {{ $dest = $c }} else {{ $dest = Join-Path (Join-Path $env:LOCALAPPDATA 'legion') '{prog}' }}"
+                ))
+            }
+        }
+    }
+}
+
+/// Fixed remote Unix command that resolves which `legion` path a session will execute (honoring
+/// `PATH` and any configured `program`) and checks whether that destination is writable.
+pub fn unix_resolve_dest_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    let assign = unix_dest_assignment(program)?;
+    Ok(format!(
+        "sh -c '{assign}; printf \"LEGION_DEST=%s\\n\" \"$d\"; \
+if [ -d \"$d\" ]; then printf \"LEGION_WRITABLE=dir\\n\"; exit 0; fi; \
+pdir=$(dirname \"$d\"); while [ ! -e \"$pdir\" ] && [ \"$pdir\" != \"/\" ] && [ \"$pdir\" != \".\" ]; do pdir=$(dirname \"$pdir\"); done; \
+if [ -w \"$pdir\" ] && ( [ ! -e \"$d\" ] || [ -w \"$d\" ] || [ -w \"$(dirname \"$d\")\" ] ); then printf \"LEGION_WRITABLE=yes\\n\"; else printf \"LEGION_WRITABLE=no\\n\"; fi'"
+    ))
+}
+
+/// Fixed remote Windows command that resolves which `legion` path a session will execute (honoring
+/// `PATH` and any configured `program`) and checks whether that destination is writable.
+pub fn windows_resolve_dest_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    let assign = windows_dest_assignment(program)?;
+    let script = format!(
+        "{assign}; Write-Output ('LEGION_DEST=' + $dest); \
+if (Test-Path -LiteralPath $dest -PathType Container) {{ Write-Output 'LEGION_WRITABLE=dir'; exit 0 }}; \
+$pdir = Split-Path -Parent $dest; \
+while ($pdir -and -not (Test-Path -LiteralPath $pdir)) {{ $next = Split-Path -Parent $pdir; if ($next -eq $pdir) {{ break }}; $pdir = $next }}; \
+$w = 'no'; \
+if ($pdir -and (Test-Path -LiteralPath $pdir -PathType Container)) {{ \
+  $probe = Join-Path $pdir ('.legion-probe-' + [Guid]::NewGuid().ToString('N')); \
+  try {{ [System.IO.File]::WriteAllBytes($probe, @()); Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue; $w = 'yes' }} catch {{ $w = 'no' }} \
+}}; \
+Write-Output ('LEGION_WRITABLE=' + $w)"
+    );
+    Ok(encode_powershell_command(&script))
+}
+
+/// Fixed remote Unix command to probe the currently installed version of `program` (or `legion`).
+pub fn unix_version_probe_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok(UNIX_VERSION_PROBE_COMMAND.to_owned()),
+        Some(prog) => {
+            validate_program(prog)
+                .map_err(|reason| ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}.")))?;
+            if let Some(rest) = prog.strip_prefix("~/") {
+                Ok(format!(
+                    "sh -c 'if [ -x \"$HOME/{rest}\" ]; then \"$HOME/{rest}\" --version; fi'"
+                ))
+            } else if is_explicit_program_path(prog) {
+                Ok(format!(
+                    "sh -c 'if [ -x \"{prog}\" ]; then \"{prog}\" --version; fi'"
+                ))
+            } else {
+                Ok(format!(
+                    "sh -c 'if command -v {prog} >/dev/null 2>&1; then {prog} --version; elif [ -x \"$HOME/.local/bin/{prog}\" ]; then \"$HOME/.local/bin/{prog}\" --version; fi'"
+                ))
+            }
+        }
+    }
+}
+
+/// Fixed remote Windows command to probe the currently installed version of `program` (or `legion`).
+pub fn windows_version_probe_command(program: Option<&str>) -> Result<String, ErrorBody> {
+    match program {
+        None => Ok(WINDOWS_VERSION_PROBE_COMMAND.to_owned()),
+        Some(prog) => {
+            validate_program(prog)
+                .map_err(|reason| ErrorBody::new(ErrorCode::InvalidArgs, format!("{reason}.")))?;
+            Ok(format!("{prog} --version"))
+        }
+    }
+}
+
+/// Resolved remote destination path and writability returned by the remote destination probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedDestination {
+    /// Concrete path on the remote machine that a session will execute.
+    pub path: String,
+    /// Whether the destination directory is writable by the SSH account.
+    pub writable: bool,
+    /// Whether the destination path currently names a directory instead of a file.
+    pub is_dir: bool,
+}
+
+/// Parses the output of [`unix_resolve_dest_command`] or [`windows_resolve_dest_command`].
+pub fn parse_remote_dest_probe(output: &str) -> Option<ResolvedDestination> {
+    let mut path = None;
+    let mut writable = None;
+    for line in output.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("LEGION_DEST=")
+            && !rest.is_empty()
+        {
+            path = Some(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix("LEGION_WRITABLE=") {
+            writable = Some(rest.to_owned());
+        }
+    }
+    let path = path?;
+    let w = writable.as_deref().unwrap_or("yes");
+    Some(ResolvedDestination {
+        path,
+        writable: w == "yes",
+        is_dir: w == "dir",
+    })
+}
+
+/// Fixed remote Unix command that marks `temp` executable and renames it atomically onto the
+/// resolved destination (`command -v legion`, `$HOME/.local/bin/legion`, or configured `program`).
+pub fn unix_finalize_command(temp: &TempName, program: Option<&str>) -> Result<String, ErrorBody> {
     let name = temp.as_str();
-    format!(
-        "sh -c 'chmod 0755 \"$HOME/.local/bin/{name}\" && mv -f \"$HOME/.local/bin/{name}\" \"$HOME/.local/bin/legion\"'"
-    )
+    let assign = unix_dest_assignment(program)?;
+    Ok(format!(
+        "sh -c 'set -eu; {assign}; ddir=$(dirname \"$d\"); mkdir -p \"$ddir\" 2>/dev/null || true; \
+if [ ! -w \"$ddir\" ]; then printf \"LEGION_DENIED:%s\\n\" \"$d\" >&2; exit 13; fi; \
+src=\"$HOME/.local/bin/{name}\"; staged=\"$ddir/{name}\"; \
+if [ \"$src\" != \"$staged\" ]; then cp \"$src\" \"$staged\" && rm -f \"$src\"; fi; \
+chmod 0755 \"$staged\" && mv -f \"$staged\" \"$d\"'"
+    ))
 }
 
 /// Fixed remote Unix command that removes a staged temp file after a failed install.
@@ -509,15 +664,20 @@ pub fn unix_cleanup_command(temp: &TempName) -> String {
     format!("sh -c 'rm -f \"$HOME/.local/bin/{name}\"'")
 }
 
-/// Fixed remote Windows command that moves `temp` into `%LOCALAPPDATA%\legion\legion.exe`
-/// (renaming any running previous binary aside first and rolling back on error) and ensures
-/// `%LOCALAPPDATA%\legion` is on the user's `PATH` without duplicates.
-pub fn windows_finalize_command(temp: &TempName) -> String {
+/// Fixed remote Windows command that moves `temp` into the resolved destination (default
+/// `%LOCALAPPDATA%\legion\legion.exe`, existing `legion` on PATH, or configured `program`),
+/// renaming any running previous binary aside first and rolling back on error, and ensures the
+/// destination directory is on the user's `PATH` without duplicates.
+pub fn windows_finalize_command(
+    temp: &TempName,
+    program: Option<&str>,
+) -> Result<String, ErrorBody> {
     let name = temp.as_str();
+    let assign = windows_dest_assignment(program)?;
     let script = format!(
         "$ErrorActionPreference = 'Stop'; \
-$dir = Join-Path $env:LOCALAPPDATA 'legion'; \
-$dest = Join-Path $dir 'legion.exe'; \
+{assign}; \
+$dir = Split-Path -Parent $dest; \
 $src = Join-Path (Join-Path $env:USERPROFILE 'AppData\\Local\\legion') '{name}'; \
 New-Item -ItemType Directory -Path $dir -Force | Out-Null; \
 if (Test-Path -LiteralPath $dest) {{ \
@@ -536,7 +696,7 @@ $found = $false; \
 foreach ($e in $entries) {{ if ($e.Trim().TrimEnd('\\').Equals($norm, [System.StringComparison]::OrdinalIgnoreCase)) {{ $found = $true; break }} }}; \
 if (-not $found) {{ [Environment]::SetEnvironmentVariable('Path', (($entries + @($dir)) -join ';'), 'User') }}"
     );
-    encode_powershell_command(&script)
+    Ok(encode_powershell_command(&script))
 }
 
 /// Fixed remote Windows command that removes a staged temp file after a failed install.
@@ -792,11 +952,15 @@ async fn run_fleet_install_with_key(
         .with_machine(args.machine.clone()));
     }
 
-    let ssh_systems: Vec<(String, Option<RemoteOs>)> = entry
+    let ssh_systems: Vec<(String, Option<String>, Option<RemoteOs>)> = entry
         .resolved_systems()
         .into_iter()
         .filter_map(|sys| match sys.transport {
-            Transport::Ssh { target, os, .. } => Some((target, os)),
+            Transport::Ssh {
+                target,
+                program,
+                os,
+            } => Some((target, program, os)),
             Transport::Command { .. } => None,
         })
         .collect();
@@ -815,16 +979,29 @@ async fn run_fleet_install_with_key(
         .with_machine(args.machine.clone()));
     }
 
-    let (ssh_target, platform) =
+    let (ssh_target, program, platform) =
         detect_active_system(&args.machine, &ssh_systems, backend, cancel.clone()).await?;
 
-    let previous_version =
-        probe_previous_version(&ssh_target, platform.remote_os, backend, cancel.clone()).await;
+    let resolved_dest = resolve_remote_destination(
+        &args.machine,
+        &ssh_target,
+        platform.remote_os,
+        program.as_deref(),
+        backend,
+        cancel.clone(),
+    )
+    .await?;
 
-    let remote_display_path = match platform.remote_os {
-        RemoteOs::Unix => "~/.local/bin/legion".to_owned(),
-        RemoteOs::Windows => r"%LOCALAPPDATA%\legion\legion.exe".to_owned(),
-    };
+    let remote_display_path = resolved_dest.path.clone();
+
+    let previous_version = probe_previous_version(
+        &ssh_target,
+        platform.remote_os,
+        program.as_deref(),
+        backend,
+        cancel.clone(),
+    )
+    .await;
 
     let floor_path = machine_floor_path(paths, &args.machine);
     let previous_semver = previous_version
@@ -872,8 +1049,8 @@ async fn run_fleet_install_with_key(
         });
     }
 
-    let local_binary = match &args.from {
-        Some(from_raw) => resolve_local_binary(paths, from_raw)?,
+    let (local_binary, expected_version) = match &args.from {
+        Some(from_raw) => (resolve_local_binary(paths, from_raw)?, None),
         None => {
             let version = match &args.version {
                 Some(raw) => normalize_version(raw)?,
@@ -888,7 +1065,7 @@ async fn run_fleet_install_with_key(
             )
             .map_err(|err| err.with_machine(args.machine.clone()))?;
             let fetcher = BackendFetcher(backend);
-            resolve_release_binary_with_key(
+            let bin = resolve_release_binary_with_key(
                 paths,
                 &fetcher,
                 &version,
@@ -896,9 +1073,35 @@ async fn run_fleet_install_with_key(
                 public_key,
                 cancel.clone(),
             )
-            .await?
+            .await?;
+            (bin, Some(version))
         }
     };
+
+    if resolved_dest.is_dir {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Cannot install legion on {}: destination {} is a directory.",
+                args.machine, resolved_dest.path
+            ),
+        )
+        .with_hint("Move or remove that directory, or set `program` in fleet.toml to a file path.")
+        .with_machine(args.machine.clone()));
+    }
+    if !resolved_dest.writable {
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Cannot install legion on {}: resolved destination {} is not writable by the SSH account.",
+                args.machine, resolved_dest.path
+            ),
+        )
+        .with_hint(
+            "Make that path writable, remove the older shadowing binary from PATH so ~/.local/bin/legion is used, or set `program` in fleet.toml.",
+        )
+        .with_machine(args.machine.clone()));
+    }
 
     let prepare_cmd = match platform.remote_os {
         RemoteOs::Unix => UNIX_PREPARE_DIR_COMMAND.to_owned(),
@@ -936,8 +1139,8 @@ async fn run_fleet_install_with_key(
         .map_err(|err| err.with_machine(args.machine.clone()))?;
 
     let finalize_cmd = match platform.remote_os {
-        RemoteOs::Unix => unix_finalize_command(&temp_name),
-        RemoteOs::Windows => windows_finalize_command(&temp_name),
+        RemoteOs::Unix => unix_finalize_command(&temp_name, program.as_deref())?,
+        RemoteOs::Windows => windows_finalize_command(&temp_name, program.as_deref())?,
     };
     let finalized = backend
         .ssh_exec(&ssh_target, &finalize_cmd, SSH_CMD_TIMEOUT, cancel.clone())
@@ -945,16 +1148,36 @@ async fn run_fleet_install_with_key(
 
     let finalize_ok = match finalized {
         Ok(out) if out.success => Ok(()),
-        Ok(out) => Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "Could not move the staged legion binary into place on {}: {}",
-                args.machine,
-                first_diagnostic(&out)
-            ),
-        )
-        .with_hint("Check permissions on the remote install directory; any previous installation was left untouched.")
-        .with_machine(args.machine.clone())),
+        Ok(out) => {
+            if let Some(denied_path) = out
+                .stderr
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("LEGION_DENIED:"))
+            {
+                Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Cannot install legion on {}: destination {} is not writable by the SSH account.",
+                        args.machine, denied_path
+                    ),
+                )
+                .with_hint(
+                    "Make that path writable, remove the shadowing binary from PATH, or set `program` in fleet.toml.",
+                )
+                .with_machine(args.machine.clone()))
+            } else {
+                Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Could not move the staged legion binary into place on {}: {}",
+                        args.machine,
+                        first_diagnostic(&out)
+                    ),
+                )
+                .with_hint("Check permissions on the remote install directory; any previous installation was left untouched.")
+                .with_machine(args.machine.clone()))
+            }
+        }
         Err(err) => Err(err.with_machine(args.machine.clone())),
     };
 
@@ -986,10 +1209,26 @@ async fn run_fleet_install_with_key(
                 ),
             )
             .with_hint(
-                "Verify that the binary architecture matches the target machine and that `~/.local/bin` (Unix) or `%LOCALAPPDATA%\\legion` (Windows) is executable.",
+                "Verify that the binary architecture matches the target machine and that the resolved install path is executable.",
             )
             .with_machine(args.machine.clone())
         })?;
+
+    if let Some(expected) = &expected_version
+        && !versions_match(&installed_version, expected)
+    {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Installed legion {expected} to {} on {}, but a new session still answered with version {installed_version}.",
+                remote_display_path, args.machine
+            ),
+        )
+        .with_hint(
+            "Another legion binary earlier on the remote PATH may be shadowing the installed copy; check `command -v legion` or set `program` in fleet.toml.",
+        )
+        .with_machine(args.machine.clone()));
+    }
 
     if let Ok(installed_semver) = SemVer::parse(&installed_version) {
         commit_floor(&floor_path, &installed_semver, args.allow_downgrade)?;
@@ -1008,16 +1247,58 @@ async fn run_fleet_install_with_key(
     })
 }
 
-async fn detect_active_system(
+fn versions_match(actual: &str, expected: &str) -> bool {
+    match (SemVer::parse(actual), SemVer::parse(expected)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => actual.trim() == expected.trim(),
+    }
+}
+
+async fn resolve_remote_destination(
     machine: &str,
-    ssh_systems: &[(String, Option<RemoteOs>)],
+    ssh_target: &str,
+    remote_os: RemoteOs,
+    program: Option<&str>,
     backend: &dyn InstallBackend,
     cancel: CancellationToken,
-) -> Result<(String, DetectedPlatform), ErrorBody> {
+) -> Result<ResolvedDestination, ErrorBody> {
+    let cmd = match remote_os {
+        RemoteOs::Unix => unix_resolve_dest_command(program)?,
+        RemoteOs::Windows => windows_resolve_dest_command(program)?,
+    };
+    let output = backend
+        .ssh_exec(ssh_target, &cmd, SSH_CMD_TIMEOUT, cancel)
+        .await
+        .map_err(|err| err.with_machine(machine.to_owned()))?;
+    if output.success
+        && let Some(resolved) = parse_remote_dest_probe(&output.stdout)
+    {
+        return Ok(resolved);
+    }
+    let fallback = match (remote_os, program) {
+        (RemoteOs::Unix, Some(prog)) if is_explicit_program_path(prog) => prog.to_owned(),
+        (RemoteOs::Unix, Some(prog)) => format!("~/.local/bin/{prog}"),
+        (RemoteOs::Unix, None) => "~/.local/bin/legion".to_owned(),
+        (RemoteOs::Windows, Some(prog)) => prog.to_owned(),
+        (RemoteOs::Windows, None) => r"%LOCALAPPDATA%\legion\legion.exe".to_owned(),
+    };
+    Ok(ResolvedDestination {
+        path: fallback,
+        writable: true,
+        is_dir: false,
+    })
+}
+
+async fn detect_active_system(
+    machine: &str,
+    ssh_systems: &[(String, Option<String>, Option<RemoteOs>)],
+    backend: &dyn InstallBackend,
+    cancel: CancellationToken,
+) -> Result<(String, Option<String>, DetectedPlatform), ErrorBody> {
     let mut last_error: Option<ErrorBody> = None;
-    for (ssh_target, os_hint) in ssh_systems {
+    for (ssh_target, program, os_hint) in ssh_systems {
         match probe_remote_platform(ssh_target, *os_hint, backend, cancel.clone()).await {
-            Ok(platform) => return Ok((ssh_target.clone(), platform)),
+            Ok(platform) => return Ok((ssh_target.clone(), program.clone(), platform)),
             Err(err) => {
                 // Unsupported architecture/OS errors came from a live host: stop immediately
                 // rather than masking the clear refusal behind another system's connection failure.
@@ -1105,15 +1386,16 @@ async fn probe_remote_platform(
 async fn probe_previous_version(
     ssh_target: &str,
     remote_os: RemoteOs,
+    program: Option<&str>,
     backend: &dyn InstallBackend,
     cancel: CancellationToken,
 ) -> Option<String> {
     let cmd = match remote_os {
-        RemoteOs::Unix => UNIX_VERSION_PROBE_COMMAND,
-        RemoteOs::Windows => WINDOWS_VERSION_PROBE_COMMAND,
+        RemoteOs::Unix => unix_version_probe_command(program).ok()?,
+        RemoteOs::Windows => windows_version_probe_command(program).ok()?,
     };
     let output = backend
-        .ssh_exec(ssh_target, cmd, SSH_CMD_TIMEOUT, cancel)
+        .ssh_exec(ssh_target, &cmd, SSH_CMD_TIMEOUT, cancel)
         .await
         .ok()?;
     if !output.success {
@@ -1327,7 +1609,8 @@ mod tests {
             UNIX_PROBE_COMMAND.to_owned(),
             UNIX_PREPARE_DIR_COMMAND.to_owned(),
             UNIX_VERSION_PROBE_COMMAND.to_owned(),
-            unix_finalize_command(&temp_unix),
+            unix_resolve_dest_command(None).unwrap(),
+            unix_finalize_command(&temp_unix, None).unwrap(),
             unix_cleanup_command(&temp_unix),
         ];
         for cmd in &unix_cmds {
@@ -1335,9 +1618,10 @@ mod tests {
             assert!(!cmd.contains("0.9.9"));
             assert!(!cmd.contains("/home/me"));
         }
-        assert!(unix_finalize_command(&temp_unix).contains(".legion-install-0123456789abcdef"));
-        assert!(unix_finalize_command(&temp_unix).contains("chmod 0755"));
-        assert!(unix_finalize_command(&temp_unix).contains("mv -f"));
+        let unix_fin = unix_finalize_command(&temp_unix, None).unwrap();
+        assert!(unix_fin.contains(".legion-install-0123456789abcdef"));
+        assert!(unix_fin.contains("chmod 0755"));
+        assert!(unix_fin.contains("mv -f"));
 
         // Windows commands are encoded PowerShell containing only fixed code and the generated temp name.
         let win_probe = decode_powershell_command(&windows_probe_command());
@@ -1347,7 +1631,8 @@ mod tests {
         let win_prep = decode_powershell_command(&windows_prepare_dir_command());
         assert!(win_prep.contains("LOCALAPPDATA"));
 
-        let win_fin = decode_powershell_command(&windows_finalize_command(&temp_win));
+        let win_fin =
+            decode_powershell_command(&windows_finalize_command(&temp_win, None).unwrap());
         assert!(win_fin.contains(".legion-install-fedcba9876543210.exe"));
         assert!(win_fin.contains("legion.exe.old."));
         assert!(win_fin.contains("SetEnvironmentVariable('Path'"));
@@ -1361,6 +1646,7 @@ mod tests {
         files: HashMap<String, Vec<u8>>,
         uname_output: Option<RemoteCommandOutput>,
         ps_probe_output: Option<RemoteCommandOutput>,
+        dest_probe_output: Option<RemoteCommandOutput>,
         previous_version_output: Option<String>,
         session_version_after_install: String,
         fail_finalize: bool,
@@ -1381,6 +1667,11 @@ mod tests {
                     stderr: String::new(),
                 }),
                 ps_probe_output: None,
+                dest_probe_output: Some(RemoteCommandOutput {
+                    success: true,
+                    stdout: "LEGION_DEST=~/.local/bin/legion\nLEGION_WRITABLE=yes\n".to_owned(),
+                    stderr: String::new(),
+                }),
                 previous_version_output: previous.map(|v| format!("legion {v}\n")),
                 session_version_after_install: session_after.to_owned(),
                 fail_finalize: false,
@@ -1403,6 +1694,13 @@ mod tests {
                 ps_probe_output: Some(RemoteCommandOutput {
                     success: true,
                     stdout: "LEGION_OS=windows X64\r\n".to_owned(),
+                    stderr: String::new(),
+                }),
+                dest_probe_output: Some(RemoteCommandOutput {
+                    success: true,
+                    stdout:
+                        "LEGION_DEST=%LOCALAPPDATA%\\legion\\legion.exe\r\nLEGION_WRITABLE=yes\r\n"
+                            .to_owned(),
                     stderr: String::new(),
                 }),
                 previous_version_output: previous.map(|v| format!("legion {v}\r\n")),
@@ -1490,9 +1788,20 @@ mod tests {
                         stderr: "powershell not found".to_owned(),
                     }));
                 }
-                if remote_cmd == UNIX_VERSION_PROBE_COMMAND
-                    || remote_cmd == WINDOWS_VERSION_PROBE_COMMAND
+                if remote_cmd.contains("LEGION_DEST=")
+                    || (remote_cmd.contains("-EncodedCommand")
+                        && decode_powershell_command(remote_cmd).contains("LEGION_DEST="))
                 {
+                    return Ok(self
+                        .dest_probe_output
+                        .clone()
+                        .unwrap_or(RemoteCommandOutput {
+                            success: false,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        }));
+                }
+                if remote_cmd.contains("--version") {
                     return Ok(match &self.previous_version_output {
                         Some(out) => RemoteCommandOutput {
                             success: true,
@@ -1965,5 +2274,136 @@ via = "tower"
         .await
         .unwrap();
         assert_eq!(ok.installed_version, "0.2.0");
+    }
+
+    #[tokio::test]
+    async fn resolves_path_destination_honors_program_denies_unwritable_and_checks_answering_version()
+     {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = parse::<FleetFile>(
+            Path::new("fleet.toml"),
+            br#"
+[machines.tower]
+ssh = "tower"
+
+[machines.custom]
+ssh = "custom-host"
+program = "/opt/legion/legion"
+"#,
+        )
+        .unwrap();
+        let signing = SigningKey::from_bytes(&[0x35; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+
+        // 1. Unwritable resolved PATH destination fails with Denied naming that path.
+        let mut unwritable = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.2.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                b"legion-0.2.0",
+                Some(&signing),
+            );
+        unwritable.dest_probe_output = Some(RemoteCommandOutput {
+            success: true,
+            stdout: "LEGION_DEST=/usr/local/bin/legion\nLEGION_WRITABLE=no\n".to_owned(),
+            stderr: String::new(),
+        });
+        let denied = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &unwritable,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Denied);
+        assert!(
+            denied.message.contains("/usr/local/bin/legion"),
+            "{}",
+            denied.message
+        );
+        assert!(unwritable.scp_log.lock().unwrap().is_empty());
+
+        // 2. Configured `program` is honored in remote probe, version check, and finalize commands.
+        let mut custom = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.2.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                b"legion-0.2.0",
+                Some(&signing),
+            );
+        custom.dest_probe_output = Some(RemoteCommandOutput {
+            success: true,
+            stdout: "LEGION_DEST=/opt/legion/legion\nLEGION_WRITABLE=yes\n".to_owned(),
+            stderr: String::new(),
+        });
+        let custom_res = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &custom,
+            &pubkey,
+            InstallArgs {
+                machine: "custom".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(custom_res.path, "/opt/legion/legion");
+        assert!(
+            custom
+                .ssh_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, cmd)| cmd.contains("/opt/legion/legion") && cmd.contains("mv -f"))
+        );
+
+        // 3. If a session still answers with the old version after install, fail clearly.
+        let mismatched = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.1.0")
+            .with_release(
+                "0.2.0",
+                "x86_64-unknown-linux-musl",
+                b"legion-0.2.0",
+                Some(&signing),
+            );
+        let mismatch_err = run_fleet_install_with_key(
+            &paths,
+            &fleet,
+            "laptop",
+            &mismatched,
+            &pubkey,
+            InstallArgs {
+                machine: "tower".to_owned(),
+                version: Some("0.2.0".to_owned()),
+                from: None,
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatch_err.code, ErrorCode::Failed);
+        assert!(
+            mismatch_err.message.contains("0.1.0") && mismatch_err.message.contains("0.2.0"),
+            "{}",
+            mismatch_err.message
+        );
     }
 }
