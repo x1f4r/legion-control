@@ -25,6 +25,60 @@ use crate::session::{CallError, Session};
 /// Default idle duration after which unused sessions are closed (matches `legion serve`).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// Default duration to remember that a learned node has not received this device yet (falling back
+/// to a relay without retrying direct SSH auth on every call).
+pub const DEFAULT_UNSYNCED_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// How a routed [`Link::call_machine`] call reached its target machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Route {
+    /// Connected directly to the target machine.
+    Direct,
+    /// Relayed through another trusted node (`on: <machine>`).
+    Relay {
+        /// Name of the node that relayed the call.
+        via: String,
+    },
+}
+
+/// Outcome of a routed call on [`Link`], pairing the JSON tool result with the [`Route`] taken.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoutedValue {
+    /// Tool result JSON returned by the target machine.
+    pub value: Value,
+    /// Route taken to reach the target machine.
+    pub route: Route,
+}
+
+/// Observed runtime reachability status for a machine known to [`Link`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MachineRouteStatus {
+    /// Reached directly (or configured for direct connection with no refusal observed).
+    Direct,
+    /// Currently reached by relaying through `via`.
+    Relay {
+        /// Relay node name.
+        via: String,
+    },
+    /// Learned entry exists, but direct SSH auth was refused (`device_removed_or_unknown`): the
+    /// introducer has not yet passed this device on to it.
+    NotSyncedYet {
+        /// Trusted node that introduced this machine, if known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        introducer: Option<String>,
+        /// Relay node currently used to reach this machine, if one answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
+    },
+    /// A trusted node reported different host keys than the ones pinned for this machine.
+    IdentityChanged {
+        /// Trusted node that reported the changed host keys.
+        reported_by: String,
+    },
+}
+
 /// Serializable configuration for [`Link`]: paired or local nodes plus the device's OpenSSH
 /// private key string. The caller persists this JSON document in app storage.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +267,9 @@ pub struct LinkOptions {
     pub idle_timeout: Duration,
     /// Connect, handshake, and keepalive timeouts (used by SSH and local pipes alike).
     pub ssh_timeouts: SshTimeouts,
+    /// How long to remember a learned node whose direct auth failed with
+    /// `device_removed_or_unknown` before trying direct SSH again.
+    pub unsynced_backoff: Duration,
 }
 
 impl Default for LinkOptions {
@@ -220,6 +277,7 @@ impl Default for LinkOptions {
         LinkOptions {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             ssh_timeouts: SshTimeouts::default(),
+            unsynced_backoff: DEFAULT_UNSYNCED_BACKOFF,
         }
     }
 }
@@ -255,6 +313,11 @@ struct LinkInner {
     /// `close_idle` once no caller holds a reference or in-flight call, or closed by `forget`.
     retired: Mutex<Vec<LiveSession>>,
     active_calls: Mutex<HashMap<String, CancellationToken>>,
+    /// Learned nodes that rejected our device key with `device_removed_or_unknown`; bypassed in
+    /// favour of a relay until the recorded deadline.
+    unsynced_until: Mutex<HashMap<String, Instant>>,
+    /// Last observed runtime route status per machine.
+    routes: Mutex<HashMap<String, MachineRouteStatus>>,
     reaper_started: AtomicBool,
 }
 
@@ -356,6 +419,8 @@ impl Link {
                 slots: Mutex::new(HashMap::new()),
                 retired: Mutex::new(Vec::new()),
                 active_calls: Mutex::new(HashMap::new()),
+                unsynced_until: Mutex::new(HashMap::new()),
+                routes: Mutex::new(HashMap::new()),
                 reaper_started: AtomicBool::new(false),
             }),
         }
@@ -460,6 +525,7 @@ impl Link {
 
         // Retire any cached session for this node so the next call opens cleanly with the fresh
         // enrolment (while leaving any in-flight call untouched until it completes).
+        self.clear_route_state(&enrolled.node);
         self.retire_node(&enrolled.node);
         Ok(enrolled)
     }
@@ -512,6 +578,7 @@ impl Link {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove_node(node);
+        self.clear_route_state(node);
         self.evict(node).await;
         removed
     }
@@ -814,6 +881,722 @@ impl Link {
         })
     }
 
+    /// Calls `tool` on `machine` using direct-first routing with relay fallback:
+    ///
+    /// - Connects directly to `machine` when this [`Link`] has an entry for it (unless it is a
+    ///   learned entry currently backed off as not-yet-synced) and it answers.
+    /// - Otherwise relays through another answering node with `on: <machine>`.
+    /// - Failover occurs strictly when the previous attempt provably never sent the request
+    ///   (`details.sent == false`).
+    /// - A direct `device_removed_or_unknown` refusal on a learned entry falls back to a relay and
+    ///   is remembered for [`LinkOptions::unsynced_backoff`]; if every machine including the paired
+    ///   one refuses with `device_removed_or_unknown` (or no relay answers), that refusal is
+    ///   returned.
+    pub async fn call_machine(
+        &self,
+        machine: &str,
+        tool: &str,
+        arguments: Value,
+        events: impl FnMut(Value),
+    ) -> Result<RoutedValue, ErrorBody> {
+        self.call_machine_inner(None, machine, tool, arguments, events)
+            .await
+    }
+
+    /// Like [`Link::call_machine`], registering the routed call under `call_id` so [`Link::cancel`]
+    /// cancels whichever direct or relay attempt is running.
+    pub async fn call_machine_with_id(
+        &self,
+        call_id: impl Into<String>,
+        machine: &str,
+        tool: &str,
+        arguments: Value,
+        events: impl FnMut(Value),
+    ) -> Result<RoutedValue, ErrorBody> {
+        self.call_machine_inner(Some(call_id.into()), machine, tool, arguments, events)
+            .await
+    }
+
+    /// Lists tools offered by `machine`, going direct when possible and relaying through another
+    /// answering node otherwise (obeying the same `details.sent == false` failover rules as
+    /// [`Link::call_machine`]).
+    pub async fn tools_machine(&self, machine: &str) -> Result<RoutedValue, ErrorBody> {
+        self.ensure_reaper();
+        let entry = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .node(machine)
+            .cloned();
+
+        if let Some(ref e) = entry
+            && e.local_program.is_some()
+            && e.target.is_none()
+        {
+            let value = self.tools(machine, None).await?;
+            self.record_route(machine, MachineRouteStatus::Direct);
+            return Ok(RoutedValue {
+                value,
+                route: Route::Direct,
+            });
+        }
+
+        let entry_is_learned = entry
+            .as_ref()
+            .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
+        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+
+        let mut direct_err: Option<ErrorBody> = None;
+        let mut learned_auth_err: Option<ErrorBody> = None;
+
+        if entry.is_some() && !in_unsynced_backoff {
+            match self.tools(machine, None).await {
+                Ok(value) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(RoutedValue {
+                        value,
+                        route: Route::Direct,
+                    });
+                }
+                Err(err) => {
+                    if !is_unsent(&err) {
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        if entry_is_learned {
+                            self.mark_unsynced(machine);
+                            learned_auth_err = Some(err);
+                        } else {
+                            return Err(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        direct_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
+        let mut last_relay_err: Option<ErrorBody> = None;
+        let mut relay_auth_err: Option<ErrorBody> = None;
+
+        for relay in relays {
+            match self
+                .tools(&relay, Some(Value::String(machine.to_owned())))
+                .await
+            {
+                Ok(value) => {
+                    let status = if in_unsynced_backoff || learned_auth_err.is_some() {
+                        MachineRouteStatus::NotSyncedYet {
+                            introducer: entry_learned_from.clone(),
+                            via: Some(relay.clone()),
+                        }
+                    } else {
+                        MachineRouteStatus::Relay { via: relay.clone() }
+                    };
+                    self.record_route(machine, status);
+                    return Ok(RoutedValue {
+                        value,
+                        route: Route::Relay { via: relay },
+                    });
+                }
+                Err(err) => {
+                    if !is_unsent(&err) {
+                        if in_unsynced_backoff || learned_auth_err.is_some() {
+                            self.record_route(
+                                machine,
+                                MachineRouteStatus::NotSyncedYet {
+                                    introducer: entry_learned_from.clone(),
+                                    via: None,
+                                },
+                            );
+                        }
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        last_relay_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        if in_unsynced_backoff {
+            match self.tools(machine, None).await {
+                Ok(value) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(RoutedValue {
+                        value,
+                        route: Route::Direct,
+                    });
+                }
+                Err(err) => {
+                    if is_device_removed_or_unknown(&err) {
+                        self.clear_unsynced(machine);
+                        return Err(err);
+                    }
+                    if direct_err.is_none() {
+                        direct_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(auth_err) = relay_auth_err.or(learned_auth_err) {
+            self.clear_unsynced(machine);
+            return Err(auth_err);
+        }
+
+        Err(direct_err.or(last_relay_err).unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("No configured node can reach {machine:?}."),
+            )
+            .with_hint("Pair with at least one machine first.")
+            .with_machine(machine)
+        }))
+    }
+
+    /// Calls `tool` on the first answering configured node (starting from `preferred` if given,
+    /// then paired nodes, then learned nodes), failing over strictly when `details.sent == false`.
+    ///
+    /// Intended for fleet-wide queries (`on: "all"`, `on: ["a", "b"]`) and door-level discovery
+    /// calls (`fleet.list`, `fleet.ping`, `meta.whoami`, `meta.version`). Returns the name of the
+    /// answering node and the tool's JSON result.
+    pub async fn call_any_with_id(
+        &self,
+        call_id: Option<String>,
+        preferred: Option<&str>,
+        tool: &str,
+        arguments: Value,
+        on: Option<Value>,
+        mut events: impl FnMut(Value),
+    ) -> Result<(String, Value), ErrorBody> {
+        self.ensure_reaper();
+        let args = validate_call_args(arguments, preferred.unwrap_or("node"))?;
+        let target = parse_optional_target(on)?;
+        let (cancel, _active_guard) = self.register_call_id(call_id)?;
+
+        let all_candidates = self.ordered_candidates(preferred);
+        if all_candidates.is_empty() {
+            return Err(
+                ErrorBody::new(ErrorCode::NotFound, "No configured nodes are available.")
+                    .with_hint("Pair with at least one machine first."),
+            );
+        }
+
+        // Prefer nodes not currently in unsynced backoff, keeping backed-off nodes as a final pass.
+        let mut primary = Vec::new();
+        let mut deferred = Vec::new();
+        for c in all_candidates {
+            if self.is_learned(&c) && self.is_in_unsynced_backoff(&c) {
+                deferred.push(c);
+            } else {
+                primary.push(c);
+            }
+        }
+        primary.extend(deferred);
+
+        let mut last_err: Option<ErrorBody> = None;
+        let mut auth_err: Option<ErrorBody> = None;
+
+        for candidate in primary {
+            match self
+                .call_with_cancel(
+                    &candidate,
+                    tool,
+                    args.clone(),
+                    target.clone(),
+                    cancel.clone(),
+                    &mut events,
+                )
+                .await
+            {
+                Ok(value) => {
+                    self.clear_unsynced(&candidate);
+                    self.record_route(&candidate, MachineRouteStatus::Direct);
+                    return Ok((candidate, value));
+                }
+                Err(err) => {
+                    if !is_unsent(&err) {
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        let is_learned = self.is_learned(&candidate);
+                        if is_learned {
+                            self.mark_unsynced(&candidate);
+                        }
+                        if auth_err.is_none() || !is_learned {
+                            auth_err = Some(err);
+                        }
+                        continue;
+                    }
+                    if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        if let Some(err) = auth_err {
+            return Err(err);
+        }
+        Err(last_err.unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                "Could not reach any configured node.",
+            )
+        }))
+    }
+
+    /// Lists tools through the first answering configured node, delegating single-machine `on`
+    /// targets to [`Link::tools_machine`]. Returns the answering node name and `ToolsResult` JSON.
+    pub async fn tools_any(
+        &self,
+        preferred: Option<&str>,
+        on: Option<Value>,
+    ) -> Result<(String, Value), ErrorBody> {
+        let parsed = parse_optional_target(on.clone())?;
+        if let Some(Target::One(machine)) = parsed {
+            let routed = self.tools_machine(&machine).await?;
+            let answering = match routed.route {
+                Route::Direct => machine,
+                Route::Relay { via } => via,
+            };
+            return Ok((answering, routed.value));
+        }
+
+        let all_candidates = self.ordered_candidates(preferred);
+        if all_candidates.is_empty() {
+            return Err(
+                ErrorBody::new(ErrorCode::NotFound, "No configured nodes are available.")
+                    .with_hint("Pair with at least one machine first."),
+            );
+        }
+
+        let mut primary = Vec::new();
+        let mut deferred = Vec::new();
+        for c in all_candidates {
+            if self.is_learned(&c) && self.is_in_unsynced_backoff(&c) {
+                deferred.push(c);
+            } else {
+                primary.push(c);
+            }
+        }
+        primary.extend(deferred);
+
+        let mut last_err: Option<ErrorBody> = None;
+        let mut auth_err: Option<ErrorBody> = None;
+
+        for candidate in primary {
+            match self.tools(&candidate, on.clone()).await {
+                Ok(value) => {
+                    self.clear_unsynced(&candidate);
+                    self.record_route(&candidate, MachineRouteStatus::Direct);
+                    return Ok((candidate, value));
+                }
+                Err(err) => {
+                    if !is_unsent(&err) {
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        let is_learned = self.is_learned(&candidate);
+                        if is_learned {
+                            self.mark_unsynced(&candidate);
+                        }
+                        if auth_err.is_none() || !is_learned {
+                            auth_err = Some(err);
+                        }
+                        continue;
+                    }
+                    if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        if let Some(err) = auth_err {
+            return Err(err);
+        }
+        Err(last_err.unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                "Could not reach any configured node.",
+            )
+        }))
+    }
+
+    /// Returns the observed runtime routing status for every configured node and every machine
+    /// reached via relay.
+    pub fn route_status(&self) -> HashMap<String, MachineRouteStatus> {
+        let now = Instant::now();
+        let cfg = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let unsynced: HashMap<String, Instant> = self
+            .inner
+            .unsynced_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(_, exp)| **exp > now)
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let observed = self
+            .inner
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        let mut out = HashMap::new();
+        for (machine, status) in &observed {
+            out.insert(machine.clone(), status.clone());
+        }
+        for entry in &cfg.nodes {
+            if let Some(pending) = &entry.identity_changed {
+                out.insert(
+                    entry.node.clone(),
+                    MachineRouteStatus::IdentityChanged {
+                        reported_by: pending.reported_by.clone(),
+                    },
+                );
+            } else if unsynced.contains_key(&entry.node) {
+                let via = match observed.get(&entry.node) {
+                    Some(MachineRouteStatus::NotSyncedYet { via, .. }) => via.clone(),
+                    Some(MachineRouteStatus::Relay { via }) => Some(via.clone()),
+                    _ => None,
+                };
+                out.insert(
+                    entry.node.clone(),
+                    MachineRouteStatus::NotSyncedYet {
+                        introducer: entry.learned_from.clone(),
+                        via,
+                    },
+                );
+            } else {
+                out.entry(entry.node.clone())
+                    .or_insert(MachineRouteStatus::Direct);
+            }
+        }
+        out
+    }
+
+    async fn call_machine_inner(
+        &self,
+        call_id: Option<String>,
+        machine: &str,
+        tool: &str,
+        arguments: Value,
+        mut events: impl FnMut(Value),
+    ) -> Result<RoutedValue, ErrorBody> {
+        self.ensure_reaper();
+        let args = validate_call_args(arguments, machine)?;
+        let (cancel, _active_guard) = self.register_call_id(call_id)?;
+
+        let entry = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .node(machine)
+            .cloned();
+
+        // A local-only desktop pipe (e.g. `local`) cannot be relayed through remote SSH peers.
+        if let Some(ref e) = entry
+            && e.local_program.is_some()
+            && e.target.is_none()
+        {
+            let value = self
+                .call_with_cancel(machine, tool, args, None, cancel, &mut events)
+                .await?;
+            self.record_route(machine, MachineRouteStatus::Direct);
+            return Ok(RoutedValue {
+                value,
+                route: Route::Direct,
+            });
+        }
+
+        let entry_is_learned = entry
+            .as_ref()
+            .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
+        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+
+        let mut direct_err: Option<ErrorBody> = None;
+        let mut learned_auth_err: Option<ErrorBody> = None;
+
+        if entry.is_some() && !in_unsynced_backoff {
+            match self
+                .call_with_cancel(
+                    machine,
+                    tool,
+                    args.clone(),
+                    None,
+                    cancel.clone(),
+                    &mut events,
+                )
+                .await
+            {
+                Ok(value) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(RoutedValue {
+                        value,
+                        route: Route::Direct,
+                    });
+                }
+                Err(err) => {
+                    if !is_unsent(&err) {
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        if entry_is_learned {
+                            self.mark_unsynced(machine);
+                            learned_auth_err = Some(err);
+                        } else {
+                            return Err(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        direct_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
+        let mut last_relay_err: Option<ErrorBody> = None;
+        let mut relay_auth_err: Option<ErrorBody> = None;
+
+        for relay in relays {
+            match self
+                .call_with_cancel(
+                    &relay,
+                    tool,
+                    args.clone(),
+                    Some(Target::One(machine.to_owned())),
+                    cancel.clone(),
+                    &mut events,
+                )
+                .await
+            {
+                Ok(value) => {
+                    let status = if in_unsynced_backoff || learned_auth_err.is_some() {
+                        MachineRouteStatus::NotSyncedYet {
+                            introducer: entry_learned_from.clone(),
+                            via: Some(relay.clone()),
+                        }
+                    } else {
+                        MachineRouteStatus::Relay { via: relay.clone() }
+                    };
+                    self.record_route(machine, status);
+                    return Ok(RoutedValue {
+                        value,
+                        route: Route::Relay { via: relay },
+                    });
+                }
+                Err(err) => {
+                    if !is_unsent(&err) {
+                        if in_unsynced_backoff || learned_auth_err.is_some() {
+                            self.record_route(
+                                machine,
+                                MachineRouteStatus::NotSyncedYet {
+                                    introducer: entry_learned_from.clone(),
+                                    via: None,
+                                },
+                            );
+                        }
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        last_relay_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        // If we skipped direct because of a previous unsynced backoff and no relay could be
+        // reached, probe direct once so we either recover if the node has since synced or report
+        // its refusal honestly.
+        if in_unsynced_backoff {
+            match self
+                .call_with_cancel(machine, tool, args, None, cancel, &mut events)
+                .await
+            {
+                Ok(value) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(RoutedValue {
+                        value,
+                        route: Route::Direct,
+                    });
+                }
+                Err(err) => {
+                    if is_device_removed_or_unknown(&err) {
+                        self.clear_unsynced(machine);
+                        return Err(err);
+                    }
+                    if direct_err.is_none() {
+                        direct_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(auth_err) = relay_auth_err.or(learned_auth_err) {
+            self.clear_unsynced(machine);
+            return Err(auth_err);
+        }
+
+        Err(direct_err.or(last_relay_err).unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::NotFound,
+                format!("No configured node can reach {machine:?}."),
+            )
+            .with_hint("Pair with at least one machine first.")
+            .with_machine(machine)
+        }))
+    }
+
+    fn relay_candidates(&self, exclude: &str, preferred_introducer: Option<&str>) -> Vec<String> {
+        let ordered = self.ordered_candidates(preferred_introducer);
+        let mut primary = Vec::new();
+        let mut deferred = Vec::new();
+        for node in ordered {
+            if node == exclude {
+                continue;
+            }
+            if self.is_learned(&node) && self.is_in_unsynced_backoff(&node) {
+                deferred.push(node);
+            } else {
+                primary.push(node);
+            }
+        }
+        primary.extend(deferred);
+        primary
+    }
+
+    fn is_in_unsynced_backoff(&self, node: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self
+            .inner
+            .unsynced_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match map.get(node) {
+            Some(&exp) if exp > now => true,
+            Some(_) => {
+                map.remove(node);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn mark_unsynced(&self, node: &str) {
+        if self.inner.options.unsynced_backoff.is_zero() {
+            return;
+        }
+        self.inner
+            .unsynced_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                node.to_owned(),
+                Instant::now() + self.inner.options.unsynced_backoff,
+            );
+    }
+
+    fn clear_unsynced(&self, node: &str) {
+        self.inner
+            .unsynced_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(node);
+    }
+
+    fn record_route(&self, machine: &str, status: MachineRouteStatus) {
+        self.inner
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(machine.to_owned(), status);
+    }
+
+    fn clear_route_state(&self, node: &str) {
+        self.clear_unsynced(node);
+        self.inner
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(node);
+    }
+
+    fn register_call_id(
+        &self,
+        call_id: Option<String>,
+    ) -> Result<(CancellationToken, Option<ActiveCallGuard>), ErrorBody> {
+        let cancel = CancellationToken::new();
+        let guard = if let Some(id) = call_id {
+            let mut active = self
+                .inner
+                .active_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if active.contains_key(&id) {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!("A call with id {id:?} is already running."),
+                )
+                .with_hint("Choose a unique call id for each concurrent call."));
+            }
+            active.insert(id.clone(), cancel.clone());
+            drop(active);
+            Some(ActiveCallGuard {
+                active_calls: Arc::clone(&self.inner),
+                id,
+            })
+        } else {
+            None
+        };
+        Ok((cancel, guard))
+    }
+
     /// Calls `tool` on `node` with JSON `arguments` and optional `on` (passed through untouched to
     /// the node for forwarding or fan-out), streaming live events as JSON objects to `events`.
     pub async fn call(
@@ -843,8 +1626,8 @@ impl Link {
             .await
     }
 
-    /// Cancels an active call registered via [`Link::call_with_id`], returning `true` if the call
-    /// was found and signalled.
+    /// Cancels an active call registered via [`Link::call_with_id`] or
+    /// [`Link::call_machine_with_id`], returning `true` if the call was found and signalled.
     pub fn cancel(&self, call_id: &str) -> bool {
         let token = self
             .inner
@@ -871,43 +1654,22 @@ impl Link {
         mut events: impl FnMut(Value),
     ) -> Result<Value, ErrorBody> {
         self.ensure_reaper();
-        let args = match arguments {
-            Value::Null => json!({}),
-            Value::Object(_) => arguments,
-            _ => {
-                return Err(ErrorBody::new(
-                    ErrorCode::InvalidArgs,
-                    "Tool arguments must be a JSON object.",
-                )
-                .with_hint("Pass a JSON object such as `{}`.")
-                .with_machine(node));
-            }
-        };
+        let args = validate_call_args(arguments, node)?;
         let target = parse_optional_target(on)?;
-        let cancel = CancellationToken::new();
-        let _active_guard = if let Some(id) = call_id {
-            let mut active = self
-                .inner
-                .active_calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if active.contains_key(&id) {
-                return Err(ErrorBody::new(
-                    ErrorCode::Conflict,
-                    format!("A call with id {id:?} is already running."),
-                )
-                .with_hint("Choose a unique call id for each concurrent call."));
-            }
-            active.insert(id.clone(), cancel.clone());
-            drop(active);
-            Some(ActiveCallGuard {
-                active_calls: Arc::clone(&self.inner),
-                id,
-            })
-        } else {
-            None
-        };
+        let (cancel, _active_guard) = self.register_call_id(call_id)?;
+        self.call_with_cancel(node, tool, args, target, cancel, &mut events)
+            .await
+    }
 
+    async fn call_with_cancel(
+        &self,
+        node: &str,
+        tool: &str,
+        args: Value,
+        target: Option<Target>,
+        cancel: CancellationToken,
+        events: &mut impl FnMut(Value),
+    ) -> Result<Value, ErrorBody> {
         let live = self.get_or_open(node, cancel.clone()).await?;
         let _flight = live.acquire_flight();
 
@@ -920,7 +1682,7 @@ impl Link {
         };
 
         match self
-            .run_call_with_events(&live.session, params.clone(), cancel.clone(), &mut events)
+            .run_call_with_events(&live.session, params.clone(), cancel.clone(), events)
             .await
         {
             Ok(value) => Ok(value),
@@ -930,7 +1692,7 @@ impl Link {
                 let _flight2 = fresh.acquire_flight();
                 let mut retry_params = params;
                 retry_params.as_principal = fresh.config_snapshot.principal.clone();
-                self.run_call_with_events(&fresh.session, retry_params, cancel, &mut events)
+                self.run_call_with_events(&fresh.session, retry_params, cancel, events)
                     .await
                     .map_err(|err| self.handle_call_error(node, &fresh.session, err))
             }
@@ -1387,6 +2149,19 @@ pub fn parse_optional_target(on: Option<Value>) -> Result<Option<Target>, ErrorB
         ErrorBody::new(ErrorCode::InvalidArgs, format!("on: {reason}."))
             .with_hint("Give on as a machine name, comma-separated names, a list of names, or \"all\", or omit it.")
     })
+}
+
+fn validate_call_args(arguments: Value, machine: &str) -> Result<Value, ErrorBody> {
+    match arguments {
+        Value::Null => Ok(json!({})),
+        Value::Object(_) => Ok(arguments),
+        _ => Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "Tool arguments must be a JSON object.",
+        )
+        .with_hint("Pass a JSON object such as `{}`.")
+        .with_machine(machine)),
+    }
 }
 
 fn is_unsent(err: &ErrorBody) -> bool {
@@ -2947,6 +3722,398 @@ mod tests {
         // Accepting again when no change is pending returns InvalidArgs.
         let again = link.accept_identity_change("pi").unwrap_err();
         assert_eq!(again.code, ErrorCode::InvalidArgs);
+
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn call_machine_routes_direct_relays_on_unsent_and_handles_learned_unsynced_and_revocation()
+     {
+        #[derive(Clone, Copy)]
+        enum Mode {
+            Ok,
+            Unreachable,
+            AuthFailed,
+            HostKeyMismatch,
+            DropInFlight,
+            RemoteToolError,
+        }
+
+        let modes: Arc<Mutex<HashMap<String, Mode>>> = Arc::new(Mutex::new(HashMap::from([
+            ("tower".to_owned(), Mode::Ok),
+            ("pi".to_owned(), Mode::Ok),
+        ])));
+        let opens: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+        type SeenCalls = Arc<Mutex<Vec<(String, Option<Value>)>>>;
+        let seen_relays: SeenCalls = Arc::new(Mutex::new(Vec::new()));
+
+        let modes_c = Arc::clone(&modes);
+        let opens_c = Arc::clone(&opens);
+        let relays_c = Arc::clone(&seen_relays);
+
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let mode = *modes_c
+                .lock()
+                .unwrap()
+                .get(&entry.node)
+                .unwrap_or(&Mode::Ok);
+            *opens_c
+                .lock()
+                .unwrap()
+                .entry(entry.node.clone())
+                .or_insert(0) += 1;
+            let relays_c = Arc::clone(&relays_c);
+            Box::pin(async move {
+                match mode {
+                    Mode::Unreachable => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("{} is offline", entry.node),
+                        )
+                        .with_machine(&entry.node));
+                    }
+                    Mode::AuthFailed => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Denied,
+                            format!("SSH auth rejected on {}", entry.node),
+                        )
+                        .with_machine(&entry.node)
+                        .with_details(json!({ "reason": crate::REASON_AUTH_FAILED })));
+                    }
+                    Mode::HostKeyMismatch => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Denied,
+                            format!("Host key mismatch on {}", entry.node),
+                        )
+                        .with_machine(&entry.node)
+                        .with_details(json!({ "reason": crate::REASON_HOST_KEY_MISMATCH })));
+                    }
+                    Mode::Ok | Mode::DropInFlight | Mode::RemoteToolError => {}
+                }
+
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                let (server_r, mut server_w) = tokio::io::split(server);
+                let node_name = entry.node.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let resp = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            let _ = server_w.flush().await;
+                        } else if req.method == method::CALL {
+                            let on_val = req.params.get("on").cloned();
+                            relays_c
+                                .lock()
+                                .unwrap()
+                                .push((node_name.clone(), on_val.clone()));
+                            match mode {
+                                Mode::DropInFlight => break,
+                                Mode::RemoteToolError => {
+                                    let resp = Response::error(
+                                        req.id,
+                                        legion_proto::RpcError::new(
+                                            legion_proto::TOOL_ERROR,
+                                            ErrorBody::new(ErrorCode::Timeout, "tool timed out"),
+                                        ),
+                                    );
+                                    let _ = server_w
+                                        .write_all(
+                                            format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                                .as_bytes(),
+                                        )
+                                        .await;
+                                    let _ = server_w.flush().await;
+                                }
+                                _ => {
+                                    let resp = Response::ok(
+                                        req.id,
+                                        json!({ "handled_by": node_name, "on": on_val }),
+                                    );
+                                    let _ = server_w
+                                        .write_all(
+                                            format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                                .as_bytes(),
+                                        )
+                                        .await;
+                                    let _ = server_w.flush().await;
+                                }
+                            }
+                        }
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let target_a = SshTarget {
+            hosts: vec!["tower.example.net".to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![test_host_key(10)],
+        };
+        let target_b = SshTarget {
+            hosts: vec!["pi.example.net".to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![test_host_key(11)],
+        };
+        let cfg = LinkConfig {
+            device_key: Some("dummy".to_owned()),
+            nodes: vec![
+                NodeLink::ssh("tower", target_a, Some("device:pixel".to_owned())),
+                NodeLink::learned("pi", target_b, Some("device:pixel".to_owned()), "tower"),
+            ],
+        };
+        let opts = LinkOptions {
+            unsynced_backoff: Duration::from_millis(80),
+            ..LinkOptions::default()
+        };
+        let link = Link::with_opener(cfg, opts, opener);
+
+        // 1. Direct call to `pi` succeeds directly.
+        let r_direct = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(r_direct.route, Route::Direct);
+        assert_eq!(r_direct.value["handled_by"], json!("pi"));
+        assert_eq!(
+            link.route_status().get("pi"),
+            Some(&MachineRouteStatus::Direct)
+        );
+
+        // 2. Call to unknown machine `nas` relays through `tower` with `on: "nas"`.
+        let r_nas = link
+            .call_machine("nas", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            r_nas.route,
+            Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        assert_eq!(r_nas.value["on"], json!("nas"));
+        assert_eq!(
+            link.route_status().get("nas"),
+            Some(&MachineRouteStatus::Relay {
+                via: "tower".to_owned()
+            })
+        );
+
+        // 3. Direct unreachable (`sent == false`) on `pi` relays through `tower` with `on: "pi"`.
+        link.close().await;
+        modes
+            .lock()
+            .unwrap()
+            .insert("pi".to_owned(), Mode::Unreachable);
+        let r_relayed = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            r_relayed.route,
+            Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        assert_eq!(r_relayed.value["on"], json!("pi"));
+
+        // 4. Lost-in-flight and remote tool error on `pi` NEVER fail over to `tower`.
+        link.close().await;
+        seen_relays.lock().unwrap().clear();
+        modes
+            .lock()
+            .unwrap()
+            .insert("pi".to_owned(), Mode::DropInFlight);
+        let lost_err = link
+            .call_machine("pi", "power.restart", json!({}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(lost_err.code, ErrorCode::Unreachable);
+        assert!(
+            !seen_relays
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| n == "tower"),
+            "lost-in-flight call must never fail over to relay"
+        );
+
+        link.close().await;
+        seen_relays.lock().unwrap().clear();
+        modes
+            .lock()
+            .unwrap()
+            .insert("pi".to_owned(), Mode::RemoteToolError);
+        let tool_err = link
+            .call_machine("pi", "power.restart", json!({}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(tool_err.code, ErrorCode::Timeout);
+        assert!(
+            !seen_relays
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| n == "tower"),
+            "remote tool error must never fail over to relay"
+        );
+
+        // 5. Direct host_key_mismatch NEVER fails over silently.
+        link.close().await;
+        seen_relays.lock().unwrap().clear();
+        modes
+            .lock()
+            .unwrap()
+            .insert("pi".to_owned(), Mode::HostKeyMismatch);
+        let hk_err = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(hk_err.code, ErrorCode::Denied);
+        assert_eq!(
+            hk_err.details.as_ref().unwrap()["reason"],
+            json!(crate::REASON_HOST_KEY_MISMATCH)
+        );
+        assert!(
+            !seen_relays
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, _)| n == "tower")
+        );
+
+        // 6. Learned `pi` rejecting key auth (`device_removed_or_unknown`) falls back to relay
+        //    `tower`, records NotSyncedYet, skips direct attempts during backoff, and recovers
+        //    once backoff expires.
+        link.close().await;
+        opens.lock().unwrap().clear();
+        modes
+            .lock()
+            .unwrap()
+            .insert("pi".to_owned(), Mode::AuthFailed);
+        let r_unsynced = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            r_unsynced.route,
+            Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        assert_eq!(*opens.lock().unwrap().get("pi").unwrap_or(&0), 1);
+        assert_eq!(
+            link.route_status().get("pi"),
+            Some(&MachineRouteStatus::NotSyncedYet {
+                introducer: Some("tower".to_owned()),
+                via: Some("tower".to_owned()),
+            })
+        );
+
+        // Second call within backoff must bypass direct `pi` (open count stays 1).
+        let r_cached = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            r_cached.route,
+            Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        assert_eq!(*opens.lock().unwrap().get("pi").unwrap_or(&0), 1);
+
+        // Once backoff expires and `pi` accepts the device key, direct route resumes.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        modes.lock().unwrap().insert("pi".to_owned(), Mode::Ok);
+        let r_recovered = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(r_recovered.route, Route::Direct);
+        assert_eq!(*opens.lock().unwrap().get("pi").unwrap_or(&0), 2);
+        assert_eq!(
+            link.route_status().get("pi"),
+            Some(&MachineRouteStatus::Direct)
+        );
+
+        // 7. Device removed on `pi` while paired `tower` is unreachable surfaces
+        //    `device_removed_or_unknown` (never masked by `tower`'s unreachable error).
+        link.close().await;
+        modes
+            .lock()
+            .unwrap()
+            .insert("tower".to_owned(), Mode::Unreachable);
+        modes
+            .lock()
+            .unwrap()
+            .insert("pi".to_owned(), Mode::AuthFailed);
+        let revoked_b = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(revoked_b.code, ErrorCode::Denied);
+        assert_eq!(
+            revoked_b.details.as_ref().unwrap()["reason"],
+            json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+        );
+
+        // 8. Refusal from every machine including paired `tower` returns `device_removed_or_unknown`.
+        modes
+            .lock()
+            .unwrap()
+            .insert("tower".to_owned(), Mode::AuthFailed);
+        let revoked_all = link
+            .call_machine("pi", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(revoked_all.code, ErrorCode::Denied);
+        assert_eq!(
+            revoked_all.details.as_ref().unwrap()["reason"],
+            json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+        );
+
+        let revoked_paired = link
+            .call_machine("tower", "sys.info", json!({}), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(revoked_paired.code, ErrorCode::Denied);
+        assert_eq!(
+            revoked_paired.details.as_ref().unwrap()["reason"],
+            json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+        );
 
         link.close().await;
     }

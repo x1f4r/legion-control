@@ -123,8 +123,9 @@ pub use invite::{
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    DEFAULT_IDLE_TIMEOUT, LearnReport, Link, LinkConfig, LinkOptions, NodeLink, NodeOrigin,
-    PendingIdentityChange, SessionOpener, parse_optional_target,
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, LearnReport, Link, LinkConfig, LinkOptions,
+    MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
+    SessionOpener, parse_optional_target,
 };
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
