@@ -291,12 +291,23 @@ async fn project_status(
             error,
         };
     }
-    let state =
-        tokio::time::timeout(PROJECT_TIMEOUT, git::repo_state(&path, &grant, &cancel)).await;
+    // At the deadline git is cancelled and waited for, so no git is left running after the call
+    // returns; dropping the work instead would leave it to finish on its own.
+    let deadline = cancel.child_token();
+    let reading = git::repo_state(&path, &grant, &deadline);
+    tokio::pin!(reading);
+    let state = tokio::select! {
+        state = &mut reading => Ok(state),
+        () = tokio::time::sleep(PROJECT_TIMEOUT) => {
+            deadline.cancel();
+            let _ = reading.await;
+            Err(())
+        }
+    };
     let (git, error) = match state {
         Ok(Ok(git)) => (git, None),
         Ok(Err(error)) => (None, Some(error)),
-        Err(_) => (
+        Err(()) => (
             None,
             Some(ErrorBody::new(
                 ErrorCode::Timeout,
@@ -586,6 +597,7 @@ async fn clone(ctx: &Ctx, args: CloneArgs) -> Result<Cloned, ToolError> {
         on_output: Some(forward),
         // Belt and braces: repo_source already refuses every `transport::address`.
         config: vec!["protocol.ext.allow=never".to_owned()],
+        batch_ssh: git::batch_ssh(None, &cancel).await,
     }
     .run();
     tokio::pin!(run);
@@ -788,6 +800,7 @@ async fn pull(ctx: &Ctx, args: PullArgs) -> Result<Pulled, ToolError> {
         cancel: &cancel,
         on_output: None,
         config: Vec::new(),
+        batch_ssh: git::batch_ssh(Some(&path), &cancel).await,
     }
     .run()
     .await?;

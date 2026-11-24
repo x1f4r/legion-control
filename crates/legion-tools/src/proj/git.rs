@@ -53,6 +53,8 @@ pub(super) struct Git<'a> {
     pub on_output: Option<ChunkCallback>,
     /// Settings passed as `-c`, after the ones a read-only command always gets.
     pub config: Vec<String>,
+    /// Whether ssh is to run in batch mode, which [`batch_ssh`] decides for a remote command.
+    pub batch_ssh: bool,
 }
 
 impl<'a> Git<'a> {
@@ -66,6 +68,7 @@ impl<'a> Git<'a> {
             cancel,
             on_output: None,
             config: Vec::new(),
+            batch_ssh: false,
         }
     }
 
@@ -84,6 +87,9 @@ impl<'a> Git<'a> {
         } else {
             Vec::new()
         };
+        if self.mode == Mode::Write {
+            settings.push("credential.interactive=never".to_owned());
+        }
         settings.extend(self.config);
         let mut args: Vec<OsString> = settings
             .into_iter()
@@ -96,6 +102,13 @@ impl<'a> Git<'a> {
             .timeout(self.timeout);
         if self.mode == Mode::Read {
             options = options.env("GIT_OPTIONAL_LOCKS", "0");
+        } else {
+            // With no terminal prompt and no program to ask, a credential git cannot find on its
+            // own makes it fail at once rather than wait for an answer nobody will give.
+            options = options.envs(NO_PROMPTS);
+            if self.batch_ssh {
+                options = options.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+            }
         }
         if let Some(cwd) = self.cwd {
             options = options.cwd(cwd);
@@ -222,6 +235,53 @@ fn blank_filters(listing: &str) -> Vec<String> {
             ]
         })
         .collect()
+}
+
+/// Variables that keep git, Git Credential Manager and ssh from asking anyone anything.
+const NO_PROMPTS: [(&str, &str); 3] = [
+    ("GIT_ASKPASS", ""),
+    ("SSH_ASKPASS", ""),
+    ("GCM_INTERACTIVE", "never"),
+];
+
+/// Whether a remote command may run ssh as `ssh -o BatchMode=yes`, which makes ssh fail instead of
+/// asking for a passphrase or a host key on a terminal it finds.
+///
+/// Only when nobody chose the ssh command: setting `GIT_SSH_COMMAND` would override one the user
+/// configured, with the options it carries. When they did choose one, a prompt it shows is
+/// stopped by the command's timeout and by a cancel instead.
+pub(super) async fn batch_ssh(cwd: Option<&Path>, cancel: &CancellationToken) -> bool {
+    if ["GIT_SSH_COMMAND", "GIT_SSH"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return false;
+    }
+    let mut query = Git::read(
+        cwd.unwrap_or_else(|| Path::new(".")),
+        &[
+            "config",
+            "--includes",
+            "--show-origin",
+            "--get-all",
+            "core.sshCommand",
+        ],
+        cancel,
+    );
+    query.cwd = cwd;
+    match query.run().await {
+        Ok(output) => !ssh_configured(&output.stdout.text),
+        Err(_) => false,
+    }
+}
+
+/// Whether a `git config --show-origin` listing of `core.sshCommand` holds a command from a file,
+/// as opposed to the blank one read-only commands pass on the command line.
+fn ssh_configured(listing: &str) -> bool {
+    listing.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(origin, value)| origin != "command line:" && !value.trim().is_empty())
+    })
 }
 
 fn start_error(error: OsError, cwd: Option<&Path>) -> ErrorBody {
@@ -814,6 +874,16 @@ mod tests {
             ]
         );
         assert!(blank_filters("").is_empty());
+    }
+
+    #[test]
+    fn only_an_ssh_command_from_a_file_counts_as_chosen() {
+        assert!(!ssh_configured(""));
+        assert!(!ssh_configured("command line:\t\n"));
+        assert!(ssh_configured(
+            "file:/home/me/.gitconfig\tssh -i ~/.ssh/work\ncommand line:\t\n"
+        ));
+        assert!(!ssh_configured("file:.git/config\t\n"));
     }
 
     #[test]

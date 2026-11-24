@@ -25,6 +25,10 @@ use support::{Events, Fixture, HELPER, Test, this_binary};
 const HERMETIC: &str = "LEGION_PROJ_TEST_HERMETIC";
 /// The first argument that makes the test binary a task's program.
 const TASK_HELPER: &str = "--proj-helper";
+/// The first argument that makes the test binary play ssh for git: it writes down its process id
+/// and the variables that keep it from prompting to the file named next, then sleeps for the
+/// seconds named after that.
+const FAKE_SSH: &str = "--proj-ssh";
 /// The first argument that makes the test binary leave a marker file at the path after it.
 const MARKER: &str = "--proj-mark";
 
@@ -32,6 +36,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some(TASK_HELPER) {
         return task_helper(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some(FAKE_SSH) {
+        return fake_ssh(&args[1..]);
     }
     if args.first().map(String::as_str) == Some(MARKER) {
         // Run by git as a filter, a monitor or a hook a hostile repository names.
@@ -80,6 +87,9 @@ fn main() -> ExitCode {
         }),
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
+        }),
+        ("remote_git_never_prompts_and_stops_when_cancelled", || {
+            Box::pin(remote_git_never_prompts_and_stops_when_cancelled())
         }),
         (
             "a_confined_role_cannot_move_or_forget_projects_outside_its_paths",
@@ -132,6 +142,28 @@ fn task_helper(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn fake_ssh(args: &[String]) -> ExitCode {
+    let names = [
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GCM_INTERACTIVE",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_SSH_COMMAND",
+    ];
+    let seen: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|name| ((*name).to_owned(), json!(env::var(name).ok())))
+        .collect();
+    let record = json!({"pid": std::process::id(), "env": seen});
+    let target = PathBuf::from(&args[0]);
+    let partial = target.with_extension("partial");
+    std::fs::write(&partial, record.to_string()).unwrap();
+    std::fs::rename(&partial, &target).unwrap();
+    let seconds: u64 = args[1].parse().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+    ExitCode::from(1)
 }
 
 fn git_installed() -> bool {
@@ -1288,4 +1320,74 @@ async fn a_confined_role_cannot_move_or_forget_projects_outside_its_paths() {
         .await
         .unwrap();
     assert_eq!(removed["removed"], json!("everywhere"));
+}
+
+async fn remote_git_never_prompts_and_stops_when_cancelled() {
+    let fixture = tower();
+    let app = fixture.home().join("app");
+    repo(&app);
+    git(
+        &app,
+        &["remote", "add", "origin", "ssh://me@git.example/app.git"],
+    );
+    git(&app, &["config", "branch.main.remote", "origin"]);
+    git(&app, &["config", "branch.main.merge", "refs/heads/main"]);
+    fixture.write_config("projects.toml", "[projects.app.on]\ntower = \"~/app\"\n");
+    let record = fixture.dir.path().join("ssh.json");
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let fake = |seconds: u32| {
+        format!(
+            "{} {FAKE_SSH} {} {seconds}",
+            quote(&this_binary()),
+            quote(&record.to_string_lossy())
+        )
+    };
+
+    git(&app, &["config", "core.sshCommand", &fake(0)]);
+    let error = fixture
+        .call("proj.pull", json!({"project": "app"}))
+        .await
+        .unwrap_err();
+    assert_ne!(error.code, ErrorCode::Conflict, "{error:?}");
+    let seen: Value = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    assert_eq!(seen["env"]["GCM_INTERACTIVE"], json!("never"), "{seen:#}");
+    assert_eq!(seen["env"]["GIT_TERMINAL_PROMPT"], json!("0"), "{seen:#}");
+    for name in ["GIT_ASKPASS", "SSH_ASKPASS"] {
+        let value = seen["env"][name].as_str().unwrap_or_default();
+        assert_eq!(value, "", "{name}: {seen:#}");
+    }
+    // The repository names its own ssh command, which is left alone.
+    assert_eq!(seen["env"]["GIT_SSH_COMMAND"], Value::Null, "{seen:#}");
+
+    // Cancelled while git waits on ssh: the call returns only once ssh is gone.
+    std::fs::remove_file(&record).unwrap();
+    git(&app, &["config", "core.sshCommand", &fake(60)]);
+    let cancel = CancellationToken::new();
+    let events = Events::default();
+    let pulling = fixture.call_with(
+        "proj.pull",
+        json!({"project": "app"}),
+        &events,
+        cancel.clone(),
+    );
+    tokio::pin!(pulling);
+    let pid = loop {
+        tokio::select! {
+            result = &mut pulling => panic!("the pull ended before it was cancelled: {result:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+        if let Ok(text) = std::fs::read_to_string(&record) {
+            let seen: Value = serde_json::from_str(&text).unwrap();
+            break u32::try_from(seen["pid"].as_u64().unwrap()).unwrap();
+        }
+    };
+    let started = std::time::Instant::now();
+    cancel.cancel();
+    let error = pulling.await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled, "{error:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(
+        !support::alive(pid),
+        "ssh was left running after the call returned"
+    );
 }
