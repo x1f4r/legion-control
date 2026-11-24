@@ -11,7 +11,9 @@ use legion_proto::{ErrorBody, ErrorCode};
 use russh::client::{self, AuthResult};
 use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg, PublicKey};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{Channel, ChannelMsg, Disconnect, Preferred, cipher, compression, kex, mac};
+use russh::{
+    AlgorithmKind, Channel, ChannelMsg, Disconnect, Preferred, cipher, compression, kex, mac,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
@@ -193,6 +195,8 @@ pub async fn open_exec_raw(
     cancel: CancellationToken,
 ) -> Result<SshPipe, ErrorBody> {
     let expected_keys = parse_host_keys(&target.host_keys)?;
+    // Fail fast if none of the pinned host keys use a supported algorithm.
+    let _ = build_ssh_config(&expected_keys, None, timeouts)?;
     if target.hosts.is_empty() {
         return Err(ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -310,18 +314,14 @@ async fn connect_one_host(
         })?;
         let _ = tcp.set_nodelay(true);
 
-        let offered_mismatch = Arc::new(Mutex::new(None::<String>));
-        let handler = HostKeyHandler {
-            expected: expected_keys.to_vec(),
-            offered_mismatch: Arc::clone(&offered_mismatch),
-        };
-        let config = Arc::new(build_ssh_config(expected_keys, timeouts));
-
-        let mut session = client::connect_stream(config, tcp, handler)
-            .await
-            .map_err(|err| {
-                map_handshake_error(host, port, err, &offered_mismatch, expected_keys)
-            })?;
+        let mut session = handshake_with_host_key_retry(
+            host,
+            port,
+            tcp,
+            expected_keys,
+            timeouts,
+        )
+        .await?;
 
         let auth = session
             .authenticate_publickey(
@@ -425,26 +425,123 @@ async fn connect_one_host(
     }
 }
 
+async fn handshake_with_host_key_retry(
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+    expected_keys: &[PublicKey],
+    timeouts: SshTimeouts,
+) -> Result<client::Handle<HostKeyHandler>, HostAttemptError> {
+    let first = handshake_once(host, port, tcp, expected_keys, None, timeouts).await;
+    match first {
+        Ok(session) => Ok(session),
+        Err(HandshakeAttemptError::HostKeyMismatch {
+            error: first_err,
+            offered_family: Some(fam),
+        }) if !host_key_algorithms(expected_keys, Some(fam)).is_empty() => {
+            // The server offered a key of family `fam` that did not match our pin (for instance a
+            // rotated ed25519 key while our ecdsa pin still matches). Retry once without `fam`.
+            let tcp2 = match TcpStream::connect((host, port)).await {
+                Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    stream
+                }
+                Err(_) => return Err(HostAttemptError::Fatal(first_err)),
+            };
+            match handshake_once(host, port, tcp2, expected_keys, Some(fam), timeouts).await {
+                Ok(session) => Ok(session),
+                Err(HandshakeAttemptError::HostKeyMismatch { error, .. }) => {
+                    Err(HostAttemptError::Fatal(error))
+                }
+                // If the server has no key of the fallback family (NoCommonAlgo) or fails on retry,
+                // keep the original mismatch error carrying the fingerprint it actually offered.
+                Err(HandshakeAttemptError::Other(_)) => Err(HostAttemptError::Fatal(first_err)),
+            }
+        }
+        Err(HandshakeAttemptError::HostKeyMismatch { error, .. }) => {
+            Err(HostAttemptError::Fatal(error))
+        }
+        Err(HandshakeAttemptError::Other(err)) => Err(err),
+    }
+}
+
+enum HandshakeAttemptError {
+    HostKeyMismatch {
+        error: ErrorBody,
+        offered_family: Option<HostKeyFamily>,
+    },
+    Other(HostAttemptError),
+}
+
+async fn handshake_once(
+    host: &str,
+    port: u16,
+    tcp: TcpStream,
+    expected_keys: &[PublicKey],
+    exclude: Option<HostKeyFamily>,
+    timeouts: SshTimeouts,
+) -> Result<client::Handle<HostKeyHandler>, HandshakeAttemptError> {
+    let offered_mismatch = Arc::new(Mutex::new(None::<OfferedMismatch>));
+    let handler = HostKeyHandler {
+        expected: expected_keys.to_vec(),
+        offered_mismatch: Arc::clone(&offered_mismatch),
+    };
+    let config = build_ssh_config(expected_keys, exclude, timeouts)
+        .map_err(|err| HandshakeAttemptError::Other(HostAttemptError::Fatal(err)))?;
+    client::connect_stream(Arc::new(config), tcp, handler)
+        .await
+        .map_err(|err| map_handshake_error(host, port, err, &offered_mismatch, expected_keys))
+}
+
 fn map_handshake_error(
     host: &str,
     port: u16,
     err: russh::Error,
-    offered_mismatch: &Arc<Mutex<Option<String>>>,
+    offered_mismatch: &Arc<Mutex<Option<OfferedMismatch>>>,
     expected_keys: &[PublicKey],
-) -> HostAttemptError {
-    if let Some(offered) = offered_mismatch
+) -> HandshakeAttemptError {
+    if let Some(mismatch) = offered_mismatch
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
     {
-        return HostAttemptError::Fatal(host_key_mismatch_error(
-            host,
-            port,
-            &offered,
-            expected_keys,
+        return HandshakeAttemptError::HostKeyMismatch {
+            error: host_key_mismatch_error(host, port, &mismatch.fingerprint, expected_keys),
+            offered_family: mismatch.family,
+        };
+    }
+    if let russh::Error::NoCommonAlgo {
+        kind: AlgorithmKind::Key,
+        ours,
+        theirs,
+    } = err
+    {
+        return HandshakeAttemptError::Other(HostAttemptError::Fatal(
+            ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "Host key mismatch for {host}:{port}: the server offers only {} while this target pins {}.",
+                    if theirs.is_empty() {
+                        "no host key algorithms".to_owned()
+                    } else {
+                        theirs.join(", ")
+                    },
+                    ours.join(", "),
+                ),
+            )
+            .with_hint(
+                "None of the server's host key types match the pinned host keys. Verify the node's host keys and pair again if they changed.",
+            )
+            .with_details(json!({
+                "reason": REASON_HOST_KEY_MISMATCH,
+                "host": host,
+                "port": port,
+                "offered_algorithms": theirs,
+                "pinned_algorithms": ours,
+            })),
         ));
     }
-    HostAttemptError::TryNext(
+    HandshakeAttemptError::Other(HostAttemptError::TryNext(
         ErrorBody::new(
             ErrorCode::Unreachable,
             format!("SSH handshake with {host}:{port} failed: {err}."),
@@ -455,7 +552,31 @@ fn map_handshake_error(
             "host": host,
             "port": port,
         })),
-    )
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostKeyFamily {
+    Ed25519,
+    Ecdsa(EcdsaCurve),
+    Rsa,
+}
+
+impl HostKeyFamily {
+    fn from_algorithm(alg: Algorithm) -> Option<Self> {
+        match alg {
+            Algorithm::Ed25519 => Some(HostKeyFamily::Ed25519),
+            Algorithm::Ecdsa { curve } => Some(HostKeyFamily::Ecdsa(curve)),
+            Algorithm::Rsa { .. } => Some(HostKeyFamily::Rsa),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OfferedMismatch {
+    fingerprint: String,
+    family: Option<HostKeyFamily>,
 }
 
 fn host_key_mismatch_error(
@@ -486,7 +607,7 @@ fn host_key_mismatch_error(
 
 struct HostKeyHandler {
     expected: Vec<PublicKey>,
-    offered_mismatch: Arc<Mutex<Option<String>>>,
+    offered_mismatch: Arc<Mutex<Option<OfferedMismatch>>>,
 }
 
 impl client::Handler for HostKeyHandler {
@@ -500,10 +621,14 @@ impl client::Handler for HostKeyHandler {
         match matched {
             Ok(()) => Ok(true),
             Err(offered_fingerprint) => {
+                let family = HostKeyFamily::from_algorithm(server_public_key.public_key().algorithm());
                 *self
                     .offered_mismatch
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(offered_fingerprint);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(OfferedMismatch {
+                    fingerprint: offered_fingerprint,
+                    family,
+                });
                 Ok(false)
             }
         }
@@ -558,49 +683,56 @@ pub(crate) fn parse_host_keys(lines: &[String]) -> Result<Vec<PublicKey>, ErrorB
     Ok(parsed)
 }
 
-/// Modern algorithm set accepted by OpenSSH 8+ and Windows OpenSSH by default, filtered to host
-/// key algorithms present in `expected_keys` so a multi-key server always offers a pinned key type.
-fn build_ssh_config(expected_keys: &[PublicKey], timeouts: SshTimeouts) -> client::Config {
-    let mut host_key_algos: Vec<Algorithm> = Vec::new();
-    let mut push_unique = |alg: Algorithm| {
-        if !host_key_algos.contains(&alg) {
-            host_key_algos.push(alg);
+/// Returns the supported host-key algorithms present in `expected_keys` in canonical preference
+/// order (`ed25519`, `ecdsa`, `rsa`), regardless of the order the pins were listed in, optionally
+/// excluding one family after a mismatch.
+fn host_key_algorithms(
+    expected_keys: &[PublicKey],
+    exclude: Option<HostKeyFamily>,
+) -> Vec<Algorithm> {
+    let has = |fam: HostKeyFamily| -> bool {
+        if exclude == Some(fam) {
+            return false;
         }
+        expected_keys
+            .iter()
+            .any(|k| HostKeyFamily::from_algorithm(k.algorithm()) == Some(fam))
     };
-    for key in expected_keys {
-        match key.algorithm() {
-            Algorithm::Ed25519 => push_unique(Algorithm::Ed25519),
-            Algorithm::Ecdsa { curve } => push_unique(Algorithm::Ecdsa { curve }),
-            Algorithm::Rsa { .. } => {
-                push_unique(Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha512),
-                });
-                push_unique(Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha256),
-                });
-            }
-            _ => {}
+
+    let mut algos = Vec::new();
+    if has(HostKeyFamily::Ed25519) {
+        algos.push(Algorithm::Ed25519);
+    }
+    for curve in [EcdsaCurve::NistP256, EcdsaCurve::NistP384, EcdsaCurve::NistP521] {
+        if has(HostKeyFamily::Ecdsa(curve)) {
+            algos.push(Algorithm::Ecdsa { curve });
         }
     }
+    if has(HostKeyFamily::Rsa) {
+        algos.push(Algorithm::Rsa {
+            hash: Some(HashAlg::Sha512),
+        });
+        algos.push(Algorithm::Rsa {
+            hash: Some(HashAlg::Sha256),
+        });
+    }
+    algos
+}
+
+/// Modern algorithm set accepted by OpenSSH 8+ and Windows OpenSSH by default, filtered to host
+/// key algorithms present in `expected_keys` in canonical order (`ed25519`, `ecdsa`, `rsa`).
+fn build_ssh_config(
+    expected_keys: &[PublicKey],
+    exclude: Option<HostKeyFamily>,
+    timeouts: SshTimeouts,
+) -> Result<client::Config, ErrorBody> {
+    let host_key_algos = host_key_algorithms(expected_keys, exclude);
     if host_key_algos.is_empty() {
-        host_key_algos = vec![
-            Algorithm::Ed25519,
-            Algorithm::Ecdsa {
-                curve: EcdsaCurve::NistP256,
-            },
-            Algorithm::Ecdsa {
-                curve: EcdsaCurve::NistP384,
-            },
-            Algorithm::Ecdsa {
-                curve: EcdsaCurve::NistP521,
-            },
-            Algorithm::Rsa {
-                hash: Some(HashAlg::Sha512),
-            },
-            Algorithm::Rsa {
-                hash: Some(HashAlg::Sha256),
-            },
-        ];
+        return Err(ErrorBody::new(
+            ErrorCode::Unsupported,
+            "None of the pinned SSH host keys use a supported key algorithm (ed25519, ecdsa, rsa).",
+        )
+        .with_hint("Pin at least one ssh-ed25519, ecdsa-sha2-nistp*, or ssh-rsa host key."));
     }
 
     let preferred = Preferred {
@@ -630,13 +762,13 @@ fn build_ssh_config(expected_keys: &[PublicKey], timeouts: SshTimeouts) -> clien
         compression: Cow::Borrowed(&[compression::NONE]),
     };
 
-    client::Config {
+    Ok(client::Config {
         preferred,
         keepalive_interval: timeouts.keepalive_interval,
         keepalive_max: timeouts.keepalive_max,
         nodelay: true,
         ..client::Config::default()
-    }
+    })
 }
 
 fn bridge_channel(
@@ -774,6 +906,94 @@ mod tests {
         assert_eq!(
             parse_host_keys(&["not-a-key".to_owned()]).unwrap_err().code,
             ErrorCode::InvalidArgs
+        );
+    }
+
+    #[test]
+    fn host_key_algorithms_follow_canonical_order_and_support_exclusion() {
+        // Valid NIST P-256 ECDSA public key (generator point) + Ed25519 public key.
+        let ed = DeviceKey::from_seed([5u8; 32]).private_key().public_key().clone();
+        let ecdsa = PublicKey::from_openssh(
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBGvC1z7tL0kP4c0L6K0d6O9u1nL2y2M9N5Z2G3m5e2d5M9Q2G4H7j8K1l2M3n4O5p6Q7r8S9t0U1v2W3x4Y5z6A=",
+        );
+        // Generate an actual valid ECDSA key via ssh_key::PrivateKey if needed, or test with
+        // russh's own ed25519 + ecdsa test key.
+        let ecdsa_key = match ecdsa {
+            Ok(k) => k,
+            Err(_) => {
+                // Build a valid P-256 public key directly from the SEC1 generator point.
+                let sec1 = [
+                    0x04u8, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6,
+                    0xe5, 0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0,
+                    0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96, 0x4f, 0xe3, 0x42, 0xe2, 0xfe,
+                    0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f, 0x9e, 0x16, 0x2b, 0xce,
+                    0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51,
+                    0xf5,
+                ];
+                let ecdsa_pub = russh::keys::ssh_key::public::EcdsaPublicKey::from_sec1_bytes(&sec1)
+                    .unwrap();
+                PublicKey::from(russh::keys::ssh_key::public::KeyData::Ecdsa(ecdsa_pub))
+            }
+        };
+
+        // Even when ECDSA is listed first in pins, Ed25519 is offered first.
+        let algos = host_key_algorithms(&[ecdsa_key.clone(), ed.clone()], None);
+        assert_eq!(
+            algos,
+            vec![
+                Algorithm::Ed25519,
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP256
+                }
+            ]
+        );
+
+        // Excluding Ed25519 falls back to ECDSA only.
+        let fallback =
+            host_key_algorithms(&[ecdsa_key, ed.clone()], Some(HostKeyFamily::Ed25519));
+        assert_eq!(
+            fallback,
+            vec![Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256
+            }]
+        );
+
+        // No remaining supported algorithms fails cleanly with Unsupported.
+        let err = build_ssh_config(&[ed], Some(HostKeyFamily::Ed25519), SshTimeouts::default())
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn no_common_key_algorithm_maps_to_denied_host_key_mismatch() {
+        let ed = DeviceKey::from_seed([6u8; 32]).private_key().public_key().clone();
+        let mismatch = Arc::new(Mutex::new(None));
+        let outcome = map_handshake_error(
+            "tower.example.net",
+            22,
+            russh::Error::NoCommonAlgo {
+                kind: AlgorithmKind::Key,
+                ours: vec!["ssh-ed25519".to_owned()],
+                theirs: vec!["ecdsa-sha2-nistp256".to_owned()],
+            },
+            &mismatch,
+            &[ed],
+        );
+        let HandshakeAttemptError::Other(HostAttemptError::Fatal(err)) = outcome else {
+            panic!("expected fatal denied error");
+        };
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(err.message.contains("ecdsa-sha2-nistp256"), "{}", err.message);
+        assert!(err.message.contains("ssh-ed25519"), "{}", err.message);
+        assert!(
+            err.hint.as_deref().unwrap().contains("pinned host keys"),
+            "{:?}",
+            err.hint
+        );
+        assert_eq!(
+            err.details.unwrap()["reason"],
+            json!(REASON_HOST_KEY_MISMATCH)
         );
     }
 }
