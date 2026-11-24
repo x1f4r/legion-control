@@ -423,6 +423,11 @@ pub(crate) async fn read_body(body: Body) -> Result<Bytes, Box<Response<Body>>> 
             ),
         ))
     };
+    // A body whose declared length is already too large is refused before a byte of it is read.
+    let declared = http_body::Body::size_hint(&body).lower();
+    if usize::try_from(declared).map_or(true, |declared| declared > MAX_BODY) {
+        return Err(too_large());
+    }
     match tokio::time::timeout(BODY_TIMEOUT, axum::body::to_bytes(body, MAX_BODY)).await {
         Ok(Ok(bytes)) => Ok(bytes),
         Ok(Err(_)) => Err(too_large()),
