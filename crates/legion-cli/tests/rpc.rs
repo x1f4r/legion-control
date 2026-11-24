@@ -135,10 +135,7 @@ fn malformed_lines_get_errors_and_the_session_goes_on() {
         "call",
         json!({"tool": "meta.version", "on": "elsewhere"}),
     ));
-    assert_eq!(
-        session.next()["error"]["data"]["code"],
-        json!("unreachable")
-    );
+    assert_eq!(session.next()["error"]["data"]["code"], json!("not_found"));
 
     assert_eq!(session.finish(), 0);
 }

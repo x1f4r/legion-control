@@ -81,6 +81,7 @@ where
         }
     };
     while calls.join_next().await.is_some() {}
+    session.router.shutdown().await;
     drop(session);
     let written = writer
         .await
@@ -281,11 +282,12 @@ impl Session {
         let events = {
             let out = self.out.clone();
             let id = id.clone();
-            EventSink::new(move |kind, data| {
+            EventSink::with_events(move |event| {
                 let params = EventParams {
                     id: id.clone(),
-                    kind,
-                    data,
+                    kind: event.kind,
+                    data: event.data,
+                    machine: event.machine,
                 };
                 if let Ok(params) = serde_json::to_value(params) {
                     send(&out, &Notification::new(method::EVENT, params));
@@ -307,7 +309,7 @@ impl Session {
         let out = self.out.clone();
         let running = Arc::clone(&self.running);
         calls.spawn(async move {
-            let result = router.call(&node, call, params.on).await;
+            let result = router.call(&node, call, params.on).await.into_wire();
             running
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

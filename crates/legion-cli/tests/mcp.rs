@@ -353,10 +353,20 @@ fn failures_are_tool_results_carrying_the_error_object() {
         assert_eq!(extra["code"], json!("invalid_args"));
 
         let elsewhere = failed(&mcp.call("meta_version", json!({"on": "pi"})));
-        assert_eq!(elsewhere["code"], json!("unreachable"));
+        assert_eq!(elsewhere["code"], json!("not_found"));
         assert!(elsewhere["hint"].is_string());
-        let several = failed(&mcp.call("meta_version", json!({"on": ["tower", "pi"]})));
-        assert_eq!(several["code"], json!("unreachable"));
+        let partial = ok(&mcp.call("meta_version", json!({"on": ["tower", "pi"]})));
+        assert_eq!(partial["results"]["tower"]["ok"]["node"], json!("tower"));
+        assert_eq!(
+            partial["results"]["pi"]["error"]["code"],
+            json!("not_found")
+        );
+        let all_failed = mcp.call("meta_version", json!({"on": ["pi", "laptop"]}));
+        assert_eq!(all_failed["isError"], json!(true), "{all_failed}");
+        assert_eq!(
+            all_failed["structuredContent"]["results"]["pi"]["error"]["code"],
+            json!("not_found")
+        );
         let bad_on = failed(&mcp.call("meta_version", json!({"on": 5})));
         assert_eq!(bad_on["code"], json!("invalid_args"));
 
@@ -479,7 +489,7 @@ fn compact_mode_serves_three_tools_that_reach_every_other() {
             "legion_call",
             json!({"tool": "meta.version", "on": "elsewhere"}),
         ));
-        assert_eq!(elsewhere["code"], json!("unreachable"));
+        assert_eq!(elsewhere["code"], json!("not_found"));
         let missing = failed(&mcp.call("legion_call", json!({"args": {}})));
         assert_eq!(missing["code"], json!("invalid_args"));
         let direct = failed(&mcp.call("meta_version", json!({})));
