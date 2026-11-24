@@ -1,0 +1,26 @@
+# Example projects.toml: named projects, their per-machine paths, and runnable tasks.
+# Paths are keyed by node name so the same file can be synced across every machine.
+
+[projects.site]
+description = "Public website"
+repo = "git@git.example:me/site.git"
+
+[projects.site.on]
+tower = "~/projects/site"
+laptop = "~/code/site"
+pi = "/home/me/projects/site"
+
+[projects.site.tasks]
+# Plain string: run through the platform shell with the default timeout.
+test = "npm test"
+# Background job: starts detached through `job.start` and returns a job id.
+dev = { cmd = "npm run dev", job = true }
+# Exact argv with no shell and a custom timeout in seconds (max 3600).
+build = { argv = ["cargo", "build", "--release"], timeout_s = 1800 }
+
+[projects.notes]
+description = "Plain-text engineering notes"
+
+[projects.notes.on]
+tower = "~/notes"
+pi = "/home/me/notes"

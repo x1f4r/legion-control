@@ -1,0 +1,14 @@
+# Example tokens.toml: bearer token hashes accepted by `legion serve`.
+# Machine-local; never synced. Create real entries with `legion token add <name> <principal>`.
+# The hashes below are inert placeholders and correspond to no secret token.
+
+[tokens.phone]
+principal = "phone"
+hash = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+created = "2026-01-01T00:00:00Z"
+expires = "2027-01-01T00:00:00Z"
+
+[tokens.laptop]
+principal = "agent:reader"
+hash = "blake3:1111111111111111111111111111111111111111111111111111111111111111"
+created = "2026-01-01T00:00:00Z"

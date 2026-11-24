@@ -1,0 +1,14 @@
+# Example extension tool using exact argv (`run`, no shell).
+# Place under <config_dir>/tools.d/gpu.free.toml.
+
+name = "gpu.free"
+description = "Report free GPU memory in MiB."
+effect = "read"
+run = ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"]
+timeout_s = 15
+
+[params.index]
+type = "integer"
+description = "Optional GPU index (available to wrapper scripts as LEGION_ARG_INDEX)."
+required = false
+default = 0
