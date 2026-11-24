@@ -574,6 +574,7 @@ mod tests {
             created: now_rfc3339(),
             boot_id: "test-boot".to_owned(),
             exclusive: false,
+            launching: None,
             detach: None,
         };
         write_job_record(&dir, &record).unwrap();
@@ -632,6 +633,7 @@ mod tests {
             created: now_rfc3339(),
             boot_id: "test-boot".to_owned(),
             exclusive: false,
+            launching: None,
             detach: None,
         };
         write_job_record(&dir, &record).unwrap();
