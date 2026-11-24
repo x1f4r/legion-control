@@ -13,11 +13,11 @@
 //! working in it at the same moment.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use legion_core::CancellationToken;
 use legion_core::proto::{ErrorBody, ErrorCode};
+use legion_core::{Access, CancellationToken, Grant};
 use legion_os::OsError;
 use legion_os::run::{ChunkCallback, RunOptions, RunOutput, run};
 use legion_os::shell::CommandSpec;
@@ -463,15 +463,77 @@ impl RepoState {
     }
 }
 
-/// The repository at `path`: `Ok(None)` when it is not in one, `Err` with a sentence when git
-/// could not say.
-pub(super) async fn repo_state(
+/// Where a working tree keeps its git data. A `.git` file or `core.worktree` can put either part
+/// anywhere, so both are checked before anything is read through them.
+#[derive(Debug)]
+pub(super) struct Layout {
+    /// This working tree's own git directory.
+    pub git_dir: PathBuf,
+    /// The directory shared by all its worktrees, with the objects and most of the refs.
+    pub common_dir: PathBuf,
+}
+
+/// The git directories of the repository `path` is in: `Ok(None)` when it is in none.
+pub(super) async fn layout(
     path: &Path,
     cancel: &CancellationToken,
-) -> Result<Option<RepoState>, String> {
-    let filters = filter_overrides(path, cancel)
-        .await
-        .map_err(|error| error.message)?;
+) -> Result<Option<Layout>, ErrorBody> {
+    let output = Git::read(
+        path,
+        &["rev-parse", "--absolute-git-dir", "--git-common-dir"],
+        cancel,
+    )
+    .run()
+    .await?;
+    if not_a_repository(&output) {
+        return Ok(None);
+    }
+    let mut lines = output.stdout.text.lines();
+    match (output.exit_code, lines.next(), lines.next()) {
+        (Some(0), Some(git_dir), Some(common_dir)) => Ok(Some(Layout {
+            git_dir: PathBuf::from(git_dir),
+            // A relative common directory is relative to where git ran.
+            common_dir: path.join(common_dir),
+        })),
+        _ => Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "git could not say where the repository at {} keeps its data: {}",
+                path.display(),
+                explanation(&output)
+            ),
+        )),
+    }
+}
+
+impl Layout {
+    /// Checks that the caller may use both git directories as `access` says; a confined role must
+    /// not reach a repository outside its paths through a working tree inside them.
+    pub(super) fn check(&self, grant: &Grant, access: Access) -> Result<(), ErrorBody> {
+        for dir in [&self.git_dir, &self.common_dir] {
+            grant.check_path(dir, access).map_err(|error| {
+                error.with_hint(format!(
+                    "The working tree keeps its git data in {}, through a .git file or the repository's configuration, and the caller may not use that place.",
+                    dir.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The repository at `path`: `Ok(None)` when it is not in one.
+pub(super) async fn repo_state(
+    path: &Path,
+    grant: &Grant,
+    cancel: &CancellationToken,
+) -> Result<Option<RepoState>, ErrorBody> {
+    let failed = |message: String| ErrorBody::new(ErrorCode::Failed, message);
+    let Some(layout) = layout(path, cancel).await? else {
+        return Ok(None);
+    };
+    layout.check(grant, Access::Read)?;
+    let filters = filter_overrides(path, cancel).await?;
     let status_args = [
         "status",
         "--porcelain=v2",
@@ -483,8 +545,7 @@ pub(super) async fn repo_state(
     let mut output = Git::read(path, &status_args, cancel)
         .with_config(filters.clone())
         .run()
-        .await
-        .map_err(|error| error.message)?;
+        .await?;
     if not_a_repository(&output) {
         return Ok(None);
     }
@@ -494,23 +555,27 @@ pub(super) async fn repo_state(
         output = Git::read(path, &status_args[..5], cancel)
             .with_config(filters)
             .run()
-            .await
-            .map_err(|error| error.message)?;
+            .await?;
     }
     if output.exit_code != Some(0) {
-        return Err(format!("git status failed: {}", explanation(&output)));
+        return Err(failed(format!(
+            "git status failed: {}",
+            explanation(&output)
+        )));
     }
     if output.stdout.truncated {
-        return Err("git status printed more than legion reads; the working tree has too many changes to count".to_owned());
+        return Err(failed("git status printed more than legion reads; the working tree has too many changes to count.".to_owned()));
     }
     let mut status = parse_porcelain(&output.stdout.text).map_err(|error| {
-        format!("git status said something legion does not understand: {error}")
+        failed(format!(
+            "git status said something legion does not understand: {error}."
+        ))
     })?;
     if old_git {
         status.stash = stash_count(path, cancel).await;
     }
     let last_commit = match &status.oid {
-        Some(_) => last_commit(path, cancel).await?,
+        Some(_) => last_commit(path, cancel).await.map_err(failed)?,
         None => None,
     };
     Ok(Some(RepoState::new(status, last_commit)))

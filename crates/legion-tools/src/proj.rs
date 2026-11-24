@@ -197,9 +197,9 @@ pub struct ProjectStatus {
     /// Its git state, when it is a git repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<RepoState>,
-    /// Why its state could not be read.
+    /// Why its state could not be read, as an error object with the code to branch on.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<ErrorBody>,
 }
 
 async fn status(ctx: &Ctx, args: StatusArgs) -> Result<Statuses, ToolError> {
@@ -217,7 +217,7 @@ async fn status(ctx: &Ctx, args: StatusArgs) -> Result<Statuses, ToolError> {
                     let path = ctx
                         .grant()
                         .check_path(written, Access::Read)
-                        .map_err(|error| (written.clone(), error.message));
+                        .map_err(|error| (written.clone(), error));
                     targets.push((name.clone(), path));
                 }
             }
@@ -244,9 +244,10 @@ async fn status(ctx: &Ctx, args: StatusArgs) -> Result<Statuses, ToolError> {
         };
         let limit = Arc::clone(&limit);
         let cancel = ctx.cancel_token().child_token();
+        let grant = ctx.grant().clone();
         running.spawn(async move {
             let _turn = limit.acquire_owned().await;
-            (index, project_status(name, path, cancel).await)
+            (index, project_status(name, path, grant, cancel).await)
         });
     }
     while let Some(done) = running.join_next().await {
@@ -266,12 +267,22 @@ async fn status(ctx: &Ctx, args: StatusArgs) -> Result<Statuses, ToolError> {
 }
 
 /// A project's path for `proj.status`, or the path as written and why it cannot be looked at.
-type Target = Result<PathBuf, (String, String)>;
+type Target = Result<PathBuf, (String, ErrorBody)>;
 
-async fn project_status(name: String, path: PathBuf, cancel: CancellationToken) -> ProjectStatus {
+async fn project_status(
+    name: String,
+    path: PathBuf,
+    grant: Grant,
+    cancel: CancellationToken,
+) -> ProjectStatus {
     let shown = path.display().to_string();
     if !path.is_dir() {
-        let error = path.exists().then(|| format!("{shown} is not a directory"));
+        let error = path.exists().then(|| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("{shown} is a file, and a project lives in a directory."),
+            )
+        });
         return ProjectStatus {
             name,
             path: shown,
@@ -280,15 +291,19 @@ async fn project_status(name: String, path: PathBuf, cancel: CancellationToken) 
             error,
         };
     }
-    let state = tokio::time::timeout(PROJECT_TIMEOUT, git::repo_state(&path, &cancel)).await;
+    let state =
+        tokio::time::timeout(PROJECT_TIMEOUT, git::repo_state(&path, &grant, &cancel)).await;
     let (git, error) = match state {
         Ok(Ok(git)) => (git, None),
         Ok(Err(error)) => (None, Some(error)),
         Err(_) => (
             None,
-            Some(format!(
-                "git took longer than {} seconds to describe it",
-                PROJECT_TIMEOUT.as_secs()
+            Some(ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "git took longer than {} seconds to describe it.",
+                    PROJECT_TIMEOUT.as_secs()
+                ),
             )),
         ),
     };
@@ -638,6 +653,18 @@ async fn pull(ctx: &Ctx, args: PullArgs) -> Result<Pulled, ToolError> {
     let (_, written) = here(ctx, &file, &args.project)?;
     let path = existing_dir(ctx, &args.project, written, Access::Write)?;
     let cancel = ctx.cancel_token().clone();
+    match git::layout(&path, &cancel).await? {
+        Some(layout) => layout.check(ctx.grant(), Access::Write)?,
+        None => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "{} is not a git repository, so there is nothing to pull.",
+                    path.display()
+                ),
+            ));
+        }
+    }
     let before = git::head(&path, &cancel).await?;
     let output = Git {
         args: ["pull", "--ff-only", "--no-rebase"]
@@ -991,6 +1018,9 @@ pub struct Found {
     pub repo: Option<String>,
     /// Whether projects.toml already records it as living here.
     pub already_listed: bool,
+    /// Why its repository could not be read, such as git data outside the caller's paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
 }
 
 async fn discover(ctx: &Ctx, args: DiscoverArgs) -> Result<Discovered, ToolError> {
@@ -1029,12 +1059,7 @@ async fn discover(ctx: &Ctx, args: DiscoverArgs) -> Result<Discovered, ToolError
     let cancel = ctx.cancel_token().clone();
     let mut repos = Vec::with_capacity(walked.found.len());
     for path in &walked.found {
-        let repo = Git::read(path, &["config", "--get", "remote.origin.url"], &cancel)
-            .run()
-            .await
-            .ok()
-            .and_then(|output| git::first_line(&output));
-        repos.push(repo);
+        repos.push(origin(path, ctx.grant(), &cancel).await);
     }
 
     let grant = ctx.grant().clone();
@@ -1083,7 +1108,7 @@ fn classify(
     node: &str,
     grant: &Grant,
     paths: &[PathBuf],
-    repos: Vec<Option<String>>,
+    repos: Vec<Origin>,
 ) -> Vec<Found> {
     let listed: BTreeMap<PathBuf, &str> = file
         .projects
@@ -1099,7 +1124,7 @@ fn classify(
     paths
         .iter()
         .zip(repos)
-        .map(|(path, repo)| {
+        .map(|(path, (repo, error))| {
             let (name, already_listed) = match listed.get(path) {
                 Some(name) => ((*name).to_owned(), true),
                 None => (new_names.next().unwrap_or_default(), false),
@@ -1109,9 +1134,42 @@ fn classify(
                 name,
                 repo,
                 already_listed,
+                error,
             }
         })
         .collect()
+}
+
+/// Where a working tree's `origin` points, or why it was not read.
+type Origin = (Option<String>, Option<ErrorBody>);
+
+/// Reads the `origin` remote of the working tree at `path`, from its own configuration file only:
+/// an include could pull in a file from anywhere, and the caller may not be allowed to read there.
+async fn origin(path: &Path, grant: &Grant, cancel: &CancellationToken) -> Origin {
+    let layout = match git::layout(path, cancel).await {
+        Ok(Some(layout)) => layout,
+        Ok(None) => return (None, None),
+        Err(error) => return (None, Some(error)),
+    };
+    if let Err(error) = layout.check(grant, Access::Read) {
+        return (None, Some(error));
+    }
+    let repo = Git::read(
+        path,
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            "remote.origin.url",
+        ],
+        cancel,
+    )
+    .run()
+    .await
+    .ok()
+    .and_then(|output| git::first_line(&output));
+    (repo, None)
 }
 
 /// A path as projects.toml should hold it: from `~` when it is under the home directory, which

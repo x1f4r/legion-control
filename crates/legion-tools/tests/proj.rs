@@ -81,6 +81,10 @@ fn main() -> ExitCode {
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
+        (
+            "git_indirection_does_not_lead_a_confined_role_outside",
+            || Box::pin(git_indirection_does_not_lead_a_confined_role_outside()),
+        ),
         ("reading_a_hostile_repository_runs_nothing", || {
             Box::pin(reading_a_hostile_repository_runs_nothing())
         }),
@@ -876,8 +880,12 @@ async fn a_confined_role_sees_only_its_paths() {
     );
     let out = entry(&status, "out");
     assert_eq!(out.get("git"), None);
+    assert_eq!(out["error"]["code"], json!("denied"), "{out:#}");
     assert!(
-        out["error"].as_str().unwrap().contains("confines"),
+        out["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("confines"),
         "{out:#}"
     );
     let listing = fixture
@@ -1044,4 +1052,86 @@ async fn reading_a_hostile_repository_runs_nothing() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(ran.is_empty(), "reading the repository ran {ran:?}");
+}
+
+async fn git_indirection_does_not_lead_a_confined_role_outside() {
+    let fixture = tower();
+    fixture.write_config(
+        "policy.toml",
+        "[principals.\"agent:claude\"]\nrole = \"builder\"\n[roles.builder]\nallow = [\"effect:read\", \"effect:write\", \"effect:exec\"]\npaths = [\"~/projects/**\"]\n",
+    );
+    let agent = "agent:claude";
+    let private = fixture.home().join("private");
+    let real = private.join("real");
+    repo(&real);
+    commit(&real, "secret.txt", "secret\n");
+    git(
+        &real,
+        &["commit", "--quiet", "--amend", "-m", "Secret subject"],
+    );
+    let projects = fixture.home().join("projects");
+    let linked = projects.join("linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", real.join(".git").display()),
+    )
+    .unwrap();
+    let included = projects.join("included");
+    repo(&included);
+    let secret_config = private.join("secret.cfg");
+    std::fs::write(
+        &secret_config,
+        "[remote \"origin\"]\n\turl = https://git.example/me/secret.git\n",
+    )
+    .unwrap();
+    git(
+        &included,
+        &["config", "include.path", secret_config.to_str().unwrap()],
+    );
+    fixture.write_config(
+        "projects.toml",
+        "[projects.linked.on]\ntower = \"~/projects/linked\"\n[projects.included.on]\ntower = \"~/projects/included\"\n",
+    );
+
+    let status = fixture
+        .call_as(agent, "proj.status", json!({}))
+        .await
+        .unwrap();
+    let text = status.to_string();
+    assert!(!text.contains("Secret subject"), "{status:#}");
+    let linked_entry = entry(&status, "linked");
+    assert_eq!(linked_entry.get("git"), None, "{status:#}");
+    assert_eq!(linked_entry["error"]["code"], json!("denied"), "{status:#}");
+    assert_eq!(entry(&status, "included")["git"]["clean"], json!(true));
+
+    let found = fixture
+        .call_as(agent, "proj.discover", json!({"root": "~/projects"}))
+        .await
+        .unwrap();
+    assert!(!found.to_string().contains("secret.git"), "{found:#}");
+    let linked_found = found["found"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == json!("linked"))
+        .unwrap();
+    assert_eq!(linked_found["error"]["code"], json!("denied"), "{found:#}");
+
+    let pulled = fixture
+        .call_as(agent, "proj.pull", json!({"project": "linked"}))
+        .await
+        .unwrap_err();
+    assert_eq!(pulled.code, ErrorCode::Denied, "{pulled:?}");
+
+    // The owner, who may go anywhere, still sees through the link.
+    let owner = fixture
+        .call("proj.status", json!({"project": "linked"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        owner["projects"][0]["git"]["last_commit"]["subject"],
+        json!("Secret subject"),
+        "{owner:#}"
+    );
 }
