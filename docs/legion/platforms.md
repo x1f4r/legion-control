@@ -98,11 +98,12 @@ leaves it.
    invite (there is no trust on first use), and hands over its public key and a name.
 3. The node enforces exact UTC expiry against `state/devices.json` (and refuses the temporary key
    or any key already present in `authorized_keys`), replaces the temporary line with a permanent
-   one that forces `legion gate --as <principal> --device <name>` (always pinning `--home` or
-   `--config-dir`/`--state-dir`, plus `--account` on Windows's shared
-   `administrators_authorized_keys`), records the device, and audits it with `door: "ssh"`. From
-   then on the device can only speak the Legion protocol as that principal, with that principal's
-   role, and every call it makes is reported and audited with `door: "ssh"` and its device name.
+   one that forces `legion gate --as <principal> --device <name> --pairing <id>` (always pinning a
+   random per-pairing id and `--home` or `--config-dir`/`--state-dir`, plus `--account` on
+   Windows's shared `administrators_authorized_keys`), records the device, and audits it with
+   `door: "ssh"`. From then on the device can only speak the Legion protocol as that principal, with
+   that principal's role, and every call it makes is reported and audited with `door: "ssh"` and its
+   device name.
 
 `device.list` shows paired devices (and sweeps expired invites recorded by this home, plus reports
 foreign or orphaned Legion lines for owner callers) and `device.remove` removes the key, immediately

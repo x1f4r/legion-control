@@ -705,9 +705,10 @@ What happens during pairing:
    hostname when Tailscale is absent), the account and port, the node's sshd public host keys
    (pinned — when `[devices] host_keys` is unset, `ssh-keyscan` against local `sshd` is intersected
    with readable default host `.pub` files as `ssh-keyscan+files`, refusing disjoint results with a
-   `[devices] host_keys` hint, and falling back to scan alone or files alone only when the other is
-   unavailable; invites without a usable host key are refused), and the temporary key. Neither the
-   invite text nor the temporary key is logged or audited.
+   `[devices] host_keys` hint, and falling back to scan alone — labelled `ssh-keyscan only`, with a
+   warning in `legion pair` — or files alone only when the other is unavailable; invites without a
+   usable host key are refused), and the temporary key. Neither the invite text nor the temporary
+   key is logged or audited.
    **Keep the invite secret until used:** `device.invite` returns the invite text (which carries
    the temporary private key seed) in its tool result, so invoking `device.invite` through an AI
    agent puts the live invite into that agent's conversation transcript. Run `legion pair` directly
@@ -719,21 +720,25 @@ What happens during pairing:
    temporary key stops working at its exact expiry because `legion gate --enrol` refuses it and
    the expired line is swept on the next `device.*` command), refuses enrolling the invite's own
    temporary key or any key already present in `authorized_keys`, replaces the temporary line with
-   a permanent `restrict,command="<legion> gate --as phone --device <name> ..."` line pinning the
-   node's config and state directories, records the device in `state/devices.json`, and writes an
-   audit record (`door: "ssh"`, `tool: "device.enrol"`, `device: "<name>"`). The temporary key
-   immediately stops working. Every subsequent call served through `legion gate` is reported and
-   audited with `door: "ssh"` (and `device: "<name>"` when `--device` is set).
+   a permanent `restrict,command="<legion> gate --as phone --device <name> --pairing <id> ..."` line
+   pinning a random per-pairing id and the node's config and state directories, records the device
+   in `state/devices.json`, and writes an audit record (`door: "ssh"`, `tool: "device.enrol"`,
+   `device: "<name>"`). The temporary key immediately stops working. Every subsequent call served
+   through `legion gate` is reported and audited with `door: "ssh"` (and `device: "<name>"` when
+   `--device` is set).
 
 Inspect paired devices and pending invites, or revoke one at once (removing a paired device also
 terminates any active sessions and same-account parent `sshd` connections — including multiplexed
 `ControlMaster` connections — immediately and reports `sessions_ended`, while `legion gate`
-re-checks `authorized_keys` after registering so a newly opened channel on an already-open
-connection is refused too; detached background jobs the device started keep running and their IDs
-are reported in `jobs_left_running`, so cancel them separately with `job.cancel` if needed). For
-owner callers, `device.list` also shows Legion lines pointing at another or deleted Legion home
-(`foreign: true`, `missing_home: true`, `home`), `meta.doctor` warns about orphaned keys, and
-`device.remove ... foreign=true` cleans them up:
+re-checks `authorized_keys` for its exact `--device` and `--pairing` id after registering and tears
+down its verified same-account parent `sshd` on refusal, so neither a newly opened channel on an
+already-open connection nor a later re-pair under the same name can revive a revoked pairing;
+detached background jobs the device started keep running and their IDs are reported in
+`jobs_left_running`, so cancel them separately with `job.cancel` if needed). For owner callers,
+`device.list` also shows Legion lines pointing at another or deleted Legion home (`foreign: true`,
+`missing_home: true`, `home`), `meta.doctor` warns about orphaned keys, and
+`device.remove ... foreign=true` cleans them up (removing a foreign device's key without ending
+sessions tracked under that other home and reporting `sessions_not_ended: true` with a hint):
 
 ```sh
 legion device.list
@@ -749,8 +754,9 @@ By default Legion edits `~/.ssh/authorized_keys` (on Windows, when the account i
 `%ProgramData%\ssh\administrators_authorized_keys`, sets its owner to `BUILTIN\Administrators`
 alongside the `Administrators` and `SYSTEM` ACL, pins `--account` on forced commands so each
 administrator sees and manages only their own entries, and quotes forced commands for the shell
-configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` — `cmd.exe` by default, PowerShell, or a POSIX
-shell such as Git Bash, refusing unrecognised shells clearly). Host keys intersect `ssh-keyscan`
+configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` — `cmd.exe` by default, PowerShell (refusing
+Unicode curly single-quote delimiters `U+2018`–`U+201B`), or a POSIX shell such as Git Bash,
+refusing unrecognised shells clearly). Host keys intersect `ssh-keyscan`
 against local `sshd` on the invite's port with `/etc/ssh/ssh_host_*_key.pub` (or
 `%ProgramData%\ssh\ssh_host_*_key.pub` on Windows), refusing disjoint keys unless configured
 explicitly. To override either for a custom sshd setup, set `[devices]` in `node.toml`:
