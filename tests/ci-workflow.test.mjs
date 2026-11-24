@@ -110,3 +110,21 @@ test('Dependabot proposes weekly updates for the actions, Cargo and the UI brows
   assert.match(of('npm'), /directory: \/apps\/ui\/test\n/);
   for (const block of ecosystems) assert.match(block, /schedule:\n\s+interval: weekly/);
 });
+
+test('legion-app.yml covers every platform with timeouts, credential-free checkouts, and no secrets', () => {
+  const appWorkflow = read('.github/workflows/legion-app.yml');
+  const appJobs = jobs(appWorkflow);
+  for (const id of ['rust-check', 'android', 'linux-desktop', 'ios', 'macos-desktop', 'windows-desktop']) {
+    assert.ok(appJobs.has(id), `legion-app.yml has no job ${id}`);
+  }
+  for (const [id, lines] of appJobs) {
+    assert.ok(lines.some(line => /^ {4}timeout-minutes: \d+$/.test(line)), `legion-app.yml:${id} has no timeout-minutes`);
+    lines.forEach((line, at) => {
+      if (/uses: actions\/checkout@/.test(line)) {
+        assert.match(lines.slice(at + 1, at + 3).join('\n'), /persist-credentials: false/, `legion-app.yml:${id} keeps the checkout's token`);
+      }
+    });
+    assert.doesNotMatch(lines.join('\n'), /secrets\./, `legion-app.yml:${id} reads a secret`);
+  }
+  assert.match(appWorkflow, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \|\| \(github\.event_name == 'push' && github\.ref != 'refs\/heads\/main'\) \}\}/);
+});
