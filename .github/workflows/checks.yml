@@ -79,6 +79,10 @@ jobs:
       # tests run the built binary under a LEGION_HOME of their own, so Windows is the one place its
       # paths, its locks and its line endings are exercised.
       - run: bash scripts/check.sh rust
+      # Verify that the generated tool reference matches the built binary's registry.
+      - name: Check generated Legion tool reference
+        if: runner.os == 'Linux'
+        run: node scripts/legion-tools-doc.mjs --bin target/debug/legion --check
       # Building each crate's tests on its own catches feature unification bugs where a crate only
       # compiles because another workspace member enabled a dependency feature.
       - name: Build each crate's tests alone
