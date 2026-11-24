@@ -72,6 +72,7 @@ async fn version_says_which_build_runs() {
     assert_eq!(version["name"], json!("legion"));
     assert_eq!(version["version"], json!(VERSION));
     assert_eq!(version.get("build").and_then(Value::as_str), BUILD);
+    assert_eq!(version["install"], json!("standalone"));
     assert_eq!(version["protocol"], json!(1));
     assert_eq!(version["os"], json!(std::env::consts::OS));
     assert_eq!(version["node"], json!(fixture.node.name()));

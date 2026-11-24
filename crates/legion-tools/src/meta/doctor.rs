@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent::find_program_on_env_path;
+use crate::package::{PackageManager, detect_package_manager};
 
 use super::Check;
 
@@ -58,8 +59,15 @@ struct FleetPingResponse {
 
 /// Runs the extra environment, policy, and (unless `quick` is set) fleet checks and appends them.
 pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec<Check>) {
-    let exe_dir = legion_core::current_exe()
-        .ok()
+    let exe_path = legion_core::current_exe().ok();
+    let package_manager = exe_path.as_deref().and_then(detect_package_manager);
+    checks.push(check_installation(
+        exe_path.as_deref(),
+        package_manager.as_ref(),
+    ));
+
+    let exe_dir = exe_path
+        .as_deref()
         .and_then(|path| path.parent().map(Path::to_path_buf));
     let login_path = query_login_shell_path(ctx).await;
     checks.push(check_executable_on_path(
@@ -117,6 +125,36 @@ pub fn check_pending_power(pending: &crate::power::pending::Pending) -> Check {
         hint: Some(
             "power.cancel calls it off until then; power.status shows it under pending.".to_owned(),
         ),
+    }
+}
+
+/// Reports how this `legion` binary was installed and whether in-place self-update is managed by
+/// a system package manager.
+pub fn check_installation(exe: Option<&Path>, manager: Option<&PackageManager>) -> Check {
+    let detail = match (exe, manager) {
+        (Some(path), Some(pm)) => format!(
+            "Installed at {}, managed by {} (upgrade through the package manager; meta.update is disabled).",
+            path.display(),
+            pm.display_name()
+        ),
+        (None, Some(pm)) => format!(
+            "Managed by {} (upgrade through the package manager; meta.update is disabled).",
+            pm.display_name()
+        ),
+        (Some(path), None) => format!(
+            "Installed at {} as a standalone binary (self-update via meta.update is enabled).",
+            path.display()
+        ),
+        (None, None) => {
+            "Installed as a standalone binary (executable path could not be determined).".to_owned()
+        }
+    };
+    Check {
+        name: "installation".to_owned(),
+        ok: true,
+        warning: false,
+        detail,
+        hint: None,
     }
 }
 
@@ -858,5 +896,28 @@ deny = [\"effect:power\", \"effect:admin\"]
         assert_eq!(checks[5].name, "fleet: noisy");
         assert!(!checks[5].ok && !checks[5].warning);
         assert!(checks[5].detail.contains("non-protocol lines"));
+    }
+
+    #[test]
+    fn installation_check_reports_standalone_and_package_managers() {
+        let standalone = check_installation(Some(Path::new("/home/me/.local/bin/legion")), None);
+        assert_eq!(standalone.name, "installation");
+        assert!(standalone.ok && !standalone.warning && standalone.hint.is_none());
+        assert!(standalone.detail.contains("standalone"));
+
+        let deb = check_installation(
+            Some(Path::new("/usr/bin/legion")),
+            Some(&PackageManager::Deb),
+        );
+        assert!(deb.ok && !deb.warning);
+        assert!(deb.detail.contains("deb (apt)"));
+        assert!(deb.detail.contains("meta.update is disabled"));
+
+        let pacman = check_installation(
+            Some(Path::new("/usr/bin/legion")),
+            Some(&PackageManager::Pacman),
+        );
+        assert!(pacman.ok && !pacman.warning);
+        assert!(pacman.detail.contains("pacman"));
     }
 }
