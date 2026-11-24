@@ -16,6 +16,7 @@ function invoke(command, payload) {
       message: 'The native Legion shell is not available in this window.',
       hint: null,
       machine: null,
+      details: null,
     });
   }
   return core.invoke(command, payload);
@@ -28,6 +29,7 @@ function normalizeError(err) {
       message: err.message,
       hint: err.hint || null,
       machine: err.machine || null,
+      details: err.details || null,
     };
   }
   return {
@@ -35,13 +37,57 @@ function normalizeError(err) {
     message: typeof err === 'string' ? err : 'The native command failed.',
     hint: null,
     machine: null,
+    details: null,
   };
 }
 
-export function createAppLink() {
-  let nextCallId = 1;
+function randomCallPrefix() {
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Math.random().toString(16).slice(2, 10) + Date.now().toString(16);
+}
 
-  async function state() {
+export function createAppLink() {
+  const callPrefix = randomCallPrefix();
+  let nextCallId = 1;
+  let readySent = false;
+
+  function signalReady() {
+    if (readySent) return;
+    readySent = true;
+    let fired = false;
+    const fire = () => {
+      if (fired) return;
+      fired = true;
+      invoke('ready').catch(() => {});
+    };
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => window.requestAnimationFrame(fire));
+      window.setTimeout(fire, 250);
+    } else {
+      fire();
+    }
+  }
+  function ensureLocalNetworkPermission() {
+    if (typeof window === 'undefined') return Promise.resolve(true);
+    const android = window.__LEGION_ANDROID__;
+    if (!android || typeof android.requestLocalNetwork !== 'function') {
+      return Promise.resolve(true);
+    }
+    try {
+      if (typeof android.hasLocalNetwork === 'function' && android.hasLocalNetwork() === true) {
+        return Promise.resolve(true);
+      }
+      return Promise.resolve(android.requestLocalNetwork()).then(Boolean, () => true);
+    } catch {
+      return Promise.resolve(true);
+    }
+  }
+
+  async function rawState() {
     try {
       return await invoke('state');
     } catch (err) {
@@ -59,12 +105,11 @@ export function createAppLink() {
 
   async function call(tool, args = {}, options = {}) {
     const { on, onEvent, signal } = options || {};
-    const id = `c${nextCallId++}`;
+    const id = `${callPrefix}-${nextCallId++}`;
     const core = tauriCore();
 
-    let channel = null;
-    if (typeof onEvent === 'function' && core && typeof core.Channel === 'function') {
-      channel = new core.Channel();
+    const channel = core && typeof core.Channel === 'function' ? new core.Channel() : null;
+    if (channel && typeof onEvent === 'function') {
       channel.onmessage = (evt) => {
         try {
           onEvent(evt);
@@ -84,6 +129,7 @@ export function createAppLink() {
           message: 'The call was cancelled.',
           hint: null,
           machine: null,
+          details: null,
         };
       }
       signal.addEventListener('abort', onAbort, { once: true });
@@ -107,7 +153,58 @@ export function createAppLink() {
     }
   }
 
+  async function state() {
+    try {
+      const base = await rawState();
+      if (!base?.ready || !Array.isArray(base.nodes) || base.nodes.length === 0) {
+        return base;
+      }
+
+      await ensureLocalNetworkPermission();
+
+      try {
+        const [whoami, version] = await Promise.all([
+          call('meta.whoami', {}),
+          call('meta.version', {}).catch(() => null),
+        ]);
+        // Re-read backend state in case failover switched the active node during the probe.
+        const latest = await rawState().catch(() => base);
+        const nodes = Array.isArray(latest?.nodes) && latest.nodes.length > 0 ? latest.nodes : base.nodes;
+        const primary = nodes[0];
+        const enriched = {
+          ...primary,
+          node: whoami.node || primary.node,
+          principal: whoami.principal || primary.principal,
+          role: whoami.role || primary.role,
+          version: version?.version || '',
+          build: version?.build || null,
+          protocol: version?.protocol ?? 1,
+          whoami,
+        };
+        return {
+          ...latest,
+          nodes: [enriched, ...nodes.slice(1)],
+        };
+      } catch (err) {
+        return {
+          ...base,
+          error: normalizeError(err),
+        };
+      }
+    } finally {
+      signalReady();
+    }
+  }
+
   async function deviceName() {
+    if (
+      typeof window !== 'undefined' &&
+      window.__LEGION_ANDROID__ &&
+      typeof window.__LEGION_ANDROID__.deviceModel === 'function'
+    ) {
+      const model = String(window.__LEGION_ANDROID__.deviceModel() || '').trim();
+      if (model) return model;
+    }
     try {
       const name = await invoke('device_name');
       return typeof name === 'string' ? name : '';
@@ -117,8 +214,18 @@ export function createAppLink() {
   }
 
   async function pair(inviteText, name) {
+    const granted = await ensureLocalNetworkPermission();
+    if (!granted) {
+      throw {
+        code: 'denied',
+        message: 'Local network permission was denied.',
+        hint: 'Allow local network access for Legion in Android Settings to connect to machines on your LAN or Tailscale.',
+        machine: null,
+        details: null,
+      };
+    }
     try {
-      await invoke('pair', { inviteText, deviceName: name });
+      await invoke('pair', { invite: inviteText, name: name || null });
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -130,6 +237,37 @@ export function createAppLink() {
       return await invoke('unpair', { node });
     } catch (err) {
       throw normalizeError(err);
+    }
+  }
+
+  async function selectNode(node) {
+    try {
+      await invoke('select_node', { node });
+      return await state();
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function repairStore() {
+    try {
+      const result = await invoke('repair_store');
+      const nextState = await state();
+      return {
+        archived_to: result?.archived_to || '',
+        message: result?.message || '',
+        state: nextState,
+      };
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function invalidateSessions() {
+    try {
+      await invoke('invalidate_sessions');
+    } catch {
+      // Best-effort teardown on resume; subsequent calls still reconnect on error.
     }
   }
 
@@ -159,6 +297,9 @@ export function createAppLink() {
     deviceName,
     pair,
     unpair,
+    selectNode,
+    repairStore,
+    invalidateSessions,
     scanInvite,
   };
 }

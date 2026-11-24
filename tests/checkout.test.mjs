@@ -34,3 +34,23 @@ test('scripts are written out with LF line endings in every checkout', () => {
     'somewhere/new.mjs: text: set', 'somewhere/new.mjs: eol: lf',
   ].join('\n') + '\n');
 });
+
+test('Android Gradle wrapper scripts keep LF for gradlew and CRLF for gradlew.bat', () => {
+  const files = new Map(git('ls-files', '--eol', '--', '*gradlew', '*gradlew.bat').split('\n').filter(Boolean).map((line) => {
+    const [, index, attributes, file] = /^i\/(\S*)\s+w\/\S*\s+attr\/(.*?)\s*\t(.+)$/.exec(line);
+    return [file, { index, attributes }];
+  }));
+  const unixWrapper = 'apps/legion-app/src-tauri/gen/android/gradlew';
+  const winWrapper = 'apps/legion-app/src-tauri/gen/android/gradlew.bat';
+  assert.ok(files.has(unixWrapper), `${unixWrapper} is not in the checkout`);
+  assert.ok(files.has(winWrapper), `${winWrapper} is not in the checkout`);
+  for (const [file, { index, attributes }] of files) {
+    if (file.endsWith('.bat')) {
+      assert.equal(attributes, 'text eol=crlf', `${file} has no CRLF rule`);
+      assert.equal(index, 'crlf', `${file} is stored with ${index} line endings`);
+    } else {
+      assert.equal(attributes, 'text eol=lf', `${file} has no LF rule`);
+      assert.equal(index, 'lf', `${file} is stored with ${index} line endings`);
+    }
+  }
+});

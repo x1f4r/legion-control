@@ -140,9 +140,18 @@ function setupFleet(root) {
   );
   fs.writeFileSync(path.join(towerHome, 'config', 'policy.toml'), policy);
 
+  const probeCmd = [process.execPath, '-e', "console.log('1239887 worker'); process.exit(0)"];
   fs.writeFileSync(
     path.join(piHome, 'config', 'node.toml'),
-    'name = "pi"\nsystem = "linux"\nbusy = "none"\n',
+    [
+      'name = "pi"',
+      'system = "linux"',
+      '',
+      '[[busy.probes]]',
+      'name = "agents"',
+      `run = ${JSON.stringify(probeCmd)}`,
+      '',
+    ].join('\n'),
   );
   fs.writeFileSync(path.join(piHome, 'config', 'policy.toml'), policy);
 
@@ -215,14 +224,31 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
     // Machines appear (both local tower and remote pi over command pipe).
     await page.getByText('Machines · 2 of 2 answering').waitFor({ timeout: 15_000 });
     await page.locator('a.row', { hasText: 'tower' }).waitFor();
-    await page.locator('a.row', { hasText: 'pi' }).waitFor();
+    const piRow = page.locator('a.row', { hasText: 'pi' });
+    await piRow.waitFor();
     await page.locator('a.row .meters').nth(1).waitFor({ timeout: 5_000 });
+    // Busy probe reason formats cleanly as "busy: agents" without [object Object] or raw detail.
+    await piRow.getByText(/busy: agents/).waitFor({ timeout: 5_000 });
+    const piRowText = await piRow.innerText();
+    assert.ok(!piRowText.includes('[object Object]'), `raw object in pi row: ${piRowText}`);
+    assert.ok(!piRowText.includes('1239887'), `raw probe detail leaked into list row: ${piRowText}`);
     await maybeShot(page, 'real-phone-dark-machines');
     await setTheme(page, 'light');
     await maybeShot(page, 'real-phone-light-machines');
     await setTheme(page, 'dark');
 
-    // Open a machine -> Overview.
+    // Open busy machine (pi) -> Overview and Power tabs show full "name: detail" reason lines.
+    await piRow.first().click();
+    await page.getByRole('tab', { name: 'Overview', selected: true }).waitFor();
+    await page.getByText('agents: busy: 1239887 worker').waitFor({ timeout: 5_000 });
+    await page.getByRole('tab', { name: 'Power' }).click();
+    await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
+    await page.getByText('agents: busy: 1239887 worker').waitFor({ timeout: 5_000 });
+    const piPowerText = await page.locator('.main').innerText();
+    assert.ok(!piPowerText.includes('[object Object]'), `raw object in pi Power tab: ${piPowerText}`);
+
+    // Back to Machines and open tower -> Overview.
+    await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: 'Machines' }).click();
     await page.locator('a.row', { hasText: 'tower' }).first().click();
     await page.getByRole('tab', { name: 'Overview', selected: true }).waitFor();
     await page.getByText('Processor').waitFor();
@@ -420,6 +446,20 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
 
       await p.goto(`${server.url}/?mock`, { waitUntil: 'domcontentloaded' });
       await p.getByText('Machines · 3 of 4 answering').waitFor();
+      // Multi-reason busy machine shows "busy: agents +1" (never [object Object] or raw detail).
+      const studioRow = p.locator('a.row', { hasText: 'studio' }).first();
+      await studioRow.getByText(/busy: agents \+1/).waitFor();
+      const studioRowText = await studioRow.innerText();
+      assert.ok(!studioRowText.includes('[object Object]'), `raw object in studio row: ${studioRowText}`);
+      assert.ok(!studioRowText.includes('1239887'), `raw probe detail in studio row: ${studioRowText}`);
+      // Offline dual-boot machine row shows short "Did not answer" without raw transport error.
+      const laptopRow = p.locator('a.row.off', { hasText: 'laptop' }).first();
+      await laptopRow.getByText(/Did not answer/).waitFor();
+      const laptopRowText = await laptopRow.innerText();
+      assert.ok(
+        !laptopRowText.includes("None of laptop's systems answered"),
+        `raw node error leaked into list row: ${laptopRowText}`,
+      );
       await setTheme(p, 'dark');
       await maybeShot(p, `mock-${label}-dark-machines`);
       if (SHOTS_DIR) {
@@ -430,7 +470,7 @@ test('real legion serve UI end-to-end on phone (390x844) and desktop (1100x720)'
 
       // Unreachable machine detail shows full message and hint.
       await p.goto(`${server.url}/?mock#/machines/laptop`, { waitUntil: 'domcontentloaded' });
-      await p.getByText(/SSH timed out after 8 s/i).waitFor();
+      await p.getByText(/None of laptop's systems answered/i).waitFor();
       await p.getByText(/Check that laptop is powered on/i).waitFor();
       await maybeShot(p, `mock-${label}-dark-laptop`);
       if (SHOTS_DIR) {
@@ -573,11 +613,23 @@ test('fast start with an offline dual-boot machine paints this node immediately 
     await maybeShot(page, 'real-phone-dark-machines-asking');
 
     // Full list settles after a single ping timeout for the dead dual-boot machine.
-    await page.locator('a.row.off', { hasText: 'dead' }).waitFor({ timeout: 10_000 });
+    const deadRow = page.locator('a.row.off', { hasText: 'dead' });
+    await deadRow.waitFor({ timeout: 10_000 });
     await page.getByText('Machines · 2 of 3 answering').waitFor({ timeout: 5000 });
     const tSettled = Math.round(performance.now() - tClick);
     assert.ok(tSettled < 8000, `fleet took ${tSettled} ms to settle (expected one timeout)`);
+    // Offline list row stays calm ("Did not answer"), keeping raw dual-boot errors on the detail page.
+    const deadRowText = await deadRow.innerText();
+    assert.match(deadRowText, /Did not answer/);
+    assert.ok(
+      !deadRowText.includes("None of dead's systems answered"),
+      `raw dual-boot error leaked into list row: ${deadRowText}`,
+    );
     await maybeShot(page, 'real-phone-dark-machines-offline');
+
+    // Opening dead shows the full dual-boot error message on the detail page.
+    await deadRow.click();
+    await page.getByText(/None of dead's systems answered/i).waitFor({ timeout: 5000 });
 
     // Jobs view queries answering machines only and paints without waiting on dead.
     const tJobs0 = performance.now();

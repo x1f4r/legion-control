@@ -374,6 +374,32 @@ impl Link {
         Ok(enrolled)
     }
 
+    /// Stores a validated OpenSSH device key in the live [`LinkConfig`] in place without closing
+    /// existing sessions.
+    ///
+    /// Intended for callers that persist a newly generated key before calling [`Link::pair`].
+    /// Setting the same key again is a no-op; attempting to replace a different existing key
+    /// returns `conflict`.
+    #[cfg(feature = "ssh")]
+    pub fn set_device_key(&self, pem: String) -> Result<(), ErrorBody> {
+        let _ = crate::key::DeviceKey::from_openssh(&pem)?;
+        let mut cfg = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = &cfg.device_key
+            && existing != &pem
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "A different device key is already configured on this link.",
+            ));
+        }
+        cfg.device_key = Some(pem);
+        Ok(())
+    }
+
     /// Adds or updates a node entry in the live config. If its connection details changed, any
     /// existing session to that node will be replaced on next use.
     pub fn upsert_node(&self, entry: NodeLink) {
@@ -760,7 +786,11 @@ impl Link {
 
     fn handle_call_error(&self, node: &str, session: &Arc<Session>, err: CallError) -> ErrorBody {
         match err {
-            CallError::NotWritten(body) | CallError::LostInFlight(body) => {
+            CallError::NotWritten(body) => {
+                self.invalidate_if_same(node, session);
+                mark_not_sent(body)
+            }
+            CallError::LostInFlight(body) => {
                 self.invalidate_if_same(node, session);
                 body
             }
@@ -842,7 +872,7 @@ impl Link {
 
         let session = (self.inner.opener)(entry.clone(), device_key, cancel)
             .await
-            .map_err(|err| classify_open_error(node, err))?;
+            .map_err(|err| mark_not_sent(classify_open_error(node, err)))?;
         let live = LiveSession {
             session: Arc::new(session),
             config_snapshot: entry,
@@ -1038,6 +1068,20 @@ pub fn parse_optional_target(on: Option<Value>) -> Result<Option<Target>, ErrorB
         ErrorBody::new(ErrorCode::InvalidArgs, format!("on: {reason}."))
             .with_hint("Give on as a machine name, comma-separated names, a list of names, or \"all\", or omit it.")
     })
+}
+
+fn mark_not_sent(mut err: ErrorBody) -> ErrorBody {
+    let mut details = err.details.take().unwrap_or_else(|| json!({}));
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert(crate::DETAIL_SENT.to_owned(), Value::Bool(false));
+    } else {
+        details = json!({
+            crate::DETAIL_SENT: false,
+            "detail": details,
+        });
+    }
+    err.details = Some(details);
+    err
 }
 
 fn classify_open_error(node: &str, mut err: ErrorBody) -> ErrorBody {
@@ -2000,5 +2044,276 @@ mod tests {
         );
 
         link.close().await;
+    }
+
+    #[tokio::test]
+    async fn open_and_not_written_errors_mark_details_sent_false_but_in_flight_and_remote_do_not() {
+        // 1. Session open failure marks `details.sent = false` while keeping existing details.
+        let open_fail_opener: SessionOpener = Arc::new(|entry, _, _| {
+            Box::pin(async move {
+                Err(
+                    ErrorBody::new(ErrorCode::Unreachable, "Connection refused.")
+                        .with_machine(&entry.node)
+                        .with_details(json!({ "reason": crate::REASON_UNREACHABLE })),
+                )
+            })
+        });
+        let open_fail_link = Link::with_opener(
+            test_config("tower"),
+            LinkOptions::default(),
+            open_fail_opener,
+        );
+        let err = open_fail_link
+            .call("tower", "sys.info", json!({}), None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unreachable);
+        assert_eq!(
+            err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(false)
+        );
+        assert_eq!(
+            err.details.as_ref().unwrap()["reason"],
+            json!(crate::REASON_UNREACHABLE)
+        );
+
+        // 2. Call lost in flight (server receives request then drops connection) does NOT set `sent: false`.
+        let lost_opener: SessionOpener = Arc::new(|entry, _, cancel| {
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        if req.method == method::HELLO {
+                            let reply = Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let mut out = serde_json::to_string(&reply).unwrap();
+                            out.push('\n');
+                            server_w.write_all(out.as_bytes()).await.unwrap();
+                            server_w.flush().await.unwrap();
+                        } else if req.method == method::CALL {
+                            // Request arrived on the server; drop pipe before answering.
+                            drop(server_w);
+                            break;
+                        }
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+        let lost_link =
+            Link::with_opener(test_config("tower"), LinkOptions::default(), lost_opener);
+        let lost_err = lost_link
+            .call("tower", "power.reboot", json!({}), None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(lost_err.code, ErrorCode::Unreachable);
+        assert_ne!(
+            lost_err
+                .details
+                .as_ref()
+                .and_then(|d| d.get(crate::DETAIL_SENT)),
+            Some(&json!(false)),
+            "in-flight failure must never claim sent=false"
+        );
+
+        // 3. Remote timeout returned from the node does NOT set `sent: false`.
+        let remote_timeout_opener: SessionOpener = Arc::new(|entry, _, cancel| {
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            )
+                        } else {
+                            Response::error(
+                                req.id,
+                                legion_proto::RpcError::new(
+                                    legion_proto::TOOL_ERROR,
+                                    ErrorBody::new(ErrorCode::Timeout, "Tool timed out on node.")
+                                        .with_machine(&node_name),
+                                ),
+                            )
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap();
+                        out.push('\n');
+                        server_w.write_all(out.as_bytes()).await.unwrap();
+                        server_w.flush().await.unwrap();
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+        let timeout_link = Link::with_opener(
+            test_config("tower"),
+            LinkOptions::default(),
+            remote_timeout_opener,
+        );
+        let remote_err = timeout_link
+            .call("tower", "exec.run", json!({}), None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(remote_err.code, ErrorCode::Timeout);
+        assert_ne!(
+            remote_err
+                .details
+                .as_ref()
+                .and_then(|d| d.get(crate::DETAIL_SENT)),
+            Some(&json!(false)),
+            "remote tool timeout must never claim sent=false"
+        );
+
+        // 4. NotWritten on retry session marks `details.sent = false`.
+        let not_written_opener: SessionOpener = Arc::new(|entry, _, cancel| {
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                let ready = Arc::new(Notify::new());
+                let ready_tx = Arc::clone(&ready);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    if let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        let reply = Response::ok(
+                            req.id,
+                            serde_json::to_value(HelloResult {
+                                node: node_name.clone(),
+                                version: "0.1.0".to_owned(),
+                                build: None,
+                                protocol: PROTOCOL,
+                                os: "linux".to_owned(),
+                                arch: "x86_64".to_owned(),
+                                systems: Vec::new(),
+                                system: None,
+                                boot_id: None,
+                            })
+                            .unwrap(),
+                        );
+                        let mut out = serde_json::to_string(&reply).unwrap();
+                        out.push('\n');
+                        server_w.write_all(out.as_bytes()).await.unwrap();
+                        server_w.flush().await.unwrap();
+                        ready_tx.notified().await;
+                        // Close both halves so the client session dies before writing the call.
+                        drop(server_w);
+                        drop(lines);
+                    }
+                });
+                let session = Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await?;
+                ready.notify_one();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(session)
+            })
+        });
+        let not_written_link = Link::with_opener(
+            test_config("tower"),
+            LinkOptions::default(),
+            not_written_opener,
+        );
+        let nw_err = not_written_link
+            .call("tower", "sys.info", json!({}), None, |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(nw_err.code, ErrorCode::Unreachable);
+        assert_eq!(
+            nw_err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(false)
+        );
+
+        open_fail_link.close().await;
+        lost_link.close().await;
+        timeout_link.close().await;
+        not_written_link.close().await;
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn set_device_key_stores_validated_key_and_rejects_replacement() {
+        let link = Link::new(LinkConfig::default());
+        let key1 = crate::key::DeviceKey::generate()
+            .unwrap()
+            .to_openssh()
+            .unwrap();
+        let key2 = crate::key::DeviceKey::generate()
+            .unwrap()
+            .to_openssh()
+            .unwrap();
+
+        link.set_device_key(key1.clone()).unwrap();
+        assert_eq!(link.config().device_key.as_deref(), Some(key1.as_str()));
+
+        // Re-setting the identical key is idempotent.
+        link.set_device_key(key1.clone()).unwrap();
+
+        // Replacing with a different key is refused.
+        let err = link.set_device_key(key2).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+
+        // Invalid PEM is refused.
+        let bad_link = Link::new(LinkConfig::default());
+        let bad_err = bad_link.set_device_key("not a key".to_owned()).unwrap_err();
+        assert_eq!(bad_err.code, ErrorCode::InvalidArgs);
     }
 }

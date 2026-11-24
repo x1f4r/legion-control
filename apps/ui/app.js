@@ -179,6 +179,7 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [confirmRequest, setConfirmRequest] = useState(null);
   const [runHistory, setRunHistory] = useState([]);
+  const [pairingOpen, setPairingOpen] = useState(false);
   const sheetHistoryRef = useRef(false);
 
   const nodeInfo = linkState?.nodes?.[0] || null;
@@ -242,6 +243,14 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const onOpenPairing = () => {
+      if (link.kind === 'app') setPairingOpen(true);
+    };
+    window.addEventListener('legion:open-pairing', onOpenPairing);
+    return () => window.removeEventListener('legion:open-pairing', onOpenPairing);
+  }, [link]);
+
   const refreshFleet = useCallback(
     async (activeNodeInfo, options = {}) => {
       const targetNode = activeNodeInfo || nodeInfoRef.current;
@@ -294,6 +303,11 @@ function App() {
     async (nextState) => {
       setLinkState(nextState);
       if (!nextState?.ready) {
+        setBooting(false);
+        return;
+      }
+      if (nextState.error) {
+        setFleetError(nextState.error);
         setBooting(false);
         return;
       }
@@ -356,27 +370,54 @@ function App() {
     };
   }, [link, hydrate]);
 
-  // Poll every 15 s while visible and refresh on window focus.
+  // Poll every 15 s while visible and refresh on resume/focus. On mobile resume from background,
+  // tear down cached SSH sessions before refreshing so waking a phone does not stall on half-open
+  // TCP sockets.
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
-    const onFocus = () => {
-      if (document.visibilityState === 'visible') {
+    let wasHidden = document.visibilityState === 'hidden';
+    let resuming = false;
+
+    const onVisibilityChange = async () => {
+      if (document.visibilityState === 'hidden') {
+        wasHidden = true;
+        return;
+      }
+      if (document.visibilityState !== 'visible') return;
+      if (wasHidden && typeof link.invalidateSessions === 'function') {
+        wasHidden = false;
+        resuming = true;
+        try {
+          await link.invalidateSessions();
+        } finally {
+          resuming = false;
+        }
+        refreshFleet(nodeInfo, { background: true });
+      } else {
+        wasHidden = false;
         refreshFleet(nodeInfo, { background: true });
       }
     };
+
+    const onFocus = () => {
+      if (document.visibilityState === 'visible' && !wasHidden && !resuming) {
+        refreshFleet(nodeInfo, { background: true });
+      }
+    };
+
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && !resuming) {
         refreshFleet(nodeInfo, { background: true });
       }
     }, POLL_MS);
     window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       window.clearInterval(timer);
       window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [linkState?.ready, nodeInfo, refreshFleet]);
+  }, [link, linkState?.ready, nodeInfo, refreshFleet]);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {
@@ -508,17 +549,22 @@ function App() {
       <${IconSprite} />
       ${booting
         ? html`
-            <div class="app">
+            <div class="app standalone">
               <header class="bar"><h1 class="wordmark"><b>▍</b>Legion</h1></header>
               <main class="main"><div class="empty">Connecting…</div></main>
             </div>
           `
-        : !linkState?.ready
+        : !linkState?.ready || pairingOpen
           ? html`
               <${StartView}
                 link=${link}
                 linkState=${linkState}
-                onConnected=${(next) => hydrate(next)}
+                onCancel=${linkState?.ready ? () => setPairingOpen(false) : null}
+                onConnected=${(next) => {
+                  setPairingOpen(false);
+                  setFleetError(null);
+                  hydrate(next);
+                }}
               />
             `
           : html`
@@ -578,6 +624,24 @@ function App() {
                               theme=${theme}
                               onChangeTheme=${setTheme}
                               onRequestConfirm=${openConfirm}
+                              onOpenPairing=${link.kind === 'app' ? () => setPairingOpen(true) : null}
+                              onSelectNode=${
+                                link.kind === 'app' && typeof link.selectNode === 'function'
+                                  ? async (node) => {
+                                      if (refreshAbortRef.current) {
+                                        refreshAbortRef.current.abort();
+                                        refreshAbortRef.current = null;
+                                      }
+                                      refreshInFlightRef.current = false;
+                                      sessionCache.clear();
+                                      persistentCache.clear();
+                                      setSnapshot(null);
+                                      setTools([]);
+                                      const next = await link.selectNode(node);
+                                      await hydrate(next);
+                                    }
+                                  : null
+                              }
                               onDisconnected=${async () => {
                                 if (refreshAbortRef.current) {
                                   refreshAbortRef.current.abort();
@@ -589,7 +653,7 @@ function App() {
                                 setSnapshot(null);
                                 setTools([]);
                                 const st = await link.state();
-                                setLinkState(st);
+                                await hydrate(st);
                               }}
                             />
                           `}

@@ -15,9 +15,12 @@ export function DeviceView({
   onChangeTheme,
   onRequestConfirm,
   onDisconnected,
+  onSelectNode,
+  onOpenPairing,
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
   const whoami = nodeInfo?.whoami;
   const allowLines = describeRoleAccess(whoami, tools);
 
@@ -45,9 +48,25 @@ export function DeviceView({
   async function onUnpair(node) {
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
-      await link.unpair(node);
+      const res = await link.unpair(node);
+      if (res?.message) setNotice(res.message);
       await onDisconnected();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSelectNode(node) {
+    if (!onSelectNode) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await onSelectNode(node);
     } catch (err) {
       setError(err);
     } finally {
@@ -58,6 +77,7 @@ export function DeviceView({
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${notice ? html`<${Notice} title=${notice} kind="warn" />` : null}
 
       <p class="label">Identity</p>
       <div class="list">
@@ -79,30 +99,62 @@ export function DeviceView({
 
       <p class="label">Link</p>
       ${link.kind === 'app'
-        ? (linkState?.nodes || []).length > 0
-          ? html`
-              <div class="list">
-                ${linkState.nodes.map(
-                  (n) => html`
-                    <div class="row" key=${n.node}>
-                      <div class="body">
-                        <div class="title mono">${n.node}</div>
-                        <div class="sub">${n.principal} · ${n.role} · ${n.via}</div>
-                      </div>
-                      <button
-                        type="button"
-                        class="btn small"
-                        disabled=${busy}
-                        onClick=${() => onUnpair(n.node)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  `,
-                )}
-              </div>
-            `
-          : html`<div class="empty">No paired machines.</div>`
+        ? html`
+            ${(linkState?.nodes || []).length > 0
+              ? html`
+                  <div class="list">
+                    ${linkState.nodes.map(
+                      (n, idx) => html`
+                        <div class="row" key=${`${n.node}:${n.via}`}>
+                          <div class="body">
+                            <div class="title mono">
+                              ${n.node}
+                              ${idx === 0 ? html`<span class="chip">active</span>` : null}
+                              ${n.temporary ? html`<span class="chip fx write">temporary</span>` : null}
+                            </div>
+                            <div class="sub">${n.principal} · ${n.role} · ${n.via}</div>
+                            ${n.path ? html`<div class="sub mono">${n.path}</div>` : null}
+                          </div>
+                          ${idx > 0 && onSelectNode
+                            ? html`
+                                <button
+                                  type="button"
+                                  class="btn small"
+                                  disabled=${busy}
+                                  onClick=${() => handleSelectNode(n.node)}
+                                >
+                                  Use
+                                </button>
+                              `
+                            : null}
+                          ${n.via !== 'local'
+                            ? html`
+                                <button
+                                  type="button"
+                                  class="btn small"
+                                  disabled=${busy}
+                                  onClick=${() => onUnpair(n.node)}
+                                >
+                                  Remove
+                                </button>
+                              `
+                            : null}
+                        </div>
+                      `,
+                    )}
+                  </div>
+                `
+              : html`<div class="empty">No paired machines.</div>`}
+            ${onOpenPairing
+              ? html`
+                  <div class="spaced">
+                    <button type="button" class="btn" disabled=${busy} onClick=${onOpenPairing}>
+                      Pair a machine
+                    </button>
+                  </div>
+                `
+              : null}
+          `
         : html`
             <div class="list">
               <dl class="kv">

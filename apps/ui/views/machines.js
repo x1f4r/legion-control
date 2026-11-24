@@ -3,9 +3,10 @@
 import { html } from '../vendor/preact-htm.js';
 import { Meter, Notice } from './common.js';
 import {
-  firstSentence,
+  formatBusyReasonsShort,
   formatDuration,
   formatElapsed,
+  formatOfflineSubtext,
   formatRelativeTime,
   machineMetrics,
   osLabel,
@@ -25,15 +26,17 @@ function machineSubtext(m) {
     return parts.join(' · ');
   }
   if (!m.reachable) {
-    return firstSentence(m.reason || m.error?.message) || 'Did not answer';
+    return formatOfflineSubtext(m.lastSeenAt);
   }
   const parts = [];
   if (m.os) parts.push(osLabel(m.os));
   if (m.arch) parts.push(m.arch);
   if (m.runningJobs > 0) {
     parts.push(`${m.runningJobs} ${m.runningJobs === 1 ? 'job' : 'jobs'} running`);
-  } else if (m.busy && m.busyReasons?.length) {
-    parts.push(`busy: ${m.busyReasons[0]}`);
+  } else if (m.busy) {
+    parts.push(formatBusyReasonsShort(m.busyReasons) || 'busy');
+  } else if (m.busyState === 'unmonitored') {
+    parts.push('unmonitored');
   } else if (m.sys?.uptime_s != null) {
     parts.push(`up ${formatDuration(m.sys.uptime_s)}`);
   }
