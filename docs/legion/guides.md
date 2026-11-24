@@ -804,10 +804,10 @@ fleet.sync direction=pull from=<machine> documents='["devices.toml"]'` explicitl
 - **List devices and invites**: `legion device.list` reconciles `authorized_keys` with
   `devices.toml`, sweeps expired invites recorded by this home, and shows each device's `id`,
   `name`, `principal`, effective `role`, `fingerprint`, `added`, `paired_on`, and any collision,
-  immutable-field conflict, unmarked-principal, or quarantine `status`. For owner callers, it also
+  immutable-field conflict, role-tie conflict, unmarked-principal, or quarantine `status`. For owner callers, it also
   shows Legion lines pointing at another or deleted Legion home (`foreign: true`,
   `missing_home: true`, `home`). `meta.doctor` warns about orphaned keys, unmarked `device:*`
-  principals, key collisions, conflicting device entries, quarantined devices, and drifted fleet
+  principals, key collisions, conflicting or role-conflicting device entries, quarantined devices, and drifted fleet
   peers (and fails loudly if a previous `policy.toml`/`devices.toml` rollback failed; after
   verifying the files, an owner clears that record with `legion meta.doctor
   acknowledge=devices-rollback`). Tombstones in `devices.toml` are permanent so removed devices
@@ -824,8 +824,9 @@ fleet.sync direction=pull from=<machine> documents='["devices.toml"]'` explicitl
   descendant (`confirm=true`, owner role only), updating `policy.toml`, `devices.toml`, and
   `authorized_keys`, then pushing `devices.toml` to reachable fleet peers. `name` and `role` carry
   independent update stamps so a stale rename never raises a role lowered on a peer, and a stale
-  role change never undoes a newer rename; `device.set` refuses entries flagged with an immutable
-  conflict until they are removed.
+  role change never undoes a newer rename; an equal-stamp, equal-origin role tie marks
+  `role_conflict = true` (inactive until an owner resolves it with `device.set id=<id> role=<role>`),
+  while `device.set` refuses entries flagged with an immutable conflict until they are removed.
 - **Discover endpoints**: `legion device.endpoint` (`effect: read`) returns this node's SSH
   connection details (`node`, `hosts`, `port`, `user`, `host_keys`) using the same detection as
   `device.invite` (caching auto-discovered host-key scans briefly per node). Controllers call
