@@ -377,8 +377,14 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
         None => true,
     };
     let node = ctx.node_name().to_owned();
+    let grant = ctx.grant().clone();
     edit(ctx, move |current| {
         let known = current.projects.get(&args.name);
+        if let Some(recorded) = known.and_then(|project| project.on.get(&node))
+            && args.path.as_ref().is_some_and(|path| path != recorded)
+        {
+            may_change(&grant, &args.name, recorded)?;
+        }
         let has_repo = args.repo.is_some() || known.is_some_and(|project| project.repo.is_some());
         if !exists && !has_repo {
             let path = args.path.as_deref().unwrap_or_default();
@@ -434,9 +440,28 @@ pub struct Removed {
 
 async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
     let node = ctx.node_name().to_owned();
+    let grant = ctx.grant().clone();
     edit(ctx, move |current| {
         let project = find(current, &args.name)?;
+        if let Some(recorded) = project.on.get(&node) {
+            may_change(&grant, &args.name, recorded)?;
+        }
         if args.everywhere {
+            // Its paths on other machines cannot be checked here, so only a role that may go
+            // anywhere may forget a project on every machine at once.
+            if let Some(roots) = grant.roots() {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "{} may not forget {} on every machine: its role {} confines it to {}.",
+                        grant.principal(),
+                        args.name,
+                        grant.role(),
+                        roots.join(", ")
+                    ),
+                )
+                .with_hint("Forget it here only, without `everywhere`, or ask the owner."));
+            }
             return Ok((
                 vec![Edit::Forget {
                     name: args.name.clone(),
@@ -1279,6 +1304,20 @@ fn written_form(path: &Path, home: Option<&Path>) -> String {
         }
     }
     path.display().to_string()
+}
+
+/// Checks that the caller may change the directory a project is recorded at on this node, before
+/// it moves or forgets that record: whoever relies on the project trusts that its tasks run where
+/// it was recorded, so only someone who may write there may point it elsewhere.
+fn may_change(grant: &Grant, name: &str, recorded: &str) -> Result<(), ErrorBody> {
+    grant
+        .check_path(recorded, Access::Write)
+        .map(|_| ())
+        .map_err(|error| {
+            error.with_hint(format!(
+                "{name} is recorded at {recorded} on this machine, which the caller may not change; ask someone who may to move or forget it."
+            ))
+        })
 }
 
 /// The project called `name`, or `not_found` naming the projects there are.

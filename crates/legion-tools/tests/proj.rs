@@ -81,6 +81,10 @@ fn main() -> ExitCode {
         ("a_role_without_the_effect_is_denied", || {
             Box::pin(a_role_without_the_effect_is_denied())
         }),
+        (
+            "a_confined_role_cannot_move_or_forget_projects_outside_its_paths",
+            || Box::pin(a_confined_role_cannot_move_or_forget_projects_outside_its_paths()),
+        ),
         ("clone_takes_only_repositories_it_may_read", || {
             Box::pin(clone_takes_only_repositories_it_may_read())
         }),
@@ -1217,4 +1221,71 @@ async fn clone_takes_only_repositories_it_may_read() {
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
     assert!(!config.exists());
+}
+
+async fn a_confined_role_cannot_move_or_forget_projects_outside_its_paths() {
+    let fixture = tower();
+    fixture.write_config(
+        "policy.toml",
+        concat!(
+            "[principals.\"agent:claude\"]\nrole = \"scratch\"\n",
+            "[principals.worker]\nrole = \"worker\"\n",
+            "[roles.scratch]\nallow = [\"effect:read\", \"effect:write\", \"effect:exec\"]\npaths = [\"~/scratch/**\"]\n",
+            "[roles.worker]\nallow = [\"effect:read\", \"effect:write\"]\n",
+        ),
+    );
+    let agent = "agent:claude";
+    for dir in ["projects/site", "scratch/evil", "scratch/mine"] {
+        std::fs::create_dir_all(fixture.home().join(dir)).unwrap();
+    }
+    let original = "[projects.site.on]\ntower = \"~/projects/site\"\n\n[projects.mine.on]\ntower = \"~/scratch/mine\"\n";
+    fixture.write_config("projects.toml", original);
+
+    for (tool, args) in [
+        (
+            "proj.add",
+            json!({"name": "site", "path": "~/scratch/evil"}),
+        ),
+        ("proj.remove", json!({"name": "site"})),
+        ("proj.remove", json!({"name": "site", "everywhere": true})),
+        ("proj.remove", json!({"name": "mine", "everywhere": true})),
+    ] {
+        let error = fixture
+            .call_as(agent, tool, args.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied, "{tool} {args}: {error:?}");
+    }
+    assert_eq!(projects_toml(&fixture), original);
+
+    // Its own projects are its to change, and a new one is its to add.
+    fixture
+        .call_as(
+            agent,
+            "proj.add",
+            json!({"name": "mine", "path": "~/scratch/evil"}),
+        )
+        .await
+        .unwrap();
+    fixture
+        .call_as(
+            agent,
+            "proj.add",
+            json!({"name": "other", "path": "~/scratch/mine"}),
+        )
+        .await
+        .unwrap();
+    fixture
+        .call_as(agent, "proj.remove", json!({"name": "mine"}))
+        .await
+        .unwrap();
+    let removed = fixture
+        .call_as(
+            "worker",
+            "proj.remove",
+            json!({"name": "site", "everywhere": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed["removed"], json!("everywhere"));
 }
