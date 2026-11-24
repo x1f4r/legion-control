@@ -37,7 +37,8 @@ Over HTTP (`legion serve`), request compact mode with `/mcp?compact=1` or the he
 `Legion-Compact: 1`.
 
 Long-lived MCP sessions watch the registry dynamically, so extension tools added or removed in
-`tools.d/` appear without restarting the session.
+`tools.d/` appear without restarting the session; full-mode sessions also emit
+`notifications/tools/list_changed` when `tools.d/` changes.
 
 ## Registering agents with `legion agents`
 
@@ -153,10 +154,10 @@ Every door uses the same closed set of 13 error codes:
 If your principal has the `admin` effect, you can add reusable tools in `tools.d/` with
 `ext.define`. Follow these rules:
 
-1. **Pick an unreserved `family.verb` name.** Built-in families (`meta`, `audit`, `fs`, `sys`,
-   `exec`, `job`, `proj`, `svc`, `power`, `fleet`, `ext`, `token`, plus existing built-ins under
-   `agent` and `config`) cannot be shadowed. Use a domain prefix such as `ops.*`, `gpu.*`, or
-   `backup.*`.
+1. **Pick an unreserved `family.verb` name.** Every family present in the built-in registry plus
+   the reserved families (`agent`, `audit`, `config`, `exec`, `ext`, `fleet`, `fs`, `job`,
+   `legion`, `meta`, `power`, `proj`, `svc`, `sys`, `token`) cannot be shadowed. Use a domain
+   prefix such as `ops.*`, `gpu.*`, or `backup.*`.
 2. **Declare `effect` honestly.** Policy and MCP confirmation hints rely on the declared effect.
    A command that writes files must be `write`; one that deletes must be `destroy`; one that runs
    arbitrary subcommands or mutates services must be `exec`. Never label a mutating command `read`.
@@ -165,6 +166,9 @@ If your principal has the `admin` effect, you can add reusable tools in `tools.d
 4. **Never splice arguments into a command string.** Caller arguments are validated against `params`
    and passed as `LEGION_ARG_<NAME>` environment variables (plus a JSON object on stdin, alongside
    `LEGION_TOOL`, `LEGION_PRINCIPAL`, and `LEGION_NODE`). Quote `"$LEGION_ARG_..."` in shell
-   commands and validate discrete choices with `enum`.
+   commands and validate discrete choices with `enum`. String arguments larger than 32 KiB per
+   variable (or 96 KiB total) are refused by default (`large = "refuse"`); set `large = "stdin"` on
+   tools that read the full value from stdin JSON (the oversized variable is omitted and
+   `LEGION_ARG_<NAME>_OMITTED=1` is set).
 5. **Set a reasonable `timeout_s`** (default 60 s, max 3600 s) and test the new tool immediately
    with `legion_describe` / `legion help <name>` and a non-destructive call.
