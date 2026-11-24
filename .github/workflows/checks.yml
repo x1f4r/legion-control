@@ -79,6 +79,45 @@ jobs:
       # tests run the built binary under a LEGION_HOME of their own, so Windows is the one place its
       # paths, its locks and its line endings are exercised.
       - run: bash scripts/check.sh rust
+      # Building each crate's tests on its own catches feature unification bugs where a crate only
+      # compiles because another workspace member enabled a dependency feature.
+      - name: Build each crate's tests alone
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for dir in crates/*/; do
+            crate="$(basename "$dir")"
+            cargo test -p "$crate" --no-run --locked
+          done
+      # Exercise the Unix install script's offline path against the freshly built binary, including
+      # idempotent re-installation over an existing copy, inside a throwaway HOME.
+      - name: Test install/legion.sh with --from
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          tmp_home="$(mktemp -d)"
+          trap 'rm -rf "$tmp_home"' EXIT
+          HOME="$tmp_home" sh install/legion.sh --from target/debug/legion
+          HOME="$tmp_home" sh install/legion.sh --from target/debug/legion
+          "$tmp_home/.local/bin/legion" --version
+      # Exercise the Windows install script's offline path against the freshly built binary,
+      # including idempotent replacement and non-duplicating user PATH updates.
+      - name: Test install/legion.ps1 with -From
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tmpLocal = Join-Path ([System.IO.Path]::GetTempPath()) ('legion-ci-install-' + [Guid]::NewGuid().ToString('N'))
+          $null = New-Item -ItemType Directory -Path $tmpLocal -Force
+          try {
+            $env:LOCALAPPDATA = $tmpLocal
+            ./install/legion.ps1 -From target/debug/legion.exe
+            ./install/legion.ps1 -From target/debug/legion.exe
+            & (Join-Path $tmpLocal 'legion\legion.exe') --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item -LiteralPath $tmpLocal -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
   private-data:
     name: Private data
