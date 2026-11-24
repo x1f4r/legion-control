@@ -370,6 +370,27 @@ fn meta_init_empty_idempotent_and_generated_roles() {
     let ed_exec = home.run(&["exec.run", "cmd=echo hi", "--as", "writer"]);
     assert_eq!(ed_exec.code, 1);
     assert_eq!(ed_exec.json()["code"], json!("denied"));
+    let ed_proj_add = home.run(&[
+        "proj.add",
+        "name=x",
+        "path=~/projects/app",
+        "--as",
+        "writer",
+    ]);
+    assert_eq!(ed_proj_add.code, 1);
+    assert_eq!(ed_proj_add.json()["code"], json!("denied"));
+    let ed_xfer = home.run(&[
+        "fs.transfer",
+        "from=~/projects/app/hello.txt",
+        "to=~/projects/app/hello2.txt",
+        "--as",
+        "writer",
+    ]);
+    assert_eq!(ed_xfer.code, 1);
+    assert_eq!(ed_xfer.json()["code"], json!("denied"));
+    let ed_audit = home.run(&["audit.tail", "--as", "writer"]);
+    assert_eq!(ed_audit.code, 1);
+    assert_eq!(ed_audit.json()["code"], json!("denied"));
     let ed_admin = home.run(&["token.list", "--as", "writer"]);
     assert_eq!(ed_admin.code, 1);
     assert_eq!(ed_admin.json()["code"], json!("denied"));
