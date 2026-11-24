@@ -2228,6 +2228,11 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
             confirmed_at: None,
             updated_at: now.clone(),
             updated_on: "laptop".to_owned(),
+            name_updated_at: now.clone(),
+            name_updated_on: "laptop".to_owned(),
+            role_updated_at: now.clone(),
+            role_updated_on: "laptop".to_owned(),
+            conflict: false,
         };
     let mut pi_devices = legion_tools::device::registry::DevicesFile::default();
     pi_devices

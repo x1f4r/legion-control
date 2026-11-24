@@ -3132,8 +3132,13 @@ fn real_sshd_two_node_fleet_devices_sync_roles_revocation_and_legacy_adoption() 
                 paired_by: None,
                 confirmed_by: None,
                 confirmed_at: None,
-                updated_at: now_str,
+                updated_at: now_str.clone(),
                 updated_on: "b".to_owned(),
+                name_updated_at: now_str.clone(),
+                name_updated_on: "b".to_owned(),
+                role_updated_at: now_str,
+                role_updated_on: "b".to_owned(),
+                conflict: false,
             },
         );
         std::fs::write(&b_devices_path, b_devices.to_toml_string()).unwrap();
@@ -3363,6 +3368,11 @@ role = \"phone_admin\"
             confirmed_at: None,
             updated_at: now_str.clone(),
             updated_on: "a".to_owned(),
+            name_updated_at: now_str.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: now_str.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
         },
     );
     devices_a.devices.insert(
@@ -3379,6 +3389,11 @@ role = \"phone_admin\"
             confirmed_at: None,
             updated_at: now_str.clone(),
             updated_on: "a".to_owned(),
+            name_updated_at: now_str.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: now_str.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
         },
     );
     node_a.write_config("devices.toml", &devices_a.to_toml_string());
@@ -3398,6 +3413,11 @@ role = \"phone_admin\"
             confirmed_at: None,
             updated_at: now_str.clone(),
             updated_on: "a".to_owned(),
+            name_updated_at: now_str.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: now_str.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
         },
     );
     devices_b.removed.insert(
@@ -3586,6 +3606,11 @@ role = \"ops\"
             confirmed_at: None,
             updated_at: t0.clone(),
             updated_on: "stamp-box".to_owned(),
+            name_updated_at: t0.clone(),
+            name_updated_on: "stamp-box".to_owned(),
+            role_updated_at: t0.clone(),
+            role_updated_on: "stamp-box".to_owned(),
+            conflict: false,
         },
     );
     initial.devices.insert(
@@ -3600,8 +3625,13 @@ role = \"ops\"
             paired_by: None,
             confirmed_by: None,
             confirmed_at: None,
-            updated_at: t0,
+            updated_at: t0.clone(),
             updated_on: "stamp-box".to_owned(),
+            name_updated_at: t0.clone(),
+            name_updated_on: "stamp-box".to_owned(),
+            role_updated_at: t0,
+            role_updated_on: "stamp-box".to_owned(),
+            conflict: false,
         },
     );
     home.write_config("devices.toml", &initial.to_toml_string());
@@ -3897,6 +3927,11 @@ role = \"ops\"
             confirmed_at: Some(t1.clone()),
             updated_at: t1.clone(),
             updated_on: "a".to_owned(),
+            name_updated_at: t0.clone(),
+            name_updated_on: "a".to_owned(),
+            role_updated_at: t0.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
         },
     );
     node_a.write_config("devices.toml", &dev_a.to_toml_string());
@@ -3919,8 +3954,13 @@ role = \"ops\"
             }),
             confirmed_by: None,
             confirmed_at: None,
-            updated_at: t2,
+            updated_at: t2.clone(),
             updated_on: "b".to_owned(),
+            name_updated_at: t2,
+            name_updated_on: "b".to_owned(),
+            role_updated_at: t0.clone(),
+            role_updated_on: "a".to_owned(),
+            conflict: false,
         },
     );
     node_b.write_config("devices.toml", &dev_b.to_toml_string());
@@ -3975,8 +4015,13 @@ role = \"ops\"
             }),
             confirmed_by: None,
             confirmed_at: None,
-            updated_at: t3,
+            updated_at: t3.clone(),
             updated_on: "b".to_owned(),
+            name_updated_at: t3.clone(),
+            name_updated_on: "b".to_owned(),
+            role_updated_at: t3,
+            role_updated_on: "b".to_owned(),
+            conflict: false,
         },
     );
     node_b.write_config("devices.toml", &dev_b2.to_toml_string());
@@ -4006,8 +4051,251 @@ role = \"ops\"
         &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
     )
     .unwrap();
+    assert!(a_after2.devices[&id_child].conflict);
     assert_eq!(a_after2.devices[&id_child].confirmed_by, None);
     assert_eq!(a_after2.devices[&id_child].confirmed_at, None);
+}
+
+#[test]
+fn f1_independent_field_stamps_prevent_stale_rename_raising_role_and_stale_role_undoing_rename() {
+    use legion_tools::device::registry::DevicesFile;
+
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let host_key_a = node_a.home().join("host_a.pub");
+    let host_key_b = node_b.home().join("host_b.pub");
+    std::fs::write(
+        &host_key_a,
+        format!("{} host@a\n", ed25519_public_key_from_seed(&[0x91; 32])),
+    )
+    .unwrap();
+    std::fs::write(
+        &host_key_b,
+        format!("{} host@b\n", ed25519_public_key_from_seed(&[0x92; 32])),
+    )
+    .unwrap();
+    let home_a_legion = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "\
+default = \"owner\"
+
+[roles.admin]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[roles.observer]
+allow = [\"effect:read\"]
+";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_a),
+            toml_literal(&host_key_a),
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_b),
+            toml_literal(&host_key_b),
+        ),
+    );
+
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let make_fleet_entry = |peer_name: &str, peer_legion: &Path, peer_home: &Path| {
+        if cfg!(windows) {
+            let script = peer_home.join(format!("run-{peer_name}-f1.cmd"));
+            let body = format!(
+                "@echo off\r\n\
+                 set \"LEGION_HOME={}\"\r\n\
+                 set \"HOME={}\"\r\n\
+                 set \"USERPROFILE={}\"\r\n\
+                 set \"XDG_CONFIG_HOME=\"\r\n\
+                 set \"XDG_STATE_HOME=\"\r\n\
+                 \"{}\" rpc\r\n",
+                peer_legion.display(),
+                peer_home.display(),
+                peer_home.display(),
+                bin,
+            );
+            std::fs::write(&script, body).unwrap();
+            format!(
+                "[machines.{peer_name}]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+                toml_literal(&script),
+            )
+        } else {
+            let env_arg = format!("LEGION_HOME={}", peer_legion.display());
+            format!(
+                "[machines.{peer_name}]\ncommand = [\"env\", {}, {}, \"rpc\"]\n",
+                toml_literal(Path::new(&env_arg)),
+                toml_literal(Path::new(bin)),
+            )
+        }
+    };
+
+    let run_enrol_on =
+        |home: &Home, legion_home: &Path, invite_id: &str, name: &str, pub_key: &str| {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args([
+                "gate",
+                "--home",
+                &legion_home.display().to_string(),
+                "--enrol",
+                invite_id,
+            ])
+            .env("HOME", home.home())
+            .env("USERPROFILE", home.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+            let mut child = cmd.spawn().unwrap();
+            let line = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": invite_id, "public_key": pub_key, "name": name})
+            );
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "enrol failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let reply: Value =
+                serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+            assert_eq!(reply["ok"], json!(true), "{reply}");
+        };
+
+    // Direction 1 (reproduced attack):
+    // Enrol X (`role = "admin"`) on A, push to B so both A and B have X as `admin`.
+    node_a.write_config(
+        "fleet.toml",
+        &make_fleet_entry("b", &home_b_legion, &node_b.home()),
+    );
+    let inv_x = node_a.run(&[
+        "device.invite",
+        "name=x",
+        "role=admin",
+        "host=127.0.0.1",
+        "port=22",
+        "user=tester",
+    ]);
+    assert_eq!(inv_x.code, 0, "{}", inv_x.stderr);
+    let inv_x_id = inv_x.json()["id"].as_str().unwrap().to_owned();
+    run_enrol_on(
+        &node_a,
+        &home_a_legion,
+        &inv_x_id,
+        "x",
+        &ed25519_public_key_from_seed(&[0xd1; 32]),
+    );
+
+    // Confirm B has X as `admin`, then lower X to `observer` on B WITHOUT pushing to A (B has no fleet.toml yet).
+    let b_lower = node_b.run(&["device.set", "name=x", "role=observer"]);
+    assert_eq!(b_lower.code, 0, "{}", b_lower.stderr);
+    assert_eq!(b_lower.json()["role"], json!("observer"));
+
+    // On A (which missed B's role downgrade and still thinks X is `admin`), X itself renames
+    // `x` -> `x2`, which pushes with node authority to B.
+    let a_rename = node_a.run(&["device.set", "name=x", "rename=x2", "--as", "device:x"]);
+    assert_eq!(a_rename.code, 0, "rename on A failed: {}", a_rename.stderr);
+    assert_eq!(a_rename.json()["fleet"]["b"]["status"], json!("synced"));
+
+    // B MUST keep `role = "observer"` in BOTH `devices.toml` AND `policy.toml`, while accepting
+    // the newer rename `x2`!
+    let b_devices: DevicesFile = legion_core::config::parse(
+        &home_b_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_b_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let b_x = b_devices
+        .devices
+        .values()
+        .find(|d| d.principal == "device:x")
+        .expect("device:x missing on B");
+    assert_eq!(b_x.name, "x2", "newer rename must apply on B: {b_x:?}");
+    assert_eq!(
+        b_x.role.as_deref(),
+        Some("observer"),
+        "stale rename from A MUST NOT raise role back to admin on B: {b_x:?}"
+    );
+    let b_policy: legion_core::policy::Policy = legion_core::config::parse(
+        &home_b_legion.join("config").join("policy.toml"),
+        &std::fs::read(home_b_legion.join("config").join("policy.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        b_policy.role_of("device:x").0,
+        "observer",
+        "B's policy.toml MUST remain observer after stale rename push from A"
+    );
+
+    // Direction 2 (symmetric):
+    // Enrol Y (`role = "admin"`) on A and sync to B; disconnect A -> B; rename Y -> y2 on A;
+    // then on B (which missed the rename and still calls it `y`), owner lowers Y to `observer`
+    // and pushes B -> A. A MUST keep `name = "y2"` while applying `role = "observer"`!
+    let inv_y = node_a.run(&[
+        "device.invite",
+        "name=y",
+        "role=admin",
+        "host=127.0.0.1",
+        "port=22",
+        "user=tester",
+    ]);
+    assert_eq!(inv_y.code, 0, "{}", inv_y.stderr);
+    let inv_y_id = inv_y.json()["id"].as_str().unwrap().to_owned();
+    run_enrol_on(
+        &node_a,
+        &home_a_legion,
+        &inv_y_id,
+        "y",
+        &ed25519_public_key_from_seed(&[0xd2; 32]),
+    );
+
+    // Detach A from B so A's rename does not reach B yet; attach B -> A.
+    node_a.write_config("fleet.toml", "");
+    let a_rename_y = node_a.run(&["device.set", "name=y", "rename=y2"]);
+    assert_eq!(a_rename_y.code, 0, "{}", a_rename_y.stderr);
+
+    node_b.write_config(
+        "fleet.toml",
+        &make_fleet_entry("a", &home_a_legion, &node_a.home()),
+    );
+    let b_lower_y = node_b.run(&["device.set", "name=y", "role=observer"]);
+    assert_eq!(b_lower_y.code, 0, "{}", b_lower_y.stderr);
+    assert_eq!(b_lower_y.json()["fleet"]["a"]["status"], json!("synced"));
+
+    let a_devices: DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    let a_y = a_devices
+        .devices
+        .values()
+        .find(|d| d.principal == "device:y")
+        .expect("device:y missing on A");
+    assert_eq!(
+        a_y.name, "y2",
+        "stale role change from B MUST NOT undo newer rename y2 on A: {a_y:?}"
+    );
+    assert_eq!(
+        a_y.role.as_deref(),
+        Some("observer"),
+        "newer role change from B must apply on A: {a_y:?}"
+    );
 }
 
 #[test]

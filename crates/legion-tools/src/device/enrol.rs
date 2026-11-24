@@ -661,8 +661,13 @@ fn process_enrol_blocking(
             paired_by,
             confirmed_by: None,
             confirmed_at: None,
-            updated_at: precise_now,
+            updated_at: precise_now.clone(),
             updated_on: valid_node_name.clone(),
+            name_updated_at: precise_now.clone(),
+            name_updated_on: valid_node_name.clone(),
+            role_updated_at: precise_now,
+            role_updated_on: valid_node_name.clone(),
+            conflict: false,
         },
     );
 

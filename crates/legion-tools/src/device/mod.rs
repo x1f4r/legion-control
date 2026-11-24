@@ -989,6 +989,19 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
             .cloned()
             .ok_or_else(|| ErrorBody::new(ErrorCode::Internal, "Matched device disappeared."))?;
 
+        if current_entry.conflict {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "Device {} ({pairing_id}) has conflicting immutable identity or pairing provenance across peers and cannot be modified with device.set.",
+                    current_entry.name
+                ),
+            )
+            .with_hint(format!(
+                "Remove the conflicted entry with `legion device.remove id={pairing_id}` and re-pair if needed."
+            )));
+        }
+
         let quarantine_removed_ts = if confirm {
             let quarantined_map = registry::quarantined_devices_with_timestamps(&devices_file);
             match quarantined_map.get(&pairing_id) {
@@ -1113,30 +1126,49 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         } else {
             None
         };
-        let previous_name = if let Some(ref renamed) = new_name
+        let (previous_name, name_ts) = if let Some(ref renamed) = new_name
             && renamed != &current_entry.name
         {
+            let ts = registry::next_updated_timestamp_at(Some(&current_entry.name_updated_at), now)
+                .map_err(&rollback_policy)?;
             updated_entry.name = renamed.clone();
-            Some(current_entry.name.clone())
+            updated_entry.name_updated_at = ts.clone();
+            updated_entry.name_updated_on = valid_node_name.clone();
+            (Some(current_entry.name.clone()), Some(ts))
         } else {
-            None
+            (None, None)
         };
-        let previous_role = if let Some(ref target_role) = new_role {
-            if updated_entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+        let (previous_role, role_ts) = if let Some(ref target_role) = new_role {
+            let role_ts = if updated_entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+                let ts =
+                    registry::next_updated_timestamp_at(Some(&current_entry.role_updated_at), now)
+                        .map_err(&rollback_policy)?;
                 updated_entry.role = Some(target_role.clone());
-            }
-            (target_role != &previous_role_effective).then_some(previous_role_effective)
+                updated_entry.role_updated_at = ts.clone();
+                updated_entry.role_updated_on = valid_node_name.clone();
+                Some(ts)
+            } else {
+                None
+            };
+            (
+                (target_role != &previous_role_effective).then_some(previous_role_effective),
+                role_ts,
+            )
         } else {
-            None
+            (None, None)
         };
 
-        let mut next_updated = registry::next_updated_timestamp_at(Some(&current_entry.updated_at), now)
-            .map_err(&rollback_policy)?;
-        if let Some(ref c_str) = confirm_ts
-            && let (Ok(c_ts), Ok(u_ts)) = (c_str.parse::<Timestamp>(), next_updated.parse::<Timestamp>())
-            && u_ts < c_ts
-        {
-            next_updated = c_str.clone();
+        let mut next_updated =
+            registry::next_updated_timestamp_at(Some(&current_entry.updated_at), now)
+                .map_err(&rollback_policy)?;
+        for stamp in [&confirm_ts, &name_ts, &role_ts].into_iter().flatten() {
+            if let (Ok(s_ts), Ok(u_ts)) = (
+                stamp.parse::<Timestamp>(),
+                next_updated.parse::<Timestamp>(),
+            ) && u_ts < s_ts
+            {
+                next_updated = stamp.clone();
+            }
         }
         updated_entry.updated_at = next_updated;
         updated_entry.updated_on = valid_node_name;
@@ -1366,7 +1398,16 @@ async fn list(ctx: &Ctx, _args: ListArgs) -> Result<ListResult, ToolError> {
             .iter()
             .map(|(id, entry)| {
                 let effective_role = policy.role_of(&entry.principal).0;
-                let (quarantined, status) = if let Some(reason) = report.quarantined_ids.get(id) {
+                let (quarantined, status) = if report.immutable_conflict_ids.contains(id)
+                    || entry.conflict
+                {
+                    (
+                        false,
+                        Some(format!(
+                            "not active here: conflicting immutable identity or pairing provenance across peers; remove with `legion device.remove id={id}`"
+                        )),
+                    )
+                } else if let Some(reason) = report.quarantined_ids.get(id) {
                     (
                         true,
                         Some(format!(
@@ -4285,6 +4326,11 @@ allow = ["effect:read", "effect:write"]
                     confirmed_at: None,
                     updated_at: "2026-11-24T10:00:00Z".to_owned(),
                     updated_on: "tower".to_owned(),
+                    name_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                    name_updated_on: "tower".to_owned(),
+                    role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                    role_updated_on: "tower".to_owned(),
+                    conflict: false,
                 },
             );
         }
@@ -4711,6 +4757,11 @@ allow = ["effect:read", "effect:write"]
                 confirmed_at: None,
                 updated_at: b_paired_at.clone(),
                 updated_on: "tower".to_owned(),
+                name_updated_at: b_paired_at.clone(),
+                name_updated_on: "tower".to_owned(),
+                role_updated_at: b_paired_at.clone(),
+                role_updated_on: "tower".to_owned(),
+                conflict: false,
             },
         );
         let dev_a = devices_file.devices.remove(&id_a).unwrap();
@@ -5040,6 +5091,11 @@ device = \"{id_healthy}\"
                     confirmed_at: None,
                     updated_at: now.to_owned(),
                     updated_on: "tower".to_owned(),
+                    name_updated_at: now.to_owned(),
+                    name_updated_on: "tower".to_owned(),
+                    role_updated_at: now.to_owned(),
+                    role_updated_on: "tower".to_owned(),
+                    conflict: false,
                 },
             );
         }
@@ -5580,30 +5636,36 @@ role = \"ops\"
                 .unwrap();
             assert_eq!(owner_rm["removed"], json!(true));
         } else {
-            // Enrol was refused first: enrol one as owner, then verify non-owner remove is refused
-            // while owner remove succeeds.
-            let inv = h
-                .call(
-                    "device.invite",
-                    json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
-                )
-                .await
-                .unwrap();
-            let inv_id = inv["id"].as_str().unwrap().to_owned();
-            let req = format!(
-                "{}\n",
-                json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[0xef; 32]), "name": "owner-seeded-tablet"})
-            );
-            let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
-            assert!(
-                reply.is_ok(),
-                "owner enrol past 512 KiB must still succeed: {reply:?}"
-            );
+            // Enrol was refused first: enrol two devices as owner so the file is strictly past
+            // 512 KiB even after turning one into a tombstone, then verify non-owner remove is
+            // refused while owner remove succeeds.
+            for (seed, name) in [
+                (0xee_u8, "owner-seeded-tablet-1"),
+                (0xef_u8, "owner-seeded-tablet-2"),
+            ] {
+                let inv = h
+                    .call(
+                        "device.invite",
+                        json!({"principal": "tablet", "host": "127.0.0.1", "port": 22, "user": "tester"}),
+                    )
+                    .await
+                    .unwrap();
+                let inv_id = inv["id"].as_str().unwrap().to_owned();
+                let req = format!(
+                    "{}\n",
+                    json!({"enrol": 1, "id": inv_id, "public_key": ed25519_public_key_from_seed(&[seed; 32]), "name": name})
+                );
+                let reply = run_enrol(&h.node, &inv_id, req.as_bytes()).await;
+                assert!(
+                    reply.is_ok(),
+                    "owner enrol past 512 KiB must still succeed: {reply:?}"
+                );
+            }
 
             let mut rm_call = Call::new(
                 Door::Cli,
                 "device.remove",
-                json!({"name": "owner-seeded-tablet"}),
+                json!({"name": "owner-seeded-tablet-2"}),
             );
             rm_call.pinned = Some("tablet".to_owned());
             let rm_err = h
@@ -5621,7 +5683,7 @@ role = \"ops\"
             );
 
             let owner_rm = h
-                .call("device.remove", json!({"name": "owner-seeded-tablet"}))
+                .call("device.remove", json!({"name": "owner-seeded-tablet-2"}))
                 .await
                 .unwrap();
             assert_eq!(owner_rm["removed"], json!(true));
@@ -5764,5 +5826,190 @@ allow = [\"effect:read\", \"effect:write\"]
                 .is_some_and(|d| d.contains("device.set") && d.contains("policy.toml")),
             "{rollback_check}"
         );
+    }
+
+    #[tokio::test]
+    async fn only_device_set_role_writes_role_stamp_and_conflicted_device_is_blocked() {
+        let h = Harness::new();
+        std::fs::write(
+            h.node.paths().config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+
+[roles.editor]
+allow = [\"effect:read\", \"effect:write\"]
+",
+        )
+        .unwrap();
+
+        // 1. Enrol `phone` with role `observer`. Both `name_updated_*` and `role_updated_*`
+        //    start equal to `(paired_at, paired_on)`.
+        let inv = h
+            .call(
+                "device.invite",
+                json!({"name": "phone", "role": "observer"}),
+            )
+            .await
+            .unwrap();
+        let inv_id = inv["id"].as_str().unwrap().to_owned();
+        let key = keys::ed25519_public_key_from_seed(&[0xe1; 32]);
+        let req = format!(
+            "{{\"enrol\":1,\"id\":\"{inv_id}\",\"public_key\":\"{key}\",\"name\":\"phone\"}}\n"
+        );
+        let reply = enrol::run_enrol(&h.node, &inv_id, req.as_bytes()).await;
+        assert!(reply.is_ok(), "{reply:?}");
+
+        let load_devices = || -> DevicesFile {
+            legion_core::config::parse(
+                &h.node.paths().config_file("devices.toml"),
+                &std::fs::read(h.node.paths().config_file("devices.toml")).unwrap(),
+            )
+            .unwrap()
+        };
+        let initial = load_devices();
+        let id = initial.devices.keys().next().unwrap().clone();
+        let dev0 = &initial.devices[&id];
+        assert_eq!(dev0.name_updated_at, dev0.paired_at);
+        assert_eq!(dev0.name_updated_on, dev0.paired_on);
+        assert_eq!(dev0.role_updated_at, dev0.paired_at);
+        assert_eq!(dev0.role_updated_on, dev0.paired_on);
+
+        // 2. Rename ONLY bumps `name_updated_*` and MUST NOT touch `role_updated_*`.
+        h.call("device.set", json!({"id": id, "rename": "phone-2"}))
+            .await
+            .unwrap();
+        let after_rename = load_devices();
+        let dev1 = &after_rename.devices[&id];
+        assert_eq!(dev1.name, "phone-2");
+        assert_ne!(dev1.name_updated_at, dev0.name_updated_at);
+        assert_eq!(
+            dev1.role_updated_at, dev0.role_updated_at,
+            "rename must not touch role_updated_at"
+        );
+        assert_eq!(
+            dev1.role_updated_on, dev0.role_updated_on,
+            "rename must not touch role_updated_on"
+        );
+
+        // 3. `device.list` MUST NOT touch `name_updated_*` or `role_updated_*`.
+        h.call("device.list", json!({})).await.unwrap();
+        let after_list = load_devices();
+        assert_eq!(after_list.devices[&id], *dev1);
+
+        // 4. `device.set confirm=true` ONLY bumps `confirmed_at` / `updated_at` and MUST NOT
+        //    touch `name_updated_*` or `role_updated_*`.
+        let parent_id = "aa".repeat(16);
+        let mut quarantined_file = after_list.clone();
+        quarantined_file.devices.get_mut(&id).unwrap().paired_by = Some(registry::PairedBy {
+            principal: "owner".to_owned(),
+            device: Some(parent_id.clone()),
+        });
+        quarantined_file.removed.insert(
+            parent_id,
+            registry::DeviceTombstone {
+                name: "old-parent".to_owned(),
+                principal: "owner".to_owned(),
+                fingerprint: None,
+                paired_at: None,
+                paired_on: None,
+                paired_by: None,
+                removed_by: None,
+                removed_at: dev0.paired_at.clone(),
+                removed_on: "tower".to_owned(),
+            },
+        );
+        std::fs::write(
+            h.node.paths().config_file("devices.toml"),
+            quarantined_file.to_toml_string(),
+        )
+        .unwrap();
+        h.call("device.set", json!({"id": id, "confirm": true}))
+            .await
+            .unwrap();
+        let after_confirm = load_devices();
+        let dev2 = &after_confirm.devices[&id];
+        assert!(dev2.confirmed_at.is_some());
+        assert_eq!(
+            dev2.name_updated_at, dev1.name_updated_at,
+            "confirm=true must not touch name_updated_at"
+        );
+        assert_eq!(
+            dev2.role_updated_at, dev0.role_updated_at,
+            "confirm=true must not touch role_updated_at"
+        );
+
+        // 5. `device.set role=editor` ONLY bumps `role_updated_*` and MUST NOT touch `name_updated_*`.
+        h.call("device.set", json!({"id": id, "role": "editor"}))
+            .await
+            .unwrap();
+        let after_role = load_devices();
+        let dev3 = &after_role.devices[&id];
+        assert_eq!(dev3.role.as_deref(), Some("editor"));
+        assert_ne!(dev3.role_updated_at, dev0.role_updated_at);
+        assert_eq!(
+            dev3.name_updated_at, dev1.name_updated_at,
+            "role change must not touch name_updated_at"
+        );
+
+        // 6. Conflicted entry: `device.list` flags it & warns, `authorized_keys` has no line,
+        //    `device.set` refuses with Conflict, `meta.doctor` flags it, and `device.remove` clears it.
+        let mut conflicted = after_role.clone();
+        let c = conflicted.devices.get_mut(&id).unwrap();
+        c.conflict = true;
+        c.confirmed_by = None;
+        c.confirmed_at = None;
+        std::fs::write(
+            h.node.paths().config_file("devices.toml"),
+            conflicted.to_toml_string(),
+        )
+        .unwrap();
+
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        let item = listed["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == json!(id))
+            .unwrap();
+        assert!(
+            item["status"]
+                .as_str()
+                .is_some_and(|s| s.contains("conflicting immutable")),
+            "{item}"
+        );
+        assert!(
+            listed["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains(&id))),
+            "{listed}"
+        );
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys).unwrap().contains(&id),
+            "conflicted device must have no authorized_keys line"
+        );
+
+        let set_err = h
+            .call("device.set", json!({"id": id, "rename": "phone-3"}))
+            .await
+            .unwrap_err();
+        assert_eq!(set_err.code, ErrorCode::Conflict, "{set_err:?}");
+
+        let doctor = h.call("meta.doctor", json!({"quick": true})).await.unwrap();
+        assert!(
+            doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == json!("conflicting device entries")),
+            "{doctor}"
+        );
+
+        let rem = h.call("device.remove", json!({"id": id})).await.unwrap();
+        assert_eq!(rem["removed"], json!(true), "{rem}");
     }
 }

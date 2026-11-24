@@ -3115,6 +3115,11 @@ mod tests {
             confirmed_at: None,
             updated_at: "2026-11-24T10:00:00Z".to_owned(),
             updated_on: "node-a".to_owned(),
+            name_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+            name_updated_on: "node-a".to_owned(),
+            role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+            role_updated_on: "node-a".to_owned(),
+            conflict: false,
         };
         let dev_b = FleetDevice {
             name: "phone-b".to_owned(),
@@ -3128,6 +3133,11 @@ mod tests {
             confirmed_at: None,
             updated_at: "2026-11-24T10:01:00Z".to_owned(),
             updated_on: "node-b".to_owned(),
+            name_updated_at: "2026-11-24T10:01:00Z".to_owned(),
+            name_updated_on: "node-b".to_owned(),
+            role_updated_at: "2026-11-24T10:01:00Z".to_owned(),
+            role_updated_on: "node-b".to_owned(),
+            conflict: false,
         };
 
         let mut only_a = DevicesFile::default();
@@ -3216,6 +3226,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         local.removed.insert(
@@ -3251,6 +3266,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T11:00:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
+                name_updated_at: "2026-11-24T11:00:00Z".to_owned(),
+                name_updated_on: "box-b".to_owned(),
+                role_updated_at: "2026-11-24T11:00:00Z".to_owned(),
+                role_updated_on: "box-b".to_owned(),
+                conflict: false,
             },
         );
         incoming.devices.insert(
@@ -3267,6 +3287,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:10:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
+                name_updated_at: "2026-11-24T10:10:00Z".to_owned(),
+                name_updated_on: "box-b".to_owned(),
+                role_updated_at: "2026-11-24T10:10:00Z".to_owned(),
+                role_updated_on: "box-b".to_owned(),
+                conflict: false,
             },
         );
 
@@ -3321,6 +3346,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:20:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
+                name_updated_at: "2026-11-24T10:20:00Z".to_owned(),
+                name_updated_on: "box-b".to_owned(),
+                role_updated_at: "2026-11-24T10:20:00Z".to_owned(),
+                role_updated_on: "box-b".to_owned(),
+                conflict: false,
             },
         );
         let mut rogue_call = Call::new(
@@ -3419,6 +3449,11 @@ device = \"11111111111111111111111111111111\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -3441,6 +3476,11 @@ device = \"11111111111111111111111111111111\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:05:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: "2026-11-24T10:05:00Z".to_owned(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: "2026-11-24T10:05:00Z".to_owned(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         let mut add_call = Call::new(
@@ -3457,6 +3497,7 @@ device = \"11111111111111111111111111111111\"
         let entry = raise_role.devices.get_mut(&id_existing).unwrap();
         entry.role = Some("owner".to_owned());
         entry.updated_at = "2026-11-24T10:06:00Z".to_owned();
+        entry.role_updated_at = "2026-11-24T10:06:00Z".to_owned();
         let mut change_call = Call::new(
             Door::Http,
             "config.write",
@@ -3555,6 +3596,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), local.to_toml_string()).unwrap();
@@ -3576,6 +3622,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:05:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
+                name_updated_at: "2026-11-24T10:05:00Z".to_owned(),
+                name_updated_on: "box-b".to_owned(),
+                role_updated_at: "2026-11-24T10:05:00Z".to_owned(),
+                role_updated_on: "box-b".to_owned(),
+                conflict: false,
             },
         );
         let mut hijack_call = Call::new(
@@ -3637,6 +3688,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:07:00Z".to_owned(),
                 updated_on: "box-b".to_owned(),
+                name_updated_at: "2026-11-24T10:07:00Z".to_owned(),
+                name_updated_on: "box-b".to_owned(),
+                role_updated_at: "2026-11-24T10:07:00Z".to_owned(),
+                role_updated_on: "box-b".to_owned(),
+                conflict: false,
             },
         );
         let err3 = node
@@ -3704,6 +3760,11 @@ role = \"phone_admin\"
                 confirmed_at: None,
                 updated_at: "2026-11-24T10:00:00Z".to_owned(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -3933,6 +3994,11 @@ role = \"ops\"
                 confirmed_at: None,
                 updated_at: t0.clone(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: t0.clone(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: t0.clone(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         initial.devices.insert(
@@ -3952,6 +4018,11 @@ role = \"ops\"
                 confirmed_at: None,
                 updated_at: t0.clone(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: t0.clone(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: t0.clone(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -3979,6 +4050,11 @@ role = \"ops\"
                 confirmed_at: None,
                 updated_at: t1.clone(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: t1.clone(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: t1.clone(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         let mut hijack_call = Call::new(
@@ -4029,6 +4105,11 @@ role = \"ops\"
                     confirmed_at: None,
                     updated_at: t1.clone(),
                     updated_on: "box-a".to_owned(),
+                    name_updated_at: t1.clone(),
+                    name_updated_on: "box-a".to_owned(),
+                    role_updated_at: t1.clone(),
+                    role_updated_on: "box-a".to_owned(),
+                    conflict: false,
                 },
             );
             f
@@ -4296,6 +4377,11 @@ role = \"ops\"
                 confirmed_at: None,
                 updated_at: now_str.clone(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: now_str.clone(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: now_str.clone(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), initial.to_toml_string()).unwrap();
@@ -4324,6 +4410,11 @@ role = \"ops\"
                 confirmed_at: None,
                 updated_at: now_str.clone(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: now_str.clone(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: now_str.clone(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         let mut add_call = Call::new(
@@ -4476,6 +4567,11 @@ role = \"ops\"
                 confirmed_at: Some(t1.clone()),
                 updated_at: t1.clone(),
                 updated_on: "box-a".to_owned(),
+                name_updated_at: t1.clone(),
+                name_updated_on: "box-a".to_owned(),
+                role_updated_at: t1.clone(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         std::fs::write(paths.config_file("devices.toml"), local.to_toml_string()).unwrap();
@@ -4506,6 +4602,11 @@ role = \"ops\"
                 confirmed_at: None,
                 updated_at: t2.clone(),
                 updated_on: "box-b".to_owned(),
+                name_updated_at: t2.clone(),
+                name_updated_on: "box-b".to_owned(),
+                role_updated_at: t0.clone(),
+                role_updated_on: "box-a".to_owned(),
+                conflict: false,
             },
         );
         let res1 = node
@@ -4554,8 +4655,13 @@ role = \"ops\"
                 }),
                 confirmed_by: None,
                 confirmed_at: None,
-                updated_at: t3,
+                updated_at: t3.clone(),
                 updated_on: "box-b".to_owned(),
+                name_updated_at: t3.clone(),
+                name_updated_on: "box-b".to_owned(),
+                role_updated_at: t3,
+                role_updated_on: "box-b".to_owned(),
+                conflict: false,
             },
         );
         let res2 = node
@@ -4582,6 +4688,10 @@ role = \"ops\"
         )
         .unwrap();
         let dev2 = &after2.devices[&id_child];
+        assert!(
+            dev2.conflict,
+            "immutable public_key mismatch must mark conflict = true: {dev2:?}"
+        );
         assert_eq!(
             dev2.confirmed_by, None,
             "local confirmation must be cleared when incoming entry changes public_key: {dev2:?}"

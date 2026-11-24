@@ -249,9 +249,100 @@ pub struct PairedBy {
     pub device: Option<String>,
 }
 
-/// One live paired device entry in `devices.toml`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawFleetDevice {
+    name: String,
+    public_key: String,
+    principal: String,
+    #[serde(default)]
+    role: Option<String>,
+    paired_at: String,
+    paired_on: String,
+    #[serde(default)]
+    paired_by: Option<PairedBy>,
+    #[serde(default)]
+    confirmed_by: Option<String>,
+    #[serde(default)]
+    confirmed_at: Option<String>,
+    updated_at: String,
+    updated_on: String,
+    #[serde(default)]
+    name_updated_at: Option<String>,
+    #[serde(default)]
+    name_updated_on: Option<String>,
+    #[serde(default)]
+    role_updated_at: Option<String>,
+    #[serde(default)]
+    role_updated_on: Option<String>,
+    #[serde(default)]
+    conflict: bool,
+}
+
+impl TryFrom<RawFleetDevice> for FleetDevice {
+    type Error = String;
+
+    fn try_from(raw: RawFleetDevice) -> Result<Self, Self::Error> {
+        if raw.name_updated_at.is_some() != raw.name_updated_on.is_some() {
+            return Err(
+                "name_updated_at and name_updated_on must either both be set or both be omitted"
+                    .to_owned(),
+            );
+        }
+        if raw.role_updated_at.is_some() != raw.role_updated_on.is_some() {
+            return Err(
+                "role_updated_at and role_updated_on must either both be set or both be omitted"
+                    .to_owned(),
+            );
+        }
+        let name_updated_at = raw
+            .name_updated_at
+            .unwrap_or_else(|| raw.updated_at.clone());
+        let name_updated_on = raw
+            .name_updated_on
+            .unwrap_or_else(|| raw.updated_on.clone());
+        let role_updated_at = raw
+            .role_updated_at
+            .unwrap_or_else(|| raw.updated_at.clone());
+        let role_updated_on = raw
+            .role_updated_on
+            .unwrap_or_else(|| raw.updated_on.clone());
+        Ok(FleetDevice {
+            name: raw.name,
+            public_key: raw.public_key,
+            principal: raw.principal,
+            role: raw.role,
+            paired_at: raw.paired_at,
+            paired_on: raw.paired_on,
+            paired_by: raw.paired_by,
+            confirmed_by: raw.confirmed_by,
+            confirmed_at: raw.confirmed_at,
+            updated_at: raw.updated_at,
+            updated_on: raw.updated_on,
+            name_updated_at,
+            name_updated_on,
+            role_updated_at,
+            role_updated_on,
+            conflict: raw.conflict,
+        })
+    }
+}
+
+/// One live paired device entry in `devices.toml`.
+///
+/// Mutable fields (`name` and `role`) carry independent per-field stamps (`name_updated_at` /
+/// `name_updated_on` and `role_updated_at` / `role_updated_on`) so a stale rename can never
+/// overwrite a newer role change (and vice versa). Legacy entries with only `updated_at` /
+/// `updated_on` are read with both per-field stamps equal to `(updated_at, updated_on)`.
+/// Immutable identity and pairing-provenance fields (`public_key`, `principal`, `paired_at`,
+/// `paired_on`, `paired_by`) must agree across peers; a mismatch sets `conflict = true` (never
+/// "newest wins") so the entry receives no `authorized_keys` line and warns until removed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawFleetDevice")]
 pub struct FleetDevice {
     /// Sanitised device label (matches `--device <name>` and `legion-device:<name>`).
     pub name: String,
@@ -284,6 +375,19 @@ pub struct FleetDevice {
     pub updated_at: String,
     /// Node name that wrote the most recent update (initially `paired_on`).
     pub updated_on: String,
+    /// RFC 3339 UTC timestamp of the most recent `name` change (initially `paired_at`).
+    pub name_updated_at: String,
+    /// Node name that wrote the most recent `name` change (initially `paired_on`).
+    pub name_updated_on: String,
+    /// RFC 3339 UTC timestamp of the most recent `role` change (initially `paired_at`).
+    pub role_updated_at: String,
+    /// Node name that wrote the most recent `role` change (initially `paired_on`).
+    pub role_updated_on: String,
+    /// `true` when two peers held different immutable identity or pairing-provenance fields for
+    /// this pairing id during a merge. Conflicted devices are inactive (no `authorized_keys` line,
+    /// `nobody`, denied by `legion gate`) until removed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub conflict: bool,
 }
 
 /// One removed-device tombstone in `devices.toml`.
@@ -426,6 +530,23 @@ impl Document for DevicesFile {
                 .map_err(|e| format!("devices.{id}.updated_at is not RFC 3339 UTC: {e}"))?;
             NodeName::try_from(entry.updated_on.clone())
                 .map_err(|e| format!("devices.{id}.updated_on: {e}"))?;
+            entry
+                .name_updated_at
+                .parse::<Timestamp>()
+                .map_err(|e| format!("devices.{id}.name_updated_at is not RFC 3339 UTC: {e}"))?;
+            NodeName::try_from(entry.name_updated_on.clone())
+                .map_err(|e| format!("devices.{id}.name_updated_on: {e}"))?;
+            entry
+                .role_updated_at
+                .parse::<Timestamp>()
+                .map_err(|e| format!("devices.{id}.role_updated_at is not RFC 3339 UTC: {e}"))?;
+            NodeName::try_from(entry.role_updated_on.clone())
+                .map_err(|e| format!("devices.{id}.role_updated_on: {e}"))?;
+            if entry.conflict && (entry.confirmed_by.is_some() || entry.confirmed_at.is_some()) {
+                return Err(format!(
+                    "devices.{id}: conflicted entries cannot carry confirmed_by or confirmed_at"
+                ));
+            }
         }
         for (id, tomb) in &self.removed {
             validate_pairing_id(id).map_err(|e| format!("removed.{id}: {}", e.message))?;
@@ -518,6 +639,13 @@ impl DevicesFile {
                 }
                 t["updated_at"] = value(dev.updated_at.as_str());
                 t["updated_on"] = value(dev.updated_on.as_str());
+                t["name_updated_at"] = value(dev.name_updated_at.as_str());
+                t["name_updated_on"] = value(dev.name_updated_on.as_str());
+                t["role_updated_at"] = value(dev.role_updated_at.as_str());
+                t["role_updated_on"] = value(dev.role_updated_on.as_str());
+                if dev.conflict {
+                    t["conflict"] = value(true);
+                }
                 devices_table.insert(id, Item::Table(t));
             }
             doc.insert("devices", Item::Table(devices_table));
@@ -661,6 +789,8 @@ pub fn validate_incoming_timestamps(
     for (id, entry) in &devices.devices {
         check("devices", id, "paired_at", &entry.paired_at)?;
         check("devices", id, "updated_at", &entry.updated_at)?;
+        check("devices", id, "name_updated_at", &entry.name_updated_at)?;
+        check("devices", id, "role_updated_at", &entry.role_updated_at)?;
         if let Some(confirmed_at) = &entry.confirmed_at {
             check("devices", id, "confirmed_at", confirmed_at)?;
         }
@@ -709,27 +839,95 @@ fn tombstone_sort_key(t: &DeviceTombstone) -> impl Ord + '_ {
     )
 }
 
-fn device_sort_key(d: &FleetDevice) -> impl Ord + '_ {
+fn immutable_sort_key(d: &FleetDevice) -> impl Ord + '_ {
     (
-        timestamp_sort_key(&d.updated_at),
-        d.updated_on.as_str(),
-        d.name.as_str(),
-        d.role.as_deref().unwrap_or(""),
-        d.principal.as_str(),
         d.public_key.as_str(),
+        d.principal.as_str(),
         d.paired_at.as_str(),
         d.paired_on.as_str(),
         d.paired_by
             .as_ref()
-            .map(|p| p.principal.as_str())
-            .unwrap_or(""),
-        d.paired_by
-            .as_ref()
-            .and_then(|p| p.device.as_deref())
-            .unwrap_or(""),
-        d.confirmed_by.as_deref().unwrap_or(""),
-        d.confirmed_at.as_deref().unwrap_or(""),
+            .map(|p| (p.principal.as_str(), p.device.as_deref())),
     )
+}
+
+fn name_sort_key(d: &FleetDevice) -> impl Ord + '_ {
+    (
+        timestamp_sort_key(&d.name_updated_at),
+        d.name_updated_on.as_str(),
+        d.name.as_str(),
+    )
+}
+
+fn role_sort_key(d: &FleetDevice) -> impl Ord + '_ {
+    (
+        timestamp_sort_key(&d.role_updated_at),
+        d.role_updated_on.as_str(),
+        d.role.as_deref(),
+    )
+}
+
+fn updated_sort_key(d: &FleetDevice) -> impl Ord + '_ {
+    (timestamp_sort_key(&d.updated_at), d.updated_on.as_str())
+}
+
+fn confirm_sort_key(d: &FleetDevice) -> impl Ord + '_ {
+    (
+        d.confirmed_at.as_deref().map(timestamp_sort_key),
+        d.confirmed_by.as_deref(),
+    )
+}
+
+fn merge_live_device(da: &FleetDevice, db: &FleetDevice) -> FleetDevice {
+    let conflict = da.conflict || db.conflict || immutable_sort_key(da) != immutable_sort_key(db);
+    let imm = if immutable_sort_key(da) <= immutable_sort_key(db) {
+        da
+    } else {
+        db
+    };
+    let name_src = if name_sort_key(da) >= name_sort_key(db) {
+        da
+    } else {
+        db
+    };
+    let role_src = if role_sort_key(da) >= role_sort_key(db) {
+        da
+    } else {
+        db
+    };
+    let updated_src = if updated_sort_key(da) >= updated_sort_key(db) {
+        da
+    } else {
+        db
+    };
+    let (confirmed_by, confirmed_at) = if conflict {
+        (None, None)
+    } else {
+        let conf_src = if confirm_sort_key(da) >= confirm_sort_key(db) {
+            da
+        } else {
+            db
+        };
+        (conf_src.confirmed_by.clone(), conf_src.confirmed_at.clone())
+    };
+    FleetDevice {
+        name: name_src.name.clone(),
+        public_key: imm.public_key.clone(),
+        principal: imm.principal.clone(),
+        role: role_src.role.clone(),
+        paired_at: imm.paired_at.clone(),
+        paired_on: imm.paired_on.clone(),
+        paired_by: imm.paired_by.clone(),
+        confirmed_by,
+        confirmed_at,
+        updated_at: updated_src.updated_at.clone(),
+        updated_on: updated_src.updated_on.clone(),
+        name_updated_at: name_src.name_updated_at.clone(),
+        name_updated_on: name_src.name_updated_on.clone(),
+        role_updated_at: role_src.role_updated_at.clone(),
+        role_updated_on: role_src.role_updated_on.clone(),
+        conflict,
+    }
 }
 
 fn confirmed_after(entry: &FleetDevice, removed_ts: Timestamp) -> bool {
@@ -850,6 +1048,20 @@ pub fn inspect_quarantined_devices(paths: &Paths) -> Vec<(String, String, String
         .collect()
 }
 
+/// Read-only list of `(name, pairing_id)` for live devices in `devices.toml` marked with an
+/// immutable-field conflict across peers, used by `meta.doctor`.
+pub fn inspect_immutable_conflict_devices(paths: &Paths) -> Vec<(String, String)> {
+    let Ok(Some(devices)) = load_devices_raw(paths) else {
+        return Vec::new();
+    };
+    devices
+        .devices
+        .iter()
+        .filter(|(_, entry)| entry.conflict)
+        .map(|(id, entry)| (entry.name.clone(), id.clone()))
+        .collect()
+}
+
 /// Rewrites incoming tombstone identity and pairing-provenance fields from the local registry
 /// whenever the tombstoned pairing id already exists locally (live or already tombstoned).
 ///
@@ -932,16 +1144,20 @@ pub fn preserve_local_confirmations(local: &DevicesFile, merged: &mut DevicesFil
             continue;
         }
         let diffs = local_entry.identity_or_provenance_differences(merged_entry);
-        if diffs.is_empty() {
+        if !merged_entry.conflict && diffs.is_empty() {
             merged_entry.confirmed_by = local_entry.confirmed_by.clone();
             merged_entry.confirmed_at = local_entry.confirmed_at.clone();
         } else {
             merged_entry.confirmed_by = None;
             merged_entry.confirmed_at = None;
-            warnings.push(format!(
-                "Cleared local confirmation on device {} ({id}) because the incoming entry changed its identity or pairing provenance ({}).",
-                merged_entry.name,
+            let detail = if diffs.is_empty() {
+                "conflicting identity or pairing provenance across peers".to_owned()
+            } else {
                 diffs.join(", ")
+            };
+            warnings.push(format!(
+                "Cleared local confirmation on device {} ({id}) because the incoming entry changed or conflicted on its identity or pairing provenance ({detail}).",
+                merged_entry.name,
             ));
         }
     }
@@ -956,8 +1172,13 @@ pub fn preserve_local_confirmations(local: &DevicesFile, merged: &mut DevicesFil
 /// - **Idempotent**: `merge_devices(a, a) == a`
 /// - **Tombstone dominance**: an `id` present in `removed` on either side is always in `removed`
 ///   and never in `devices` (tombstones can never be resurrected or dropped).
-/// - **Live edit ordering**: when both sides hold a live entry for the same `id`, the entry with
-///   the newer `updated_at` wins (with a deterministic total-order tie-break).
+/// - **Live edit ordering**: when both sides hold a live entry for the same `id`, immutable
+///   identity and pairing-provenance fields (`public_key`, `principal`, `paired_at`, `paired_on`,
+///   `paired_by`) must match or the entry is flagged `conflict = true` (inactive, no
+///   `authorized_keys` line, `nobody` in `policy.toml`, denied by `legion gate`, confirmation
+///   cleared); mutable fields (`name` and `role`) each merge independently using their own
+///   `(name_updated_at, name_updated_on)` and `(role_updated_at, role_updated_on)` stamps with a
+///   deterministic total-order tie-break.
 pub fn merge_devices(a: &DevicesFile, b: &DevicesFile) -> DevicesFile {
     let mut all_ids: BTreeSet<&str> = BTreeSet::new();
     for id in a
@@ -994,12 +1215,7 @@ pub fn merge_devices(a: &DevicesFile, b: &DevicesFile) -> DevicesFile {
             }
             (None, None) => match (a.devices.get(id), b.devices.get(id)) {
                 (Some(da), Some(db)) => {
-                    let winner = if device_sort_key(da) >= device_sort_key(db) {
-                        da.clone()
-                    } else {
-                        db.clone()
-                    };
-                    out.devices.insert(id.to_owned(), winner);
+                    out.devices.insert(id.to_owned(), merge_live_device(da, db));
                 }
                 (Some(da), None) => {
                     out.devices.insert(id.to_owned(), da.clone());
@@ -1510,6 +1726,18 @@ pub fn reconcile_device_principals_locked(
             continue;
         }
 
+        if devices.devices.get(pairing_id).is_some_and(|d| d.conflict) {
+            warnings.push(format!(
+                "Principal {principal} belongs to conflicted device {pairing_id} (conflicting immutable identity or pairing provenance across peers); leaving it restricted to `nobody` until removed."
+            ));
+            if let Some(existing) = existing_entry
+                && existing.device.as_deref() == Some(pairing_id)
+            {
+                upsert_device_principal_locked(paths, principal, NOBODY, pairing_id)?;
+            }
+            continue;
+        }
+
         if let Some(reason) = quarantined.get(pairing_id) {
             warnings.push(format!(
                 "Principal {principal} belongs to quarantined device {pairing_id} ({reason}); leaving it restricted to `nobody` until confirmed by the owner."
@@ -1678,8 +1906,13 @@ pub fn adopt_legacy_devices_from_auth_keys(
                 paired_by: None,
                 confirmed_by: None,
                 confirmed_at: None,
-                updated_at: paired_at,
+                updated_at: paired_at.clone(),
                 updated_on: valid_node.clone(),
+                name_updated_at: paired_at.clone(),
+                name_updated_on: valid_node.clone(),
+                role_updated_at: paired_at,
+                role_updated_on: valid_node.clone(),
+                conflict: false,
             });
     }
 
@@ -1705,6 +1938,9 @@ pub struct AuthKeysReconcileReport {
     /// Live pairing ids skipped because their public key already sits on a foreign line of
     /// `authorized_keys`.
     pub foreign_key_ids: BTreeSet<String>,
+    /// Live pairing ids skipped because two peers disagreed on immutable identity or
+    /// pairing-provenance fields during a merge.
+    pub immutable_conflict_ids: BTreeSet<String>,
     /// Live pairing ids quarantined because an unconfirmed ancestor was removed at or before their
     /// pairing time, mapped to a human-readable reason.
     pub quarantined_ids: BTreeMap<String, String>,
@@ -2003,7 +2239,16 @@ pub fn reconcile_authorized_keys_in_memory(
     let principal_conflict_ids = device_principal_conflicts(devices, policy);
     let mut expected_lines: BTreeMap<&str, (String, Vec<u8>)> = BTreeMap::new();
     let mut foreign_key_ids: BTreeSet<String> = BTreeSet::new();
+    let mut immutable_conflict_ids: BTreeSet<String> = BTreeSet::new();
     for (id, entry) in &devices.devices {
+        if entry.conflict {
+            immutable_conflict_ids.insert(id.clone());
+            warnings.push(format!(
+                "Device {} ({id}) has conflicting immutable identity or pairing provenance across peers and is not active here; remove it with `legion device.remove id={id}`.",
+                entry.name
+            ));
+            continue;
+        }
         if let Some(reason) = quarantined_ids.get(id) {
             warnings.push(format!(
                 "Device {} ({id}) is quarantined ({reason}) and not active here; confirm with `legion device.set id={id} confirm=true` or remove with `legion device.remove id={id}`.",
@@ -2117,6 +2362,7 @@ pub fn reconcile_authorized_keys_in_memory(
         removed_targets: removed_targets.into_iter().collect(),
         duplicate_key_ids,
         foreign_key_ids,
+        immutable_conflict_ids,
         quarantined_ids,
         principal_conflict_ids,
         warnings,
@@ -2365,6 +2611,19 @@ pub fn verify_gate_device(
             format!("Device {device_name} is no longer authorized as {principal}."),
         ));
     };
+
+    if entry.conflict {
+        let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
+        return Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!(
+                "Device {device_name} ({pairing_id}) has conflicting immutable identity or pairing provenance across peers and cannot connect."
+            ),
+        )
+        .with_hint(format!(
+            "Remove the conflicted entry with `legion device.remove id={pairing_id}` and re-pair if needed."
+        )));
+    }
 
     if entry.name != device_name || entry.principal != principal {
         let _ = reconcile_devices_and_auth_keys_blocking(paths, node_name, node_file, false);
@@ -2773,9 +3032,10 @@ pub fn apply_devices_merge_blocking(
     let newly_tombstoned: Vec<SessionTarget> = local
         .devices
         .iter()
-        .filter(|(id, _)| {
+        .filter(|(id, prev)| {
             merged.removed.contains_key(*id)
                 || (quarantined_after.contains_key(*id) && !quarantined_before.contains_key(*id))
+                || (!prev.conflict && merged.devices.get(*id).is_some_and(|d| d.conflict))
         })
         .map(|(id, prev)| SessionTarget::new(prev.name.clone(), Some(id.clone())))
         .collect();
@@ -3019,6 +3279,11 @@ mod tests {
             confirmed_at: None,
             updated_at: updated_at.to_owned(),
             updated_on: node.to_owned(),
+            name_updated_at: updated_at.to_owned(),
+            name_updated_on: node.to_owned(),
+            role_updated_at: updated_at.to_owned(),
+            role_updated_on: node.to_owned(),
+            conflict: false,
         }
     }
 
@@ -3077,6 +3342,11 @@ mod tests {
                     let paired_on = *rng.pick(&nodes);
                     let updated_at = *rng.pick(&times);
                     let updated_on = *rng.pick(&nodes);
+                    let name_updated_at = *rng.pick(&times);
+                    let name_updated_on = *rng.pick(&nodes);
+                    let role_updated_at = *rng.pick(&times);
+                    let role_updated_on = *rng.pick(&nodes);
+                    let conflict = rng.next().is_multiple_of(5);
                     let key_seed = ((idx + 1) as u8) * 10 + (rng.next() % 3) as u8;
                     let paired_by = match rng.next() % 3 {
                         0 => None,
@@ -3089,10 +3359,13 @@ mod tests {
                             device: Some(rng.pick(&ids).clone()),
                         }),
                     };
-                    let confirmed_by = (*rng.pick(&confirmed_opts)).map(str::to_owned);
-                    let confirmed_at = confirmed_by
-                        .as_ref()
-                        .map(|_| (*rng.pick(&times)).to_owned());
+                    let (confirmed_by, confirmed_at) = if conflict {
+                        (None, None)
+                    } else {
+                        let by = (*rng.pick(&confirmed_opts)).map(str::to_owned);
+                        let at = by.as_ref().map(|_| (*rng.pick(&times)).to_owned());
+                        (by, at)
+                    };
                     file.devices.insert(
                         id.clone(),
                         FleetDevice {
@@ -3107,6 +3380,11 @@ mod tests {
                             confirmed_at,
                             updated_at: updated_at.to_owned(),
                             updated_on: updated_on.to_owned(),
+                            name_updated_at: name_updated_at.to_owned(),
+                            name_updated_on: name_updated_on.to_owned(),
+                            role_updated_at: role_updated_at.to_owned(),
+                            role_updated_on: role_updated_on.to_owned(),
+                            conflict,
                         },
                     );
                 }
@@ -3173,6 +3451,11 @@ mod tests {
             confirmed_at: None,
             updated_at: "2026-11-24T10:00:00Z".to_owned(),
             updated_on: "pi".to_owned(),
+            name_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+            name_updated_on: "pi".to_owned(),
+            role_updated_at: "2026-11-24T10:00:00Z".to_owned(),
+            role_updated_on: "pi".to_owned(),
+            conflict: false,
         };
 
         let mut variants: Vec<FleetDevice> = Vec::new();
@@ -3182,8 +3465,11 @@ mod tests {
             variants.push(v);
         };
         push_variant(|d| d.updated_on = "tower".to_owned());
+        push_variant(|d| d.name_updated_on = "tower".to_owned());
+        push_variant(|d| d.role_updated_on = "tower".to_owned());
         push_variant(|d| d.name = "beta".to_owned());
         push_variant(|d| d.role = Some("editor".to_owned()));
+        push_variant(|d| d.conflict = true);
         push_variant(|d| d.principal = "device:beta".to_owned());
         push_variant(|d| d.public_key = sample_key(11));
         push_variant(|d| d.paired_at = "2026-11-24T09:30:00Z".to_owned());
@@ -3340,18 +3626,18 @@ mod tests {
             ),
         );
         let mut b = DevicesFile::default();
-        b.devices.insert(
-            id.clone(),
-            sample_device(
-                1,
-                "pixel-renamed",
-                Some("editor"),
-                "2026-11-24T11:00:00Z",
-                "pi",
-            ),
+        let mut b_dev = sample_device(
+            1,
+            "pixel-renamed",
+            Some("editor"),
+            "2026-11-24T11:00:00Z",
+            "pi",
         );
+        b_dev.principal = "device:pixel".to_owned();
+        b.devices.insert(id.clone(), b_dev);
 
         let merged = merge_devices(&a, &b);
+        assert!(!merged.devices[&id].conflict);
         assert_eq!(merged.devices[&id].name, "pixel-renamed");
         assert_eq!(merged.devices[&id].role.as_deref(), Some("editor"));
 
@@ -3364,6 +3650,192 @@ mod tests {
         let merged_tomb = merge_devices(&b, &c);
         assert!(merged_tomb.devices.is_empty());
         assert!(merged_tomb.removed.contains_key(&id));
+    }
+
+    #[test]
+    fn legacy_single_stamp_parses_and_immutable_mismatch_marks_conflict_without_auth_line() {
+        let id = sample_id(0x71);
+        let key1 = sample_key(0x71);
+        let key2 = sample_key(0x72);
+
+        // 1. Legacy TOML carrying only `updated_at` / `updated_on` parses with both per-field
+        //    stamps equal to `(updated_at, updated_on)` and `conflict = false`.
+        let legacy_toml = format!(
+            "\
+version = 1
+
+[devices.{id}]
+name = \"pixel\"
+public_key = \"{key1}\"
+principal = \"device:pixel\"
+role = \"observer\"
+paired_at = \"2026-11-24T09:00:00Z\"
+paired_on = \"tower\"
+updated_at = \"2026-11-24T10:00:00Z\"
+updated_on = \"pi\"
+"
+        );
+        let legacy: DevicesFile = parse(Path::new("devices.toml"), legacy_toml.as_bytes()).unwrap();
+        let dev = &legacy.devices[&id];
+        assert_eq!(dev.name_updated_at, "2026-11-24T10:00:00Z");
+        assert_eq!(dev.name_updated_on, "pi");
+        assert_eq!(dev.role_updated_at, "2026-11-24T10:00:00Z");
+        assert_eq!(dev.role_updated_on, "pi");
+        assert!(!dev.conflict);
+
+        // Half-set per-field stamp is rejected.
+        let half_stamp = format!("{legacy_toml}name_updated_at = \"2026-11-24T10:05:00Z\"\n");
+        assert!(parse::<DevicesFile>(Path::new("devices.toml"), half_stamp.as_bytes()).is_err());
+
+        // 2. Independent per-field stamps merge `name` and `role` separately.
+        let mut side_a = legacy.clone();
+        let da = side_a.devices.get_mut(&id).unwrap();
+        da.name = "pixel-renamed".to_owned();
+        da.name_updated_at = "2026-11-24T12:00:00Z".to_owned();
+        da.name_updated_on = "tower".to_owned();
+        da.updated_at = "2026-11-24T12:00:00Z".to_owned();
+        da.updated_on = "tower".to_owned();
+        da.role = Some("admin".to_owned());
+        da.role_updated_at = "2026-11-24T09:00:00Z".to_owned();
+        da.role_updated_on = "tower".to_owned();
+
+        let mut side_b = legacy.clone();
+        let db = side_b.devices.get_mut(&id).unwrap();
+        db.role = Some("observer".to_owned());
+        db.role_updated_at = "2026-11-24T11:00:00Z".to_owned();
+        db.role_updated_on = "pi".to_owned();
+        db.updated_at = "2026-11-24T11:00:00Z".to_owned();
+        db.updated_on = "pi".to_owned();
+
+        let ab = merge_devices(&side_a, &side_b);
+        let ba = merge_devices(&side_b, &side_a);
+        assert_eq!(ab, ba);
+        let merged = &ab.devices[&id];
+        assert!(!merged.conflict);
+        assert_eq!(merged.name, "pixel-renamed");
+        assert_eq!(merged.role.as_deref(), Some("observer"));
+
+        // 3. Immutable-field mismatch on ANY of public_key, principal, paired_at, paired_on,
+        //    or paired_by produces `conflict = true` (never "newest wins"), clears confirmation,
+        //    emits warnings, writes NO authorized_keys line, restricts policy.toml to nobody, and
+        //    is denied by verify_gate_device.
+        for (label, mutate) in [
+            (
+                "public_key",
+                Box::new(|d: &mut FleetDevice| d.public_key = key2.clone())
+                    as Box<dyn Fn(&mut FleetDevice)>,
+            ),
+            (
+                "principal",
+                Box::new(|d: &mut FleetDevice| d.principal = "device:other".to_owned()),
+            ),
+            (
+                "paired_at",
+                Box::new(|d: &mut FleetDevice| d.paired_at = "2026-11-24T09:05:00Z".to_owned()),
+            ),
+            (
+                "paired_on",
+                Box::new(|d: &mut FleetDevice| d.paired_on = "pi".to_owned()),
+            ),
+            (
+                "paired_by",
+                Box::new(|d: &mut FleetDevice| {
+                    d.paired_by = Some(PairedBy {
+                        principal: "owner".to_owned(),
+                        device: None,
+                    });
+                }),
+            ),
+        ] {
+            let mut peer = legacy.clone();
+            let p = peer.devices.get_mut(&id).unwrap();
+            mutate(p);
+            // Even with much newer timestamps, immutable mismatch MUST become a conflict.
+            p.updated_at = "2026-11-24T23:00:00Z".to_owned();
+            p.name_updated_at = "2026-11-24T23:00:00Z".to_owned();
+            p.role_updated_at = "2026-11-24T23:00:00Z".to_owned();
+
+            let m1 = merge_devices(&legacy, &peer);
+            let m2 = merge_devices(&peer, &legacy);
+            assert_eq!(m1, m2, "{label}: merge must remain commutative");
+            assert!(
+                m1.devices[&id].conflict,
+                "{label}: immutable mismatch must set conflict = true"
+            );
+            assert_eq!(m1.devices[&id].confirmed_by, None);
+            assert_eq!(m1.devices[&id].confirmed_at, None);
+        }
+
+        // End-to-end check on policy, authorized_keys, inspect_immutable_conflict_devices, and gate.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        std::fs::write(&auth_keys, "").unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        let node_toml =
+            format!("name = \"tower\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n");
+        std::fs::write(paths.config_file("node.toml"), &node_toml).unwrap();
+        let node_file: NodeFile =
+            parse(&paths.config_file("node.toml"), node_toml.as_bytes()).unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.\"device:pixel\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let mut peer_key_conflict = legacy.clone();
+        peer_key_conflict.devices.get_mut(&id).unwrap().public_key = key2;
+        let conflicted = merge_devices(&legacy, &peer_key_conflict);
+        {
+            let _lock = lock_config(&paths).unwrap();
+            save_devices_locked(&paths, &conflicted).unwrap();
+            let pol_warnings = reconcile_device_principals_locked(&paths, &conflicted).unwrap();
+            assert!(
+                pol_warnings.iter().any(|w| w.contains(&id)),
+                "expected policy warning for conflicted device: {pol_warnings:?}"
+            );
+        }
+        let pol: Policy = parse(
+            &paths.config_file("policy.toml"),
+            &std::fs::read(paths.config_file("policy.toml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pol.role_of("device:pixel").0, NOBODY);
+
+        let rec =
+            reconcile_devices_and_auth_keys_blocking(&paths, "tower", &node_file, false).unwrap();
+        assert!(
+            rec.warnings.iter().any(|w| w.contains(&id)),
+            "expected auth_keys reconcile warning: {:?}",
+            rec.warnings
+        );
+        assert!(
+            std::fs::read_to_string(&auth_keys)
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "conflicted device must receive NO authorized_keys line"
+        );
+        assert_eq!(
+            inspect_immutable_conflict_devices(&paths),
+            vec![("pixel".to_owned(), id.clone())]
+        );
+        let gate_err = verify_gate_device(
+            &paths,
+            "tower",
+            &node_file,
+            "pixel",
+            &id,
+            "device:pixel",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(gate_err.code, ErrorCode::Denied, "{gate_err:?}");
     }
 
     #[test]

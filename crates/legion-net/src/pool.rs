@@ -2456,6 +2456,11 @@ device = \"{pad_id}\"
                 confirmed_at: None,
                 updated_at: now.clone(),
                 updated_on: "tower".to_owned(),
+                name_updated_at: now.clone(),
+                name_updated_on: "tower".to_owned(),
+                role_updated_at: now.clone(),
+                role_updated_on: "tower".to_owned(),
+                conflict: false,
             },
         );
         let mut live_call = Call::new(
