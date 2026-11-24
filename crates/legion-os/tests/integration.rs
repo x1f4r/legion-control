@@ -460,6 +460,10 @@ fn helper_detach_worker(args: &[String]) -> ExitCode {
     while procid::is_alive(&parent_id) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(15));
     }
+    assert!(
+        !procid::is_alive(&parent_id),
+        "timed out after 20s waiting for detach_parent ({parent_id}) to exit"
+    );
 
     let mark = env::var("LEGION_DETACH_MARK").unwrap_or_default();
     println!("worker-stdout:{mark}");
@@ -1385,8 +1389,12 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
         .await
         .unwrap();
 
-    let _ = wait_for_detached_file(&id1_file, Duration::from_secs(20), &h1, &[]).await;
-    let _ = wait_for_detached_file(&id2_file, Duration::from_secs(20), &h2, &[]).await;
+    let p1 =
+        parse_procid(&wait_for_detached_file(&id1_file, Duration::from_secs(20), &h1, &[]).await);
+    let p2 =
+        parse_procid(&wait_for_detached_file(&id2_file, Duration::from_secs(20), &h2, &[]).await);
+    assert_eq!(p1, h1.process);
+    assert_eq!(p2, h2.process);
     assert!(procid::is_alive(&h1.process));
     assert!(procid::is_alive(&h2.process));
 
@@ -1426,8 +1434,11 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
                 h_no_linger.warnings
             );
         }
-        let _ = wait_for_detached_file(&linger_id_file, Duration::from_secs(5), &h_no_linger, &[])
-            .await;
+        let p_linger = parse_procid(
+            &wait_for_detached_file(&linger_id_file, Duration::from_secs(20), &h_no_linger, &[])
+                .await,
+        );
+        assert_eq!(p_linger, h_no_linger.process);
         let rl = stop_detached(&h_no_linger, Duration::from_millis(300))
             .await
             .unwrap();
@@ -1667,7 +1678,11 @@ async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
     while procid::is_alive(&handle.process) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(!procid::is_alive(&handle.process));
+    assert!(
+        !procid::is_alive(&handle.process),
+        "timed out after 15s waiting for root {} to exit",
+        handle.process
+    );
     assert!(procid::is_alive(&child_id));
 
     // A handle referencing the same exited root PID with a DIFFERENT marker must NOT treat this
@@ -1763,7 +1778,13 @@ async fn test_detach_stop_without_scope_stops_reparented_setsid_grandchild() {
             &wait_for_detached_file(&grandchild_file, Duration::from_secs(20), &handle, &[]).await,
         );
         // Wait for the intermediate child to finish exiting so the grandchild is reparented.
-        let _ = wait_for_detached_file(&ready_file, Duration::from_secs(20), &handle, &[]).await;
+        let ready =
+            wait_for_detached_file(&ready_file, Duration::from_secs(20), &handle, &[]).await;
+        assert_eq!(
+            ready.trim(),
+            "ready",
+            "unexpected reparented_ready payload ({label})"
+        );
         assert!(procid::is_alive(&handle.process));
         assert!(procid::is_alive(&grandchild_id));
         assert!(detached_active(&handle).await.unwrap());
