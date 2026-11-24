@@ -647,12 +647,13 @@ Takes no arguments.
 
 Effect: `power`
 
-Restart this machine `delay_s` seconds (1 to 60, default 3) after this call replies, optionally into another of its systems: `into` names a boot target from node.toml ([boot.<name>]), the firmware is set to start it once and read back, and only when the setting reads back is the restart scheduled; otherwise nothing restarts. The reply means the restart was scheduled, not that it happened, and carries the current boot id to compare with later; to restart another machine and confirm which system came back, call power.switch from a different machine. Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. `dry_run: true` returns the exact commands without running them.
+Restart this machine `delay_s` seconds (1 to 60, default 3) after this call replies, optionally into another of its systems: `into` names a boot target from node.toml ([boot.<name>]), the firmware is set to start it once and read back, and only when the setting reads back is the restart scheduled; otherwise nothing restarts. The reply means the restart was scheduled, not that it happened, and carries the current boot id to compare with later; to restart another machine and confirm which system came back, call power.switch from a different machine. Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. On Linux a logind inhibitor (an application asking not to be interrupted) also fails it with `busy`, naming who holds it; `force` does not override that, `ignore_inhibitors: true` does. One power action runs at a time: while one is pending the call fails with `conflict`. `dry_run: true` returns the exact commands without running them, and when a check would refuse the real call, what it would say (`would_refuse`).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `into` | `string` | no | - | A boot target from this machine's node.toml ([boot.<name>]) to start once, such as `windows`; power.status lists them. Absent restarts into the firmware's usual choice. |
-| `force` | `boolean` | no | `false` | Go ahead even while the machine is busy or unmonitored. |
+| `force` | `boolean` | no | `false` | Go ahead even while the machine is busy or unmonitored. It does not override a logind inhibitor; `ignore_inhibitors` does. |
+| `ignore_inhibitors` | `boolean` | no | `false` | Linux: go ahead even while a logind inhibitor (an application asking not to be interrupted, such as a running update or an unsaved document) holds the action back, through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere. |
 | `delay_s` | `integer` | no | - | Seconds between the reply and the restart, 1 to 60; 3 when absent. Range: 1 to 60. |
 | `dry_run` | `boolean` | no | `false` | Return the exact commands this call would run, without running them. |
 
@@ -660,11 +661,12 @@ Restart this machine `delay_s` seconds (1 to 60, default 3) after this call repl
 
 Effect: `power`
 
-Power this machine off `delay_s` seconds (1 to 60, default 3) after this call replies. The reply means the shutdown was scheduled, not that it happened. Bringing the machine back takes Wake-on-LAN (power.wake from another machine) or someone at it. Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. `dry_run: true` returns the exact commands without running them.
+Power this machine off `delay_s` seconds (1 to 60, default 3) after this call replies. The reply means the shutdown was scheduled, not that it happened. Bringing the machine back takes Wake-on-LAN (power.wake from another machine) or someone at it. Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. On Linux a logind inhibitor (an application asking not to be interrupted) also fails it with `busy`, naming who holds it; `force` does not override that, `ignore_inhibitors: true` does. One power action runs at a time: while one is pending the call fails with `conflict`. `dry_run: true` returns the exact commands without running them, and when a check would refuse the real call, what it would say (`would_refuse`).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `force` | `boolean` | no | `false` | Go ahead even while the machine is busy or unmonitored. |
+| `force` | `boolean` | no | `false` | Go ahead even while the machine is busy or unmonitored. It does not override a logind inhibitor; `ignore_inhibitors` does. |
+| `ignore_inhibitors` | `boolean` | no | `false` | Linux: go ahead even while a logind inhibitor (an application asking not to be interrupted, such as a running update or an unsaved document) holds the action back, through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere. |
 | `delay_s` | `integer` | no | - | Seconds between the reply and the shutdown, 1 to 60; 3 when absent. Range: 1 to 60. |
 | `dry_run` | `boolean` | no | `false` | Return the exact commands this call would run, without running them. |
 
@@ -672,11 +674,12 @@ Power this machine off `delay_s` seconds (1 to 60, default 3) after this call re
 
 Effect: `power`
 
-Put this machine to sleep about 3 seconds after this call replies. The reply means the sleep was handed to the operating system, not that the machine is asleep. The commands in node.toml's [power] before_sleep run first, and a failure there stops the sleep. Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. `dry_run: true` returns the exact commands without running them.
+Put this machine to sleep about 3 seconds after this call replies. The reply means the sleep was handed to the operating system, not that the machine is asleep. The commands in node.toml's [power] before_sleep run first, and a failure there stops the sleep. Busy gate: the call fails with `busy` while a busy probe or an exclusive job says the machine is busy, or while node.toml says nothing about what keeps it busy (`unmonitored`; the error says what to write); `force: true` goes ahead anyway, and the state is checked again just before acting. On Linux a logind inhibitor (an application asking not to be interrupted) also fails it with `busy`, naming who holds it; `force` does not override that, `ignore_inhibitors: true` does. One power action runs at a time: while one is pending the call fails with `conflict`. `dry_run: true` returns the exact commands without running them, and when a check would refuse the real call, what it would say (`would_refuse`).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `force` | `boolean` | no | `false` | Go ahead even while the machine is busy or unmonitored. |
+| `force` | `boolean` | no | `false` | Go ahead even while the machine is busy or unmonitored. It does not override a logind inhibitor; `ignore_inhibitors` does. |
+| `ignore_inhibitors` | `boolean` | no | `false` | Linux: go ahead even while a logind inhibitor (an application asking not to be interrupted, such as a running update or an unsaved document) holds the action back, through systemctl's own `-i`. It needs `[power] sudo = true`. No effect elsewhere. |
 | `dry_run` | `boolean` | no | `false` | Return the exact commands this call would run, without running them. |
 
 ### `power.status`
@@ -691,14 +694,15 @@ Takes no arguments.
 
 Effect: `power`
 
-Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, and `force`; the machine's own busy gate applies, and a `busy` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. `dry_run: true` returns the machine's own power.restart dry run (`would_run`, with the exact commands) and restarts nothing. Call it from a machine other than the one being restarted.
+Restart another machine, optionally into another of its systems, and confirm it came back. Reads the machine's boot id and system, calls power.restart on it (with `into`, a boot target in that system's node.toml, `force` and `ignore_inhibitors`; the machine's own busy gate applies, and a `busy` or `conflict` refusal comes back as is), then looks at each of the machine's systems every few seconds for up to `wait_s` seconds (0 to 900, default 180) until one answers with a different boot id. `restarted` is true only then. When `into` was given, the system that answers must be that one, or the call fails with `failed` and says which system came up instead. The connection dropping while the machine goes down is expected. With wait_s 0 the restart is only requested and `restarted` is false. `dry_run: true` returns the machine's own power.restart dry run (`would_run`, with the exact commands) and restarts nothing. Call it from a machine other than the one being restarted.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `machine` | `string` | yes | - | The machine to restart, as fleet.toml names it. |
 | `into` | `string` | no | - | The system to restart into: a boot target in node.toml of the system running now, such as `windows`, which must also be the `system` the other one's node.toml names. Absent restarts into the firmware's usual choice. |
 | `wait_s` | `integer` | no | - | Seconds to wait for the machine to come back, 0 to 900; 180 when absent. 0 requests the restart and returns. Range: 0 to 900. |
-| `force` | `boolean` | no | `false` | Restart even while the machine is busy or unmonitored. |
+| `force` | `boolean` | no | `false` | Restart even while the machine is busy or unmonitored. It does not override a logind inhibitor there; `ignore_inhibitors` does. |
+| `ignore_inhibitors` | `boolean` | no | `false` | Restart even while a logind inhibitor holds it back (Linux, with `[power] sudo = true` there). |
 | `dry_run` | `boolean` | no | `false` | Ask the machine for its power.restart dry run: the exact commands it would run, run nowhere. |
 
 ### `power.wake`
