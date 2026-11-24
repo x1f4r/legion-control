@@ -13,6 +13,7 @@ publish = false
 # Every version is named once, here; a crate takes what it needs with `workspace = true`.
 [workspace.dependencies]
 legion-proto = { path = "crates/legion-proto" }
+legion-link = { path = "crates/legion-link" }
 legion-core = { path = "crates/legion-core" }
 legion-net = { path = "crates/legion-net" }
 legion-tools = { path = "crates/legion-tools" }
@@ -24,6 +25,10 @@ gethostname = "1.1.0"
 jiff = { version = "1.0.2", default-features = false, features = ["std"] }
 libc = "0.2.191"
 process-wrap = { version = "10.0.1", default-features = false }
+# In-process SSH client for mobile and app controllers (behind legion-link's `ssh` feature).
+# Uses the `ring` crypto backend rather than `aws-lc-rs` so cross-compilation to Android NDK and
+# iOS needs only a C compiler and no cmake or bindgen.
+russh = { version = "0.65.4", default-features = false, features = ["ring", "rsa"] }
 same-file = "1.0.6"
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -42,6 +47,7 @@ toml = "1.2.2"
 # Edits fleet.toml and projects.toml in place, keeping the comments and layout a person gave them.
 toml_edit = { version = "0.25.20", default-features = false, features = ["parse", "display"] }
 windows = { version = "0.62.2", default-features = false }
+zeroize = "1.9.2"
 legion-os = { path = "crates/legion-os" }
 nix = { version = "0.31.1", default-features = false, features = ["signal"] }
 # Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.

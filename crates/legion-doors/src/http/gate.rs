@@ -75,8 +75,9 @@ pub(crate) fn host_allowed(headers: &HeaderMap, port: u16, config: &ServeConfig)
         })
 }
 
-/// Whether a request's `Origin`, if it has one, is listed in `[serve] origins`. A request
-/// without one did not come from a browser page, and the token is what guards it.
+/// Whether a request's `Origin`, if it has one, is allowed: either listed in `[serve] origins`, or
+/// (when the built-in interface is enabled) same-origin with this request's already-validated
+/// `Host` header. A request without an `Origin` did not come from a browser page.
 pub(crate) fn origin_allowed(headers: &HeaderMap, config: &ServeConfig) -> bool {
     let Some(origin) = headers.get(ORIGIN) else {
         return true;
@@ -84,11 +85,59 @@ pub(crate) fn origin_allowed(headers: &HeaderMap, config: &ServeConfig) -> bool 
     let Ok(origin) = origin.to_str() else {
         return false;
     };
+    if is_listed_origin(origin, config) {
+        return true;
+    }
+    config.ui && is_same_origin(headers, origin)
+}
+
+/// Returns the request's `Origin` header when it is explicitly listed in `[serve] origins` and
+/// should receive cross-origin CORS headers.
+pub(crate) fn listed_origin(
+    headers: &HeaderMap,
+    config: &ServeConfig,
+) -> Option<axum::http::HeaderValue> {
+    let origin = headers.get(ORIGIN)?;
+    let text = origin.to_str().ok()?;
+    is_listed_origin(text, config).then(|| origin.clone())
+}
+
+fn is_listed_origin(origin: &str, config: &ServeConfig) -> bool {
     let origin = normalise_origin(origin);
     config
         .origins
         .iter()
         .any(|allowed| normalise_origin(allowed) == origin)
+}
+
+fn is_same_origin(headers: &HeaderMap, origin: &str) -> bool {
+    let Some(host_header) = headers.get(HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let Some((req_host, req_port)) = split_authority(host_header) else {
+        return false;
+    };
+    let trimmed = origin.trim();
+    let (default_port, rest) = if let Some(rest) = trimmed.strip_prefix("https://") {
+        (443u16, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        (80u16, rest)
+    } else {
+        return false;
+    };
+    if rest.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    let Some((orig_host, orig_port)) = split_authority(rest) else {
+        return false;
+    };
+    if orig_host != req_host {
+        return false;
+    }
+    match req_port {
+        Some(port) => orig_port.unwrap_or(default_port) == port,
+        None => orig_port.is_none() || orig_port == Some(default_port),
+    }
 }
 
 /// Who the request's bearer token says it is.
@@ -166,6 +215,7 @@ mod tests {
         ServeConfig {
             hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
             origins: origins.iter().map(|origin| (*origin).to_owned()).collect(),
+            ui: true,
         }
     }
 
@@ -250,6 +300,30 @@ mod tests {
             &from("https://app.example.net:8443"),
             &listed
         ));
+
+        // Same-origin browser requests from the served UI are allowed when ui = true.
+        let same = headers(&[
+            ("host", "127.0.0.1:7117"),
+            ("origin", "http://127.0.0.1:7117"),
+        ]);
+        assert!(origin_allowed(&same, &none));
+        assert!(listed_origin(&same, &none).is_none());
+
+        let wrong_port = headers(&[
+            ("host", "127.0.0.1:7117"),
+            ("origin", "http://127.0.0.1:8080"),
+        ]);
+        assert!(!origin_allowed(&wrong_port, &none));
+
+        let ts_same = headers(&[
+            ("host", "tower.example.ts.net"),
+            ("origin", "https://tower.example.ts.net"),
+        ]);
+        assert!(origin_allowed(&ts_same, &none));
+
+        let mut no_ui = config(&[], &[]);
+        no_ui.ui = false;
+        assert!(!origin_allowed(&same, &no_ui));
     }
 
     #[test]

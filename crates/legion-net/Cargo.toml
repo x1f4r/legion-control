@@ -11,6 +11,7 @@ publish.workspace = true
 base64.workspace = true
 jiff.workspace = true
 legion-core.workspace = true
+legion-link = { workspace = true, features = ["schemars"] }
 legion-os.workspace = true
 legion-proto.workspace = true
 # Also the power tools' actuator and Wake-on-LAN, which power.wol, power.wake and power.switch

@@ -8,11 +8,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use legion_core::config::{ConfigStore, Document, NodeName, parse};
+pub use legion_link::{RemoteOs, validate_program};
 use legion_os::OsError;
 use legion_os::lock::FileLock;
 use legion_proto::{ErrorBody, ErrorCode};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value as TomlValue};
 
 /// The implicit system name reported when a machine uses the shorthand single-system form.
@@ -27,34 +27,6 @@ const FLEET_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serializes in-process `fleet.toml` mutations before acquiring the kernel [`FileLock`].
 static FLEET_EDIT_LOCK: Mutex<()> = Mutex::new(());
-
-/// Operating system family hint used to choose the remote ssh command shape without probing first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum RemoteOs {
-    /// Linux, macOS, or another POSIX-like host reached through `sh -c`.
-    Unix,
-    /// Windows host where `legion` is on `PATH`.
-    Windows,
-}
-
-impl RemoteOs {
-    /// The other operating system family, tried as a fallback when no hint is configured.
-    pub fn other(self) -> RemoteOs {
-        match self {
-            RemoteOs::Unix => RemoteOs::Windows,
-            RemoteOs::Windows => RemoteOs::Unix,
-        }
-    }
-
-    /// The lower-case spelling written in `fleet.toml` and state files.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RemoteOs::Unix => "unix",
-            RemoteOs::Windows => "windows",
-        }
-    }
-}
 
 /// `fleet.toml`: every machine this node knows how to reach.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -298,35 +270,6 @@ pub fn validate_ssh_target(target: &str) -> Result<(), String> {
 
 fn is_safe_ssh_target_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | ':' | '[' | ']' | '-')
-}
-
-/// Checks that a configured remote `program` needs no shell quoting on any supported shell.
-///
-/// Only ASCII letters, digits, `_ . / ~ : - \` are allowed. Leading `-` is refused so the name
-/// cannot be parsed as an option by `command -v` or `exec`, and a trailing `\` is refused because
-/// `fish` treats `\'` inside single quotes as an escaped quote.
-pub fn validate_program(program: &str) -> Result<(), String> {
-    if program.is_empty() {
-        return Err("program cannot be empty".to_owned());
-    }
-    if program.starts_with('-') {
-        return Err(format!(
-            "program {program:?} cannot begin with `-`, which a shell builtin would read as an option"
-        ));
-    }
-    if program.ends_with('\\') {
-        return Err(format!("program {program:?} cannot end with `\\`"));
-    }
-    if let Some(bad) = program.chars().find(|&c| !is_safe_program_char(c)) {
-        return Err(format!(
-            "program {program:?} contains {bad:?}; only A-Z, a-z, 0-9, `_`, `.`, `/`, `~`, `:`, `-`, and `\\` are allowed so nothing is ever quoted for a remote shell"
-        ));
-    }
-    Ok(())
-}
-
-fn is_safe_program_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '~' | ':' | '-' | '\\')
 }
 
 /// Checks a hardware MAC address (`02:00:00:00:00:01` or `02-00-00-00-00-01`).
