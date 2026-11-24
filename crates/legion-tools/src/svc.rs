@@ -327,7 +327,7 @@ pub struct StatusResult {
     pub description: Option<String>,
     /// Last exit code reported by the service manager, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     /// A few raw backend properties useful for diagnosis.
     pub detail: BTreeMap<String, Value>,
 }

@@ -647,7 +647,7 @@ pub(crate) fn parse_print(
         instance_id: runs.map(|r| format!("runs:{r}")),
         oneshot_completed,
         description: program,
-        exit_code,
+        exit_code: exit_code.map(i64::from),
         detail,
     })
 }

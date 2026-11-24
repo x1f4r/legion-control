@@ -19,6 +19,9 @@ use super::backend::{
 };
 use super::{Action, BackendKind, Scope, ServiceState, ServiceSummary};
 
+/// Windows SCM exit code meaning the service has not been started since the last boot.
+const ERROR_SERVICE_NEVER_STARTED: u32 = 1077;
+
 /// Windows Service Control Manager backend.
 pub(crate) struct Windows;
 
@@ -285,9 +288,9 @@ struct PsServiceRow {
     #[serde(default)]
     path_name: Option<String>,
     #[serde(default)]
-    exit_code: Option<i32>,
+    exit_code: Option<u32>,
     #[serde(default)]
-    service_specific_exit_code: Option<i32>,
+    service_specific_exit_code: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,8 +374,11 @@ pub(crate) fn parse_status_json(
         .and_then(start_mode_value_to_str);
     let pid = row.process_id.filter(|&p| p > 0);
     let effective_exit = match (row.exit_code, row.service_specific_exit_code) {
-        (Some(1066), Some(specific)) if specific != 0 => Some(specific),
-        (Some(code), _) if code != 0 => Some(code),
+        // 1077 (ERROR_SERVICE_NEVER_STARTED) is the normal state of a stopped service that has
+        // not run since boot, not a failure.
+        (Some(ERROR_SERVICE_NEVER_STARTED), _) => None,
+        (Some(1066), Some(specific)) if specific != 0 => Some(i64::from(specific)),
+        (Some(code), _) if code != 0 => Some(i64::from(code)),
         _ => None,
     };
     let state = map_windows_status(status_text.as_deref(), effective_exit);
@@ -500,7 +506,7 @@ fn start_mode_value_to_str(val: &Value) -> Option<String> {
     }
 }
 
-fn map_windows_status(status: Option<&str>, exit_code: Option<i32>) -> ServiceState {
+fn map_windows_status(status: Option<&str>, exit_code: Option<i64>) -> ServiceState {
     match status.map(str::to_ascii_lowercase).as_deref() {
         Some("running") => ServiceState::Running,
         Some("stopped") => match exit_code {
@@ -707,6 +713,34 @@ mod tests {
         assert_eq!(st.state, ServiceState::Failed);
         assert_eq!(st.pid, None);
         assert_eq!(st.exit_code, Some(42));
+
+        // 1077 (ERROR_SERVICE_NEVER_STARTED) is stopped, not failed.
+        let never_started = r#"{
+            "Name": "Fax",
+            "DisplayName": "Fax",
+            "Status": "Stopped",
+            "StartMode": "Manual",
+            "ProcessId": 0,
+            "ExitCode": 1077,
+            "ServiceSpecificExitCode": 0
+        }"#;
+        let st = parse_status_json(never_started, "Fax").unwrap();
+        assert_eq!(st.state, ServiceState::Stopped);
+        assert_eq!(st.exit_code, None);
+
+        // Unsigned 32-bit exit codes above i32::MAX (such as HRESULT 0x80070005) parse cleanly.
+        let hresult = r#"{
+            "Name": "AuthSvc",
+            "DisplayName": "Auth Service",
+            "Status": "Stopped",
+            "StartMode": "Auto",
+            "ProcessId": 0,
+            "ExitCode": 1066,
+            "ServiceSpecificExitCode": 2147942405
+        }"#;
+        let st = parse_status_json(hresult, "AuthSvc").unwrap();
+        assert_eq!(st.state, ServiceState::Failed);
+        assert_eq!(st.exit_code, Some(2_147_942_405));
     }
 
     #[test]

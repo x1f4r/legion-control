@@ -101,8 +101,9 @@ pub(crate) struct BackendStatus {
     pub(crate) oneshot_completed: bool,
     /// Human-readable description, when available.
     pub(crate) description: Option<String>,
-    /// Last reported exit code, when available.
-    pub(crate) exit_code: Option<i32>,
+    /// Last reported exit code, when available (wide enough for signed Unix signals and unsigned
+    /// 32-bit Windows service exit codes).
+    pub(crate) exit_code: Option<i64>,
     /// A few raw backend properties useful for diagnosis.
     pub(crate) detail: BTreeMap<String, Value>,
 }

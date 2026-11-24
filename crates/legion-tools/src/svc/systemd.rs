@@ -450,7 +450,7 @@ pub(crate) fn parse_show(
         .get("ExecMainStatus")
         .and_then(|v| v.parse::<i32>().ok());
     let exit_code = match exec_status {
-        Some(status) if exec_code != 0 || status != 0 => Some(status),
+        Some(status) if exec_code != 0 || status != 0 => Some(i64::from(status)),
         _ => None,
     };
 
