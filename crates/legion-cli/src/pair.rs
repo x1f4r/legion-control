@@ -207,6 +207,7 @@ struct RoleEffects {
     broad_write: bool,
     broad_exec: bool,
     broad_admin: bool,
+    can_write_policy: bool,
     has_unknown_tool_rule: bool,
 }
 
@@ -261,6 +262,12 @@ fn analyze_role(role: &Role, specs: &[ToolSpec]) -> RoleEffects {
         }
     });
 
+    let can_write_policy = broad_rule_allows(Effect::Admin)
+        || specs
+            .iter()
+            .find(|spec| spec.name == "config.write")
+            .is_some_and(spec_allowed);
+
     RoleEffects {
         read: allows_effect(Effect::Read),
         write: allows_effect(Effect::Write),
@@ -271,6 +278,7 @@ fn analyze_role(role: &Role, specs: &[ToolSpec]) -> RoleEffects {
         broad_write: broad_rule_allows(Effect::Write),
         broad_exec: broad_rule_allows(Effect::Exec),
         broad_admin: broad_rule_allows(Effect::Admin),
+        can_write_policy,
         has_unknown_tool_rule,
     }
 }
@@ -286,7 +294,7 @@ fn summarize_allow_rules(role: &Role) -> String {
 /// hardcoded role names).
 pub fn describe_role(name: &str, role: &Role, specs: &[ToolSpec]) -> String {
     if name == OWNER {
-        return "everything (full access, including pairing and removing devices)".to_owned();
+        return "everything, including changing who may do what".to_owned();
     }
     if role.allow.is_empty() {
         return "nothing (no tools allowed)".to_owned();
@@ -296,8 +304,12 @@ pub fn describe_role(name: &str, role: &Role, specs: &[ToolSpec]) -> String {
     let summary = summarize_allow_rules(role);
 
     if eff.admin {
-        if eff.broad_admin && !eff.has_unknown_tool_rule {
-            "administer (full control over tools and settings)".to_owned()
+        if eff.broad_admin {
+            "everything, including changing who may do what (admin — as strong as owner)".to_owned()
+        } else if eff.can_write_policy {
+            format!(
+                "everything, including changing who may do what (allows admin — as strong as owner: {summary})"
+            )
         } else {
             format!("custom (allows admin: {summary})")
         }
@@ -822,6 +834,55 @@ allow = ["effect:read", "custom.unknown_tool"]
         assert!(
             pos("pure_read") < pos("read_plus_admin"),
             "admin role must rank above pure read: {choices:?}"
+        );
+    }
+
+    #[test]
+    fn s3_admin_role_descriptions_state_plainly_it_is_as_strong_as_owner() {
+        let policy = parse::<Policy>(
+            Path::new("policy.toml"),
+            br#"
+default = "owner"
+
+[roles.fleet_admin]
+allow = ["effect:read", "effect:admin"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+"#,
+        )
+        .unwrap();
+        let mut reg = legion_tools::registry();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = legion_core::Paths::under(dir.path());
+        let fleet = legion_net::Fleet::new(&paths);
+        legion_net::register(&mut reg, fleet);
+        let specs = reg.specs();
+
+        let owner_desc = describe_role(OWNER, &Role::default(), &specs);
+        assert!(
+            owner_desc.contains("everything, including changing who may do what"),
+            "owner description: {owner_desc}"
+        );
+
+        let admin_desc = describe_role("fleet_admin", &policy.roles["fleet_admin"], &specs);
+        assert!(
+            admin_desc.contains("everything, including changing who may do what")
+                && admin_desc.contains("owner"),
+            "effect:admin description must state plainly it is as strong as owner: {admin_desc}"
+        );
+
+        let pw_desc = describe_role("policy_writer", &policy.roles["policy_writer"], &specs);
+        assert!(
+            pw_desc.contains("everything, including changing who may do what"),
+            "config.write role description: {pw_desc}"
+        );
+
+        let cw_spec = specs.iter().find(|s| s.name == "config.write").unwrap();
+        assert!(
+            cw_spec.description.contains("as strong as owner"),
+            "config.write tool description must state plainly it is as strong as owner: {}",
+            cw_spec.description
         );
     }
 }

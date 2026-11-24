@@ -10,9 +10,13 @@ can read, write, and start anything the OS lets that user touch — including Le
 `policy.toml`, `tokens.toml`, and `audit.jsonl`. `paths` does not contain `exec`; it only chooses
 where a command starts.
 
+**A role with `effect:admin` (or `config.write`) is as strong as `owner`.** It can rewrite
+`policy.toml` and change who may do what on the machine — including giving itself `exec` or full
+access.
+
 **Real boundaries require both:**
 
-1. A role **without** the `exec` effect (such as `observer` or `editor`), and
+1. A role **without** the `exec` or `admin` effects (such as `observer` or `editor`), and
 2. A door that **pins** the principal and cannot be bypassed by the caller: a restricted SSH key
    forced through `legion gate --as <principal>`, or an HTTP bearer token served by `legion serve`.
 
@@ -64,7 +68,7 @@ Every tool declares one of six effects:
 | `destroy` | `fs.remove`, `sys.kill` | Removes files or directories or terminates processes. Replacing a whole directory counts as destroying it. |
 | `exec` | `exec.run`, `job.start`, `job.cancel`, `svc.start`, `svc.stop`, `svc.restart`, `proj.run`, `proj.clone`, `proj.pull` | Runs programs on the machine. **`exec` is as strong as the account**: `paths` does not contain what a command reads, writes, or launches. |
 | `power` | `power.sleep`, `power.restart`, `power.shutdown`, `power.cancel`, `power.wol`, `power.wake`, `power.switch` | Changes machine power state, calls a pending change off, or sends Wake-on-LAN packets. |
-| `admin` | `meta.init`, `meta.update`, `fleet.add`, `fleet.remove`, `fleet.install`, `fleet.sync`, `config.*`, `token.*`, `device.*`, `ext.define`, `ext.remove`, `agent.*` | Changes Legion itself: policy, tokens, paired devices, fleet membership, extensions, synced config, agent registrations, and the binary. |
+| `admin` | `meta.init`, `meta.update`, `fleet.add`, `fleet.remove`, `fleet.install`, `fleet.sync`, `config.*`, `token.*`, `device.*`, `ext.define`, `ext.remove`, `agent.*` | Changes Legion itself: policy, tokens, paired devices, fleet membership, extensions, synced config, agent registrations, and the binary. **`admin` is as strong as `owner`**: it can rewrite `policy.toml` (via `config.write`) and change who may do what on this machine. |
 
 ### Legion's own files belong to `admin`
 
