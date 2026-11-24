@@ -66,6 +66,9 @@ fn main() -> ExitCode {
         ("run_delivers_single_sigterm_for_graceful_cleanup", || {
             Box::pin(test_run_delivers_single_sigterm_for_graceful_cleanup())
         }),
+        ("run_dropped_future_kills_grandchildren", || {
+            Box::pin(test_run_dropped_future_kills_grandchildren())
+        }),
         (
             "run_does_not_hang_when_escaped_grandchild_keeps_pipes_open",
             || Box::pin(test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open()),
@@ -651,6 +654,45 @@ async fn test_run_delivers_single_sigterm_for_graceful_cleanup() {
             res.stdout.text
         );
     }
+}
+
+async fn test_run_dropped_future_kills_grandchildren() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild_file = dir.path().join("grandchild_drop.pid");
+    let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let notify_ready = Arc::clone(&ready);
+    let (spec, helper_env) = helper_spec("spawn_tree", &[&grandchild_str]);
+    let handle = tokio::spawn(run(RunOptions::new(spec)
+        .envs(helper_env)
+        .timeout(Duration::from_secs(30))
+        .on_output(Arc::new(move |chunk| {
+            if String::from_utf8_lossy(&chunk.bytes).contains("READY") {
+                notify_ready.notify_one();
+            }
+        }))));
+
+    tokio::time::timeout(Duration::from_secs(5), ready.notified())
+        .await
+        .expect("timed out waiting for spawn_tree READY");
+
+    let grandchild_id =
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(2)).await);
+    assert!(procid::is_alive(&grandchild_id));
+
+    // Abort the task running `run(...)`, dropping its future mid-flight.
+    handle.abort();
+    let _ = handle.await;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while procid::is_alive(&grandchild_id) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !procid::is_alive(&grandchild_id),
+        "grandchild {grandchild_id} leaked after dropping run() future"
+    );
 }
 
 async fn test_run_does_not_hang_when_escaped_grandchild_keeps_pipes_open() {

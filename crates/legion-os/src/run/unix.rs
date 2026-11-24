@@ -12,6 +12,38 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop, ProcessGroup};
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
 
+/// Kills the child's entire process group if the `run` future is dropped before completing.
+///
+/// Tokio's `kill_on_drop` only signals the direct child PID; without this guard an aborted task
+/// or caller-side timeout would leak grandchildren in the child's process group.
+pub(super) struct TreeDropGuard {
+    pgid: Option<Pid>,
+    armed: bool,
+}
+
+impl TreeDropGuard {
+    pub(super) fn new(child_pid: Option<u32>) -> Self {
+        let pgid = child_pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map(Pid::from_raw);
+        Self { pgid, armed: true }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TreeDropGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(group) = self.pgid
+        {
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+    }
+}
+
 pub(super) fn configure_containment(wrapped: &mut CommandWrap) {
     wrapped.wrap(ProcessGroup::leader()).wrap(KillOnDrop);
 }

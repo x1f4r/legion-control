@@ -290,6 +290,7 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         .spawn()
         .map_err(|err| OsError::from_spawn_io(program_display, err))?;
     let child_pid = child.id();
+    let mut tree_guard = create_drop_guard(child_pid);
 
     let stdin_task = match (child.stdin().take(), options.stdin) {
         (Some(mut stdin_pipe), Some(bytes)) => Some(tokio::spawn(async move {
@@ -300,6 +301,7 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     };
 
     let drain_stop = CancellationToken::new();
+    let _drain_guard = drain_stop.clone().drop_guard();
     let mut stdout_task = child.stdout().take().map(|pipe| {
         tokio::spawn(read_bounded_stream(
             pipe,
@@ -387,6 +389,7 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     if let Some(handle) = stdin_task {
         handle.abort();
     }
+    tree_guard.disarm();
     drop(child);
 
     let (exit_code, signal) = exit_status.map_or((None, None), extract_status);
@@ -590,6 +593,24 @@ impl BoundedCapture {
             total_bytes: self.total_bytes,
         }
     }
+}
+
+#[cfg(any(unix, windows))]
+fn create_drop_guard(child_pid: Option<u32>) -> platform::TreeDropGuard {
+    platform::TreeDropGuard::new(child_pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+struct FallbackDropGuard;
+
+#[cfg(not(any(unix, windows)))]
+impl FallbackDropGuard {
+    fn disarm(&mut self) {}
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_drop_guard(_child_pid: Option<u32>) -> FallbackDropGuard {
+    FallbackDropGuard
 }
 
 #[cfg(any(unix, windows))]
