@@ -17,6 +17,7 @@ use super::{EnvMarkerCheck, KillTreeReport, ProcessId, child_not_older_than_pare
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ANCESTOR_HOPS: usize = 256;
+const MAX_SSHD_ANCESTOR_HOPS: usize = 4;
 
 /// Backward clock-step tolerance for exact `ProcessId.start_time` parent-before-child checks:
 /// Linux `/proc/<pid>/stat` jiffies are monotonic (zero tolerance); macOS `proc_bsdinfo` uses
@@ -149,6 +150,131 @@ fn is_ancestor_of_current(identity: &ProcessId) -> bool {
         }
         cur = parent;
     }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_same_account_sshd(pid: u32, expected_start: Option<u64>) -> Option<ProcessId> {
+    if pid <= 1 || pid == std::process::id() {
+        return None;
+    }
+    let (_ppid, start_ticks) = linux_parent_and_start(pid)?;
+    if let Some(expected) = expected_start
+        && start_ticks != expected
+    {
+        return None;
+    }
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let (ruid, euid) = super::parse_linux_proc_status_uids(&status)?;
+    let my_euid = nix::unistd::Uid::effective().as_raw();
+    if ruid != my_euid || euid != my_euid {
+        return None;
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let cmdline_bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv = super::parse_linux_proc_cmdline(&cmdline_bytes);
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    if !super::is_sshd_session_process(comm.trim(), &argv_refs, false) {
+        return None;
+    }
+    Some(ProcessId::new(pid, start_ticks))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
+    let own_pid = std::process::id();
+    let (mut parent_pid, mut child_start) = linux_parent_and_start(own_pid)?;
+    let mut seen = HashSet::new();
+    seen.insert(own_pid);
+
+    for _ in 0..MAX_SSHD_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        let (next_ppid, parent_start) = linux_parent_and_start(parent_pid)?;
+        if parent_start > child_start {
+            break;
+        }
+        if let Some(sshd_id) = linux_same_account_sshd(parent_pid, Some(parent_start)) {
+            return Some(sshd_id);
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{parent_pid}/comm")).ok()?;
+        if !super::is_shell_wrapper_comm(comm.trim()) {
+            break;
+        }
+        child_start = parent_start;
+        parent_pid = next_ppid;
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
+    linux_same_account_sshd(identity.pid, Some(identity.start_time)).is_some()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_same_account_sshd(pid: u32, expected_start: Option<u64>) -> Option<ProcessId> {
+    if pid <= 1 || pid == std::process::id() {
+        return None;
+    }
+    let (_ppid, start_us, ruid, euid, comm) = macos_proc::bsd_details(pid)?;
+    if let Some(expected) = expected_start
+        && start_us != expected
+    {
+        return None;
+    }
+    let my_euid = nix::unistd::Uid::effective().as_raw();
+    if ruid != my_euid || euid != my_euid {
+        return None;
+    }
+    let argv = macos_proc::query_argv(pid)?;
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    if !super::is_sshd_session_process(&comm, &argv_refs, false) {
+        return None;
+    }
+    Some(ProcessId::new(pid, start_us))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
+    let own_pid = std::process::id();
+    let (mut parent_pid, mut child_start) = macos_proc::parent_and_start(own_pid)?;
+    let mut seen = HashSet::new();
+    seen.insert(own_pid);
+
+    for _ in 0..MAX_SSHD_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        let (next_ppid, parent_start, _ruid, _euid, comm) = macos_proc::bsd_details(parent_pid)?;
+        if !child_not_older_than_parent(child_start, parent_start, EXACT_START_BACKWARD_TOLERANCE) {
+            break;
+        }
+        if let Some(sshd_id) = macos_same_account_sshd(parent_pid, Some(parent_start)) {
+            return Some(sshd_id);
+        }
+        if !super::is_shell_wrapper_comm(&comm) {
+            break;
+        }
+        child_start = parent_start;
+        parent_pid = next_ppid;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
+    macos_same_account_sshd(identity.pid, Some(identity.start_time)).is_some()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn verify_same_account_sshd(_identity: &ProcessId) -> bool {
     false
 }
 
@@ -320,6 +446,84 @@ mod macos_proc {
         }
         let start_us = macos_start_time_us(info.pbi_start_tvsec, info.pbi_start_tvusec)?;
         Some((info.pbi_ppid, start_us))
+    }
+
+    pub(super) fn bsd_details(pid: u32) -> Option<(u32, u64, u32, u32, String)> {
+        let raw_pid = i32::try_from(pid).ok()?;
+        // SAFETY: `libc::proc_bsdinfo` is a plain C struct safe to zero-initialize; `proc_pidinfo`
+        // writes at most `size_of::<libc::proc_bsdinfo>()` bytes into `info`.
+        let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+        let expected = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                raw_pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                expected,
+            )
+        };
+        if written != expected || info.pbi_status == MACOS_SZOMB {
+            return None;
+        }
+        let start_us = macos_start_time_us(info.pbi_start_tvsec, info.pbi_start_tvusec)?;
+        let cstr_to_string = |buf: &[libc::c_char]| -> String {
+            let bytes: Vec<u8> = buf
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let mut comm = cstr_to_string(&info.pbi_name);
+        if comm.is_empty() {
+            comm = cstr_to_string(&info.pbi_comm);
+        }
+        Some((info.pbi_ppid, start_us, info.pbi_ruid, info.pbi_uid, comm))
+    }
+
+    pub(super) fn query_argv(pid: u32) -> Option<Vec<String>> {
+        let raw_pid = libc::c_int::try_from(pid).ok()?;
+        let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, raw_pid];
+
+        for _ in 0..2 {
+            let mut size: libc::size_t = 0;
+            // SAFETY: Querying buffer size with a valid 3-element MIB and null output pointer.
+            if unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as libc::c_uint,
+                    std::ptr::null_mut(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } != 0
+                || size == 0
+            {
+                return None;
+            }
+            let mut buf = vec![0u8; size];
+            // SAFETY: `buf` has exact byte capacity `size` and remains alive across `sysctl`.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    mib.len() as libc::c_uint,
+                    buf.as_mut_ptr().cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 {
+                buf.truncate(size);
+                return crate::procid::parse_macos_procargs2_argv(&buf);
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOMEM) {
+                return None;
+            }
+        }
+        None
     }
 
     pub(super) fn check_env_marker(

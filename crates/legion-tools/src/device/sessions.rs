@@ -1,12 +1,15 @@
 //! Active paired-device session tracking and termination on revocation.
 //!
 //! Each `legion gate --as <principal> --device <name>` session registers its OS process identity
-//! ([`legion_os::procid::ProcessId`] + [`legion_os::procid::boot_id`]) in an owner-only file under
-//! `state/device-sessions/` for the duration of the session and removes it on exit. When
-//! `device.remove` revokes a device, it terminates every live recorded session for that device
-//! (SIGTERM then SIGKILL after grace on Unix; handle-pinned TerminateProcess on Windows) so a
-//! held-open SSH session cannot keep running after its key is removed from `authorized_keys`.
+//! ([`legion_os::procid::ProcessId`] + [`legion_os::procid::boot_id`]) together with any verified
+//! same-account parent `sshd` / `sshd-session` connection process in owner-only files under
+//! `state/device-sessions/`. Gate records are removed when the gate exits; deduplicated parent
+//! `sshd` connection records remain while that `sshd` connection lives so `device.remove` can
+//! terminate both live gate processes and open multiplexed (`ControlMaster`) SSH connections
+//! belonging to the same OS account (re-verifying the target's exact PID, start time, account,
+//! and `sshd` identity before signalling, and never signalling anything else).
 
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,14 +33,28 @@ pub const DEFAULT_TERMINATE_GRACE: Duration = Duration::from_secs(2);
 /// Maximum length accepted for a `--device` session label.
 const MAX_DEVICE_LABEL_LEN: usize = 128;
 
-/// Persistent record for one live `legion gate --device <name>` session.
+/// Kind of process tracked by a [`DeviceSessionRecord`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRecordKind {
+    /// A live `legion gate --as <principal> --device <name>` process (deleted when the gate exits).
+    #[default]
+    Gate,
+    /// A same-account parent `sshd` / `sshd-session` connection process that spawned a gate for
+    /// this device (retained while `sshd` lives so idle `ControlMaster` connections are also ended
+    /// on `device.remove`).
+    SshConnection,
+}
+
+/// Persistent record for one live `legion gate --device <name>` session or its parent `sshd`
+/// connection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSessionRecord {
     /// Device name (`legion-device:<name>`).
     pub device: String,
     /// Principal pinned by `legion gate --as`.
     pub principal: String,
-    /// OS process ID of the `legion gate` process.
+    /// OS process ID of the recorded process (`legion gate` or parent `sshd`).
     pub pid: u32,
     /// Kernel process start timestamp matching `pid` (guards against PID reuse).
     pub start_time: u64,
@@ -45,6 +62,13 @@ pub struct DeviceSessionRecord {
     pub boot_id: String,
     /// RFC 3339 UTC timestamp when the session registered.
     pub started: String,
+    /// Whether this record tracks a `legion gate` process or a parent `sshd` connection.
+    #[serde(default)]
+    pub kind: SessionRecordKind,
+    /// Verified same-account parent `sshd` / `sshd-session` process recorded when `legion gate`
+    /// started, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_sshd: Option<ProcessId>,
 }
 
 impl DeviceSessionRecord {
@@ -76,13 +100,15 @@ pub fn validate_device_label(name: &str) -> Result<(), ErrorBody> {
 }
 
 /// RAII guard that registers this process as an active session for one paired device and removes
-/// its session record file when dropped.
+/// its gate session record file when dropped.
 pub struct DeviceSessionGuard {
     path: PathBuf,
+    conn_path: Option<PathBuf>,
 }
 
 impl DeviceSessionGuard {
-    /// Registers the current process under `state/device-sessions/` for `device` and `principal`.
+    /// Registers the current process (and any verified same-account parent `sshd` session process)
+    /// under `state/device-sessions/` for `device` and `principal`.
     pub fn register(
         paths: &Paths,
         device: &str,
@@ -104,6 +130,7 @@ impl DeviceSessionGuard {
                 format!("Cannot determine boot identity for device session tracking: {error}."),
             )
         })?;
+        let parent_sshd = procid::sshd_session_ancestor();
         let now = Timestamp::now();
         let started = Timestamp::from_second(now.as_second())
             .map(format_rfc3339)
@@ -114,30 +141,45 @@ impl DeviceSessionGuard {
             principal: principal.to_owned(),
             pid: identity.pid,
             start_time: identity.start_time,
-            boot_id,
-            started,
+            boot_id: boot_id.clone(),
+            started: started.clone(),
+            kind: SessionRecordKind::Gate,
+            parent_sshd,
         };
         let path = session_file_path(&dir, device, identity);
-        let mut bytes = serde_json::to_vec(&record).map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Internal,
-                format!("Device session record cannot be serialized: {error}."),
-            )
-        })?;
-        bytes.push(b'\n');
-        write_atomic(
-            &path,
-            &bytes,
-            WriteOptions::with_mode(0o600).force_mode(true),
-        )
-        .map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be written: {error}.", path.display()),
-            )
-        })?;
+        write_session_record(&path, &record)?;
 
-        Ok(DeviceSessionGuard { path })
+        // Also persist a deduplicated record for the parent `sshd` connection process so
+        // `device.remove` can still tear down an idle `ControlMaster` connection after this
+        // individual `legion gate` channel has exited cleanly.
+        let conn_path = if let Some(sshd_id) = parent_sshd {
+            let conn = DeviceSessionRecord {
+                device: device.to_owned(),
+                principal: principal.to_owned(),
+                pid: sshd_id.pid,
+                start_time: sshd_id.start_time,
+                boot_id,
+                started,
+                kind: SessionRecordKind::SshConnection,
+                parent_sshd: None,
+            };
+            let conn_file = connection_file_path(&dir, device, sshd_id);
+            write_session_record(&conn_file, &conn)?;
+            Some(conn_file)
+        } else {
+            None
+        };
+
+        Ok(DeviceSessionGuard { path, conn_path })
+    }
+
+    /// Removes the persisted parent `sshd` connection record written during [`Self::register`].
+    ///
+    /// Called when `legion gate` refuses to serve after finding the device is no longer authorized.
+    pub fn cancel_connection_record(&mut self) {
+        if let Some(conn_path) = self.conn_path.take() {
+            let _ = remove_ignoring_not_found(&conn_path);
+        }
     }
 
     /// Path of the session record file managed by this guard.
@@ -151,6 +193,27 @@ impl Drop for DeviceSessionGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+fn write_session_record(path: &Path, record: &DeviceSessionRecord) -> Result<(), ErrorBody> {
+    let mut bytes = serde_json::to_vec(record).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Device session record cannot be serialized: {error}."),
+        )
+    })?;
+    bytes.push(b'\n');
+    write_atomic(
+        path,
+        &bytes,
+        WriteOptions::with_mode(0o600).force_mode(true),
+    )
+    .map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be written: {error}.", path.display()),
+        )
+    })
 }
 
 /// Removes stale session files (from exited processes, recycled PIDs, earlier boots, or corrupt
@@ -177,49 +240,131 @@ pub fn sweep_stale_sessions(paths: &Paths) -> usize {
     removed
 }
 
-/// Sweeps stale session records and immediately terminates every live recorded session for
-/// `device`, escalating from graceful termination to forced kill after `grace`.
+struct CollectedTargets {
+    gates: Vec<(PathBuf, ProcessId, Option<ProcessId>)>,
+    sshds: BTreeMap<(u32, u64), (ProcessId, Vec<PathBuf>)>,
+}
+
+enum TerminationResult {
+    Gate {
+        ended: bool,
+        parent_sshd: Option<ProcessId>,
+    },
+    Sshd {
+        ended: bool,
+        id: ProcessId,
+    },
+}
+
+/// Sweeps stale session records and immediately terminates every live recorded session and verified
+/// same-account parent `sshd` connection for `device`, escalating from graceful termination to
+/// forced kill after `grace`.
 ///
 /// Protected processes (PID 0/1, current process, ancestors, and critical OS processes) are never
-/// signaled. Returns the number of live sessions terminated.
+/// signaled, and parent `sshd` targets are re-verified as live same-account non-listener `sshd`
+/// session processes immediately before signalling. Returns the number of live sessions/connections
+/// terminated (counting an active gate together with its parent `sshd` as one session, and an idle
+/// `ControlMaster` connection with no active gate as one session).
 pub async fn terminate_device_sessions(paths: &Paths, device: &str, grace: Duration) -> usize {
     let dir = sessions_dir(paths);
     let device_owned = device.to_owned();
-    let targets = tokio::task::spawn_blocking(move || collect_live_and_sweep(&dir, &device_owned))
-        .await
-        .unwrap_or_default();
+    let collected =
+        tokio::task::spawn_blocking(move || collect_live_and_sweep(&dir, &device_owned))
+            .await
+            .unwrap_or(CollectedTargets {
+                gates: Vec::new(),
+                sshds: BTreeMap::new(),
+            });
 
-    let mut set = JoinSet::new();
-    for (path, identity) in targets {
+    let mut set: JoinSet<TerminationResult> = JoinSet::new();
+    for (path, identity, parent_sshd) in collected.gates {
         set.spawn(async move {
             if procid::is_protected(&identity).is_some() {
-                return false;
+                return TerminationResult::Gate {
+                    ended: false,
+                    parent_sshd,
+                };
             }
             let outcome = procid::kill_process(&identity, false, grace).await;
             let gone = matches!(outcome, Ok(true)) || !procid::is_alive(&identity);
             if gone {
                 let _ = remove_ignoring_not_found(&path);
             }
-            gone
+            TerminationResult::Gate {
+                ended: gone,
+                parent_sshd,
+            }
         });
     }
 
-    let mut ended = 0usize;
+    for (_, (sshd_id, conn_paths)) in collected.sshds {
+        set.spawn(async move {
+            // Re-verify immediately before signalling: never touch a protected process, another OS
+            // account's sshd, a listener daemon, a recycled PID, or any non-sshd process.
+            if procid::is_protected(&sshd_id).is_some()
+                || !procid::verify_same_account_sshd(&sshd_id)
+            {
+                return TerminationResult::Sshd {
+                    ended: false,
+                    id: sshd_id,
+                };
+            }
+            let outcome = procid::kill_process(&sshd_id, false, grace).await;
+            let gone = matches!(outcome, Ok(true)) || !procid::is_alive(&sshd_id);
+            if gone {
+                for conn_path in conn_paths {
+                    let _ = remove_ignoring_not_found(&conn_path);
+                }
+            }
+            TerminationResult::Sshd {
+                ended: gone,
+                id: sshd_id,
+            }
+        });
+    }
+
+    let mut ended_gates = 0usize;
+    let mut sshds_covered_by_ended_gates: HashSet<ProcessId> = HashSet::new();
+    let mut ended_sshds: Vec<ProcessId> = Vec::new();
     while let Some(joined) = set.join_next().await {
-        if matches!(joined, Ok(true)) {
-            ended += 1;
+        match joined {
+            Ok(TerminationResult::Gate { ended, parent_sshd }) => {
+                if ended {
+                    ended_gates += 1;
+                    if let Some(sshd_id) = parent_sshd {
+                        sshds_covered_by_ended_gates.insert(sshd_id);
+                    }
+                }
+            }
+            Ok(TerminationResult::Sshd { ended, id }) => {
+                if ended {
+                    ended_sshds.push(id);
+                }
+            }
+            Err(_) => {}
         }
     }
-    ended
+
+    let ended_idle_connections = ended_sshds
+        .into_iter()
+        .filter(|id| !sshds_covered_by_ended_gates.contains(id))
+        .count();
+    ended_gates + ended_idle_connections
 }
 
-fn collect_live_and_sweep(dir: &Path, device: &str) -> Vec<(PathBuf, ProcessId)> {
+fn collect_live_and_sweep(dir: &Path, device: &str) -> CollectedTargets {
     let current_boot = procid::boot_id().ok();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            return CollectedTargets {
+                gates: Vec::new(),
+                sshds: BTreeMap::new(),
+            };
+        }
     };
-    let mut targets = Vec::new();
+    let mut gates = Vec::new();
+    let mut sshds: BTreeMap<(u32, u64), (ProcessId, Vec<PathBuf>)> = BTreeMap::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -227,8 +372,29 @@ fn collect_live_and_sweep(dir: &Path, device: &str) -> Vec<(PathBuf, ProcessId)>
         }
         match is_live_session_file(&path, current_boot.as_deref()) {
             Some(record) => {
-                if record.device == device {
-                    targets.push((path, record.process_id()));
+                if record.device != device {
+                    continue;
+                }
+                match record.kind {
+                    SessionRecordKind::Gate => {
+                        let gate_id = record.process_id();
+                        if let Some(sshd_id) = record.parent_sshd
+                            && procid::verify_same_account_sshd(&sshd_id)
+                        {
+                            sshds
+                                .entry((sshd_id.pid, sshd_id.start_time))
+                                .or_insert_with(|| (sshd_id, Vec::new()));
+                        }
+                        gates.push((path, gate_id, record.parent_sshd));
+                    }
+                    SessionRecordKind::SshConnection => {
+                        let sshd_id = record.process_id();
+                        sshds
+                            .entry((sshd_id.pid, sshd_id.start_time))
+                            .or_insert_with(|| (sshd_id, Vec::new()))
+                            .1
+                            .push(path);
+                    }
                 }
             }
             None => {
@@ -236,7 +402,7 @@ fn collect_live_and_sweep(dir: &Path, device: &str) -> Vec<(PathBuf, ProcessId)>
             }
         }
     }
-    targets
+    CollectedTargets { gates, sshds }
 }
 
 fn is_live_session_file(path: &Path, current_boot: Option<&str>) -> Option<DeviceSessionRecord> {
@@ -247,8 +413,18 @@ fn is_live_session_file(path: &Path, current_boot: Option<&str>) -> Option<Devic
     {
         return None;
     }
-    if !procid::is_alive(&record.process_id()) {
-        return None;
+    let identity = record.process_id();
+    match record.kind {
+        SessionRecordKind::Gate => {
+            if !procid::is_alive(&identity) {
+                return None;
+            }
+        }
+        SessionRecordKind::SshConnection => {
+            if !procid::verify_same_account_sshd(&identity) {
+                return None;
+            }
+        }
     }
     Some(record)
 }
@@ -269,6 +445,13 @@ fn session_file_path(dir: &Path, device: &str, identity: ProcessId) -> PathBuf {
     dir.join(format!(
         "{device}-{}-{}.json",
         identity.pid, identity.start_time
+    ))
+}
+
+fn connection_file_path(dir: &Path, device: &str, sshd_id: ProcessId) -> PathBuf {
+    dir.join(format!(
+        "conn-{device}-{}-{}.json",
+        sshd_id.pid, sshd_id.start_time
     ))
 }
 
@@ -323,7 +506,8 @@ mod tests {
         let mut bystander = spawn_sleeper();
         let bystander_id = procid::of_pid(bystander.id()).unwrap().unwrap();
 
-        // 1. Live session belonging to `pixel` (must be terminated).
+        // 1. Live session belonging to `pixel` (must be terminated), with a forged `parent_sshd`
+        //    pointing at the non-sshd `bystander` (which MUST NOT be signalled!).
         let victim_file = write_record(
             &sess_dir,
             &format!("pixel-{}-{}.json", victim_id.pid, victim_id.start_time),
@@ -334,6 +518,27 @@ mod tests {
                 start_time: victim_id.start_time,
                 boot_id: boot.clone(),
                 started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::Gate,
+                parent_sshd: Some(bystander_id),
+            },
+        );
+        // 1b. Forged `SshConnection` record for `pixel` pointing at the non-sshd `bystander`
+        //     (must be swept without signalling bystander).
+        let forged_conn_file = write_record(
+            &sess_dir,
+            &format!(
+                "conn-pixel-{}-{}.json",
+                bystander_id.pid, bystander_id.start_time
+            ),
+            &DeviceSessionRecord {
+                device: "pixel".to_owned(),
+                principal: "phone".to_owned(),
+                pid: bystander_id.pid,
+                start_time: bystander_id.start_time,
+                boot_id: boot.clone(),
+                started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::SshConnection,
+                parent_sshd: None,
             },
         );
         // 2. Recycled-PID record for `pixel` pointing at bystander's PID with a wrong start_time
@@ -348,6 +553,8 @@ mod tests {
                 start_time: bystander_id.start_time.wrapping_add(999),
                 boot_id: boot.clone(),
                 started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::Gate,
+                parent_sshd: None,
             },
         );
         // 3. Prior-boot record for `pixel` pointing at bystander's exact ProcessId with another
@@ -362,6 +569,8 @@ mod tests {
                 start_time: bystander_id.start_time,
                 boot_id: "00000000-0000-0000-0000-000000000000".to_owned(),
                 started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::Gate,
+                parent_sshd: None,
             },
         );
         // 4. Live session belonging to another device `tablet` (must remain untouched).
@@ -378,6 +587,8 @@ mod tests {
                 start_time: bystander_id.start_time,
                 boot_id: boot,
                 started: "2026-11-24T12:00:00Z".to_owned(),
+                kind: SessionRecordKind::Gate,
+                parent_sshd: None,
             },
         );
         // 5. Corrupt JSON file (must be swept).
@@ -391,6 +602,7 @@ mod tests {
         let status = victim.wait().unwrap();
         assert!(!status.success() || !procid::is_alive(&victim_id));
         assert!(!victim_file.exists());
+        assert!(!forged_conn_file.exists());
         assert!(!recycled_file.exists());
         assert!(!old_boot_file.exists());
         assert!(!corrupt_file.exists());

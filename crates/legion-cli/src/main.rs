@@ -353,7 +353,7 @@ async fn gate(
         err(&format!("{}\n", legion_net::gate::REFUSAL));
         return ExitCode::from(FAILED);
     };
-    let _session = if let Some(device_name) = device.as_deref() {
+    let mut session = if let Some(device_name) = device.as_deref() {
         match legion_tools::device::sessions::DeviceSessionGuard::register(
             node.paths(),
             device_name,
@@ -369,6 +369,29 @@ async fn gate(
     } else {
         None
     };
+    if let Some(device_name) = device.as_deref() {
+        let auth_check = node
+            .config()
+            .get::<legion_core::config::NodeFile>()
+            .and_then(|node_file| {
+                legion_tools::device::authkeys::verify_device_authorized(
+                    node.paths(),
+                    &node_file,
+                    device_name,
+                    &pinned,
+                    account.as_deref(),
+                )
+            });
+        if let Err(error) = auth_check {
+            if let Some(mut guard) = session.take() {
+                guard.cancel_connection_record();
+            }
+            router.shutdown().await;
+            err(&format!("legion gate: {}\n", error.message));
+            return ExitCode::from(FAILED);
+        }
+    }
+    let _session = session;
     match subcommand {
         Subcommand::Rpc => serve_rpc(node, router, Some(pinned), Door::Ssh, device, shutdown).await,
         Subcommand::Stream => {

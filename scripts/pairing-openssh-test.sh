@@ -333,15 +333,131 @@ if "${ssh_base[@]}" -i "$work/temp_key" me@127.0.0.1 'legion rpc' </dev/null >/d
 fi
 echo "    temp key revocation verified"
 
-# 7. device.list shows device and device.remove stops the key working.
+# 7. device.list shows device; device.remove ends a held ControlMaster sshd connection and stops
+#    both multiplexed reuse and fresh connections.
 list_json="$(legion device.list --json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert len(d["invites"])==0 and len(d["devices"])==1 and d["devices"][0]["name"]=="container-phone", d' "$list_json"
-legion device.remove name=container-phone --json >/dev/null
+
+ctl_active="/tmp/lgm-active-$$.sock"
+ctl_fresh="/tmp/lgm-fresh-$$.sock"
+cleanup_ctls() {
+  ssh -S "$ctl_active" -O exit me@127.0.0.1 >/dev/null 2>&1 || true
+  ssh -S "$ctl_fresh" -O exit me@127.0.0.1 >/dev/null 2>&1 || true
+  rm -f "$ctl_active" "$ctl_fresh"
+}
+trap cleanup_ctls EXIT
+
+ssh -T -f -N \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes \
+  -o "UserKnownHostsFile=$work/known_hosts" \
+  -o GlobalKnownHostsFile=none \
+  -o ConnectTimeout=10 \
+  -o ControlMaster=yes \
+  -o ControlPersist=yes \
+  -S "$ctl_active" \
+  -p 2222 \
+  -i "$work/device_key" \
+  me@127.0.0.1
+
+mux_whoami="$(
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"meta.whoami","args":{}}}' \
+  | ssh -T -o BatchMode=yes -o ControlMaster=no -S "$ctl_active" me@127.0.0.1 'legion rpc'
+)"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["result"]["principal"]=="phone" and r["result"]["door"]=="ssh", r' "$mux_whoami"
+
+rm_active_json="$(legion device.remove name=container-phone --json)"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["removed"] is True and r["sessions_ended"] >= 1, r' "$rm_active_json"
+
+# Wait briefly for the ssh ControlMaster client to observe its terminated parent sshd.
+mux_dead=0
+for _ in $(seq 1 50); do
+  if ! ssh -S "$ctl_active" -O check me@127.0.0.1 >/dev/null 2>&1; then
+    mux_dead=1
+    break
+  fi
+  sleep 0.1
+done
+[[ "$mux_dead" -eq 1 ]] || { echo "ControlMaster stayed alive after device.remove!" >&2; exit 1; }
+
+if printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"meta.whoami","args":{}}}' \
+  | ssh -T -o BatchMode=yes -o ControlMaster=no -S "$ctl_active" me@127.0.0.1 'legion rpc' >/dev/null 2>&1; then
+  echo "revoked ControlMaster still answered legion rpc!" >&2
+  exit 1
+fi
 if "${ssh_base[@]}" -i "$work/device_key" me@127.0.0.1 'legion rpc' </dev/null >/dev/null 2>&1; then
   echo "removed device key still authenticated!" >&2
   exit 1
 fi
-echo "    device.list and device.remove verified"
+echo "    device.list, device.remove, and active ControlMaster teardown verified"
+
+# 7b. A never-used `-fN` ControlMaster opened before device.remove is still refused when it tries
+#     to open a session channel afterwards (`legion gate` re-checks authorized_keys after registering).
+inv_fresh_json="$(legion device.invite principal=phone host=127.0.0.1 port=2222 --json)"
+printf '%s\n' "$inv_fresh_json" > "$work/invite_fresh.json"
+python3 - "$work/invite_fresh.json" "$work/temp_key_fresh" "$work/invite_fresh_id" <<'PY'
+import base64, json, os, struct, subprocess, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    invite = json.load(fh)["invite"]
+raw = invite[len("legion-invite-1."):]
+raw += "=" * ((4 - len(raw) % 4) % 4)
+payload = json.loads(base64.urlsafe_b64decode(raw).decode("utf-8"))
+seed = base64.b64decode(payload["key"])
+pkcs8 = bytes.fromhex("302e020100300506032b657004220420") + seed
+pub32 = subprocess.run(
+    ["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+    input=pkcs8, stdout=subprocess.PIPE, check=True,
+).stdout[-32:]
+def ssh_str(data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + data
+pub_blob = ssh_str(b"ssh-ed25519") + ssh_str(pub32)
+priv = b"\x11\x22\x33\x44" * 2 + ssh_str(b"ssh-ed25519") + ssh_str(pub32) + ssh_str(seed + pub32) + ssh_str(b"fresh")
+pad = 1
+while len(priv) % 8 != 0:
+    priv += bytes([pad])
+    pad += 1
+blob = b"openssh-key-v1\x00" + ssh_str(b"none") + ssh_str(b"none") + ssh_str(b"") + struct.pack(">I", 1) + ssh_str(pub_blob) + ssh_str(priv)
+b64 = base64.b64encode(blob).decode("ascii")
+lines = [b64[i:i + 70] for i in range(0, len(b64), 70)]
+pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END OPENSSH PRIVATE KEY-----\n"
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="ascii") as fh:
+    fh.write(pem)
+with open(sys.argv[3], "w", encoding="utf-8") as fh:
+    fh.write(payload["id"])
+PY
+ssh-keygen -q -t ed25519 -N '' -C 'fresh@test' -f "$work/fresh_key"
+fresh_pub="$(cat "$work/fresh_key.pub")"
+fresh_req="$(python3 -c 'import json,sys; print(json.dumps({"enrol":1,"id":sys.argv[1],"public_key":sys.argv[2],"name":"Container Fresh"}))' "$(cat "$work/invite_fresh_id")" "$fresh_pub")"
+printf '%s\n' "$fresh_req" | "${ssh_base[@]}" -i "$work/temp_key_fresh" me@127.0.0.1 >/dev/null
+
+ssh -T -f -N \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes \
+  -o "UserKnownHostsFile=$work/known_hosts" \
+  -o GlobalKnownHostsFile=none \
+  -o ConnectTimeout=10 \
+  -o ControlMaster=yes \
+  -o ControlPersist=yes \
+  -S "$ctl_fresh" \
+  -p 2222 \
+  -i "$work/fresh_key" \
+  me@127.0.0.1
+
+legion device.remove name=container-fresh --json >/dev/null
+
+set +e
+fresh_stderr="$(
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"call","params":{"tool":"meta.whoami","args":{}}}' \
+  | ssh -T -o BatchMode=yes -o ControlMaster=no -S "$ctl_fresh" me@127.0.0.1 'legion rpc' 2>&1 >/dev/null
+)"
+fresh_rc=$?
+set -e
+[[ "$fresh_rc" -ne 0 ]] || { echo "never-used ControlMaster unexpectedly succeeded after device.remove!" >&2; exit 1; }
+[[ "$fresh_stderr" == *"no longer authorized"* ]] || { echo "expected gate re-check refusal, got: $fresh_stderr" >&2; exit 1; }
+echo "    never-used ControlMaster gate re-check refusal verified"
 
 # 8. sshd itself enforces a past 12-digit expiry-time without Z.
 inv2_json="$(legion device.invite principal=phone host=127.0.0.1 port=2222 --json)"

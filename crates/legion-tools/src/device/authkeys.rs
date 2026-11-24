@@ -777,6 +777,63 @@ pub fn verify_gate_account(expected: Option<&str>) -> Result<(), ErrorBody> {
     Ok(())
 }
 
+/// Verifies that `authorized_keys` still contains a Legion-managed device line for `device`
+/// pinned to `principal`, `paths`, and `account` (when present or required on Windows's shared
+/// `administrators_authorized_keys`).
+///
+/// Called by `legion gate --as <principal> --device <name>` immediately after registering its
+/// session record so a gate starting on an already-open multiplexed SSH connection (`ControlMaster`)
+/// or racing with `device.remove` refuses to serve once the line has been removed. Strictly
+/// read-only.
+pub fn verify_device_authorized(
+    paths: &Paths,
+    node_file: &NodeFile,
+    device: &str,
+    principal: &str,
+    account: Option<&str>,
+) -> Result<(), ErrorBody> {
+    let target = resolve_target(paths, node_file)?;
+    let write_path = resolve_safe_write_path(&target, paths.home())?;
+    let auth_keys = read_auth_keys(&write_path)?;
+    let expected_account = match account {
+        Some(acct) => Some(acct.to_owned()),
+        None if target.windows_admin_acl => Some(current_account_name()?),
+        None => None,
+    };
+    let require_pinned_account = target.windows_admin_acl || account.is_some();
+
+    let authorized = auth_keys.lines.iter().any(|line| {
+        matches!(
+            &line.kind,
+            LineKind::Device {
+                name,
+                principal: line_principal,
+                home,
+                account: line_account,
+                ..
+            } if name == device
+                && line_principal == principal
+                && line_matches_home(home.as_ref(), paths)
+                && line_matches_account(
+                    line_account.as_deref(),
+                    expected_account.as_deref(),
+                    require_pinned_account,
+                    cfg!(windows),
+                )
+        )
+    });
+
+    if authorized {
+        Ok(())
+    } else {
+        Err(ErrorBody::new(
+            ErrorCode::Denied,
+            format!("Device {device} is no longer authorized in authorized_keys."),
+        )
+        .with_hint("Pair the device again if access should be restored."))
+    }
+}
+
 /// Pinned Legion home embedded in every Legion-managed `authorized_keys` forced command so `sshd`
 /// session environment variables (`AcceptEnv LEGION_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`)
 /// can never redirect a paired key to another configuration or policy directory.
@@ -2744,5 +2801,72 @@ Match Group users
             &parsed_dev.lines[0].kind,
             LineKind::Device { name, .. } if name == "pixel"
         ));
+    }
+
+    #[test]
+    fn verify_device_authorized_requires_matching_device_principal_home_and_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_a = dir.path().join("legion-a");
+        let home_b = dir.path().join("legion-b");
+        let paths_a = Paths::from_explicit_home(&home_a).unwrap();
+        let paths_b = Paths::from_explicit_home(&home_b).unwrap();
+        let auth_path = dir.path().join("authorized_keys");
+
+        let mut node_file = NodeFile::default();
+        node_file.devices.authorized_keys = Some(auth_path.display().to_string());
+
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000";
+        let line_a = format_device_line(
+            Path::new("/usr/local/bin/legion"),
+            "phone",
+            key,
+            "pixel",
+            &PinnedHome::from_paths(&paths_a),
+            None,
+            ForcedCommandShell::Posix,
+        )
+        .unwrap();
+        std::fs::write(&auth_path, format!("{line_a}\n")).unwrap();
+
+        // Exact match succeeds.
+        assert!(verify_device_authorized(&paths_a, &node_file, "pixel", "phone", None).is_ok());
+
+        // Mismatched device name, principal, home, or account all fail with Denied.
+        assert_eq!(
+            verify_device_authorized(&paths_a, &node_file, "other", "phone", None)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            verify_device_authorized(&paths_a, &node_file, "pixel", "owner", None)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            verify_device_authorized(&paths_b, &node_file, "pixel", "phone", None)
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+        assert_eq!(
+            verify_device_authorized(&paths_a, &node_file, "pixel", "phone", Some("alice"))
+                .unwrap_err()
+                .code,
+            ErrorCode::Denied
+        );
+
+        // Removing the line immediately causes refusal.
+        std::fs::write(&auth_path, "# empty\n").unwrap();
+        let err =
+            verify_device_authorized(&paths_a, &node_file, "pixel", "phone", None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(
+            err.message.contains("no longer authorized"),
+            "{}",
+            err.message
+        );
     }
 }

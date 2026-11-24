@@ -1443,3 +1443,390 @@ fn gate_refuses_missing_pinned_home_without_creating_anything() {
     assert!(!out_split.status.success());
     assert!(!gone_cfg.exists() && !gone_state.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels() {
+    if !TestSshd::available() {
+        eprintln!(
+            "skipping real_sshd_control_master_revocation_ends_connection_and_refuses_new_channels: sshd unavailable"
+        );
+        return;
+    }
+
+    struct ControlMasterGuard {
+        ssh_bin: std::path::PathBuf,
+        ctl_path: std::path::PathBuf,
+        target: String,
+    }
+
+    impl Drop for ControlMasterGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(&self.ssh_bin)
+                .args(["-S"])
+                .arg(&self.ctl_path)
+                .args(["-O", "exit", &self.target])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = std::fs::remove_file(&self.ctl_path);
+        }
+    }
+
+    let home = Home::new_strict();
+    let auth_keys = home.home().join("mux_authorized_keys");
+    let home_dir_str = home.home().to_string_lossy().into_owned();
+    let Some(sshd) = TestSshd::start(auth_keys.clone(), &[("HOME", &home_dir_str)])
+        .expect("throwaway sshd failed to start")
+    else {
+        return;
+    };
+
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(sshd.host_key_path()),
+        ),
+    );
+    home.write_config(
+        "policy.toml",
+        "default = \"owner\"\n\n\
+         [roles.observer]\n\
+         allow = [\"effect:read\"]\n\n\
+         [principals.phone]\n\
+         role = \"observer\"\n",
+    );
+
+    let client_dir = tempfile::tempdir().unwrap();
+    let known_hosts = client_dir.path().join("known_hosts");
+    write_known_hosts(
+        &known_hosts,
+        sshd.host(),
+        sshd.port(),
+        &[sshd.host_key_line().to_owned()],
+    )
+    .unwrap();
+
+    // Helper to enrol a fresh device key under `label` via real sshd.
+    let enrol_device = |label: &str| -> std::path::PathBuf {
+        let invite_run = home.run(&[
+            "device.invite",
+            "principal=phone",
+            "host=127.0.0.1",
+            &format!("port={}", sshd.port()),
+            &format!("user={}", sshd.user()),
+        ]);
+        assert_eq!(
+            invite_run.code, 0,
+            "invite {label}: {} {}",
+            invite_run.stdout, invite_run.stderr
+        );
+        let payload = InvitePayload::decode(invite_run.json()["invite"].as_str().unwrap()).unwrap();
+        let temp_key = client_dir.path().join(format!("{label}_temp_key"));
+        write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), label)
+            .unwrap();
+        let device_key = client_dir.path().join(format!("{label}_ed25519"));
+        let device_pub =
+            generate_ed25519_keypair(sshd.ssh_keygen_bin(), &device_key, label).unwrap();
+
+        let mut child = sshd
+            .ssh_command(&temp_key, &known_hosts)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "{}",
+            json!({
+                "enrol": 1,
+                "id": payload.id,
+                "public_key": device_pub,
+                "name": label,
+            })
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "enrol {label} failed: stdout={} stderr={}\nsshd:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            sshd.logs(),
+        );
+        device_key
+    };
+
+    // Short directory under `/tmp` so Unix domain socket paths stay well below SUN_LEN (~104 bytes).
+    let ctl_dir = tempfile::Builder::new()
+        .prefix("lgm-")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let target = format!("{}@{}", sshd.user(), sshd.host());
+
+    let start_master = |key: &Path, name: &str| -> ControlMasterGuard {
+        let ctl_path = ctl_dir.path().join(format!("{name}.sock"));
+        let out = std::process::Command::new(sshd.ssh_bin())
+            .args([
+                "-T",
+                "-f",
+                "-N",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "GlobalKnownHostsFile=none",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "PubkeyAuthentication=yes",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "ControlMaster=yes",
+                "-o",
+                "ControlPersist=yes",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                &format!("UserKnownHostsFile={}", known_hosts.display()),
+                "-S",
+            ])
+            .arg(&ctl_path)
+            .args(["-p", &sshd.port().to_string(), "-i"])
+            .arg(key)
+            .arg(&target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ControlMaster {name} failed to start: stdout={} stderr={}\nsshd:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            sshd.logs(),
+        );
+        ControlMasterGuard {
+            ssh_bin: sshd.ssh_bin().to_path_buf(),
+            ctl_path,
+            target: target.clone(),
+        }
+    };
+
+    let run_whoami_via_ctl = |ctl_path: &Path| -> std::process::Output {
+        let mut child = std::process::Command::new(sshd.ssh_bin())
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "LogLevel=ERROR",
+                "-S",
+            ])
+            .arg(ctl_path)
+            .args([&target, "legion rpc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let req = rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}));
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{req}");
+            let _ = stdin.flush();
+        }
+        child.wait_with_output().unwrap()
+    };
+
+    let ctl_is_alive = |ctl_path: &Path| -> bool {
+        std::process::Command::new(sshd.ssh_bin())
+            .args(["-S"])
+            .arg(ctl_path)
+            .args(["-O", "check", &target])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+
+    // Enrol an unrelated bystander device whose ControlMaster must stay alive across removals.
+    let bystander_key = enrol_device("bystander-phone");
+    let bystander_ctl = start_master(&bystander_key, "bystander");
+    let bystander_before = run_whoami_via_ctl(&bystander_ctl.ctl_path);
+    assert!(
+        bystander_before.status.success(),
+        "bystander before failed: {}",
+        String::from_utf8_lossy(&bystander_before.stderr)
+    );
+
+    // 1. Active session + ControlMaster: removing the device kills both the active gate AND the
+    //    parent sshd connection so neither the held channel nor any new channel on `-S <ctl>` works.
+    let active_key = enrol_device("mux-active");
+    let active_ctl = start_master(&active_key, "active");
+    let mut held = std::process::Command::new(sshd.ssh_bin())
+        .args([
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "LogLevel=ERROR",
+            "-S",
+        ])
+        .arg(&active_ctl.ctl_path)
+        .args([&target, "legion rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut held_stdin = held.stdin.take().unwrap();
+    let mut held_stdout = BufReader::new(held.stdout.take().unwrap());
+    writeln!(
+        held_stdin,
+        "{}",
+        rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+    )
+    .unwrap();
+    held_stdin.flush().unwrap();
+    let reply = read_json_line(&mut held_stdout, "active mux whoami");
+    assert_eq!(reply["result"]["principal"], json!("phone"));
+
+    let rm_active = home.run(&["device.remove", "name=mux-active"]);
+    assert_eq!(rm_active.code, 0, "rm_active: {}", rm_active.stderr);
+    assert!(
+        rm_active.json()["sessions_ended"].as_u64().unwrap() >= 1,
+        "expected sessions_ended >= 1, got {}",
+        rm_active.stdout
+    );
+
+    // Held session must terminate promptly, and the ControlMaster connection itself must die.
+    drop(held_stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let held_exited = loop {
+        if held.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = held.kill();
+            let _ = held.wait();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        held_exited,
+        "held multiplexed ssh session did not exit after device.remove"
+    );
+
+    // Wait briefly for the ssh ControlMaster client to observe the closed sshd connection.
+    let ctl_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < ctl_deadline && ctl_is_alive(&active_ctl.ctl_path) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ctl_is_alive(&active_ctl.ctl_path),
+        "ControlMaster connection stayed alive after device.remove"
+    );
+
+    let after_active = run_whoami_via_ctl(&active_ctl.ctl_path);
+    assert!(
+        !after_active.status.success(),
+        "ssh -S <ctl> still answered after device.remove: stdout={} stderr={}",
+        String::from_utf8_lossy(&after_active.stdout),
+        String::from_utf8_lossy(&after_active.stderr)
+    );
+
+    // 2. Idle previously-used ControlMaster: gate exited cleanly earlier, leaving only the
+    //    multiplexed sshd connection open. `device.remove` must still terminate that parent sshd.
+    let idle_key = enrol_device("mux-idle");
+    let idle_ctl = start_master(&idle_key, "idle");
+    let idle_before = run_whoami_via_ctl(&idle_ctl.ctl_path);
+    assert!(
+        idle_before.status.success(),
+        "idle before failed: {}",
+        String::from_utf8_lossy(&idle_before.stderr)
+    );
+    assert!(ctl_is_alive(&idle_ctl.ctl_path));
+
+    let rm_idle = home.run(&["device.remove", "name=mux-idle"]);
+    assert_eq!(rm_idle.code, 0, "rm_idle: {}", rm_idle.stderr);
+    assert!(
+        rm_idle.json()["sessions_ended"].as_u64().unwrap() >= 1,
+        "expected idle ControlMaster connection to be ended, got {}",
+        rm_idle.stdout
+    );
+
+    let idle_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < idle_deadline && ctl_is_alive(&idle_ctl.ctl_path) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ctl_is_alive(&idle_ctl.ctl_path),
+        "idle ControlMaster connection stayed alive after device.remove"
+    );
+    let after_idle = run_whoami_via_ctl(&idle_ctl.ctl_path);
+    assert!(
+        !after_idle.status.success(),
+        "idle ControlMaster still answered after device.remove: stdout={}",
+        String::from_utf8_lossy(&after_idle.stdout)
+    );
+
+    // 3. Never-used `-fN` ControlMaster (opened before removal, no gate ran yet): `device.remove`
+    //    cannot know its sshd PID yet, so when the device later opens a channel over `-S <ctl>`,
+    //    `legion gate` re-checks authorized_keys after registering and refuses to serve.
+    let fresh_key = enrol_device("mux-fresh");
+    let fresh_ctl = start_master(&fresh_key, "fresh");
+    assert!(ctl_is_alive(&fresh_ctl.ctl_path));
+
+    let rm_fresh = home.run(&["device.remove", "name=mux-fresh"]);
+    assert_eq!(rm_fresh.code, 0, "rm_fresh: {}", rm_fresh.stderr);
+
+    let after_fresh = run_whoami_via_ctl(&fresh_ctl.ctl_path);
+    assert!(
+        !after_fresh.status.success(),
+        "fresh -fN ControlMaster answered as phone after device.remove: stdout={} stderr={}",
+        String::from_utf8_lossy(&after_fresh.stdout),
+        String::from_utf8_lossy(&after_fresh.stderr)
+    );
+    let fresh_stderr = String::from_utf8_lossy(&after_fresh.stderr);
+    assert!(
+        fresh_stderr.contains("no longer authorized"),
+        "expected gate re-check refusal on stderr, got: {fresh_stderr:?}"
+    );
+    assert!(
+        after_fresh.stdout.is_empty(),
+        "refused gate must not write RPC output: {:?}",
+        String::from_utf8_lossy(&after_fresh.stdout)
+    );
+
+    // Unrelated bystander ControlMaster and the sshd listener must both remain intact.
+    assert!(
+        ctl_is_alive(&bystander_ctl.ctl_path),
+        "bystander ControlMaster was disrupted by removing another device"
+    );
+    let bystander_after = run_whoami_via_ctl(&bystander_ctl.ctl_path);
+    assert!(
+        bystander_after.status.success(),
+        "bystander RPC failed after removing another device: {}",
+        String::from_utf8_lossy(&bystander_after.stderr)
+    );
+    let bystander_reply: Value =
+        serde_json::from_str(String::from_utf8_lossy(&bystander_after.stdout).trim()).unwrap();
+    assert_eq!(bystander_reply["result"]["principal"], json!("phone"));
+}

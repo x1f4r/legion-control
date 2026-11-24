@@ -19,6 +19,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_WALK_PASSES: usize = 8;
 const MAX_ANCESTOR_HOPS: usize = 256;
+const MAX_SSHD_ANCESTOR_HOPS: usize = 4;
 
 pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
     if identity.pid == 4 {
@@ -28,6 +29,65 @@ pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
         return Some("ancestor of current process");
     }
     win_proc::check_protected_system_process(identity)
+}
+
+fn windows_info_is_same_account_sshd(info: &win_proc::WindowsProcSshdInfo) -> bool {
+    if !info.same_account || info.id.pid <= 4 || info.id.pid == std::process::id() {
+        return false;
+    }
+    let Some(cmdline) = info.cmdline.as_deref() else {
+        return false;
+    };
+    let argv = super::split_windows_cmdline(cmdline);
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    super::is_sshd_session_process(&info.image_path, &argv_refs, true)
+}
+
+pub(super) fn sshd_session_ancestor() -> Option<ProcessId> {
+    let own_pid = std::process::id();
+    let OpenPinnedOutcome::Pinned(self_proc) = win_proc::open_pinned_query_only(own_pid, false)
+    else {
+        return None;
+    };
+    let mut parent_pid = self_proc.parent_pid;
+    let mut child_start = self_proc.id.start_time;
+    drop(self_proc);
+
+    let mut seen = HashSet::new();
+    seen.insert(own_pid);
+
+    for _ in 0..MAX_SSHD_ANCESTOR_HOPS {
+        if parent_pid <= 4 || !seen.insert(parent_pid) {
+            break;
+        }
+        let info = win_proc::inspect_process_for_sshd(parent_pid)?;
+        if !child_not_older_than_parent(
+            child_start,
+            info.id.start_time,
+            WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+        ) {
+            break;
+        }
+        if windows_info_is_same_account_sshd(&info) {
+            return Some(info.id);
+        }
+        if !super::is_shell_wrapper_comm(&info.image_path) {
+            break;
+        }
+        child_start = info.id.start_time;
+        parent_pid = info.parent_pid;
+    }
+    None
+}
+
+pub(super) fn verify_same_account_sshd(identity: &ProcessId) -> bool {
+    if identity.pid <= 4 || identity.pid == std::process::id() {
+        return false;
+    }
+    let Some(info) = win_proc::inspect_process_for_sshd(identity.pid) else {
+        return false;
+    };
+    identity.matches(&info.id) && windows_info_is_same_account_sshd(&info)
 }
 
 fn is_ancestor_of_current(identity: &ProcessId) -> bool {
