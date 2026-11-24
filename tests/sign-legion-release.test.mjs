@@ -90,3 +90,13 @@ if (args[0] === 'release' && args[1] === 'view') {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('legion release workflow enforces main ancestry, --latest=false, and --prerelease without signing', () => {
+  const workflow = fs.readFileSync(new URL('../.github/workflows/legion-release.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /git merge-base --is-ancestor HEAD origin\/main/);
+  assert.match(workflow, /--latest=false/);
+  assert.match(workflow, /--prerelease/);
+  assert.match(workflow, /--draft/);
+  assert.doesNotMatch(workflow, /--draft=false\s+dist\//);
+  assert.match(workflow, /gh release edit legion-vX\.Y\.Z --draft=false --latest=false/);
+});

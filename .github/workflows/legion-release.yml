@@ -4,6 +4,17 @@
 # compiled into `legion` from `contract/release-public-key.pem`) is the trust anchor. This workflow
 # never holds the signing key and never signs releases; the GitHub build provenance attestation is
 # defence in depth for installers and operators verifying CI provenance.
+#
+# Release procedure (owner):
+#   1. Bump `[workspace.package].version` in Cargo.toml on `main` and wait for CI to turn green.
+#   2. Tag that commit on `main` and push the tag:
+#        git tag legion-vX.Y.Z && git push origin legion-vX.Y.Z
+#   3. Wait for this workflow to finish building all targets, attesting them, and creating the
+#      draft release (with `--latest=false` so `/releases/latest` stays untouched for older apps).
+#   4. Sign `SHA256SUMS` offline on the machine holding `~/.legion-control/release-signing.key`:
+#        node scripts/sign-legion-release.mjs legion-vX.Y.Z
+#   5. Review the listed artifacts/digests and run the publish command printed by the script:
+#        gh release edit legion-vX.Y.Z --draft=false --latest=false
 name: Legion release
 on:
   push:
@@ -28,14 +39,17 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       is_release: ${{ steps.version.outputs.is_release }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
     steps:
+      # Full history lets the tag-push check verify the tagged commit is reachable from `main`.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
-      # Refuse a tag whose version disagrees with Cargo.toml before spending runner minutes on
-      # cross-platform release builds.
+      # Refuse a tag whose version disagrees with Cargo.toml or whose commit is not on `main`
+      # before spending runner minutes on cross-platform release builds.
       - id: version
-        name: Check tag against workspace Cargo.toml
+        name: Check tag against workspace Cargo.toml and main
         shell: bash
         run: |
           set -euo pipefail
@@ -59,14 +73,24 @@ jobs:
               echo "Tag ${tag} (version ${tag_version}) does not match Cargo.toml workspace version ${workspace_version}." >&2
               exit 1
             fi
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "Tag ${tag} ($(git rev-parse --short HEAD)) is not on origin/main; refusing to build a release from an unmerged commit." >&2
+              exit 1
+            fi
             is_release="true"
           else
             tag="legion-v${workspace_version}"
             is_release="false"
           fi
+          if [[ "$workspace_version" == *-* ]]; then
+            is_prerelease="true"
+          else
+            is_prerelease="false"
+          fi
           echo "version=${workspace_version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "is_release=${is_release}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${is_prerelease}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build (${{ matrix.target }})
@@ -263,9 +287,17 @@ jobs:
               git log --no-merges --format='- %s (%h)' "${tag}" -- Cargo.toml Cargo.lock crates/ install/ .github/workflows/legion-release.yml
             fi
           } > release-notes.md
-          gh release create "$tag" \
-            --draft \
-            --verify-tag \
-            --title "Legion v${version}" \
-            --notes-file release-notes.md \
-            dist/*
+          # Always pass --latest=false so publishing a Legion release never moves `/releases/latest`,
+          # which the older Mac and Android apps read for their own updates.
+          create_args=(
+            "$tag"
+            --draft
+            --latest=false
+            --verify-tag
+            --title "Legion v${version}"
+            --notes-file release-notes.md
+          )
+          if [[ "${{ needs.prepare.outputs.is_prerelease }}" == "true" ]]; then
+            create_args+=(--prerelease)
+          fi
+          gh release create "${create_args[@]}" dist/*
