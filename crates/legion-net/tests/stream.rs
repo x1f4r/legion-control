@@ -8,7 +8,7 @@ use std::io::{BufRead, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use legion_core::Paths;
-use legion_net::stream::{Host, serve};
+use legion_net::stream::{Host, STREAM_PROTOCOL, serve};
 use legion_proto::ErrorCode;
 use serde_json::{Value, json};
 
@@ -45,7 +45,13 @@ impl Node {
     }
 
     /// Runs one operation: the header, then `body` on its input.
+    /// Runs one operation: the header, which speaks the current protocol unless it says
+    /// otherwise, then `body` on its input.
     fn run(&self, pinned: Option<&str>, header: &Value, body: &[u8]) -> Ran {
+        let mut header = header.clone();
+        if header.get("protocol").is_none() {
+            header["protocol"] = json!(STREAM_PROTOCOL);
+        }
         let mut input = header.to_string().into_bytes();
         input.push(b'\n');
         input.extend_from_slice(body);
@@ -380,7 +386,7 @@ fn manifest_of_a_home_leaves_out_legions_own_files_for_a_role_without_admin() {
         serve(
             &host,
             pinned,
-            Cursor::new(b"{\"op\":\"manifest\",\"root\":\"~\"}\n".to_vec()),
+            Cursor::new(b"{\"op\":\"manifest\",\"root\":\"~\",\"protocol\":1}\n".to_vec()),
             &mut output,
         )
         .unwrap();
@@ -474,7 +480,7 @@ fn unpack_checks_where_each_entry_lands_and_leaves_legions_own_files_alone() {
     let archive = tar_of(staging.path(), &[".legion/config/policy.toml", "fine.txt"]);
 
     let mut input =
-        b"{\"op\":\"unpack\",\"root\":\"~\",\"names\":[\".legion/config/policy.toml\",\"fine.txt\"]}\n"
+        b"{\"op\":\"unpack\",\"root\":\"~\",\"names\":[\".legion/config/policy.toml\",\"fine.txt\"],\"protocol\":1}\n"
             .to_vec();
     input.extend_from_slice(&archive);
     let mut output = Vec::new();
@@ -791,8 +797,7 @@ fn a_header_that_cannot_be_read_is_refused_on_the_first_line() {
     for input in [
         &b""[..],
         b"not json\n",
-        b"{\"op\":\"format\",\"path\":\"/\"}\n",
-        b"{\"path\":\"/\"}\n",
+        b"{\"op\":\"stat\",\"protocol\":1}\n",
         b"[1]\n",
     ] {
         let mut output = Vec::new();
@@ -804,6 +809,45 @@ fn a_header_that_cannot_be_read_is_refused_on_the_first_line() {
     }
     let relative = node.run(None, &json!({"op": "stat", "path": "relative/path"}), b"");
     relative.refused(ErrorCode::InvalidArgs);
+}
+
+#[test]
+fn a_header_in_another_protocol_or_with_an_unknown_operation_is_unsupported() {
+    let node = Node::new();
+    for (header, names) in [
+        (
+            json!({"op": "stat", "path": "~", "protocol": null}),
+            "protocol",
+        ),
+        (
+            json!({"op": "stat", "path": "~", "protocol": 99}),
+            "protocol 99",
+        ),
+        (json!({"op": "format", "path": "/"}), "format"),
+        (json!({"path": "/"}), "operation"),
+    ] {
+        let error = node.run(None, &header, b"").refused(ErrorCode::Unsupported);
+        assert!(
+            error["message"].as_str().unwrap().contains(names),
+            "{error}"
+        );
+        assert_eq!(
+            error["details"]["protocol"],
+            json!([STREAM_PROTOCOL]),
+            "{error}"
+        );
+        assert!(
+            error["details"]["ops"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("unpack")),
+            "{error}"
+        );
+        assert!(
+            error["hint"].as_str().unwrap().contains("Update legion"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -836,7 +880,8 @@ fn unpack_takes_only_the_planned_entries_and_the_directories_on_their_way() {
 fn a_refused_unpack_reads_nothing_of_what_follows() {
     let node = Node::new();
     node.policy(CONFINED);
-    let mut input = b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"names\":[]}\n".to_vec();
+    let mut input =
+        b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"names\":[],\"protocol\":1}\n".to_vec();
     input.extend(std::iter::repeat_n(0u8, 1 << 20));
     let mut cursor = Cursor::new(input);
     let mut output = Vec::new();

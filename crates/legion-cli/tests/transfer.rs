@@ -79,6 +79,10 @@ fn main() -> ExitCode {
             names_that_differ_only_in_case_are_held_back_where_they_would_collide,
         ),
         (
+            "an_end_that_speaks_another_protocol_is_told_apart_from_a_banner",
+            an_end_that_speaks_another_protocol_is_told_apart_from_a_banner,
+        ),
+        (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
             gate_serves_only_the_connectors_commands_pinned_to_its_principal,
         ),
@@ -236,6 +240,12 @@ fn evil(behaviour: &str, mut command: Command) -> ExitCode {
                 }
                 writeln!(out, "{reply}").unwrap();
             }
+        }
+        // Speaks an older protocol, whose archive came without a line before it.
+        ("old", "pack") => {
+            let mut line = String::new();
+            replies.read_line(&mut line).unwrap();
+            std::io::copy(&mut replies, &mut out).unwrap();
         }
         // Says its file system ignores letter case, as macOS and Windows usually do.
         ("caseless", "stat") => {
@@ -1032,8 +1042,8 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
     pi.write_config("policy.toml", POLICY);
     // A receiver that refuses answers and exits while the sender still has megabytes to send.
     for header in [
-        json!({"op": "put", "path": "~/projects/x.bin", "size": 64 << 20, "hash": format!("blake3:{}", "0".repeat(64)), "as": "reader"}),
-        json!({"op": "unpack", "root": "~/projects/x", "names": [], "as": "reader"}),
+        json!({"op": "put", "path": "~/projects/x.bin", "size": 64 << 20, "hash": format!("blake3:{}", "0".repeat(64)), "as": "reader", "protocol": 1}),
+        json!({"op": "unpack", "root": "~/projects/x", "names": [], "as": "reader", "protocol": 1}),
     ] {
         let mut child = pi
             .command(&["stream"])
@@ -1081,7 +1091,7 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
     writeln!(
         missing.stdin.take().unwrap(),
         "{}",
-        json!({"op": "get", "path": "~/none.bin"})
+        json!({"op": "get", "path": "~/none.bin", "protocol": 1})
     )
     .unwrap();
     let output = missing.wait_with_output().unwrap();
@@ -1211,7 +1221,7 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
         writeln!(
             child.stdin.take().unwrap(),
             "{}",
-            json!({"op": "stat", "path": path, "as": "owner"})
+            json!({"op": "stat", "path": path, "as": "owner", "protocol": 1})
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
@@ -1459,4 +1469,51 @@ fn names_that_differ_only_in_case_are_held_back_where_they_would_collide() {
     ));
     assert_eq!(both["files_sent"], 5, "{both}");
     assert_eq!(both["conflicts"], json!([]), "{both}");
+}
+
+fn an_end_that_speaks_another_protocol_is_told_apart_from_a_banner() {
+    let laptop = node("laptop");
+    let old = node("old");
+    fleet(&laptop, &[("old", &old, "evil", vec!["old".to_owned()])]);
+    fs::create_dir_all(old.home().join("export")).unwrap();
+    fs::write(old.home().join("export/readme.txt"), b"read me").unwrap();
+
+    let started = Instant::now();
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "old:~/export", "to": "~/export"}),
+        &[],
+    ));
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("unsupported"), Some("old")),
+        "{error}"
+    );
+    assert!(
+        error["hint"].as_str().unwrap().contains("Update legion"),
+        "{error}"
+    );
+    assert!(!laptop.home().join("export/readme.txt").exists());
+
+    // Asked for a protocol it does not speak, a node says which it does.
+    let mut child = old
+        .command(&["stream"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"op": "stat", "path": "~", "protocol": 2})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let reply: Value =
+        serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(reply["error"]["code"], "unsupported", "{reply}");
+    assert_eq!(reply["error"]["details"]["protocol"], json!([1]), "{reply}");
 }

@@ -6,8 +6,15 @@
 //! every path and value rides inside the header, so nothing a caller supplies is ever quoted for a
 //! remote shell.
 //!
+//! Every header carries `protocol`, the version of this exchange it speaks. A node that does not
+//! speak that version, or does not know the operation, answers `unsupported` and names what it
+//! speaks, so two nodes of different ages fail plainly rather than misread each other.
+//!
 //! Every reply starts with one JSON line, so a client can skip a login banner before it and tell a
-//! refusal (`{"error": …}`) from data:
+//! refusal (`{"error": …}`) from data. While an operation works on something long (hashing a
+//! large file, listing a large tree, verifying what it received), it writes `{"busy": true}` every
+//! [`HEARTBEAT`] where a line is awaited, so a reader can give up on silence without giving up on
+//! work:
 //!
 //! | `op` | Header | Reply |
 //! | --- | --- | --- |
@@ -33,7 +40,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
@@ -47,6 +55,15 @@ use legion_xfer::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// The version of this exchange: a header names it, and a node refuses one it does not speak.
+pub const STREAM_PROTOCOL: u32 = 1;
+
+/// How often an operation at work on something long says so, where a reply line is awaited.
+pub const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// The operations this node knows, as `unsupported` names them.
+const OPS: [&str; 7] = ["manifest", "stat", "get", "put", "pack", "unpack", "delete"];
+
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
 /// transfer sends in batches well below this; anything longer is a client gone wrong.
 pub const LONGEST_HEADER: usize = 64 * 1024 * 1024;
@@ -55,9 +72,13 @@ pub const LONGEST_HEADER: usize = 64 * 1024 * 1024;
 /// a listing's lines are not written one by one.
 const OUTPUT_BUFFER: usize = 64 * 1024;
 
-/// How much of the input an `unpack` reads past the end of its archive before it stops waiting
-/// for the sender to finish: the padding a tar writer adds is a few blocks.
+/// How much of the input an operation reads past what it took before it stops: the padding a tar
+/// writer adds after an archive is a few blocks, and a sender that goes on past this has its pipe
+/// closed on it rather than being read forever.
 const MOST_TRAILING: u64 = 1024 * 1024;
+
+/// How many chunks of input wait for an operation that reads it on its own thread.
+const QUEUED_CHUNKS: usize = 4;
 
 /// The node a stream is served for: where its files are, and the name its errors and audit lines
 /// carry.
@@ -361,6 +382,40 @@ fn read_header<R: BufRead>(input: &mut R) -> Result<(Header, Value), ErrorBody> 
             format!("The stream's header is not JSON: {error}."),
         )
     })?;
+    let Value::Object(fields) = &value else {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "The stream's header is not a JSON object.",
+        ));
+    };
+    match fields.get("protocol") {
+        Some(Value::Number(number)) if number.as_u64() == Some(u64::from(STREAM_PROTOCOL)) => {}
+        Some(Value::Number(number)) => {
+            return Err(unsupported(format!(
+                "The stream asks for stream protocol {number}, and this node speaks stream protocol {STREAM_PROTOCOL}."
+            )));
+        }
+        _ => {
+            return Err(unsupported(format!(
+                "The stream's header names no protocol, and this node speaks stream protocol {STREAM_PROTOCOL}."
+            )));
+        }
+    }
+    match fields.get("op").and_then(Value::as_str) {
+        Some(op) if OPS.contains(&op) => {}
+        Some(op) => {
+            return Err(unsupported(format!(
+                "This node does not know the stream operation {op}; it knows {}.",
+                OPS.join(", ")
+            )));
+        }
+        None => {
+            return Err(unsupported(format!(
+                "The stream's header names no operation; this node knows {}.",
+                OPS.join(", ")
+            )));
+        }
+    }
     let header: Header = serde_json::from_value(value.clone()).map_err(|error| {
         ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -373,6 +428,15 @@ fn read_header<R: BufRead>(input: &mut R) -> Result<(Header, Value), ErrorBody> 
         map.remove("as");
     }
     Ok((header, recorded))
+}
+
+/// What a node answers a header it cannot serve: what it speaks instead.
+fn unsupported(message: String) -> ErrorBody {
+    ErrorBody::new(ErrorCode::Unsupported, message)
+        .with_hint(
+            "Update legion on whichever machine is older, so both speak the same stream protocol.",
+        )
+        .with_details(json!({"protocol": [STREAM_PROTOCOL], "ops": OPS}))
 }
 
 /// Decides whom the operation acts as and whether that principal may do it, as a tool call would
@@ -502,12 +566,8 @@ fn list<W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Read)?;
-    let listing = manifest(
-        grant,
-        &host.paths,
-        &root,
-        &ManifestOptions { checksum, exclude },
-    )?;
+    let options = ManifestOptions { checksum, exclude };
+    let listing = busy(output, || manifest(grant, &host.paths, &root, &options))??;
     write_listing(output, listing.entries, listing.skipped)
         .map_err(|error| Failure::Raw(gone(&error)))
 }
@@ -573,14 +633,12 @@ fn stat<W: Write>(
         }
     } else if kind.is_file() {
         let hash = checksum && if_size.is_none_or(|size| size == found.len());
-        let listed = legion_xfer::manifest::build(
-            &path,
-            &ManifestOptions {
-                checksum: hash,
-                exclude: Vec::new(),
-            },
-        )
-        .map_err(xfer_error)?;
+        let options = ManifestOptions {
+            checksum: hash,
+            exclude: Vec::new(),
+        };
+        let listed =
+            busy(output, || legion_xfer::manifest::build(&path, &options))?.map_err(xfer_error)?;
         let entry = listed.entries.into_iter().next();
         StatReply {
             kind: "file".to_owned(),
@@ -707,7 +765,10 @@ fn put<R: BufRead, W: Write>(
         offset = 0;
     }
     reply(output, &PutReady { offset })?;
-    let done = legion_xfer::put(&target, size, hash, offset, input, mode).map_err(xfer_error)?;
+    let done = feed(input, Some(size - offset), output, |fed| {
+        legion_xfer::put(&target, size, hash, offset, fed, mode)
+    })?
+    .map_err(xfer_error)?;
     reply(
         output,
         &PutDone {
@@ -795,34 +856,35 @@ fn unpack<R: BufRead, W: Write>(
         ));
     }
     reply(output, &UnpackReady { ready: true })?;
-    let mut refused: Vec<SkippedEntry> = Vec::new();
-    let mut unplanned: Vec<String> = Vec::new();
-    let report = legion_xfer::unpack_filtered(&root, &mut *input, |rel, kind| {
-        // A directory on the way to a planned entry may come along; nothing else may.
-        let expected = planned.contains(rel) || (kind == EntryKind::Dir && ancestors.contains(rel));
-        if !expected {
-            unplanned.push(rel.to_owned());
-            refused.push(SkippedEntry {
-                path: rel.to_owned(),
-                reason: "it was not among the entries planned for this transfer".to_owned(),
-            });
-            return false;
-        }
-        match checked(grant, &root, rel, Access::Write) {
-            Ok(_) => true,
-            Err(error) => {
+    let (report, mut refused, unplanned) = feed(input, None, output, |fed| {
+        let mut refused: Vec<SkippedEntry> = Vec::new();
+        let mut unplanned: Vec<String> = Vec::new();
+        let report = legion_xfer::unpack_filtered(&root, fed, |rel, kind| {
+            // A directory on the way to a planned entry may come along; nothing else may.
+            let expected =
+                planned.contains(rel) || (kind == EntryKind::Dir && ancestors.contains(rel));
+            if !expected {
+                unplanned.push(rel.to_owned());
                 refused.push(SkippedEntry {
                     path: rel.to_owned(),
-                    reason: error.message,
+                    reason: "it was not among the entries planned for this transfer".to_owned(),
                 });
-                false
+                return false;
             }
-        }
-    })
-    .map_err(xfer_error)?;
-    // What follows the archive's end is the writer's padding; reading it lets the sender finish
-    // its last write instead of finding the pipe closed.
-    let _ = io::copy(&mut input.take(MOST_TRAILING), &mut io::sink());
+            match checked(grant, &root, rel, Access::Write) {
+                Ok(_) => true,
+                Err(error) => {
+                    refused.push(SkippedEntry {
+                        path: rel.to_owned(),
+                        reason: error.message,
+                    });
+                    false
+                }
+            }
+        });
+        (report, refused, unplanned)
+    })?;
+    let report = report.map_err(xfer_error)?;
     let mut skipped: Vec<SkippedEntry> = report
         .skipped
         .into_iter()
@@ -873,13 +935,15 @@ fn delete<W: Write>(
     // Deepest first, so a directory's children are gone before it is.
     valid.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     valid.dedup();
-    for (_, name) in valid {
-        match remove_one(grant, &root, &name) {
-            Ok(true) => done.removed += 1,
-            Ok(false) => {}
-            Err(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+    busy(output, || {
+        for (_, name) in valid {
+            match remove_one(grant, &root, &name) {
+                Ok(true) => done.removed += 1,
+                Ok(false) => {}
+                Err(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+            }
         }
-    }
+    })?;
     done.skipped.sort();
     reply(output, &done)
 }
@@ -916,6 +980,109 @@ fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
         fs::remove_file(&path).map_err(|error| error.to_string())
     };
     removed.map(|()| true)
+}
+
+/// Runs `work` on a thread of its own and says `{"busy": true}` every [`HEARTBEAT`] until it is
+/// done, so a reader waiting for the next line knows the operation is at work, not stuck.
+fn busy<W: Write, T: Send>(output: &mut W, work: impl FnOnce() -> T + Send) -> Result<T, Failure> {
+    std::thread::scope(|scope| {
+        let (done, finished) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = done.send(work());
+        });
+        wait_for(&finished, output)
+    })
+}
+
+/// Like [`busy`], for work that reads the operation's input: this thread passes the input on in
+/// chunks (`limit` bytes at most, or to its end) while the work runs on its own, then says it is
+/// busy until the work is done. The input itself stays on this thread, which a locked standard
+/// input needs. Once the work stops reading, at most [`MOST_TRAILING`] more bytes are read, so a
+/// sender's last write finds a reader and a sender that goes on finds the pipe closed.
+fn feed<R: BufRead, W: Write, T: Send>(
+    input: &mut R,
+    limit: Option<u64>,
+    output: &mut W,
+    work: impl FnOnce(Fed) -> T + Send,
+) -> Result<T, Failure> {
+    std::thread::scope(|scope| {
+        let (chunks, fed) = mpsc::sync_channel::<Vec<u8>>(QUEUED_CHUNKS);
+        let (done, finished) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = done.send(work(Fed {
+                chunks: fed,
+                chunk: Vec::new(),
+                at: 0,
+            }));
+        });
+        let mut left = limit.unwrap_or(u64::MAX);
+        let mut trailing = 0u64;
+        let mut taking = true;
+        while left > 0 && trailing <= MOST_TRAILING {
+            let available = match input.fill_buf() {
+                Ok([]) | Err(_) => break,
+                Ok(available) => available,
+            };
+            let take = usize::try_from(left)
+                .unwrap_or(usize::MAX)
+                .min(available.len());
+            if taking && chunks.send(available[..take].to_vec()).is_err() {
+                taking = false;
+            }
+            if !taking {
+                trailing += take as u64;
+            }
+            input.consume(take);
+            left -= take as u64;
+        }
+        drop(chunks);
+        wait_for(&finished, output)
+    })
+}
+
+/// Waits for work to finish, saying it is busy every [`HEARTBEAT`].
+fn wait_for<W: Write, T>(finished: &Receiver<T>, output: &mut W) -> Result<T, Failure> {
+    loop {
+        match finished.recv_timeout(HEARTBEAT) {
+            Ok(result) => return Ok(result),
+            Err(RecvTimeoutError::Timeout) => {
+                line(output, &json!({"busy": true}))
+                    .and_then(|()| output.flush())
+                    .map_err(|error| Failure::Raw(gone(&error)))?;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Failure::Reply(ErrorBody::new(
+                    ErrorCode::Internal,
+                    "The stream operation stopped without an answer.",
+                )));
+            }
+        }
+    }
+}
+
+/// The input of an operation, as [`feed`] passes it on.
+struct Fed {
+    chunks: Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    at: usize,
+}
+
+impl Read for Fed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.at == self.chunk.len() {
+            match self.chunks.recv() {
+                Ok(chunk) => {
+                    self.chunk = chunk;
+                    self.at = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.chunk.len() - self.at);
+        buf[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
 }
 
 /// Why a name a peer sent cannot be used.

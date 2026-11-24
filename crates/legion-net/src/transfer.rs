@@ -26,7 +26,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::io::SyncIoBridge;
@@ -58,6 +60,17 @@ const BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// The shortest time between two `progress` events.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+/// How long an operation's first reply may take from the moment its pipe is opened: long enough
+/// for ssh to connect and a node to start and begin its answer, short enough that a node which will
+/// never answer (an older legion waiting for input this one does not send, a stalled connection)
+/// is given up on. A node at work on something long says it is busy before this runs out.
+const FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a stream may go without moving a byte in either direction while bytes are relayed,
+/// or without a line while a reply is awaited. A node that is busy says so every
+/// [`stream::HEARTBEAT`], well inside this, so only a stall runs it out.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long an ended stream is given to exit and say why on stderr.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
@@ -1002,6 +1015,8 @@ struct Conn {
     answered: bool,
     noise_lines: usize,
     noise_bytes: usize,
+    /// When the pipe was opened, which the first reply's time limit counts from.
+    opened: tokio::time::Instant,
 }
 
 /// One line of a `manifest` reply.
@@ -1030,6 +1045,7 @@ impl Conn {
         end: &End,
         mut header: Value,
     ) -> Result<Conn, ErrorBody> {
+        header["protocol"] = json!(stream::STREAM_PROTOCOL);
         let (reader, writer, process): (BoxRead, BoxWrite, Process) = if end.remote {
             // The other node decides whether the caller may act as this principal, as it does
             // for a forwarded call.
@@ -1070,10 +1086,19 @@ impl Conn {
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
+            opened: tokio::time::Instant::now(),
         };
         let mut line = header.to_string().into_bytes();
         line.push(b'\n');
-        if let Err(error) = conn.write(&line).await {
+        let written = match tokio::time::timeout(FIRST_REPLY_TIMEOUT, conn.write(&line)).await {
+            Ok(written) => written,
+            Err(_) => {
+                let error = conn.stalled(FIRST_REPLY_TIMEOUT);
+                conn.abort().await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = written {
             let error = conn
                 .ended(&format!("before it took its header ({error})"))
                 .await;
@@ -1094,20 +1119,27 @@ impl Conn {
         writer.flush().await
     }
 
-    /// The next reply, which has the shape `T` or is the other end's error. Before the first
-    /// one, lines that are neither (a login banner, a shell's own noise, even one that happens
-    /// to be JSON) are skipped within bounds; after it, anything else is the other end gone wrong.
+    /// The next reply, which has the shape `T` or is the other end's error. `{"busy": true}`
+    /// lines, which say the other end is at work, are passed over wherever they come. Before the
+    /// first reply, lines of text that are neither (a login banner, a shell's own noise, even one
+    /// that happens to be JSON) are skipped within bounds, while bytes that are not text at all
+    /// mean the other end speaks another protocol; after it, anything else is the other end gone
+    /// wrong.
     async fn first<T: DeserializeOwned>(&mut self) -> Result<T, ErrorBody> {
         loop {
             let line = self.line().await?;
-            if let Ok(value @ Value::Object(_)) = serde_json::from_slice::<Value>(&line) {
-                if let Some(error) = value.get("error")
+            if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&line) {
+                if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                    self.answered = true;
+                    continue;
+                }
+                if let Some(error) = fields.get("error")
                     && let Ok(error) = serde_json::from_value::<ErrorBody>(error.clone())
                 {
                     self.answered = true;
                     return Err(with_machine(error, &self.machine));
                 }
-                if let Ok(reply) = serde_json::from_value::<T>(value) {
+                if let Ok(reply) = serde_json::from_value::<T>(Value::Object(fields)) {
                     self.answered = true;
                     return Ok(reply);
                 }
@@ -1123,32 +1155,52 @@ impl Conn {
                 .with_hint("Update legion there, so both ends speak the same stream protocol.")
                 .with_machine(self.machine.clone()));
             }
+            if std::str::from_utf8(&line).is_err() {
+                return Err(self.mismatch("with bytes that are not text"));
+            }
             self.noise_lines += 1;
             self.noise_bytes += line.len();
-            if self.noise_lines > MOST_NOISE_LINES || self.noise_bytes > MOST_NOISE_BYTES {
-                return Err(ErrorBody::new(
-                    ErrorCode::Unreachable,
-                    format!(
-                        "{} printed {} lines that are not legion's before answering a stream.",
-                        self.machine, self.noise_lines
-                    ),
-                )
-                .with_hint("Something on the way (a login script, a banner) writes to stdout; make it quiet for sessions without a terminal.")
-                .with_machine(self.machine.clone()));
+            if self.noise_lines > MOST_NOISE_LINES {
+                return Err(self.mismatch(&format!(
+                    "with {} lines that are not legion's",
+                    self.noise_lines
+                )));
             }
         }
     }
 
-    /// One line of output, without reading more than a reply can be.
+    /// One line of output, read within the time and length a reply may take. Before the first
+    /// reply, a byte that cannot be in a line of text ends the read at once: it is data from a
+    /// node that speaks another protocol, which may never send a newline.
     async fn line(&mut self) -> Result<Vec<u8>, ErrorBody> {
+        let (wait, longest) = if self.answered {
+            (IDLE_TIMEOUT, LONGEST_REPLY)
+        } else {
+            (
+                FIRST_REPLY_TIMEOUT.saturating_sub(self.opened.elapsed()),
+                MOST_NOISE_BYTES.saturating_sub(self.noise_bytes),
+            )
+        };
         let mut line = Vec::new();
-        let read = (&mut self.reader)
-            .take(LONGEST_REPLY as u64 + 1)
-            .read_until(b'\n', &mut line)
-            .await;
+        let binary_is_foreign = !self.answered;
+        let read = tokio::time::timeout(
+            wait,
+            read_line(&mut self.reader, &mut line, longest, binary_is_foreign),
+        )
+        .await;
         match read {
-            Ok(0) => Err(self.ended("before it answered").await),
-            Ok(_) if line.len() > LONGEST_REPLY => Err(ErrorBody::new(
+            Err(_) => Err(self.stalled(if self.answered {
+                IDLE_TIMEOUT
+            } else {
+                FIRST_REPLY_TIMEOUT
+            })),
+            Ok(Ok(Read::Line)) => Ok(line),
+            Ok(Ok(Read::End)) => Err(self.ended("before it answered").await),
+            Ok(Ok(Read::Binary)) => Err(self.mismatch("with bytes that are not text")),
+            Ok(Ok(Read::TooLong)) if !self.answered => {
+                Err(self.mismatch("with more than a banner before its answer"))
+            }
+            Ok(Ok(Read::TooLong)) => Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
                     "{} answered a stream with a line longer than {LONGEST_REPLY} bytes.",
@@ -1156,8 +1208,52 @@ impl Conn {
                 ),
             )
             .with_machine(self.machine.clone())),
-            Ok(_) => Ok(line),
-            Err(error) => Err(self.ended(&format!("while it answered ({error})")).await),
+            Ok(Err(error)) => Err(self.ended(&format!("while it answered ({error})")).await),
+        }
+    }
+
+    /// The other end answered with something other than this protocol's first line.
+    fn mismatch(&self, how: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!(
+                "{} answered a stream {how}, where a line of JSON was expected, so it does not speak this node's stream protocol.",
+                self.machine
+            ),
+        )
+        .with_hint(format!(
+            "Update legion on {} (or on this machine, if it is the older one). If a login script or banner prints to stdout there, make it quiet for sessions without a terminal.",
+            self.machine
+        ))
+        .with_machine(self.machine.clone())
+    }
+
+    /// The other end went silent for `waited`.
+    fn stalled(&self, waited: Duration) -> ErrorBody {
+        let seconds = waited.as_secs();
+        if self.answered {
+            ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "{} went {seconds} seconds without a word in the middle of a stream.",
+                    self.machine
+                ),
+            )
+            .with_hint("The connection or the machine stalled; run the transfer again to continue where it stopped.")
+            .with_machine(self.machine.clone())
+        } else {
+            ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "{} did not answer a stream within {seconds} seconds.",
+                    self.machine
+                ),
+            )
+            .with_hint(format!(
+                "Check that {} is reachable. If it runs an older legion, update it, so both speak the same stream protocol.",
+                self.machine
+            ))
+            .with_machine(self.machine.clone())
         }
     }
 
@@ -1292,6 +1388,54 @@ impl Conn {
     }
 }
 
+/// How reading a line ended.
+enum Read {
+    /// A whole line, or the last bytes before the end.
+    Line,
+    /// The end, before any byte.
+    End,
+    /// More than the longest line allowed.
+    TooLong,
+    /// A NUL byte, which no line of text holds.
+    Binary,
+}
+
+/// Reads one line into `line`, newline included, without taking more than `longest` bytes, and
+/// stopping at the first NUL byte when `stop_at_binary` says to, without waiting for a newline.
+async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    longest: usize,
+    stop_at_binary: bool,
+) -> std::io::Result<Read> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                Read::End
+            } else {
+                Read::Line
+            });
+        }
+        let (chunk, found) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(end) => (&available[..=end], true),
+            None => (available, false),
+        };
+        if stop_at_binary && chunk.contains(&0) {
+            return Ok(Read::Binary);
+        }
+        if line.len() + chunk.len() > longest {
+            return Ok(Read::TooLong);
+        }
+        line.extend_from_slice(chunk);
+        let used = chunk.len();
+        reader.consume(used);
+        if found {
+            return Ok(Read::Line);
+        }
+    }
+}
+
 fn with_machine(error: ErrorBody, machine: &str) -> ErrorBody {
     if error.machine.is_some() {
         error
@@ -1302,6 +1446,9 @@ fn with_machine(error: ErrorBody, machine: &str) -> ErrorBody {
 
 /// Where a relay broke.
 enum Broken {
+    /// This end moved no bytes for [`IDLE_TIMEOUT`]: the source sent none, or the destination
+    /// took none.
+    Stalled { source: bool },
     /// The source's output failed or ended before it should have.
     Source(String),
     /// The source sent more than it may: the limit it went past.
@@ -1314,6 +1461,24 @@ impl Broken {
     /// The error to report, preferring what the end that broke said itself.
     async fn explain(self, mut source: Conn, mut dest: Conn) -> ErrorBody {
         match self {
+            Broken::Stalled { source: at_source } => {
+                let machine = if at_source {
+                    source.machine.clone()
+                } else {
+                    dest.machine.clone()
+                };
+                source.abort().await;
+                dest.abort().await;
+                ErrorBody::new(
+                    ErrorCode::Timeout,
+                    format!(
+                        "{machine} moved no bytes for {} seconds in the middle of a transfer.",
+                        IDLE_TIMEOUT.as_secs()
+                    ),
+                )
+                .with_hint("The connection or the machine stalled; run the transfer again to continue where it stopped.")
+                .with_machine(machine)
+            }
             Broken::Source(what) => {
                 let error = source.ended(&what).await;
                 source.abort().await;
@@ -1381,10 +1546,9 @@ async fn relay(
         if want == 0 {
             break;
         }
-        let read = source
-            .reader
-            .read(&mut buf[..want])
+        let read = tokio::time::timeout(IDLE_TIMEOUT, source.reader.read(&mut buf[..want]))
             .await
+            .map_err(|_| Broken::Stalled { source: true })?
             .map_err(|error| Broken::Source(format!("while it sent ({error})")))?;
         if read == 0 {
             if let Amount::Exactly(_) = amount {
@@ -1397,8 +1561,9 @@ async fn relay(
         if copied + read as u64 > limit {
             return Err(Broken::Excess(limit));
         }
-        dest.write(&buf[..read])
+        tokio::time::timeout(IDLE_TIMEOUT, dest.write(&buf[..read]))
             .await
+            .map_err(|_| Broken::Stalled { source: false })?
             .map_err(|error| Broken::Destination(format!("while it received ({error})")))?;
         copied += read as u64;
         meter.add(&buf[..read]);
@@ -1439,7 +1604,8 @@ fn archive_budget(names: &[String], listed: &HashMap<&str, &Entry>) -> u64 {
 
 /// Counts what passes and tells the caller a few times a second.
 struct Meter<'a> {
-    ctx: &'a Ctx,
+    /// The call progress goes to; none where nobody listens.
+    ctx: Option<&'a Ctx>,
     sent: &'a Sent,
     bytes_total: u64,
     files_total: u64,
@@ -1456,7 +1622,7 @@ impl<'a> Meter<'a> {
         tar: bool,
     ) -> Meter<'a> {
         Meter {
-            ctx,
+            ctx: Some(ctx),
             sent,
             bytes_total,
             files_total,
@@ -1480,7 +1646,10 @@ impl<'a> Meter<'a> {
             return;
         }
         self.last = Instant::now();
-        self.ctx.emit(
+        let Some(ctx) = self.ctx else {
+            return;
+        };
+        ctx.emit(
             EventKind::Progress,
             json!({
                 "bytes": self.sent.bytes.load(Ordering::Relaxed),
@@ -1655,6 +1824,99 @@ mod tests {
         assert_eq!(join("/home/me/inbox/", "a.txt"), "/home/me/inbox/a.txt");
         assert_eq!(join(r"C:\Users\me", "a.txt"), r"C:\Users\me\a.txt");
         assert_eq!(join("~", "a.txt"), "~/a.txt");
+    }
+
+    /// A pipe end that nobody writes to until a test says so, standing for the other node.
+    fn conn(machine: &str) -> (Conn, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (reader, peer_out) = tokio::io::duplex(CHUNK);
+        let (writer, peer_in) = tokio::io::duplex(CHUNK);
+        let conn = Conn {
+            machine: machine.to_owned(),
+            reader: BufReader::with_capacity(CHUNK, Box::new(reader)),
+            writer: Some(Box::new(writer)),
+            process: Process::Local(None),
+            answered: false,
+            noise_lines: 0,
+            noise_bytes: 0,
+            opened: tokio::time::Instant::now(),
+        };
+        (conn, peer_out, peer_in)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_end_that_never_answers_times_out_naming_it() {
+        let (mut conn, _out, _in) = conn("pi");
+        let started = tokio::time::Instant::now();
+        let error = conn.first::<StatReply>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert_eq!(error.machine.as_deref(), Some("pi"));
+        assert!(error.hint.unwrap().contains("older legion"));
+        assert_eq!(started.elapsed(), FIRST_REPLY_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_end_that_says_it_is_busy_is_waited_for() {
+        let (mut conn, mut out, _in) = conn("pi");
+        let talker = tokio::spawn(async move {
+            for _ in 0..30 {
+                tokio::time::sleep(stream::HEARTBEAT).await;
+                out.write_all(b"{\"busy\":true}\n").await.unwrap();
+            }
+            out.write_all(b"{\"kind\":\"file\",\"size\":3}\n")
+                .await
+                .unwrap();
+            out
+        });
+        let reply = conn.first::<StatReply>().await.unwrap();
+        assert_eq!((reply.kind.as_str(), reply.size), ("file", 3));
+        // After the first reply, a silence longer than the idle limit is a stall.
+        let _out = talker.await.unwrap();
+        let error = conn.first::<StatReply>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert!(error.message.contains("middle of a stream"), "{error:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bytes_that_are_not_text_before_a_reply_are_another_protocol() {
+        let (mut conn, mut out, _in) = conn("old");
+        out.write_all(b"Welcome!\nreadme.txt\0\0\0\0\0\x000000644\0")
+            .await
+            .unwrap();
+        let error = conn.first::<PackReady>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported, "{error:?}");
+        assert!(error.hint.unwrap().contains("Update legion on old"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_that_stops_moving_times_out_naming_the_end_that_stalled() {
+        let sent = Sent::default();
+        let (mut source, mut source_out, _source_in) = conn("tower");
+        let (mut dest, _dest_out, mut dest_in) = conn("pi");
+        source_out.write_all(&[7u8; 100]).await.unwrap();
+        let drain = tokio::spawn(async move {
+            let mut taken = Vec::new();
+            let _ = dest_in.read_to_end(&mut taken).await;
+            taken.len()
+        });
+        let mut meter = Meter {
+            ctx: None,
+            sent: &sent,
+            bytes_total: 1000,
+            files_total: 1,
+            tar: None,
+            last: Instant::now(),
+        };
+        let started = tokio::time::Instant::now();
+        let broken = relay(&mut source, &mut dest, Amount::Exactly(1000), &mut meter)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(started.elapsed(), IDLE_TIMEOUT);
+        let error = broken.explain(source, dest).await;
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert_eq!(error.machine.as_deref(), Some("tower"));
+        assert_eq!(drain.await.unwrap(), 100);
+        drop(source_out);
     }
 
     #[test]
