@@ -20,14 +20,14 @@ android {
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "com.x1f4r.legion"
-        minSdk = 24
+        minSdk = 30
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
     buildTypes {
         getByName("debug") {
-            manifestPlaceholders["usesCleartextTraffic"] = "true"
+            manifestPlaceholders["usesCleartextTraffic"] = "false"
             isDebuggable = true
             isJniDebuggable = true
             isMinifyEnabled = false
@@ -40,12 +40,13 @@ android {
         }
         getByName("release") {
             optimization {
-               enable = true
+                enable = true
             }
+            isShrinkResources = true
             proguardFiles(
                 *fileTree(".") {
-                  include("**/*.pro")
-                  exclude("build/**")
+                    include("**/*.pro")
+                    exclude("build/**")
                 }.files.toTypedArray()
             )
         }

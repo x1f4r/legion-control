@@ -200,7 +200,7 @@ const PLACEHOLDER_CSS: &str = r##".hidden {
   display: none !important;
 }
 
-/* Measure resolved safe-area-inset-* values, falling back to injected CSS variables. */
+/* Measure raw CSS env(safe-area-inset-*) directly, separate from activity CSS variables. */
 .inset-probe {
   position: fixed;
   top: 0;
@@ -208,20 +208,20 @@ const PLACEHOLDER_CSS: &str = r##".hidden {
   width: 0;
   height: 0;
   visibility: hidden;
-  padding-top: max(env(safe-area-inset-top, 0px), var(--legion-inset-top, 0px));
-  padding-right: max(env(safe-area-inset-right, 0px), var(--legion-inset-right, 0px));
-  padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--legion-inset-bottom, 0px));
-  padding-left: max(env(safe-area-inset-left, 0px), var(--legion-inset-left, 0px));
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
 }
 
 .bar {
-  padding-top: calc(max(env(safe-area-inset-top, 0px), var(--legion-inset-top, 0px)) + 6px);
-  padding-left: calc(var(--pad) + max(env(safe-area-inset-left, 0px), var(--legion-inset-left, 0px)));
-  padding-right: calc(var(--pad) + max(env(safe-area-inset-right, 0px), var(--legion-inset-right, 0px)));
+  padding-top: calc(max(env(safe-area-inset-top, 0px), var(--safe-area-inset-top, 0px)) + 6px);
+  padding-left: calc(var(--pad) + max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px)));
+  padding-right: calc(var(--pad) + max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px)));
 }
 
 .nav {
-  padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--legion-inset-bottom, 0px));
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-inset-bottom, 0px));
 }
 "##;
 
@@ -260,16 +260,12 @@ const PLACEHOLDER_JS: &str = r##"(function () {
     const probe = document.querySelector(".inset-probe");
     if (!probe) return;
     const cs = window.getComputedStyle(probe);
-    const top = cs.paddingTop;
-    const right = cs.paddingRight;
-    const bottom = cs.paddingBottom;
-    const left = cs.paddingLeft;
-    const injectedTop = window.getComputedStyle(document.documentElement)
-      .getPropertyValue("--legion-inset-top")
-      .trim();
+    const rootCs = window.getComputedStyle(document.documentElement);
+    const actTop = rootCs.getPropertyValue("--safe-area-inset-top").trim() || "0px";
+    const actBot = rootCs.getPropertyValue("--safe-area-inset-bottom").trim() || "0px";
     insetsEl.textContent =
-      "top " + top + " · bottom " + bottom + " · left " + left + " · right " + right +
-      (injectedTop ? " (activity " + injectedTop + ")" : "");
+      "env top " + cs.paddingTop + " / bottom " + cs.paddingBottom +
+      " · activity top " + actTop + " / bottom " + actBot;
   }
 
   window.addEventListener("popstate", renderRoute);
