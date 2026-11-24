@@ -15,7 +15,7 @@ use std::time::Duration;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::{BoxFuture, CancellationToken};
 use legion_os::OsError;
-use legion_os::detach::{DetachOptions, spawn_detached};
+use legion_os::detach::{DetachHandle, DetachOptions, spawn_detached, stop_detached};
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use serde_json::json;
@@ -24,6 +24,9 @@ use super::delay::{DELAY_MODE, log_path};
 
 /// How much of a command's output is kept: enough for any listing the power tools parse.
 const CAPTURE_LIMIT: usize = 1024 * 1024;
+/// How long a delayed runner is given to stop by itself before it is killed. It does nothing but
+/// wait, so nothing is lost by stopping it at once.
+const STOP_GRACE: Duration = Duration::from_millis(500);
 
 /// How a command ran.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -92,15 +95,40 @@ pub trait Actuator: Send + Sync + 'static {
 
     /// Starts the delayed runner for an action recorded in `job.dir`: a process that outlives
     /// this one, takes the runner lock, waits `job.delay` and then runs `job.argv` (see
-    /// [`super::pending`]). Returns once that process has started, with any warnings about how
-    /// well it is detached.
-    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>>;
+    /// [`super::pending`]). Returns once that process has started, with its handle and any
+    /// warnings about how well it is detached.
+    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Started, ErrorBody>>;
+
+    /// Stops a delayed runner and everything it started, by the identity its handle records, so a
+    /// process that has since taken its id is never touched.
+    fn stop_runner<'a>(
+        &'a self,
+        runner: &'a DetachHandle,
+    ) -> BoxFuture<'a, Result<Stopped, ErrorBody>>;
 
     /// Sends one UDP datagram, broadcast allowed, from an unbound socket.
     fn send_datagram(&self, payload: &[u8], to: SocketAddrV4) -> Result<(), String>;
 
     /// Where a program of this name is on `PATH`, if anywhere.
     fn find_program(&self, name: &str) -> Option<PathBuf>;
+}
+
+/// A delayed runner that has started.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Started {
+    /// What stops it, when the platform's detaching gave one.
+    pub runner: Option<DetachHandle>,
+    /// Anything about how well it is detached.
+    pub warnings: Vec<String>,
+}
+
+/// How stopping a delayed runner went.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stopped {
+    /// Whether it and everything it started are gone.
+    pub all_gone: bool,
+    /// The ids of processes of it still running.
+    pub survivors: Vec<u32>,
 }
 
 /// An action handed to the delayed runner.
@@ -168,7 +196,7 @@ impl Actuator for SystemActuator {
         })
     }
 
-    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
+    fn schedule<'a>(&'a self, job: &'a Scheduled) -> BoxFuture<'a, Result<Started, ErrorBody>> {
         Box::pin(async move {
             let exe = legion_core::current_exe()?;
             let args: Vec<OsString> = vec![
@@ -183,7 +211,33 @@ impl Actuator for SystemActuator {
             let handle = spawn_detached(options)
                 .await
                 .map_err(|error| os_error(error, &job.argv))?;
-            Ok(handle.warnings)
+            Ok(Started {
+                warnings: handle.warnings.clone(),
+                runner: Some(handle),
+            })
+        })
+    }
+
+    fn stop_runner<'a>(
+        &'a self,
+        runner: &'a DetachHandle,
+    ) -> BoxFuture<'a, Result<Stopped, ErrorBody>> {
+        Box::pin(async move {
+            let report = stop_detached(runner, STOP_GRACE).await.map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("The delayed runner could not be stopped: {error}."),
+                )
+            })?;
+            Ok(Stopped {
+                all_gone: report.all_gone,
+                survivors: report
+                    .survivors
+                    .iter()
+                    .chain(&report.unverified_survivors)
+                    .map(|process| process.pid)
+                    .collect(),
+            })
         })
     }
 

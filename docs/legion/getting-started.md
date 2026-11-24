@@ -439,3 +439,20 @@ would_refuse
 Run `legion power.status` to see which probes or exclusive jobs are active, or pass `force=true` to
 override the busy gate once (on Linux, logind inhibitors are separate and require
 `ignore_inhibitors=true` with `[power] sudo = true`).
+
+### A restart or shutdown that should not happen
+
+Until a pending restart or shutdown has happened, `legion power.cancel` (with `--on <machine>` from
+elsewhere) calls it off; `legion power.status` shows whether one is pending:
+
+```sh
+legion power.cancel
+```
+
+```text
+cancelled  false
+detail     Nothing is pending on this machine. The last action, a restart handed over at 2026-11-24T10:00:00Z, was called off by owner at 2026-11-24T10:00:12Z.
+```
+
+`cancelled: false` is not an error: the `detail` says why there was nothing to call off, or that the
+command had already started and could no longer be stopped.

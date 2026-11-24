@@ -729,6 +729,19 @@ verify = ["check-next-entry", "Other"]
             Some(BootTarget::Commands { .. })
         ));
 
+        let disarmed =
+            node("[boot.rescue]\narm = [\"a\"]\nverify = [\"v\"]\ndisarm = [\"d\"]\n").unwrap();
+        assert!(matches!(
+            disarmed.boot.get("rescue"),
+            Some(BootTarget::Commands { disarm: Some(argv), .. }) if argv == &["d".to_owned()]
+        ));
+        for wrong in [
+            "[boot.windows]\nefi_label = \"Windows Boot Manager\"\ndisarm = [\"d\"]\n",
+            "[boot.rescue]\narm = [\"a\"]\nverify = [\"v\"]\ndisarm = []\n",
+        ] {
+            assert!(node(wrong).is_err(), "{wrong}");
+        }
+
         let never = node("busy = \"none\"\n").unwrap();
         assert_eq!(never.busy, Some(BusyConfig::Never));
         let unmonitored = node("").unwrap();

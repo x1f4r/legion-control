@@ -199,13 +199,14 @@ pub struct Arming {
     pub readback: Readback,
     /// The firmware entry chosen, for messages, when there is one.
     pub entry: Option<String>,
-    /// The command that clears the arming again, when legion knows one: arm and verify commands
-    /// from node.toml have none.
+    /// The command that clears the arming again, when there is one: legion's own for a firmware
+    /// entry, and for arm and verify commands from node.toml its `disarm`, if given.
     pub disarm: Option<Vec<String>>,
 }
 
 /// How an arming is confirmed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Readback {
     /// `efibootmgr` must report `BootNext` as this entry.
     BootNext(String),
@@ -264,12 +265,16 @@ pub async fn prepare(
     target: &BootTarget,
 ) -> Result<Arming, ErrorBody> {
     let label = match target {
-        BootTarget::Commands { arm, verify } => {
+        BootTarget::Commands {
+            arm,
+            verify,
+            disarm,
+        } => {
             return Ok(Arming {
                 arm: arm.clone(),
                 readback: Readback::Verify(verify.clone()),
                 entry: None,
-                disarm: None,
+                disarm: disarm.clone(),
             });
         }
         BootTarget::EfiLabel(label) => label,
@@ -436,6 +441,61 @@ pub async fn arm(
                 .with_details(json!({"argv": verify, "said": said(&checked)})))
             }
         }
+    }
+}
+
+/// Whether the firmware's next boot reads back cleared after a disarm, for a target legion arms
+/// itself: `Err` says what it reads instead.
+pub async fn read_back_cleared(
+    actuator: &dyn Actuator,
+    cancel: &CancellationToken,
+    platform: Platform,
+    sudo: bool,
+    readback: &Readback,
+) -> Result<(), String> {
+    match readback {
+        Readback::BootNext(_) => match read_efi(actuator, cancel, sudo).await {
+            Ok(listing) => match listing.boot_next {
+                None => Ok(()),
+                Some(found) => Err(format!("BootNext still reads {found}")),
+            },
+            Err(error) => Err(format!("efibootmgr could not be read: {}", error.message)),
+        },
+        Readback::BootSequence(_) => {
+            match run_read(
+                actuator,
+                cancel,
+                &strings(&["bcdedit", "/enum", "{fwbootmgr}"]),
+                platform,
+                false,
+                "read the firmware's next boot back",
+            )
+            .await
+            {
+                Ok(back) => {
+                    let sequence = parse_bootsequence(&back.stdout);
+                    if sequence.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!("bootsequence still reads {}", sequence.join(", ")))
+                    }
+                }
+                Err(error) => Err(format!("bcdedit could not be read: {}", error.message)),
+            }
+        }
+        // A command of the owner's own says by exiting 0 that the arming took; after a disarm it
+        // must not say so any more.
+        Readback::Verify(verify) => match actuator.run(verify, ARM_TIMEOUT, cancel).await {
+            Ok(checked) if checked.ok() => Err(format!(
+                "the verify command `{}` still says it is set",
+                verify.join(" ")
+            )),
+            Ok(_) => Ok(()),
+            Err(error) => Err(format!(
+                "the verify command could not be run: {}",
+                error.message
+            )),
+        },
     }
 }
 
@@ -1006,6 +1066,7 @@ description             UEFI: PXE IPv4 Ethernet\r\n";
         let target = BootTarget::Commands {
             arm: argv(&["grub-reboot", "Windows"]),
             verify: argv(&["check-next", "Windows"]),
+            disarm: None,
         };
         let cancel = CancellationToken::new();
         let ok = RecordingActuator::new();

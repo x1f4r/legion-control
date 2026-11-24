@@ -157,12 +157,14 @@ pub struct PowerConfig {
 /// efi_label = "Windows Boot Manager"
 /// ```
 ///
-/// or with commands of your own, where `verify` must exit 0 only when the arming took:
+/// or with commands of your own, where `verify` must exit 0 only when the arming took, and
+/// `disarm`, when given, clears it again if the restart is called off or fails:
 ///
 /// ```toml
 /// [boot.windows]
 /// arm = ["sudo", "-n", "grub-reboot", "Windows 11"]
 /// verify = ["sh", "-c", "grub-editenv list | grep -qx 'next_entry=Windows 11'"]
+/// disarm = ["sudo", "-n", "grub-editenv", "-", "unset", "next_entry"]
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "RawBootTarget")]
@@ -175,6 +177,9 @@ pub enum BootTarget {
         arm: Vec<String>,
         /// Exits 0 only when the next boot is set; anything else means the arming did not take.
         verify: Vec<String>,
+        /// Clears the next boot again; without it, a restart called off or failed after arming
+        /// leaves the next boot, whatever causes it, going to this system.
+        disarm: Option<Vec<String>>,
     },
 }
 
@@ -187,12 +192,20 @@ struct RawBootTarget {
     arm: Option<Vec<String>>,
     #[serde(default)]
     verify: Option<Vec<String>>,
+    #[serde(default)]
+    disarm: Option<Vec<String>>,
 }
 
 impl TryFrom<RawBootTarget> for BootTarget {
     type Error = String;
 
     fn try_from(raw: RawBootTarget) -> Result<Self, Self::Error> {
+        if raw.disarm.is_some() && raw.arm.is_none() {
+            return Err(
+                "disarm goes with arm and verify; an efi_label target is cleared by legion itself"
+                    .to_owned(),
+            );
+        }
         match (raw.efi_label, raw.arm, raw.verify) {
             (Some(label), None, None) => {
                 if label.trim().is_empty() {
@@ -204,7 +217,14 @@ impl TryFrom<RawBootTarget> for BootTarget {
             (None, Some(arm), Some(verify)) => {
                 check_argv("arm", &arm)?;
                 check_argv("verify", &verify)?;
-                Ok(BootTarget::Commands { arm, verify })
+                if let Some(disarm) = &raw.disarm {
+                    check_argv("disarm", disarm)?;
+                }
+                Ok(BootTarget::Commands {
+                    arm,
+                    verify,
+                    disarm: raw.disarm,
+                })
             }
             (None, Some(_), None) => Err(
                 "arm needs a verify command that exits 0 only when the arming took: a restart on the strength of an arming nobody read back lands in the system it was already in".to_owned(),

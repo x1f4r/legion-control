@@ -112,6 +112,13 @@ pub fn exclusive_running_jobs(paths: &Paths) -> Result<Vec<ExclusiveJob>, ErrorB
     store::exclusive_running_jobs_in(paths.state_dir())
 }
 
+/// The same, for a process that knows only the state directory, such as a power action's runner.
+pub(crate) fn exclusive_running_jobs_in(
+    state_dir: &std::path::Path,
+) -> Result<Vec<ExclusiveJob>, ErrorBody> {
+    store::exclusive_running_jobs_in(state_dir)
+}
+
 /// Arguments of `job.start`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

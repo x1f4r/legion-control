@@ -19,6 +19,14 @@
 //! reads what to run from `pending.json`, which the call writes, and acts only while that record
 //! is still its own and not given up. A restart Windows times itself has no runner: its record
 //! stands for it until the delay has passed, or the machine has booted since.
+//!
+//! `power.cancel` and the runner can reach for the same record at the same moment, the one to call
+//! the action off and the other to carry it out. A third lock, `fire.lock`, decides between them:
+//! the runner takes it to see the record is still its own and to write that it has started
+//! ([`fire`]); a cancel takes it to see the action has not started and to mark it given up
+//! ([`call_off`]). Whichever comes second finds what the first wrote, so an action is never both
+//! called off and carried out. The call that hands an action over also writes `runner.json`, the
+//! detached runner's handle, so a cancel can stop that very process and nothing else.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,6 +35,7 @@ use jiff::Timestamp;
 use legion_core::Paths;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::OsError;
+use legion_os::detach::DetachHandle;
 use legion_os::lock::{FileLock, LockMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -39,6 +48,9 @@ const SELF_TIMED_GRACE: Duration = Duration::from_secs(120);
 /// How long the runner keeps the power lock after a sleep command returns, while the machine goes
 /// to sleep.
 const SLEEP_SETTLE_S: u32 = 5;
+/// How long the runner and a cancel wait for `fire.lock`, which either holds only while it reads
+/// and writes the record.
+const FIRE_PATIENCE: Duration = Duration::from_secs(10);
 
 /// `state/power`: the locks, the pending record and the runner's log.
 pub fn dir(paths: &Paths) -> PathBuf {
@@ -79,9 +91,23 @@ pub struct Pending {
     /// causes it, does not land in that system unasked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disarm: Option<Vec<String>>,
-    /// Whether the call gave up on it, so a runner that starts late must not act.
+    /// Whether the call gave up on it, or a cancel called it off, so a runner must not act.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub abandoned: bool,
+    /// When the runner started the command, RFC 3339: from then on it can no longer be called off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired: Option<String>,
+    /// Whether the call went ahead past the busy gate, so the runner does not ask again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+    /// The node's configuration directory, where the runner reads what keeps the machine busy
+    /// when the action is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<PathBuf>,
+    /// For a restart into another system: how the firmware's next boot is read, so that clearing
+    /// it again can be read back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback: Option<super::boot::Readback>,
 }
 
 /// How a handed-over action ended, as its runner wrote it to `last.json`.
@@ -116,6 +142,12 @@ pub struct Outcome {
     /// The firmware's next boot cleared again after a failed restart, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disarmed: Option<Disarmed>,
+    /// The principal that called it off, when `power.cancel` did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_by: Option<String>,
+    /// When it was called off, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at: Option<String>,
 }
 
 /// The clearing of the firmware's next boot after a failed restart into another system.
@@ -141,12 +173,18 @@ pub enum Fate {
     /// The machine has booted since it was handed over: the restart or shutdown happened.
     Happened,
     /// Its time and the margin have passed and the machine is still on the boot it was handed over
-    /// in: it did not happen (cancelled on the machine, as `shutdown /a` does, or refused late).
+    /// in: it did not happen (called off on the machine, as `shutdown /a` there does, or refused
+    /// late).
     DidNotHappen,
     /// Its runner is gone: it finished (and its outcome, when written, says how) or stopped early.
     RunnerGone,
     /// The call that handed it over gave it up, so it never ran.
     GivenUp,
+    /// `power.cancel` called it off before it ran.
+    Cancelled,
+    /// When it was due the machine was busy, so its runner did not run it (only for an action
+    /// handed over without `force`); `said` says what kept the machine busy.
+    Busy,
 }
 
 /// The record a call writes for an action it hands over, as planned for this platform: a runner
@@ -177,6 +215,10 @@ pub fn record(
         taken: None,
         disarm,
         abandoned: false,
+        fired: None,
+        force: false,
+        config_dir: None,
+        readback: None,
     }
 }
 
@@ -203,6 +245,15 @@ pub fn fate(record: &Pending, now: Timestamp, boot_id: Option<&str>, runner_hold
         Some(due) if now < due => Fate::Pending,
         _ => Fate::DidNotHappen,
     }
+}
+
+/// When a handed-over action is to happen: its hand-over time plus its delay, RFC 3339.
+pub fn due_at(record: &Pending) -> Option<String> {
+    let since: Timestamp = record.since.parse().ok()?;
+    let due = since
+        .checked_add(jiff::SignedDuration::from_secs(i64::from(record.delay_s)))
+        .ok()?;
+    Some(due.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// When an action the operating system times stops counting as pending: its delay and the margin
@@ -241,6 +292,8 @@ pub fn last_known(paths: &Paths, boot_id: Option<&str>) -> Option<Outcome> {
             timed_out: false,
             said: String::new(),
             disarmed: None,
+            cancelled_by: None,
+            cancelled_at: None,
         })
     });
     // The newer of the two; both write times the same way, so their text orders as they do.
@@ -279,17 +332,7 @@ pub struct CallGuard {
 /// when.
 pub fn begin(paths: &Paths, action: Action, boot_id: Option<&str>) -> Result<CallGuard, ErrorBody> {
     let dir = dir(paths);
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("{} cannot be created: {error}.", dir.display()),
-        )
-    })?;
-    let lock = match FileLock::try_acquire(dir.join("call.lock"), LockMode::Exclusive) {
-        Ok(lock) => lock,
-        Err(OsError::WouldBlock { .. }) => return Err(busy_call(&dir)),
-        Err(error) => return Err(lock_failed(&dir, &error)),
-    };
+    let lock = take_call_lock(&dir)?;
     if let Some(conflict) = pending_conflict(&dir, boot_id) {
         return Err(conflict);
     }
@@ -302,6 +345,26 @@ pub fn begin(paths: &Paths, action: Action, boot_id: Option<&str>) -> Result<Cal
         let _ = legion_core::config::write_atomically(&dir.join("call.json"), &text);
     }
     Ok(CallGuard { _lock: lock })
+}
+
+/// The call lock for `power.cancel`, which comes to deal with what is pending, so only a call
+/// still preparing its own action holds it up.
+pub fn begin_cancel(paths: &Paths) -> Result<CallGuard, ErrorBody> {
+    take_call_lock(&dir(paths)).map(|lock| CallGuard { _lock: lock })
+}
+
+fn take_call_lock(dir: &Path) -> Result<FileLock, ErrorBody> {
+    std::fs::create_dir_all(dir).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{} cannot be created: {error}.", dir.display()),
+        )
+    })?;
+    match FileLock::try_acquire(dir.join("call.lock"), LockMode::Exclusive) {
+        Ok(lock) => Ok(lock),
+        Err(OsError::WouldBlock { .. }) => Err(busy_call(dir)),
+        Err(error) => Err(lock_failed(dir, &error)),
+    }
 }
 
 /// The `conflict` a call would get now, without taking anything: for a dry run.
@@ -335,7 +398,7 @@ fn pending_conflict(dir: &Path, boot_id: Option<&str>) -> Option<ErrorBody> {
                 ErrorCode::Conflict,
                 format!("{what} has not run yet, and one power action at a time is carried out."),
             )
-            .with_hint("Wait for it: power.status shows what is pending. A machine that went to sleep or restarted has run it.")
+            .with_hint("Wait for it, or call it off with power.cancel: power.status shows what is pending. A machine that went to sleep or restarted has run it.")
             .with_details(json!({"pending": read_pending(dir)})),
         );
     }
@@ -348,7 +411,7 @@ fn pending_conflict(dir: &Path, boot_id: Option<&str>) -> Option<ErrorBody> {
             ErrorCode::Conflict,
             format!("{} is still to happen.", describe(&record)),
         )
-        .with_hint("Wait for it; on Windows `shutdown /a` on the machine cancels it.")
+        .with_hint("Wait for it, or call it off with power.cancel.")
         .with_details(json!({"pending": record})),
     )
 }
@@ -434,9 +497,129 @@ pub fn write_pending(dir: &Path, record: &Pending) -> Result<(), ErrorBody> {
         })
 }
 
-/// Removes the pending record once its action has run.
+/// Removes the pending record once its action has run or been called off, with the runner's
+/// handle.
 pub fn clear_pending(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("pending.json"));
+    let _ = std::fs::remove_file(dir.join("runner.json"));
+}
+
+/// The detached runner a call started, as `runner.json` keeps it for `power.cancel`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerHandle {
+    /// The hand-over it carries out.
+    pub id: String,
+    /// What stops it and everything it started, by identity, never by a bare process id.
+    pub handle: DetachHandle,
+}
+
+/// Records the runner started for the hand-over `id`.
+pub fn write_runner(dir: &Path, id: &str, handle: &DetachHandle) -> Result<(), ErrorBody> {
+    let text = serde_json::to_vec_pretty(&RunnerHandle {
+        id: id.to_owned(),
+        handle: handle.clone(),
+    })
+    .map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("The delayed runner's handle cannot be written as JSON: {error}."),
+        )
+    })?;
+    legion_core::config::write_atomically(&dir.join("runner.json"), &text).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "The delayed runner's handle cannot be recorded in {}: {error}.",
+                dir.display()
+            ),
+        )
+    })
+}
+
+/// The runner started for the hand-over `id`, when its handle was recorded.
+pub fn read_runner(dir: &Path, id: &str) -> Option<DetachHandle> {
+    let bytes = std::fs::read(dir.join("runner.json")).ok()?;
+    let runner: RunnerHandle = serde_json::from_slice(&bytes).ok()?;
+    (runner.id == id).then_some(runner.handle)
+}
+
+/// What the runner found when it came to start its command.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fire {
+    /// The record is still its own and not called off; it now says the command has started.
+    Go(Box<Pending>),
+    /// Given up, called off or replaced: nothing may run.
+    Stop,
+    /// `fire.lock` could not be taken, so whether the action was called off cannot be known and
+    /// nothing runs.
+    Unsure,
+}
+
+/// The runner's side of the race with `power.cancel`: under `fire.lock`, the record `id` still its
+/// own and not given up is marked started and returned; otherwise nothing may run.
+pub fn fire(dir: &Path, id: &str) -> Fire {
+    let Some(_fire) = take_fire_lock(dir) else {
+        return Fire::Unsure;
+    };
+    match read_pending(dir) {
+        Some(mut record) if record.id == id && !record.abandoned => {
+            record.fired = Some(now());
+            match write_pending(dir, &record) {
+                Ok(()) => Fire::Go(Box::new(record)),
+                // Unwritten, a cancel could still think it in time: do not run.
+                Err(_) => Fire::Unsure,
+            }
+        }
+        _ => Fire::Stop,
+    }
+}
+
+/// The runner's note that it has taken `id` over, written under `fire.lock` so it cannot undo a
+/// cancel that came in between; `None` when the record is no longer its own to run.
+pub fn take_over(dir: &Path, id: &str) -> Option<Pending> {
+    let _fire = take_fire_lock(dir)?;
+    let mut record = read_pending(dir).filter(|record| record.id == id && !record.abandoned)?;
+    record.taken = Some(now());
+    let _ = write_pending(dir, &record);
+    Some(record)
+}
+
+/// What a cancel found when it came to call the action `id` off.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CallOff {
+    /// Marked given up before the runner started it: it will not run.
+    CalledOff(Box<Pending>),
+    /// The runner had already started the command, at this time.
+    TooLate(Box<Pending>),
+    /// No such action is pending any more.
+    Gone,
+    /// `fire.lock` could not be taken.
+    Unsure,
+}
+
+/// `power.cancel`'s side of the race with the runner: under `fire.lock`, the record `id`, not yet
+/// started, is marked given up so the runner will not run it.
+pub fn call_off(dir: &Path, id: &str) -> CallOff {
+    let Some(_fire) = take_fire_lock(dir) else {
+        return CallOff::Unsure;
+    };
+    match read_pending(dir) {
+        Some(record) if record.id == id && record.fired.is_some() => {
+            CallOff::TooLate(Box::new(record))
+        }
+        Some(mut record) if record.id == id && !record.abandoned => {
+            record.abandoned = true;
+            match write_pending(dir, &record) {
+                Ok(()) => CallOff::CalledOff(Box::new(record)),
+                Err(_) => CallOff::Unsure,
+            }
+        }
+        _ => CallOff::Gone,
+    }
+}
+
+fn take_fire_lock(dir: &Path) -> Option<FileLock> {
+    FileLock::acquire_timeout(dir.join("fire.lock"), LockMode::Exclusive, FIRE_PATIENCE).ok()
 }
 
 /// Waits until the runner for `id` has taken over: it holds the runner lock, or has said so in
@@ -506,6 +689,10 @@ mod tests {
             taken: None,
             disarm: None,
             abandoned: false,
+            fired: None,
+            force: false,
+            config_dir: None,
+            readback: None,
         }
     }
 
@@ -668,9 +855,75 @@ mod tests {
             timed_out: false,
             said: String::new(),
             disarmed: None,
+            cancelled_by: None,
+            cancelled_at: None,
         };
         write_outcome(&dir, &outcome).unwrap();
         assert_eq!(last_known(&paths, Some("boot-1")), Some(outcome));
+    }
+
+    #[test]
+    fn a_cancel_and_the_runner_firing_never_both_win() {
+        let (_dir, paths) = paths();
+        let dir = dir(&paths);
+        // The runner first: too late to call off.
+        let record = sample(true);
+        write_pending(&dir, &record).unwrap();
+        assert!(matches!(fire(&dir, &record.id), Fire::Go(_)));
+        assert!(matches!(call_off(&dir, &record.id), CallOff::TooLate(_)));
+        // The cancel first: the runner finds it called off.
+        let record = sample(true);
+        write_pending(&dir, &record).unwrap();
+        assert!(matches!(call_off(&dir, &record.id), CallOff::CalledOff(_)));
+        assert_eq!(fire(&dir, &record.id), Fire::Stop);
+        assert_eq!(take_over(&dir, &record.id), None);
+        // Someone else's record, or none: nothing to fire or call off.
+        assert_eq!(fire(&dir, "other"), Fire::Stop);
+        assert_eq!(call_off(&dir, "other"), CallOff::Gone);
+        clear_pending(&dir);
+        assert_eq!(call_off(&dir, &record.id), CallOff::Gone);
+
+        // Both at once, many times over: always exactly one of them wins.
+        for _ in 0..200 {
+            let record = sample(true);
+            write_pending(&dir, &record).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (runner_dir, runner_id, runner_start) = (
+                dir.clone(),
+                record.id.clone(),
+                std::sync::Arc::clone(&start),
+            );
+            let runner = std::thread::spawn(move || {
+                runner_start.wait();
+                fire(&runner_dir, &runner_id)
+            });
+            start.wait();
+            let cancel = call_off(&dir, &record.id);
+            let fired = runner.join().unwrap();
+            match (&fired, &cancel) {
+                (Fire::Go(_), CallOff::TooLate(_)) | (Fire::Stop, CallOff::CalledOff(_)) => {}
+                other => panic!("both or neither won: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_runners_handle_is_kept_for_its_own_hand_over_only() {
+        let (_dir, paths) = paths();
+        let dir = dir(&paths);
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = DetachHandle {
+            process: legion_os::procid::ProcessId::new(4242, 7),
+            systemd_unit: Some("legion-job-power.scope".to_owned()),
+            windows_job: None,
+            marker: Some("m".to_owned()),
+            warnings: Vec::new(),
+        };
+        write_runner(&dir, "a1", &handle).unwrap();
+        assert_eq!(read_runner(&dir, "a1"), Some(handle));
+        assert_eq!(read_runner(&dir, "a2"), None);
+        clear_pending(&dir);
+        assert_eq!(read_runner(&dir, "a1"), None);
     }
 
     #[tokio::test]

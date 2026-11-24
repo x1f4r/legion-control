@@ -400,7 +400,9 @@ sudo = true
 
 Power tools never claim an action succeeded because the machine goes down underneath the call.
 Instead, `power.sleep`, `power.restart`, and `power.shutdown` schedule the action a few seconds out
-so the reply leaves first, and every disruptive action passes through the busy gate.
+so the reply leaves first (`power.restart` and `power.shutdown` take `delay_s` up to 600 seconds),
+every disruptive action passes through the busy gate, and until it has happened `power.cancel`
+calls it off.
 
 ### Busy, inhibitors, and one action at a time
 
@@ -413,6 +415,13 @@ A node reports one of three busy states in `power.status`:
 - `idle` — `busy = "none"` is declared explicitly, or every probe exited `1` and no exclusive job
   is running.
 
+Unless the call says `force=true`, the busy state is checked when the call is made and again just
+before the action. On Linux and macOS the delayed runner asks the probes and exclusive jobs once
+more when the delay has passed, and does nothing if the machine has become busy meanwhile (`last`
+then shows `fate: busy` with what kept it busy). On Windows, whose own timer carries out a restart or
+shutdown, the state is checked only when it is handed over, and the reply's `warnings` say so: with
+a long `delay_s` there, use `power.cancel` if work starts before it is due.
+
 Three additional guards protect the machine:
 
 - **One power action at a time**: a node holds two kernel locks under `state/power/` (`call.lock`
@@ -424,10 +433,11 @@ Three additional guards protect the machine:
   `unmonitored`, **not** logind inhibitors; to override inhibitors, pass `ignore_inhibitors=true`
   (which passes `-i` to `systemctl` and requires `[power] sudo = true`).
 - **`power.status` `pending` and `last`**: while an action is waiting to run, `power.status`
-  includes `pending`. After it runs (or after a reboot), `last` reports how the previous handed-over
+  includes `pending`, and `meta.doctor` adds a warning naming it and `power.cancel`. After it runs (or after a reboot), `last` reports how the previous handed-over
   action ended — either the runner's own record (`ran_at`, `exit_code`, `said`, and `disarmed` if a
   failed `into` restart cleared the firmware's next boot) or a derived `fate` (`pending`,
-  `happened`, `did_not_happen`, `runner_gone`, or `given_up`).
+  `happened`, `did_not_happen`, `runner_gone`, `given_up`, `busy` when the machine was busy when it
+  was due, or `cancelled`, which also names `cancelled_by` and `cancelled_at`).
 
 Configure `node.toml` with probes (or `busy = "none"` if nothing needs protecting) and optional
 boot targets:
@@ -500,12 +510,49 @@ commands
 dry_run    true
 ```
 
+### Calling a pending action off (`power.cancel`)
+
+A mistaken `power.restart` or `power.shutdown` can be called off until it happens, from the machine
+itself or through another with `--on`. Give a longer `delay_s` when you want time to change your
+mind:
+
+```sh
+legion power.restart delay_s=600 --on tower
+legion power.cancel --on tower
+```
+
+```text
+cancelled  true
+action     restart
+id         187a9f3c2b1d4e00-10e1
+was_due    2026-11-24T10:10:00Z
+detail     Called off the restart handed over at 2026-11-24T10:00:00Z, which was due at 2026-11-24T10:10:00Z: it will not run. Its runner (process 4321) was stopped.
+```
+
+On Linux and macOS the delayed runner that would have run the command is stopped, by the identity
+recorded when it started; on Windows, which times a restart or shutdown itself, Windows calls it
+off with `shutdown /a`, and its own answer decides what `power.cancel` reports. For a restart into
+another system, the one-time boot entry it armed is cleared again and read back: for an `efi_label`
+target with `efibootmgr --delete-bootnext` or `bcdedit /deletevalue`, for a target with `arm` and
+`verify` commands only when it also gives a `disarm` command (whose clearing `verify` must then stop
+confirming). Without one, the reply says the firmware stays set to start that system on the next
+boot, whatever causes it; the same happens when a restart fails after arming. Afterwards `power.status`
+shows no `pending` action and `last` with `fate: cancelled` and who cancelled it, and the next power
+call can go ahead.
+
+`power.cancel` reports `cancelled: false` with a `detail` instead of failing when there is nothing to
+call off: nothing is pending (the detail says what became of the last action), Windows says no
+shutdown is in progress because someone called it off on the machine, or the runner has already
+started the command, which can no longer be stopped from here. A sleep is a few seconds out, so in
+practice it is too late to call off. `power.cancel` needs the `power` effect, like the actions it
+calls off.
+
 ### Restarting into another system (`power.restart` and `power.switch`)
 
 `power.restart into=windows` resolves the firmware entry by label on every call (never cached),
 arms one-time boot (`efibootmgr --bootnext` on Linux, `bcdedit` on Windows, or your custom `arm`
-and `verify` commands), reads the setting back, and schedules the reboot only if the readback
-matches:
+and `verify` commands, with an optional `disarm` that clears it again), reads the setting back, and
+schedules the reboot only if the readback matches:
 
 ```sh
 legion power.restart into=windows dry_run=true
@@ -602,13 +649,13 @@ that `would_refuse` is absent:
      sudo = true`.
   2. Run one supervised `power.restart` and confirm `boot_id` changes in `power.status` when it
      returns.
-- **macOS** *(not run here; from code)*:
+- **macOS** *(a restart and a shutdown are scheduled and called off in CI; none has been carried out)*:
   1. `power.sleep` uses `pmset sleepnow` (no `sudo` required); `power.restart` and `power.shutdown`
      use `shutdown -r now` / `shutdown -h now` and need `[power] sudo = true` with `NOPASSWD`
      sudoers rules (or root).
   2. Verify `power.sleep dry_run=true` and `power.restart dry_run=true` have no `would_refuse`,
      then run one supervised sleep and one supervised restart.
-- **Windows** *(not run here; from code)*:
+- **Windows** *(a restart and a shutdown are scheduled and called off in CI; none has been carried out)*:
   1. `power.restart` and `power.shutdown` use `shutdown.exe /r /t <delay>` and `/s /t <delay>`, so
      Windows times the delay itself and `power.status` tracks `last.fate` across reboots.
   2. For `power.sleep`, place Sysinternals `psshutdown` on `PATH` (or set `[power] sleep` in

@@ -4,8 +4,12 @@
 //! hears that it was accepted. A task inside the node would die with the session that asked, so
 //! the node re-executes its own binary, detached through `legion-os`, as this runner. It takes the
 //! runner lock first and holds it until its command has run (see [`super::pending`]), reads what
-//! to run from the pending record the call wrote, waits, looks once more that the record is still
-//! its own and not given up, and runs the command exactly as written: no shell, nothing quoted.
+//! to run from the pending record the call wrote, waits, and then, under the lock `power.cancel`
+//! takes too, looks once more that the record is still its own and not given up or called off and
+//! notes that it starts, and runs the command exactly as written: no shell, nothing quoted. An
+//! action handed over without `force` is not run when, after the delay, the machine is busy: the
+//! node's busy probes and exclusive jobs are asked again first, as the call asked them before it
+//! handed the action over.
 //! What it prints, and the command's own output, go to `state/power/scheduled.log`.
 
 use std::ffi::OsString;
@@ -14,6 +18,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use legion_core::config::NodeFile;
+use legion_core::{CancellationToken, ConfigStore};
+
+use super::actuator::actuator;
+use super::busy;
 use super::pending::{self, Disarmed, Outcome, Pending};
 
 /// The first argument that makes `legion` this runner instead of a command line.
@@ -32,6 +41,7 @@ const DISARM_TIMEOUT: Duration = Duration::from_secs(30);
 /// Exit codes: the command's own, or these when it was not run.
 const NO_LOCK: u8 = 3;
 const NOTHING_TO_DO: u8 = 4;
+const BUSY: u8 = 5;
 
 /// Runs the handed-over action when `args` (the process arguments after the program name) start
 /// with [`DELAY_MODE`], returning its exit code; `None` for any other command line.
@@ -72,6 +82,9 @@ pub(crate) trait Commands {
     fn pause(&self, duration: Duration);
     /// Runs `argv` to completion, or stops it after `timeout`.
     fn run(&self, argv: &[String], timeout: Duration) -> Finished;
+    /// Whether the machine is busy now, as the call's busy gate would say: what keeps it busy, or
+    /// `None` when it is idle.
+    fn busy(&self, record: &Pending, dir: &Path) -> Option<String>;
 }
 
 /// Carries out the action `id` recorded in `dir`, returning the process exit code.
@@ -83,26 +96,39 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
         ));
         return NO_LOCK;
     };
-    let Some(mut record) = own(dir, id) else {
+    // The lock already says it was taken; the record says so too for a call that looks late.
+    let Some(record) = pending::take_over(dir, id) else {
         say(&format!(
             "legion power-delay {id}: the call gave this action up or replaced it; nothing was run"
         ));
         return NOTHING_TO_DO;
     };
-    record.taken = Some(pending::now());
-    // The lock already says it was taken; the record says so too for a call that looks late.
-    let _ = pending::write_pending(dir, &record);
     say(&format!(
         "legion power-delay {id}: running {:?} in {} s",
         record.argv, record.delay_s
     ));
     commands.pause(Duration::from_secs(u64::from(record.delay_s)));
-    if own(dir, id).is_none() {
-        say(&format!(
-            "legion power-delay {id}: given up during the delay; nothing was run"
-        ));
-        return NOTHING_TO_DO;
+    if !record.force
+        && let Some(why) = commands.busy(&record, dir)
+    {
+        return refuse_busy(dir, id, &why, commands);
     }
+    let record = match pending::fire(dir, id) {
+        pending::Fire::Go(record) => *record,
+        pending::Fire::Stop => {
+            say(&format!(
+                "legion power-delay {id}: given up or called off during the delay; nothing was run"
+            ));
+            return NOTHING_TO_DO;
+        }
+        pending::Fire::Unsure => {
+            say(&format!(
+                "legion power-delay {id}: {} could not be taken, so whether this action was called off is unknown; nothing was run",
+                dir.join("fire.lock").display()
+            ));
+            return NOTHING_TO_DO;
+        }
+    };
     let finished = commands.run(&record.argv, COMMAND_TIMEOUT);
     let succeeded = finished.exit_code == Some(0) && !finished.timed_out;
     // A restart into another system that did not happen leaves the firmware set to start it on
@@ -134,6 +160,8 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
         timed_out: finished.timed_out,
         said: finished.said.clone(),
         disarmed,
+        cancelled_by: None,
+        cancelled_at: None,
     };
     if let Err(error) = pending::write_outcome(dir, &outcome) {
         say(&format!(
@@ -166,9 +194,53 @@ pub(crate) fn carry_out(dir: &Path, id: &str, commands: &dyn Commands) -> u8 {
     }
 }
 
-/// The pending record, when it is still `id`'s and not given up.
-fn own(dir: &Path, id: &str) -> Option<Pending> {
-    pending::read_pending(dir).filter(|record| record.id == id && !record.abandoned)
+/// Leaves an action due while the machine is busy undone, unless a cancel got to it first: called
+/// off under the lock a cancel takes, a firmware entry it armed cleared, and the reason recorded
+/// as its outcome.
+fn refuse_busy(dir: &Path, id: &str, why: &str, commands: &dyn Commands) -> u8 {
+    let record = match pending::call_off(dir, id) {
+        pending::CallOff::CalledOff(record) => *record,
+        _ => {
+            say(&format!(
+                "legion power-delay {id}: given up or called off during the delay; nothing was run"
+            ));
+            return NOTHING_TO_DO;
+        }
+    };
+    say(&format!(
+        "legion power-delay {id}: the machine is busy now, so {:?} was not run: {why}",
+        record.argv
+    ));
+    let disarmed = record.disarm.as_ref().map(|disarm| {
+        let cleared = commands.run(disarm, DISARM_TIMEOUT);
+        Disarmed {
+            argv: disarm.clone(),
+            exit_code: cleared.exit_code,
+            said: cleared.said,
+        }
+    });
+    let outcome = Outcome {
+        id: record.id.clone(),
+        action: record.action,
+        into: record.into.clone(),
+        argv: record.argv.clone(),
+        since: record.since.clone(),
+        ran_at: None,
+        fate: Some(pending::Fate::Busy),
+        exit_code: None,
+        timed_out: false,
+        said: why.to_owned(),
+        disarmed,
+        cancelled_by: None,
+        cancelled_at: None,
+    };
+    if let Err(error) = pending::write_outcome(dir, &outcome) {
+        say(&format!(
+            "legion power-delay {id}: its outcome could not be recorded: {error}"
+        ));
+    }
+    pending::clear_pending(dir);
+    BUSY
 }
 
 /// The machine's own processes.
@@ -177,6 +249,40 @@ struct SystemCommands;
 impl Commands for SystemCommands {
     fn pause(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+
+    fn busy(&self, record: &Pending, dir: &Path) -> Option<String> {
+        // A record from before runners asked again says nothing about where to look.
+        let config_dir = record.config_dir.as_ref()?;
+        let node_toml = config_dir.join("node.toml");
+        let what = record.action.phrase();
+        let file = match ConfigStore::new(config_dir.clone()).get::<NodeFile>() {
+            Ok(file) => file,
+            // Not knowing is not the same as idle.
+            Err(error) => return Some(error.message),
+        };
+        let jobs = match dir.parent() {
+            Some(state) => crate::job::exclusive_running_jobs_in(state),
+            None => Err(legion_core::proto::ErrorBody::new(
+                legion_core::proto::ErrorCode::Internal,
+                format!("{} has no state directory above it.", dir.display()),
+            )),
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => return Some(format!("the busy probes could not be run: {error}")),
+        };
+        let found = runtime.block_on(busy::evaluate(
+            &actuator(),
+            file.busy.as_ref(),
+            jobs,
+            &CancellationToken::new(),
+        ));
+        (found.state != busy::BusyState::Idle)
+            .then(|| busy::refusal(&found, what, &node_toml).message)
     }
 
     fn run(&self, argv: &[String], timeout: Duration) -> Finished {
@@ -270,6 +376,8 @@ mod tests {
         paused: Mutex<Vec<Duration>>,
         exit_code: Option<i32>,
         give_up_during_pause: bool,
+        cancel_during_pause: bool,
+        busy_when_due: Option<String>,
     }
 
     impl Commands for Recorded {
@@ -281,6 +389,16 @@ mod tests {
                 record.abandoned = true;
                 write_pending(&self.dir, &record).unwrap();
             }
+            if self.cancel_during_pause {
+                assert!(matches!(
+                    pending::call_off(&self.dir, "a1"),
+                    pending::CallOff::CalledOff(_)
+                ));
+            }
+        }
+
+        fn busy(&self, _record: &Pending, _dir: &Path) -> Option<String> {
+            self.busy_when_due.clone()
         }
 
         fn run(&self, argv: &[String], _timeout: Duration) -> Finished {
@@ -318,6 +436,10 @@ mod tests {
             taken: None,
             disarm: None,
             abandoned: false,
+            fired: None,
+            force: false,
+            config_dir: None,
+            readback: None,
         };
         write_pending(dir, &record).unwrap();
         record
@@ -384,6 +506,111 @@ mod tests {
         assert_eq!(carry_out(dir.path(), "a1", &giving_up), NOTHING_TO_DO);
         assert!(commands.ran.lock().unwrap().is_empty());
         assert!(giving_up.ran.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_runner_whose_action_is_called_off_during_the_delay_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        handed_over(dir.path());
+        let commands = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            cancel_during_pause: true,
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &commands), NOTHING_TO_DO);
+        assert!(commands.ran.lock().unwrap().is_empty());
+        // Once it has started the command, a cancel finds it too late.
+        handed_over(dir.path());
+        let started = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &started), 0);
+        assert_eq!(started.ran.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_action_due_while_the_machine_is_busy_is_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = handed_over(dir.path());
+        record.action = Action::Restart;
+        record.into = Some("windows".to_owned());
+        record.disarm = Some(vec![
+            "efibootmgr".to_owned(),
+            "--delete-bootnext".to_owned(),
+        ]);
+        write_pending(dir.path(), &record).unwrap();
+        let why = "Refused to restart this machine: the machine is busy (job render-frames).";
+        let commands = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            busy_when_due: Some(why.to_owned()),
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &commands), BUSY);
+        // Not run; the firmware entry it armed is cleared again.
+        assert_eq!(
+            *commands.ran.lock().unwrap(),
+            [record.disarm.clone().unwrap()]
+        );
+        let outcome: Outcome =
+            serde_json::from_slice(&std::fs::read(dir.path().join("last.json")).unwrap()).unwrap();
+        assert_eq!(outcome.fate, Some(pending::Fate::Busy));
+        assert_eq!(outcome.said, why);
+        assert_eq!(outcome.ran_at, None);
+        assert!(outcome.disarmed.is_some());
+        assert!(read_pending(dir.path()).is_none());
+        assert!(!runner_holds(dir.path()));
+
+        // Handed over with force: the busy machine is not asked again.
+        let mut forced = handed_over(dir.path());
+        forced.force = true;
+        write_pending(dir.path(), &forced).unwrap();
+        let busy_but_forced = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            busy_when_due: Some(why.to_owned()),
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &busy_but_forced), 0);
+        assert_eq!(busy_but_forced.ran.lock().unwrap().len(), 1);
+
+        // Called off during the delay and busy as well: the cancel's outcome stands.
+        handed_over(dir.path());
+        let cancelled = Recorded {
+            dir: dir.path().to_path_buf(),
+            exit_code: Some(0),
+            cancel_during_pause: true,
+            busy_when_due: Some(why.to_owned()),
+            ..Recorded::default()
+        };
+        assert_eq!(carry_out(dir.path(), "a1", &cancelled), NOTHING_TO_DO);
+        assert!(cancelled.ran.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_runner_asks_the_node_s_own_configuration_whether_it_is_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let power = root.path().join("state").join("power");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&power).unwrap();
+        let mut record = handed_over(&power);
+        // A record that names no configuration is not asked about.
+        assert_eq!(SystemCommands.busy(&record, &power), None);
+        record.config_dir = Some(config.clone());
+        // node.toml says nothing about what keeps the machine busy: not knowing is not idle.
+        let unmonitored = SystemCommands.busy(&record, &power).unwrap();
+        assert!(
+            unmonitored.contains("does not say what keeps this machine busy"),
+            "{unmonitored}"
+        );
+        std::fs::write(config.join("node.toml"), "busy = \"none\"\n").unwrap();
+        assert_eq!(SystemCommands.busy(&record, &power), None);
+        std::fs::write(config.join("node.toml"), "busy = [\n").unwrap();
+        assert!(SystemCommands.busy(&record, &power).is_some());
     }
 
     #[test]

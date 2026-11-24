@@ -43,9 +43,11 @@ before_sleep = [["sync"]]
 efi_label = "Windows Boot Manager"
 
 [boot.rescue]
-# Custom arm + verify commands; verify must exit 0 only when the arming took.
+# Custom arm + verify commands; verify must exit 0 only when the arming took. disarm (optional)
+# clears it again when the restart is called off or fails, so the next boot is not left set.
 arm = ["sudo", "-n", "grub-reboot", "Rescue"]
 verify = ["sh", "-c", "grub-editenv list | grep -qx 'next_entry=Rescue'"]
+disarm = ["sudo", "-n", "grub-editenv", "-", "unset", "next_entry"]
 
 # Extra hosts and browser origins accepted by `legion serve` (for example behind Tailscale Serve).
 [serve]

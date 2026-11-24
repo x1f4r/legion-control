@@ -2,7 +2,7 @@
 // Run legion end to end between two nodes on this machine, the second one reached over real ssh.
 //
 //   node scripts/legion-e2e.mjs --bin <built legion> --work <directory> --far <ssh alias>
-//       --gate <ssh alias> --far-home <directory> --far-bin <path> [--skip <steps>]
+//       --gate <ssh alias> --far-home <directory> --far-bin <path> [--skip <steps>] [--real-power]
 //
 // The first node ("near") is installed from --bin with the platform's install script into --work
 // and talks to the second ("far") only through `ssh <alias>`, so every routed call opens a fresh
@@ -11,6 +11,10 @@
 // sshd with LEGION_HOME set to --far-home; --gate is a second key whose authorized_keys line forces
 // `legion gate --as e2e:gate` with the binary at --far-bin, where fleet.install puts it. The
 // workflow .github/workflows/legion-e2e.yml sets all of that up and explains the choices per OS.
+//
+// With --real-power, and only then, the far node really schedules a restart and a shutdown and
+// calls them off again (steps l): that is for a throwaway CI runner, never a machine anyone uses,
+// so it is refused unless CI=true says this is one.
 //
 // Each step prints what it checks and the run stops at the first failure, naming the step. What
 // is worth keeping when it fails (both audit logs, the doctor's answers, every call this script
@@ -52,7 +56,7 @@ const TRICKY_TEXT = TRICKY.join(' | ');
 
 function usage(message) {
   if (message) console.error(`legion-e2e: ${message}`);
-  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--skip <steps>]');
+  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--skip <steps>] [--real-power]');
   process.exit(2);
 }
 
@@ -60,6 +64,10 @@ function parseArgs(argv) {
   const options = {};
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
+    if (key === '--real-power') {
+      options['real-power'] = true;
+      continue;
+    }
     if (!key.startsWith('--') || i + 1 >= argv.length) usage(`unexpected argument ${key}`);
     options[key.slice(2)] = argv[(i += 1)];
   }
@@ -75,10 +83,49 @@ function parseArgs(argv) {
     farBin: options['far-bin'],
     // Step names or their letters (`h,i3`) to leave out, for a machine without, say, systemd.
     skip: (options.skip ?? '').split(',').map(s => s.trim()).filter(Boolean),
+    realPower: options['real-power'] === true,
   };
 }
 
-const opts = parseArgs(process.argv.slice(2));
+/**
+ * Why --real-power may not run here, or null when it may: it restarts the machine this runs on if
+ * calling the restart off fails. A CI runner is thrown away after the job; anyone else's machine
+ * is not, so without CI=true it is refused.
+ */
+export function realPowerRefusal(options, env) {
+  if (options.realPower && env.CI !== 'true') {
+    return '--real-power really schedules a restart and a shutdown of this machine and calls them off; if calling off failed, this machine would go down. It runs only where CI=true says the machine is a throwaway CI runner.';
+  }
+  return null;
+}
+
+/**
+ * The operating system's own way of stopping what the far node may have scheduled: Windows'
+ * `shutdown /a`; on Unix killing the far node's delayed runner, by the mode and the directory only
+ * it is started with (`legion power-delay <far LEGION_HOME>/state/power <id>`), so the pattern
+ * cannot match this script, whose own command line has neither next to the other.
+ */
+export function emergencyAbort(isWindows, farHome) {
+  if (isWindows) return ['shutdown', ['/a']];
+  const runnerDir = path.join(farHome, 'state', 'power');
+  const pattern = `power-delay ${runnerDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} `;
+  return ['pkill', ['-f', '--', pattern]];
+}
+
+/**
+ * The step that keeps a step needing `needs` (prefixes of step names) from running: one that
+ * failed, or one that did not run itself, skipped as asked or for want of another.
+ */
+export function blockerOf(needs, failedNames, skippedNames) {
+  return [...failedNames, ...skippedNames].find(other => needs.some(prefix => other.startsWith(prefix)));
+}
+
+// Imported by its tests, the script does nothing but define; run, it parses its arguments and
+// goes. Compared through realpath, as scripts/check-syntax.mjs does.
+const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
+const isMain = process.argv[1] !== undefined && real(process.argv[1]) === real(fileURLToPath(import.meta.url));
+const opts = isMain ? parseArgs(process.argv.slice(2)) : { work: '.', farHome: '.', skip: [], realPower: false };
+if (isMain && realPowerRefusal(opts, process.env)) usage(realPowerRefusal(opts, process.env));
 const run = crypto.randomBytes(4).toString('hex');
 const farRoot = `~/legion-e2e-${run}`;
 const artifacts = path.join(opts.work, 'artifacts');
@@ -846,6 +893,168 @@ step('k2 an extension tool with a shell command on far prints the argument verba
   check(printed.output === TRICKY_TEXT, 'the shell printed something else', { sent: TRICKY_TEXT, received: printed.output });
 });
 
+// --- l. power for real, called off ---------------------------------------------------------------
+//
+// A real restart and a real shutdown of the far node, which is this runner, scheduled as far out
+// as power.restart allows and called off with power.cancel; then a wait past the time they were
+// due, to see the machine still up on the same boot. On Windows this is the operating system's own
+// `shutdown /r /t <n>` accepted and its own `shutdown /a` calling it off; on Linux and macOS the
+// delayed runner really started, detached, and really stopped.
+//
+// If calling off ever fails, the runner restarts or powers off under this job: the job then ends
+// red with GitHub saying it lost communication with the runner, or that the runner received a
+// shutdown signal, and no verdict from this script. That is what a broken power.cancel looks
+// like here. To make it unlikely, the delay is the longest there is, and every way out of these
+// steps first calls the operating system's own abort (abortPowerOutright) whatever Legion said.
+
+/** Calls the operating system's own abort for what the far node may have scheduled. */
+function abortPowerOutright() {
+  if (!opts.realPower) return;
+  const [program, args] = emergencyAbort(windows, opts.farHome);
+  const result = spawnSync(program, args, { encoding: 'utf8', windowsHide: true });
+  record({ program, args, status: result.status, stdout: clip(result.stdout), stderr: clip(result.stderr), note: 'emergency abort' });
+}
+
+// Interrupted or told to stop (a cancelled job, a timeout), the script calls the operating
+// system's own abort before it goes, as every other way out of the power steps does.
+for (const signal of isMain ? ['SIGINT', 'SIGTERM', 'SIGHUP'] : []) {
+  process.on(signal, () => {
+    abortPowerOutright();
+    console.error(`legion e2e: stopped by ${signal}; anything the far node had scheduled was aborted.`);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
+  });
+}
+
+/** The far node's node.toml for these steps: not busy, and on Unix acting through sudo when asked. */
+function farNodeToml(sudo) {
+  const lines = ['name = "far"', 'busy = "none"'];
+  if (sudo) lines.push('', '[power]', 'sudo = true');
+  ok('fs.write', { path: path.join(opts.farHome, 'config', 'node.toml'), content: `${lines.join('\n')}\n` }, { on: 'far' });
+}
+
+/** The delay_s maximum power.restart and power.shutdown take, from the binary's own schema. */
+function longestDelay() {
+  const result = exec(near, ['help', 'power.restart', '--json'], { env: nearEnv() });
+  const most = JSON.parse(result.stdout).input_schema.properties.delay_s.maximum;
+  check(Number.isInteger(most) && most >= 60, 'power.restart does not say its longest delay', most);
+  return most;
+}
+
+/** The runner processes the far node has, by the mode they run in. */
+function runners() {
+  return ok('sys.procs', { filter: 'power-delay', limit: 50 }, { on: 'far' }).procs;
+}
+
+const realPower = { boot: null, lastDue: 0, delay: 0, said: [] };
+
+/** Schedules `action` for real, sees it pending, calls it off and checks that it is gone. */
+async function scheduleAndCallOff(action, sudo) {
+  const tool = `power.${action}`;
+  try {
+    const before = ok('power.status', {}, { on: 'far' });
+    check(before.pending === undefined, `something is already pending on far before ${tool}`, before);
+    if (!windows) check(runners().length === 0, 'a delayed runner is already running on far');
+    const handed = Date.now();
+    const done = ok(tool, { delay_s: realPower.delay }, { on: 'far' });
+    check(done.scheduled === true && done.in_s === realPower.delay, `${tool} was not scheduled ${realPower.delay} s out`, done);
+    const argv = done.commands.at(-1);
+    const expected = {
+      linux: sudo ? ['sudo', '-n', 'systemctl', action === 'restart' ? 'reboot' : 'poweroff'] : null,
+      macos: ['sudo', '-n', 'shutdown', action === 'restart' ? '-r' : '-h', 'now'],
+      windows: ['shutdown', action === 'restart' ? '/r' : '/s', '/t', String(realPower.delay)],
+    }[expectedOs];
+    if (expected) check(isDeepStrictEqual(argv, expected), `${tool} scheduled ${JSON.stringify(argv)}, expected ${JSON.stringify(expected)}`, done);
+    realPower.lastDue = Math.max(realPower.lastDue, handed + realPower.delay * 1000);
+
+    const pending = ok('power.status', {}, { on: 'far' });
+    check(pending.pending?.action === action && isDeepStrictEqual(pending.pending?.argv, argv), `power.status does not show the ${action} pending with its command`, pending);
+    if (!windows) {
+      const started = runners();
+      check(started.length >= 1, `no delayed runner is running on far for the ${action}`, started);
+    }
+
+    const cancelled = ok('power.cancel', {}, { on: 'far' });
+    check(cancelled.cancelled === true && cancelled.action === action && cancelled.id === pending.pending.id, `power.cancel did not call the ${action} off`, cancelled);
+    realPower.said.push(`${action}: ${cancelled.detail}`);
+
+    const after = ok('power.status', {}, { on: 'far' });
+    check(after.pending === undefined, `power.status still shows something pending after power.cancel`, after);
+    check(after.last?.id === pending.pending.id && after.last?.fate === 'cancelled' && after.last?.cancelled_by === 'owner', `power.status does not show the ${action} as the last action, cancelled by owner`, after);
+    if (windows) {
+      // Windows' own word that nothing is left to abort.
+      const again = ok('exec.run', { argv: ['shutdown', '/a'] }, { on: 'far' });
+      const said = `${again.stdout}${again.stderr}`.trim();
+      check(again.exit_code === 1116, `a second shutdown /a did not find nothing to abort: exit ${again.exit_code}`, again);
+      realPower.said.push(`second shutdown /a: exit ${again.exit_code}: ${said}`);
+    } else {
+      const left = runners();
+      check(left.length === 0, `the delayed runner for the ${action} is still running after power.cancel`, left);
+    }
+    const twice = ok('power.cancel', {}, { on: 'far' });
+    check(twice.cancelled === false, 'a second power.cancel claims to have called something off', twice);
+    return cancelled.detail;
+  } finally {
+    abortPowerOutright();
+  }
+}
+
+step('l1 without [power] sudo, a restart this account may not do is refused rather than scheduled', async () => {
+  if (!opts.realPower) return 'not run: needs --real-power';
+  realPower.delay = longestDelay();
+  realPower.boot = ok('power.status', {}, { on: 'far' }).boot_id;
+  farNodeToml(false);
+  try {
+    const outcome = call('power.restart', { delay_s: realPower.delay }, { on: 'far' });
+    if (outcome.ok) {
+      // This account may restart the machine without sudo (Windows' administrator, or a logind
+      // that says yes): then it is a real restart to call off at once.
+      check(outcome.value.scheduled === true, 'power.restart neither refused nor scheduled', outcome.value);
+      realPower.lastDue = Math.max(realPower.lastDue, Date.now() + realPower.delay * 1000);
+      const cancelled = ok('power.cancel', {}, { on: 'far' });
+      check(cancelled.cancelled === true, 'power.cancel did not call off the restart scheduled without sudo', cancelled);
+      check(expectedOs !== 'macos', 'macOS scheduled shutdown -r without root or sudo', outcome.value);
+      return `allowed without sudo, and called off: ${cancelled.detail}`;
+    }
+    const error = outcome.error;
+    check(error.code === 'denied' && /sudo/.test(error.hint ?? ''), 'the refusal is not a denied with a hint about sudo', error);
+    check(ok('power.status', {}, { on: 'far' }).pending === undefined, 'a refused restart left something pending');
+    return `${error.message} (hint: ${error.hint})`;
+  } finally {
+    abortPowerOutright();
+  }
+});
+
+step('l2 a real restart, as far out as it goes, is pending with its real command and power.cancel calls it off', async () => {
+  if (!opts.realPower) return 'not run: needs --real-power';
+  farNodeToml(!windows);
+  return scheduleAndCallOff('restart', !windows);
+}, ['l1']);
+
+step('l3 the same for a real shutdown', async () => {
+  if (!opts.realPower) return 'not run: needs --real-power';
+  return scheduleAndCallOff('shutdown', !windows);
+}, ['l2']);
+
+step('l4 after the time they were due, far still answers on the same boot', async () => {
+  if (!opts.realPower) return 'not run: needs --real-power';
+  try {
+    // A little past the later of the two, then once more to be sure nothing was merely late.
+    while (Date.now() < realPower.lastDue + 30_000) {
+      const status = ok('power.status', {}, { on: 'far' });
+      check(status.boot_id === realPower.boot, 'far booted again while the cancelled actions were due', status);
+      await sleep(Math.min(60_000, Math.max(1000, realPower.lastDue + 30_000 - Date.now())));
+    }
+    const status = ok('power.status', {}, { on: 'far' });
+    check(status.boot_id === realPower.boot && status.pending === undefined, 'far is not on the same boot with nothing pending after the cancelled actions were due', status);
+    const version = ok('meta.version', {}, { on: 'far' });
+    check(version.node === 'far', 'far does not answer as far', version);
+    for (const line of realPower.said) console.log(`    ${line}`);
+    return `still up on boot ${status.boot_id}, ${Math.round((Date.now() - realPower.lastDue) / 1000)} s past the last due time`;
+  } finally {
+    abortPowerOutright();
+  }
+}, ['l2']);
+
 // --- run -----------------------------------------------------------------------------------------
 
 function collect() {
@@ -871,10 +1080,10 @@ async function main() {
       process.stdout.write(`--- ${name}: skipped as asked\n`);
       continue;
     }
-    const blocker = failed.find(f => needs.some(prefix => f.name.startsWith(prefix)));
+    const blocker = blockerOf(needs, failed.map(f => f.name), skipped);
     if (blocker) {
       skipped.push(name);
-      process.stdout.write(`--- ${name}: skipped, it needs "${blocker.name}"\n`);
+      process.stdout.write(`--- ${name}: skipped, it needs "${blocker}"\n`);
       continue;
     }
     const started = Date.now();
@@ -889,6 +1098,7 @@ async function main() {
       if (fatal) break;
     }
   }
+  abortPowerOutright();
   collect();
   if (failed.length > 0) {
     console.error(`\nlegion e2e FAILED on ${os.type()} at ${failed.length} step(s):`);
@@ -902,10 +1112,13 @@ async function main() {
 
 // Said outright: a timer or a child left behind by a step would otherwise keep the run, and the
 // runner it holds, waiting after the verdict.
-try {
-  await main();
-  process.exit(0);
-} catch (error) {
-  console.error(`legion e2e: the driver itself failed: ${error.stack}`);
-  process.exit(1);
+if (isMain) {
+  try {
+    await main();
+    process.exit(0);
+  } catch (error) {
+    abortPowerOutright();
+    console.error(`legion e2e: the driver itself failed: ${error.stack}`);
+    process.exit(1);
+  }
 }
