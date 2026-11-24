@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic, write_atomic_from_reader};
 use legion_os::detach::{
-    DetachHandle, DetachOptions, ScopeProbeOverride, detached_active, spawn_detached,
-    spawn_detached_for_test, stop_detached,
+    DETACH_MARKER_ENV, DetachHandle, DetachOptions, ScopeProbeOverride, detached_active,
+    spawn_detached, spawn_detached_for_test, stop_detached,
 };
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid::{self, ProcessId};
@@ -103,12 +103,16 @@ fn main() -> ExitCode {
             || Box::pin(test_detach_active_tracks_root_and_surviving_descendants()),
         ),
         (
+            "detach_orphan_proof_ignores_unmarked_and_mismatched_processes",
+            || Box::pin(test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes()),
+        ),
+        (
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
             || Box::pin(test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time()),
         ),
         (
-            "procid_kill_tree_stops_surviving_descendants_after_root_exits",
-            || Box::pin(test_procid_kill_tree_stops_surviving_descendants_after_root_exits()),
+            "procid_kill_tree_reports_unverified_orphans_after_root_exits",
+            || Box::pin(test_procid_kill_tree_reports_unverified_orphans_after_root_exits()),
         ),
         (
             "procid_kill_process_stops_only_verified_target_and_respects_force",
@@ -623,7 +627,9 @@ fn helper_env_remove_driver(args: &[String]) -> ExitCode {
     assert!(text.contains("LEGION_KEEP_ME=keep-val"), "got: {text}");
     assert!(text.contains("LEGION_RESET_ME=fresh-value"), "got: {text}");
 
-    // 2. Verify DetachOptions::env_remove drops inherited vars and lets explicit `env` win.
+    // 2. Verify DetachOptions::env_remove drops inherited vars, lets explicit `env` win, and still
+    //    stamps a fresh `LEGION_DETACH_ID` matching `handle.marker` even when `LEGION_DETACH_ID`
+    //    is listed in `env_remove`.
     let (dspec, denv) = helper_spec("dump_env_vars", &[]);
     let handle = rt
         .block_on(spawn_detached(
@@ -631,11 +637,15 @@ fn helper_env_remove_driver(args: &[String]) -> ExitCode {
                 .name("env-remove")
                 .envs(denv)
                 .env_remove("LEGION_DROP_ME")
-                .env_removes(["LEGION_DROP_TOO", "LEGION_RESET_ME"])
+                .env_removes(["LEGION_DROP_TOO", "LEGION_RESET_ME", DETACH_MARKER_ENV])
                 .env("LEGION_RESET_ME", "detached-fresh")
                 .stdout_path(&detach_out),
         ))
         .expect("spawn_detached with env_remove failed");
+    let expected_marker = handle
+        .marker
+        .as_deref()
+        .expect("spawn_detached should stamp DetachHandle.marker");
 
     let detach_text = rt.block_on(wait_for_detached_file(
         &detach_out,
@@ -659,6 +669,10 @@ fn helper_env_remove_driver(args: &[String]) -> ExitCode {
         detach_text.contains("LEGION_RESET_ME=detached-fresh"),
         "got: {detach_text}"
     );
+    assert!(
+        detach_text.contains(&format!("{DETACH_MARKER_ENV}={expected_marker}")),
+        "expected fresh detach marker in child env, got: {detach_text}"
+    );
     ExitCode::SUCCESS
 }
 
@@ -668,6 +682,7 @@ fn helper_dump_env_vars(_args: &[String]) -> ExitCode {
         "LEGION_DROP_TOO",
         "LEGION_KEEP_ME",
         "LEGION_RESET_ME",
+        DETACH_MARKER_ENV,
     ] {
         let val = env::var(key).unwrap_or_else(|_| "<unset>".to_owned());
         println!("{key}={val}");
@@ -1486,6 +1501,99 @@ async fn test_detach_active_tracks_root_and_surviving_descendants() {
     }
 }
 
+async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_id_file = dir.path().join("proof-root.pid");
+    let child_id_file = dir.path().join("proof-child.pid");
+    let root_str = root_id_file.to_string_lossy().into_owned();
+    let child_str = child_id_file.to_string_lossy().into_owned();
+
+    let (spec, env_vars) = helper_spec("orphan_root_exit", &[&root_str, &child_str]);
+    let opts = DetachOptions::new(spec).name("orphan-proof").envs(env_vars);
+    let handle = spawn_detached_for_test(opts, ScopeProbeOverride::ForceNoSystemd)
+        .await
+        .unwrap();
+    assert!(handle.systemd_unit.is_none());
+    assert!(
+        handle.marker.is_some(),
+        "detached handle must carry a unique env marker"
+    );
+
+    let child_id = parse_procid(
+        &wait_for_detached_file(&child_id_file, Duration::from_secs(5), &handle, &[]).await,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while procid::is_alive(&handle.process) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!procid::is_alive(&handle.process));
+    assert!(procid::is_alive(&child_id));
+
+    // A handle referencing the same exited root PID with a DIFFERENT marker must NOT treat this
+    // orphan as active and must NOT kill it (simulating an unrelated process reusing the PID).
+    let wrong_marker = DetachHandle {
+        process: handle.process,
+        systemd_unit: None,
+        windows_job: None,
+        marker: Some("unrelated-job-marker-0000".into()),
+        warnings: Vec::new(),
+    };
+    assert!(
+        !detached_active(&wrong_marker).await.unwrap(),
+        "detached_active matched an orphan carrying a different marker"
+    );
+    let wrong_stop = stop_detached(&wrong_marker, Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert!(wrong_stop.all_gone, "unexpected report: {wrong_stop:?}");
+    assert!(
+        procid::is_alive(&child_id),
+        "stop_detached with a mismatched marker killed an unrelated orphan"
+    );
+
+    // A legacy handle with no marker, scope, or job must NOT treat an exited root's orphan as
+    // active and must report it in `unverified_survivors` without killing it.
+    let legacy_handle = DetachHandle {
+        process: handle.process,
+        systemd_unit: None,
+        windows_job: None,
+        marker: None,
+        warnings: Vec::new(),
+    };
+    assert!(
+        !detached_active(&legacy_handle).await.unwrap(),
+        "detached_active with no marker should return false after root exits"
+    );
+    let legacy_stop = stop_detached(&legacy_handle, Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert!(!legacy_stop.all_gone);
+    assert!(legacy_stop.survivors.is_empty());
+    assert!(
+        legacy_stop.unverified_survivors.contains(&child_id),
+        "expected {child_id} in unverified_survivors, got {legacy_stop:?}"
+    );
+    assert!(
+        procid::is_alive(&child_id),
+        "legacy stop_detached without marker must not kill unverified orphan"
+    );
+
+    // The real handle carrying the matching marker proves ownership and stops the orphan cleanly.
+    assert!(detached_active(&handle).await.unwrap());
+    let real_stop = stop_detached(&handle, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(
+        real_stop.all_gone,
+        "real stop left survivors: {real_stop:?}"
+    );
+    assert!(real_stop.survivors.is_empty());
+    assert!(real_stop.unverified_survivors.is_empty());
+    assert!(!procid::is_alive(&child_id));
+    assert!(!detached_active(&handle).await.unwrap());
+}
+
 async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time() {
     let dir = tempfile::tempdir().unwrap();
     let id_file = dir.path().join("live.pid");
@@ -1508,6 +1616,8 @@ async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time
         .await
         .unwrap();
     assert!(report.all_gone);
+    assert!(report.survivors.is_empty());
+    assert!(report.unverified_survivors.is_empty());
     assert!(
         procid::is_alive(&real_id),
         "kill_tree killed a live process whose start_time did not match"
@@ -1518,7 +1628,7 @@ async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time
     assert!(!procid::is_alive(&real_id));
 }
 
-async fn test_procid_kill_tree_stops_surviving_descendants_after_root_exits() {
+async fn test_procid_kill_tree_reports_unverified_orphans_after_root_exits() {
     let dir = tempfile::tempdir().unwrap();
     let root_id_file = dir.path().join("orphan_root.pid");
     let child_id_file = dir.path().join("orphan_child.pid");
@@ -1566,18 +1676,31 @@ async fn test_procid_kill_tree_stops_surviving_descendants_after_root_exits() {
         "child {child_id} should still be running after root exited"
     );
 
-    let report = procid::kill_tree(&root_id, Duration::from_millis(300))
+    // Plain `procid::kill_tree` without a detach marker must NOT kill orphans by session/group or
+    // parent_pid alone once the root has exited; it reports them in `unverified_survivors`.
+    let report = procid::kill_tree(&root_id, Duration::from_millis(200))
         .await
         .unwrap();
     assert!(
-        report.all_gone,
-        "kill_tree left surviving descendants after root exit: {report:?}"
+        !report.all_gone,
+        "expected all_gone == false when unverified orphan candidates exist: {report:?}"
     );
     assert!(report.survivors.is_empty());
     assert!(
-        !procid::is_alive(&child_id),
-        "surviving child {child_id} was not stopped by kill_tree after root exited"
+        report.unverified_survivors.contains(&child_id),
+        "expected surviving child {child_id} in unverified_survivors, got {report:?}"
     );
+    assert!(
+        procid::is_alive(&child_id),
+        "plain kill_tree killed unverified orphan {child_id} after root exited"
+    );
+
+    // Clean up the test helper directly by its own verified identity.
+    let gone = procid::kill_process(&child_id, true, Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert!(gone);
+    assert!(!procid::is_alive(&child_id));
 }
 
 async fn test_procid_kill_process_stops_only_verified_target_and_respects_force() {

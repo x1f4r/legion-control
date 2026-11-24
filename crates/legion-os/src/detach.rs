@@ -26,8 +26,10 @@
 //!   job, to launch the process so it survives SSH disconnect.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,7 +38,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::procid::{self, KillTreeReport, ProcessId};
+#[cfg(not(any(unix, windows)))]
+use crate::procid;
+use crate::procid::{KillTreeReport, ProcessId};
 use crate::shell::{
     self, CommandSpec, ResolvedCommand, encode_utf16le_base64, powershell_single_quote,
     windows_cmdline_escape,
@@ -44,6 +48,16 @@ use crate::shell::{
 use crate::{OsError, Result};
 
 static SCOPE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MARKER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Environment variable injected into every process launched by [`spawn_detached`] with a unique
+/// per-launch token (recorded in [`DetachHandle::marker`]).
+///
+/// Always applied after [`DetachOptions::env_remove`] and [`DetachOptions::env`] so callers that
+/// drop inherited `LEGION_*` variables still tag the newly detached process tree. When no kernel
+/// boundary (Linux systemd user scope or Windows named Job Object) is active, [`detached_active`]
+/// and [`stop_detached`] use this marker to prove orphan ownership after the root process exits.
+pub const DETACH_MARKER_ENV: &str = "LEGION_DETACH_ID";
 
 #[cfg(unix)]
 #[path = "detach/unix.rs"]
@@ -167,7 +181,9 @@ impl DetachOptions {
 /// Persistent handle for a detached process, serializable for storage in a job record.
 ///
 /// Later invocations (including in a different process) can deserialize this handle and pass it
-/// to [`stop_detached`] to tear down the entire detached process tree or Linux systemd scope.
+/// to [`stop_detached`] to tear down the entire detached process tree, Linux systemd scope, or
+/// Windows named Job Object. Handles persisted by older versions without `windows_job` or `marker`
+/// deserialize cleanly with those fields set to `None`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DetachHandle {
     /// Process identity (`pid` and full-precision kernel start time) of the detached target.
@@ -176,6 +192,15 @@ pub struct DetachHandle {
     /// the process was started inside a systemd user scope; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub systemd_unit: Option<String>,
+    /// Named Windows Job Object (`Local\legion-job-...`) bounding the detached process tree when
+    /// started through the direct Windows path; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_job: Option<String>,
+    /// Unique value placed in [`DETACH_MARKER_ENV`] (`LEGION_DETACH_ID`) for this launch, used to
+    /// prove orphan ownership after the root process exits when no systemd scope or Windows Job
+    /// Object is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
     /// Non-fatal warnings produced while launching (for example when systemd user lingering is off).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -245,29 +270,57 @@ pub async fn spawn_detached_for_test(
 /// - **Linux with a systemd user scope (`handle.systemd_unit`):** checks the root process first,
 ///   then reads the scope's cgroup (`cgroup.procs` / `cgroup.events`) directly under `/sys/fs/cgroup`
 ///   when available, falling back to `systemctl --user show` on non-standard cgroup layouts.
-/// - **Other Unix (or `setsid` fallback):** returns `true` if `handle.process` is alive or if any
-///   live process still has `handle.process.pid` as its session ID or process group ID and started
-///   at or after `handle.process.start_time` (the same rule [`procid::kill_tree`] uses).
-/// - **Windows:** returns `true` if `handle.process` is alive or if a verified read-only process
-///   tree walk finds any live descendant whose handle confirms `parent_pid` and creation time.
+/// - **Windows with a named Job Object (`handle.windows_job`):** opens the job read-only
+///   (`JOB_OBJECT_QUERY`) and queries `JobObjectBasicProcessIdList`, falling back to root plus
+///   `handle.marker` if the job object is no longer openable.
+/// - **Without a scope or Job Object:** returns `true` while `handle.process` is alive or—when
+///   `handle.marker` is set—while any live process carries `LEGION_DETACH_ID=<marker>` in its
+///   environment. Legacy handles without a scope, job, or marker return `false` once the root
+///   exits rather than trusting unverified session, group, or `parent_pid` matches across PID reuse.
 pub async fn detached_active(handle: &DetachHandle) -> Result<bool> {
-    if handle.systemd_unit.is_some() {
-        return detached_active_impl(handle).await;
-    }
-    procid::tree_is_active(&handle.process).await
+    detached_active_impl(handle).await
 }
 
 /// Stop a detached process and its entire tree using the boundary recorded in `handle`.
 ///
-/// When `handle.systemd_unit` names a Linux transient systemd user scope, termination goes through
-/// `systemctl --user kill`/`stop` on that scope so even descendants that called `setsid` are
-/// stopped inside the cgroup. Otherwise falls back to [`procid::kill_tree`]. Returns only once
-/// every process is gone or reports any survivors.
+/// - **Linux with `handle.systemd_unit`:** stops the transient systemd user scope via
+///   `systemctl --user kill`/`stop` so even descendants that called `setsid` are stopped inside
+///   the cgroup.
+/// - **Windows with `handle.windows_job`:** terminates the named Job Object via
+///   `TerminateJobObject`, falling back to root plus `handle.marker` if the job object is no
+///   longer openable.
+/// - **Without a scope or Job Object:** delegates to the marker-verified process-tree stopper
+///   (using `handle.marker` to prove orphan ownership once the root has exited, and leaving
+///   unverifiable candidates untouched in [`KillTreeReport::unverified_survivors`]).
 pub async fn stop_detached(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
-    if handle.systemd_unit.is_some() {
-        return stop_detached_impl(handle, grace).await;
-    }
-    procid::kill_tree(&handle.process, grace).await
+    stop_detached_impl(handle, grace).await
+}
+
+/// Generate a unique ASCII token for [`DETACH_MARKER_ENV`] (`LEGION_DETACH_ID`) and Windows named
+/// Job Objects.
+pub(crate) fn generate_detach_marker() -> String {
+    let pid = std::process::id();
+    let seq = MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u32(pid);
+    h1.write_u64(seq);
+    h1.write_u128(nanos);
+    let r1 = h1.finish();
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(r1);
+    h2.write_u64(seq.wrapping_add(1));
+    let r2 = h2.finish();
+    format!("{pid:x}-{seq:x}-{r1:016x}{r2:016x}")
+}
+
+/// Build the session-local Windows named Job Object identifier (`Local\legion-job-<marker>`).
+#[allow(dead_code)]
+pub(crate) fn resolve_windows_job_name(marker: &str) -> String {
+    format!(r"Local\legion-job-{marker}")
 }
 
 /// Validate an optional caller-supplied job name for systemd scope naming.
@@ -490,24 +543,24 @@ async fn spawn_detached_impl(
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn detached_active_impl(handle: &DetachHandle) -> Result<bool> {
     platform::detached_active(handle).await
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn detached_active_impl(handle: &DetachHandle) -> Result<bool> {
-    procid::tree_is_active(&handle.process).await
+    procid::tree_is_active_with_marker(&handle.process, handle.marker.as_deref()).await
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn stop_detached_impl(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
     platform::stop_detached(handle, grace).await
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 async fn stop_detached_impl(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
-    procid::kill_tree(&handle.process, grace).await
+    procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await
 }
 
 /// Build the PowerShell launcher script executed by WMI `Win32_Process.Create`.
@@ -1305,23 +1358,54 @@ mod tests {
         let with_scope = DetachHandle {
             process: ProcessId::new(9001, 42_000),
             systemd_unit: Some("legion-job-build-1.scope".into()),
+            windows_job: None,
+            marker: Some("abc-1".into()),
             warnings: Vec::new(),
         };
         let json = serde_json::to_string(&with_scope).unwrap();
         assert!(json.contains("\"systemd_unit\":\"legion-job-build-1.scope\""));
+        assert!(json.contains("\"marker\":\"abc-1\""));
+        assert!(!json.contains("\"windows_job\""));
         assert!(!json.contains("\"warnings\""));
         let decoded: DetachHandle = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, with_scope);
 
-        let without_scope = DetachHandle {
+        let with_job = DetachHandle {
             process: ProcessId::new(9002, 42_001),
             systemd_unit: None,
+            windows_job: Some(r"Local\legion-job-abc-2".into()),
+            marker: Some("abc-2".into()),
             warnings: vec!["lingering disabled".into()],
         };
-        let json2 = serde_json::to_string(&without_scope).unwrap();
+        let json2 = serde_json::to_string(&with_job).unwrap();
         assert!(!json2.contains("systemd_unit"));
+        assert!(json2.contains("\"windows_job\""));
         let decoded2: DetachHandle = serde_json::from_str(&json2).unwrap();
-        assert_eq!(decoded2, without_scope);
+        assert_eq!(decoded2, with_job);
+
+        // Backward compatibility: handles persisted before `marker` and `windows_job` existed
+        // must deserialize cleanly with those fields defaulting to `None`.
+        let legacy_json = r#"{"process":{"pid":9003,"start_time":42002}}"#;
+        let legacy: DetachHandle = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            legacy,
+            DetachHandle {
+                process: ProcessId::new(9003, 42_002),
+                systemd_unit: None,
+                windows_job: None,
+                marker: None,
+                warnings: Vec::new(),
+            }
+        );
+
+        let m1 = generate_detach_marker();
+        let m2 = generate_detach_marker();
+        assert_ne!(m1, m2);
+        assert!(m1.is_ascii() && !m1.is_empty());
+        assert_eq!(
+            resolve_windows_job_name(&m1),
+            format!(r"Local\legion-job-{m1}")
+        );
     }
 
     #[test]
@@ -1416,6 +1500,8 @@ mod tests {
         let absent = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
             systemd_unit: None,
+            windows_job: None,
+            marker: None,
             warnings: Vec::new(),
         };
         assert!(!detached_active(&absent).await.unwrap());
@@ -1423,6 +1509,8 @@ mod tests {
         let absent_scope = DetachHandle {
             process: ProcessId::new(i32::MAX as u32, 1),
             systemd_unit: Some("legion-job-definitely-absent-0.scope".into()),
+            windows_job: None,
+            marker: Some("absent-marker-0".into()),
             warnings: Vec::new(),
         };
         assert!(!detached_active(&absent_scope).await.unwrap());

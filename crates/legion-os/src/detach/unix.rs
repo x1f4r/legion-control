@@ -23,7 +23,10 @@ use crate::procid::{self, KillTreeReport};
 use crate::shell::{ResolvedCommand, find_executable_in_paths};
 use crate::{OsError, Result};
 
-use super::{DetachHandle, DetachOptions, ScopeProbeOverride, open_append_stdio};
+use super::{
+    DETACH_MARKER_ENV, DetachHandle, DetachOptions, ScopeProbeOverride, generate_detach_marker,
+    open_append_stdio,
+};
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_USER_SCOPE_ARGS: &[&str] = &["--user", "--scope", "--quiet", "--collect"];
@@ -161,6 +164,7 @@ pub(super) async fn spawn_detached(
         options.stderr_path.as_deref(),
     )?;
 
+    let marker = generate_detach_marker();
     let program_display = resolved.program_display();
     let (mut wrapped, systemd_unit) = if use_systemd_scope {
         #[cfg(target_os = "linux")]
@@ -197,7 +201,7 @@ pub(super) async fn spawn_detached(
                 }
                 cmd.arg(&resolved.program);
                 cmd.args(&resolved.args);
-                configure_common_cmd(cmd, resolved, options, stdout_stdio, scope_stderr);
+                configure_common_cmd(cmd, resolved, options, &marker, stdout_stdio, scope_stderr);
             });
             (wrap, Some(full_unit))
         }
@@ -205,14 +209,14 @@ pub(super) async fn spawn_detached(
         {
             let wrap = CommandWrap::with_new(&resolved.program, |cmd| {
                 cmd.args(&resolved.args);
-                configure_common_cmd(cmd, resolved, options, stdout_stdio, stderr_stdio);
+                configure_common_cmd(cmd, resolved, options, &marker, stdout_stdio, stderr_stdio);
             });
             (wrap, None)
         }
     } else {
         let wrap = CommandWrap::with_new(&resolved.program, |cmd| {
             cmd.args(&resolved.args);
-            configure_common_cmd(cmd, resolved, options, stdout_stdio, stderr_stdio);
+            configure_common_cmd(cmd, resolved, options, &marker, stdout_stdio, stderr_stdio);
         });
         (wrap, None)
     };
@@ -265,6 +269,8 @@ pub(super) async fn spawn_detached(
     Ok(DetachHandle {
         process,
         systemd_unit,
+        windows_job: None,
+        marker: Some(marker),
         warnings,
     })
 }
@@ -347,14 +353,18 @@ async fn confirm_scope_entry(
 pub(super) async fn detached_active(handle: &DetachHandle) -> Result<bool> {
     #[cfg(target_os = "linux")]
     if let Some(ref unit) = handle.systemd_unit {
-        return systemd_scope_active(unit, &handle.process).await;
+        return systemd_scope_active(unit, &handle.process, handle.marker.as_deref()).await;
     }
 
-    procid::tree_is_active(&handle.process).await
+    procid::tree_is_active_with_marker(&handle.process, handle.marker.as_deref()).await
 }
 
 #[cfg(target_os = "linux")]
-async fn systemd_scope_active(unit: &str, root_process: &ProcessId) -> Result<bool> {
+async fn systemd_scope_active(
+    unit: &str,
+    root_process: &ProcessId,
+    marker: Option<&str>,
+) -> Result<bool> {
     let unit_owned = unit.to_owned();
     let root = *root_process;
 
@@ -433,7 +443,7 @@ async fn systemd_scope_active(unit: &str, root_process: &ProcessId) -> Result<bo
     if !state.live_pids().is_empty() || state.is_active() {
         return Ok(true);
     }
-    procid::tree_is_active(root_process).await
+    procid::tree_is_active_with_marker(root_process, marker).await
 }
 
 pub(super) async fn stop_detached(
@@ -442,16 +452,17 @@ pub(super) async fn stop_detached(
 ) -> Result<KillTreeReport> {
     #[cfg(target_os = "linux")]
     if let Some(ref unit) = handle.systemd_unit {
-        return stop_systemd_scope(unit, &handle.process, grace).await;
+        return stop_systemd_scope(unit, &handle.process, handle.marker.as_deref(), grace).await;
     }
 
-    procid::kill_tree(&handle.process, grace).await
+    procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await
 }
 
 #[cfg(target_os = "linux")]
 async fn stop_systemd_scope(
     unit: &str,
     root_process: &ProcessId,
+    marker: Option<&str>,
     grace: Duration,
 ) -> Result<KillTreeReport> {
     let initial = query_scope_state(unit).await;
@@ -460,11 +471,12 @@ async fn stop_systemd_scope(
     // still alive and handle it via kill_tree if so.
     if !initial.is_active() && initial.live_pids().is_empty() {
         if procid::is_alive(root_process) {
-            return procid::kill_tree(root_process, grace).await;
+            return procid::kill_tree_with_marker(root_process, marker, grace).await;
         }
         return Ok(KillTreeReport {
             all_gone: true,
             survivors: Vec::new(),
+            unverified_survivors: Vec::new(),
         });
     }
 
@@ -485,6 +497,7 @@ async fn stop_systemd_scope(
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
+                unverified_survivors: Vec::new(),
             });
         }
         let now = Instant::now();
@@ -513,6 +526,7 @@ async fn stop_systemd_scope(
             return Ok(KillTreeReport {
                 all_gone: true,
                 survivors: Vec::new(),
+                unverified_survivors: Vec::new(),
             });
         }
         let now = Instant::now();
@@ -532,6 +546,7 @@ async fn stop_systemd_scope(
     Ok(KillTreeReport {
         all_gone: survivors.is_empty(),
         survivors,
+        unverified_survivors: Vec::new(),
     })
 }
 
@@ -625,6 +640,7 @@ fn configure_common_cmd(
     cmd: &mut std::process::Command,
     resolved: &ResolvedCommand,
     options: &DetachOptions,
+    marker: &str,
     stdout_stdio: Stdio,
     stderr_stdio: Stdio,
 ) {
@@ -637,6 +653,9 @@ fn configure_common_cmd(
     for (key, value) in &options.env {
         cmd.env(key, value);
     }
+    // Stamp the unique per-launch marker AFTER `env_remove` and explicit `env` so callers dropping
+    // inherited `LEGION_*` variables still tag the newly detached tree for orphan verification.
+    cmd.env(DETACH_MARKER_ENV, marker);
     if let Some(ref cwd) = options.cwd {
         cmd.current_dir(cwd);
     }

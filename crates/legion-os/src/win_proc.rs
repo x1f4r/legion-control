@@ -18,30 +18,41 @@ use windows::Wdk::System::SystemInformation::{
 };
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
-    ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, STILL_ACTIVE,
+    CloseHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS, DuplicateHandle,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, STILL_ACTIVE,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
 };
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JobObjectBasicProcessIdList, OpenJobObjectW, QueryInformationJobObject, TerminateJobObject,
+};
+use windows::Win32::System::Memory::{
+    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
+};
+use windows::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
     InitializeProcThreadAttributeList, IsProcessCritical, LPPROC_THREAD_ATTRIBUTE_LIST,
-    OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION,
-    PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute,
+    OpenProcess, PEB, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_BASIC_INFORMATION,
+    PROCESS_INFORMATION, PROCESS_NAME_FORMAT, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
+    QueryFullProcessImageNameW, RTL_USER_PROCESS_PARAMETERS, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
-use crate::procid::ProcessId;
+use crate::procid::{EnvMarkerCheck, ProcessId, windows_env_utf16_has_marker};
 use crate::{OsError, Result};
 
 /// Serializes direct Windows detach spawns while temporary inheritable stdio duplicates exist
@@ -502,13 +513,51 @@ fn build_unicode_env_block(
     block
 }
 
+fn duplicate_inheritable_with_access(source: HANDLE, desired_access: u32) -> Result<OwnedHandle> {
+    let mut dup = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns the current-process pseudo-handle, `source` is a valid
+    // open handle owned by this process, and `dup` is immediately wrapped in `OwnedHandle`.
+    unsafe {
+        let me = GetCurrentProcess();
+        DuplicateHandle(
+            me,
+            source,
+            me,
+            &mut dup,
+            desired_access,
+            true,
+            DUPLICATE_HANDLE_OPTIONS(0),
+        )
+    }
+    .map_err(|err| OsError::Platform {
+        detail: format!("DuplicateHandle for inheritable job handle failed: {err}"),
+    })?;
+    Ok(OwnedHandle(dup))
+}
+
+fn create_named_job(job_name: &str) -> Option<OwnedHandle> {
+    let wide = to_wide_null(OsStr::new(job_name));
+    // SAFETY: `wide` is NUL-terminated UTF-16 and `None` uses default non-inheritable security
+    // attributes; returned handle is immediately wrapped in `OwnedHandle`.
+    let handle = unsafe { CreateJobObjectW(None, PCWSTR::from_raw(wide.as_ptr())) }.ok()?;
+    let owned = OwnedHandle(handle);
+    // Refuse to attach to a pre-existing job object if the name somehow already existed.
+    // SAFETY: `GetLastError` reads thread-local error state set by `CreateJobObjectW`.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        return None;
+    }
+    Some(owned)
+}
+
 /// Spawn a detached Windows process via `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
 /// restricted strictly to short-lived inheritable duplicates of the three standard handles
-/// (`stdin` null, `stdout` and `stderr` log files or null).
+/// (`stdin` null, `stdout` and `stderr` log files or null) plus, when `job_name` is supplied and a
+/// named Job Object is created, one read-only `JOB_OBJECT_QUERY` keepalive handle to that job so
+/// its name remains openable via `OpenJobObjectW` across process exits.
 ///
-/// The base log and `NUL` handles are opened non-inheritable before acquiring `DIRECT_SPAWN_LOCK`;
-/// inheritable duplicates exist only inside `DIRECT_SPAWN_LOCK` across `CreateProcessW` and are
-/// closed immediately afterwards so they cannot leak into other spawns.
+/// The base log, `NUL`, and Job Object handles are opened non-inheritable before acquiring
+/// `DIRECT_SPAWN_LOCK`; inheritable duplicates exist only inside `DIRECT_SPAWN_LOCK` across
+/// `CreateProcessW` and are closed immediately afterwards so they cannot leak into other spawns.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_detached_direct(
     program_display: &str,
@@ -519,7 +568,8 @@ pub(crate) fn spawn_detached_direct(
     env_overrides: &BTreeMap<OsString, OsString>,
     stdout_path: Option<&Path>,
     stderr_path: Option<&Path>,
-) -> std::result::Result<ProcessId, DirectSpawnError> {
+    job_name: Option<&str>,
+) -> std::result::Result<(ProcessId, Option<String>), DirectSpawnError> {
     // Open base stdio handles non-inheritable before taking the spawn lock.
     let stdin_base = open_non_inheritable_nul(GENERIC_READ.0).map_err(DirectSpawnError::Other)?;
 
@@ -542,6 +592,10 @@ pub(crate) fn spawn_detached_direct(
             None => open_non_inheritable_nul(GENERIC_WRITE.0).map_err(DirectSpawnError::Other)?,
         })
     };
+
+    // Create the non-inheritable named Job Object before taking the spawn lock. If creation fails,
+    // fall back cleanly to the `LEGION_DETACH_ID` environment-marker rule without failing launch.
+    let job_base = job_name.and_then(|name| create_named_job(name).map(|h| (h, name.to_owned())));
 
     let app_wide = application_name.map(|app| to_wide_null(OsStr::new(app)));
     let app_pcwstr = match app_wide {
@@ -583,11 +637,16 @@ pub(crate) fn spawn_detached_direct(
         ptr: attr_ptr,
     };
 
-    let flags = CREATE_BREAKAWAY_FROM_JOB
+    let mut flags = CREATE_BREAKAWAY_FROM_JOB
         | CREATE_NO_WINDOW
         | CREATE_NEW_PROCESS_GROUP
         | CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT;
+    if job_base.is_some() {
+        // Start suspended so we assign the child into the named Job Object before it can spawn
+        // any descendants or exit.
+        flags |= CREATE_SUSPENDED;
+    }
 
     let mut pi = PROCESS_INFORMATION::default();
     let create_res = {
@@ -601,16 +660,25 @@ pub(crate) fn spawn_detached_direct(
             Some(ref base) => Some(duplicate_inheritable(base.0).map_err(DirectSpawnError::Other)?),
             None => None,
         };
+        let job_keepalive_dup = match job_base {
+            Some((ref job, _)) => duplicate_inheritable_with_access(job.0, JOB_OBJECT_QUERY).ok(),
+            None => None,
+        };
 
         let h_in = stdin_dup.0;
         let h_out = stdout_dup.0;
         let h_err = stderr_dup.as_ref().map_or(h_out, |h| h.0);
 
-        let mut handle_list = Vec::with_capacity(3);
+        let mut handle_list = Vec::with_capacity(4);
         for h in [h_in, h_out, h_err] {
             if !handle_list.contains(&h) {
                 handle_list.push(h);
             }
+        }
+        if let Some(ref job_dup) = job_keepalive_dup
+            && !handle_list.contains(&job_dup.0)
+        {
+            handle_list.push(job_dup.0);
         }
 
         // SAFETY: `attr_list.ptr` is initialized for 1 attribute and `handle_list` stays alive
@@ -662,6 +730,7 @@ pub(crate) fn spawn_detached_direct(
         // Close all inheritable duplicates before releasing `DIRECT_SPAWN_LOCK`.
         drop(attr_list);
         drop(handle_list);
+        drop(job_keepalive_dup);
         drop(stderr_dup);
         drop(stdout_dup);
         drop(stdin_dup);
@@ -688,11 +757,286 @@ pub(crate) fn spawn_detached_direct(
         }));
     }
 
-    let _thread_handle = OwnedHandle(pi.hThread);
+    let thread_handle = OwnedHandle(pi.hThread);
     let proc_handle = OwnedHandle(pi.hProcess);
+
+    let assigned_job_name = if let Some((job_handle, name)) = job_base {
+        // SAFETY: `job_handle.0` and `proc_handle.0` are valid open handles.
+        let assigned = unsafe { AssignProcessToJobObject(job_handle.0, proc_handle.0) }.is_ok();
+        // SAFETY: `thread_handle.0` is the suspended primary thread from `CreateProcessW`.
+        let resume_rc = unsafe { ResumeThread(thread_handle.0) };
+        if resume_rc == u32::MAX {
+            // SAFETY: Avoid leaking a permanently suspended child process if resume fails.
+            let _ = unsafe { TerminateProcess(proc_handle.0, 1) };
+            return Err(DirectSpawnError::Other(OsError::Platform {
+                detail: format!("ResumeThread failed for `{program_display}`"),
+            }));
+        }
+        if assigned { Some(name) } else { None }
+    } else {
+        None
+    };
+
     let (creation, _) = query_times_raw(proc_handle.0, "detached child process")
         .map_err(DirectSpawnError::Other)?;
-    Ok(ProcessId::new(pi.dwProcessId, creation))
+    Ok((ProcessId::new(pi.dwProcessId, creation), assigned_job_name))
+}
+
+/// Query all PIDs currently assigned to the named Job Object `job_name`.
+///
+/// Returns `Ok(None)` when the named job does not exist (for example after every process in the
+/// job has exited and closed its handle) or cannot be opened.
+pub(crate) fn query_job_active_pids(job_name: &str) -> Result<Option<Vec<u32>>> {
+    let wide = to_wide_null(OsStr::new(job_name));
+    // SAFETY: `wide` is NUL-terminated UTF-16; returned handle is wrapped in `OwnedHandle`.
+    let job =
+        match unsafe { OpenJobObjectW(JOB_OBJECT_QUERY, false, PCWSTR::from_raw(wide.as_ptr())) } {
+            Ok(h) => OwnedHandle(h),
+            Err(err)
+                if err.code() == ERROR_FILE_NOT_FOUND.to_hresult()
+                    || err.code() == ERROR_ACCESS_DENIED.to_hresult() =>
+            {
+                return Ok(None);
+            }
+            Err(_) => return Ok(None),
+        };
+    query_job_pids_raw(job.0).map(Some)
+}
+
+/// Terminate every process inside the named Job Object `job_name` via `TerminateJobObject` and
+/// return the live [`ProcessId`] snapshot captured just before termination so the caller can wait
+/// for them to settle.
+///
+/// Returns `Ok(None)` when the named job does not exist or cannot be opened (caller should fall
+/// back to root + marker inspection).
+pub(crate) fn terminate_named_job(job_name: &str) -> Result<Option<Vec<ProcessId>>> {
+    let wide = to_wide_null(OsStr::new(job_name));
+    let access = JOB_OBJECT_TERMINATE | JOB_OBJECT_QUERY;
+    // SAFETY: `wide` is NUL-terminated UTF-16; returned handle is wrapped in `OwnedHandle`.
+    let job = match unsafe { OpenJobObjectW(access, false, PCWSTR::from_raw(wide.as_ptr())) } {
+        Ok(h) => OwnedHandle(h),
+        Err(_) => return Ok(None),
+    };
+
+    let own_pid = std::process::id();
+    let pids = query_job_pids_raw(job.0)?;
+    let mut tracked = Vec::with_capacity(pids.len());
+    for pid in pids {
+        if pid == 0 || pid == own_pid {
+            continue;
+        }
+        if let Ok(Some(id)) = query_process_identity(pid, false) {
+            tracked.push(id);
+        }
+    }
+
+    // SAFETY: `job.0` was opened with `JOB_OBJECT_TERMINATE`.
+    unsafe { TerminateJobObject(job.0, 1) }.map_err(|err| OsError::Platform {
+        detail: format!("TerminateJobObject failed for `{job_name}`: {err}"),
+    })?;
+    Ok(Some(tracked))
+}
+
+fn query_job_pids_raw(job: HANDLE) -> Result<Vec<u32>> {
+    let own_pid = std::process::id();
+    let mut capacity: usize = 64;
+
+    for _ in 0..5 {
+        let header_words =
+            size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>().div_ceil(size_of::<usize>());
+        let total_words = header_words.saturating_add(capacity);
+        let mut storage = vec![0usize; total_words];
+        let byte_len = (total_words * size_of::<usize>()) as u32;
+
+        // SAFETY: `storage` is `usize`-aligned and sized for `JOBOBJECT_BASIC_PROCESS_ID_LIST`
+        // plus `capacity` trailing `usize` PID slots.
+        let res = unsafe {
+            QueryInformationJobObject(
+                Some(job),
+                JobObjectBasicProcessIdList,
+                storage.as_mut_ptr().cast::<c_void>(),
+                byte_len,
+                None,
+            )
+        };
+
+        // SAFETY: `storage` starts with a properly aligned `JOBOBJECT_BASIC_PROCESS_ID_LIST`.
+        let list_ptr = storage.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+        let (assigned, in_list) = unsafe {
+            (
+                (*list_ptr).NumberOfAssignedProcesses as usize,
+                (*list_ptr).NumberOfProcessIdsInList as usize,
+            )
+        };
+
+        match res {
+            Ok(()) => {
+                // SAFETY: `QueryInformationJobObject` populated `in_list` entries starting at
+                // `ProcessIdList` within `storage`.
+                let base_pid_ptr =
+                    unsafe { std::ptr::addr_of!((*list_ptr).ProcessIdList) as *const usize };
+                let max_slots = (total_words * size_of::<usize>()
+                    - (base_pid_ptr as usize - storage.as_ptr() as usize))
+                    / size_of::<usize>();
+                let count = in_list.min(max_slots);
+                let mut out = Vec::with_capacity(count);
+                for idx in 0..count {
+                    // SAFETY: `idx < count <= max_slots` stays strictly inside `storage`.
+                    let raw = unsafe { *base_pid_ptr.add(idx) };
+                    if let Ok(pid) = u32::try_from(raw)
+                        && pid != 0
+                        && pid != own_pid
+                    {
+                        out.push(pid);
+                    }
+                }
+                return Ok(out);
+            }
+            Err(err) if err.code() == ERROR_MORE_DATA.to_hresult() => {
+                capacity = assigned.max(capacity.saturating_mul(2)).saturating_add(16);
+            }
+            Err(err) => {
+                return Err(OsError::Platform {
+                    detail: format!("QueryInformationJobObject(BasicProcessIdList) failed: {err}"),
+                });
+            }
+        }
+    }
+
+    Err(OsError::Platform {
+        detail: "QueryInformationJobObject(BasicProcessIdList) exceeded retry limit".into(),
+    })
+}
+
+/// Extension of `windows::Win32::System::Threading::RTL_USER_PROCESS_PARAMETERS` exposing the
+/// immediately-following `Environment` pointer (`0x80` on 64-bit, `0x48` on 32-bit Windows).
+#[repr(C)]
+struct RtlUserProcessParametersWithEnv {
+    base: RTL_USER_PROCESS_PARAMETERS,
+    environment: *mut c_void,
+}
+
+/// Inspect `pid`'s PEB environment block via `ReadProcessMemory` to check for `key=expected`.
+///
+/// Returns [`EnvMarkerCheck::Unverifiable`] whenever the process cannot be opened with
+/// `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` or its PEB/environment memory cannot be read.
+pub(crate) fn check_process_env_marker(pid: u32, key: &str, expected: &str) -> EnvMarkerCheck {
+    const MAX_ENV_BYTES: usize = 1024 * 1024;
+
+    // SAFETY: `OpenProcess` takes plain integer flags and any handle is wrapped in `OwnedHandle`.
+    let handle =
+        match unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) } {
+            Ok(h) => OwnedHandle(h),
+            Err(_) => return EnvMarkerCheck::Unverifiable,
+        };
+
+    let mut pbi = PROCESS_BASIC_INFORMATION::default();
+    let mut returned = 0u32;
+    // SAFETY: `handle.0` has `PROCESS_QUERY_INFORMATION`; `pbi` matches `ProcessBasicInformation`.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle.0,
+            ProcessBasicInformation,
+            (&mut pbi as *mut PROCESS_BASIC_INFORMATION).cast::<c_void>(),
+            size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut returned,
+        )
+    };
+    if status.is_err() || pbi.PebBaseAddress.is_null() {
+        return EnvMarkerCheck::Unverifiable;
+    }
+
+    let mut peb: PEB = unsafe { std::mem::zeroed() };
+    let mut read_bytes = 0usize;
+    // SAFETY: Reading `size_of::<PEB>()` bytes from the remote `PebBaseAddress` into stack `peb`.
+    if unsafe {
+        ReadProcessMemory(
+            handle.0,
+            pbi.PebBaseAddress.cast::<c_void>(),
+            (&mut peb as *mut PEB).cast::<c_void>(),
+            size_of::<PEB>(),
+            Some(&mut read_bytes),
+        )
+    }
+    .is_err()
+        || read_bytes < size_of::<PEB>()
+        || peb.ProcessParameters.is_null()
+    {
+        return EnvMarkerCheck::Unverifiable;
+    }
+
+    let mut params: RtlUserProcessParametersWithEnv = unsafe { std::mem::zeroed() };
+    read_bytes = 0;
+    // SAFETY: Reading `RtlUserProcessParametersWithEnv` from remote `peb.ProcessParameters`.
+    if unsafe {
+        ReadProcessMemory(
+            handle.0,
+            peb.ProcessParameters.cast::<c_void>(),
+            (&mut params as *mut RtlUserProcessParametersWithEnv).cast::<c_void>(),
+            size_of::<RtlUserProcessParametersWithEnv>(),
+            Some(&mut read_bytes),
+        )
+    }
+    .is_err()
+        || read_bytes < size_of::<RtlUserProcessParametersWithEnv>()
+        || params.environment.is_null()
+    {
+        return EnvMarkerCheck::Unverifiable;
+    }
+
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: `VirtualQueryEx` queries memory protection and region bounds for `params.environment`.
+    if unsafe {
+        VirtualQueryEx(
+            handle.0,
+            Some(params.environment.cast_const()),
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    } == 0
+    {
+        return EnvMarkerCheck::Unverifiable;
+    }
+    if mbi.State != MEM_COMMIT || (mbi.Protect.0 & (PAGE_NOACCESS.0 | PAGE_GUARD.0)) != 0 {
+        return EnvMarkerCheck::Unverifiable;
+    }
+
+    let env_addr = params.environment as usize;
+    let base_addr = mbi.BaseAddress as usize;
+    if env_addr < base_addr {
+        return EnvMarkerCheck::Unverifiable;
+    }
+    let offset = env_addr - base_addr;
+    if offset >= mbi.RegionSize {
+        return EnvMarkerCheck::Unverifiable;
+    }
+    let available = mbi.RegionSize - offset;
+    let truncated = available > MAX_ENV_BYTES;
+    let to_read = available.min(MAX_ENV_BYTES) & !1;
+    if to_read < 2 {
+        return EnvMarkerCheck::Unverifiable;
+    }
+
+    let mut units = vec![0u16; to_read / 2];
+    let mut env_bytes_read = 0usize;
+    // SAFETY: `units` has exact byte length `to_read`, aligned to `u16`.
+    if unsafe {
+        ReadProcessMemory(
+            handle.0,
+            params.environment.cast_const(),
+            units.as_mut_ptr().cast::<c_void>(),
+            to_read,
+            Some(&mut env_bytes_read),
+        )
+    }
+    .is_err()
+        || env_bytes_read < 2
+    {
+        return EnvMarkerCheck::Unverifiable;
+    }
+
+    units.truncate(env_bytes_read / 2);
+    windows_env_utf16_has_marker(&units, key, expected, truncated || env_bytes_read < to_read)
 }
 
 /// Query full-precision [`ProcessId`] (`pid` + 100-ns `FILETIME` creation time) for `pid`.

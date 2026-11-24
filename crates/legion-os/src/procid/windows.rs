@@ -11,8 +11,8 @@ use crate::win_proc::{self, OpenPinnedOutcome, PinnedProcess, TerminateOutcome};
 use crate::{OsError, Result};
 
 use super::{
-    KillTreeReport, ProcessId, WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME, child_not_older_than_parent,
-    is_alive,
+    EnvMarkerCheck, KillTreeReport, ProcessId, WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+    child_not_older_than_parent, is_alive,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -86,59 +86,49 @@ pub(super) fn boot_id() -> Result<String> {
     Ok(format!("boot-win-{unbiased}"))
 }
 
-pub(super) async fn tree_is_active(identity: &ProcessId) -> Result<bool> {
+pub(super) async fn tree_is_active(identity: &ProcessId, marker: Option<&str>) -> Result<bool> {
     let identity = *identity;
+    let marker_owned = marker.map(str::to_owned);
     let own_pid = std::process::id();
 
     tokio::task::spawn_blocking(move || -> Result<bool> {
-        let mut direct_child_max_start: Option<u64> = None;
-
         // Fast path: check root directly using read-only query rights.
         match win_proc::open_pinned_query_only(identity.pid, false) {
             OpenPinnedOutcome::Pinned(root_proc) => {
                 if identity.matches(&root_proc.id) {
                     return Ok(true);
                 }
-                if root_proc.id.start_time > identity.start_time {
-                    direct_child_max_start = Some(root_proc.id.start_time);
-                } else {
-                    return Ok(false);
-                }
             }
             OpenPinnedOutcome::Gone => {}
             OpenPinnedOutcome::AccessDenied | OpenPinnedOutcome::Failed => {
-                match super::of_pid(identity.pid) {
-                    Ok(Some(observed)) if identity.matches(&observed) => return Ok(true),
-                    Ok(Some(observed)) if observed.start_time > identity.start_time => {
-                        direct_child_max_start = Some(observed.start_time);
-                    }
-                    Ok(Some(_)) => return Ok(false),
-                    Ok(None) | Err(_) => {}
+                if let Ok(Some(observed)) = super::of_pid(identity.pid)
+                    && identity.matches(&observed)
+                {
+                    return Ok(true);
                 }
             }
         }
 
-        // Root has exited; run the same verified snapshot walk as `kill_tree` (strictly
-        // read-only, opening handles with `PROCESS_QUERY_LIMITED_INFORMATION` only) and return
-        // `true` on the first verified live descendant.
+        // Once the root itself is gone, treat another process as part of the tree ONLY if it
+        // carries the detach environment marker proving ownership across PID reuse.
+        let Some(ref marker_val) = marker_owned else {
+            return Ok(false);
+        };
+
         let entries = win_proc::snapshot_processes()?;
         for entry in entries {
-            if entry.pid == 0
-                || entry.pid == own_pid
-                || entry.pid == entry.parent_pid
-                || entry.parent_pid != identity.pid
-            {
+            if entry.pid == 0 || entry.pid == own_pid {
                 continue;
             }
-            if let OpenPinnedOutcome::Pinned(child) =
-                win_proc::open_pinned_query_only(entry.pid, false)
-                && child.parent_pid == identity.pid
-                && child_not_older_than_parent(
-                    child.id.start_time,
-                    identity.start_time,
-                    WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+            if win_proc::check_process_env_marker(
+                entry.pid,
+                crate::detach::DETACH_MARKER_ENV,
+                marker_val,
+            ) == EnvMarkerCheck::Matched
+                && matches!(
+                    win_proc::open_pinned_query_only(entry.pid, false),
+                    OpenPinnedOutcome::Pinned(_)
                 )
-                && direct_child_max_start.is_none_or(|limit| child.id.start_time < limit)
             {
                 return Ok(true);
             }
@@ -195,20 +185,24 @@ pub(super) async fn kill_process(
     }
 }
 
-pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
+pub(super) async fn kill_tree(
+    identity: &ProcessId,
+    marker: Option<&str>,
+    grace: Duration,
+) -> Result<KillTreeReport> {
     let identity = *identity;
+    let marker_owned = marker.map(str::to_owned);
     let own_pid = std::process::id();
 
-    let tracked_list: Vec<ProcessId> =
-        tokio::task::spawn_blocking(move || -> Result<Vec<ProcessId>> {
+    let (tracked_list, unverified_list): (Vec<ProcessId>, Vec<ProcessId>) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<ProcessId>, Vec<ProcessId>)> {
             let mut pinned: HashMap<u32, PinnedProcess> = HashMap::new();
+            let mut unverified: HashMap<u32, ProcessId> = HashMap::new();
             let mut root_pinned = false;
             let mut root_live_unopened = false;
-            // Held open (never terminated) if `identity.pid` was already reused by a newer process
-            // so the PID stays pinned and direct orphan children of `identity` are upper-bounded
-            // by the recycled process's creation time.
             let mut recycled_root_guard: Option<PinnedProcess> = None;
             let mut direct_child_max_start: Option<u64> = None;
+            let mut root_preceded_by_older = false;
 
             match win_proc::open_pinned(identity.pid, false) {
                 OpenPinnedOutcome::Pinned(root_proc) => {
@@ -217,19 +211,12 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
                         pinned.insert(root_proc.id.pid, root_proc);
                         root_pinned = true;
                     } else if root_proc.id.start_time > identity.start_time {
-                        // The original root exited and a newer process reused its PID. Orphans of
-                        // the original root still carry `parent_pid == identity.pid` with creation
-                        // times strictly earlier than the recycled process's creation time.
                         direct_child_max_start = Some(root_proc.id.start_time);
                         recycled_root_guard = Some(root_proc);
                     } else {
-                        // The process currently holding `identity.pid` started before `identity`,
-                        // so `identity` cannot correspond to this PID or any orphan under it.
-                        return Ok(Vec::new());
+                        root_preceded_by_older = true;
                     }
                 }
-                // Root exited and its PID is currently vacant; Windows orphans keep their original
-                // `parent_pid`, so keep walking from `(identity.pid, identity.start_time)`.
                 OpenPinnedOutcome::Gone => {}
                 OpenPinnedOutcome::AccessDenied | OpenPinnedOutcome::Failed => {
                     match super::of_pid(identity.pid) {
@@ -239,45 +226,79 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
                         Ok(Some(observed)) if observed.start_time > identity.start_time => {
                             direct_child_max_start = Some(observed.start_time);
                         }
-                        Ok(Some(_)) => return Ok(Vec::new()),
+                        Ok(Some(_)) => {
+                            root_preceded_by_older = true;
+                        }
                         Ok(None) | Err(_) => {}
                     }
                 }
             }
 
-            // Re-snapshot and terminate newly discovered descendants in bounded waves while
-            // keeping every previously opened handle alive so none of their PIDs can be reused
-            // between passes.
-            for pass in 0..MAX_WALK_PASSES {
-                // If `identity.pid` was initially vacant and gets reused between passes, bound
-                // direct children by the new occupant's creation time without touching it.
-                if !root_pinned
-                    && direct_child_max_start.is_none()
-                    && let OpenPinnedOutcome::Pinned(occupant) =
-                        win_proc::open_pinned(identity.pid, false)
-                    && !identity.matches(&occupant.id)
-                {
-                    direct_child_max_start = Some(occupant.id.start_time);
-                    recycled_root_guard = Some(occupant);
+            if root_pinned || root_live_unopened {
+                // While `root` is pinned in `pinned`, Windows cannot reuse `identity.pid`.
+                for pass in 0..MAX_WALK_PASSES {
+                    let newly_found = discover_and_terminate_pass(
+                        &identity,
+                        direct_child_max_start,
+                        own_pid,
+                        &mut pinned,
+                    )?;
+                    if newly_found == 0 && (pass > 0 || !root_pinned) {
+                        break;
+                    }
                 }
-
-                let newly_found = discover_and_terminate_pass(
-                    &identity,
-                    direct_child_max_start,
-                    own_pid,
-                    &mut pinned,
-                )?;
-                if newly_found == 0 && (pass > 0 || !root_pinned) {
-                    break;
+            } else {
+                // Root is already gone. Never kill by `parent_pid` alone across Windows PID reuse:
+                // require `LEGION_DETACH_ID=<marker>` proof, or report unverified candidates.
+                match marker_owned.as_deref() {
+                    Some(marker_val) => {
+                        for pass in 0..MAX_WALK_PASSES {
+                            let mut newly_found = discover_marked_orphans_pass(
+                                &identity,
+                                direct_child_max_start,
+                                root_preceded_by_older,
+                                marker_val,
+                                own_pid,
+                                &mut pinned,
+                                &mut unverified,
+                            )?;
+                            if !pinned.is_empty() {
+                                newly_found += discover_children_of_pinned_pass(
+                                    &identity,
+                                    own_pid,
+                                    &mut pinned,
+                                )?;
+                            }
+                            if newly_found == 0 && pass > 0 {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        if !root_preceded_by_older {
+                            collect_unverified_orphans_readonly(
+                                &identity,
+                                direct_child_max_start,
+                                own_pid,
+                                &mut unverified,
+                            )?;
+                        }
+                    }
                 }
             }
 
             drop(recycled_root_guard);
+            let tracked_pids: HashSet<u32> = pinned.keys().copied().collect();
             let mut tracked: Vec<ProcessId> = pinned.into_values().map(|p| p.id).collect();
             if root_live_unopened && !tracked.iter().any(|p| p.pid == identity.pid) {
                 tracked.push(identity);
             }
-            Ok(tracked)
+            let unverified_out: Vec<ProcessId> = unverified
+                .into_iter()
+                .filter(|(pid, _)| !tracked_pids.contains(pid))
+                .map(|(_, id)| id)
+                .collect();
+            Ok((tracked, unverified_out))
         })
         .await
         .map_err(|err| OsError::Platform {
@@ -285,9 +306,19 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         })??;
 
     if tracked_list.is_empty() {
+        let unverified_survivors = tokio::task::spawn_blocking(move || {
+            let mut unv: Vec<ProcessId> = unverified_list.into_iter().filter(is_alive).collect();
+            unv.sort_by_key(|id| id.pid);
+            unv
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_tree unverified survivor check failed: {err}"),
+        })?;
         return Ok(KillTreeReport {
-            all_gone: true,
+            all_gone: unverified_survivors.is_empty(),
             survivors: Vec::new(),
+            unverified_survivors,
         });
     }
 
@@ -301,9 +332,20 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
                 detail: format!("kill_tree poll task failed: {err}"),
             })?;
         if !any_alive {
+            let unverified_survivors = tokio::task::spawn_blocking(move || {
+                let mut unv: Vec<ProcessId> =
+                    unverified_list.into_iter().filter(is_alive).collect();
+                unv.sort_by_key(|id| id.pid);
+                unv
+            })
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("kill_tree unverified survivor check failed: {err}"),
+            })?;
             return Ok(KillTreeReport {
-                all_gone: true,
+                all_gone: unverified_survivors.is_empty(),
                 survivors: Vec::new(),
+                unverified_survivors,
             });
         }
         let now = Instant::now();
@@ -314,10 +356,12 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
         tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 
-    let survivors = tokio::task::spawn_blocking(move || {
+    let (survivors, unverified_survivors) = tokio::task::spawn_blocking(move || {
         let mut left: Vec<ProcessId> = tracked_list.into_iter().filter(is_alive).collect();
         left.sort_by_key(|id| id.pid);
-        left
+        let mut unv: Vec<ProcessId> = unverified_list.into_iter().filter(is_alive).collect();
+        unv.sort_by_key(|id| id.pid);
+        (left, unv)
     })
     .await
     .map_err(|err| OsError::Platform {
@@ -325,9 +369,186 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
     })?;
 
     Ok(KillTreeReport {
-        all_gone: survivors.is_empty(),
+        all_gone: survivors.is_empty() && unverified_survivors.is_empty(),
         survivors,
+        unverified_survivors,
     })
+}
+
+fn collect_unverified_orphans_readonly(
+    root: &ProcessId,
+    direct_child_max_start: Option<u64>,
+    own_pid: u32,
+    unverified: &mut HashMap<u32, ProcessId>,
+) -> Result<()> {
+    let entries = win_proc::snapshot_processes()?;
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries {
+        if entry.pid == 0 || entry.parent_pid == 0 || entry.pid == entry.parent_pid {
+            continue;
+        }
+        children_by_parent
+            .entry(entry.parent_pid)
+            .or_default()
+            .push(entry.pid);
+    }
+
+    let mut queue: VecDeque<ProcessId> = VecDeque::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    queue.push_back(*root);
+    visited.insert(root.pid);
+
+    while let Some(parent) = queue.pop_front() {
+        let Some(children) = children_by_parent.get(&parent.pid) else {
+            continue;
+        };
+        let max_start = if parent.pid == root.pid {
+            direct_child_max_start
+        } else {
+            None
+        };
+        for &child_pid in children {
+            if child_pid == own_pid || !visited.insert(child_pid) {
+                continue;
+            }
+            if let OpenPinnedOutcome::Pinned(child) =
+                win_proc::open_pinned_query_only(child_pid, false)
+                && child.parent_pid == parent.pid
+                && child_not_older_than_parent(
+                    child.id.start_time,
+                    parent.start_time,
+                    WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                )
+                && max_start.is_none_or(|limit| child.id.start_time < limit)
+            {
+                let child_id = child.id;
+                unverified.entry(child_pid).or_insert(child_id);
+                queue.push_back(child_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn discover_marked_orphans_pass(
+    root: &ProcessId,
+    direct_child_max_start: Option<u64>,
+    root_preceded_by_older: bool,
+    marker: &str,
+    own_pid: u32,
+    pinned: &mut HashMap<u32, PinnedProcess>,
+    unverified: &mut HashMap<u32, ProcessId>,
+) -> Result<usize> {
+    let entries = win_proc::snapshot_processes()?;
+    let mut newly_found = 0usize;
+    for entry in entries {
+        if entry.pid == 0 || entry.pid == own_pid || pinned.contains_key(&entry.pid) {
+            continue;
+        }
+        match win_proc::check_process_env_marker(
+            entry.pid,
+            crate::detach::DETACH_MARKER_ENV,
+            marker,
+        ) {
+            EnvMarkerCheck::Matched => {
+                if let OpenPinnedOutcome::Pinned(proc_handle) =
+                    win_proc::open_pinned(entry.pid, false)
+                {
+                    let _ = proc_handle.terminate();
+                    pinned.insert(entry.pid, proc_handle);
+                    unverified.remove(&entry.pid);
+                    newly_found += 1;
+                }
+            }
+            EnvMarkerCheck::NotMatched => {}
+            EnvMarkerCheck::Unverifiable => {
+                if !root_preceded_by_older
+                    && entry.parent_pid == root.pid
+                    && entry.pid != root.pid
+                    && let OpenPinnedOutcome::Pinned(child) =
+                        win_proc::open_pinned_query_only(entry.pid, false)
+                    && child.parent_pid == root.pid
+                    && child_not_older_than_parent(
+                        child.id.start_time,
+                        root.start_time,
+                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    )
+                    && direct_child_max_start.is_none_or(|limit| child.id.start_time < limit)
+                {
+                    unverified.entry(entry.pid).or_insert(child.id);
+                }
+            }
+        }
+    }
+    Ok(newly_found)
+}
+
+fn discover_children_of_pinned_pass(
+    root: &ProcessId,
+    own_pid: u32,
+    pinned: &mut HashMap<u32, PinnedProcess>,
+) -> Result<usize> {
+    let entries = win_proc::snapshot_processes()?;
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for entry in entries {
+        if entry.pid == 0 || entry.parent_pid == 0 || entry.pid == entry.parent_pid {
+            continue;
+        }
+        children_by_parent
+            .entry(entry.parent_pid)
+            .or_default()
+            .push(entry.pid);
+    }
+
+    let mut queue: VecDeque<ProcessId> = VecDeque::new();
+    let mut queued: HashSet<u32> = HashSet::new();
+    for proc_handle in pinned.values() {
+        if queued.insert(proc_handle.id.pid) {
+            queue.push_back(proc_handle.id);
+        }
+    }
+
+    let mut visited_candidates: HashSet<u32> = HashSet::new();
+    let mut newly_found = 0usize;
+
+    while let Some(parent) = queue.pop_front() {
+        let Some(children) = children_by_parent.get(&parent.pid) else {
+            continue;
+        };
+        for &child_pid in children {
+            if child_pid == own_pid || pinned.contains_key(&child_pid) {
+                continue;
+            }
+            if !visited_candidates.insert(child_pid) {
+                continue;
+            }
+            if let OpenPinnedOutcome::Pinned(child_proc) = win_proc::open_pinned(child_pid, false) {
+                if child_proc.parent_pid != parent.pid
+                    || !child_not_older_than_parent(
+                        child_proc.id.start_time,
+                        parent.start_time,
+                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    )
+                    || !child_not_older_than_parent(
+                        child_proc.id.start_time,
+                        root.start_time,
+                        WALL_CLOCK_BACKWARD_TOLERANCE_FILETIME,
+                    )
+                {
+                    continue;
+                }
+                let child_id = child_proc.id;
+                let _ = child_proc.terminate();
+                pinned.insert(child_pid, child_proc);
+                if queued.insert(child_pid) {
+                    queue.push_back(child_id);
+                }
+                newly_found += 1;
+            }
+        }
+    }
+
+    Ok(newly_found)
 }
 
 /// Take one process-table snapshot, verify every candidate child's `parent_pid` and creation time
