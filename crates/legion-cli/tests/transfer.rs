@@ -51,8 +51,8 @@ fn main() -> ExitCode {
             an_interrupted_file_resumes_where_it_stopped,
         ),
         (
-            "a_cancelled_transfer_leaves_nothing_under_a_final_name",
-            a_cancelled_transfer_leaves_nothing_under_a_final_name,
+            "a_cancelled_transfer_leaves_nothing_half_written_under_a_final_name",
+            a_cancelled_transfer_leaves_nothing_half_written_under_a_final_name,
         ),
         (
             "each_end_applies_its_own_policy_and_says_which_machine_refused",
@@ -65,6 +65,30 @@ fn main() -> ExitCode {
         (
             "ends_are_parsed_and_unknown_machines_named",
             ends_are_parsed_and_unknown_machines_named,
+        ),
+        (
+            "a_source_cannot_send_what_was_not_planned",
+            a_source_cannot_send_what_was_not_planned,
+        ),
+        (
+            "extra_entries_go_only_once_everything_new_has_arrived",
+            extra_entries_go_only_once_everything_new_has_arrived,
+        ),
+        (
+            "names_that_differ_only_in_case_are_held_back_where_they_would_collide",
+            names_that_differ_only_in_case_are_held_back_where_they_would_collide,
+        ),
+        (
+            "an_end_that_speaks_another_protocol_is_told_apart_from_a_banner",
+            an_end_that_speaks_another_protocol_is_told_apart_from_a_banner,
+        ),
+        (
+            "what_arrives_is_checked_and_a_file_keeps_its_time",
+            what_arrives_is_checked_and_a_file_keeps_its_time,
+        ),
+        (
+            "an_end_that_is_stopped_is_given_time_to_clean_up",
+            an_end_that_is_stopped_is_given_time_to_clean_up,
         ),
         (
             "gate_serves_only_the_connectors_commands_pinned_to_its_principal",
@@ -174,12 +198,122 @@ fn helper(args: &[String]) -> ExitCode {
             drop(child_in);
             exit_of(child.wait().unwrap())
         }
-        "cut" | "slow" => exit_of(command.status().unwrap()),
+        // A source that does not keep to the protocol, in the way `extra[0]` names.
+        "evil" if subcommand == "stream" => evil(&extra[0], Path::new(home), command),
+        "cut" | "slow" | "evil" => exit_of(command.status().unwrap()),
         other => {
             eprintln!("unknown helper mode {other}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Runs `legion stream` behind a source that misbehaves: it rewrites the header it passes on and
+/// the replies it passes back.
+fn evil(behaviour: &str, home: &Path, mut command: Command) -> ExitCode {
+    let mut input = BufReader::new(std::io::stdin());
+    let mut line = String::new();
+    input.read_line(&mut line).unwrap();
+    let mut header: Value = serde_json::from_str(&line).unwrap();
+    let op = header["op"].as_str().unwrap().to_owned();
+    match (behaviour, op.as_str()) {
+        // Packs more than it was asked for: files it never listed.
+        ("extra-entries", "pack") => header["names"] = json!(["readme.txt", ".env", "other.txt"]),
+        ("oversized", "pack") => header["names"] = json!(["readme.txt", "big.bin"]),
+        // Its file is edited in place after it was listed and before it is packed.
+        ("mutate", "pack") => fs::write(home.join("export/readme.txt"), b"READ ME").unwrap(),
+        // An unpack that, like a real one, has a temporary file to remove once its input ends,
+        // and takes a moment to do it: killed at once, it leaves the file behind.
+        ("slow-cleanup", "unpack") => {
+            let root = home.join(header["root"].as_str().unwrap().trim_start_matches("~/"));
+            fs::create_dir_all(&root).unwrap();
+            let temporary = root.join(".legion-unpack-1-0.tmp");
+            fs::write(&temporary, b"half").unwrap();
+            println!("{}", json!({"ready": true}));
+            std::io::stdout().flush().unwrap();
+            let _ = std::io::copy(&mut input, &mut std::io::sink());
+            std::thread::sleep(Duration::from_millis(300));
+            fs::remove_file(&temporary).unwrap();
+            return ExitCode::from(1);
+        }
+        // Fails as soon as it is asked for an archive.
+        ("fail-pack", "pack") => {
+            let error =
+                json!({"code": "failed", "message": "The disk went away.", "machine": "broken"});
+            println!("{}", json!({ "error": error }));
+            return ExitCode::from(1);
+        }
+        _ => {}
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_in = child.stdin.take().unwrap();
+    writeln!(child_in, "{header}").unwrap();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut input, &mut child_in);
+    });
+    let mut replies = BufReader::new(child.stdout.take().unwrap());
+    let mut out = std::io::stdout().lock();
+    match (behaviour, op.as_str()) {
+        // Lists only readme.txt, whatever is there.
+        ("extra-entries" | "oversized", "manifest") => {
+            let mut kept = 0;
+            for line in replies.lines() {
+                let mut reply: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                if reply.get("done").is_some() {
+                    reply["entries"] = json!(kept);
+                } else if reply["path"] != "readme.txt" {
+                    continue;
+                } else {
+                    kept += 1;
+                }
+                writeln!(out, "{reply}").unwrap();
+            }
+        }
+        // Speaks an older protocol, whose archive came without a line before it.
+        ("old", "pack") => {
+            let mut line = String::new();
+            replies.read_line(&mut line).unwrap();
+            std::io::copy(&mut replies, &mut out).unwrap();
+        }
+        // Says its file system ignores letter case, as macOS and Windows usually do.
+        ("caseless", "stat") => {
+            let mut line = String::new();
+            replies.read_line(&mut line).unwrap();
+            let mut reply: Value = serde_json::from_str(&line).unwrap();
+            if reply.get("kind").is_some() {
+                reply["case_insensitive"] = json!(true);
+            }
+            writeln!(out, "{reply}").unwrap();
+            std::io::copy(&mut replies, &mut out).unwrap();
+        }
+        // Stops half way through its archive and fails.
+        ("truncate", "pack") => {
+            let mut taken = Vec::new();
+            replies.read_until(b'\n', &mut taken).unwrap();
+            out.write_all(&taken).unwrap();
+            let mut archive = vec![0u8; 300 * 1024];
+            replies.read_exact(&mut archive).unwrap();
+            out.write_all(&archive).unwrap();
+            out.flush().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            return ExitCode::from(1);
+        }
+        // Sends more than the size it announced.
+        ("extra-bytes", "get") => {
+            std::io::copy(&mut replies, &mut out).unwrap();
+            out.write_all(b"and then some").unwrap();
+        }
+        _ => {
+            std::io::copy(&mut replies, &mut out).unwrap();
+        }
+    }
+    out.flush().unwrap();
+    exit_of(child.wait().unwrap())
 }
 
 fn exit_of(status: std::process::ExitStatus) -> ExitCode {
@@ -712,7 +846,7 @@ fn an_interrupted_file_resumes_where_it_stopped() {
     );
 }
 
-fn a_cancelled_transfer_leaves_nothing_under_a_final_name() {
+fn a_cancelled_transfer_leaves_nothing_half_written_under_a_final_name() {
     let laptop = node("laptop");
     let pi = node("pi");
     fleet(&laptop, &[("pi", &pi, "slow", vec![])]);
@@ -761,32 +895,44 @@ fn a_cancelled_transfer_leaves_nothing_under_a_final_name() {
             error["details"]["bytes_sent"].as_u64().unwrap() > 0,
             "{reply}"
         );
+        assert_eq!(error["details"]["deleted"], 0, "{reply}");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("not what the destination confirmed"),
+            "{reply}"
+        );
         assert_eq!(rpc.finish(), 0);
     }
-    // Give the destination's stream a moment to notice its input ended and clean up.
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        let names: Vec<String> = fs::read_dir(pi.home())
-            .unwrap()
-            .chain(fs::read_dir(pi.home().join("tree")).into_iter().flatten())
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        let finals: Vec<&String> = names
-            .iter()
-            .filter(|name| {
-                *name == "huge.bin" || (name.starts_with("part") && name.ends_with(".bin"))
-            })
-            .collect();
-        let temporaries = names.iter().any(|name| name.ends_with(".tmp"));
-        if finals.is_empty() && !temporaries {
-            break;
+    // Both ends were waited for before the reply. Whatever has its final name by then (a part
+    // that finished before the cancel came) is whole and right; nothing is half written under one.
+    let names: Vec<(PathBuf, String)> = fs::read_dir(pi.home())
+        .unwrap()
+        .chain(fs::read_dir(pi.home().join("tree")).into_iter().flatten())
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.path(),
+                entry.file_name().to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    for (path, name) in &names {
+        if name == "huge.bin" {
+            assert_eq!(fs::read(path).unwrap(), data(24 * 1024 * 1024, 5), "{name}");
         }
-        assert!(
-            finals.is_empty(),
-            "a half-written file has its final name: {finals:?}"
-        );
-        assert!(Instant::now() < deadline, "{names:?}");
-        std::thread::sleep(Duration::from_millis(50));
+        if let Some(at) = name
+            .strip_prefix("part")
+            .and_then(|rest| rest.strip_suffix(".bin"))
+        {
+            let seed: u64 = at.parse().unwrap();
+            assert_eq!(
+                fs::read(path).unwrap(),
+                data(6 * 1024 * 1024, seed),
+                "{name}"
+            );
+        }
     }
     let audit = laptop.audit();
     assert!(
@@ -953,8 +1099,8 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
     pi.write_config("policy.toml", POLICY);
     // A receiver that refuses answers and exits while the sender still has megabytes to send.
     for header in [
-        json!({"op": "put", "path": "~/projects/x.bin", "size": 64 << 20, "hash": format!("blake3:{}", "0".repeat(64)), "as": "reader"}),
-        json!({"op": "unpack", "root": "~/projects/x", "as": "reader"}),
+        json!({"op": "put", "path": "~/projects/x.bin", "size": 64 << 20, "hash": format!("blake3:{}", "0".repeat(64)), "as": "reader", "protocol": 1}),
+        json!({"op": "unpack", "root": "~/projects/x", "names": [], "as": "reader", "protocol": 1}),
     ] {
         let mut child = pi
             .command(&["stream"])
@@ -1002,7 +1148,7 @@ fn a_stream_that_fails_early_never_leaves_the_other_side_waiting() {
     writeln!(
         missing.stdin.take().unwrap(),
         "{}",
-        json!({"op": "get", "path": "~/none.bin"})
+        json!({"op": "get", "path": "~/none.bin", "protocol": 1})
     )
     .unwrap();
     let output = missing.wait_with_output().unwrap();
@@ -1132,7 +1278,7 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
         writeln!(
             child.stdin.take().unwrap(),
             "{}",
-            json!({"op": "stat", "path": path, "as": "owner"})
+            json!({"op": "stat", "path": path, "as": "owner", "protocol": 1})
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
@@ -1185,6 +1331,340 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
         "{}",
         help.stdout
     );
+}
+
+fn a_source_cannot_send_what_was_not_planned() {
+    let laptop = node("laptop");
+    let evil = node("evil");
+    fleet(
+        &laptop,
+        &[
+            ("evil", &evil, "evil", vec!["extra-entries".to_owned()]),
+            ("huge", &evil, "evil", vec!["oversized".to_owned()]),
+            ("chatty", &evil, "evil", vec!["extra-bytes".to_owned()]),
+        ],
+    );
+    let export = evil.home().join("export");
+    fs::create_dir_all(&export).unwrap();
+    fs::write(export.join("readme.txt"), b"read me").unwrap();
+    fs::write(export.join(".env"), b"SECRET=from-the-source").unwrap();
+    fs::write(export.join("other.txt"), b"never listed").unwrap();
+    fs::write(export.join("big.bin"), data(2 * 1024 * 1024, 21)).unwrap();
+    let work = laptop.home().join("projects/work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(work.join(".env"), b"SECRET=mine").unwrap();
+
+    // Entries it never listed are refused, the transfer fails and says which machine sent them.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "evil:~/export", "to": "~/projects/work", "exclude": [".env"]}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("evil")),
+        "{error}"
+    );
+    assert!(error.to_string().contains("other.txt"), "{error}");
+    assert_eq!(fs::read(work.join(".env")).unwrap(), b"SECRET=mine");
+    assert!(!work.join("other.txt").exists());
+    assert_eq!(fs::read(work.join("readme.txt")).unwrap(), b"read me");
+
+    // More bytes than the plan allows are cut off before they arrive.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "huge:~/export", "to": "~/projects/huge"}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("huge")),
+        "{error}"
+    );
+    assert!(!laptop.home().join("projects/huge/big.bin").exists());
+
+    // A file's source may not send more than the size it announced; nothing past it is passed on.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "chatty:~/export/readme.txt", "to": "~/readme.txt"}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("chatty")),
+        "{error}"
+    );
+    // Whatever arrived is exactly what was announced and hashed.
+    assert!(
+        fs::read(laptop.home().join("readme.txt"))
+            .ok()
+            .is_none_or(|bytes| bytes == b"read me")
+    );
+}
+
+fn extra_entries_go_only_once_everything_new_has_arrived() {
+    let laptop = node("laptop");
+    let broken = node("broken");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("broken", &broken, "evil", vec!["fail-pack".to_owned()]),
+            ("pi", &pi, "node", vec![]),
+        ],
+    );
+    let src = broken.home().join("site");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("index.html"), b"new").unwrap();
+    let dst = laptop.home().join("site");
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(dst.join("index.html"), b"old!").unwrap();
+    fs::write(
+        dst.join("extra.txt"),
+        b"still needed until the new site is here",
+    )
+    .unwrap();
+
+    // The source fails before anything new arrives: nothing at the destination is removed.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "broken:~/site", "to": "~/site", "delete": true}),
+        &[],
+    ));
+    assert_eq!(error["machine"], "broken", "{error}");
+    assert!(error.to_string().contains("left in place"), "{error}");
+    assert!(dst.join("extra.txt").exists());
+    assert_eq!(fs::read(dst.join("index.html")).unwrap(), b"old!");
+
+    // When it works, an entry of another kind is replaced and the extras go last.
+    let tree = laptop.home().join("tree");
+    fs::create_dir_all(tree.join("was-a-file")).unwrap();
+    fs::write(tree.join("was-a-file/inside.txt"), b"in").unwrap();
+    fs::write(tree.join("kept.txt"), b"kept").unwrap();
+    let there = pi.home().join("tree");
+    fs::create_dir_all(&there).unwrap();
+    fs::write(there.join("was-a-file"), b"a file").unwrap();
+    fs::write(there.join("extra.txt"), b"x").unwrap();
+    let done = ok(&transfer(
+        &laptop,
+        json!({"from": "~/tree", "to": "pi:~/tree", "delete": true}),
+        &[],
+    ));
+    assert_eq!(done["deleted"], 2, "{done}");
+    assert_eq!(
+        fs::read(there.join("was-a-file/inside.txt")).unwrap(),
+        b"in"
+    );
+    assert!(!there.join("extra.txt").exists());
+}
+
+fn names_that_differ_only_in_case_are_held_back_where_they_would_collide() {
+    let laptop = node("laptop");
+    let mac = node("mac");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("mac", &mac, "evil", vec!["caseless".to_owned()]),
+            ("pi", &pi, "node", vec![]),
+        ],
+    );
+    // The source must hold both names, which a file system that ignores case cannot.
+    fs::write(laptop.home().join("Probe"), b"").unwrap();
+    if laptop.home().join("probe").exists() {
+        return;
+    }
+    let src = laptop.home().join("docs");
+    fs::create_dir_all(src.join("Notes")).unwrap();
+    fs::create_dir_all(src.join("notes")).unwrap();
+    fs::write(src.join("Readme.md"), b"upper").unwrap();
+    fs::write(src.join("readme.md"), b"lower").unwrap();
+    fs::write(src.join("Notes/a.txt"), b"a").unwrap();
+    fs::write(src.join("notes/b.txt"), b"b").unwrap();
+    fs::write(src.join("plain.txt"), b"plain").unwrap();
+
+    let first = ok(&transfer(
+        &laptop,
+        json!({"from": "~/docs", "to": "mac:~/docs"}),
+        &[],
+    ));
+    assert_eq!(first["files_sent"], 1, "{first}");
+    let conflicts = first["conflicts"].as_array().unwrap();
+    let held: Vec<&str> = conflicts
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    for name in ["Readme.md", "readme.md", "Notes", "notes"] {
+        assert!(held.contains(&name), "{name} missing from {held:?}");
+    }
+    assert!(
+        conflicts[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cannot hold both"),
+        "{first}"
+    );
+    let dst = mac.home().join("docs");
+    assert!(dst.join("plain.txt").exists());
+    for name in ["Readme.md", "readme.md", "Notes", "notes"] {
+        assert!(!dst.join(name).exists(), "{name} was sent");
+    }
+    // A second run sends nothing and says the same.
+    let second = ok(&transfer(
+        &laptop,
+        json!({"from": "~/docs", "to": "mac:~/docs"}),
+        &[],
+    ));
+    assert_eq!(second["files_sent"], 0, "{second}");
+    assert_eq!(second["conflicts"], first["conflicts"]);
+
+    // A file system that tells them apart takes both.
+    let both = ok(&transfer(
+        &laptop,
+        json!({"from": "~/docs", "to": "pi:~/docs"}),
+        &[],
+    ));
+    assert_eq!(both["files_sent"], 5, "{both}");
+    assert_eq!(both["conflicts"], json!([]), "{both}");
+}
+
+fn an_end_that_speaks_another_protocol_is_told_apart_from_a_banner() {
+    let laptop = node("laptop");
+    let old = node("old");
+    fleet(&laptop, &[("old", &old, "evil", vec!["old".to_owned()])]);
+    fs::create_dir_all(old.home().join("export")).unwrap();
+    fs::write(old.home().join("export/readme.txt"), b"read me").unwrap();
+
+    let started = Instant::now();
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "old:~/export", "to": "~/export"}),
+        &[],
+    ));
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("unsupported"), Some("old")),
+        "{error}"
+    );
+    assert!(
+        error["hint"].as_str().unwrap().contains("Update legion"),
+        "{error}"
+    );
+    assert!(!laptop.home().join("export/readme.txt").exists());
+
+    // Asked for a protocol it does not speak, a node says which it does.
+    let mut child = old
+        .command(&["stream"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "{}",
+        json!({"op": "stat", "path": "~", "protocol": 2})
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let reply: Value =
+        serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(reply["error"]["code"], "unsupported", "{reply}");
+    assert_eq!(reply["error"]["details"]["protocol"], json!([1]), "{reply}");
+}
+
+fn what_arrives_is_checked_and_a_file_keeps_its_time() {
+    let laptop = node("laptop");
+    let edited = node("edited");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("edited", &edited, "evil", vec!["mutate".to_owned()]),
+            ("pi", &pi, "node", vec![]),
+        ],
+    );
+    let export = edited.home().join("export");
+    fs::create_dir_all(&export).unwrap();
+    fs::write(export.join("readme.txt"), b"read me").unwrap();
+    fs::write(export.join("steady.txt"), b"steady").unwrap();
+
+    // With checksum, a file that changed between its listing and its packing is caught.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "edited:~/export", "to": "~/export", "checksum": true}),
+        &[],
+    ));
+    assert_eq!(
+        (error["code"].as_str(), error["machine"].as_str()),
+        (Some("failed"), Some("edited")),
+        "{error}"
+    );
+    assert!(error.to_string().contains("readme.txt"), "{error}");
+    assert!(!error.to_string().contains("steady.txt"), "{error}");
+
+    // A file sent on its own keeps its time, so a tree that holds it later finds it unchanged.
+    let dir = laptop.home().join("dir");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"alpha").unwrap();
+    fs::write(dir.join("b.txt"), b"beta").unwrap();
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    fs::File::options()
+        .write(true)
+        .open(dir.join("a.txt"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    ok(&transfer(
+        &laptop,
+        json!({"from": "~/dir/a.txt", "to": "pi:~/dir/a.txt"}),
+        &[],
+    ));
+    assert_eq!(
+        fs::metadata(pi.home().join("dir/a.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        old
+    );
+    let tree = ok(&transfer(
+        &laptop,
+        json!({"from": "~/dir", "to": "pi:~/dir"}),
+        &[],
+    ));
+    assert_eq!(tree["files_sent"], 1, "{tree}");
+    assert_eq!(tree["files_unchanged"], 1, "{tree}");
+}
+
+fn an_end_that_is_stopped_is_given_time_to_clean_up() {
+    let laptop = node("laptop");
+    let broken = node("broken");
+    let pi = node("pi");
+    fleet(
+        &laptop,
+        &[
+            ("broken", &broken, "evil", vec!["truncate".to_owned()]),
+            ("pi", &pi, "evil", vec!["slow-cleanup".to_owned()]),
+        ],
+    );
+    fs::create_dir_all(broken.home().join("export")).unwrap();
+    fs::write(broken.home().join("export/big.bin"), data(1024 * 1024, 31)).unwrap();
+
+    // The source fails half way through a file; the destination, stopped, still removes what
+    // it was writing before it goes.
+    let error = refused(&transfer(
+        &laptop,
+        json!({"from": "broken:~/export", "to": "pi:~/copy"}),
+        &[],
+    ));
+    assert_eq!(error["machine"], "broken", "{error}");
+    let left: Vec<String> = fs::read_dir(pi.home().join("copy"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
 }
 
 fn forwarding_node_authorises_and_audits_remote_stream_pipes() {

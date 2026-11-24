@@ -718,6 +718,7 @@ dependencies = [
  "legion-proto",
  "legion-tools",
  "legion-xfer",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

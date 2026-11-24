@@ -8,7 +8,7 @@ use std::io::{BufRead, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use legion_core::Paths;
-use legion_net::stream::{Host, serve};
+use legion_net::stream::{Host, STREAM_PROTOCOL, serve};
 use legion_proto::ErrorCode;
 use serde_json::{Value, json};
 
@@ -45,7 +45,13 @@ impl Node {
     }
 
     /// Runs one operation: the header, then `body` on its input.
+    /// Runs one operation: the header, which speaks the current protocol unless it says
+    /// otherwise, then `body` on its input.
     fn run(&self, pinned: Option<&str>, header: &Value, body: &[u8]) -> Ran {
+        let mut header = header.clone();
+        if header.get("protocol").is_none() {
+            header["protocol"] = json!(STREAM_PROTOCOL);
+        }
         let mut input = header.to_string().into_bytes();
         input.push(b'\n');
         input.extend_from_slice(body);
@@ -197,6 +203,34 @@ fn stat_describes_files_directories_and_missing_paths() {
     assert_eq!(audit["principal"], "owner");
     assert_eq!(audit["target"], "tower");
     assert_eq!(audit["outcome"], "ok");
+}
+
+#[test]
+fn stat_tells_whether_a_directory_ignores_letter_case_without_writing() {
+    let node = Node::new();
+    let dir = node.home().join("projects");
+    fs::write(dir.join("Probe.txt"), b"").unwrap();
+    let ignores_case = dir.join("probe.txt").exists();
+    fs::remove_file(dir.join("Probe.txt")).unwrap();
+    let before: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+
+    for path in ["~/projects", "~/projects/not/yet"] {
+        let ran = node.run(None, &json!({"op": "stat", "path": path}), b"");
+        let (line, _) = ran.ok().first();
+        assert_eq!(
+            line["case_insensitive"],
+            json!(ignores_case),
+            "{path}: {line}"
+        );
+    }
+    let after: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(before, after);
 }
 
 #[test]
@@ -352,7 +386,7 @@ fn manifest_of_a_home_leaves_out_legions_own_files_for_a_role_without_admin() {
         serve(
             &host,
             pinned,
-            Cursor::new(b"{\"op\":\"manifest\",\"root\":\"~\"}\n".to_vec()),
+            Cursor::new(b"{\"op\":\"manifest\",\"root\":\"~\",\"protocol\":1}\n".to_vec()),
             &mut output,
         )
         .unwrap();
@@ -403,7 +437,7 @@ fn pack_names_what_it_leaves_out_then_unpack_writes_the_tree() {
 
     let ran = node.run(
         None,
-        &json!({"op": "unpack", "root": "~/projects/dst"}),
+        &json!({"op": "unpack", "root": "~/projects/dst", "names": ["nested", "nested/a.txt", "nested/empty", "odd name #1.txt"]}),
         &archive,
     );
     let lines = ran.ok().lines();
@@ -445,7 +479,9 @@ fn unpack_checks_where_each_entry_lands_and_leaves_legions_own_files_alone() {
     fs::write(staging.path().join("fine.txt"), b"fine").unwrap();
     let archive = tar_of(staging.path(), &[".legion/config/policy.toml", "fine.txt"]);
 
-    let mut input = b"{\"op\":\"unpack\",\"root\":\"~\"}\n".to_vec();
+    let mut input =
+        b"{\"op\":\"unpack\",\"root\":\"~\",\"names\":[\".legion/config/policy.toml\",\"fine.txt\"],\"protocol\":1}\n"
+            .to_vec();
     input.extend_from_slice(&archive);
     let mut output = Vec::new();
     serve(&host, Some("writer"), Cursor::new(input), &mut output).unwrap();
@@ -509,6 +545,110 @@ fn delete_removes_children_before_parents_and_never_follows_links() {
     assert_eq!(node.last_audit()["tool"], "stream.delete");
 }
 
+#[cfg(unix)]
+#[test]
+fn pack_and_delete_never_go_through_a_link_inside_a_name() {
+    let node = Node::new();
+    let tree = node.home().join("projects/tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::create_dir_all(node.home().join("precious")).unwrap();
+    fs::write(node.home().join("precious/secret.txt"), b"secret").unwrap();
+    fs::write(tree.join("plain.txt"), b"plain").unwrap();
+    std::os::unix::fs::symlink(node.home().join("precious"), tree.join("link")).unwrap();
+
+    let ran = node.run(
+        None,
+        &json!({"op": "pack", "root": "~/projects/tree", "names": ["link/secret.txt", "plain.txt", "link"]}),
+        b"",
+    );
+    let (ready, archive) = ran.ok().first();
+    assert_eq!(ready["skipped"][0]["path"], "link/secret.txt", "{ready}");
+    assert!(
+        ready["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("symbolic link"),
+        "{ready}"
+    );
+    // The link itself is packed as a link; what it leads to is not read.
+    let unpacked = tempfile::tempdir().unwrap();
+    let report = legion_xfer::unpack(unpacked.path(), archive).unwrap();
+    assert_eq!(report.files, ["plain.txt"]);
+    assert_eq!(report.symlinks, ["link"]);
+    assert!(!String::from_utf8_lossy(archive).contains("secret"));
+
+    let ran = node.run(
+        None,
+        &json!({"op": "delete", "root": "~/projects/tree", "names": ["link/secret.txt"]}),
+        b"",
+    );
+    let (done, _) = ran.ok().first();
+    assert_eq!(done["removed"], 0, "{done}");
+    assert_eq!(done["skipped"][0]["path"], "link/secret.txt", "{done}");
+    assert!(node.home().join("precious/secret.txt").exists());
+
+    // The last part, when it is a link, is removed as a link.
+    let ran = node.run(
+        None,
+        &json!({"op": "delete", "root": "~/projects/tree", "names": ["link"]}),
+        b"",
+    );
+    assert_eq!(ran.ok().first().0["removed"], 1);
+    assert!(fs::symlink_metadata(tree.join("link")).is_err());
+    assert!(node.home().join("precious/secret.txt").exists());
+}
+
+#[test]
+fn a_partial_file_beside_a_target_is_checked_like_the_target() {
+    let node = Node::new();
+    node.policy(
+        "[principals.boxed]\nrole = \"boxed\"\n[roles.boxed]\nallow = [\"effect:read\", \"effect:write\"]\npaths = [\"~/sandbox\"]\n",
+    );
+    // The role's root does not exist yet, so its partial file would sit outside it, in the home.
+    let outside = node.home().join("sandbox.legion-part");
+    fs::write(&outside, b"not yours").unwrap();
+
+    let ran = node.run(
+        Some("boxed"),
+        &json!({"op": "stat", "path": "~/sandbox"}),
+        b"",
+    );
+    let (line, _) = ran.ok().first();
+    assert_eq!(line["kind"], "missing");
+    assert!(line.get("partial").is_none(), "{line}");
+
+    let error = node
+        .run(
+            Some("boxed"),
+            &json!({"op": "put", "path": "~/sandbox", "size": 3, "hash": hash(b"abc")}),
+            b"abc",
+        )
+        .refused(ErrorCode::Denied);
+    assert!(
+        error["message"].as_str().unwrap().contains("legion-part"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"not yours");
+    assert!(!node.home().join("sandbox").exists());
+
+    // Inside the root, a partial file is used as before.
+    fs::create_dir_all(node.home().join("sandbox")).unwrap();
+    fs::write(node.home().join("sandbox/f.bin.legion-part"), b"ab").unwrap();
+    let ran = node.run(
+        Some("boxed"),
+        &json!({"op": "stat", "path": "~/sandbox/f.bin"}),
+        b"",
+    );
+    assert_eq!(ran.ok().first().0["partial"], 2);
+    let ran = node.run(
+        Some("boxed"),
+        &json!({"op": "put", "path": "~/sandbox/f.bin", "size": 3, "hash": hash(b"abc")}),
+        b"c",
+    );
+    assert_eq!(ran.ok().lines()[0], json!({"offset": 2}));
+    assert_eq!(fs::read(node.home().join("sandbox/f.bin")).unwrap(), b"abc");
+}
+
 #[test]
 fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     let node = Node::new();
@@ -533,7 +673,7 @@ fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     );
     node.run(
         Some("reader"),
-        &json!({"op": "unpack", "root": "~/projects/x"}),
+        &json!({"op": "unpack", "root": "~/projects/x", "names": []}),
         b"",
     )
     .refused(ErrorCode::Denied);
@@ -600,7 +740,7 @@ fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     );
     node.run(
         Some("writer"),
-        &json!({"op": "unpack", "root": node.config()}),
+        &json!({"op": "unpack", "root": node.config(), "names": []}),
         b"",
     )
     .refused(ErrorCode::Denied);
@@ -657,8 +797,7 @@ fn a_header_that_cannot_be_read_is_refused_on_the_first_line() {
     for input in [
         &b""[..],
         b"not json\n",
-        b"{\"op\":\"format\",\"path\":\"/\"}\n",
-        b"{\"path\":\"/\"}\n",
+        b"{\"op\":\"stat\",\"protocol\":1}\n",
         b"[1]\n",
     ] {
         let mut output = Vec::new();
@@ -673,10 +812,76 @@ fn a_header_that_cannot_be_read_is_refused_on_the_first_line() {
 }
 
 #[test]
+fn a_header_in_another_protocol_or_with_an_unknown_operation_is_unsupported() {
+    let node = Node::new();
+    for (header, names) in [
+        (
+            json!({"op": "stat", "path": "~", "protocol": null}),
+            "protocol",
+        ),
+        (
+            json!({"op": "stat", "path": "~", "protocol": 99}),
+            "protocol 99",
+        ),
+        (json!({"op": "format", "path": "/"}), "format"),
+        (json!({"path": "/"}), "operation"),
+    ] {
+        let error = node.run(None, &header, b"").refused(ErrorCode::Unsupported);
+        assert!(
+            error["message"].as_str().unwrap().contains(names),
+            "{error}"
+        );
+        assert_eq!(
+            error["details"]["protocol"],
+            json!([STREAM_PROTOCOL]),
+            "{error}"
+        );
+        assert!(
+            error["details"]["ops"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("unpack")),
+            "{error}"
+        );
+        assert!(
+            error["hint"].as_str().unwrap().contains("Update legion"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unpack_takes_only_the_planned_entries_and_the_directories_on_their_way() {
+    let node = Node::new();
+    let staging = tempfile::tempdir().unwrap();
+    fs::create_dir_all(staging.path().join("a/b")).unwrap();
+    fs::create_dir_all(staging.path().join("stray")).unwrap();
+    fs::write(staging.path().join("a/b/wanted.txt"), b"w").unwrap();
+    fs::write(staging.path().join(".env"), b"SECRET").unwrap();
+    let archive = tar_of(
+        staging.path(),
+        &["a", "a/b", "a/b/wanted.txt", ".env", "stray"],
+    );
+    let ran = node.run(
+        None,
+        &json!({"op": "unpack", "root": "~/projects/dst", "names": ["a/b/wanted.txt"]}),
+        &archive,
+    );
+    let done = &ran.ok().lines()[1];
+    assert_eq!(done["files"], 1, "{done}");
+    assert_eq!(done["unplanned"], json!([".env", "stray"]), "{done}");
+    let dst = node.home().join("projects/dst");
+    assert!(dst.join("a/b/wanted.txt").exists());
+    assert!(!dst.join(".env").exists());
+    assert!(!dst.join("stray").exists());
+}
+
+#[test]
 fn a_refused_unpack_reads_nothing_of_what_follows() {
     let node = Node::new();
     node.policy(CONFINED);
-    let mut input = b"{\"op\":\"unpack\",\"root\":\"~/projects/x\"}\n".to_vec();
+    let mut input =
+        b"{\"op\":\"unpack\",\"root\":\"~/projects/x\",\"names\":[],\"protocol\":1}\n".to_vec();
     input.extend(std::iter::repeat_n(0u8, 1 << 20));
     let mut cursor = Cursor::new(input);
     let mut output = Vec::new();

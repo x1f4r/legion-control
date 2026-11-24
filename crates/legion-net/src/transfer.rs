@@ -11,21 +11,25 @@
 //! tree is listed at both ends, [`legion_xfer::plan::plan`] decides what differs, and only that is
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
-use legion_xfer::{Entry, Hash, Manifest, PlanConflict, PlanOptions, SkippedEntry};
+use legion_xfer::{
+    CaseCollision, Entry, EntryKind, Manifest, Plan, PlanConflict, PlanOptions, SkippedEntry,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::io::SyncIoBridge;
 
 use crate::config::{FleetFile, validate_machine_name};
@@ -56,12 +60,31 @@ const BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// The shortest time between two `progress` events.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
+/// How long an operation's first reply may take from the moment its pipe is opened: long enough
+/// for ssh to connect and a node to start and begin its answer, short enough that a node which will
+/// never answer (an older legion waiting for input this one does not send, a stalled connection)
+/// is given up on. A node at work on something long says it is busy before this runs out.
+const FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a stream may go without moving a byte in either direction while bytes are relayed,
+/// or without a line while a reply is awaited. A node that is busy says so every
+/// [`stream::HEARTBEAT`], well inside this, so only a stall runs it out.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long an end whose input was cut off is given to clean up (an unpack removes the temporary
+/// file it was writing) and exit before it is killed.
+const ABORT_GRACE: Duration = Duration::from_secs(2);
+
 /// How long an ended stream is given to exit and say why on stderr.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
 
 /// How long a source that has sent the end of its archive is given to report that it exited
 /// cleanly; over a slow link the exit status can trail the last byte.
 const FINISH_WAIT: Duration = Duration::from_secs(10);
+
+/// The most entries a listing from another node may hold. Both listings of a tree are compared
+/// in this node's memory; a tree bigger than this is transferred a subdirectory at a time.
+const MOST_LISTED_ENTRIES: usize = 1_000_000;
 
 /// How many paths a result lists in each of its lists; the counts are always whole.
 const MOST_LISTED: usize = 100;
@@ -305,26 +328,79 @@ fn resolve(ctx: &Ctx, text: &str) -> Result<End, ErrorBody> {
 }
 
 /// What has been sent so far, kept outside the transfer so a cancelled one can still say, and
-/// the ends served here, so a cancelled one can wait for them to stop.
+/// the ends whose pipes were dropped before they were closed, so the transfer can still wait for
+/// them.
 #[derive(Default)]
 struct Sent {
     files: AtomicU64,
     bytes: AtomicU64,
-    served_here: Mutex<Vec<oneshot::Receiver<()>>>,
+    deleted: AtomicU64,
+    ends: Ends,
 }
 
 impl Sent {
-    /// Waits, within reason, for every end served here to have stopped: one writing a file has
-    /// then dropped or kept its partial file, never renamed it into place.
-    async fn settle(&self) {
-        let waiting: Vec<_> = self
-            .served_here
+    /// Gives every end left behind time to clean up and stop, together, and waits for them: a
+    /// remote end has its input closed and is killed only if it is still there after
+    /// [`ABORT_GRACE`]. Says whether all of them stopped; an end on this node runs on a thread,
+    /// which cannot be killed.
+    async fn settle(&self) -> bool {
+        let mut stopping = JoinSet::new();
+        for process in self.ends.take() {
+            stopping.spawn(async move {
+                match process {
+                    Process::Remote(handle) => {
+                        handle.close(ABORT_GRACE).await;
+                        true
+                    }
+                    Process::Local(Some(task)) => {
+                        tokio::time::timeout(EXIT_WAIT, task).await.is_ok()
+                    }
+                    Process::Local(None) => true,
+                }
+            });
+        }
+        let mut stopped = true;
+        while let Some(joined) = stopping.join_next().await {
+            stopped &= joined.unwrap_or(false);
+        }
+        stopped
+    }
+}
+
+/// The processes of ends whose pipes were dropped before they were closed.
+#[derive(Clone, Default)]
+struct Ends(Arc<Mutex<Vec<Process>>>);
+
+impl Ends {
+    fn push(&self, process: Process) {
+        self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-            .collect();
-        for stopped in waiting {
-            let _ = tokio::time::timeout(EXIT_WAIT, stopped).await;
+            .push(process);
+    }
+
+    fn take(&self) -> Vec<Process> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+/// The process behind one pipe. Dropped with its pipe before the pipe was closed, as when a
+/// transfer fails or is cancelled half way, it is handed to the transfer's [`Ends`] rather than
+/// killed on the spot, so it can still clean up.
+struct Owned {
+    process: Option<Process>,
+    ends: Ends,
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            self.ends.push(process);
         }
     }
 }
@@ -343,30 +419,38 @@ async fn transfer(
         ctx,
         sent: &sent,
     };
+    // A cancel drops the work, and with it every pipe it holds: each end sees its input end
+    // without the rest of what it expected, so none renames anything into place that was not
+    // complete, and each is then given time to clean up and stop before the transfer replies.
     let finished = {
         let work = job.run(&from, &to, &args);
-        // Dropping the work closes every pipe it holds: a remote end sees its input end and its
-        // process is killed, an end served here sees its pipe close, and neither renames anything
-        // into place that was not complete.
         tokio::select! {
             report = work => Some(report),
             () = ctx.cancelled() => None,
         }
     };
-    let mut report = match finished {
-        Some(report) => report?,
-        None => {
-            sent.settle().await;
-            let files = sent.files.load(Ordering::Relaxed);
-            let bytes = sent.bytes.load(Ordering::Relaxed);
-            return Err(ErrorBody::new(
-                ErrorCode::Cancelled,
-                format!("The transfer from {} to {} was cancelled after {bytes} bytes and {files} files.", from.named(), to.named()),
-            )
-            .with_hint("Run it again to continue: a file resumes where it stopped and a tree sends only what is still missing.")
-            .with_details(json!({"files_sent": files, "bytes_sent": bytes})));
-        }
+    let stopped = sent.settle().await;
+    let Some(report) = finished else {
+        let files = sent.files.load(Ordering::Relaxed);
+        let bytes = sent.bytes.load(Ordering::Relaxed);
+        let deleted = sent.deleted.load(Ordering::Relaxed);
+        let ends = if stopped {
+            "Both ends have stopped."
+        } else {
+            "The end on this node is still finishing."
+        };
+        return Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!(
+                "The transfer from {} to {} was cancelled after sending {bytes} bytes of {files} files and deleting {deleted} entries; those are what was sent, not what the destination confirmed it wrote. {ends}",
+                from.named(),
+                to.named()
+            ),
+        )
+        .with_hint("Run it again to continue: a file resumes where it stopped and a tree sends only what is still missing.")
+        .with_details(json!({"files_sent": files, "bytes_sent": bytes, "deleted": deleted, "stopped": stopped})));
     };
+    let mut report = report?;
     report.dry_run = args.dry_run;
     report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(report)
@@ -484,15 +568,11 @@ impl Transfer<'_> {
             report.would_send = Some(vec![target.path.clone()]);
             return Ok(report);
         }
-        let (resumed, sent) = match self
-            .send_file(from, &target, size, hash, source.mode, partial)
-            .await
-        {
+        let (resumed, sent) = match self.send_file(from, &target, source, partial).await {
             Err(error) if partial.is_some() && error.code == ErrorCode::Conflict => {
                 // What an earlier attempt left was not a prefix of this file (it changed since):
                 // the destination dropped it when the hash did not match, so start over once.
-                self.send_file(from, &target, size, hash, source.mode, None)
-                    .await?
+                self.send_file(from, &target, source, None).await?
             }
             other => other?,
         };
@@ -507,11 +587,13 @@ impl Transfer<'_> {
         &self,
         from: &End,
         to: &End,
-        size: u64,
-        hash: Hash,
-        mode: Option<u32>,
+        source_file: &StatReply,
         hint: Option<u64>,
     ) -> Result<(u64, u64), ErrorBody> {
+        let size = source_file.size;
+        let Some(hash) = source_file.hash else {
+            return Err(changed(from));
+        };
         let mut offset = hint.unwrap_or(0);
         // The source first: a source that refuses leaves nothing behind at the destination.
         let (mut source, ready) = self.get(from, offset).await?;
@@ -521,8 +603,11 @@ impl Transfer<'_> {
         }
         let mut header =
             json!({"op": "put", "path": to.path, "size": size, "hash": hash, "offset": offset});
-        if let Some(mode) = mode {
+        if let Some(mode) = source_file.mode {
             header["mode"] = json!(mode);
+        }
+        if let Some(mtime) = source_file.mtime {
+            header["mtime"] = json!(mtime);
         }
         let mut dest = self.open(to, header).await?;
         let started: PutReady = match dest.first().await {
@@ -552,7 +637,13 @@ impl Transfer<'_> {
             source = again;
         }
         let mut meter = Meter::new(self.ctx, self.sent, size - offset, 1, false);
-        let relayed = relay(&mut source, &mut dest, Some(size - offset), &mut meter).await;
+        let relayed = relay(
+            &mut source,
+            &mut dest,
+            Amount::Exactly(size - offset),
+            &mut meter,
+        )
+        .await;
         if let Err(broken) = relayed {
             return Err(broken.explain(source, dest).await);
         }
@@ -614,7 +705,7 @@ impl Transfer<'_> {
         } else {
             self.manifest(to, args).await?
         };
-        let plan = legion_xfer::plan::plan(
+        let mut plan = legion_xfer::plan::plan(
             &source,
             &dest,
             &PlanOptions {
@@ -622,6 +713,19 @@ impl Transfer<'_> {
                 delete: args.delete,
             },
         );
+        let listed: HashMap<&str, &Entry> = source
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        // Where letter case is ignored, two names that differ only in case are one file, so
+        // sending both would overwrite one with the other on every run. Neither is sent. Where
+        // that cannot be told, the destination is taken to ignore case: holding back is safer.
+        let caseless = there.case_insensitive.unwrap_or(true);
+        let mut conflicts = plan.conflicts.clone();
+        if caseless {
+            conflicts.extend(hold_back_case_collisions(&mut plan, &listed, &to.machine));
+        }
         let mut report = TransferReport {
             from: from.named(),
             to: to.named(),
@@ -632,7 +736,6 @@ impl Transfer<'_> {
         let mut skipped: Vec<SkippedEntry> = Vec::new();
         skipped.extend(on(&from.machine, source.skipped));
         skipped.extend(on(&to.machine, dest.skipped));
-        let conflicts = plan.conflicts.clone();
         if args.dry_run {
             report.files_sent = plan.totals.files_to_send;
             report.bytes_sent = plan.totals.bytes_to_send;
@@ -643,13 +746,16 @@ impl Transfer<'_> {
             report.skipped = report.list(skipped);
             return Ok(report);
         }
-        for names in batches(&plan.delete) {
-            let done: DeleteDone = self
-                .request(to, json!({"op": "delete", "root": to.path, "names": names}))
-                .await?;
-            report.deleted += done.removed;
-            skipped.extend(on(&to.machine, done.skipped));
-        }
+        // Removals that make room for an entry about to be sent as another kind go first; what
+        // the destination has and the source does not goes only once everything new has arrived,
+        // so a transfer that fails half way never leaves a destination with less than it had.
+        let sending: HashSet<&str> = plan.send.iter().map(String::as_str).collect();
+        let (room, extras): (Vec<String>, Vec<String>) = plan
+            .delete
+            .iter()
+            .cloned()
+            .partition(|path| makes_room(path, &sending));
+        report.deleted += self.delete(to, &room, &mut skipped).await?;
         let mut meter = Meter::new(
             self.ctx,
             self.sent,
@@ -664,27 +770,69 @@ impl Transfer<'_> {
             rounds.push(&[]);
         }
         for names in rounds {
+            let budget = archive_budget(names, &listed);
             let done = self
-                .pack_unpack(from, to, names, &mut meter, &mut skipped)
-                .await?;
+                .pack_unpack(
+                    from,
+                    to,
+                    Round {
+                        names,
+                        budget,
+                        expected: args.checksum.then_some(&listed),
+                    },
+                    &mut meter,
+                    &mut skipped,
+                )
+                .await
+                .map_err(|error| left_in_place(error, extras.len(), &to.machine))?;
             report.files_sent += done.files;
             report.bytes_sent += done.bytes;
             skipped.extend(on(&to.machine, done.skipped));
+            if caseless {
+                conflicts.extend(case_conflicts(&done.case_collisions, &to.machine));
+            }
         }
         meter.emit(true);
+        conflicts.sort();
+        conflicts.dedup();
+        report.deleted += self.delete(to, &extras, &mut skipped).await?;
         report.conflicts = report.list(conflicts);
         report.skipped = report.list(skipped);
         Ok(report)
+    }
+
+    /// Removes `names` under the destination's root, in batches; says how many went.
+    async fn delete(
+        &self,
+        to: &End,
+        names: &[String],
+        skipped: &mut Vec<SkippedEntry>,
+    ) -> Result<u64, ErrorBody> {
+        let mut removed = 0;
+        for names in batches(names) {
+            let done: DeleteDone = self
+                .request(to, json!({"op": "delete", "root": to.path, "names": names}))
+                .await?;
+            removed += done.removed;
+            self.sent.deleted.fetch_add(done.removed, Ordering::Relaxed);
+            skipped.extend(on(&to.machine, done.skipped));
+        }
+        Ok(removed)
     }
 
     async fn pack_unpack(
         &self,
         from: &End,
         to: &End,
-        names: &[String],
+        round: Round<'_>,
         meter: &mut Meter<'_>,
         skipped: &mut Vec<SkippedEntry>,
     ) -> Result<UnpackDone, ErrorBody> {
+        let Round {
+            names,
+            budget,
+            expected,
+        } = round;
         let mut source = self
             .open(
                 from,
@@ -700,7 +848,10 @@ impl Transfer<'_> {
         };
         skipped.extend(on(&from.machine, ready.skipped));
         let mut dest = match self
-            .open(to, json!({"op": "unpack", "root": to.path}))
+            .open(
+                to,
+                json!({"op": "unpack", "root": to.path, "names": names, "hash": expected.is_some()}),
+            )
             .await
         {
             Ok(dest) => dest,
@@ -714,7 +865,7 @@ impl Transfer<'_> {
             dest.abort().await;
             return Err(error);
         }
-        if let Err(broken) = relay(&mut source, &mut dest, None, meter).await {
+        if let Err(broken) = relay(&mut source, &mut dest, Amount::AtMost(budget), meter).await {
             return Err(broken.explain(source, dest).await);
         }
         // The archive ended; it is whole only if the source says it finished.
@@ -725,7 +876,56 @@ impl Transfer<'_> {
         dest.end_input().await;
         let done = dest.first::<UnpackDone>().await;
         dest.close().await;
-        done
+        let done = done?;
+        if !done.unplanned.is_empty() {
+            let shown: Vec<&String> = done.unplanned.iter().take(MOST_LISTED).collect();
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "{} sent {} entries that were not planned for this transfer, and {} refused them: {}.",
+                    from.machine,
+                    done.unplanned.len(),
+                    to.machine,
+                    shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            )
+            .with_hint(format!(
+                "legion on {} is not behaving as it should; what was planned arrived, and nothing else was written.",
+                from.machine
+            ))
+            .with_details(json!({"unplanned": shown, "files_sent": done.files}))
+            .with_machine(from.machine.clone()));
+        }
+        if let Some(expected) = expected {
+            // What arrived must be what the source listed: a file edited in place while it was
+            // packed arrives whole and well formed, and only its hash tells.
+            let mismatched: Vec<&String> = done
+                .hashes
+                .iter()
+                .filter(|(path, arrived)| {
+                    let listed = expected.get(path.as_str()).and_then(|entry| entry.hash);
+                    listed.is_none() || **arrived != listed
+                })
+                .map(|(path, _)| path)
+                .collect();
+            if !mismatched.is_empty() {
+                let shown: Vec<&String> = mismatched.iter().copied().take(MOST_LISTED).collect();
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "{} files that arrived on {} are not what {} listed: {}.",
+                        mismatched.len(),
+                        to.machine,
+                        from.machine,
+                        shown.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                )
+                .with_hint("They probably changed while they were sent; run the transfer again once they stop changing.")
+                .with_details(json!({"mismatched": shown}))
+                .with_machine(from.machine.clone()));
+            }
+        }
+        Ok(done)
     }
 
     async fn manifest(&self, end: &End, args: &TransferArgs) -> Result<Manifest, ErrorBody> {
@@ -759,6 +959,113 @@ impl Transfer<'_> {
     async fn open(&self, end: &End, header: Value) -> Result<Conn, ErrorBody> {
         Conn::open(self.fleet, self.ctx, self.sent, end, header).await
     }
+}
+
+/// Takes out of the plan every entry whose name differs only in letter case from another's, at
+/// either end, with whatever is under it, and says why for each.
+fn hold_back_case_collisions(
+    plan: &mut Plan,
+    listed: &HashMap<&str, &Entry>,
+    machine: &str,
+) -> Vec<PlanConflict> {
+    let conflicts = case_conflicts(&plan.case_collisions, machine);
+    if conflicts.is_empty() {
+        return conflicts;
+    }
+    let held: HashSet<&str> = conflicts.iter().map(|c| c.path.as_str()).collect();
+    let is_held = |path: &str| {
+        let mut at = path;
+        loop {
+            if held.contains(at) {
+                return true;
+            }
+            match at.rsplit_once('/') {
+                Some((parent, _)) => at = parent,
+                None => return false,
+            }
+        }
+    };
+    plan.send.retain(|path| !is_held(path));
+    plan.delete.retain(|path| !is_held(path));
+    let files: Vec<&&Entry> = plan
+        .send
+        .iter()
+        .filter_map(|path| listed.get(path.as_str()))
+        .filter(|entry| entry.kind == EntryKind::File)
+        .collect();
+    plan.totals.files_to_send = files.len() as u64;
+    plan.totals.bytes_to_send = files.iter().map(|entry| entry.size).sum();
+    plan.totals.entries_to_delete = plan.delete.len() as u64;
+    conflicts
+}
+
+/// One conflict for each name in each collision.
+fn case_conflicts(collisions: &[CaseCollision], machine: &str) -> Vec<PlanConflict> {
+    let mut conflicts = Vec::new();
+    for collision in collisions {
+        for path in &collision.paths {
+            let others: Vec<&str> = collision
+                .paths
+                .iter()
+                .filter(|other| *other != path)
+                .map(String::as_str)
+                .collect();
+            conflicts.push(PlanConflict {
+                path: path.clone(),
+                reason: format!(
+                    "its name differs only in letter case from {}, and the file system on {machine} cannot hold both names; rename one of them to send both",
+                    others.join(", ")
+                ),
+            });
+        }
+    }
+    conflicts
+}
+
+/// Whether removing `path` makes room for an entry about to be sent: the entry itself, of another
+/// kind at the destination, or something inside a directory that a file or link replaces.
+fn makes_room(path: &str, sending: &HashSet<&str>) -> bool {
+    let mut at = path;
+    loop {
+        if sending.contains(at) {
+            return true;
+        }
+        match at.rsplit_once('/') {
+            Some((parent, _)) => at = parent,
+            None => return false,
+        }
+    }
+}
+
+/// Says in a failed transfer's error that what the destination has and the source does not was
+/// left where it was, since the new content did not all arrive.
+fn left_in_place(error: ErrorBody, extras: usize, machine: &str) -> ErrorBody {
+    if extras == 0 {
+        return error;
+    }
+    let said = format!(
+        "The {extras} entries on {machine} that the source no longer has were left in place, since not everything new arrived."
+    );
+    let hint = match &error.hint {
+        Some(hint) => format!("{hint} {said}"),
+        None => said,
+    };
+    let mut details = match error.details.clone() {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    details.insert("left_in_place".to_owned(), json!(extras));
+    let mut error = error.with_hint(hint);
+    error.details = Some(Value::Object(details));
+    error
+}
+
+/// One archive's worth of a tree: its names, the most bytes the archive may take, and, with
+/// `checksum`, what the source listed, to check what arrives against.
+struct Round<'a> {
+    names: &'a [String],
+    budget: u64,
+    expected: Option<&'a HashMap<&'a str, &'a Entry>>,
 }
 
 fn changed(from: &End) -> ErrorBody {
@@ -832,12 +1139,14 @@ struct Conn {
     machine: String,
     reader: BufReader<BoxRead>,
     writer: Option<BoxWrite>,
-    process: Process,
+    process: Owned,
     /// Whether a reply has been read, which tells a server that never started from one that
     /// failed on the way.
     answered: bool,
     noise_lines: usize,
     noise_bytes: usize,
+    /// When the pipe was opened, which the first reply's time limit counts from.
+    opened: tokio::time::Instant,
 }
 
 /// One line of a `manifest` reply.
@@ -866,6 +1175,7 @@ impl Conn {
         end: &End,
         mut header: Value,
     ) -> Result<Conn, ErrorBody> {
+        header["protocol"] = json!(stream::STREAM_PROTOCOL);
         let (reader, writer, process): (BoxRead, BoxWrite, Process) = if end.remote {
             let op = header
                 .get("op")
@@ -905,15 +1215,8 @@ impl Conn {
             let principal = ctx.principal().to_owned();
             let input = SyncIoBridge::new(server_in);
             let output = SyncIoBridge::new(server_out);
-            let (stopped, waiting) = oneshot::channel();
-            sent.served_here
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(waiting);
             let task = tokio::task::spawn_blocking(move || {
-                let served = stream::serve(&host, Some(&principal), input, output);
-                let _ = stopped.send(());
-                served
+                stream::serve(&host, Some(&principal), input, output)
             });
             (
                 Box::new(client_in),
@@ -925,14 +1228,26 @@ impl Conn {
             machine: end.machine.clone(),
             reader: BufReader::with_capacity(CHUNK, reader),
             writer: Some(writer),
-            process,
+            process: Owned {
+                process: Some(process),
+                ends: sent.ends.clone(),
+            },
             answered: false,
             noise_lines: 0,
             noise_bytes: 0,
+            opened: tokio::time::Instant::now(),
         };
         let mut line = header.to_string().into_bytes();
         line.push(b'\n');
-        if let Err(error) = conn.write(&line).await {
+        let written = match tokio::time::timeout(FIRST_REPLY_TIMEOUT, conn.write(&line)).await {
+            Ok(written) => written,
+            Err(_) => {
+                let error = conn.stalled(FIRST_REPLY_TIMEOUT);
+                conn.abort().await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = written {
             let error = conn
                 .ended(&format!("before it took its header ({error})"))
                 .await;
@@ -953,20 +1268,27 @@ impl Conn {
         writer.flush().await
     }
 
-    /// The next reply, which has the shape `T` or is the other end's error. Before the first
-    /// one, lines that are neither (a login banner, a shell's own noise, even one that happens
-    /// to be JSON) are skipped within bounds; after it, anything else is the other end gone wrong.
+    /// The next reply, which has the shape `T` or is the other end's error. `{"busy": true}`
+    /// lines, which say the other end is at work, are passed over wherever they come. Before the
+    /// first reply, lines of text that are neither (a login banner, a shell's own noise, even one
+    /// that happens to be JSON) are skipped within bounds, while bytes that are not text at all
+    /// mean the other end speaks another protocol; after it, anything else is the other end gone
+    /// wrong.
     async fn first<T: DeserializeOwned>(&mut self) -> Result<T, ErrorBody> {
         loop {
             let line = self.line().await?;
-            if let Ok(value @ Value::Object(_)) = serde_json::from_slice::<Value>(&line) {
-                if let Some(error) = value.get("error")
+            if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&line) {
+                if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                    self.answered = true;
+                    continue;
+                }
+                if let Some(error) = fields.get("error")
                     && let Ok(error) = serde_json::from_value::<ErrorBody>(error.clone())
                 {
                     self.answered = true;
                     return Err(with_machine(error, &self.machine));
                 }
-                if let Ok(reply) = serde_json::from_value::<T>(value) {
+                if let Ok(reply) = serde_json::from_value::<T>(Value::Object(fields)) {
                     self.answered = true;
                     return Ok(reply);
                 }
@@ -982,32 +1304,52 @@ impl Conn {
                 .with_hint("Update legion there, so both ends speak the same stream protocol.")
                 .with_machine(self.machine.clone()));
             }
+            if std::str::from_utf8(&line).is_err() {
+                return Err(self.mismatch("with bytes that are not text"));
+            }
             self.noise_lines += 1;
             self.noise_bytes += line.len();
-            if self.noise_lines > MOST_NOISE_LINES || self.noise_bytes > MOST_NOISE_BYTES {
-                return Err(ErrorBody::new(
-                    ErrorCode::Unreachable,
-                    format!(
-                        "{} printed {} lines that are not legion's before answering a stream.",
-                        self.machine, self.noise_lines
-                    ),
-                )
-                .with_hint("Something on the way (a login script, a banner) writes to stdout; make it quiet for sessions without a terminal.")
-                .with_machine(self.machine.clone()));
+            if self.noise_lines > MOST_NOISE_LINES {
+                return Err(self.mismatch(&format!(
+                    "with {} lines that are not legion's",
+                    self.noise_lines
+                )));
             }
         }
     }
 
-    /// One line of output, without reading more than a reply can be.
+    /// One line of output, read within the time and length a reply may take. Before the first
+    /// reply, a byte that cannot be in a line of text ends the read at once: it is data from a
+    /// node that speaks another protocol, which may never send a newline.
     async fn line(&mut self) -> Result<Vec<u8>, ErrorBody> {
+        let (wait, longest) = if self.answered {
+            (IDLE_TIMEOUT, LONGEST_REPLY)
+        } else {
+            (
+                FIRST_REPLY_TIMEOUT.saturating_sub(self.opened.elapsed()),
+                MOST_NOISE_BYTES.saturating_sub(self.noise_bytes),
+            )
+        };
         let mut line = Vec::new();
-        let read = (&mut self.reader)
-            .take(LONGEST_REPLY as u64 + 1)
-            .read_until(b'\n', &mut line)
-            .await;
+        let binary_is_foreign = !self.answered;
+        let read = tokio::time::timeout(
+            wait,
+            read_line(&mut self.reader, &mut line, longest, binary_is_foreign),
+        )
+        .await;
         match read {
-            Ok(0) => Err(self.ended("before it answered").await),
-            Ok(_) if line.len() > LONGEST_REPLY => Err(ErrorBody::new(
+            Err(_) => Err(self.stalled(if self.answered {
+                IDLE_TIMEOUT
+            } else {
+                FIRST_REPLY_TIMEOUT
+            })),
+            Ok(Ok(Read::Line)) => Ok(line),
+            Ok(Ok(Read::End)) => Err(self.ended("before it answered").await),
+            Ok(Ok(Read::Binary)) => Err(self.mismatch("with bytes that are not text")),
+            Ok(Ok(Read::TooLong)) if !self.answered => {
+                Err(self.mismatch("with more than a banner before its answer"))
+            }
+            Ok(Ok(Read::TooLong)) => Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
                     "{} answered a stream with a line longer than {LONGEST_REPLY} bytes.",
@@ -1015,16 +1357,76 @@ impl Conn {
                 ),
             )
             .with_machine(self.machine.clone())),
-            Ok(_) => Ok(line),
-            Err(error) => Err(self.ended(&format!("while it answered ({error})")).await),
+            Ok(Err(error)) => Err(self.ended(&format!("while it answered ({error})")).await),
         }
     }
 
-    /// Reads a `manifest` reply: one entry per line, then the line that ends it.
+    /// The other end answered with something other than this protocol's first line.
+    fn mismatch(&self, how: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!(
+                "{} answered a stream {how}, where a line of JSON was expected, so it does not speak this node's stream protocol.",
+                self.machine
+            ),
+        )
+        .with_hint(format!(
+            "Update legion on {} (or on this machine, if it is the older one). If a login script or banner prints to stdout there, make it quiet for sessions without a terminal.",
+            self.machine
+        ))
+        .with_machine(self.machine.clone())
+    }
+
+    /// The other end went silent for `waited`.
+    fn stalled(&self, waited: Duration) -> ErrorBody {
+        let seconds = waited.as_secs();
+        if self.answered {
+            ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "{} went {seconds} seconds without a word in the middle of a stream.",
+                    self.machine
+                ),
+            )
+            .with_hint("The connection or the machine stalled; run the transfer again to continue where it stopped.")
+            .with_machine(self.machine.clone())
+        } else {
+            ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "{} did not answer a stream within {seconds} seconds.",
+                    self.machine
+                ),
+            )
+            .with_hint(format!(
+                "Check that {} is reachable. If it runs an older legion, update it, so both speak the same stream protocol.",
+                self.machine
+            ))
+            .with_machine(self.machine.clone())
+        }
+    }
+
+    /// Reads a `manifest` reply: one entry per line, then the line that ends it, which must come
+    /// and must count what came before it.
     async fn manifest(&mut self) -> Result<Manifest, ErrorBody> {
+        self.manifest_at_most(MOST_LISTED_ENTRIES).await
+    }
+
+    async fn manifest_at_most(&mut self, most: usize) -> Result<Manifest, ErrorBody> {
         let mut manifest = Manifest::default();
         loop {
             match self.first::<Listed>().await? {
+                Listed::Entry(_) if manifest.entries.len() == most => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "The tree on {} holds more than {most} entries, more than one transfer compares.",
+                            self.machine
+                        ),
+                    )
+                    .with_hint("Transfer its subdirectories one at a time.")
+                    .with_machine(self.machine.clone()));
+                }
                 Listed::Entry(entry) => manifest.entries.push(entry),
                 Listed::Done(done) => {
                     if done.entries != manifest.entries.len() as u64 {
@@ -1050,8 +1452,8 @@ impl Conn {
     /// stderr when it ran on another machine.
     async fn ended(&mut self, when: &str) -> ErrorBody {
         let machine = self.machine.clone();
-        match &mut self.process {
-            Process::Local(task) => {
+        match self.process.process.as_mut() {
+            Some(Process::Local(task)) => {
                 if let Some(task) = task.take()
                     && let Ok(Ok(Err(error))) = tokio::time::timeout(EXIT_WAIT, task).await
                 {
@@ -1063,7 +1465,12 @@ impl Conn {
                 )
                 .with_machine(machine)
             }
-            Process::Remote(handle) => {
+            None => ErrorBody::new(
+                ErrorCode::Failed,
+                format!("The stream on {machine} ended {when}."),
+            )
+            .with_machine(machine),
+            Some(Process::Remote(handle)) => {
                 let (code, stderr) = handle.collect_exit_info(EXIT_WAIT).await;
                 let status = code
                     .map(|code| format!(" (exit status {code})"))
@@ -1094,8 +1501,9 @@ impl Conn {
     async fn finish(mut self) -> Result<(), ErrorBody> {
         self.writer.take();
         let machine = self.machine.clone();
-        let result = match &mut self.process {
-            Process::Local(task) => match task.take() {
+        let result = match self.process.process.as_mut() {
+            None => Ok(()),
+            Some(Process::Local(task)) => match task.take() {
                 Some(task) => match tokio::time::timeout(EXIT_WAIT, task).await {
                     Ok(Ok(Ok(()))) => Ok(()),
                     Ok(Ok(Err(error))) => Err(with_machine(error, &machine)),
@@ -1107,7 +1515,7 @@ impl Conn {
                 },
                 None => Ok(()),
             },
-            Process::Remote(handle) => match handle.collect_exit_info(FINISH_WAIT).await {
+            Some(Process::Remote(handle)) => match handle.collect_exit_info(FINISH_WAIT).await {
                 (Some(0), _) => Ok(()),
                 _ => Err(self.ended("before it finished").await),
             },
@@ -1126,27 +1534,77 @@ impl Conn {
     /// Lets the server finish on its own: its input ends and it is given a moment to exit.
     async fn close(mut self) {
         self.end_input().await;
-        match self.process {
-            Process::Remote(handle) => handle.close(EXIT_WAIT).await,
-            Process::Local(Some(task)) => {
+        match self.process.process.take() {
+            Some(Process::Remote(handle)) => handle.close(EXIT_WAIT).await,
+            Some(Process::Local(Some(task))) => {
                 drop(self.reader);
                 let _ = tokio::time::timeout(EXIT_WAIT, task).await;
             }
-            Process::Local(None) => {}
+            Some(Process::Local(None)) | None => {}
         }
     }
 
-    /// Stops the server now. Its input ends without the rest of what it expected, so nothing it
-    /// was writing is renamed into place.
-    async fn abort(self) {
+    /// Stops the server. Its input ends without the rest of what it expected, so nothing it was
+    /// writing is renamed into place, and it is given [`ABORT_GRACE`] to remove what it was
+    /// writing and exit before it is killed.
+    async fn abort(mut self) {
+        let process = self.process.process.take();
         drop(self.writer);
         drop(self.reader);
-        match self.process {
-            Process::Remote(handle) => handle.close(Duration::ZERO).await,
-            Process::Local(Some(task)) => {
+        match process {
+            Some(Process::Remote(handle)) => handle.close(ABORT_GRACE).await,
+            Some(Process::Local(Some(task))) => {
                 let _ = tokio::time::timeout(EXIT_WAIT, task).await;
             }
-            Process::Local(None) => {}
+            Some(Process::Local(None)) | None => {}
+        }
+    }
+}
+
+/// How reading a line ended.
+enum Read {
+    /// A whole line, or the last bytes before the end.
+    Line,
+    /// The end, before any byte.
+    End,
+    /// More than the longest line allowed.
+    TooLong,
+    /// A NUL byte, which no line of text holds.
+    Binary,
+}
+
+/// Reads one line into `line`, newline included, without taking more than `longest` bytes, and
+/// stopping at the first NUL byte when `stop_at_binary` says to, without waiting for a newline.
+async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    longest: usize,
+    stop_at_binary: bool,
+) -> std::io::Result<Read> {
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                Read::End
+            } else {
+                Read::Line
+            });
+        }
+        let (chunk, found) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(end) => (&available[..=end], true),
+            None => (available, false),
+        };
+        if stop_at_binary && chunk.contains(&0) {
+            return Ok(Read::Binary);
+        }
+        if line.len() + chunk.len() > longest {
+            return Ok(Read::TooLong);
+        }
+        line.extend_from_slice(chunk);
+        let used = chunk.len();
+        reader.consume(used);
+        if found {
+            return Ok(Read::Line);
         }
     }
 }
@@ -1157,8 +1615,13 @@ fn with_machine(error: ErrorBody, machine: &str) -> ErrorBody {
 
 /// Where a relay broke.
 enum Broken {
+    /// This end moved no bytes for [`IDLE_TIMEOUT`]: the source sent none, or the destination
+    /// took none.
+    Stalled { source: bool },
     /// The source's output failed or ended before it should have.
     Source(String),
+    /// The source sent more than it may: the limit it went past.
+    Excess(u64),
     /// The destination stopped taking input.
     Destination(String),
 }
@@ -1167,11 +1630,42 @@ impl Broken {
     /// The error to report, preferring what the end that broke said itself.
     async fn explain(self, mut source: Conn, mut dest: Conn) -> ErrorBody {
         match self {
+            Broken::Stalled { source: at_source } => {
+                let machine = if at_source {
+                    source.machine.clone()
+                } else {
+                    dest.machine.clone()
+                };
+                source.abort().await;
+                dest.abort().await;
+                ErrorBody::new(
+                    ErrorCode::Timeout,
+                    format!(
+                        "{machine} moved no bytes for {} seconds in the middle of a transfer.",
+                        IDLE_TIMEOUT.as_secs()
+                    ),
+                )
+                .with_hint("The connection or the machine stalled; run the transfer again to continue where it stopped.")
+                .with_machine(machine)
+            }
             Broken::Source(what) => {
                 let error = source.ended(&what).await;
                 source.abort().await;
                 dest.abort().await;
                 error
+            }
+            Broken::Excess(limit) => {
+                let machine = source.machine.clone();
+                source.abort().await;
+                dest.abort().await;
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "{machine} sent more than the {limit} bytes that were planned, so the transfer was stopped there."
+                    ),
+                )
+                .with_hint("The source may have grown while it was sent; run the transfer again. If it keeps happening, legion there is not behaving as it should.")
+                .with_machine(machine)
             }
             Broken::Destination(what) => {
                 // A destination that refused mid-way says why on its output before it exits.
@@ -1187,49 +1681,100 @@ impl Broken {
     }
 }
 
-/// Copies the source's output to the destination's input in fixed chunks: `exact` bytes, or to
-/// the end of the source's output.
+/// How much a relay may move.
+#[derive(Clone, Copy, Debug)]
+enum Amount {
+    /// A file's bytes from the offset on, exactly as many as its source announced.
+    Exactly(u64),
+    /// An archive, which ends when its source ends it and is cut off once it passes this many
+    /// bytes: what the planned entries can take, headers included.
+    AtMost(u64),
+}
+
+/// Copies the source's output to the destination's input in fixed chunks, never more than
+/// `amount` allows: a source that sends more is stopped before the excess reaches the destination.
 async fn relay(
     source: &mut Conn,
     dest: &mut Conn,
-    exact: Option<u64>,
+    amount: Amount,
     meter: &mut Meter<'_>,
 ) -> Result<(), Broken> {
     let mut buf = vec![0u8; CHUNK];
     let mut copied = 0u64;
+    let limit = match amount {
+        Amount::Exactly(total) | Amount::AtMost(total) => total,
+    };
     loop {
-        let want = match exact {
-            Some(total) => usize::try_from(total - copied).unwrap_or(CHUNK).min(CHUNK),
-            None => CHUNK,
+        // An archive is read one byte past its limit, to tell an archive that ends there from one
+        // that goes on.
+        let room = match amount {
+            Amount::Exactly(_) => limit - copied,
+            Amount::AtMost(_) => limit - copied + 1,
         };
+        let want = usize::try_from(room).unwrap_or(CHUNK).min(CHUNK);
         if want == 0 {
             break;
         }
-        let read = source
-            .reader
-            .read(&mut buf[..want])
+        let read = tokio::time::timeout(IDLE_TIMEOUT, source.reader.read(&mut buf[..want]))
             .await
+            .map_err(|_| Broken::Stalled { source: true })?
             .map_err(|error| Broken::Source(format!("while it sent ({error})")))?;
         if read == 0 {
-            if exact.is_some() {
+            if let Amount::Exactly(_) = amount {
                 return Err(Broken::Source(format!(
                     "after {copied} bytes, before the rest"
                 )));
             }
             break;
         }
-        dest.write(&buf[..read])
+        if copied + read as u64 > limit {
+            return Err(Broken::Excess(limit));
+        }
+        tokio::time::timeout(IDLE_TIMEOUT, dest.write(&buf[..read]))
             .await
+            .map_err(|_| Broken::Stalled { source: false })?
             .map_err(|error| Broken::Destination(format!("while it received ({error})")))?;
         copied += read as u64;
         meter.add(&buf[..read]);
     }
+    if let Amount::Exactly(_) = amount {
+        // All that was announced has passed; a source that has more is not behaving.
+        let mut more = [0u8; 1];
+        if let Ok(Ok(read)) = tokio::time::timeout(EXIT_WAIT, source.reader.read(&mut more)).await
+            && read > 0
+        {
+            return Err(Broken::Excess(limit));
+        }
+    }
     Ok(())
+}
+
+/// The most bytes an archive of `names` can take: each entry's content padded to whole tar
+/// blocks, and room for its headers, a long name or link target and an extended header for a
+/// time before 1970, then the blocks that end an archive. A source that sends more is not sending
+/// what was planned.
+fn archive_budget(names: &[String], listed: &HashMap<&str, &Entry>) -> u64 {
+    const BLOCK: u64 = 512;
+    let padded = |len: u64| len.div_ceil(BLOCK) * BLOCK;
+    let entries: u64 = names
+        .iter()
+        .map(|name| {
+            let (size, target) = listed.get(name.as_str()).map_or((0, 0), |entry| {
+                (
+                    entry.size,
+                    entry.link_target.as_ref().map_or(0, String::len),
+                )
+            });
+            4 * BLOCK + padded(size) + 2 * padded(name.len() as u64 + 1) + padded(target as u64 + 1)
+        })
+        .sum();
+    entries + 20 * BLOCK
 }
 
 /// Counts what passes and tells the caller a few times a second.
 struct Meter<'a> {
-    ctx: &'a Ctx,
+    /// The call progress goes to; none where nobody listens.
+    ctx: Option<&'a Ctx>,
     sent: &'a Sent,
     bytes_total: u64,
     files_total: u64,
@@ -1246,7 +1791,7 @@ impl<'a> Meter<'a> {
         tar: bool,
     ) -> Meter<'a> {
         Meter {
-            ctx,
+            ctx: Some(ctx),
             sent,
             bytes_total,
             files_total,
@@ -1270,7 +1815,10 @@ impl<'a> Meter<'a> {
             return;
         }
         self.last = Instant::now();
-        self.ctx.emit(
+        let Some(ctx) = self.ctx else {
+            return;
+        };
+        ctx.emit(
             EventKind::Progress,
             json!({
                 "bytes": self.sent.bytes.load(Ordering::Relaxed),
@@ -1445,6 +1993,153 @@ mod tests {
         assert_eq!(join("/home/me/inbox/", "a.txt"), "/home/me/inbox/a.txt");
         assert_eq!(join(r"C:\Users\me", "a.txt"), r"C:\Users\me\a.txt");
         assert_eq!(join("~", "a.txt"), "~/a.txt");
+    }
+
+    /// A pipe end that nobody writes to until a test says so, standing for the other node.
+    fn conn(machine: &str) -> (Conn, tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (reader, peer_out) = tokio::io::duplex(CHUNK);
+        let (writer, peer_in) = tokio::io::duplex(CHUNK);
+        let conn = Conn {
+            machine: machine.to_owned(),
+            reader: BufReader::with_capacity(CHUNK, Box::new(reader)),
+            writer: Some(Box::new(writer)),
+            process: Owned {
+                process: Some(Process::Local(None)),
+                ends: Ends::default(),
+            },
+            answered: false,
+            noise_lines: 0,
+            noise_bytes: 0,
+            opened: tokio::time::Instant::now(),
+        };
+        (conn, peer_out, peer_in)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_end_that_never_answers_times_out_naming_it() {
+        let (mut conn, _out, _in) = conn("pi");
+        let started = tokio::time::Instant::now();
+        let error = conn.first::<StatReply>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert_eq!(error.machine.as_deref(), Some("pi"));
+        assert!(error.hint.unwrap().contains("older legion"));
+        assert_eq!(started.elapsed(), FIRST_REPLY_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_end_that_says_it_is_busy_is_waited_for() {
+        let (mut conn, mut out, _in) = conn("pi");
+        let talker = tokio::spawn(async move {
+            for _ in 0..30 {
+                tokio::time::sleep(stream::HEARTBEAT).await;
+                out.write_all(b"{\"busy\":true}\n").await.unwrap();
+            }
+            out.write_all(b"{\"kind\":\"file\",\"size\":3}\n")
+                .await
+                .unwrap();
+            out
+        });
+        let reply = conn.first::<StatReply>().await.unwrap();
+        assert_eq!((reply.kind.as_str(), reply.size), ("file", 3));
+        // After the first reply, a silence longer than the idle limit is a stall.
+        let _out = talker.await.unwrap();
+        let error = conn.first::<StatReply>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert!(error.message.contains("middle of a stream"), "{error:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bytes_that_are_not_text_before_a_reply_are_another_protocol() {
+        let (mut conn, mut out, _in) = conn("old");
+        out.write_all(b"Welcome!\nreadme.txt\0\0\0\0\0\x000000644\0")
+            .await
+            .unwrap();
+        let error = conn.first::<PackReady>().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unsupported, "{error:?}");
+        assert!(error.hint.unwrap().contains("Update legion on old"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_that_stops_moving_times_out_naming_the_end_that_stalled() {
+        let sent = Sent::default();
+        let (mut source, mut source_out, _source_in) = conn("tower");
+        let (mut dest, _dest_out, mut dest_in) = conn("pi");
+        source_out.write_all(&[7u8; 100]).await.unwrap();
+        let drain = tokio::spawn(async move {
+            let mut taken = Vec::new();
+            let _ = dest_in.read_to_end(&mut taken).await;
+            taken.len()
+        });
+        let mut meter = Meter {
+            ctx: None,
+            sent: &sent,
+            bytes_total: 1000,
+            files_total: 1,
+            tar: None,
+            last: Instant::now(),
+        };
+        let started = tokio::time::Instant::now();
+        let broken = relay(&mut source, &mut dest, Amount::Exactly(1000), &mut meter)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(started.elapsed(), IDLE_TIMEOUT);
+        let error = broken.explain(source, dest).await;
+        assert_eq!(error.code, ErrorCode::Timeout, "{error:?}");
+        assert_eq!(error.machine.as_deref(), Some("tower"));
+        assert_eq!(drain.await.unwrap(), 100);
+        drop(source_out);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_is_bounded_and_must_end_with_its_count() {
+        let entry = |path: &str| {
+            format!(
+                "{{\"path\":\"{path}\",\"kind\":\"file\",\"size\":1,\"mtime\":{{\"secs\":1,\"nanos\":0}}}}\n"
+            )
+        };
+        let listing = |count: usize, done: Option<usize>| {
+            let mut text: String = (0..count).map(|at| entry(&format!("f{at}"))).collect();
+            if let Some(said) = done {
+                text.push_str(&format!("{{\"done\":true,\"entries\":{said}}}\n"));
+            }
+            text
+        };
+        for (text, most, code, says) in [
+            (
+                listing(4, Some(4)),
+                3,
+                ErrorCode::Failed,
+                "more than 3 entries",
+            ),
+            (
+                listing(2, Some(3)),
+                10,
+                ErrorCode::Failed,
+                "said it listed 3",
+            ),
+            (listing(2, None), 10, ErrorCode::Failed, "ended"),
+        ] {
+            let (mut conn, mut out, _in) = conn("pi");
+            out.write_all(text.as_bytes()).await.unwrap();
+            drop(out);
+            let error = conn.manifest_at_most(most).await.unwrap_err();
+            assert_eq!(error.code, code, "{error:?}");
+            assert!(error.message.contains(says), "{error:?}");
+            assert_eq!(error.machine.as_deref(), Some("pi"));
+        }
+        let (mut conn, mut out, _in) = conn("pi");
+        out.write_all(listing(3, Some(3)).as_bytes()).await.unwrap();
+        assert_eq!(conn.manifest_at_most(3).await.unwrap().entries.len(), 3);
+    }
+
+    #[test]
+    fn only_what_is_replaced_by_another_kind_makes_room() {
+        let sending: HashSet<&str> = ["x", "new.txt"].into_iter().collect();
+        assert!(makes_room("x", &sending));
+        assert!(makes_room("x/inside/deep.txt", &sending));
+        assert!(!makes_room("extra.txt", &sending));
+        assert!(!makes_room("xy/z", &sending));
     }
 
     #[test]

@@ -6,17 +6,24 @@
 //! every path and value rides inside the header, so nothing a caller supplies is ever quoted for a
 //! remote shell.
 //!
+//! Every header carries `protocol`, the version of this exchange it speaks. A node that does not
+//! speak that version, or does not know the operation, answers `unsupported` and names what it
+//! speaks, so two nodes of different ages fail plainly rather than misread each other.
+//!
 //! Every reply starts with one JSON line, so a client can skip a login banner before it and tell a
-//! refusal (`{"error": …}`) from data:
+//! refusal (`{"error": …}`) from data. While an operation works on something long (hashing a
+//! large file, listing a large tree, verifying what it received), it writes `{"busy": true}` every
+//! [`HEARTBEAT`] where a line is awaited, so a reader can give up on silence without giving up on
+//! work:
 //!
 //! | `op` | Header | Reply |
 //! | --- | --- | --- |
 //! | `manifest` | `{root, checksum?, exclude?}` | one line per entry, then `{done, entries, skipped}` |
-//! | `stat` | `{path, checksum?, if_size?}` | `{kind, size, mode?, hash?, partial?}` |
+//! | `stat` | `{path, checksum?, if_size?}` | `{kind, size, mode?, hash?, mtime?, partial?, …}` |
 //! | `get` | `{path, offset?}` | `{size}`, then the bytes from `offset` to the end |
-//! | `put` | `{path, size, hash, offset?, mode?}` | `{offset}`; reads the rest; `{ok, size, hash}` |
+//! | `put` | `{path, size, hash, offset?, mode?, mtime?}` | `{offset}`; reads the rest; `{ok, size, hash}` |
 //! | `pack` | `{root, names}` | `{ready, skipped}`, then a tar stream of those names |
-//! | `unpack` | `{root}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
+//! | `unpack` | `{root, names, hash?}` | `{ready}`; reads a tar stream to its end; `{ok, files, …}` |
 //! | `delete` | `{root, names}` | `{removed, skipped}` |
 //!
 //! Each operation is authorised as the file tool it amounts to would be (`fs.read` for the first
@@ -29,10 +36,12 @@
 //! ends and the reason goes to stderr. A receiver that refuses replies and returns at once, which
 //! closes its input, so a sender writing to it is never left blocked.
 
-use std::fs;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, FileTimes};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
@@ -40,9 +49,21 @@ use legion_core::policy::Policy;
 use legion_core::{Access, Door, Grant, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
-use legion_xfer::{Entry, Hash, ManifestOptions, SkippedEntry, resolve_relative_path};
+use legion_xfer::{
+    CaseCollision, Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, Timestamp,
+    resolve_relative_path,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+/// The version of this exchange: a header names it, and a node refuses one it does not speak.
+pub const STREAM_PROTOCOL: u32 = 1;
+
+/// How often an operation at work on something long says so, where a reply line is awaited.
+pub const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// The operations this node knows, as `unsupported` names them.
+const OPS: [&str; 7] = ["manifest", "stat", "get", "put", "pack", "unpack", "delete"];
 
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
 /// transfer sends in batches well below this; anything longer is a client gone wrong.
@@ -52,9 +73,13 @@ pub const LONGEST_HEADER: usize = 64 * 1024 * 1024;
 /// a listing's lines are not written one by one.
 const OUTPUT_BUFFER: usize = 64 * 1024;
 
-/// How much of the input an `unpack` reads past the end of its archive before it stops waiting
-/// for the sender to finish: the padding a tar writer adds is a few blocks.
+/// How much of the input an operation reads past what it took before it stops: the padding a tar
+/// writer adds after an archive is a few blocks, and a sender that goes on past this has its pipe
+/// closed on it rather than being read forever.
 const MOST_TRAILING: u64 = 1024 * 1024;
+
+/// How many chunks of input wait for an operation that reads it on its own thread.
+const QUEUED_CHUNKS: usize = 4;
 
 /// The node a stream is served for: where its files are, and the name its errors and audit lines
 /// carry.
@@ -111,20 +136,31 @@ pub(crate) enum Op {
         #[serde(default)]
         offset: u64,
     },
-    /// A sender's `offset` is not read: what is on disk decides where it starts.
+    /// A sender's `offset` is not read: what is on disk decides where it starts. `mtime`, the
+    /// source's modification time, is given to the file once it is in place, so a tree that holds
+    /// it later finds it unchanged.
     Put {
         path: String,
         size: u64,
         hash: String,
         #[serde(default)]
         mode: Option<u32>,
+        #[serde(default)]
+        mtime: Option<Timestamp>,
     },
     Pack {
         root: String,
         names: Vec<String>,
     },
+    /// `names` are the entries planned for this archive; anything else in it is refused, so a
+    /// source can only deliver what the destination agreed to take.
+    /// With `hash`, the files written are hashed once they are in place and the hashes sent
+    /// back, so the sender can check they are what it listed.
     Unpack {
         root: String,
+        names: Vec<String>,
+        #[serde(default)]
+        hash: bool,
     },
     Delete {
         root: String,
@@ -162,7 +198,7 @@ pub(crate) fn op_tool(op: &str) -> Option<(&'static str, Effect)> {
 }
 
 /// What `stat` says about a path.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct StatReply {
     /// `file`, `dir`, `symlink` (one that leads nowhere), `other` or `missing`, after following a
     /// last part that is a symbolic link.
@@ -173,9 +209,17 @@ pub(crate) struct StatReply {
     pub mode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<Hash>,
+    /// A file's modification time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<Timestamp>,
     /// The length of a partial file a `put` left beside it, which the next one continues from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<u64>,
+    /// For a directory, or a path that does not exist yet, whether the file system it is or
+    /// would be on ignores letter case, so two names that differ only in case are one there.
+    /// Absent when that cannot be told without writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_insensitive: Option<bool>,
 }
 
 /// The line that ends a `manifest`.
@@ -231,6 +275,16 @@ pub(crate) struct UnpackDone {
     pub bytes: u64,
     #[serde(default)]
     pub skipped: Vec<SkippedEntry>,
+    /// Entries the archive carried that were not planned, refused and drained unread.
+    #[serde(default)]
+    pub unplanned: Vec<String>,
+    /// Entries of the archive whose names differ only in letter case.
+    #[serde(default)]
+    pub case_collisions: Vec<CaseCollision>,
+    /// When asked for, each file written and its hash as it now is on disk, or nothing when it
+    /// could not be read back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hashes: BTreeMap<String, Option<Hash>>,
 }
 
 /// The line that ends a `delete`.
@@ -348,6 +402,40 @@ fn read_header<R: BufRead>(input: &mut R) -> Result<(Header, Value), ErrorBody> 
             format!("The stream's header is not JSON: {error}."),
         )
     })?;
+    let Value::Object(fields) = &value else {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "The stream's header is not a JSON object.",
+        ));
+    };
+    match fields.get("protocol") {
+        Some(Value::Number(number)) if number.as_u64() == Some(u64::from(STREAM_PROTOCOL)) => {}
+        Some(Value::Number(number)) => {
+            return Err(unsupported(format!(
+                "The stream asks for stream protocol {number}, and this node speaks stream protocol {STREAM_PROTOCOL}."
+            )));
+        }
+        _ => {
+            return Err(unsupported(format!(
+                "The stream's header names no protocol, and this node speaks stream protocol {STREAM_PROTOCOL}."
+            )));
+        }
+    }
+    match fields.get("op").and_then(Value::as_str) {
+        Some(op) if OPS.contains(&op) => {}
+        Some(op) => {
+            return Err(unsupported(format!(
+                "This node does not know the stream operation {op}; it knows {}.",
+                OPS.join(", ")
+            )));
+        }
+        None => {
+            return Err(unsupported(format!(
+                "The stream's header names no operation; this node knows {}.",
+                OPS.join(", ")
+            )));
+        }
+    }
     let header: Header = serde_json::from_value(value.clone()).map_err(|error| {
         ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -360,6 +448,15 @@ fn read_header<R: BufRead>(input: &mut R) -> Result<(Header, Value), ErrorBody> 
         map.remove("as");
     }
     Ok((header, recorded))
+}
+
+/// What a node answers a header it cannot serve: what it speaks instead.
+fn unsupported(message: String) -> ErrorBody {
+    ErrorBody::new(ErrorCode::Unsupported, message)
+        .with_hint(
+            "Update legion on whichever machine is older, so both speak the same stream protocol.",
+        )
+        .with_details(json!({"protocol": [STREAM_PROTOCOL], "ops": OPS}))
 }
 
 /// Decides whom the operation acts as and whether that principal may do it, as a tool call would
@@ -450,9 +547,10 @@ fn run<R: BufRead, W: Write>(
             size,
             hash,
             mode,
-        } => put(grant, &path, size, &hash, mode, input, output),
+            mtime,
+        } => put(grant, &path, size, &hash, mode, mtime, input, output),
         Op::Pack { root, names } => pack(grant, &root, &names, output),
-        Op::Unpack { root } => unpack(grant, &root, input, output),
+        Op::Unpack { root, names, hash } => unpack(grant, &root, &names, hash, input, output),
         Op::Delete { root, names } => delete(grant, &root, &names, output),
     }
 }
@@ -489,12 +587,8 @@ fn list<W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Read)?;
-    let listing = manifest(
-        grant,
-        &host.paths,
-        &root,
-        &ManifestOptions { checksum, exclude },
-    )?;
+    let options = ManifestOptions { checksum, exclude };
+    let listing = busy(output, || manifest(grant, &host.paths, &root, &options))??;
     write_listing(output, listing.entries, listing.skipped)
         .map_err(|error| Failure::Raw(gone(&error)))
 }
@@ -525,12 +619,17 @@ fn stat<W: Write>(
     if_size: Option<u64>,
     output: &mut W,
 ) -> Result<(), Failure> {
-    let path = resolve_root(grant, path, Access::Read)?;
+    // The partial file a `put` to this path would continue sits beside the path as given, a link
+    // kept as a link, and is only looked at when it may be read itself.
+    let given = grant.check_path(path, Access::Read)?;
     let partial = || {
-        legion_xfer::resume_offset(&path)
+        legion_xfer::part_path(&given)
             .ok()
+            .filter(|part| grant.check_path(part, Access::Read).is_ok())
+            .and_then(|_| legion_xfer::resume_offset(&given).ok())
             .filter(|len| *len > 0)
     };
+    let path = resolve_root(grant, path, Access::Read)?;
     let found = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -538,10 +637,9 @@ fn stat<W: Write>(
                 output,
                 &StatReply {
                     kind: "missing".to_owned(),
-                    size: 0,
-                    mode: None,
-                    hash: None,
                     partial: partial(),
+                    case_insensitive: case_insensitive(&path),
+                    ..StatReply::default()
                 },
             );
         }
@@ -551,28 +649,26 @@ fn stat<W: Write>(
     let answer = if kind.is_dir() {
         StatReply {
             kind: "dir".to_owned(),
-            size: 0,
-            mode: None,
-            hash: None,
-            partial: None,
+            case_insensitive: case_insensitive(&path),
+            ..StatReply::default()
         }
     } else if kind.is_file() {
         let hash = checksum && if_size.is_none_or(|size| size == found.len());
-        let listed = legion_xfer::manifest::build(
-            &path,
-            &ManifestOptions {
-                checksum: hash,
-                exclude: Vec::new(),
-            },
-        )
-        .map_err(xfer_error)?;
+        let options = ManifestOptions {
+            checksum: hash,
+            exclude: Vec::new(),
+        };
+        let listed =
+            busy(output, || legion_xfer::manifest::build(&path, &options))?.map_err(xfer_error)?;
         let entry = listed.entries.into_iter().next();
         StatReply {
             kind: "file".to_owned(),
             size: entry.as_ref().map_or(found.len(), |entry| entry.size),
             mode: entry.as_ref().and_then(|entry| entry.mode),
+            mtime: entry.as_ref().map(|entry| entry.mtime),
             hash: entry.and_then(|entry| entry.hash),
             partial: partial(),
+            case_insensitive: None,
         }
     } else {
         StatReply {
@@ -582,13 +678,58 @@ fn stat<W: Write>(
                 "other"
             }
             .to_owned(),
-            size: 0,
-            mode: None,
-            hash: None,
-            partial: None,
+            ..StatReply::default()
         }
     };
     reply(output, &answer)
+}
+
+/// Whether the file system holding `path`, or the nearest directory above it that exists,
+/// ignores letter case, told without writing anything: a name there, one of its entries or of the
+/// directories above it, is looked up again with the case of its letters flipped, and the two are
+/// the same file only where case is ignored. `None` when no name nearby has a letter to flip.
+fn case_insensitive(path: &Path) -> Option<bool> {
+    let dir = path
+        .ancestors()
+        .find(|dir| fs::metadata(dir).is_ok_and(|meta| meta.is_dir()))?;
+    let inside = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .take(64)
+        .filter_map(Result::ok)
+        .map(|entry| entry.path());
+    let above = dir.ancestors().map(Path::to_path_buf);
+    for candidate in inside.chain(above) {
+        // A link and what it leads to are the same file whatever their names.
+        if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            continue;
+        }
+        let (Some(parent), Some(name)) = (
+            candidate.parent(),
+            candidate.file_name().and_then(|name| name.to_str()),
+        ) else {
+            continue;
+        };
+        let flipped: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect();
+        if flipped == name {
+            continue;
+        }
+        let twin = parent.join(flipped);
+        return Some(
+            fs::symlink_metadata(&twin).is_ok()
+                && same_file::is_same_file(&candidate, &twin).unwrap_or(false),
+        );
+    }
+    None
 }
 
 fn get<W: Write>(grant: &Grant, path: &str, offset: u64, output: &mut W) -> Result<(), Failure> {
@@ -606,16 +747,22 @@ fn get<W: Write>(grant: &Grant, path: &str, offset: u64, output: &mut W) -> Resu
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn put<R: BufRead, W: Write>(
     grant: &Grant,
     path: &str,
     size: u64,
     hash: &str,
     mode: Option<u32>,
+    mtime: Option<Timestamp>,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
     let target = grant.check_path(path, Access::Write)?;
+    // The partial file beside the target is created, continued, truncated and removed, so it is
+    // held to what the target is: beside a role's root, it is outside it.
+    let part = legion_xfer::part_path(&target).map_err(xfer_error)?;
+    grant.check_path(&part, Access::Write)?;
     let hash: Hash = hash.parse().map_err(xfer_error)?;
     if fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
         return Err(Failure::Reply(
@@ -642,7 +789,15 @@ fn put<R: BufRead, W: Write>(
         offset = 0;
     }
     reply(output, &PutReady { offset })?;
-    let done = legion_xfer::put(&target, size, hash, offset, input, mode).map_err(xfer_error)?;
+    let done = feed(input, Some(size - offset), output, |fed| {
+        legion_xfer::put(&target, size, hash, offset, fed, mode)
+    })?
+    .map_err(xfer_error)?;
+    // The file is whole and in place; a time that cannot be set leaves it as it is, and a later
+    // listing just sees it as changed.
+    if let Some(time) = mtime.and_then(system_time) {
+        let _ = fs::set_times(&target, FileTimes::new().set_modified(time));
+    }
     reply(
         output,
         &PutDone {
@@ -675,17 +830,20 @@ fn pack<W: Write>(
     };
     let mut keep = Vec::with_capacity(names.len());
     for name in names {
-        match checked(grant, &root, name, Access::Read) {
-            Ok(path) => match fs::symlink_metadata(&path) {
-                Ok(_) => keep.push(name.as_str()),
-                Err(error) => ready.skipped.push(SkippedEntry {
-                    path: name.clone(),
-                    reason: format!("it cannot be read since it was listed: {error}"),
-                }),
-            },
-            Err(error) => ready.skipped.push(SkippedEntry {
+        let found = named(grant, &root, name, Access::Read).and_then(|path| {
+            fs::symlink_metadata(&path)
+                .map(|_| ())
+                .map_err(|error| Named::Refused(error.to_string()))
+        });
+        match found {
+            Ok(()) => keep.push(name.as_str()),
+            Err(Named::Missing) => ready.skipped.push(SkippedEntry {
                 path: name.clone(),
-                reason: error.message,
+                reason: "it is no longer there since it was listed".to_owned(),
+            }),
+            Err(Named::Refused(reason)) => ready.skipped.push(SkippedEntry {
+                path: name.clone(),
+                reason,
             }),
         }
     }
@@ -698,10 +856,23 @@ fn pack<W: Write>(
 fn unpack<R: BufRead, W: Write>(
     grant: &Grant,
     root: &str,
+    names: &[String],
+    hash: bool,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Write)?;
+    let mut planned = HashSet::with_capacity(names.len());
+    let mut ancestors = HashSet::new();
+    for name in names {
+        let name = legion_xfer::validate_relative_path(name).map_err(xfer_error)?;
+        let mut parent = name.as_str();
+        while let Some((above, _)) = parent.rsplit_once('/') {
+            ancestors.insert(above.to_owned());
+            parent = above;
+        }
+        planned.insert(name);
+    }
     if fs::metadata(&root).is_ok_and(|meta| !meta.is_dir()) {
         return Err(Failure::Reply(
             ErrorBody::new(
@@ -715,23 +886,45 @@ fn unpack<R: BufRead, W: Write>(
         ));
     }
     reply(output, &UnpackReady { ready: true })?;
-    let mut refused: Vec<SkippedEntry> = Vec::new();
-    let report = legion_xfer::unpack_filtered(&root, &mut *input, |rel, _| {
-        match checked(grant, &root, rel, Access::Write) {
-            Ok(_) => true,
-            Err(error) => {
+    let (report, mut refused, unplanned, hashes) = feed(input, None, output, |fed| {
+        let mut refused: Vec<SkippedEntry> = Vec::new();
+        let mut unplanned: Vec<String> = Vec::new();
+        let report = legion_xfer::unpack_filtered(&root, fed, |rel, kind| {
+            // A directory on the way to a planned entry may come along; nothing else may.
+            let expected =
+                planned.contains(rel) || (kind == EntryKind::Dir && ancestors.contains(rel));
+            if !expected {
+                unplanned.push(rel.to_owned());
                 refused.push(SkippedEntry {
                     path: rel.to_owned(),
-                    reason: error.message,
+                    reason: "it was not among the entries planned for this transfer".to_owned(),
                 });
-                false
+                return false;
+            }
+            match checked(grant, &root, rel, Access::Write) {
+                Ok(_) => true,
+                Err(error) => {
+                    refused.push(SkippedEntry {
+                        path: rel.to_owned(),
+                        reason: error.message,
+                    });
+                    false
+                }
+            }
+        });
+        // Read back what was written, now it is in place, for the sender to compare.
+        let mut hashes = BTreeMap::new();
+        if hash && let Ok(report) = &report {
+            for rel in &report.files {
+                let read = resolve_relative_path(&root, rel)
+                    .and_then(|path| legion_xfer::hash::hash_file(&path))
+                    .ok();
+                hashes.insert(rel.clone(), read);
             }
         }
-    })
-    .map_err(xfer_error)?;
-    // What follows the archive's end is the writer's padding; reading it lets the sender finish
-    // its last write instead of finding the pipe closed.
-    let _ = io::copy(&mut input.take(MOST_TRAILING), &mut io::sink());
+        (report, refused, unplanned, hashes)
+    })?;
+    let report = report.map_err(xfer_error)?;
     let mut skipped: Vec<SkippedEntry> = report
         .skipped
         .into_iter()
@@ -755,6 +948,9 @@ fn unpack<R: BufRead, W: Write>(
             symlinks: report.symlinks.len() as u64,
             bytes: report.bytes,
             skipped,
+            unplanned,
+            case_collisions: report.case_collisions,
+            hashes,
         },
     )
 }
@@ -780,13 +976,15 @@ fn delete<W: Write>(
     // Deepest first, so a directory's children are gone before it is.
     valid.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     valid.dedup();
-    for (_, name) in valid {
-        match remove_one(grant, &root, &name) {
-            Ok(true) => done.removed += 1,
-            Ok(false) => {}
-            Err(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+    busy(output, || {
+        for (_, name) in valid {
+            match remove_one(grant, &root, &name) {
+                Ok(true) => done.removed += 1,
+                Ok(false) => {}
+                Err(reason) => done.skipped.push(SkippedEntry { path: name, reason }),
+            }
         }
-    }
+    })?;
     done.skipped.sort();
     reply(output, &done)
 }
@@ -794,7 +992,11 @@ fn delete<W: Write>(
 /// Removes one name under `root`, never following a symbolic link; says whether there was
 /// anything to remove, or why it was left.
 fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
-    let path = checked(grant, root, name, Access::Write).map_err(|error| error.message)?;
+    let path = match named(grant, root, name, Access::Write) {
+        Ok(path) => path,
+        Err(Named::Missing) => return Ok(false),
+        Err(Named::Refused(reason)) => return Err(reason),
+    };
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -819,6 +1021,167 @@ fn remove_one(grant: &Grant, root: &Path, name: &str) -> Result<bool, String> {
         fs::remove_file(&path).map_err(|error| error.to_string())
     };
     removed.map(|()| true)
+}
+
+/// Runs `work` on a thread of its own and says `{"busy": true}` every [`HEARTBEAT`] until it is
+/// done, so a reader waiting for the next line knows the operation is at work, not stuck.
+fn busy<W: Write, T: Send>(output: &mut W, work: impl FnOnce() -> T + Send) -> Result<T, Failure> {
+    std::thread::scope(|scope| {
+        let (done, finished) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = done.send(work());
+        });
+        wait_for(&finished, output)
+    })
+}
+
+/// Like [`busy`], for work that reads the operation's input: this thread passes the input on in
+/// chunks (`limit` bytes at most, or to its end) while the work runs on its own, then says it is
+/// busy until the work is done. The input itself stays on this thread, which a locked standard
+/// input needs. Once the work stops reading, at most [`MOST_TRAILING`] more bytes are read, so a
+/// sender's last write finds a reader and a sender that goes on finds the pipe closed.
+fn feed<R: BufRead, W: Write, T: Send>(
+    input: &mut R,
+    limit: Option<u64>,
+    output: &mut W,
+    work: impl FnOnce(Fed) -> T + Send,
+) -> Result<T, Failure> {
+    std::thread::scope(|scope| {
+        let (chunks, fed) = mpsc::sync_channel::<Vec<u8>>(QUEUED_CHUNKS);
+        let (done, finished) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = done.send(work(Fed {
+                chunks: fed,
+                chunk: Vec::new(),
+                at: 0,
+            }));
+        });
+        let mut left = limit.unwrap_or(u64::MAX);
+        let mut trailing = 0u64;
+        let mut taking = true;
+        while left > 0 && trailing <= MOST_TRAILING {
+            let available = match input.fill_buf() {
+                Ok([]) | Err(_) => break,
+                Ok(available) => available,
+            };
+            let take = usize::try_from(left)
+                .unwrap_or(usize::MAX)
+                .min(available.len());
+            if taking && chunks.send(available[..take].to_vec()).is_err() {
+                taking = false;
+            }
+            if !taking {
+                trailing += take as u64;
+            }
+            input.consume(take);
+            left -= take as u64;
+        }
+        drop(chunks);
+        wait_for(&finished, output)
+    })
+}
+
+/// Waits for work to finish, saying it is busy every [`HEARTBEAT`].
+fn wait_for<W: Write, T>(finished: &Receiver<T>, output: &mut W) -> Result<T, Failure> {
+    loop {
+        match finished.recv_timeout(HEARTBEAT) {
+            Ok(result) => return Ok(result),
+            Err(RecvTimeoutError::Timeout) => {
+                line(output, &json!({"busy": true}))
+                    .and_then(|()| output.flush())
+                    .map_err(|error| Failure::Raw(gone(&error)))?;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Failure::Reply(ErrorBody::new(
+                    ErrorCode::Internal,
+                    "The stream operation stopped without an answer.",
+                )));
+            }
+        }
+    }
+}
+
+/// The input of an operation, as [`feed`] passes it on.
+struct Fed {
+    chunks: Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    at: usize,
+}
+
+impl Read for Fed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.at == self.chunk.len() {
+            match self.chunks.recv() {
+                Ok(chunk) => {
+                    self.chunk = chunk;
+                    self.at = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.chunk.len() - self.at);
+        buf[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+/// A manifest's time as the system's, or nothing for one it cannot hold.
+fn system_time(time: Timestamp) -> Option<SystemTime> {
+    let nanos = Duration::from_nanos(u64::from(time.nanos));
+    if time.secs >= 0 {
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(time.secs.unsigned_abs()))?
+            .checked_add(nanos)
+    } else {
+        UNIX_EPOCH
+            .checked_sub(Duration::from_secs(time.secs.unsigned_abs()))?
+            .checked_add(nanos)
+    }
+}
+
+/// Why a name a peer sent cannot be used.
+enum Named {
+    /// A part of it does not exist.
+    Missing,
+    /// It may not be used, for this reason.
+    Refused(String),
+}
+
+/// A relative name a peer sent for an entry under `root`, walked part by part without following
+/// a symbolic link: every part before the last must be a real directory, so a link inside the tree
+/// cannot lead a `pack` or `delete` somewhere else. The last part, when it is a link, is the link
+/// itself. The path is then checked for `access` like any other.
+fn named(grant: &Grant, root: &Path, name: &str, access: Access) -> Result<PathBuf, Named> {
+    let name = legion_xfer::validate_relative_path(name)
+        .map_err(|error| Named::Refused(xfer_error(error).message))?;
+    let parts: Vec<&str> = name.split('/').collect();
+    let mut path = root.to_path_buf();
+    for (at, part) in parts.iter().enumerate() {
+        path.push(part);
+        if at + 1 == parts.len() {
+            break;
+        }
+        let way = parts[..=at].join("/");
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Named::Refused(format!(
+                    "{way} on its way is a symbolic link, which is never followed"
+                )));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(Named::Refused(format!(
+                    "{way} on its way is not a directory"
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Named::Missing),
+            Err(error) => return Err(Named::Refused(error.to_string())),
+        }
+    }
+    grant
+        .check_path(&path, access)
+        .map_err(|error| Named::Refused(error.message))
 }
 
 /// A relative name under `root`, validated as a transfer path and checked for `access`.

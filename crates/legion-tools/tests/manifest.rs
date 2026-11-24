@@ -108,3 +108,88 @@ async fn a_confined_role_lists_only_its_own_paths() {
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Denied);
 }
+
+/// Whether this process can read a directory it has taken every permission from, as root can, in
+/// which case nothing is unreadable to it.
+#[cfg(unix)]
+fn reads_anything(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = dir.join("probe");
+    fs::create_dir(&probe).unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read_dir(&probe).is_ok();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir(&probe).unwrap();
+    readable
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn what_could_not_be_read_is_bounded_like_the_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let root = f.dir.path().join("home/projects/locked");
+    fs::create_dir_all(&root).unwrap();
+    if reads_anything(&root) {
+        return;
+    }
+    for at in 0..150 {
+        let dir = root.join(format!("d{at:03}"));
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let listed = f
+        .call(json!({"path": "~/projects/locked", "limit": 5}), None)
+        .await
+        .unwrap();
+    for at in 0..150 {
+        let dir = root.join(format!("d{at:03}"));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(listed["skipped"].as_array().unwrap().len(), 5, "{listed}");
+    assert_eq!(listed["skipped_total"], 150);
+    assert_eq!(listed["truncated"], true);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_role_without_admin_never_looks_inside_legions_own_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    // Legion's files live under the home, as they do by default.
+    let legion = home.join(".legion");
+    let config = legion.join("config");
+    fs::create_dir_all(&config).unwrap();
+    if reads_anything(&config) {
+        return;
+    }
+    fs::write(
+        config.join("policy.toml"),
+        "[principals.\"agent:x\"]\nrole = \"reader\"\n[roles.reader]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+    // Something in it that a walk would trip over and name, were it to look.
+    let hidden = config.join("hidden-name");
+    fs::create_dir(&hidden).unwrap();
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::write(home.join("notes.txt"), b"n").unwrap();
+    let node = Node::new(
+        Paths::under(&legion).with_home(&home),
+        legion_tools::registry(),
+    );
+    let mut call = Call::new(
+        Door::Cli,
+        "fs.manifest",
+        json!({"path": "~", "checksum": true}),
+    );
+    call.as_principal = Some("agent:x".to_owned());
+    let listed = node.call(call).await;
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+    let listed = listed.unwrap();
+    let text = listed.to_string();
+    assert!(!text.contains("hidden-name"), "{text}");
+    assert!(!text.contains("policy.toml"), "{text}");
+    assert!(text.contains("notes.txt"), "{text}");
+    assert!(text.contains("effect:admin"), "{text}");
+}
