@@ -1586,3 +1586,97 @@ allow = ["effect:read", "effect:write", "effect:destroy"]
         "a"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writing_and_editing_through_a_symlink_updates_target_and_refuses_dangling_links() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    let real = f.work.join("real.txt");
+    let link = f.work.join("link.txt");
+    std::fs::write(&real, "before\n").unwrap();
+    symlink(&real, &link).unwrap();
+
+    // `fs.edit` through the symlink preserves the link and edits `real.txt`.
+    f.call(
+        "fs.edit",
+        json!({"path": f.p(&link), "old": "before", "new": "after"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "after\n");
+
+    // `fs.write` (overwrite) through the symlink preserves the link and replaces `real.txt`.
+    f.call(
+        "fs.write",
+        json!({"path": f.p(&link), "content": "overwritten\n"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "overwritten\n");
+
+    // `fs.write` (mode: "create") on an existing symlink fails with `exists`.
+    assert_eq!(
+        f.call(
+            "fs.write",
+            json!({"path": f.p(&link), "content": "new", "mode": "create"}),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        ErrorCode::Exists
+    );
+
+    // Dangling symlink is refused cleanly for both `fs.write` and `fs.edit`, leaving the link
+    // untouched and never creating the missing target.
+    let missing = f.work.join("nowhere.txt");
+    let dangling = f.work.join("dangling.txt");
+    symlink(&missing, &dangling).unwrap();
+    let write_err = f
+        .call(
+            "fs.write",
+            json!({"path": f.p(&dangling), "content": "nope"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(write_err.code, ErrorCode::NotFound);
+    assert!(
+        write_err.message.contains("dangling"),
+        "{}",
+        write_err.message
+    );
+    assert!(!missing.exists());
+    assert!(
+        std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let edit_err = f
+        .call(
+            "fs.edit",
+            json!({"path": f.p(&dangling), "old": "a", "new": "b"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(edit_err.code, ErrorCode::NotFound);
+    assert!(
+        edit_err.message.contains("dangling"),
+        "{}",
+        edit_err.message
+    );
+}

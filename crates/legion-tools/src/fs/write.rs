@@ -3,12 +3,12 @@
 use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
+use legion_core::{Access, CancellationToken, Ctx, Grant, Registry, ToolError};
 use legion_os::atomic::{WriteOptions, write_atomic};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,8 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         })?,
     };
 
-    let path = ctx.grant().check_path(&args.path, Access::Write)?;
+    let checked = ctx.grant().check_path(&args.path, Access::Write)?;
+    let grant = ctx.grant().clone();
     let mode = args.mode;
     let expect_hash = args.expect_hash;
     let parents = args.parents;
@@ -125,6 +126,8 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         if cancel.is_cancelled() {
             return Err(cancelled_error("fs.write"));
         }
+
+        let path = resolve_write_target(&grant, checked, mode == WriteMode::Create)?;
 
         let existed = match fs::symlink_metadata(&path) {
             Ok(meta) => {
@@ -264,7 +267,8 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
             "Provide the exact text to replace, or use fs.write to replace the whole file.",
         ));
     }
-    let path = ctx.grant().check_path(&args.path, Access::Write)?;
+    let checked = ctx.grant().check_path(&args.path, Access::Write)?;
+    let grant = ctx.grant().clone();
     let old = args.old;
     let new = args.new;
     let all = args.all;
@@ -274,6 +278,7 @@ async fn edit(ctx: &Ctx, args: EditArgs) -> Result<EditResult, ToolError> {
         if cancel.is_cancelled() {
             return Err(cancelled_error("fs.edit"));
         }
+        let path = resolve_write_target(&grant, checked, false)?;
         let meta = match fs::metadata(&path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -479,6 +484,47 @@ async fn mkdir(ctx: &Ctx, args: MkdirArgs) -> Result<MkdirResult, ToolError> {
         })
     })
     .await
+}
+
+/// Resolves a terminal symbolic link so writing or editing through it updates the target file
+/// instead of replacing the link with a regular file. The resolved target is passed through
+/// `Grant::check_path` for write as well, and a dangling link is refused cleanly.
+fn resolve_write_target(
+    grant: &Grant,
+    path: PathBuf,
+    create_only: bool,
+) -> Result<PathBuf, ToolError> {
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if create_only {
+                return Err(ErrorBody::new(
+                    ErrorCode::Exists,
+                    format!("{} already exists.", path.display()),
+                )
+                .with_hint("Use mode \"overwrite\" or \"append\" to modify an existing file."));
+            }
+            let target = match dunce::canonicalize(&path) {
+                Ok(target) => target,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        format!(
+                            "{} is a dangling symbolic link whose target does not exist.",
+                            path.display()
+                        ),
+                    )
+                    .with_hint(
+                        "Write to the target path directly, or remove the broken symbolic link first.",
+                    ));
+                }
+                Err(error) => return Err(map_io_error("resolve symbolic link", &path, error)),
+            };
+            grant.check_path(&target, Access::Write)
+        }
+        Ok(_) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(map_io_error("inspect", &path, error)),
+    }
 }
 
 fn check_expected_hash(path: &Path, expected: &str, actual: &str) -> Result<(), ToolError> {
