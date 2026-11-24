@@ -142,6 +142,9 @@ fn is_windows_reserved_device(stem: &str) -> bool {
             | "PRN"
             | "AUX"
             | "NUL"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM0"
             | "COM1"
             | "COM2"
             | "COM3"
@@ -151,6 +154,10 @@ fn is_windows_reserved_device(stem: &str) -> bool {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "COM\u{00B9}"
+            | "COM\u{00B2}"
+            | "COM\u{00B3}"
+            | "LPT0"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -160,6 +167,9 @@ fn is_windows_reserved_device(stem: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "LPT\u{00B9}"
+            | "LPT\u{00B2}"
+            | "LPT\u{00B3}"
     )
 }
 
@@ -194,10 +204,24 @@ mod tests {
             "aux.tar.gz",
             "NUL",
             "nul.json",
+            "CONIN$",
+            "conin$.txt",
+            "CONOUT$",
+            "ConOut$.log",
+            "COM0",
+            "com0.txt",
             "COM1",
             "com9.log",
+            "COM\u{00B9}",
+            "com\u{00B2}.txt",
+            "COM\u{00B3}.log",
+            "LPT0",
+            "lpt0.bin",
             "LPT1",
             "lpt9.bin",
+            "LPT\u{00B9}",
+            "lpt\u{00B2}.txt",
+            "LPT\u{00B3}.tar.gz",
             "CON .txt",
             "trailing.",
             "trailing ",
@@ -211,9 +235,7 @@ mod tests {
 
         for good in [
             "console.txt",
-            "COM0",
             "COM10",
-            "LPT0",
             "LPT10",
             "null.txt",
             ".hidden",
