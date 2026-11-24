@@ -1,5 +1,7 @@
-//! `test`: tools that exist only so the doors can be tested end to end, built when the `testing`
-//! feature is on and never in a release.
+//! `test`: tools and reusable helpers that exist only so doors, sessions and pairing can be tested
+//! end to end, built when the `testing` feature is on and never in a release.
+
+pub mod sshd;
 
 use std::time::Duration;
 

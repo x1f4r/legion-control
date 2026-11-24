@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import test from 'node:test';
-import { blockerOf, emergencyAbort, realPowerRefusal } from '../scripts/legion-e2e.mjs';
+import {
+  blockerOf,
+  buildOpenSshEd25519Key,
+  decodeInvite,
+  emergencyAbort,
+  realPowerRefusal,
+} from '../scripts/legion-e2e.mjs';
 
 // scripts/legion-e2e.mjs restarts the machine it runs on if calling the restart off fails, so the
 // guards around its real power steps are tested here, where nothing is scheduled at all.
@@ -39,4 +46,32 @@ test('a step whose prerequisite failed or did not run is skipped too', () => {
   assert.equal(blockerOf(['l2'], [], [l2]), l2);
   assert.equal(blockerOf(['l2'], [l1], []), undefined);
   assert.equal(blockerOf([], [l1], [l2]), undefined);
+});
+
+test('decodeInvite and buildOpenSshEd25519Key handle the pairing invite contract', () => {
+  const seed = crypto.randomBytes(32);
+  const payload = {
+    v: 1,
+    id: '0123456789abcdef0123456789abcdef',
+    node: 'tower',
+    hosts: ['tower.example'],
+    port: 22,
+    user: 'me',
+    host_keys: ['ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'],
+    key: seed.toString('base64'),
+    principal: 'phone',
+    expires: '2026-11-24T12:15:00Z',
+  };
+  const encoded = `legion-invite-1.${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`;
+  assert.deepEqual(decodeInvite(encoded), payload);
+  assert.throws(() => decodeInvite('not-an-invite'));
+
+  const pem = buildOpenSshEd25519Key(seed, 'test-key');
+  assert.ok(pem.startsWith('-----BEGIN OPENSSH PRIVATE KEY-----\n'));
+  assert.ok(pem.endsWith('-----END OPENSSH PRIVATE KEY-----\n'));
+  const raw = Buffer.from(
+    pem.replace(/-----.*-----\n/g, '').replace(/\n/g, ''),
+    'base64',
+  );
+  assert.equal(raw.subarray(0, 15).toString('ascii'), 'openssh-key-v1\0');
 });

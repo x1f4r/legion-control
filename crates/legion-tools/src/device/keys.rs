@@ -97,6 +97,25 @@ impl InvitePayload {
         }
         Ok(payload)
     }
+
+    /// Decodes the standard-base64 32-byte Ed25519 private seed carried in `key`.
+    pub fn decode_seed(&self) -> Result<[u8; 32], ErrorBody> {
+        let raw = STANDARD.decode(&self.key).map_err(|error| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Invite key is not valid standard base64: {error}."),
+            )
+        })?;
+        <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Invite key decoded to {} bytes; expected a 32-byte Ed25519 seed.",
+                    raw.len()
+                ),
+            )
+        })
+    }
 }
 
 /// Freshly generated single-use Ed25519 key pair for an invite.

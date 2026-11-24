@@ -144,6 +144,8 @@ jobs:
             echo "E2E_DIR=$e2e"
             echo "E2E_FAR_HOME=$far_home"
             echo "E2E_FAR_BIN=$far_bin"
+            echo "E2E_FAR_AUTH_KEYS=$keys/authorized_keys"
+            echo "E2E_FAR_HOST_KEY=$keys/host.pub"
             echo "E2E_SSHD_LOG=$e2e/sshd.log"
           } >> "$GITHUB_ENV"
 
@@ -247,6 +249,7 @@ jobs:
         run: >-
           node scripts/legion-e2e.mjs --bin target/release/legion --work "$E2E_DIR/work"
           --far legion-e2e-far --gate legion-e2e-gate --far-home "$E2E_FAR_HOME" --far-bin "$E2E_FAR_BIN"
+          --far-auth-keys "$E2E_FAR_AUTH_KEYS" --far-host-key "$E2E_FAR_HOST_KEY" --far-port 2222
           --real-power
       # From PowerShell rather than Git's bash, whose PATH would put Git's own ssh ahead of the
       # Windows OpenSSH client people use.
