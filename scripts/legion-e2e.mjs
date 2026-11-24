@@ -56,7 +56,7 @@ const TRICKY_TEXT = TRICKY.join(' | ');
 
 function usage(message) {
   if (message) console.error(`legion-e2e: ${message}`);
-  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--far-auth-keys <path>] [--far-host-key <path>] [--far-port <port>] [--skip <steps>] [--real-power]');
+  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--far-auth-keys <path>] [--far-host-key <path>] [--far-port <port>] [--far-shell cmd|powershell] [--skip <steps>] [--real-power]');
   process.exit(2);
 }
 
@@ -78,6 +78,10 @@ function parseArgs(argv) {
   if (!Number.isInteger(farPort) || farPort < 1 || farPort > 65535) {
     usage(`--far-port must be 1..65535, not ${options['far-port']}`);
   }
+  const farShell = options['far-shell'] ?? null;
+  if (farShell !== null && farShell !== 'cmd' && farShell !== 'powershell') {
+    usage(`--far-shell must be cmd or powershell, not ${farShell}`);
+  }
   return {
     bin: path.resolve(options.bin),
     work: path.resolve(options.work),
@@ -88,10 +92,32 @@ function parseArgs(argv) {
     farAuthKeys: options['far-auth-keys'] ? path.resolve(options['far-auth-keys']) : null,
     farHostKey: options['far-host-key'] ? path.resolve(options['far-host-key']) : null,
     farPort,
+    farShell,
     // Step names or their letters (`h,i3`) to leave out, for a machine without, say, systemd.
     skip: (options.skip ?? '').split(',').map(s => s.trim()).filter(Boolean),
     realPower: options['real-power'] === true,
   };
+}
+
+/**
+ * Verifies that the forced command on the line carrying `marker` inside Windows
+ * `administrators_authorized_keys` matches the expected DefaultShell form (`powershell` requires
+ * `command="& '`, `cmd` forbids `command="& '`). Returns `null` when valid or a failure message.
+ */
+export function windowsForcedCommandError(authKeysContents, marker, shell) {
+  if (!shell) return null;
+  const line = authKeysContents.split(/\r?\n/).find(l => l.includes(marker));
+  if (!line) {
+    return `administrators_authorized_keys does not contain a line with ${marker}`;
+  }
+  const isPowerShellForm = line.includes('command="& \'');
+  if (shell === 'powershell' && !isPowerShellForm) {
+    return `Windows PowerShell leg expected PowerShell forced command (command="& '...") for ${marker}, got: ${line}`;
+  }
+  if (shell === 'cmd' && (!line.includes('command="') || isPowerShellForm)) {
+    return `Windows cmd leg expected cmd.exe forced command (not PowerShell) for ${marker}, got: ${line}`;
+  }
+  return null;
 }
 
 /**
@@ -885,6 +911,11 @@ step('g5 device.invite --on far creates a single-use invite with pinned host key
 
   const listed = ok('device.list', {}, { on: 'far' });
   check(listed.invites.some(inv => inv.id === payload.id && inv.principal === 'e2e:gate'), 'device.list --on far does not show the pending invite', listed);
+  if (windows && opts.farShell) {
+    const adminAuth = path.join(process.env.ProgramData ?? 'C:\\ProgramData', 'ssh', 'administrators_authorized_keys');
+    const err = windowsForcedCommandError(fs.readFileSync(adminAuth, 'utf8'), `legion-invite:${payload.id}`, opts.farShell);
+    check(err === null, err ?? '');
+  }
 
   pairState.invite = invited;
   pairState.payload = payload;
@@ -927,6 +958,10 @@ step('g6 connecting with the temporary invite key enrols a fresh device key over
     check(fs.existsSync(adminAuth), `${adminAuth} does not exist after pairing on Windows`);
     const contents = fs.readFileSync(adminAuth, 'utf8');
     check(contents.includes('legion-device:e2e-phone'), `${adminAuth} does not contain the enrolled device line`);
+    if (opts.farShell) {
+      const err = windowsForcedCommandError(contents, 'legion-device:e2e-phone', opts.farShell);
+      check(err === null, err ?? '');
+    }
   }
   return `device ${reply.device} (${reply.role})`;
 }, ['g5']);
@@ -1023,6 +1058,10 @@ step('g9 on Windows, pairing works from a legion.exe and LEGION_HOME path contai
     const authAfterInvite = fs.readFileSync(adminAuth, 'utf8');
     check(authAfterInvite.includes('--account'), 'Windows administrators_authorized_keys invite line missing --account');
     check(authAfterInvite.includes('--home'), 'Windows administrators_authorized_keys invite line missing --home');
+    if (opts.farShell) {
+      const err = windowsForcedCommandError(authAfterInvite, `legion-invite:${payload.id}`, opts.farShell);
+      check(err === null, err ?? '');
+    }
 
     const tempKey = path.join(spaceKeys, 'temp_invite_key');
     fs.writeFileSync(tempKey, buildOpenSshEd25519Key(Buffer.from(payload.key, 'base64'), 'legion-e2e-space-invite'));
@@ -1044,6 +1083,11 @@ step('g9 on Windows, pairing works from a legion.exe and LEGION_HOME path contai
     const reply = JSON.parse(enrol.stdout.trim());
     check(reply.ok === true && reply.node === 'far-space' && reply.principal === 'e2e:gate', 'unexpected space-path enrolment reply', reply);
     enrolledDevice = reply.device;
+    if (opts.farShell) {
+      const authAfterEnrol = fs.readFileSync(adminAuth, 'utf8');
+      const err = windowsForcedCommandError(authAfterEnrol, `legion-device:${enrolledDevice}`, opts.farShell);
+      check(err === null, err ?? '');
+    }
 
     const rpcInput = [
       JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'hello', params: { client: 'legion-e2e-space', version: '1', protocol: 1 } }),

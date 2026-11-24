@@ -495,25 +495,47 @@ pub enum ForcedCommandShell {
 impl ForcedCommandShell {
     /// Detects the forced-command shell for the current host: [`ForcedCommandShell::Posix`] on
     /// Unix, or the shell configured in `HKLM\SOFTWARE\OpenSSH\DefaultShell` on Windows (defaulting
-    /// to [`ForcedCommandShell::WindowsCmd`] when absent).
-    pub fn host() -> ForcedCommandShell {
+    /// to [`ForcedCommandShell::WindowsCmd`] when absent, and refusing unrecognised shells).
+    pub fn host() -> Result<ForcedCommandShell, ErrorBody> {
         if cfg!(windows) {
-            match legion_os::user::windows_sshd_default_shell() {
-                legion_os::user::WindowsSshShell::PowerShell => {
-                    ForcedCommandShell::WindowsPowerShell
-                }
-                legion_os::user::WindowsSshShell::Cmd => ForcedCommandShell::WindowsCmd,
-            }
+            let detected = legion_os::user::windows_sshd_default_shell().map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Cannot read Windows OpenSSH DefaultShell from the registry: {error}."
+                    ),
+                )
+                .with_hint(
+                    "Check permissions on HKLM\\SOFTWARE\\OpenSSH\\DefaultShell or remove the value to use cmd.exe.",
+                )
+            })?;
+            Self::from_windows_shell(detected)
         } else {
-            ForcedCommandShell::Posix
+            Ok(ForcedCommandShell::Posix)
         }
     }
 
-    fn is_windows(self) -> bool {
-        matches!(
-            self,
-            ForcedCommandShell::WindowsCmd | ForcedCommandShell::WindowsPowerShell
-        )
+    /// Maps a classified Windows OpenSSH `DefaultShell` into a [`ForcedCommandShell`], refusing
+    /// shells whose quoting syntax Legion cannot generate safely.
+    pub fn from_windows_shell(
+        shell: legion_os::user::WindowsSshShell,
+    ) -> Result<ForcedCommandShell, ErrorBody> {
+        match shell {
+            legion_os::user::WindowsSshShell::Cmd => Ok(ForcedCommandShell::WindowsCmd),
+            legion_os::user::WindowsSshShell::PowerShell => {
+                Ok(ForcedCommandShell::WindowsPowerShell)
+            }
+            legion_os::user::WindowsSshShell::Posix => Ok(ForcedCommandShell::Posix),
+            legion_os::user::WindowsSshShell::Unknown(raw) => Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                format!(
+                    "Unsupported Windows OpenSSH DefaultShell `{raw}`: Legion cannot safely quote forced commands for this shell."
+                ),
+            )
+            .with_hint(
+                "Set HKLM\\SOFTWARE\\OpenSSH\\DefaultShell to cmd.exe, PowerShell (powershell.exe or pwsh.exe), or a POSIX shell (such as bash.exe), or remove DefaultShell to use cmd.exe.",
+            )),
+        }
     }
 }
 
@@ -538,8 +560,7 @@ pub fn format_forced_command(
     args: &[&str],
     shell: ForcedCommandShell,
 ) -> Result<String, ErrorBody> {
-    let windows = shell.is_windows();
-    if !exe.is_absolute() && !(windows && looks_windows_absolute(exe)) {
+    if !exe.is_absolute() && !looks_windows_absolute(exe) {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
@@ -1965,6 +1986,55 @@ mod tests {
                 && principal == "agent:example"
                 && h == r"C:\Users\me\O'Neil\Legion Home"
                 && a == "O'Neil"
+        ));
+
+        // Windows POSIX DefaultShell (e.g. Git Bash) single-quotes Windows paths safely and
+        // round-trips through strict classification; unknown shells are refused with Unsupported.
+        assert_eq!(
+            ForcedCommandShell::from_windows_shell(legion_os::user::WindowsSshShell::Posix)
+                .unwrap(),
+            ForcedCommandShell::Posix
+        );
+        let unknown_err = ForcedCommandShell::from_windows_shell(
+            legion_os::user::WindowsSshShell::Unknown(r"C:\Program Files\nu\nu.exe".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(unknown_err.code, ErrorCode::Unsupported);
+        assert!(
+            unknown_err
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("DefaultShell")),
+            "{:?}",
+            unknown_err.hint
+        );
+        let win_posix_line = format_device_line(
+            Path::new(r"C:\Users\me\O'Neil\legion.exe"),
+            "agent:example",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
+            "pixel",
+            Some(Path::new(r"C:\Users\me\Legion Home")),
+            Some("me"),
+            ForcedCommandShell::Posix,
+        )
+        .unwrap();
+        assert!(
+            win_posix_line.contains(r#"command="'C:\Users\me\O'\''Neil\legion.exe'"#),
+            "{win_posix_line}"
+        );
+        let parsed_win_posix = AuthKeysFile::parse(format!("{win_posix_line}\n").as_bytes());
+        assert!(matches!(
+            &parsed_win_posix.lines[0].kind,
+            LineKind::Device {
+                name,
+                principal,
+                home: Some(h),
+                account: Some(a),
+                ..
+            } if name == "pixel"
+                && principal == "agent:example"
+                && h == r"C:\Users\me\Legion Home"
+                && a == "me"
         ));
 
         // Control characters and relative paths are refused.

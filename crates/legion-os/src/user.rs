@@ -115,52 +115,62 @@ pub fn is_windows_administrator() -> bool {
 }
 
 /// Shell Windows OpenSSH `sshd` invokes to execute `authorized_keys` forced commands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowsSshShell {
-    /// `cmd.exe` (Windows OpenSSH's built-in default when `DefaultShell` is unset).
+    /// `cmd.exe` (Windows OpenSSH's built-in default when `DefaultShell` is unset or empty).
     Cmd,
     /// Windows PowerShell (`powershell.exe`) or PowerShell 7 (`pwsh.exe`).
     PowerShell,
+    /// POSIX sh-compatible shell (such as Git Bash's `bash.exe`, `sh.exe`, `dash.exe`, `ash.exe`,
+    /// or `zsh.exe`).
+    Posix,
+    /// Any other configured `DefaultShell` whose quoting syntax is not recognised.
+    Unknown(String),
 }
 
 /// Classifies a Windows OpenSSH `HKLM\SOFTWARE\OpenSSH\DefaultShell` registry string into
 /// [`WindowsSshShell`].
 ///
-/// Absent, empty, or other values map to [`WindowsSshShell::Cmd`] (Windows OpenSSH's built-in
-/// default); paths whose basename is `powershell`, `powershell.exe`, `pwsh`, or `pwsh.exe`
-/// (case-insensitive) map to [`WindowsSshShell::PowerShell`].
+/// - Absent, empty, or `cmd` / `cmd.exe` -> [`WindowsSshShell::Cmd`].
+/// - `powershell` / `powershell.exe` / `pwsh` / `pwsh.exe` -> [`WindowsSshShell::PowerShell`].
+/// - `sh` / `bash` / `dash` / `ash` / `zsh` / `ksh` / `mksh` (with or without `.exe`) ->
+///   [`WindowsSshShell::Posix`].
+/// - Anything else -> [`WindowsSshShell::Unknown`].
 pub fn classify_windows_default_shell(value: Option<&str>) -> WindowsSshShell {
     let Some(raw) = value else {
         return WindowsSshShell::Cmd;
     };
-    let trimmed = raw.trim().trim_matches('"');
+    let trimmed = raw.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return WindowsSshShell::Cmd;
+    }
     let base = trimmed
         .rsplit(['\\', '/'])
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    if matches!(
-        base.as_str(),
-        "powershell.exe" | "powershell" | "pwsh.exe" | "pwsh"
-    ) {
-        WindowsSshShell::PowerShell
-    } else {
-        WindowsSshShell::Cmd
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    match stem {
+        "cmd" => WindowsSshShell::Cmd,
+        "powershell" | "pwsh" => WindowsSshShell::PowerShell,
+        "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "mksh" => WindowsSshShell::Posix,
+        _ => WindowsSshShell::Unknown(trimmed.to_owned()),
     }
 }
 
 /// Reads `HKLM\SOFTWARE\OpenSSH\DefaultShell` on Windows and returns which shell Windows OpenSSH
-/// uses for forced commands (`Cmd` when the value is absent or unreadable).
+/// uses for forced commands (`Cmd` when the registry value or key is absent).
 ///
-/// Always returns [`WindowsSshShell::Cmd`] on non-Windows platforms.
-pub fn windows_sshd_default_shell() -> WindowsSshShell {
+/// Always returns `Ok(WindowsSshShell::Cmd)` on non-Windows platforms.
+pub fn windows_sshd_default_shell() -> Result<WindowsSshShell> {
     #[cfg(windows)]
     {
-        classify_windows_default_shell(windows_impl::read_openssh_default_shell().as_deref())
+        let value = windows_impl::read_openssh_default_shell()?;
+        Ok(classify_windows_default_shell(value.as_deref()))
     }
     #[cfg(not(windows))]
     {
-        WindowsSshShell::Cmd
+        Ok(WindowsSshShell::Cmd)
     }
 }
 
@@ -190,15 +200,14 @@ mod windows_impl {
     use std::process::{Command, Stdio};
 
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE,
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND,
+        ERROR_SUCCESS, HANDLE,
     };
     use windows::Win32::Security::{
         CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, SECURITY_MAX_SID_SIZE,
         TOKEN_GROUPS, TOKEN_QUERY, TokenGroups, WinBuiltinAdministratorsSid,
     };
-    use windows::Win32::System::Registry::{
-        HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
-    };
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::PCWSTR;
 
@@ -290,10 +299,13 @@ mod windows_impl {
     }
 
     #[allow(unsafe_code)]
-    pub(super) fn read_openssh_default_shell() -> Option<String> {
+    pub(super) fn read_openssh_default_shell() -> Result<Option<String>> {
         let subkey: Vec<u16> = "SOFTWARE\\OpenSSH\0".encode_utf16().collect();
         let value_name: Vec<u16> = "DefaultShell\0".encode_utf16().collect();
-        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+        // `RRF_RT_REG_SZ` alone accepts both `REG_SZ` and `REG_EXPAND_SZ` (automatically expanding
+        // environment variables in the latter). Combining `RRF_RT_REG_EXPAND_SZ` without
+        // `RRF_NOEXPAND` makes Windows `RegGetValueW` return `ERROR_INVALID_PARAMETER`.
+        let flags = RRF_RT_REG_SZ;
         let mut cb_data: u32 = 0;
         // SAFETY: `subkey` and `value_name` are NUL-terminated UTF-16 buffers, and passing `None`
         // for `pvdata` queries the required byte length.
@@ -308,8 +320,19 @@ mod windows_impl {
                 Some(&mut cb_data),
             )
         };
-        if status != ERROR_SUCCESS || cb_data == 0 {
-            return None;
+        if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(OsError::Platform {
+                detail: format!(
+                    "RegGetValueW(HKLM\\SOFTWARE\\OpenSSH\\DefaultShell) failed with Win32 error {}",
+                    status.0
+                ),
+            });
+        }
+        if cb_data == 0 {
+            return Ok(Some(String::new()));
         }
         let mut buf = vec![0_u16; (cb_data as usize).div_ceil(2)];
         // SAFETY: `buf` holds at least `cb_data` bytes of writable UTF-16 storage.
@@ -324,13 +347,21 @@ mod windows_impl {
                 Some(&mut cb_data),
             )
         };
+        if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+            return Ok(None);
+        }
         if status != ERROR_SUCCESS {
-            return None;
+            return Err(OsError::Platform {
+                detail: format!(
+                    "RegGetValueW(HKLM\\SOFTWARE\\OpenSSH\\DefaultShell) failed with Win32 error {}",
+                    status.0
+                ),
+            });
         }
         let u16_len = (cb_data as usize) / 2;
         let slice = &buf[..u16_len.min(buf.len())];
         let trimmed_len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-        Some(String::from_utf16_lossy(&slice[..trimmed_len]))
+        Ok(Some(String::from_utf16_lossy(&slice[..trimmed_len])))
     }
 
     pub(super) fn apply_admin_ssh_acl(path: &Path) -> Result<()> {
@@ -432,13 +463,29 @@ mod tests {
             classify_windows_default_shell(Some("C:/Program Files/PowerShell/7/PWSH")),
             WindowsSshShell::PowerShell
         );
+        assert_eq!(
+            classify_windows_default_shell(Some(r"C:\Program Files\Git\bin\bash.exe")),
+            WindowsSshShell::Posix
+        );
+        assert_eq!(
+            classify_windows_default_shell(Some(r"C:\msys64\usr\bin\sh.exe")),
+            WindowsSshShell::Posix
+        );
+        assert_eq!(
+            classify_windows_default_shell(Some(r"C:\msys64\usr\bin\zsh.exe")),
+            WindowsSshShell::Posix
+        );
+        assert_eq!(
+            classify_windows_default_shell(Some(r"C:\Program Files\nu\bin\nu.exe")),
+            WindowsSshShell::Unknown(r"C:\Program Files\nu\bin\nu.exe".to_owned())
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn non_windows_is_not_windows_administrator_and_acl_is_noop() {
         assert!(!is_windows_administrator());
-        assert_eq!(windows_sshd_default_shell(), WindowsSshShell::Cmd);
+        assert_eq!(windows_sshd_default_shell().unwrap(), WindowsSshShell::Cmd);
         apply_windows_admin_ssh_acl(Path::new("/nonexistent")).unwrap();
     }
 }

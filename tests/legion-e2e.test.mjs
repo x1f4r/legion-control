@@ -9,6 +9,7 @@ import {
   emergencyAbort,
   realPowerRefusal,
   redactSecrets,
+  windowsForcedCommandError,
 } from '../scripts/legion-e2e.mjs';
 
 // scripts/legion-e2e.mjs restarts the machine it runs on if calling the restart off fails, so the
@@ -83,4 +84,26 @@ test('decodeInvite and buildOpenSshEd25519Key handle the pairing invite contract
   assert.ok(!redacted.includes(payload.key), 'decoded seed leaked');
   assert.ok(!redacted.includes('BEGIN OPENSSH PRIVATE KEY'), 'private key leaked');
   assert.ok(redacted.includes('legion-invite-1.<redacted>'));
+});
+
+test('windowsForcedCommandError enforces PowerShell vs cmd forced-command quoting', () => {
+  const key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl';
+  const psLine = `restrict,command="& 'C:\\Users\\me\\legion.exe' gate --as 'e2e:gate' --device e2e-phone" ${key} legion-device:e2e-phone\n`;
+  const cmdLine = `restrict,command="C:\\Users\\me\\legion.exe gate --as e2e:gate --device e2e-phone" ${key} legion-device:e2e-phone\n`;
+
+  assert.equal(windowsForcedCommandError(psLine, 'legion-device:e2e-phone', 'powershell'), null);
+  assert.match(
+    windowsForcedCommandError(cmdLine, 'legion-device:e2e-phone', 'powershell'),
+    /expected PowerShell forced command/,
+  );
+
+  assert.equal(windowsForcedCommandError(cmdLine, 'legion-device:e2e-phone', 'cmd'), null);
+  assert.match(
+    windowsForcedCommandError(psLine, 'legion-device:e2e-phone', 'cmd'),
+    /expected cmd\.exe forced command/,
+  );
+  assert.match(
+    windowsForcedCommandError('# empty\n', 'legion-device:e2e-phone', 'powershell'),
+    /does not contain/,
+  );
 });

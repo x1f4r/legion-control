@@ -447,6 +447,10 @@ fn process_enrol_blocking(
             );
         }
 
+        let shell = match ForcedCommandShell::host() {
+            Ok(shell) => shell,
+            Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),
+        };
         let permanent_line = match format_device_line(
             &exe,
             &principal,
@@ -454,7 +458,7 @@ fn process_enrol_blocking(
             &device_name,
             paths.explicit_home(),
             pinned_account.as_deref(),
-            ForcedCommandShell::host(),
+            shell,
         ) {
             Ok(line) => line,
             Err(error) => return fail_with_sweep(Some(principal), error, auth_keys, state),

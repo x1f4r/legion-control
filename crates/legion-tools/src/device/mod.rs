@@ -257,7 +257,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         &ephemeral.public_key,
         ctx.paths().explicit_home(),
         pinned_account.as_deref(),
-        ForcedCommandShell::host(),
+        ForcedCommandShell::host()?,
     )?;
 
     let payload = InvitePayload {

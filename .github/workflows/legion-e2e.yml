@@ -257,10 +257,12 @@ jobs:
       - name: Run the scenario (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          E2E_SHELL: ${{ matrix.shell }}
         run: >-
           node scripts/legion-e2e.mjs --bin target/release/legion.exe --work "$env:E2E_DIR/work"
           --far legion-e2e-far --gate legion-e2e-gate --far-home "$env:E2E_FAR_HOME" --far-bin "$env:E2E_FAR_BIN"
-          --real-power
+          --far-shell "$env:E2E_SHELL" --real-power
 
       # What there is to read when it fails: both audit logs, the doctor's answers, every call the
       # driver made, and sshd's log. None of it is key material, and the check below makes sure.
