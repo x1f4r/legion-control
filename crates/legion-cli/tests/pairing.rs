@@ -3407,3 +3407,154 @@ role = \"phone_admin\"
             .contains("legion-device:tablet-dev")
     );
 }
+
+#[test]
+fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
+    use legion_tools::device::registry::DevicesFile;
+
+    if !TestSshd::available() {
+        eprintln!(
+            "skipping real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs: sshd/ssh/ssh-keygen unavailable"
+        );
+        return;
+    }
+
+    let home = Home::new_strict();
+    let auth_keys = home.home().join("authorized_keys");
+    std::fs::write(&auth_keys, "").unwrap();
+    let home_dir_str = home.home().to_string_lossy().into_owned();
+    let Some(sshd) = TestSshd::start(auth_keys.clone(), &[("HOME", &home_dir_str)])
+        .expect("throwaway sshd failed to start")
+    else {
+        eprintln!("skipping: throwaway sshd unavailable");
+        return;
+    };
+
+    home.write_config(
+        "policy.toml",
+        "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n",
+    );
+    home.write_config(
+        "node.toml",
+        &format!(
+            "name = \"probe-p5\"\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\nhosts = [\"127.0.0.1\"]\nport = {}\n",
+            toml_literal(&auth_keys),
+            toml_literal(sshd.host_key_path()),
+            sshd.port(),
+        ),
+    );
+
+    let inv_run = home.run(&["device.invite", "name=pixel", "role=observer"]);
+    assert_eq!(inv_run.code, 0, "{}", inv_run.stderr);
+    let payload = InvitePayload::decode(inv_run.json()["invite"].as_str().unwrap()).unwrap();
+
+    let key_dir = home.home().join("p5_keys");
+    std::fs::create_dir_all(&key_dir).unwrap();
+    let kh = key_dir.join("known_hosts");
+    write_known_hosts(&kh, &payload.hosts[0], sshd.port(), &payload.host_keys).unwrap();
+
+    let temp_key = key_dir.join("temp_key");
+    write_openssh_ed25519_private_key(&temp_key, &payload.decode_seed().unwrap(), "temp").unwrap();
+
+    let k1_path = key_dir.join("k1");
+    let k1_pub = generate_ed25519_keypair(sshd.ssh_keygen_bin(), &k1_path, "k1@test").unwrap();
+    let k2_path = key_dir.join("k2");
+    let k2_pub = generate_ed25519_keypair(sshd.ssh_keygen_bin(), &k2_path, "k2@test").unwrap();
+
+    // Enrol pixel with K1 over real sshd.
+    let enrol_line = format!(
+        "{}\n",
+        json!({"enrol": 1, "id": payload.id, "public_key": k1_pub, "name": "pixel"})
+    );
+    let mut child = sshd
+        .ssh_command(&temp_key, &kh)
+        .arg("ignored")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(enrol_line.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let enrol_out = child.wait_with_output().unwrap();
+    assert!(enrol_out.status.success(), "{enrol_out:?}");
+
+    // Update devices.toml to record K2 for the same pairing id while leaving stale K1 in
+    // authorized_keys (simulating a stale authorized_keys file before reconciliation).
+    let devices_path = home.state().parent().unwrap().join("config").join("devices.toml");
+    let mut devices: DevicesFile =
+        legion_core::config::parse(&devices_path, &std::fs::read(&devices_path).unwrap()).unwrap();
+    let entry = devices.devices.values_mut().next().unwrap();
+    let k2_canonical = legion_tools::device::keys::validate_ed25519_public_key(&k2_pub)
+        .unwrap()
+        .canonical;
+    entry.public_key = k2_canonical;
+    entry.updated_at =
+        legion_tools::device::registry::next_updated_timestamp(Some(&entry.updated_at)).unwrap();
+    std::fs::write(&devices_path, devices.to_toml_string()).unwrap();
+
+    // Connecting with stale K1 MUST be denied by `legion gate` (NOT served!) and reconcile
+    // authorized_keys to K2.
+    let mut k1_rpc = sshd
+        .ssh_command(&k1_path, &kh)
+        .arg("legion rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = k1_rpc.stdin.as_mut().unwrap().write_all(
+        format!(
+            "{}\n",
+            rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+        )
+        .as_bytes(),
+    );
+    drop(k1_rpc.stdin.take());
+    let k1_out = k1_rpc.wait_with_output().unwrap();
+    let k1_stderr = String::from_utf8_lossy(&k1_out.stderr);
+    let k1_stdout = String::from_utf8_lossy(&k1_out.stdout);
+    assert!(
+        !k1_out.status.success(),
+        "stale key K1 must be denied by legion gate! stdout={k1_stdout} stderr={k1_stderr}"
+    );
+    assert!(
+        k1_stderr.contains("does not match the public key")
+            || k1_stderr.contains("stale authorized_keys"),
+        "expected mismatch/stale denial on stderr, got: {k1_stderr}"
+    );
+
+    // K2 now succeeds over real sshd after gate reconciled authorized_keys.
+    let mut k2_rpc = sshd
+        .ssh_command(&k2_path, &kh)
+        .arg("legion rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    k2_rpc
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            format!(
+                "{}\n",
+                rpc_request(json!(1), "call", json!({"tool": "meta.whoami", "args": {}}))
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    drop(k2_rpc.stdin.take());
+    let k2_out = k2_rpc.wait_with_output().unwrap();
+    assert!(k2_out.status.success(), "{k2_out:?}");
+    let k2_stdout = String::from_utf8_lossy(&k2_out.stdout);
+    let reply: Value = serde_json::from_str(k2_stdout.trim()).unwrap();
+    assert_eq!(reply["result"]["principal"], json!("device:pixel"), "{reply}");
+    assert_eq!(reply["result"]["door"], json!("ssh"), "{reply}");
+}

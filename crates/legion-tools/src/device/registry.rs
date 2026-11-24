@@ -2654,14 +2654,14 @@ mod tests {
     fn random_devices_file(rng: &mut Rng) -> DevicesFile {
         let ids: Vec<String> = (1_u8..=6).map(sample_id).collect();
         let names = ["pixel", "ipad", "laptop", "phone", "watch"];
+        let principals = ["device:pixel", "device:ipad", "owner", "phone"];
         let roles: [Option<&str>; 4] = [Some("observer"), Some("editor"), Some("operator"), None];
         let nodes = ["tower", "pi", "mac"];
-        let times = [
-            "2026-11-24T10:00:00Z",
-            "2026-11-24T10:00:00.500000000Z",
-            "2026-11-24T11:00:00Z",
-            "2026-11-24T12:30:00Z",
-        ];
+        // Small timestamp pools so tie-breaks trigger frequently across all remaining fields.
+        let paired_times = ["2026-11-24T09:00:00Z", "2026-11-24T09:30:00Z"];
+        let times = ["2026-11-24T10:00:00Z", "2026-11-24T10:00:00.500000000Z"];
+        let creator_principals = ["owner", "device:pixel"];
+        let confirmed_opts: [Option<&str>; 2] = [None, Some("owner")];
 
         let mut file = DevicesFile::default();
         for (idx, id) in ids.iter().enumerate() {
@@ -2669,24 +2669,152 @@ mod tests {
                 0 => {} // absent
                 1 | 2 => {
                     let name = *rng.pick(&names);
+                    let principal = *rng.pick(&principals);
                     let role = *rng.pick(&roles);
+                    let paired_at = *rng.pick(&paired_times);
+                    let paired_on = *rng.pick(&nodes);
                     let updated_at = *rng.pick(&times);
                     let updated_on = *rng.pick(&nodes);
+                    let key_seed = ((idx + 1) as u8) * 10 + (rng.next() % 3) as u8;
+                    let paired_by = match rng.next() % 3 {
+                        0 => None,
+                        1 => Some(PairedBy {
+                            principal: (*rng.pick(&creator_principals)).to_owned(),
+                            device: None,
+                        }),
+                        _ => Some(PairedBy {
+                            principal: (*rng.pick(&creator_principals)).to_owned(),
+                            device: Some(rng.pick(&ids).clone()),
+                        }),
+                    };
+                    let confirmed_by = (*rng.pick(&confirmed_opts)).map(str::to_owned);
                     file.devices.insert(
                         id.clone(),
-                        sample_device((idx + 1) as u8, name, role, updated_at, updated_on),
+                        FleetDevice {
+                            name: name.to_owned(),
+                            public_key: sample_key(key_seed),
+                            principal: principal.to_owned(),
+                            role: role.map(str::to_owned),
+                            paired_at: paired_at.to_owned(),
+                            paired_on: paired_on.to_owned(),
+                            paired_by,
+                            confirmed_by,
+                            updated_at: updated_at.to_owned(),
+                            updated_on: updated_on.to_owned(),
+                        },
                     );
                 }
                 _ => {
                     let name = *rng.pick(&names);
+                    let principal = *rng.pick(&principals);
+                    let paired_at = rng
+                        .next()
+                        .is_multiple_of(2)
+                        .then(|| (*rng.pick(&paired_times)).to_owned());
+                    let paired_on = rng
+                        .next()
+                        .is_multiple_of(2)
+                        .then(|| (*rng.pick(&nodes)).to_owned());
                     let removed_at = *rng.pick(&times);
                     let removed_on = *rng.pick(&nodes);
-                    file.removed
-                        .insert(id.clone(), sample_tombstone(name, removed_at, removed_on));
+                    file.removed.insert(
+                        id.clone(),
+                        DeviceTombstone {
+                            name: name.to_owned(),
+                            principal: principal.to_owned(),
+                            paired_at,
+                            paired_on,
+                            removed_at: removed_at.to_owned(),
+                            removed_on: removed_on.to_owned(),
+                        },
+                    );
                 }
             }
         }
         file
+    }
+
+    #[test]
+    fn merge_tie_breaks_cover_every_field_and_stay_commutative() {
+        let id = sample_id(9);
+        let base = FleetDevice {
+            name: "alpha".to_owned(),
+            public_key: sample_key(10),
+            principal: "device:alpha".to_owned(),
+            role: Some("observer".to_owned()),
+            paired_at: "2026-11-24T09:00:00Z".to_owned(),
+            paired_on: "mac".to_owned(),
+            paired_by: Some(PairedBy {
+                principal: "owner".to_owned(),
+                device: None,
+            }),
+            confirmed_by: None,
+            updated_at: "2026-11-24T10:00:00Z".to_owned(),
+            updated_on: "pi".to_owned(),
+        };
+
+        let mut variants: Vec<FleetDevice> = Vec::new();
+        let mut push_variant = |mutate: fn(&mut FleetDevice)| {
+            let mut v = base.clone();
+            mutate(&mut v);
+            variants.push(v);
+        };
+        push_variant(|d| d.updated_on = "tower".to_owned());
+        push_variant(|d| d.name = "beta".to_owned());
+        push_variant(|d| d.role = Some("editor".to_owned()));
+        push_variant(|d| d.principal = "device:beta".to_owned());
+        push_variant(|d| d.public_key = sample_key(11));
+        push_variant(|d| d.paired_at = "2026-11-24T09:30:00Z".to_owned());
+        push_variant(|d| d.paired_on = "tower".to_owned());
+        push_variant(|d| {
+            d.paired_by = Some(PairedBy {
+                principal: "owner".to_owned(),
+                device: Some(sample_id(1)),
+            });
+        });
+        push_variant(|d| d.confirmed_by = Some("owner".to_owned()));
+
+        let mut base_file = DevicesFile::default();
+        base_file.devices.insert(id.clone(), base.clone());
+        for variant in &variants {
+            let mut var_file = DevicesFile::default();
+            var_file.devices.insert(id.clone(), variant.clone());
+            let ab = merge_devices(&base_file, &var_file);
+            let ba = merge_devices(&var_file, &base_file);
+            assert_eq!(ab, ba, "tie-break must be commutative for {variant:?}");
+            assert_eq!(ab.to_toml_string(), ba.to_toml_string());
+        }
+
+        // Same check for every tombstone tie-break field.
+        let tomb_base = DeviceTombstone {
+            name: "alpha".to_owned(),
+            principal: "device:alpha".to_owned(),
+            paired_at: Some("2026-11-24T09:00:00Z".to_owned()),
+            paired_on: Some("mac".to_owned()),
+            removed_at: "2026-11-24T10:00:00Z".to_owned(),
+            removed_on: "pi".to_owned(),
+        };
+        let mut tomb_variants: Vec<DeviceTombstone> = Vec::new();
+        let mut push_tomb = |mutate: fn(&mut DeviceTombstone)| {
+            let mut t = tomb_base.clone();
+            mutate(&mut t);
+            tomb_variants.push(t);
+        };
+        push_tomb(|t| t.removed_on = "tower".to_owned());
+        push_tomb(|t| t.name = "beta".to_owned());
+        push_tomb(|t| t.principal = "device:beta".to_owned());
+        push_tomb(|t| t.paired_at = Some("2026-11-24T09:30:00Z".to_owned()));
+        push_tomb(|t| t.paired_on = Some("tower".to_owned()));
+
+        let mut tomb_base_file = DevicesFile::default();
+        tomb_base_file.removed.insert(id.clone(), tomb_base);
+        for variant in &tomb_variants {
+            let mut var_file = DevicesFile::default();
+            var_file.removed.insert(id.clone(), variant.clone());
+            let ab = merge_devices(&tomb_base_file, &var_file);
+            let ba = merge_devices(&var_file, &tomb_base_file);
+            assert_eq!(ab, ba, "tombstone tie-break must be commutative for {variant:?}");
+        }
     }
 
     #[test]
