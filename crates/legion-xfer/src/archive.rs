@@ -89,17 +89,15 @@ where
         let meta = fs::symlink_metadata(&full_path).map_err(|e| classify_io(&full_path, e))?;
         let ft = meta.file_type();
         let mtime = Timestamp::from_metadata(&meta);
-        let mtime_secs = u64::try_from(mtime.secs).unwrap_or(0);
 
         let mut header = Header::new_gnu();
-        header.set_mtime(mtime_secs);
 
         if ft.is_file() {
             let file = File::open(&full_path).map_err(|e| classify_io(&full_path, e))?;
             let file_meta = file.metadata().map_err(|e| classify_io(&full_path, e))?;
             let len = file_meta.len();
             let file_mtime = Timestamp::from_metadata(&file_meta);
-            header.set_mtime(u64::try_from(file_mtime.secs).unwrap_or(0));
+            set_header_mtime(&mut builder, &mut header, file_mtime)?;
             header.set_entry_type(EntryType::Regular);
             header.set_size(len);
             header.set_mode(platform::entry_mode(&file_meta).unwrap_or(0o644));
@@ -108,6 +106,7 @@ where
             report.files += 1;
             report.bytes += len;
         } else if ft.is_dir() {
+            set_header_mtime(&mut builder, &mut header, mtime)?;
             header.set_entry_type(EntryType::Directory);
             header.set_size(0);
             header.set_mode(platform::entry_mode(&meta).unwrap_or(0o755));
@@ -116,6 +115,7 @@ where
             report.dirs += 1;
         } else if ft.is_symlink() {
             let target = fs::read_link(&full_path).map_err(|e| classify_io(&full_path, e))?;
+            set_header_mtime(&mut builder, &mut header, mtime)?;
             header.set_entry_type(EntryType::Symlink);
             header.set_size(0);
             header.set_mode(platform::entry_mode(&meta).unwrap_or(0o777));
@@ -254,11 +254,7 @@ where
             ensure_safe_parent_dirs(root, &canonical_root, &segments, &rel, &mut dirs_to_sync)?;
         let dest = parent.join(final_seg);
 
-        let mtime = entry
-            .header()
-            .mtime()
-            .ok()
-            .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)));
+        let mtime = entry_mtime(&mut entry);
         // Strip setuid/setgid/sticky bits from untrusted archive headers.
         let safe_mode = entry.header().mode().ok().map(|m| m & 0o777);
 
@@ -501,6 +497,75 @@ fn append_exact_reader<R: Read, W: Write>(
             ),
         }),
         Err(err) => Err(Error::from(err)),
+    }
+}
+
+/// Writes `mtime` into `header`, emitting a PAX `mtime` record for pre-1970 timestamps that the
+/// unsigned GNU tar header field cannot represent.
+fn set_header_mtime<W: Write>(
+    builder: &mut Builder<W>,
+    header: &mut Header,
+    mtime: Timestamp,
+) -> Result<()> {
+    if mtime.secs < 0 {
+        let value = mtime.secs.to_string();
+        builder.append_pax_extensions([("mtime", value.as_bytes())])?;
+        header.set_mtime(0);
+    } else {
+        header.set_mtime(mtime.secs as u64);
+    }
+    Ok(())
+}
+
+/// Extracts an entry's modification time, preferring a PAX `mtime` extension (which carries signed
+/// pre-1970 values) over the legacy unsigned header field.
+fn entry_mtime<R: Read>(entry: &mut tar::Entry<'_, R>) -> Option<SystemTime> {
+    if let Ok(Some(exts)) = entry.pax_extensions() {
+        for ext in exts.flatten() {
+            if ext.key() == Ok("mtime")
+                && let Ok(val) = ext.value()
+                && let Some(time) = parse_pax_mtime(val)
+            {
+                return Some(time);
+            }
+        }
+    }
+    entry
+        .header()
+        .mtime()
+        .ok()
+        .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+}
+
+fn parse_pax_mtime(raw: &str) -> Option<SystemTime> {
+    let trimmed = raw.trim();
+    let (negative, unsigned) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let (secs_str, frac_str) = match unsigned.split_once('.') {
+        Some((s, f)) => (s, Some(f)),
+        None => (unsigned, None),
+    };
+    let secs: u64 = secs_str.parse().ok()?;
+    let nanos: u32 = match frac_str {
+        Some(f) if !f.is_empty() => {
+            let mut padded = [b'0'; 9];
+            for (slot, byte) in padded.iter_mut().zip(f.bytes()) {
+                if !byte.is_ascii_digit() {
+                    return None;
+                }
+                *slot = byte;
+            }
+            std::str::from_utf8(&padded).ok()?.parse().ok()?
+        }
+        _ => 0,
+    };
+    let delta = Duration::new(secs, nanos);
+    if negative {
+        UNIX_EPOCH.checked_sub(delta)
+    } else {
+        UNIX_EPOCH.checked_add(delta)
     }
 }
 
@@ -1233,5 +1298,47 @@ mod tests {
 
         assert_eq!(fs::read(dst.path().join("data.bin")).unwrap(), b"fresh");
         assert!(!stale_part.exists());
+    }
+
+    #[test]
+    fn pre_1970_mtimes_round_trip_and_produce_empty_second_plan() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        let dir_path = src.path().join("vintage");
+        let file_path = dir_path.join("old.txt");
+        fs::create_dir(&dir_path).unwrap();
+        fs::write(&file_path, b"1969 data").unwrap();
+
+        let pre_epoch_secs = 86_400u64 * 365;
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(pre_epoch_secs);
+        fs::set_times(&file_path, FileTimes::new().set_modified(pre_epoch)).unwrap();
+        fs::set_times(&dir_path, FileTimes::new().set_modified(pre_epoch)).unwrap();
+
+        let src_m = crate::manifest::build(src.path(), &crate::ManifestOptions::default()).unwrap();
+        let src_file = src_m
+            .entries
+            .iter()
+            .find(|e| e.path == "vintage/old.txt")
+            .unwrap();
+        assert_eq!(src_file.mtime.secs, -(pre_epoch_secs as i64));
+
+        let mut tar_bytes = Vec::new();
+        pack(src.path(), &["vintage", "vintage/old.txt"], &mut tar_bytes).unwrap();
+        unpack(dst.path(), Cursor::new(&tar_bytes)).unwrap();
+
+        let dst_m = crate::manifest::build(dst.path(), &crate::ManifestOptions::default()).unwrap();
+        let dst_file = dst_m
+            .entries
+            .iter()
+            .find(|e| e.path == "vintage/old.txt")
+            .unwrap();
+        assert_eq!(dst_file.mtime.secs, -(pre_epoch_secs as i64));
+
+        let second_plan = crate::plan::plan(&src_m, &dst_m, &crate::PlanOptions::default());
+        assert!(
+            second_plan.is_empty(),
+            "expected empty second plan for pre-1970 file, got {second_plan:?}"
+        );
     }
 }
