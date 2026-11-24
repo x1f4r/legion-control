@@ -73,6 +73,11 @@ impl Paths {
         self.config.join(name)
     }
 
+    /// Where user-defined extension tools live (`tools.d/*.toml`).
+    pub fn tools_dir(&self) -> PathBuf {
+        self.config.join("tools.d")
+    }
+
     /// The audit log, one JSON object per line.
     pub fn audit_log(&self) -> PathBuf {
         self.state.join("audit.jsonl")
@@ -267,6 +272,10 @@ mod tests {
         assert_eq!(
             paths.config_file("policy.toml"),
             Path::new("/legion").join("config").join("policy.toml")
+        );
+        assert_eq!(
+            paths.tools_dir(),
+            Path::new("/legion").join("config").join("tools.d")
         );
         assert_eq!(
             paths.audit_log(),

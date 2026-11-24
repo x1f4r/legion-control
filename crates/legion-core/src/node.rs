@@ -1,6 +1,7 @@
 //! The node: the one place a call is resolved, authorised, run and audited, whichever door it came
 //! through.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,8 @@ use crate::config::{ConfigStore, NodeFile, NodeName};
 use crate::ctx::{Ctx, Door, EventSink};
 use crate::paths::Paths;
 use crate::policy::Policy;
-use crate::registry::Registry;
+use crate::registry::{Registry, SourceCheck};
+use crate::tool::Tool;
 
 /// The version of legion this is; every crate in the workspace shares it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -135,18 +137,53 @@ impl Node {
         }
     }
 
-    /// Every tool's spec, sorted by name.
+    /// Every tool's spec, sorted by name: built-in tools first, then any reloadable sources.
+    /// Built-in tools always win if a source offers the same name.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.inner.registry.specs()
+        let mut by_name: BTreeMap<String, ToolSpec> = self
+            .inner
+            .registry
+            .specs()
+            .into_iter()
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        for source in self.inner.registry.sources() {
+            for spec in source.specs(&self.inner.paths, &self.inner.registry) {
+                by_name.entry(spec.name.clone()).or_insert(spec);
+            }
+        }
+        by_name.into_values().collect()
     }
 
     /// One tool's spec, or the `unknown_tool` error a call to it would get.
     pub fn spec(&self, tool: &str) -> Result<ToolSpec, ErrorBody> {
         let name = self.name();
-        match self.inner.registry.get(tool) {
+        match self.resolve_tool(tool) {
             Some(found) => Ok(found.spec().clone()),
             None => Err(self.unknown_tool(tool, &name).with_machine(name)),
         }
+    }
+
+    /// Health checks reported by reloadable tool sources, for `meta.doctor`.
+    pub fn source_checks(&self) -> Vec<SourceCheck> {
+        let mut checks = Vec::new();
+        for source in self.inner.registry.sources() {
+            checks.extend(source.checks(&self.inner.paths, &self.inner.registry));
+        }
+        checks
+    }
+
+    /// Looks up a tool in the built-in registry first, then in reloadable sources.
+    fn resolve_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(found) = self.inner.registry.get(name) {
+            return Some(Arc::clone(found));
+        }
+        for source in self.inner.registry.sources() {
+            if let Some(found) = source.get(&self.inner.paths, &self.inner.registry, name) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// Answers a `hello`, refusing a client that speaks another protocol.
@@ -245,7 +282,7 @@ impl Node {
                 return (Some(caller), Err(error));
             }
         };
-        let Some(tool) = self.inner.registry.get(&call.tool) else {
+        let Some(tool) = self.resolve_tool(&call.tool) else {
             return (Some(principal), Err(self.unknown_tool(&call.tool, name)));
         };
         let grant = match policy.authorize(&principal, tool.spec(), &self.inner.paths) {
@@ -282,10 +319,10 @@ impl Node {
 
     fn unknown_tool(&self, tool: &str, name: &str) -> ErrorBody {
         let family = tool.split('.').next().unwrap_or_default();
-        let siblings: Vec<&str> = self
-            .inner
-            .registry
-            .names()
+        let siblings: Vec<String> = self
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
             .filter(|known| known.split('.').next() == Some(family))
             .collect();
         let hint = if siblings.is_empty() {
