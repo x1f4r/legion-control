@@ -111,6 +111,7 @@ fn main() -> ExitCode {
             "leaving_an_mcp_session_call_cancels_it",
             leaving_an_mcp_session_call_cancels_it,
         ),
+        ("mcp_takes_post_and_delete", mcp_takes_post_and_delete),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -1668,4 +1669,20 @@ fn leaving_an_mcp_session_call_cancels_it() {
     assert_eq!(line["outcome"], json!("cancelled"));
     assert_eq!(line["door"], json!("http"));
     assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+fn mcp_takes_post_and_delete() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+    for method in ["GET", "PUT", "PATCH", "HEAD", "OPTIONS", "TRACE"] {
+        let reply = http(
+            server.port,
+            method,
+            "/mcp",
+            &auth(Some(&fixture.phone)),
+            b"",
+        );
+        assert_eq!(reply.status, 405, "{method}");
+        assert_eq!(reply.header("allow"), Some("POST, DELETE"), "{method}");
+    }
 }

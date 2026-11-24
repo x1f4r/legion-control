@@ -474,13 +474,14 @@ fn unauthorized(refusal: &Refusal) -> Response<Body> {
 /// `/mcp`: the MCP door over streamable HTTP.
 ///
 /// The server offers no stream of its own, so `GET` is 405 as the specification asks of such a
-/// server. The body is read here, bounded and with a deadline, before the SDK sees the request.
+/// server, and so is every method but `POST` and `DELETE`, answered here rather than by the SDK,
+/// which would offer `GET`. The body is read here, bounded and with a deadline, before the SDK sees the request.
 async fn serve_mcp(State(shared): State<Arc<Shared>>, request: Request) -> Response<Body> {
-    if request.method() == Method::GET {
+    if request.method() != Method::POST && request.method() != Method::DELETE {
         let mut response = reply::refusal(
             StatusCode::METHOD_NOT_ALLOWED,
             ErrorCode::Unsupported,
-            "This server offers no event stream of its own; send MCP messages with POST.",
+            "MCP here takes POST, and DELETE to end a session; this server offers no event stream of its own.",
         );
         response
             .headers_mut()
