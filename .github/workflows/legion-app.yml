@@ -365,6 +365,22 @@ jobs:
           echo "Selected iPhone: $IPHONE_NAME ($IPHONE_UDID)"
           echo "Selected iPad: $IPAD_NAME ($IPAD_UDID)"
 
+          # A simulator on a loaded runner can take well over half a minute to hand back a picture.
+          # Each attempt is bounded, and three failed attempts fail the job with a clear message.
+          shoot() {
+            local udid="$1" out="$2" attempt
+            for attempt in 1 2 3; do
+              if perl -e 'alarm 90; exec @ARGV' xcrun simctl io "$udid" screenshot "$out" && [ -s "$out" ]; then
+                return 0
+              fi
+              echo "screenshot attempt $attempt for $out did not finish in time; trying again" >&2
+              rm -f "$out"
+              sleep 5
+            done
+            echo "could not take $out after three attempts" >&2
+            return 1
+          }
+
           run_simulator() {
             local kind="$1"
             local udid="$2"
@@ -446,11 +462,11 @@ jobs:
           SWIFT
 
             sleep 2
-            perl -e 'alarm 30; exec @ARGV' xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-dark.png"
+            shoot "$udid" "ci-shots/ios/${kind}-dark.png"
 
             xcrun simctl ui "$udid" appearance light
             sleep 2
-            perl -e 'alarm 30; exec @ARGV' xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-light.png"
+            shoot "$udid" "ci-shots/ios/${kind}-light.png"
 
             xcrun simctl terminate "$udid" com.x1f4r.legion || true
             xcrun simctl shutdown "$udid" || true
