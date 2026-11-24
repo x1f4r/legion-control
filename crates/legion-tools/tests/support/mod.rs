@@ -129,10 +129,20 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
             let _ = stdout.flush();
             std::thread::sleep(Duration::from_secs_f64(args[0].parse().unwrap()));
         }
+        // Sleeps, ignoring the polite request to stop where there is one (SIGTERM).
+        "stubborn" => {
+            let _ignoring = ignore_terminate();
+            let _ = writeln!(stdout, "sleeping");
+            let _ = stdout.flush();
+            std::thread::sleep(Duration::from_secs(60));
+        }
         // Starts a sleeping grandchild, writes "<own pid> <grandchild pid>" to the given file,
-        // then waits for it.
+        // then waits for it. With a second argument `stubborn`, both ignore SIGTERM.
         "family" => {
-            let mut grandchild = spawn_helper("sleep", &["60"]);
+            let stubborn = args.get(1).is_some_and(|mode| mode == "stubborn");
+            let _ignoring = stubborn.then(ignore_terminate);
+            let mode = if stubborn { "stubborn" } else { "sleep" };
+            let mut grandchild = spawn_helper(mode, &["60"]);
             let line = format!("{} {}", std::process::id(), grandchild.id());
             write_atomically(Path::new(&args[0]), &line);
             let _ = writeln!(stdout, "started");
@@ -146,6 +156,27 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
     }
     let _ = stdout.flush();
     ExitCode::SUCCESS
+}
+
+/// Makes SIGTERM do nothing to this process, for as long as the returned runtime lives. Windows
+/// has no polite request to ignore.
+#[cfg(unix)]
+fn ignore_terminate() -> Option<tokio::runtime::Runtime> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let signal = runtime.block_on(async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    });
+    // Once registered, tokio's handler replaces the default for the life of the process.
+    drop(signal);
+    Some(runtime)
+}
+
+#[cfg(not(unix))]
+fn ignore_terminate() -> Option<tokio::runtime::Runtime> {
+    None
 }
 
 /// The test binary itself, which every helper child runs.

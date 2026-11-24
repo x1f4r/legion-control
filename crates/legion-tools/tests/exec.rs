@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use legion_core::CancellationToken;
 use legion_core::proto::{ErrorCode, EventKind};
 use serde_json::{Value, json};
-use support::{Events, Fixture, HELPER, Test, gone, read_pids, this_binary};
+use support::{Events, Fixture, HELPER, Test, alive, read_pids, this_binary};
 
 fn main() -> ExitCode {
     let tests: &[Test] = &[
@@ -178,7 +178,7 @@ async fn a_timeout_ends_the_command_and_everything_it_started() {
         .call(
             "exec.run",
             with(
-                helper("family", &[&pids.to_string_lossy()]),
+                helper("family", &[&pids.to_string_lossy(), "stubborn"]),
                 json!({"timeout_s": 3}),
             ),
         )
@@ -189,7 +189,7 @@ async fn a_timeout_ends_the_command_and_everything_it_started() {
     assert!(started.elapsed() < Duration::from_secs(20));
     assert_eq!(ran["stdout"].as_str().unwrap().trim(), "started");
     for pid in read_pids(&pids).await {
-        assert!(gone(pid).await, "process {pid} outlived the timeout");
+        assert!(!alive(pid), "process {pid} outlived the timeout");
     }
 }
 
@@ -268,9 +268,10 @@ async fn cancelling_the_call_stops_the_whole_tree() {
     let pids = fixture.dir.path().join("pids");
     let cancel = CancellationToken::new();
     let events = Events::default();
+    // Both ignore the polite request, so only a tree that is really stopped is gone.
     let call = fixture.call_with(
         "exec.run",
-        helper("family", &[&pids.to_string_lossy()]),
+        helper("family", &[&pids.to_string_lossy(), "stubborn"]),
         &events,
         cancel.clone(),
     );
@@ -280,10 +281,13 @@ async fn cancelling_the_call_stops_the_whole_tree() {
         family
     };
     let (result, family) = tokio::join!(call, cancelling);
-    assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+    let error = result.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert!(error.message.contains("stopped"), "{}", error.message);
     assert_eq!(family.len(), 2);
+    // Not after a while: the moment the call has returned.
     for pid in family {
-        assert!(gone(pid).await, "process {pid} outlived the cancel");
+        assert!(!alive(pid), "process {pid} outlived the cancelled call");
     }
 }
 

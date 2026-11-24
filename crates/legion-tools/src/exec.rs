@@ -1,11 +1,11 @@
 //! `exec`: running a command that finishes, with its output captured and bounded.
 //!
 //! The process runs through `legion-os`, which contains it with everything it starts (a process
-//! group, a job object), so a timeout or a cancel stops the whole tree. The run is spawned onto
-//! the runtime rather than awaited in place: when a caller cancels, the node drops the tool's
-//! future at once, and an awaited run would be dropped with it, killing only the direct child and
-//! leaving its descendants behind. Spawned, the run sees the cancel, stops the tree the patient
-//! way, and only then finishes.
+//! group, a job object), so a timeout or a cancel stops the whole tree. A cancelled call is not
+//! answered until that tree is gone: the run stops it, asking first and forcing after
+//! [`KILL_GRACE`], within the [`CANCEL_GRACE`] the node waits for, and only then does the tool
+//! return. The run is spawned onto the runtime so that a future dropped anyway (the grace ran out,
+//! the session ended) cannot take the run with it half way and leave descendants behind.
 
 mod text;
 
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind};
-use legion_core::{Access, Ctx, Registry, ToolError};
+use legion_core::{Access, CANCEL_GRACE, CancellationToken, Ctx, Registry, ToolError};
 use legion_os::OsError;
 use legion_os::run::{OutputChunk, OutputStream, RunOptions, RunOutput, run};
 use legion_os::shell::CommandSpec;
@@ -91,6 +91,11 @@ pub struct Ran {
     pub duration_ms: u64,
 }
 
+/// How long a command asked to stop (on a timeout or a cancel) has before it is forced. Well inside
+/// the node's [`CANCEL_GRACE`], so a cancelled call answers after its tree is gone.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+const _: () = assert!(KILL_GRACE.as_millis() * 2 < CANCEL_GRACE.as_millis());
+
 /// The default and the largest `timeout_s`.
 const TIMEOUT_S: (f64, f64) = (120.0, 3600.0);
 /// The default and the largest `max_output`.
@@ -122,15 +127,16 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
         })
     };
 
-    // Dropped with this future, whether it finished or the node gave up on it, which cancels the
-    // run and so stops the process tree.
-    let cancel = ctx.cancel_token().child_token();
+    // The run's own token, cancelled when the call is (which the loop below watches for) and when
+    // this future is dropped without having seen it through.
+    let cancel = CancellationToken::new();
     let _stop_on_drop = cancel.clone().drop_guard();
     let mut options = RunOptions::new(command)
         .envs(env)
         .timeout(timeout)
         .capture_limit(limit)
-        .cancel(cancel)
+        .kill_grace(KILL_GRACE)
+        .cancel(cancel.clone())
         .on_output(forward);
     if let Some(cwd) = &cwd {
         options = options.cwd(cwd);
@@ -152,10 +158,13 @@ async fn run_command(ctx: &Ctx, args: RunArgs) -> Result<Ran, ToolError> {
             ctx.emit(kind, Value::String(text));
         }
     };
+    // On a cancel the run is told to stop the tree, and is still awaited: it returns once the tree
+    // is gone, so nothing the command started outlives the call's answer.
     let finished = loop {
         tokio::select! {
             Some(chunk) = receiver.recv() => emit(chunk),
             finished = &mut running => break finished,
+            () = ctx.cancelled(), if !cancel.is_cancelled() => cancel.cancel(),
         }
     };
     // Everything read before the run returned is delivered before the result.
