@@ -103,7 +103,7 @@ Read one shared configuration document (devices.toml, fleet.toml, policy.toml, p
 
 Effect: `admin`
 
-Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml merges incoming entries with local paired devices (tombstones always win), reconciles registry-owned device:* principals (marked with `device = "<pairing id>"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.
+Validate and atomically update one shared configuration document (devices.toml, fleet.toml, policy.toml, projects.toml, or tools.d/<name>.toml), keeping the previous version as a backup in the state directory and recording the hash before and after in the audit log. Writing devices.toml merges incoming entries with local paired devices (tombstones always win), reconciles registry-owned device:* principals (marked with `device = "<pairing id>"` in policy.toml) without touching shared or unmarked principals, updates authorized_keys, and ends active sessions for newly removed devices. Writing policy.toml changes who may do what on this machine, so any role allowed to call config.write (including effect:admin) is as strong as owner. Refuses invalid documents before replacing anything, refuses mismatched expect_hash or expect_absent (when a file already exists) with conflict, and refuses machine-local files such as node.toml and tokens.toml.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -120,7 +120,7 @@ Validate and atomically update one shared configuration document (devices.toml, 
 | `device.invite` | `admin` | Create a single-use pairing invite for a remote device to connect over SSH. |
 | `device.list` | `admin` | List paired devices (from devices.toml, adopting state-matched --pairing lines on first run and listing any unmatched local-only lines) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. |
 | `device.remove` | `admin` | Remove a paired device by name or pairing id, or revoke a pending pairing invite by id, for a principal the caller could act as. |
-| `device.set` | `admin` | Change a paired device's role (only for a dedicated `device:*` principal marked with `device = "<pairing_id>"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a quarantined descendant (`confirm=true`, owner role only) in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. |
+| `device.set` | `admin` | Change a paired device's role (only for a dedicated `device:*` principal marked with `device = "<pairing_id>"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a currently quarantined descendant (`confirm=true`, owner role only; confirmation records `confirmed_at` locally on this node and is refused if the device is not quarantined) in devices.toml, reconciling authorized_keys and pushing role or name changes to reachable fleet peers. |
 
 ### `device.endpoint`
 
@@ -134,7 +134,7 @@ Takes no arguments.
 
 Effect: `admin`
 
-Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves `device:<name>` and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true.
+Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: reserves a unique `device:<name>` principal and creates it in policy.toml when the device enrols, leaving nothing in policy.toml if unused or expired) or `principal` (an existing non-device-owned principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true. A paired device may create invites only on the node it is connected to directly (not forwarded via `on=`).
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -151,11 +151,9 @@ Create a single-use pairing invite for a remote device to connect over SSH. Eith
 
 Effect: `admin`
 
-List paired devices (from devices.toml, adopting state-matched --pairing lines on first run and listing any unmatched local-only lines) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. Reports which machines in fleet.toml have not yet received each device (with the exact `fleet.sync` command to push them). Pass `prune_tombstones=true` (owner role only) to drop tombstones older than 400 days that every fleet machine has acknowledged. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).
+List paired devices (from devices.toml, adopting state-matched --pairing lines on first run and listing any unmatched local-only lines) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).
 
-| Argument | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `prune_tombstones` | `boolean` | no | `false` | Drop tombstones in `devices.toml` older than 400 days that every machine in `fleet.toml` has acknowledged (owner role only). Off unless given as true. |
+Takes no arguments.
 
 ### `device.remove`
 
@@ -173,7 +171,7 @@ Remove a paired device by name or pairing id, or revoke a pending pairing invite
 
 Effect: `admin`
 
-Change a paired device's role (only for a dedicated `device:*` principal marked with `device = "<pairing_id>"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a quarantined descendant (`confirm=true`, owner role only) in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for the owner role) and every `device.set` call is refused through an expiring credential.
+Change a paired device's role (only for a dedicated `device:*` principal marked with `device = "<pairing_id>"` in policy.toml; refuses shared or unmarked principals), rename it, or confirm a currently quarantined descendant (`confirm=true`, owner role only; confirmation records `confirmed_at` locally on this node and is refused if the device is not quarantined) in devices.toml, reconciling authorized_keys and pushing role or name changes to reachable fleet peers. Changing a role or confirming requires the owner role (plus allow_owner=true for the owner role) and every `device.set` call is refused through an expiring credential.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
