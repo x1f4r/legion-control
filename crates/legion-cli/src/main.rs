@@ -6,6 +6,7 @@
 
 mod args;
 mod cp;
+mod pair;
 mod render;
 mod rpc;
 mod serve;
@@ -23,11 +24,14 @@ use legion_core::{
 use legion_doors::mcp::{self, McpDoor};
 use legion_net::stream::Host;
 use legion_net::{Fleet, Subcommand};
+use legion_tools::device::enrol::EnrolReply;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use crate::args::{ArgsSource, CallCommand, Command, USAGE, UsageError, command_help};
+use crate::args::{
+    ArgsSource, CallCommand, Command, GateCommand, GateHome, USAGE, UsageError, command_help,
+};
 
 const FAILED: u8 = 1;
 const USAGE_ERROR: u8 = 2;
@@ -87,10 +91,47 @@ async fn run(command: Command) -> ExitCode {
     let json = match &command {
         Command::Call(call) => call.json,
         Command::Cp(cp) => cp.json,
+        Command::Pair(pair) => pair.json,
         Command::Tools { json } | Command::Help { json, .. } => *json,
         _ => false,
     };
-    let (node, router) = match Paths::from_env() {
+    let paths_result = match &command {
+        Command::Gate(GateCommand::As { home, .. } | GateCommand::Enrol { home, .. }) => {
+            let resolved = match home {
+                GateHome::Root(root) => Paths::from_explicit_home(root),
+                GateHome::Split {
+                    config_dir,
+                    state_dir,
+                } => Paths::from_explicit_dirs(config_dir, state_dir),
+                GateHome::Default => Paths::from_gate_default(),
+            };
+            resolved.and_then(|paths| {
+                // When a forced command pins a Legion home (`--home` or `--config-dir`/`--state-dir`),
+                // refuse immediately if its config directory or `node.toml` no longer exists —
+                // before `Node::new` can create any directories on disk.
+                if !matches!(home, GateHome::Default) {
+                    let cfg_dir = paths.config_dir();
+                    let node_toml = paths.config_file("node.toml");
+                    if !cfg_dir.is_dir() || !node_toml.is_file() {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!(
+                                "Pinned Legion home {} is missing its configuration ({}).",
+                                cfg_dir.display(),
+                                node_toml.display(),
+                            ),
+                        )
+                        .with_hint(
+                            "Restore that Legion home or remove this orphaned key with `legion device.remove name=<device> foreign=true`.",
+                        ));
+                    }
+                }
+                Ok(paths)
+            })
+        }
+        _ => Paths::from_env(),
+    };
+    let (node, router) = match paths_result {
         Ok(paths) => {
             let fleet = Fleet::new(&paths);
             let mut registry = legion_tools::registry();
@@ -100,19 +141,29 @@ async fn run(command: Command) -> ExitCode {
                 Arc::new(fleet) as Arc<dyn Router>,
             )
         }
-        // The stdout of `legion rpc`, `legion mcp` and `legion stream` carries protocol messages
-        // and nothing else; a stream says what went wrong as its one reply.
+        // The stdout of `legion rpc`, `legion mcp`, `legion stream` and `legion gate` carries
+        // protocol messages and nothing else; stream and gate --enrol report startup errors as
+        // their one JSON reply line.
         Err(error)
             if matches!(
                 command,
                 Command::Rpc { .. }
                     | Command::Mcp { .. }
                     | Command::Stream { .. }
-                    | Command::Gate { .. }
+                    | Command::Gate(_)
             ) =>
         {
-            if matches!(command, Command::Stream { .. }) {
-                out(&format!("{}\n", serde_json::json!({ "error": error })));
+            match command {
+                Command::Stream { .. } => {
+                    out(&format!("{}\n", serde_json::json!({ "error": error })));
+                }
+                Command::Gate(GateCommand::Enrol { .. }) => {
+                    let reply = EnrolReply::from_error(error.clone());
+                    if let Ok(line) = serde_json::to_string(&reply) {
+                        out(&format!("{line}\n"));
+                    }
+                }
+                _ => {}
             }
             err(&render::error(&error));
             return ExitCode::from(FAILED);
@@ -157,7 +208,7 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Rpc { pinned } => {
             let shutdown = install_shutdown_token();
-            serve_rpc(node, router, pinned, shutdown).await
+            serve_rpc(node, router, pinned, Door::Rpc, None, shutdown).await
         }
         Command::Mcp { pinned, compact } => {
             let shutdown = install_shutdown_token();
@@ -165,13 +216,29 @@ async fn run(command: Command) -> ExitCode {
         }
         Command::Stream { pinned } => {
             let shutdown = install_shutdown_token();
-            let code = serve_stream(&node, pinned, shutdown).await;
+            let code = serve_stream(&node, pinned, Door::Stream, None, shutdown).await;
             router.shutdown().await;
             code
         }
-        Command::Gate { pinned } => {
+        Command::Gate(GateCommand::As {
+            pinned,
+            device,
+            pairing,
+            account,
+            ..
+        }) => {
             let shutdown = install_shutdown_token();
-            gate(node, router, pinned, shutdown).await
+            gate(node, router, pinned, device, pairing, account, shutdown).await
+        }
+        Command::Gate(GateCommand::Enrol { id, account, .. }) => {
+            let shutdown = install_shutdown_token();
+            enrol(node, router, id, account, shutdown).await
+        }
+        Command::Pair(command) => {
+            let shutdown = install_shutdown_token();
+            let code = pair::run(&node, router.as_ref(), command, shutdown).await;
+            router.shutdown().await;
+            code
         }
         Command::Serve { listen, help } => {
             let shutdown = install_shutdown_token();
@@ -189,6 +256,8 @@ async fn serve_rpc(
     node: Node,
     router: Arc<dyn Router>,
     pinned: Option<String>,
+    door: Door,
+    device: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     match rpc::serve_until(
@@ -197,6 +266,8 @@ async fn serve_rpc(
         node,
         router,
         pinned,
+        door,
+        device,
         shutdown,
     )
     .await
@@ -214,13 +285,17 @@ async fn serve_rpc(
 async fn serve_stream(
     node: &Node,
     pinned: Option<String>,
+    door: Door,
+    device: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
     let mut served = tokio::task::spawn_blocking(move || {
-        legion_net::stream::serve(
+        legion_net::stream::serve_with_door(
             &host,
             pinned.as_deref(),
+            door,
+            device.as_deref(),
             io::stdin().lock(),
             io::stdout().lock(),
         )
@@ -254,28 +329,123 @@ async fn serve_stream(
 
 /// `legion gate`: serves what a key forced to it asked for, when that is exactly `legion rpc` or
 /// `legion stream` as the ssh connector sends them, pinned to the key's principal. The request is
-/// only compared, never run.
+/// only compared, never run. When `--device` is passed (as on paired-device keys), registers the
+/// live process under `state/device-sessions/` so `device.remove` ends it immediately. When
+/// `--account` is passed (on Windows's shared `administrators_authorized_keys`), refuses any other
+/// OS account.
 async fn gate(
     node: Node,
     router: Arc<dyn Router>,
     pinned: String,
+    device: Option<String>,
+    pairing: Option<String>,
+    account: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
+    if let Err(error) = legion_tools::device::authkeys::verify_gate_account(account.as_deref()) {
+        router.shutdown().await;
+        err(&format!("legion gate: {}\n", error.message));
+        return ExitCode::from(FAILED);
+    }
     let requested = std::env::var("SSH_ORIGINAL_COMMAND")
         .ok()
         .and_then(|command| legion_net::gate::requested(&command));
-    match requested {
-        Some(Subcommand::Rpc) => serve_rpc(node, router, Some(pinned), shutdown).await,
-        Some(Subcommand::Stream) => {
-            let code = serve_stream(&node, Some(pinned), shutdown).await;
+    let Some(subcommand) = requested else {
+        router.shutdown().await;
+        err(&format!("{}\n", legion_net::gate::REFUSAL));
+        return ExitCode::from(FAILED);
+    };
+    let mut session = if let Some(device_name) = device.as_deref() {
+        match legion_tools::device::sessions::DeviceSessionGuard::register(
+            node.paths(),
+            device_name,
+            &pinned,
+        ) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                router.shutdown().await;
+                err(&render::error(&error));
+                return ExitCode::from(FAILED);
+            }
+        }
+    } else {
+        None
+    };
+    if let (Some(device_name), Some(pairing_id)) = (device.as_deref(), pairing.as_deref()) {
+        let auth_check = node
+            .config()
+            .get::<legion_core::config::NodeFile>()
+            .and_then(|node_file| {
+                legion_tools::device::authkeys::verify_device_authorized(
+                    node.paths(),
+                    &node_file,
+                    device_name,
+                    pairing_id,
+                    &pinned,
+                    account.as_deref(),
+                )
+            });
+        if let Err(error) = auth_check {
+            err(&format!("legion gate: {}\n", error.message));
+            router.shutdown().await;
+            if let Some(guard) = session.take() {
+                guard.reject_and_terminate_parent().await;
+            }
+            return ExitCode::from(FAILED);
+        }
+    }
+    let _session = session;
+    match subcommand {
+        Subcommand::Rpc => serve_rpc(node, router, Some(pinned), Door::Ssh, device, shutdown).await,
+        Subcommand::Stream => {
+            let code = serve_stream(&node, Some(pinned), Door::Ssh, device, shutdown).await;
             router.shutdown().await;
             code
         }
-        None => {
-            router.shutdown().await;
-            err(&format!("{}\n", legion_net::gate::REFUSAL));
-            ExitCode::from(FAILED)
+    }
+}
+
+/// `legion gate --enrol <id>`: single-use enrolment forced command for a temporary invite key.
+/// Ignores `SSH_ORIGINAL_COMMAND` completely, reads one JSON line from stdin, and writes one JSON
+/// reply line on stdout.
+async fn enrol(
+    node: Node,
+    router: Arc<dyn Router>,
+    id: String,
+    account: Option<String>,
+    shutdown: CancellationToken,
+) -> ExitCode {
+    let reply = if let Err(error) =
+        legion_tools::device::authkeys::verify_gate_account(account.as_deref())
+    {
+        EnrolReply::from_error(error)
+    } else {
+        tokio::select! {
+            reply = legion_tools::device::enrol::run_enrol(&node, &id, tokio::io::stdin()) => reply,
+            () = shutdown.cancelled() => EnrolReply::from_error(ErrorBody::new(
+                ErrorCode::Cancelled,
+                "Device enrolment was cancelled by signal.",
+            )),
         }
+    };
+    router.shutdown().await;
+    match serde_json::to_string(&reply) {
+        Ok(line) => out(&format!("{line}\n")),
+        Err(error) => {
+            let fallback = EnrolReply::from_error(ErrorBody::new(
+                ErrorCode::Internal,
+                format!("The enrolment reply cannot be written as JSON: {error}."),
+            ));
+            if let Ok(line) = serde_json::to_string(&fallback) {
+                out(&format!("{line}\n"));
+            }
+            return ExitCode::from(FAILED);
+        }
+    }
+    if reply.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(FAILED)
     }
 }
 

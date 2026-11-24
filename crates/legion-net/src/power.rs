@@ -368,6 +368,7 @@ async fn send_here(ctx: &Ctx, machine: &str, dry_run: bool) -> Result<Value, Err
         json!({"machine": machine, "dry_run": dry_run}),
     );
     call.pinned = Some(ctx.principal().to_owned());
+    call.device = ctx.device().map(str::to_owned);
     call.cancel = ctx.cancel_token().child_token();
     call.hops = ctx.hops();
     ctx.node().call(call).await
@@ -959,8 +960,9 @@ mod tests {
             )
         };
         let wake_as_agent = || {
-            let mut call = Call::new(Door::Mcp, "power.wake", json!({"machine": "tower"}));
+            let mut call = Call::new(Door::Ssh, "power.wake", json!({"machine": "tower"}));
             call.as_principal = Some("agent:test".to_owned());
+            call.device = Some("pixel".to_owned());
             fixture.node.call(call)
         };
         let config = fixture.dir.path().join("config");
@@ -978,7 +980,7 @@ mod tests {
         let woken = wake_as_agent().await.unwrap();
         assert_eq!(woken["sent_by"], json!("pi"));
         assert!(!fixture.datagrams().is_empty());
-        // And the audit log has it, under the caller's principal.
+        // And the audit log has it, under the caller's principal, door, and paired device.
         let audit =
             std::fs::read_to_string(fixture.dir.path().join("state").join("audit.jsonl")).unwrap();
         let wol: Vec<Value> = audit
@@ -990,6 +992,10 @@ mod tests {
         assert!(
             wol.iter()
                 .all(|entry| entry["principal"] == json!("agent:test"))
+        );
+        assert!(
+            wol.iter().all(|entry| entry["device"] == json!("pixel")),
+            "nested power.wol audit entries must preserve device: {audit}"
         );
         assert_eq!(wol[0]["outcome"], json!("denied"), "{audit}");
     }

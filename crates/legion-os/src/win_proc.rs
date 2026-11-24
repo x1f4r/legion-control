@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows::Wdk::System::SystemInformation::{
@@ -19,10 +19,11 @@ use windows::Wdk::System::SystemInformation::{
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS, DuplicateHandle,
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-    ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_READ,
-    GENERIC_WRITE, GetLastError, HANDLE, STILL_ACTIVE,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, FILETIME,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, STILL_ACTIVE,
 };
+use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING, SYNCHRONIZE,
@@ -44,8 +45,8 @@ use windows::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
     InitializeProcThreadAttributeList, IsProcessCritical, LPPROC_THREAD_ATTRIBUTE_LIST,
-    OpenProcess, PEB, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_BASIC_INFORMATION,
-    PROCESS_INFORMATION, PROCESS_NAME_FORMAT, PROCESS_QUERY_INFORMATION,
+    OpenProcess, OpenProcessToken, PEB, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROCESS_BASIC_INFORMATION, PROCESS_INFORMATION, PROCESS_NAME_FORMAT, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ,
     QueryFullProcessImageNameW, RTL_USER_PROCESS_PARAMETERS, ResumeThread, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
@@ -1180,6 +1181,182 @@ fn query_image_name_raw(handle: HANDLE) -> Option<String> {
     .ok()?;
     let slice = buf.get(..(len as usize))?;
     Some(String::from_utf16_lossy(slice))
+}
+
+/// Snapshot of a pinned Windows process used to verify whether it is a same-account `sshd`
+/// session ancestor or target.
+pub(crate) struct WindowsProcSshdInfo {
+    pub(crate) id: ProcessId,
+    pub(crate) image_path: String,
+    pub(crate) same_account: bool,
+    pub(crate) cmdline: Option<String>,
+}
+
+fn read_token_user_buf(process_handle: HANDLE) -> Option<Vec<usize>> {
+    let mut token = HANDLE::default();
+    // SAFETY: `process_handle` is a valid process handle and `token` is immediately wrapped in
+    // `OwnedHandle`.
+    unsafe { OpenProcessToken(process_handle, TOKEN_QUERY, &mut token) }.ok()?;
+    let token = OwnedHandle(token);
+
+    let mut needed: u32 = 0;
+    // SAFETY: Standard Win32 buffer-size query with null output pointer.
+    let first = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut needed) };
+    if let Err(err) = first
+        && err.code() != ERROR_INSUFFICIENT_BUFFER.to_hresult()
+    {
+        return None;
+    }
+    if needed == 0 {
+        return None;
+    }
+    let words = (needed as usize).div_ceil(size_of::<usize>());
+    let mut buf = vec![0usize; words];
+    // SAFETY: `buf` is `usize`-aligned with at least `needed` bytes of writable storage.
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast::<c_void>()),
+            needed,
+            &mut needed,
+        )
+    }
+    .ok()?;
+    Some(buf)
+}
+
+fn same_user_sid_as_current(target_handle: HANDLE) -> bool {
+    // SAFETY: `GetCurrentProcess` returns the current process pseudo-handle.
+    let Some(my_buf) = read_token_user_buf(unsafe { GetCurrentProcess() }) else {
+        return false;
+    };
+    let Some(target_buf) = read_token_user_buf(target_handle) else {
+        return false;
+    };
+    let my_sid = unsafe { (*my_buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let target_sid = unsafe { (*target_buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    if my_sid.0.is_null() || target_sid.0.is_null() {
+        return false;
+    }
+    // SAFETY: Both SIDs live inside `my_buf` and `target_buf` for the duration of `EqualSid`.
+    unsafe { EqualSid(my_sid, target_sid) }.is_ok()
+}
+
+fn read_process_cmdline(pid: u32) -> Option<String> {
+    const MAX_CMDLINE_BYTES: usize = 64 * 1024;
+    // SAFETY: `OpenProcess` takes plain integer flags and returns an owned handle.
+    let handle = OwnedHandle(
+        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }.ok()?,
+    );
+    let mut pbi = PROCESS_BASIC_INFORMATION::default();
+    let mut returned = 0u32;
+    // SAFETY: `handle.0` has `PROCESS_QUERY_INFORMATION`; `pbi` matches `ProcessBasicInformation`.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle.0,
+            ProcessBasicInformation,
+            (&mut pbi as *mut PROCESS_BASIC_INFORMATION).cast::<c_void>(),
+            size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut returned,
+        )
+    };
+    if status.is_err() || pbi.PebBaseAddress.is_null() {
+        return None;
+    }
+    let mut peb: PEB = unsafe { std::mem::zeroed() };
+    let mut read_bytes = 0usize;
+    // SAFETY: Reading `PEB` from remote `PebBaseAddress`.
+    if unsafe {
+        ReadProcessMemory(
+            handle.0,
+            pbi.PebBaseAddress.cast::<c_void>(),
+            (&mut peb as *mut PEB).cast::<c_void>(),
+            size_of::<PEB>(),
+            Some(&mut read_bytes),
+        )
+    }
+    .is_err()
+        || read_bytes < size_of::<PEB>()
+        || peb.ProcessParameters.is_null()
+    {
+        return None;
+    }
+    let mut params: RTL_USER_PROCESS_PARAMETERS = unsafe { std::mem::zeroed() };
+    read_bytes = 0;
+    // SAFETY: Reading `RTL_USER_PROCESS_PARAMETERS` from remote `peb.ProcessParameters`.
+    if unsafe {
+        ReadProcessMemory(
+            handle.0,
+            peb.ProcessParameters.cast::<c_void>(),
+            (&mut params as *mut RTL_USER_PROCESS_PARAMETERS).cast::<c_void>(),
+            size_of::<RTL_USER_PROCESS_PARAMETERS>(),
+            Some(&mut read_bytes),
+        )
+    }
+    .is_err()
+        || read_bytes < size_of::<RTL_USER_PROCESS_PARAMETERS>()
+        || params.CommandLine.Buffer.is_null()
+    {
+        return None;
+    }
+    let byte_len = usize::from(params.CommandLine.Length).min(MAX_CMDLINE_BYTES) & !1;
+    if byte_len == 0 {
+        return Some(String::new());
+    }
+    let mut units = vec![0u16; byte_len / 2];
+    read_bytes = 0;
+    // SAFETY: `units` has exact byte capacity `byte_len`, aligned to `u16`.
+    if unsafe {
+        ReadProcessMemory(
+            handle.0,
+            params.CommandLine.Buffer.0.cast::<c_void>(),
+            units.as_mut_ptr().cast::<c_void>(),
+            byte_len,
+            Some(&mut read_bytes),
+        )
+    }
+    .is_err()
+        || read_bytes < 2
+    {
+        return None;
+    }
+    units.truncate(read_bytes / 2);
+    let trimmed_len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+    Some(String::from_utf16_lossy(&units[..trimmed_len]))
+}
+
+/// Query the full executable image path of live process `identity` after verifying its exact
+/// `pid` and `start_time` through a held query-only handle.
+pub(crate) fn query_verified_image_path(identity: &ProcessId) -> Option<PathBuf> {
+    let OpenPinnedOutcome::Pinned(pinned) = open_pinned_query_only(identity.pid, false) else {
+        return None;
+    };
+    if !identity.matches(&pinned.id) {
+        return None;
+    }
+    query_image_name_raw(pinned.handle.0).map(PathBuf::from)
+}
+
+/// Inspect live process `pid` through a held query-only handle to verify its identity, parent PID,
+/// image path, user SID equality with the current process, and command line.
+pub(crate) fn inspect_process_for_sshd(pid: u32) -> Option<WindowsProcSshdInfo> {
+    let OpenPinnedOutcome::Pinned(pinned) = open_pinned_query_only(pid, false) else {
+        return None;
+    };
+    let image_path = query_image_name_raw(pinned.handle.0)?;
+    let same_account = same_user_sid_as_current(pinned.handle.0);
+    let cmdline = if same_account {
+        read_process_cmdline(pid)
+    } else {
+        None
+    };
+    Some(WindowsProcSshdInfo {
+        id: pinned.id,
+        image_path,
+        same_account,
+        cmdline,
+    })
 }
 
 fn snapshot_exe_name(target_pid: u32) -> Option<String> {

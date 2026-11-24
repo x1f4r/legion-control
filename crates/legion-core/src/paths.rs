@@ -14,6 +14,7 @@ pub struct Paths {
     config: PathBuf,
     state: PathBuf,
     home: Option<PathBuf>,
+    explicit_home: Option<PathBuf>,
 }
 
 impl Paths {
@@ -28,11 +29,71 @@ impl Paths {
     /// It does not change what `~` means.
     pub fn from_env() -> Result<Paths, ErrorBody> {
         let var = |name: &str| std::env::var_os(name);
-        let home = var(home_variable(cfg!(windows)))
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .or_else(std::env::home_dir);
+        let home = env_home(&var);
         resolve(&var, home, cfg!(windows))
+    }
+
+    /// Builds [`Paths`] pinned to an explicit absolute `LEGION_HOME` root (such as from
+    /// `legion gate --home <path>`), reading only the OS user home directory from the environment
+    /// so `~` still expands normally.
+    pub fn from_explicit_home(root: impl Into<PathBuf>) -> Result<Paths, ErrorBody> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("--home {} must be an absolute path.", root.display()),
+            )
+            .with_hint("Pass an absolute directory path to --home."));
+        }
+        let var = |name: &str| std::env::var_os(name);
+        let mut paths = Paths::under(root);
+        paths.home = env_home(&var);
+        Ok(paths)
+    }
+
+    /// Builds [`Paths`] pinned to explicit absolute configuration and state directories (such as
+    /// from `legion gate --config-dir <cfg> --state-dir <state>`), ignoring `LEGION_HOME`,
+    /// `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `APPDATA`, and `LOCALAPPDATA`.
+    pub fn from_explicit_dirs(
+        config: impl Into<PathBuf>,
+        state: impl Into<PathBuf>,
+    ) -> Result<Paths, ErrorBody> {
+        let config = config.into();
+        let state = state.into();
+        if !config.is_absolute() {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "--config-dir {} must be an absolute path.",
+                    config.display()
+                ),
+            )
+            .with_hint("Pass an absolute directory path to --config-dir."));
+        }
+        if !state.is_absolute() {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("--state-dir {} must be an absolute path.", state.display()),
+            )
+            .with_hint("Pass an absolute directory path to --state-dir."));
+        }
+        let var = |name: &str| std::env::var_os(name);
+        Ok(Paths {
+            config,
+            state,
+            home: env_home(&var),
+            explicit_home: None,
+        })
+    }
+
+    /// Builds the default [`Paths`] for `legion gate` when no `--home` or
+    /// `--config-dir`/`--state-dir` flags were given, completely ignoring `LEGION_HOME`,
+    /// `XDG_CONFIG_HOME`, and `XDG_STATE_HOME` so an SSH client cannot redirect policy lookup via
+    /// `AcceptEnv`/`SendEnv`.
+    pub fn from_gate_default() -> Result<Paths, ErrorBody> {
+        let var = |name: &str| std::env::var_os(name);
+        let home = env_home(&var);
+        resolve_gate_default(&var, home, cfg!(windows))
     }
 
     /// The directories `LEGION_HOME=<root>` would give, without reading the environment. A test
@@ -43,7 +104,14 @@ impl Paths {
             config: root.join("config"),
             state: root.join("state"),
             home: None,
+            explicit_home: Some(root),
         }
+    }
+
+    /// The explicit `LEGION_HOME` root when Legion is running from a non-default home, or `None`
+    /// when using the account's standard config/state directories.
+    pub fn explicit_home(&self) -> Option<&Path> {
+        self.explicit_home.as_deref()
     }
 
     /// The same directories, with `~` standing for `home`.
@@ -87,6 +155,13 @@ impl Paths {
     pub fn audit_lock(&self) -> PathBuf {
         self.state.join("audit.lock")
     }
+}
+
+fn env_home(var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    var(home_variable(cfg!(windows)))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(std::env::home_dir)
 }
 
 fn home_variable(windows: bool) -> &'static str {
@@ -143,6 +218,7 @@ fn resolve(
             config,
             state,
             home,
+            explicit_home: None,
         }),
         _ => {
             let missing = if windows {
@@ -155,6 +231,47 @@ fn resolve(
                 format!("Legion cannot tell where its files live: {missing} not set."),
             )
             .with_hint("Set LEGION_HOME to the directory Legion should keep its files in."))
+        }
+    }
+}
+
+fn resolve_gate_default(
+    var: &dyn Fn(&str) -> Option<OsString>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> Result<Paths, ErrorBody> {
+    let set = |name: &str| var(name).filter(|value| !value.is_empty());
+    let (config, state) = if windows {
+        let config = set("APPDATA").map(|dir| PathBuf::from(dir).join("legion"));
+        let state = set("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("legion"));
+        (config, state)
+    } else {
+        let config = home.as_ref().map(|h| h.join(".config").join("legion"));
+        let state = home
+            .as_ref()
+            .map(|h| h.join(".local").join("state").join("legion"));
+        (config, state)
+    };
+    match (config, state) {
+        (Some(config), Some(state)) => Ok(Paths {
+            config,
+            state,
+            home,
+            explicit_home: None,
+        }),
+        _ => {
+            let missing = if windows {
+                "APPDATA and LOCALAPPDATA are"
+            } else {
+                "HOME is"
+            };
+            Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Legion gate cannot tell where its files live: {missing} not set."),
+            )
+            .with_hint(
+                "Pin --home or --config-dir/--state-dir on the authorized_keys forced command.",
+            ))
         }
     }
 }
@@ -187,6 +304,7 @@ mod tests {
                 config: root.join("config"),
                 state: root.join("state"),
                 home: Some(PathBuf::from("/home/me")),
+                explicit_home: Some(root),
             })
         );
     }
@@ -285,6 +403,39 @@ mod tests {
         assert_eq!(
             paths.with_home("/home/me").home(),
             Some(Path::new("/home/me"))
+        );
+    }
+
+    #[test]
+    fn gate_default_ignores_legion_home_and_xdg_overrides() {
+        let vars = env(&[
+            ("LEGION_HOME", "/attacker/home"),
+            ("XDG_CONFIG_HOME", "/attacker/cfg"),
+            ("XDG_STATE_HOME", "/attacker/state"),
+        ]);
+        let unix = resolve_gate_default(&vars, Some(PathBuf::from("/home/me")), false).unwrap();
+        assert_eq!(unix.config_dir(), Path::new("/home/me/.config/legion"));
+        assert_eq!(unix.state_dir(), Path::new("/home/me/.local/state/legion"));
+        assert_eq!(unix.explicit_home(), None);
+
+        let win_vars = env(&[
+            ("LEGION_HOME", r"C:\attacker\home"),
+            ("APPDATA", r"C:\Users\me\AppData\Roaming"),
+            ("LOCALAPPDATA", r"C:\Users\me\AppData\Local"),
+        ]);
+        let win =
+            resolve_gate_default(&win_vars, Some(PathBuf::from(r"C:\Users\me")), true).unwrap();
+        assert_eq!(
+            win.config_dir(),
+            PathBuf::from(r"C:\Users\me\AppData\Roaming")
+                .join("legion")
+                .as_path()
+        );
+        assert_eq!(
+            win.state_dir(),
+            PathBuf::from(r"C:\Users\me\AppData\Local")
+                .join("legion")
+                .as_path()
         );
     }
 }

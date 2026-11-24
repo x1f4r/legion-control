@@ -1321,8 +1321,9 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
     let pi = node("pi");
     pi.write_config("policy.toml", POLICY);
     fs::write(pi.home().join("projects/a.txt"), b"a").unwrap();
+    let pi_root = pi.state().parent().unwrap().to_string_lossy().into_owned();
     let gate = |original: Option<&str>| {
-        let mut command = pi.command(&["gate", "--as", "agent:x"]);
+        let mut command = pi.command(&["gate", "--as", "agent:x", "--home", &pi_root]);
         command.env_remove("SSH_ORIGINAL_COMMAND");
         if let Some(original) = original {
             command.env("SSH_ORIGINAL_COMMAND", original);
@@ -1350,6 +1351,10 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
     let reply: Value =
         serde_json::from_slice(output.stdout.split(|b| *b == b'\n').next().unwrap()).unwrap();
     assert_eq!(reply["result"]["principal"], "agent:x", "{reply}");
+    assert_eq!(reply["result"]["door"], "ssh", "{reply}");
+    let rpc_audit = pi.audit().pop().unwrap();
+    assert_eq!(rpc_audit["door"], json!("ssh"), "{rpc_audit}");
+    assert!(rpc_audit.get("device").is_none(), "{rpc_audit}");
 
     // stream, as the connector sends it to a Windows machine.
     let stream = remote_command(RemoteOs::Windows, Subcommand::Stream, None).unwrap();
@@ -1375,7 +1380,7 @@ fn gate_serves_only_the_connectors_commands_pinned_to_its_principal() {
                 line["principal"].as_str(),
                 line["outcome"].as_str()
             ),
-            (Some("stream"), Some("agent:x"), Some(outcome))
+            (Some("ssh"), Some("agent:x"), Some(outcome))
         );
     }
 

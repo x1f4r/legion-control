@@ -418,8 +418,11 @@ main() {
   fi
 
   # Stage beside the destination so mv is an atomic rename on the same filesystem, leaving any
-  # existing installation untouched if copying or setting permissions fails.
-  mkdir -p "$INSTALL_DIR"
+  # existing installation untouched if copying or setting permissions fails. Ensure ~/.local and
+  # ~/.local/bin are not group- or world-writable even under a 0002 umask so forced SSH commands
+  # accept the installed binary.
+  (umask 022 && mkdir -p "$INSTALL_DIR")
+  chmod go-w "${HOME}/.local" "$INSTALL_DIR"
   STAGED_FILE="$(mktemp "${INSTALL_DIR}/.legion.tmp.XXXXXX")"
   cp "$SOURCE_BIN" "$STAGED_FILE"
   chmod 0755 "$STAGED_FILE"

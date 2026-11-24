@@ -88,7 +88,7 @@ HOST_PUB_ECDSA="$(cat "$WORK/host_ecdsa.pub")"
 KEYGEN_OUT="$("$LINK_BIN" keygen "$WORK/device_key")"
 DEVICE_PUB="$(node -e 'const d = JSON.parse(process.argv[1]); console.log(d.public_key);' "$KEYGEN_OUT")"
 
-printf 'command="%s gate --as phone",restrict %s\n' "$LEGION_BIN" "$DEVICE_PUB" > "$WORK/authorized_keys"
+printf 'command="%s gate --as phone --home %s",restrict %s\n' "$LEGION_BIN" "$FAR_HOME" "$DEVICE_PUB" > "$WORK/authorized_keys"
 chmod 600 "$WORK/authorized_keys"
 
 cat > "$WORK/sshd_config" <<EOF

@@ -119,6 +119,17 @@ pub(crate) fn exclusive_running_jobs_in(
     store::exclusive_running_jobs_in(state_dir)
 }
 
+/// Returns the IDs of currently starting or running background jobs attributed to paired device
+/// `device` (or started without a device tag under `principal`). Pure read; never touches or stops
+/// any job.
+pub(crate) fn running_job_ids_for_device(
+    paths: &Paths,
+    device: &str,
+    principal: &str,
+) -> Vec<String> {
+    store::running_job_ids_for_device_in(paths.state_dir(), device, principal)
+}
+
 /// Arguments of `job.start`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -390,6 +401,7 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
 
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let principal = ctx.principal().to_owned();
+    let device = ctx.device().map(str::to_owned);
 
     // Ensure `<state dir>` exists before taking the node-wide jobs lock.
     let state_dir_for_prepare = state_dir.clone();
@@ -490,6 +502,7 @@ pub(crate) async fn start(ctx: &Ctx, args: StartArgs) -> Result<Started, ToolErr
             cwd: cwd_str,
             env_names,
             principal,
+            device,
             created: store::format_timestamp(now),
             boot_id,
             exclusive: args.exclusive,

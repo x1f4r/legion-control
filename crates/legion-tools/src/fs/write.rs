@@ -296,6 +296,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
         let size = payload.len() as u64;
         let options = WriteOptions {
             mode: unix_mode,
+            force_mode: false,
             no_replace: mode == WriteMode::Create,
         };
         write_atomic_cancellable(&path, &payload, options, &cancel, "fs.write")?;

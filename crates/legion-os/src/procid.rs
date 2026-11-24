@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -245,6 +246,97 @@ pub fn is_protected(identity: &ProcessId) -> Option<&'static str> {
     is_protected_impl(identity)
 }
 
+/// Find the closest ancestor of the current process (walking through at most a few shell wrappers)
+/// that is a live, per-connection `sshd` / `sshd-session` process running under the same OS account
+/// as the current process.
+///
+/// Returns `None` when not launched under `sshd`, when `sshd` runs under another OS account (such
+/// as `SYSTEM` on Windows), or when only an `sshd` listener daemon or privsep monitor is seen.
+pub fn sshd_session_ancestor() -> Option<ProcessId> {
+    sshd_session_ancestor_impl()
+}
+
+/// Return `true` if and only if `identity` currently refers to a live process whose PID, kernel
+/// start time, and resolved executable image path match `expected_exe`.
+///
+/// Guards against forged session records or PID reuse targeting an unrelated process belonging to
+/// the same account. Always returns `false` for PID 0, exited processes, or unreadable executable
+/// paths.
+pub fn verify_same_executable(identity: &ProcessId, expected_exe: &Path) -> bool {
+    if identity.pid == 0 {
+        return false;
+    }
+    let Some(actual_exe) = executable_of_impl(identity) else {
+        return false;
+    };
+    executables_match(&actual_exe, expected_exe)
+}
+
+fn executables_match(actual: &Path, expected: &Path) -> bool {
+    if paths_equal_platform(actual, expected) {
+        return true;
+    }
+    let canon_expected = std::fs::canonicalize(expected).ok();
+    if let Ok(canon_actual) = std::fs::canonicalize(actual) {
+        if let Some(ref exp) = canon_expected
+            && paths_equal_platform(&canon_actual, exp)
+        {
+            return true;
+        }
+        if paths_equal_platform(&canon_actual, expected) {
+            return true;
+        }
+    }
+    // On Linux, `/proc/<pid>/exe` appends `" (deleted)"` after an in-place binary upgrade while the
+    // old process is still running.
+    #[cfg(target_os = "linux")]
+    if let Some(raw) = actual.to_str()
+        && let Some(stripped) = raw.strip_suffix(" (deleted)")
+    {
+        let stripped_path = Path::new(stripped);
+        if paths_equal_platform(stripped_path, expected) {
+            return true;
+        }
+        if let Some(ref exp) = canon_expected
+            && (paths_equal_platform(stripped_path, exp)
+                || std::fs::canonicalize(stripped_path)
+                    .ok()
+                    .is_some_and(|c| paths_equal_platform(&c, exp)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn paths_equal_platform(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let norm = |p: &Path| {
+            let s = p.to_string_lossy();
+            s.strip_prefix(r"\\?\").unwrap_or(&s).to_ascii_lowercase()
+        };
+        norm(a) == norm(b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// Return `true` if and only if `identity` currently refers to a live, non-listener, per-connection
+/// `sshd` / `sshd-session` process running under the same OS account as the current process, with
+/// exact matching PID and kernel start time.
+///
+/// Always returns `false` for PID 0, PID 1, PID 4, the current process, listener daemons, privsep
+/// monitors, other OS accounts, or any non-`sshd` process.
+pub fn verify_same_account_sshd(identity: &ProcessId) -> bool {
+    if identity.pid <= 1 || identity.pid == std::process::id() {
+        return false;
+    }
+    verify_same_account_sshd_impl(identity)
+}
+
 /// Stop a single verified process without signaling its process group or walking descendants.
 ///
 /// Returns `Ok(true)` once the exact process identified by `identity` is no longer alive
@@ -396,6 +488,36 @@ fn is_protected_impl(identity: &ProcessId) -> Option<&'static str> {
 #[cfg(not(any(unix, windows)))]
 fn is_protected_impl(_identity: &ProcessId) -> Option<&'static str> {
     None
+}
+
+#[cfg(any(unix, windows))]
+fn sshd_session_ancestor_impl() -> Option<ProcessId> {
+    platform::sshd_session_ancestor()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sshd_session_ancestor_impl() -> Option<ProcessId> {
+    None
+}
+
+#[cfg(any(unix, windows))]
+fn executable_of_impl(identity: &ProcessId) -> Option<PathBuf> {
+    platform::executable_of(identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn executable_of_impl(_identity: &ProcessId) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(any(unix, windows))]
+fn verify_same_account_sshd_impl(identity: &ProcessId) -> bool {
+    platform::verify_same_account_sshd(identity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_same_account_sshd_impl(_identity: &ProcessId) -> bool {
+    false
 }
 
 #[cfg(any(unix, windows))]
@@ -598,6 +720,215 @@ pub(crate) fn is_windows_core_session_image(image_path: &str) -> bool {
         stem,
         "csrss" | "wininit" | "smss" | "lsass" | "services" | "winlogon"
     )
+}
+
+/// Normalize a process command name or executable path to its lowercased basename without a
+/// leading login-shell `-` or trailing `.exe`.
+#[allow(dead_code)]
+pub(crate) fn comm_basename_stem(name: &str) -> String {
+    let base = name.rsplit(['\\', '/']).next().unwrap_or(name).trim();
+    let base = base.strip_prefix('-').unwrap_or(base);
+    let lower = base.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_owned()
+}
+
+/// Return `true` when `name` is a known shell or console wrapper that `sshd` may spawn between
+/// the per-connection `sshd` session process and a forced `legion gate` command.
+#[allow(dead_code)]
+pub(crate) fn is_shell_wrapper_comm(name: &str) -> bool {
+    matches!(
+        comm_basename_stem(name).as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "ash"
+            | "zsh"
+            | "fish"
+            | "ksh"
+            | "mksh"
+            | "csh"
+            | "tcsh"
+            | "nu"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+            | "conhost"
+    )
+}
+
+/// Return `true` when `(comm, argv)` identifies a per-connection `sshd` / `sshd-session` user
+/// session process rather than a listener daemon, privsep monitor, pre-auth child, or unrelated
+/// process.
+///
+/// On Unix, requires a strict allowlisted OpenSSH authenticated-session `setproctitle` form
+/// matching `comm` (`sshd: <user>`, `sshd: <user>@notty`, `sshd: <user>@pts/<N>`, or
+/// `sshd: <user>@ttys<N>`, and the matching `sshd-session: ...` forms for `sshd-session`),
+/// refusing listeners, `[priv]`/`[net]`/`[accepted]`/`[rexec]` monitors, path-prefixed titles,
+/// and non-session invocations.
+#[allow(dead_code)]
+pub(crate) fn is_sshd_session_process(comm: &str, argv: &[&str], is_windows: bool) -> bool {
+    let base = comm_basename_stem(comm);
+    if base != "sshd" && base != "sshd-session" {
+        return false;
+    }
+    if argv.is_empty() {
+        return false;
+    }
+    let arg0 = argv[0];
+    let arg0_lower = arg0.to_ascii_lowercase();
+    if arg0_lower.contains("[listener]")
+        || arg0_lower.contains("[priv]")
+        || arg0_lower.contains("[accepted]")
+        || arg0_lower.contains("[rexec]")
+        || arg0_lower.contains("[net]")
+    {
+        return false;
+    }
+    if argv
+        .iter()
+        .skip(1)
+        .any(|a| matches!(*a, "-D" | "-d" | "-f" | "-t" | "-T"))
+    {
+        return false;
+    }
+
+    if !is_windows {
+        if argv.len() != 1 {
+            return false;
+        }
+        let expected_prefix = if base == "sshd" {
+            "sshd: "
+        } else {
+            "sshd-session: "
+        };
+        let Some(rest) = arg0.strip_prefix(expected_prefix) else {
+            return false;
+        };
+        return is_valid_unix_sshd_session_title(rest);
+    }
+
+    // On Windows, `sshd.exe` session workers do not rewrite argv[0] with setproctitle; callers
+    // pair this with direct-parent (`hop == 0`) and same-SID checks to exclude both the `SYSTEM`
+    // listener service and any unrelated same-account `sshd.exe` higher up the tree.
+    true
+}
+
+#[allow(dead_code)]
+fn is_valid_unix_sshd_session_title(rest: &str) -> bool {
+    if rest.is_empty()
+        || rest.starts_with('/')
+        || rest.starts_with('\\')
+        || rest.starts_with('-')
+        || rest.contains('[')
+        || rest.contains(']')
+        || rest.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    match rest.split_once('@') {
+        None => !rest.contains('/') && !rest.contains('\\'),
+        Some((user, tty)) => {
+            if user.is_empty() || user.contains('/') || user.contains('\\') {
+                return false;
+            }
+            if tty == "notty" {
+                return true;
+            }
+            if let Some(num) = tty.strip_prefix("pts/") {
+                return !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit());
+            }
+            if let Some(num) = tty.strip_prefix("ttys") {
+                return !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit());
+            }
+            false
+        }
+    }
+}
+
+/// Parse `(real_uid, effective_uid)` from the `Uid:` line of Linux `/proc/<pid>/status`.
+#[allow(dead_code)]
+pub(crate) fn parse_linux_proc_status_uids(contents: &str) -> Option<(u32, u32)> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut fields = rest.split_ascii_whitespace();
+            let real = fields.next()?.parse::<u32>().ok()?;
+            let effective = fields.next()?.parse::<u32>().ok()?;
+            return Some((real, effective));
+        }
+    }
+    None
+}
+
+/// Split a Linux `/proc/<pid>/cmdline` NUL-delimited byte slice into UTF-8 argument strings,
+/// ignoring empty trailing NUL padding written by `setproctitle`.
+#[allow(dead_code)]
+pub(crate) fn parse_linux_proc_cmdline(bytes: &[u8]) -> Vec<String> {
+    let mut parts: Vec<String> = bytes
+        .split(|&b| b == 0)
+        .map(|slice| String::from_utf8_lossy(slice).into_owned())
+        .collect();
+    while parts.last().is_some_and(String::is_empty) {
+        parts.pop();
+    }
+    parts
+}
+
+/// Parse `argv` from a macOS `sysctl([CTL_KERN, KERN_PROCARGS2, pid])` buffer.
+#[allow(dead_code)]
+pub(crate) fn parse_macos_procargs2_argv(buf: &[u8]) -> Option<Vec<String>> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if argc <= 0 {
+        return None;
+    }
+    let mut rest = &buf[4..];
+    let exec_end = rest.iter().position(|&b| b == 0)?;
+    rest = &rest[exec_end + 1..];
+    while rest.first() == Some(&0) {
+        rest = &rest[1..];
+    }
+    let mut out = Vec::with_capacity(usize::try_from(argc).ok()?);
+    for _ in 0..argc {
+        let arg_end = rest.iter().position(|&b| b == 0)?;
+        out.push(String::from_utf8_lossy(&rest[..arg_end]).into_owned());
+        rest = &rest[arg_end + 1..];
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    Some(out)
+}
+
+/// Split a Windows process command line into tokens respecting double-quoted arguments.
+#[allow(dead_code)]
+pub(crate) fn split_windows_cmdline(cmdline: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    for ch in cmdline.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_token = true;
+            }
+            c if c.is_ascii_whitespace() && !in_quotes => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 /// Parse `(state, ppid, start_ticks)` from a Linux `/proc/<pid>/stat` line.
@@ -1118,5 +1449,188 @@ mod tests {
         assert!(report.survivors.is_empty());
         assert!(report.unverified_survivors.is_empty());
         assert!(is_alive(&me));
+    }
+
+    #[test]
+    fn sshd_session_process_classifier_accepts_sessions_and_rejects_listeners_and_other_procs() {
+        // Real per-connection user sessions across OpenSSH 8.9/9.2/9.8+/10.x and macOS/Windows.
+        assert!(is_sshd_session_process("sshd", &["sshd: me@notty"], false));
+        assert!(is_sshd_session_process(
+            "sshd-session",
+            &["sshd-session: me@notty"],
+            false
+        ));
+        assert!(is_sshd_session_process("sshd", &["sshd: me@pts/0"], false));
+        assert!(is_sshd_session_process(
+            "sshd-session",
+            &["sshd-session: me@pts/12"],
+            false
+        ));
+        assert!(is_sshd_session_process(
+            "sshd",
+            &["sshd: me@ttys003"],
+            false
+        ));
+        assert!(is_sshd_session_process("sshd", &["sshd: me"], false));
+        assert!(is_sshd_session_process(
+            "sshd-session",
+            &["sshd-session: me"],
+            false
+        ));
+        assert!(is_sshd_session_process(
+            r"C:\Windows\System32\OpenSSH\sshd.exe",
+            &[r"C:\Windows\System32\OpenSSH\sshd.exe", "-z"],
+            true
+        ));
+
+        // Listeners, privsep monitors, pre-auth workers, inetd/rexec fallbacks, mismatched comm vs
+        // title prefix, weird session titles, and non-sshd processes must be rejected.
+        assert!(!is_sshd_session_process(
+            "sshd-session",
+            &["/usr/lib/ssh/sshd-session", "-R"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["/usr/sbin/sshd", "-i"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd-session: me@notty"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd-session",
+            &["sshd: me@notty"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: me@pts/abc"],
+            false
+        ));
+        assert!(!is_sshd_session_process("sshd", &["sshd: me@weird"], false));
+        assert!(!is_sshd_session_process("sshd", &["sshd: me extra"], false));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: me@notty", "-D"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["/usr/sbin/sshd", "-D", "-e", "-f", "/tmp/sshd_config"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: /usr/sbin/sshd [listener] 0 of 10-100 startups"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: /usr/sbin/sshd"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: me [priv]"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd-session",
+            &["sshd-session: me [priv]"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["sshd: [accepted]"],
+            false
+        ));
+        assert!(!is_sshd_session_process("sshd", &["sshd: [net]"], false));
+        assert!(!is_sshd_session_process(
+            "sshd",
+            &["/usr/sbin/sshd", "-f", "/etc/ssh/sshd_config"],
+            false
+        ));
+        assert!(!is_sshd_session_process(
+            r"C:\Windows\System32\OpenSSH\sshd.exe",
+            &[r"C:\Windows\System32\OpenSSH\sshd.exe", "-D"],
+            true
+        ));
+        assert!(!is_sshd_session_process(
+            r"C:\Windows\System32\OpenSSH\sshd.exe",
+            &[r"C:\Windows\System32\OpenSSH\sshd.exe", "-f", "sshd_config"],
+            true
+        ));
+        assert!(!is_sshd_session_process("sshd", &[], false));
+        assert!(!is_sshd_session_process("bash", &["sshd: me@notty"], false));
+        assert!(!is_sshd_session_process("sleep", &["sleep", "60"], false));
+
+        // Executable verification matches the current process against its own executable and
+        // rejects a different executable path, wrong start_time, and pid 0.
+        let me = current().unwrap();
+        let my_exe = std::env::current_exe().unwrap();
+        assert!(verify_same_executable(&me, &my_exe));
+        assert!(!verify_same_executable(
+            &me,
+            Path::new("/nonexistent/other-binary")
+        ));
+        assert!(!verify_same_executable(
+            &ProcessId::new(me.pid, me.start_time.wrapping_add(1)),
+            &my_exe
+        ));
+        assert!(!verify_same_executable(&ProcessId::new(0, 1), &my_exe));
+
+        // Shell wrapper detection.
+        for shell in [
+            "sh",
+            "-bash",
+            "/usr/bin/zsh",
+            "fish",
+            r"C:\Windows\System32\cmd.exe",
+            "pwsh.exe",
+            "conhost.exe",
+        ] {
+            assert!(is_shell_wrapper_comm(shell), "expected shell: {shell}");
+        }
+        for other in ["sshd", "sshd-session", "legion", "cargo", "sleep", ""] {
+            assert!(!is_shell_wrapper_comm(other), "unexpected shell: {other}");
+        }
+
+        // Parsers.
+        assert_eq!(
+            parse_linux_proc_status_uids("Name:\tsshd\nUid:\t1000\t1000\t1000\t1000\n"),
+            Some((1000, 1000))
+        );
+        assert_eq!(parse_linux_proc_status_uids("Name:\tsshd\n"), None);
+        assert_eq!(
+            parse_linux_proc_cmdline(b"sshd-session: me@notty\0\0\0"),
+            vec!["sshd-session: me@notty".to_owned()]
+        );
+        assert_eq!(
+            split_windows_cmdline(r#""C:\Program Files\OpenSSH\sshd.exe" -D -f "C:\a b\cfg""#),
+            vec![
+                r"C:\Program Files\OpenSSH\sshd.exe".to_owned(),
+                "-D".to_owned(),
+                "-f".to_owned(),
+                r"C:\a b\cfg".to_owned(),
+            ]
+        );
+        let mut procargs = Vec::new();
+        procargs.extend_from_slice(&2i32.to_ne_bytes());
+        procargs.extend_from_slice(b"/usr/sbin/sshd\0\0");
+        procargs.extend_from_slice(b"sshd: me@notty\0\0");
+        procargs.extend_from_slice(b"HOME=/Users/me\0\0");
+        assert_eq!(
+            parse_macos_procargs2_argv(&procargs),
+            Some(vec!["sshd: me@notty".to_owned()])
+        );
+
+        // Runtime verification must refuse self, pid 0/1, and non-sshd processes.
+        let me = current().unwrap();
+        assert!(!verify_same_account_sshd(&me));
+        assert!(!verify_same_account_sshd(&ProcessId::new(0, 1)));
+        assert!(!verify_same_account_sshd(&ProcessId::new(1, 1)));
     }
 }

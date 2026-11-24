@@ -137,6 +137,8 @@ pub(super) struct JobRecord {
     #[serde(default)]
     pub env_names: Vec<String>,
     pub principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     pub created: String,
     pub boot_id: String,
     #[serde(default)]
@@ -1088,6 +1090,38 @@ pub(super) fn exclusive_running_jobs_in(state_dir: &Path) -> Result<Vec<Exclusiv
     Ok(busy)
 }
 
+/// Returns the IDs of active (`starting` or `running`) background jobs under `state_dir` that
+/// were started by paired device `device` (or without a device tag under `principal`).
+///
+/// Pure read: never creates, modifies, or stops any job.
+pub(super) fn running_job_ids_for_device_in(
+    state_dir: &Path,
+    device: &str,
+    principal: &str,
+) -> Vec<String> {
+    let Ok(records) = load_all_records(state_dir) else {
+        return Vec::new();
+    };
+    let current_boot = procid::boot_id().ok();
+    let now = jiff::Timestamp::now();
+    let mut active: Vec<(String, String)> = Vec::new();
+    for (dir, record) in records {
+        let matches = match record.device.as_deref() {
+            Some(recorded_device) => recorded_device == device,
+            None => record.principal == principal,
+        };
+        if !matches {
+            continue;
+        }
+        let status = derive_status(&dir, &record, current_boot.as_deref(), now);
+        if status.state.is_active() {
+            active.push((record.created, record.id));
+        }
+    }
+    active.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    active.into_iter().map(|(_, id)| id).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,6 +1136,7 @@ mod tests {
             cwd: None,
             env_names: Vec::new(),
             principal: "owner".to_owned(),
+            device: None,
             created: created.to_owned(),
             boot_id: boot_id.to_owned(),
             exclusive: false,

@@ -44,6 +44,8 @@ pub struct Call {
     /// The principal the door pinned, when it pinned one: `legion rpc --as`, an ssh key forced to
     /// `legion gate --as`, an HTTP token.
     pub pinned: Option<String>,
+    /// The paired device name when the call arrived through `legion gate --as ... --device <name>`.
+    pub device: Option<String>,
     /// Cancelled by the door when the caller cancels.
     pub cancel: CancellationToken,
     /// Where the call's events go.
@@ -66,6 +68,7 @@ impl Call {
             as_principal: None,
             door,
             pinned: None,
+            device: None,
             cancel: CancellationToken::new(),
             events: EventSink::discard(),
             hops: 0,
@@ -258,6 +261,7 @@ impl Node {
         let recorded_args = audit::redact(&call.args);
         let tool = call.tool.clone();
         let door = call.door;
+        let device = call.device.clone();
 
         let (principal, result) = self.run(&name, call).await;
         let result = result.map_err(|error| match error.machine {
@@ -269,6 +273,7 @@ impl Node {
             time: audit::now(),
             principal,
             door,
+            device,
             tool,
             target: name,
             outcome: match &result {
@@ -299,10 +304,28 @@ impl Node {
         started: Instant,
         result: &Result<Value, ErrorBody>,
     ) {
+        self.record_audit_with_device(target, principal, door, None, tool, args, started, result)
+            .await;
+    }
+
+    /// Appends one call to this node's audit log, optionally recording the paired `device` name.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_audit_with_device(
+        &self,
+        target: String,
+        principal: Option<String>,
+        door: Door,
+        device: Option<String>,
+        tool: String,
+        args: &Value,
+        started: Instant,
+        result: &Result<Value, ErrorBody>,
+    ) {
         self.append_audit_entry(Entry {
             time: audit::now(),
             principal,
             door,
+            device,
             tool,
             target,
             outcome: match result {
@@ -368,6 +391,7 @@ impl Node {
             node: self.clone(),
             name: name.to_owned(),
             door: call.door,
+            device: call.device,
             grant,
             cancel: call.cancel.clone(),
             events: call.events,

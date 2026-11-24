@@ -14,9 +14,9 @@ use toml_edit::{Array, DocumentMut, Item, Table};
 /// Static family namespaces reserved for Legion (core families plus names kept for Legion's own
 /// future use). At load and define time, every family present in the node's built-in registry is
 /// also reserved dynamically so newly added built-in families can never be shadowed.
-pub const RESERVED_FAMILIES: [&str; 15] = [
-    "agent", "audit", "config", "exec", "ext", "fleet", "fs", "job", "legion", "meta", "power",
-    "proj", "svc", "sys", "token",
+pub const RESERVED_FAMILIES: [&str; 16] = [
+    "agent", "audit", "config", "device", "exec", "ext", "fleet", "fs", "job", "legion", "meta",
+    "power", "proj", "svc", "sys", "token",
 ];
 
 /// Default command timeout in seconds when `timeout_s` is omitted.

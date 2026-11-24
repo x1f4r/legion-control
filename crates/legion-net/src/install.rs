@@ -47,8 +47,9 @@ const SCP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Fixed remote Unix command to detect OS, architecture, and macOS Rosetta 2 translation.
 pub const UNIX_PROBE_COMMAND: &str = "sh -c 's=$(uname -s); m=$(uname -m); if [ \"$s\" = Darwin ] && [ \"$m\" = x86_64 ] && [ \"$(sysctl -in sysctl.proc_translated 2>/dev/null || true)\" = 1 ]; then printf \"%s %s translated=1\\n\" \"$s\" \"$m\"; else printf \"%s %s\\n\" \"$s\" \"$m\"; fi'";
 
-/// Fixed remote Unix command to ensure `$HOME/.local/bin` exists before `scp`.
-pub const UNIX_PREPARE_DIR_COMMAND: &str = "sh -c 'mkdir -p \"$HOME/.local/bin\"'";
+/// Fixed remote Unix command to ensure `$HOME/.local/bin` exists before `scp` with non-group- and
+/// non-world-writable permissions (even under Ubuntu/Debian's default `umask 0002`).
+pub const UNIX_PREPARE_DIR_COMMAND: &str = "sh -c 'umask 022 && mkdir -p \"$HOME/.local/bin\" && chmod go-w \"$HOME/.local\" \"$HOME/.local/bin\"'";
 
 /// Fixed remote Unix command to check whether `legion` is already installed and read its version.
 pub const UNIX_VERSION_PROBE_COMMAND: &str = "sh -c 'if command -v legion >/dev/null 2>&1; then legion --version; elif [ -x \"$HOME/.local/bin/legion\" ]; then \"$HOME/.local/bin/legion\" --version; fi'";
@@ -1885,6 +1886,36 @@ mod tests {
         assert!(unix_fin.contains("cp -p"));
         assert!(unix_fin.contains(".prev"));
         assert!(unix_fin.contains("mv -f"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(home.join(".local")).unwrap();
+            std::fs::set_permissions(home.join(".local"), std::fs::Permissions::from_mode(0o775))
+                .unwrap();
+
+            let status = std::process::Command::new("sh")
+                .args(["-c", &format!("umask 0002 && {UNIX_PREPARE_DIR_COMMAND}")])
+                .env("HOME", &home)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let local_mode = std::fs::metadata(home.join(".local"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let bin_mode = std::fs::metadata(home.join(".local/bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(local_mode & 0o022, 0, "mode was {local_mode:04o}");
+            assert_eq!(bin_mode & 0o022, 0, "mode was {bin_mode:04o}");
+        }
 
         // Windows commands are encoded PowerShell containing only fixed code and the generated temp name.
         let win_probe = decode_powershell_command(&windows_probe_command());

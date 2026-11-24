@@ -44,6 +44,10 @@ pub struct Entry {
     pub principal: Option<String>,
     /// The door it came through.
     pub door: Door,
+    /// The paired device name when the call arrived through `legion gate --device <name>` (or
+    /// completed `device.enrol`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
     /// The tool it called.
     pub tool: String,
     /// The machine it ran on.
@@ -325,8 +329,8 @@ const SECRET_KEY_ENDINGS: [&str; 3] = ["_key", "_auth", "_pass"];
 /// `sshpass` and others, and `-u`/`--user` takes `user:password` for `curl`.
 const SECRET_FLAGS: [&str; 3] = ["p", "u", "user"];
 /// How a token from a well-known service starts, as a word: GitHub, GitLab, OpenAI, Slack, AWS,
-/// Google, npm, PyPI, Hugging Face, Stripe, and Legion's own HTTP tokens.
-const TOKEN_PREFIXES: [&str; 24] = [
+/// Google, npm, PyPI, Hugging Face, Stripe, and Legion's own HTTP tokens and pairing invites.
+const TOKEN_PREFIXES: [&str; 25] = [
     "ghp_",
     "gho_",
     "ghu_",
@@ -351,6 +355,7 @@ const TOKEN_PREFIXES: [&str; 24] = [
     "rk_live_",
     "sk_test_",
     "lgn_",
+    "legion-invite-1.",
 ];
 /// What gives a secret away wherever it stands in a string, compared in lower case: a PEM block
 /// such as a private key, and a bearer token.
@@ -572,6 +577,7 @@ mod tests {
             time: now(),
             principal: Some(principal.to_owned()),
             door: Door::Cli,
+            device: None,
             tool: tool.to_owned(),
             target: "tower".to_owned(),
             outcome,
@@ -659,6 +665,7 @@ mod tests {
             "gh auth login --with-token ghp_abc",
             "export GH=ghp_abc",
             "curl -H x:lgn_Zm9v-YmFy_ https://tower.example",
+            "legion-invite-1.eyJ2IjoxLCJrZXkiOiJzZWNyZXQifQ",
             "  -----BEGIN OPENSSH PRIVATE KEY-----",
         ] {
             assert!(is_redacted(&recorded(json!(secret))), "{secret:?} was kept");

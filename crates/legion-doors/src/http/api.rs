@@ -145,6 +145,7 @@ pub(crate) async fn call(State(shared): State<Arc<Shared>>, request: Request) ->
         as_principal: body.as_principal,
         door: Door::Http,
         pinned: Some(principal),
+        device: None,
         cancel: cancel.clone(),
         events,
         hops: 0,

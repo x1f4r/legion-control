@@ -5,14 +5,13 @@
 //! log records a call's arguments and outcome, never its result.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
 use legion_core::config::{parse, write_atomically};
-use legion_core::policy::{OWNER, Policy, Principal};
+use legion_core::policy::Principal;
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::tokens::{self, Tokens};
 use legion_core::{Ctx, NoArgs, Registry, ToolError};
@@ -21,6 +20,8 @@ use legion_os::lock::{FileLock, LockMode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Table};
+
+use crate::caller::Caller;
 
 /// How many random bytes a token carries: as many as the hash that stands for it.
 const TOKEN_BYTES: usize = 32;
@@ -89,33 +90,15 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<Added, ToolError> {
     let principal = Principal::parse(&args.principal)?;
     let principal = principal.as_str().to_owned();
     let caller = Caller::of(ctx)?;
-    caller.check(&principal)?;
-    if caller.has_owner_role(&principal) {
-        if !args.allow_owner {
-            return Err(ErrorBody::new(
-                ErrorCode::Denied,
-                format!("{principal} has the owner role: a token for it may do everything the account can, from anywhere the server is published, so it is not made unless asked for in so many words."),
-            )
-            .with_hint("Give the token a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want."));
-        }
-    } else {
-        let policy = &caller.policy;
-        if !policy
-            .principals
-            .keys()
-            .any(|known| known.as_str() == principal)
-        {
-            return Err(ErrorBody::new(
-                ErrorCode::NotFound,
-                format!(
-                    "policy.toml does not name {principal}, so a token for it could do nothing."
-                ),
-            )
-            .with_hint(format!(
-                "Add [principals.\"{principal}\"] with a role to policy.toml first."
-            )));
-        }
-    }
+    caller.check_issue(
+        &principal,
+        args.allow_owner,
+        "a token",
+        format!(
+            "{principal} has the owner role: a token for it may do everything the account can, from anywhere the server is published, so it is not made unless asked for in so many words."
+        ),
+        "Give the token a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want.",
+    )?;
     if let Some(days) = args.expires_days
         && !(1..=LONGEST_DAYS).contains(&days)
     {
@@ -275,62 +258,6 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
         name: args.name,
         removed: true,
     })
-}
-
-/// Who is calling a token tool, as far as deciding whose tokens it may manage goes.
-struct Caller {
-    principal: String,
-    /// Whether the caller's role is the owner role, the one role that may act as anyone.
-    owner: bool,
-    policy: Arc<Policy>,
-}
-
-impl Caller {
-    fn of(ctx: &Ctx) -> Result<Caller, ErrorBody> {
-        Ok(Caller {
-            principal: ctx.principal().to_owned(),
-            owner: ctx.grant().role() == OWNER,
-            policy: ctx.config().get::<Policy>()?,
-        })
-    }
-
-    /// Whether `principal` has the owner role, by name (owner) or by the role the file gives it.
-    fn has_owner_role(&self, principal: &str) -> bool {
-        self.policy.role_of(principal).0 == OWNER
-    }
-
-    /// Whether the caller may make, see or remove a token for `principal`: one it could act as
-    /// itself, so a token never gives anyone more than they already have. That is its own
-    /// principal, or any when the caller has the owner role, which alone may act as others; and a
-    /// token for a principal with the owner role, the keys to the machine, only a caller with the
-    /// owner role may handle.
-    fn may_manage(&self, principal: &str) -> bool {
-        if self.has_owner_role(principal) {
-            self.owner
-        } else {
-            self.owner || principal == self.principal
-        }
-    }
-
-    /// [`Caller::may_manage`] as the error that says which rule refused it.
-    fn check(&self, principal: &str) -> Result<(), ErrorBody> {
-        if self.may_manage(principal) {
-            return Ok(());
-        }
-        let message = if self.has_owner_role(principal) {
-            format!(
-                "{} may not make a token for {principal}: it has the owner role, and only a caller with the owner role may hand out a token that may do everything the account can.",
-                self.principal
-            )
-        } else {
-            format!(
-                "{} may not make a token for {principal}: a token may stand only for the caller itself, unless the caller has the owner role.",
-                self.principal
-            )
-        };
-        Err(ErrorBody::new(ErrorCode::Denied, message)
-            .with_hint("Ask the owner of this machine to make the token."))
-    }
 }
 
 /// A token as the file will keep it.
