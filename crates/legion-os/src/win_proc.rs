@@ -13,6 +13,7 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use windows::Wdk::System::SystemInformation::{
     NtQuerySystemInformation, SystemTimeOfDayInformation,
 };
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME,
     HANDLE, STILL_ACTIVE,
@@ -21,8 +22,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE, TerminateProcess,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_BASIC_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
 };
 
 use crate::procid::ProcessId;
@@ -59,6 +60,142 @@ pub(crate) enum TerminateOutcome {
     IdentityMismatch,
     /// Access was denied when opening or terminating the process.
     AccessDenied,
+}
+
+/// An open Win32 process handle paired with its verified identity and parent PID read directly
+/// from the handle.
+///
+/// Holding this value keeps the OS PID pinned so the kernel cannot reuse it while subsequent
+/// tree-walk snapshots and termination waves are in progress.
+pub(crate) struct PinnedProcess {
+    handle: OwnedHandle,
+    pub(crate) id: ProcessId,
+    pub(crate) parent_pid: u32,
+    can_terminate: bool,
+}
+
+impl PinnedProcess {
+    /// Return `true` while this pinned process has not yet exited.
+    pub(crate) fn is_running(&self) -> bool {
+        match query_times_raw(self.handle.0, &format!("pid {}", self.id.pid)) {
+            Ok((_, exit_ft)) => is_still_running(self.handle.0, exit_ft),
+            Err(_) => false,
+        }
+    }
+
+    /// Terminate this pinned process through its already-verified handle.
+    pub(crate) fn terminate(&self) -> TerminateOutcome {
+        if !self.is_running() {
+            return TerminateOutcome::AlreadyGone;
+        }
+        if !self.can_terminate {
+            return TerminateOutcome::AccessDenied;
+        }
+
+        // SAFETY: `self.handle.0` is a valid handle opened with `PROCESS_TERMINATE` whose
+        // identity was verified while this handle pinned the PID against reuse.
+        match unsafe { TerminateProcess(self.handle.0, 1) } {
+            Ok(()) => TerminateOutcome::Terminated,
+            Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                if !self.is_running() {
+                    TerminateOutcome::AlreadyGone
+                } else {
+                    TerminateOutcome::AccessDenied
+                }
+            }
+            Err(_) => TerminateOutcome::AccessDenied,
+        }
+    }
+}
+
+/// Result of attempting to open and pin one candidate PID during a process-tree walk.
+pub(crate) enum OpenPinnedOutcome {
+    /// Handle opened and creation time plus parent PID read from the pinned handle.
+    Pinned(PinnedProcess),
+    /// The PID does not exist or has already exited.
+    Gone,
+    /// Access was denied even for `PROCESS_QUERY_LIMITED_INFORMATION`.
+    AccessDenied,
+    /// Querying times or parent PID failed for this single process.
+    Failed,
+}
+
+/// Read `InheritedFromUniqueProcessId` directly from an open handle with at least
+/// `PROCESS_QUERY_LIMITED_INFORMATION`.
+fn query_parent_pid_raw(handle: HANDLE) -> Result<u32> {
+    let mut info = PROCESS_BASIC_INFORMATION::default();
+    let mut returned = 0u32;
+    let len = size_of::<PROCESS_BASIC_INFORMATION>() as u32;
+
+    // SAFETY: `handle` is a valid process handle with at least `PROCESS_QUERY_LIMITED_INFORMATION`
+    // (sufficient for `ProcessBasicInformation` on Windows Vista+), `info` has exact size `len`,
+    // and `returned` is a valid mutable `u32`.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle,
+            ProcessBasicInformation,
+            (&mut info as *mut PROCESS_BASIC_INFORMATION).cast::<c_void>(),
+            len,
+            &mut returned,
+        )
+    };
+    status.ok().map_err(|err| OsError::Platform {
+        detail: format!("NtQueryInformationProcess(ProcessBasicInformation) failed: {err}"),
+    })?;
+    u32::try_from(info.InheritedFromUniqueProcessId).map_err(|_| OsError::Platform {
+        detail: format!(
+            "InheritedFromUniqueProcessId {} exceeds u32 range",
+            info.InheritedFromUniqueProcessId
+        ),
+    })
+}
+
+/// Open `pid` (requesting `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, falling back to
+/// `PROCESS_QUERY_LIMITED_INFORMATION` if termination is denied) and read both its creation time
+/// and its `parent_pid` directly from the held handle.
+pub(crate) fn open_pinned(pid: u32, include_exited: bool) -> OpenPinnedOutcome {
+    let terminate_rights = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    // SAFETY: `OpenProcess` takes plain integer arguments and any returned handle is immediately
+    // wrapped in `OwnedHandle`.
+    let (handle, can_terminate) = match unsafe { OpenProcess(terminate_rights, false, pid) } {
+        Ok(h) => (OwnedHandle(h), true),
+        Err(err) if err.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+            return OpenPinnedOutcome::Gone;
+        }
+        Err(err) if err.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+            // Fall back to query-only access so we can still verify identity, walk children, and
+            // record the process as a survivor if it cannot be terminated.
+            // SAFETY: Same plain-integer `OpenProcess` contract with query-only rights.
+            match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+                Ok(h) => (OwnedHandle(h), false),
+                Err(err2) if err2.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+                    return OpenPinnedOutcome::Gone;
+                }
+                Err(err2) if err2.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                    return OpenPinnedOutcome::AccessDenied;
+                }
+                Err(_) => return OpenPinnedOutcome::Failed,
+            }
+        }
+        Err(_) => return OpenPinnedOutcome::Failed,
+    };
+
+    let Ok((creation, exit_ft)) = query_times_raw(handle.0, &format!("pid {pid}")) else {
+        return OpenPinnedOutcome::Failed;
+    };
+    if !include_exited && !is_still_running(handle.0, exit_ft) {
+        return OpenPinnedOutcome::Gone;
+    }
+    let Ok(parent_pid) = query_parent_pid_raw(handle.0) else {
+        return OpenPinnedOutcome::Failed;
+    };
+
+    OpenPinnedOutcome::Pinned(PinnedProcess {
+        handle,
+        id: ProcessId::new(pid, creation),
+        parent_pid,
+        can_terminate,
+    })
 }
 
 #[inline]
@@ -249,6 +386,7 @@ pub(crate) fn snapshot_processes() -> Result<Vec<ProcessSnapshotEntry>> {
 /// Open `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verify its
 /// exact 100-ns `FILETIME` creation time while the held handle pins the PID against reuse, and
 /// call `TerminateProcess` through that handle.
+#[allow(dead_code)]
 pub(crate) fn open_verify_terminate(identity: &ProcessId) -> Result<TerminateOutcome> {
     let desired = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
     // SAFETY: `OpenProcess` takes plain integer arguments and the returned handle is immediately

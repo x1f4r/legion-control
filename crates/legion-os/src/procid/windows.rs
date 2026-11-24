@@ -7,13 +7,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::win_proc::{self, TerminateOutcome};
+use crate::win_proc::{self, OpenPinnedOutcome, PinnedProcess, TerminateOutcome};
 use crate::{OsError, Result};
 
 use super::{KillTreeReport, ProcessId, is_alive};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_WALK_PASSES: usize = 8;
 
 pub(super) fn of_pid(pid: u32, include_zombie: bool) -> Result<Option<ProcessId>> {
     win_proc::query_process_identity(pid, include_zombie)
@@ -33,22 +34,44 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
 
     let tracked_list: Vec<ProcessId> =
         tokio::task::spawn_blocking(move || -> Result<Vec<ProcessId>> {
-            if !is_alive(&identity) {
-                return Ok(Vec::new());
+            let mut pinned: HashMap<u32, PinnedProcess> = HashMap::new();
+            let mut root_pinned = false;
+
+            // Pin and verify the root first so its PID cannot be reused while we walk descendants.
+            match win_proc::open_pinned(identity.pid, false) {
+                OpenPinnedOutcome::Pinned(root_proc) => {
+                    if !identity.matches(&root_proc.id) {
+                        return Ok(Vec::new());
+                    }
+                    let _ = root_proc.terminate();
+                    pinned.insert(root_proc.id.pid, root_proc);
+                    root_pinned = true;
+                }
+                OpenPinnedOutcome::Gone => return Ok(Vec::new()),
+                OpenPinnedOutcome::AccessDenied | OpenPinnedOutcome::Failed => {
+                    // Could not open the root handle; check whether the exact root is still alive
+                    // so we can still attempt to discover its children and report it as a survivor.
+                    if !is_alive(&identity) {
+                        return Ok(Vec::new());
+                    }
+                }
             }
 
-            let mut tracked: HashMap<u32, ProcessId> = HashMap::new();
-            tracked.insert(identity.pid, identity);
-            collect_descendants_into(&identity, own_pid, &mut tracked)?;
-            terminate_tracked(&tracked, own_pid)?;
-
-            // Take one more snapshot right after the first wave in case a process spawned a late child
-            // just before TerminateProcess landed.
-            if collect_descendants_into(&identity, own_pid, &mut tracked).is_ok() {
-                terminate_tracked(&tracked, own_pid)?;
+            // Re-snapshot and terminate newly discovered descendants in bounded waves while
+            // keeping every previously opened handle alive so none of their PIDs can be reused
+            // between passes.
+            for pass in 0..MAX_WALK_PASSES {
+                let newly_found = discover_and_terminate_pass(&identity, own_pid, &mut pinned)?;
+                if newly_found == 0 && (pass > 0 || !root_pinned) {
+                    break;
+                }
             }
 
-            Ok(tracked.into_values().collect())
+            let mut tracked: Vec<ProcessId> = pinned.into_values().map(|p| p.id).collect();
+            if !root_pinned && !tracked.iter().any(|p| p.pid == identity.pid) {
+                tracked.push(identity);
+            }
+            Ok(tracked)
         })
         .await
         .map_err(|err| OsError::Platform {
@@ -101,26 +124,14 @@ pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<K
     })
 }
 
-fn terminate_tracked(tracked: &HashMap<u32, ProcessId>, own_pid: u32) -> Result<()> {
-    for proc_id in tracked.values() {
-        if proc_id.pid == own_pid {
-            continue;
-        }
-        match win_proc::open_verify_terminate(proc_id)? {
-            TerminateOutcome::Terminated
-            | TerminateOutcome::AlreadyGone
-            | TerminateOutcome::IdentityMismatch
-            | TerminateOutcome::AccessDenied => {}
-        }
-    }
-    Ok(())
-}
-
-fn collect_descendants_into(
+/// Take one process-table snapshot, verify every candidate child's `parent_pid` and creation time
+/// directly from a newly pinned handle, terminate newly confirmed descendants, and retain all
+/// pinned handles in `pinned` across passes.
+fn discover_and_terminate_pass(
     root: &ProcessId,
     own_pid: u32,
-    tracked: &mut HashMap<u32, ProcessId>,
-) -> Result<()> {
+    pinned: &mut HashMap<u32, PinnedProcess>,
+) -> Result<usize> {
     let entries = win_proc::snapshot_processes()?;
     let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
     for entry in entries {
@@ -133,28 +144,62 @@ fn collect_descendants_into(
             .push(entry.pid);
     }
 
-    let mut visited: HashSet<u32> = HashSet::new();
     let mut queue: VecDeque<ProcessId> = VecDeque::new();
-    visited.insert(root.pid);
+    let mut queued: HashSet<u32> = HashSet::new();
     queue.push_back(*root);
+    queued.insert(root.pid);
+    for proc_handle in pinned.values() {
+        if queued.insert(proc_handle.id.pid) {
+            queue.push_back(proc_handle.id);
+        }
+    }
+
+    let mut visited_candidates: HashSet<u32> = HashSet::new();
+    let mut newly_found = 0usize;
 
     while let Some(parent) = queue.pop_front() {
-        if let Some(children) = children_by_parent.get(&parent.pid) {
-            for &child_pid in children {
-                if child_pid == own_pid || !visited.insert(child_pid) {
-                    continue;
+        let Some(children) = children_by_parent.get(&parent.pid) else {
+            continue;
+        };
+        for &child_pid in children {
+            if child_pid == own_pid || pinned.contains_key(&child_pid) {
+                continue;
+            }
+            if !visited_candidates.insert(child_pid) {
+                continue;
+            }
+
+            match win_proc::open_pinned(child_pid, false) {
+                OpenPinnedOutcome::Pinned(child_proc) => {
+                    // Validate parent_pid directly on the opened handle (not just the snapshot)
+                    // AND verify full 100-ns FILETIME parent-before-child ordering.
+                    if child_proc.parent_pid != parent.pid
+                        || child_proc.id.start_time < parent.start_time
+                    {
+                        continue;
+                    }
+                    let child_id = child_proc.id;
+                    let outcome = child_proc.terminate();
+                    let _ = matches!(
+                        outcome,
+                        TerminateOutcome::Terminated
+                            | TerminateOutcome::AlreadyGone
+                            | TerminateOutcome::IdentityMismatch
+                            | TerminateOutcome::AccessDenied
+                    );
+                    pinned.insert(child_pid, child_proc);
+                    if queued.insert(child_pid) {
+                        queue.push_back(child_id);
+                    }
+                    newly_found += 1;
                 }
-                let Ok(Some(child_id)) = win_proc::query_process_identity(child_pid, false) else {
-                    continue;
-                };
-                // Full 100-ns FILETIME precision: a real child cannot be created before its parent.
-                if child_id.start_time < parent.start_time {
-                    continue;
-                }
-                tracked.entry(child_pid).or_insert(child_id);
-                queue.push_back(child_id);
+                // Single-process open/time failures never abort the rest of the wave.
+                OpenPinnedOutcome::Gone
+                | OpenPinnedOutcome::AccessDenied
+                | OpenPinnedOutcome::Failed => {}
             }
         }
     }
-    Ok(())
+
+    Ok(newly_found)
 }
