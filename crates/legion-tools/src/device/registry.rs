@@ -477,10 +477,11 @@ pub struct DeviceTombstone {
 /// Per-machine outcome reported when pushing device changes to peers in `fleet.toml`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetPushOutcome {
-    /// `"synced"` when the peer merged the change, or `"not_reached"` when it could not be reached
-    /// or returned an error.
+    /// `"synced"` when the peer merged the change, `"partial"` when removals (tombstones) were
+    /// delivered but live device changes were refused, or `"not_reached"` when the peer could not
+    /// be reached or returned an error.
     pub status: String,
-    /// Human-readable reason when `status` is `"not_reached"`.
+    /// Human-readable reason when `status` is `"partial"` or `"not_reached"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -491,6 +492,14 @@ impl FleetPushOutcome {
         Self {
             status: "synced".to_owned(),
             reason: None,
+        }
+    }
+
+    /// Builds a `"partial"` peer push outcome (removals delivered, live changes refused) with `reason`.
+    pub fn partial(reason: impl Into<String>) -> Self {
+        Self {
+            status: "partial".to_owned(),
+            reason: Some(reason.into()),
         }
     }
 
@@ -893,48 +902,87 @@ pub fn next_updated_timestamp_at(
     Ok(format_precise_rfc3339(chosen))
 }
 
+fn check_incoming_timestamp(
+    section: &str,
+    id: &str,
+    field: &str,
+    raw: &str,
+    limit: Timestamp,
+) -> Result<(), ErrorBody> {
+    let parsed = validate_canonical_timestamp(raw).map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("devices.toml {section}.{id}.{field} ({raw:?}) {error}."),
+        )
+    })?;
+    if parsed > limit {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "devices.toml {section}.{id}.{field} ({raw}) is further in the future than the allowed {} minute clock skew.",
+                MAX_FUTURE_SKEW.as_mins()
+            ),
+        )
+        .with_hint("Check the clock on the sending machine and try syncing again."));
+    }
+    Ok(())
+}
+
+/// Rejects any incoming live device entry whose timestamps lie further in the future than
+/// `now + MAX_FUTURE_SKEW` or are non-canonical.
+pub fn validate_incoming_live_timestamps(
+    devices: &DevicesFile,
+    now: Timestamp,
+) -> Result<(), ErrorBody> {
+    let limit = now.checked_add(MAX_FUTURE_SKEW).unwrap_or(Timestamp::MAX);
+    for (id, entry) in &devices.devices {
+        check_incoming_timestamp("devices", id, "paired_at", &entry.paired_at, limit)?;
+        check_incoming_timestamp("devices", id, "updated_at", &entry.updated_at, limit)?;
+        check_incoming_timestamp(
+            "devices",
+            id,
+            "name_updated_at",
+            &entry.name_updated_at,
+            limit,
+        )?;
+        check_incoming_timestamp(
+            "devices",
+            id,
+            "role_updated_at",
+            &entry.role_updated_at,
+            limit,
+        )?;
+        if let Some(confirmed_at) = &entry.confirmed_at {
+            check_incoming_timestamp("devices", id, "confirmed_at", confirmed_at, limit)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects any incoming tombstone whose timestamps lie further in the future than
+/// `now + MAX_FUTURE_SKEW` or are non-canonical.
+pub fn validate_incoming_tombstone_timestamps(
+    devices: &DevicesFile,
+    now: Timestamp,
+) -> Result<(), ErrorBody> {
+    let limit = now.checked_add(MAX_FUTURE_SKEW).unwrap_or(Timestamp::MAX);
+    for (id, tomb) in &devices.removed {
+        if let Some(paired_at) = &tomb.paired_at {
+            check_incoming_timestamp("removed", id, "paired_at", paired_at, limit)?;
+        }
+        check_incoming_timestamp("removed", id, "removed_at", &tomb.removed_at, limit)?;
+    }
+    Ok(())
+}
+
 /// Rejects any incoming `devices.toml` entry whose `paired_at`, `updated_at`, or `removed_at`
 /// lies further in the future than `now + MAX_FUTURE_SKEW`.
 pub fn validate_incoming_timestamps(
     devices: &DevicesFile,
     now: Timestamp,
 ) -> Result<(), ErrorBody> {
-    let limit = now.checked_add(MAX_FUTURE_SKEW).unwrap_or(Timestamp::MAX);
-    let check = |section: &str, id: &str, field: &str, raw: &str| -> Result<(), ErrorBody> {
-        let parsed = validate_canonical_timestamp(raw).map_err(|error| {
-            ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!("devices.toml {section}.{id}.{field} ({raw:?}) {error}."),
-            )
-        })?;
-        if parsed > limit {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!(
-                    "devices.toml {section}.{id}.{field} ({raw}) is further in the future than the allowed {} minute clock skew.",
-                    MAX_FUTURE_SKEW.as_mins()
-                ),
-            )
-            .with_hint("Check the clock on the sending machine and try syncing again."));
-        }
-        Ok(())
-    };
-
-    for (id, entry) in &devices.devices {
-        check("devices", id, "paired_at", &entry.paired_at)?;
-        check("devices", id, "updated_at", &entry.updated_at)?;
-        check("devices", id, "name_updated_at", &entry.name_updated_at)?;
-        check("devices", id, "role_updated_at", &entry.role_updated_at)?;
-        if let Some(confirmed_at) = &entry.confirmed_at {
-            check("devices", id, "confirmed_at", confirmed_at)?;
-        }
-    }
-    for (id, tomb) in &devices.removed {
-        if let Some(paired_at) = &tomb.paired_at {
-            check("removed", id, "paired_at", paired_at)?;
-        }
-        check("removed", id, "removed_at", &tomb.removed_at)?;
-    }
+    validate_incoming_live_timestamps(devices, now)?;
+    validate_incoming_tombstone_timestamps(devices, now)?;
     Ok(())
 }
 
@@ -3060,6 +3108,18 @@ pub struct MergeApplyOutcome {
 pub enum MergeApplyError {
     /// Nothing was written to `devices.toml`.
     BeforeSave(ErrorBody),
+    /// Tombstones from the incoming `devices.toml` were delivered and reconciled (and callers MUST
+    /// end live sessions for `outcome.removed_targets`), while live device changes in the same
+    /// request were refused with `live_error`.
+    PartialTombstonesApplied {
+        /// Result of applying and reconciling the tombstones-only subset.
+        outcome: MergeApplyOutcome,
+        /// `true` when the tombstone fallback updated `devices.toml` on disk; `false` when all
+        /// incoming tombstones were already present locally.
+        tombstones_changed: bool,
+        /// Reason the live device entries in the request were refused.
+        live_error: ErrorBody,
+    },
     /// `devices.toml` was saved with the tombstones, but a subsequent reconciliation step failed.
     AfterSave {
         /// Underlying failure from `policy.toml` or `authorized_keys` reconciliation.
@@ -3093,224 +3153,21 @@ pub struct DeviceRegistryPushAudit {
     pub source_node: Option<String>,
 }
 
-/// Applies an incoming `DevicesFile` (from an owner-authorised `fleet.sync` or `config.write`) by
-/// merging it with this node's current `devices.toml` (after adopting any legacy lines when
-/// `devices.toml` is absent), verifying preconditions, validating incoming entries against the
-/// live `policy.toml` and `devices.toml`, rewriting tombstones that match local entries from the
-/// local entry, enforcing registry-owned principal uniqueness, checking caller authorization,
-/// saving the merged `devices.toml` FIRST, then updating registry-owned `device:*` principals in
-/// `policy.toml` and reconciling `authorized_keys`.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_devices_merge_blocking(
+fn save_and_reconcile_devices_locked(
     paths: &Paths,
-    node_name: &str,
     node_file: &NodeFile,
-    incoming: &DevicesFile,
-    check_precondition: impl FnOnce(Option<&[u8]>) -> Result<(), ErrorBody>,
-    prepare_incoming: impl FnOnce(&DevicesFile, &Policy, &mut DevicesFile) -> Result<(), ErrorBody>,
-    authorize_change: impl Fn(MergeChange<'_>) -> Result<(), ErrorBody>,
+    policy_path: &Path,
+    local: &DevicesFile,
+    merged: DevicesFile,
+    bytes_before: Option<Vec<u8>>,
+    had_existing_file: bool,
+    size_policy: SaveSizePolicy,
+    confirmation_warnings: Vec<String>,
 ) -> Result<MergeApplyOutcome, MergeApplyError> {
-    let _cfg_guard = lock_config(paths).map_err(MergeApplyError::BeforeSave)?;
-
-    let devices_path = paths.config_file(DevicesFile::FILE);
-    let bytes_before = match std::fs::read(&devices_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", devices_path.display()),
-            )));
-        }
-    };
-    check_precondition(bytes_before.as_deref()).map_err(MergeApplyError::BeforeSave)?;
-    validate_incoming_timestamps(incoming, Timestamp::now())
-        .map_err(MergeApplyError::BeforeSave)?;
-
-    let policy_path = paths.config_file(Policy::FILE);
-    let live_policy = match std::fs::read(&policy_path) {
-        Ok(bytes) => parse::<Policy>(&policy_path, &bytes).map_err(MergeApplyError::BeforeSave)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
-        Err(error) => {
-            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
-                ErrorCode::Failed,
-                format!("{} cannot be read: {error}.", policy_path.display()),
-            )));
-        }
-    };
-
-    let had_existing_file = bytes_before.is_some();
-    let local = match bytes_before.as_deref() {
-        Some(bytes) => {
-            parse::<DevicesFile>(&devices_path, bytes).map_err(MergeApplyError::BeforeSave)?
-        }
-        None => {
-            let target = resolve_target(paths, node_file).map_err(MergeApplyError::BeforeSave)?;
-            let caller_account =
-                caller_account_for_target(&target).map_err(MergeApplyError::BeforeSave)?;
-            let write_path = resolve_safe_write_path(&target, paths.home())
-                .map_err(MergeApplyError::BeforeSave)?;
-            let auth_keys = if write_path.is_file() {
-                read_auth_keys(&write_path).map_err(MergeApplyError::BeforeSave)?
-            } else {
-                super::authkeys::AuthKeysFile::parse(b"")
-            };
-            let state = load_state(paths).unwrap_or_default();
-            adopt_legacy_devices_from_auth_keys(
-                paths,
-                node_name,
-                &auth_keys,
-                &target,
-                caller_account.as_deref(),
-                &state,
-                &live_policy,
-            )
-        }
-    };
-
-    let mut prepared_incoming = incoming.clone();
-    prepare_incoming(&local, &live_policy, &mut prepared_incoming)
-        .map_err(MergeApplyError::BeforeSave)?;
-
-    // For every caller including owner, any tombstone replacing a local live entry (or matching an
-    // existing local tombstone) takes its identity and pairing provenance from the local entry so
-    // a tombstone can never name a different principal than the device it removes.
-    rewrite_tombstones_from_local(&local, &mut prepared_incoming);
-
-    let mut merged = merge_devices(&local, &prepared_incoming);
-    let confirmation_warnings = preserve_local_confirmations(&local, &mut merged);
-
-    // Every registry-owned (marked) principal belongs to exactly one pairing id: refuse, for
-    // EVERY caller and at EVERY merge, any incoming or newly added/changed live entry whose
-    // principal is marked for a different id in policy.toml, claimed by another live pairing in
-    // devices.toml, or owned by a tombstoned pairing of a different id.
-    let check_principal_ownership = |id: &str, entry: &FleetDevice| -> Result<(), ErrorBody> {
-        if let Some(owner_id) = live_policy.device_owner(&entry.principal)
-            && owner_id != id
-        {
-            return Err(ErrorBody::new(
-                ErrorCode::Denied,
-                format!(
-                    "Principal {} in policy.toml is owned by pairing {owner_id} and cannot be assigned to pairing {id}.",
-                    entry.principal
-                ),
-            )
-            .with_hint(
-                "Each registry-owned `device:*` principal belongs to exactly one pairing id.",
-            ));
-        }
-        if entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
-            if let Some((other_id, _)) = merged.devices.iter().find(|(other_id, other)| {
-                other_id.as_str() != id && other.principal == entry.principal
-            }) {
-                return Err(ErrorBody::new(
-                    ErrorCode::Denied,
-                    format!(
-                        "Principal {} is already claimed by live pairing {other_id} and cannot also be assigned to pairing {id}.",
-                        entry.principal
-                    ),
-                )
-                .with_hint(
-                    "Each `device:*` principal belongs to exactly one pairing id.",
-                ));
-            }
-            if let Some((tomb_id, _)) = merged
-                .removed
-                .iter()
-                .find(|(tomb_id, tomb)| tomb_id.as_str() != id && tomb.principal == entry.principal)
-            {
-                return Err(ErrorBody::new(
-                    ErrorCode::Denied,
-                    format!(
-                        "Principal {} previously belonged to removed pairing {tomb_id} and cannot be assigned to pairing {id}.",
-                        entry.principal
-                    ),
-                )
-                .with_hint(
-                    "Each `device:*` principal belongs to exactly one pairing id and cannot be reused after removal.",
-                ));
-            }
-        }
-        Ok(())
-    };
-
-    for (id, inc) in &prepared_incoming.devices {
-        if merged.removed.contains_key(id) {
-            continue;
-        }
-        if local.devices.get(id) != Some(inc) {
-            check_principal_ownership(id, inc).map_err(MergeApplyError::BeforeSave)?;
-        }
-    }
-    for (id, entry) in &merged.devices {
-        if local.devices.get(id) != Some(entry) {
-            check_principal_ownership(id, entry).map_err(MergeApplyError::BeforeSave)?;
-        }
-    }
-
-    // Refuse any merge that adds or changes a live entry whose public key collides with another
-    // live entry in the merged view.
-    let duplicate_keys =
-        duplicate_live_public_keys(&merged).map_err(MergeApplyError::BeforeSave)?;
-    for ids in duplicate_keys.values() {
-        if let Some(changed_id) = ids
-            .iter()
-            .find(|id| local.devices.get(*id) != merged.devices.get(*id))
-        {
-            let name = merged
-                .devices
-                .get(changed_id)
-                .map(|d| d.name.as_str())
-                .unwrap_or("device");
-            let others: Vec<String> = ids
-                .iter()
-                .filter(|id| *id != changed_id)
-                .map(|id| {
-                    merged
-                        .devices
-                        .get(id)
-                        .map(|d| format!("{} ({id})", d.name))
-                        .unwrap_or_else(|| id.clone())
-                })
-                .collect();
-            return Err(MergeApplyError::BeforeSave(
-                ErrorBody::new(
-                    ErrorCode::Conflict,
-                    format!(
-                        "Paired device {name} ({changed_id}) uses a public key already assigned to another live paired device: {}.",
-                        others.join(", ")
-                    ),
-                )
-                .with_hint(
-                    "Remove the conflicting device or pair with a dedicated Ed25519 key pair.",
-                ),
-            ));
-        }
-    }
-
-    // Authorize every live entry and tombstone that the merge adds or modifies before writing.
-    for (id, entry) in &merged.devices {
-        let previous = local.devices.get(id);
-        if previous != Some(entry) {
-            authorize_change(MergeChange::Live { entry, previous })
-                .map_err(MergeApplyError::BeforeSave)?;
-        }
-    }
-    for (id, tombstone) in &merged.removed {
-        let previous_tomb = local.removed.get(id);
-        let previous_live = local.devices.get(id);
-        if previous_tomb != Some(tombstone) || previous_live.is_some() {
-            authorize_change(MergeChange::Removed {
-                tombstone,
-                previous_live,
-            })
-            .map_err(MergeApplyError::BeforeSave)?;
-        }
-    }
-
     // Record every previously live device that this merge tombstones or newly quarantines so live
     // sessions are ALWAYS terminated once `devices.toml` has been saved, even if a later step fails.
-    let quarantined_before = quarantined_devices(&local);
+    let quarantined_before = quarantined_devices(local);
     let quarantined_after = quarantined_devices(&merged);
     let newly_tombstoned: Vec<SessionTarget> = local
         .devices
@@ -3325,13 +3182,6 @@ pub fn apply_devices_merge_blocking(
         .collect();
 
     // Write `devices.toml` FIRST (tombstone first, then policy and authorized_keys).
-    // A merge whose only effect is turning live entries into tombstones or adding tombstones is
-    // NEVER refused for size.
-    let size_policy = if is_tombstone_only_change(Some(&local), &merged) {
-        SaveSizePolicy::AllowTombstoneOnly
-    } else {
-        SaveSizePolicy::CheckReserve
-    };
     let canonical = save_devices_locked_with_policy(paths, &merged, size_policy)
         .map_err(MergeApplyError::BeforeSave)?;
     let backup = had_existing_file.then(|| {
@@ -3351,8 +3201,8 @@ pub fn apply_devices_merge_blocking(
 
     let mut warnings = confirmation_warnings;
     warnings.extend(reconcile_device_principals_locked(paths, &merged).map_err(after_save)?);
-    let reconciled_policy = match std::fs::read(&policy_path) {
-        Ok(bytes) => parse::<Policy>(&policy_path, &bytes).map_err(after_save)?,
+    let reconciled_policy = match std::fs::read(policy_path) {
+        Ok(bytes) => parse::<Policy>(policy_path, &bytes).map_err(after_save)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
         Err(error) => {
             return Err(after_save(ErrorBody::new(
@@ -3406,6 +3256,312 @@ pub fn apply_devices_merge_blocking(
         removed_targets: removed_set.into_iter().collect(),
         warnings,
     })
+}
+
+/// Applies an incoming `DevicesFile` (from an owner-authorised `fleet.sync` or `config.write`) by
+/// merging it with this node's current `devices.toml` (after adopting any legacy lines when
+/// `devices.toml` is absent), verifying preconditions, validating incoming entries against the
+/// live `policy.toml` and `devices.toml`, rewriting tombstones that match local entries from the
+/// local entry, enforcing registry-owned principal uniqueness, checking caller authorization,
+/// saving the merged `devices.toml` FIRST, then updating registry-owned `device:*` principals in
+/// `policy.toml` and reconciling `authorized_keys`.
+///
+/// Whenever the full merge is refused because of live entries (size reserve, principal or key
+/// conflict, expiring credential, legacy single-stamp format, live timestamp skew, etc.) and
+/// `incoming.removed` is non-empty, this function still applies and reconciles the tombstones-only
+/// subset (never refused for size) and returns [`MergeApplyError::PartialTombstonesApplied`] so
+/// revocations always land while the live refusal is reported cleanly.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_devices_merge_blocking(
+    paths: &Paths,
+    node_name: &str,
+    node_file: &NodeFile,
+    incoming: &DevicesFile,
+    check_precondition: impl FnOnce(Option<&[u8]>) -> Result<(), ErrorBody>,
+    prepare_incoming: impl FnOnce(&DevicesFile, &Policy, &mut DevicesFile) -> Result<(), ErrorBody>,
+    authorize_change: impl Fn(MergeChange<'_>) -> Result<(), ErrorBody>,
+) -> Result<MergeApplyOutcome, MergeApplyError> {
+    let _cfg_guard = lock_config(paths).map_err(MergeApplyError::BeforeSave)?;
+
+    let devices_path = paths.config_file(DevicesFile::FILE);
+    let bytes_before = match std::fs::read(&devices_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", devices_path.display()),
+            )));
+        }
+    };
+    check_precondition(bytes_before.as_deref()).map_err(MergeApplyError::BeforeSave)?;
+    let now = Timestamp::now();
+    validate_incoming_tombstone_timestamps(incoming, now).map_err(MergeApplyError::BeforeSave)?;
+
+    let policy_path = paths.config_file(Policy::FILE);
+    let live_policy = match std::fs::read(&policy_path) {
+        Ok(bytes) => parse::<Policy>(&policy_path, &bytes).map_err(MergeApplyError::BeforeSave)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),
+        Err(error) => {
+            return Err(MergeApplyError::BeforeSave(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be read: {error}.", policy_path.display()),
+            )));
+        }
+    };
+
+    let had_existing_file = bytes_before.is_some();
+    let local = match bytes_before.as_deref() {
+        Some(bytes) => {
+            parse::<DevicesFile>(&devices_path, bytes).map_err(MergeApplyError::BeforeSave)?
+        }
+        None => {
+            let target = resolve_target(paths, node_file).map_err(MergeApplyError::BeforeSave)?;
+            let caller_account =
+                caller_account_for_target(&target).map_err(MergeApplyError::BeforeSave)?;
+            let write_path = resolve_safe_write_path(&target, paths.home())
+                .map_err(MergeApplyError::BeforeSave)?;
+            let auth_keys = if write_path.is_file() {
+                read_auth_keys(&write_path).map_err(MergeApplyError::BeforeSave)?
+            } else {
+                super::authkeys::AuthKeysFile::parse(b"")
+            };
+            let state = load_state(paths).unwrap_or_default();
+            adopt_legacy_devices_from_auth_keys(
+                paths,
+                node_name,
+                &auth_keys,
+                &target,
+                caller_account.as_deref(),
+                &state,
+                &live_policy,
+            )
+        }
+    };
+
+    let full_merge_attempt =
+        (|| -> Result<(DevicesFile, Vec<String>, SaveSizePolicy), ErrorBody> {
+            validate_incoming_live_timestamps(incoming, now)?;
+
+            let mut prepared_incoming = incoming.clone();
+            prepare_incoming(&local, &live_policy, &mut prepared_incoming)?;
+
+            // For every caller including owner, any tombstone replacing a local live entry (or
+            // matching an existing local tombstone) takes its identity and pairing provenance from
+            // the local entry so a tombstone can never name a different principal than the device it
+            // removes.
+            rewrite_tombstones_from_local(&local, &mut prepared_incoming);
+
+            let mut merged = merge_devices(&local, &prepared_incoming);
+            let confirmation_warnings = preserve_local_confirmations(&local, &mut merged);
+
+            // Every registry-owned (marked) principal belongs to exactly one pairing id: refuse, for
+            // EVERY caller and at EVERY merge, any incoming or newly added/changed live entry whose
+            // principal is marked for a different id in policy.toml, claimed by another live pairing
+            // in devices.toml, or owned by a tombstoned pairing of a different id.
+            let check_principal_ownership = |id: &str,
+                                             entry: &FleetDevice|
+             -> Result<(), ErrorBody> {
+                if let Some(owner_id) = live_policy.device_owner(&entry.principal)
+                    && owner_id != id
+                {
+                    return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Principal {} in policy.toml is owned by pairing {owner_id} and cannot be assigned to pairing {id}.",
+                        entry.principal
+                    ),
+                )
+                .with_hint(
+                    "Each registry-owned `device:*` principal belongs to exactly one pairing id.",
+                ));
+                }
+                if entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+                    if let Some((other_id, _)) = merged.devices.iter().find(|(other_id, other)| {
+                        other_id.as_str() != id && other.principal == entry.principal
+                    }) {
+                        return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Principal {} is already claimed by live pairing {other_id} and cannot also be assigned to pairing {id}.",
+                            entry.principal
+                        ),
+                    )
+                    .with_hint(
+                        "Each `device:*` principal belongs to exactly one pairing id.",
+                    ));
+                    }
+                    if let Some((tomb_id, _)) = merged.removed.iter().find(|(tomb_id, tomb)| {
+                        tomb_id.as_str() != id && tomb.principal == entry.principal
+                    }) {
+                        return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "Principal {} previously belonged to removed pairing {tomb_id} and cannot be assigned to pairing {id}.",
+                            entry.principal
+                        ),
+                    )
+                    .with_hint(
+                        "Each `device:*` principal belongs to exactly one pairing id and cannot be reused after removal.",
+                    ));
+                    }
+                }
+                Ok(())
+            };
+
+            for (id, inc) in &prepared_incoming.devices {
+                if merged.removed.contains_key(id) {
+                    continue;
+                }
+                if local.devices.get(id) != Some(inc) {
+                    check_principal_ownership(id, inc)?;
+                }
+            }
+            for (id, entry) in &merged.devices {
+                if local.devices.get(id) != Some(entry) {
+                    check_principal_ownership(id, entry)?;
+                }
+            }
+
+            // Refuse any merge that adds or changes a live entry whose public key collides with
+            // another live entry in the merged view.
+            let duplicate_keys = duplicate_live_public_keys(&merged)?;
+            for ids in duplicate_keys.values() {
+                if let Some(changed_id) = ids
+                    .iter()
+                    .find(|id| local.devices.get(*id) != merged.devices.get(*id))
+                {
+                    let name = merged
+                        .devices
+                        .get(changed_id)
+                        .map(|d| d.name.as_str())
+                        .unwrap_or("device");
+                    let others: Vec<String> = ids
+                        .iter()
+                        .filter(|id| *id != changed_id)
+                        .map(|id| {
+                            merged
+                                .devices
+                                .get(id)
+                                .map(|d| format!("{} ({id})", d.name))
+                                .unwrap_or_else(|| id.clone())
+                        })
+                        .collect();
+                    return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "Paired device {name} ({changed_id}) uses a public key already assigned to another live paired device: {}.",
+                        others.join(", ")
+                    ),
+                )
+                .with_hint(
+                    "Remove the conflicting device or pair with a dedicated Ed25519 key pair.",
+                ));
+                }
+            }
+
+            // Authorize every live entry and tombstone that the merge adds or modifies before writing.
+            for (id, entry) in &merged.devices {
+                let previous = local.devices.get(id);
+                if previous != Some(entry) {
+                    authorize_change(MergeChange::Live { entry, previous })?;
+                }
+            }
+            for (id, tombstone) in &merged.removed {
+                let previous_tomb = local.removed.get(id);
+                let previous_live = local.devices.get(id);
+                if previous_tomb != Some(tombstone) || previous_live.is_some() {
+                    authorize_change(MergeChange::Removed {
+                        tombstone,
+                        previous_live,
+                    })?;
+                }
+            }
+
+            // A merge whose only effect is turning live entries into tombstones or adding tombstones
+            // is NEVER refused for size. Any merge that adds or alters a live entry must fit within
+            // the 1 MiB tombstone-reserve ceiling.
+            let size_policy = if is_tombstone_only_change(Some(&local), &merged) {
+                SaveSizePolicy::AllowTombstoneOnly
+            } else {
+                let reserved = devices_reserved_bytes(&merged);
+                if reserved > MAX_DEVICES_TOML_BYTES {
+                    return Err(devices_size_limit_error(reserved));
+                }
+                SaveSizePolicy::CheckReserve
+            };
+
+            Ok((merged, confirmation_warnings, size_policy))
+        })();
+
+    match full_merge_attempt {
+        Ok((merged, confirmation_warnings, size_policy)) => save_and_reconcile_devices_locked(
+            paths,
+            node_file,
+            &policy_path,
+            &local,
+            merged,
+            bytes_before,
+            had_existing_file,
+            size_policy,
+            confirmation_warnings,
+        ),
+        Err(live_error) => {
+            // Whenever live entries are refused for ANY reason, still apply the tombstones of this
+            // push (never refused for size) so revocations and quarantine always land.
+            if incoming.removed.is_empty() {
+                return Err(MergeApplyError::BeforeSave(live_error));
+            }
+            let mut tombstones_only = DevicesFile {
+                version: DEVICES_VERSION,
+                devices: BTreeMap::new(),
+                removed: incoming.removed.clone(),
+            };
+            rewrite_tombstones_from_local(&local, &mut tombstones_only);
+            let tomb_merged = merge_devices(&local, &tombstones_only);
+
+            for (id, tombstone) in &tomb_merged.removed {
+                let previous_tomb = local.removed.get(id);
+                let previous_live = local.devices.get(id);
+                if previous_tomb != Some(tombstone) || previous_live.is_some() {
+                    authorize_change(MergeChange::Removed {
+                        tombstone,
+                        previous_live,
+                    })
+                    .map_err(MergeApplyError::BeforeSave)?;
+                }
+            }
+
+            let tombstones_changed = !had_existing_file || tomb_merged != local;
+            let outcome = if tombstones_changed {
+                save_and_reconcile_devices_locked(
+                    paths,
+                    node_file,
+                    &policy_path,
+                    &local,
+                    tomb_merged,
+                    bytes_before,
+                    had_existing_file,
+                    SaveSizePolicy::AllowTombstoneOnly,
+                    Vec::new(),
+                )?
+            } else {
+                MergeApplyOutcome {
+                    canonical_toml: local.to_toml_string(),
+                    devices: local,
+                    bytes_before,
+                    backup: None,
+                    removed_targets: Vec::new(),
+                    warnings: Vec::new(),
+                }
+            };
+            Err(MergeApplyError::PartialTombstonesApplied {
+                outcome,
+                tombstones_changed,
+                live_error,
+            })
+        }
+    }
 }
 
 /// Lists sorted peer machine names configured under `[machines]` in `fleet.toml`, excluding `here`.
@@ -3506,6 +3662,17 @@ pub fn parse_fleet_push_outcomes(sync_result: &Value) -> BTreeMap<String, FleetP
             .unwrap_or("error");
         let outcome = if matches!(status, "same" | "pushed" | "pulled") {
             FleetPushOutcome::synced()
+        } else if status == "partial" {
+            let reason = doc_outcome
+                .and_then(|d| {
+                    d.get("detail").and_then(Value::as_str).or_else(|| {
+                        d.get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(Value::as_str)
+                    })
+                })
+                .unwrap_or("removals delivered, but live device changes were refused");
+            FleetPushOutcome::partial(reason)
         } else {
             let reason = doc_outcome
                 .and_then(|d| {

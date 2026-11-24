@@ -2651,7 +2651,12 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     .await;
             let still_trusted: Vec<String> = fleet_outcomes
                 .iter()
-                .filter(|(_, outcome)| outcome.status != "synced")
+                .filter(|(_, outcome)| outcome.status != "synced" && outcome.status != "partial")
+                .map(|(machine, _)| machine.clone())
+                .collect();
+            let partial_peers: Vec<String> = fleet_outcomes
+                .iter()
+                .filter(|(_, outcome)| outcome.status == "partial")
                 .map(|(machine, _)| machine.clone())
                 .collect();
             if !still_trusted.is_empty() {
@@ -2659,9 +2664,21 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<Removed, ToolError> {
                     Some(id) => format!("{} ({id})", target.device),
                     None => target.device.clone(),
                 };
-                removed.hint = Some(format!(
+                let mut hint = format!(
                     "These machines could not be reached and still trust {label} until their next sync: {}. Run `legion fleet.sync direction=push documents='[\"devices.toml\"]'` when they are back online.",
                     still_trusted.join(", ")
+                );
+                if !partial_peers.is_empty() {
+                    hint.push_str(&format!(
+                        " Removals were delivered to {}, though live device additions were refused there (see `fleet` for reasons).",
+                        partial_peers.join(", ")
+                    ));
+                }
+                removed.hint = Some(hint);
+            } else if !partial_peers.is_empty() {
+                removed.hint = Some(format!(
+                    "Removal was delivered to {}, though live device additions were refused there (see `fleet` for reasons).",
+                    partial_peers.join(", ")
                 ));
             }
             removed.fleet = fleet_outcomes;

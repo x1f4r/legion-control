@@ -1000,6 +1000,78 @@ async fn apply_local_write(
         let merge_outcome = match merge_result {
             Ok(outcome) => outcome,
             Err(MergeApplyError::BeforeSave(err)) => return Err(err),
+            Err(MergeApplyError::PartialTombstonesApplied {
+                outcome,
+                tombstones_changed,
+                mut live_error,
+            }) => {
+                // Always end live sessions for any devices removed or newly quarantined by the
+                // tombstones that landed.
+                for target in &outcome.removed_targets {
+                    let _ = terminate_device_sessions_for_target(
+                        &paths_for_sessions,
+                        target,
+                        DEFAULT_TERMINATE_GRACE,
+                    )
+                    .await;
+                }
+                let hash_before = outcome
+                    .bytes_before
+                    .as_deref()
+                    .map(|b| hash_bytes(b).to_string());
+                let hash_after = hash_bytes(outcome.canonical_toml.as_bytes()).to_string();
+                if tombstones_changed {
+                    let mut audit_args = json!({
+                        "document": "devices.toml",
+                        "hash_before": hash_before,
+                        "hash_after": hash_after,
+                        "backup": outcome.backup,
+                        "partial": true,
+                        "tombstones_delivered": true,
+                        "live_refused": {
+                            "code": live_error.code,
+                            "message": live_error.message,
+                        },
+                    });
+                    if let Some(ref push_audit) = device_registry_push
+                        && let Some(obj) = audit_args.as_object_mut()
+                    {
+                        obj.insert("device_registry_push".to_owned(), json!(push_audit));
+                    }
+                    if !outcome.warnings.is_empty()
+                        && let Some(obj) = audit_args.as_object_mut()
+                    {
+                        obj.insert("warnings".to_owned(), json!(outcome.warnings));
+                    }
+                    ctx.node()
+                        .record_audit_with_device(
+                            ctx.node_name().to_owned(),
+                            Some(ctx.principal().to_owned()),
+                            ctx.door(),
+                            ctx.device().map(str::to_owned),
+                            "config.write.applied".to_owned(),
+                            &audit_args,
+                            started,
+                            &Ok(json!({})),
+                        )
+                        .await;
+                }
+                let mut details = match live_error.details.take() {
+                    Some(Value::Object(map)) => map,
+                    _ => serde_json::Map::new(),
+                };
+                details.insert("partial".to_owned(), json!(true));
+                details.insert("tombstones_delivered".to_owned(), json!(true));
+                details.insert("tombstones_changed".to_owned(), json!(tombstones_changed));
+                details.insert("hash".to_owned(), json!(hash_after));
+                if let Some(backup) = outcome.backup {
+                    details.insert("backup".to_owned(), json!(backup));
+                }
+                if !outcome.warnings.is_empty() {
+                    details.insert("warnings".to_owned(), json!(outcome.warnings));
+                }
+                return Err(live_error.with_details(Value::Object(details)));
+            }
             Err(MergeApplyError::AfterSave { error, tombstoned }) => {
                 // Always end live sessions for every newly tombstoned device whenever devices.toml
                 // was saved, even if policy or authorized_keys reconciliation failed afterwards.
@@ -1235,6 +1307,9 @@ pub enum SyncStatus {
     Pushed,
     /// Remote document was pulled locally (or would be under `dry_run`).
     Pulled,
+    /// Removals (tombstones) were delivered, while live device changes were refused; see `detail`
+    /// and `error`.
+    Partial,
     /// Only the local node changed since the last recorded sync with this peer.
     ChangedHere,
     /// Only the remote node changed since the last recorded sync with this peer.
@@ -2190,18 +2265,32 @@ async fn sync_devices_document(
 
             if !local_needs_tombstones && !remote_needs_push {
                 if skipped_live_due_to_expiry && let Some(limit) = ctx.credential_expires() {
-                    return error_outcome(
-                        ErrorBody::new(
-                            ErrorCode::Denied,
-                            format!(
-                                "The credential this call came with expires at {}, so it cannot push live paired devices to {machine}; only tombstones are allowed.",
-                                limit.strftime("%Y-%m-%dT%H:%M:%SZ")
-                            ),
-                        )
-                        .with_hint(
-                            "Use a local shell or a non-expiring credential to push live paired devices.",
+                    let expiry_err = ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "The credential this call came with expires at {}, so it cannot push live paired devices to {machine}; only tombstones are allowed.",
+                            limit.strftime("%Y-%m-%dT%H:%M:%SZ")
                         ),
+                    )
+                    .with_hint(
+                        "Use a local shell or a non-expiring credential to push live paired devices.",
                     );
+                    if !outgoing.removed.is_empty() {
+                        return DocSyncOutcome {
+                            status: SyncStatus::Partial,
+                            local_hash: local.hash,
+                            remote_hash: remote.hash,
+                            last_synced_hash,
+                            backup: None,
+                            detail: Some(format!(
+                                "Removals delivered to {machine}; live device changes were refused: {}",
+                                expiry_err.message
+                            )),
+                            warnings: Vec::new(),
+                            error: Some(expiry_err),
+                        };
+                    }
+                    return error_outcome(expiry_err);
                 }
                 if !dry_run
                     && local.hash == remote.hash
@@ -2258,6 +2347,7 @@ async fn sync_devices_document(
                     .iter()
                     .any(|(id, dev)| current_local.devices.get(id) != Some(dev));
             let mut tombstones_to_import = remote_tombstones_only;
+            let mut partial_live_error: Option<ErrorBody> = None;
 
             // 1. Push our outgoing entries to the peer FIRST so revocation tombstones leave this
             //    node even if a local step or an unrelated entry fails.
@@ -2330,10 +2420,36 @@ async fn sync_devices_document(
                         }
                     }
                     Err(error) => {
-                        // If outgoing contained both live entries and tombstones, still push the
-                        // tombstones on their own so a refusal on a live entry never blocks
-                        // revocation.
-                        if !outgoing.removed.is_empty() && !outgoing.devices.is_empty() {
+                        let receiver_delivered_tombstones = error
+                            .details
+                            .as_ref()
+                            .and_then(|d| d.get("tombstones_delivered"))
+                            .and_then(Value::as_bool)
+                            == Some(true);
+                        if receiver_delivered_tombstones {
+                            if let Some(hash) = error
+                                .details
+                                .as_ref()
+                                .and_then(|d| d.get("hash"))
+                                .and_then(Value::as_str)
+                            {
+                                final_remote_hash = Some(hash.to_owned());
+                            }
+                            if let Some(arr) = error
+                                .details
+                                .as_ref()
+                                .and_then(|d| d.get("warnings"))
+                                .and_then(Value::as_array)
+                            {
+                                warnings.extend(
+                                    arr.iter().filter_map(Value::as_str).map(str::to_owned),
+                                );
+                            }
+                            partial_live_error = Some(error);
+                        } else if !outgoing.removed.is_empty() && !outgoing.devices.is_empty() {
+                            // Compatibility fallback for older peers that do not apply tombstones
+                            // when refusing a live entry: send tombstones on their own so
+                            // revocation still lands.
                             let tombs_only = DevicesFile {
                                 version: DEVICES_VERSION,
                                 devices: BTreeMap::new(),
@@ -2361,23 +2477,32 @@ async fn sync_devices_document(
                                     serde_json::from_value::<ConfigWriteResult>(val)
                             {
                                 warnings.extend(written.warnings);
-                                warnings.push(format!(
-                                    "Tombstones were pushed to {machine}, but live device entries could not be pushed: {}",
-                                    error.message
-                                ));
                                 final_remote_hash = Some(written.hash);
+                                partial_live_error = Some(error);
+                            } else {
+                                return DocSyncOutcome {
+                                    status: SyncStatus::Error,
+                                    local_hash: Some(current_local_hash),
+                                    remote_hash: final_remote_hash,
+                                    last_synced_hash,
+                                    backup: local_backup,
+                                    detail: None,
+                                    warnings,
+                                    error: Some(error),
+                                };
                             }
+                        } else {
+                            return DocSyncOutcome {
+                                status: SyncStatus::Error,
+                                local_hash: Some(current_local_hash),
+                                remote_hash: final_remote_hash,
+                                last_synced_hash,
+                                backup: local_backup,
+                                detail: None,
+                                warnings,
+                                error: Some(error),
+                            };
                         }
-                        return DocSyncOutcome {
-                            status: SyncStatus::Error,
-                            local_hash: Some(current_local_hash),
-                            remote_hash: final_remote_hash,
-                            last_synced_hash,
-                            backup: local_backup,
-                            detail: None,
-                            warnings,
-                            error: Some(error),
-                        };
                     }
                 }
             }
@@ -2414,6 +2539,49 @@ async fn sync_devices_document(
                 }
             }
 
+            if let Some(live_err) = partial_live_error {
+                let detail = format!(
+                    "Removals delivered to {machine}; live device changes were refused: {}",
+                    live_err.message
+                );
+                return DocSyncOutcome {
+                    status: SyncStatus::Partial,
+                    local_hash: Some(current_local_hash),
+                    remote_hash: final_remote_hash,
+                    last_synced_hash,
+                    backup: local_backup,
+                    detail: Some(detail),
+                    warnings,
+                    error: Some(live_err),
+                };
+            }
+
+            if skipped_live_due_to_expiry && let Some(limit) = ctx.credential_expires() {
+                let expiry_err = ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "The credential this call came with expires at {}, so it cannot push live paired devices to {machine}; only tombstones are allowed.",
+                        limit.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    ),
+                )
+                .with_hint(
+                    "Use a local shell or a non-expiring credential to push live paired devices.",
+                );
+                return DocSyncOutcome {
+                    status: SyncStatus::Partial,
+                    local_hash: Some(current_local_hash),
+                    remote_hash: final_remote_hash,
+                    last_synced_hash,
+                    backup: local_backup,
+                    detail: Some(format!(
+                        "Removals delivered to {machine}; live device changes were refused: {}",
+                        expiry_err.message
+                    )),
+                    warnings,
+                    error: Some(expiry_err),
+                };
+            }
+
             let converged = final_remote_hash.as_deref() == Some(current_local_hash.as_str());
             if converged
                 && let Err(error) =
@@ -2446,6 +2614,40 @@ async fn sync_devices_document(
                 .map(legion_tools::device::registry::legacy_single_stamp_device_ids)
                 .unwrap_or_default();
             if !remote_legacy_ids.is_empty() {
+                let legacy_err = legion_tools::device::registry::legacy_single_stamp_incoming_error(
+                    &remote_legacy_ids,
+                );
+                if !dry_run && !remote_devices.removed.is_empty() {
+                    let tombs_only = DevicesFile {
+                        version: DEVICES_VERSION,
+                        devices: BTreeMap::new(),
+                        removed: remote_devices.removed.clone(),
+                    };
+                    if let Ok(written) = apply_local_write(
+                        ctx,
+                        SharedDocument::Devices,
+                        tombs_only.to_toml_string(),
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+                    {
+                        return DocSyncOutcome {
+                            status: SyncStatus::Partial,
+                            local_hash: Some(written.hash_after),
+                            remote_hash: remote.hash,
+                            last_synced_hash,
+                            backup: written.backup,
+                            detail: Some(format!(
+                                "Removals imported from {machine}; live device changes were refused: {}",
+                                legacy_err.message
+                            )),
+                            warnings: written.warnings,
+                            error: Some(legacy_err),
+                        };
+                    }
+                }
                 return DocSyncOutcome {
                     status: SyncStatus::Error,
                     local_hash: local.hash,
@@ -2454,11 +2656,7 @@ async fn sync_devices_document(
                     backup: None,
                     detail: None,
                     warnings: Vec::new(),
-                    error: Some(
-                        legion_tools::device::registry::legacy_single_stamp_incoming_error(
-                            &remote_legacy_ids,
-                        ),
-                    ),
+                    error: Some(legacy_err),
                 };
             }
             // Explicit pull: merges the peer's live devices and tombstones into local `devices.toml`
@@ -2557,6 +2755,54 @@ async fn sync_devices_document(
                         detail: None,
                         warnings: written.warnings,
                         error: None,
+                    }
+                }
+                Err(error)
+                    if error
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("tombstones_delivered"))
+                        .and_then(Value::as_bool)
+                        == Some(true) =>
+                {
+                    let new_local_hash = error
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("hash"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or(local.hash);
+                    let backup = error
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("backup"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let warnings = error
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("warnings"))
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let detail = format!(
+                        "Removals imported from {machine}; live device changes were refused: {}",
+                        error.message
+                    );
+                    DocSyncOutcome {
+                        status: SyncStatus::Partial,
+                        local_hash: new_local_hash,
+                        remote_hash: remote.hash,
+                        last_synced_hash,
+                        backup,
+                        detail: Some(detail),
+                        warnings,
+                        error: Some(error),
                     }
                 }
                 Err(error) => DocSyncOutcome {
@@ -5207,5 +5453,348 @@ name_updated_on = \"box-b\"
         let still_local = load_devices_raw(&paths).unwrap().unwrap();
         assert!(!still_local.devices.contains_key(&incoming_id));
         assert!(still_local.devices.contains_key(&local_id));
+    }
+
+    #[tokio::test]
+    async fn tombstones_land_when_live_entries_are_refused_for_any_reason() {
+        use jiff::SignedDuration;
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{
+            DeviceTombstone, FleetDevice, load_devices_raw, next_updated_timestamp,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        std::fs::write(&auth_keys, "").unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-b\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n",
+        )
+        .unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        let t0 = next_updated_timestamp(None).unwrap();
+        let t1 = next_updated_timestamp(Some(&t0)).unwrap();
+
+        let make_live = |seed: u8, name: &str, principal: &str, role: Option<&str>| FleetDevice {
+            name: name.to_owned(),
+            public_key: ed25519_public_key_from_seed(&[seed; 32]),
+            principal: principal.to_owned(),
+            role: role.map(str::to_owned),
+            paired_at: t0.clone(),
+            paired_on: "box-b".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t0.clone(),
+            updated_on: "box-b".to_owned(),
+            name_updated_at: t0.clone(),
+            name_updated_on: "box-b".to_owned(),
+            role_updated_at: t0.clone(),
+            role_updated_on: "box-b".to_owned(),
+            conflict: false,
+            role_conflict: false,
+        };
+        let make_tomb = |name: &str, principal: &str| DeviceTombstone {
+            name: name.to_owned(),
+            principal: principal.to_owned(),
+            fingerprint: None,
+            paired_at: Some(t0.clone()),
+            paired_on: Some("box-b".to_owned()),
+            paired_by: None,
+            removed_by: None,
+            removed_at: t1.clone(),
+            removed_on: "box-a".to_owned(),
+        };
+
+        // Seed box-b with live devices: `holder` (`device:phone`), plus x1..x4 to revoke under
+        // different live-refusal causes.
+        let id_holder = "10".repeat(16);
+        let id_x1 = "11".repeat(16);
+        let id_x2 = "12".repeat(16);
+        let id_x3 = "13".repeat(16);
+        let id_x4 = "14".repeat(16);
+        let mut seed = DevicesFile::default();
+        seed.devices.insert(
+            id_holder.clone(),
+            make_live(0x10, "phone", "device:phone", Some("observer")),
+        );
+        seed.devices
+            .insert(id_x1.clone(), make_live(0x11, "x1", "owner", None));
+        seed.devices
+            .insert(id_x2.clone(), make_live(0x12, "x2", "owner", None));
+        seed.devices
+            .insert(id_x3.clone(), make_live(0x13, "x3", "owner", None));
+        seed.devices
+            .insert(id_x4.clone(), make_live(0x14, "x4", "owner", None));
+        node.call(Call::new(
+            Door::Cli,
+            "config.write",
+            json!({"document": "devices.toml", "content": seed.to_toml_string()}),
+        ))
+        .await
+        .unwrap();
+        let ak_before = std::fs::read_to_string(&auth_keys).unwrap();
+        for id in [&id_holder, &id_x1, &id_x2, &id_x3, &id_x4] {
+            assert!(ak_before.contains(id), "expected {id} active before test");
+        }
+
+        // (a) Principal collision (`device:phone` already owned by `id_holder`) + tombstone for x1.
+        let id_bad_principal = "a1".repeat(16);
+        let mut push_principal = DevicesFile::default();
+        push_principal
+            .removed
+            .insert(id_x1.clone(), make_tomb("x1", "owner"));
+        push_principal.devices.insert(
+            id_bad_principal.clone(),
+            make_live(0xa1, "phone", "device:phone", Some("observer")),
+        );
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": push_principal.to_toml_string()}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|d| d.get("tombstones_delivered")),
+            Some(&json!(true)),
+            "principal collision must still deliver tombstones: {err:?}"
+        );
+        let cur = load_devices_raw(&paths).unwrap().unwrap();
+        assert!(cur.removed.contains_key(&id_x1) && !cur.devices.contains_key(&id_x1));
+        assert!(!cur.devices.contains_key(&id_bad_principal));
+        assert!(cur.devices.contains_key(&id_holder));
+        assert!(
+            !std::fs::read_to_string(&auth_keys)
+                .unwrap()
+                .contains(&id_x1)
+        );
+
+        // (b) Public-key collision (reusing `id_holder`'s key) + tombstone for x2.
+        let id_bad_key = "a2".repeat(16);
+        let mut push_key = DevicesFile::default();
+        push_key
+            .removed
+            .insert(id_x2.clone(), make_tomb("x2", "owner"));
+        push_key.devices.insert(
+            id_bad_key.clone(),
+            make_live(0x10, "dup-key", "owner", None),
+        );
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": push_key.to_toml_string()}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|d| d.get("tombstones_delivered")),
+            Some(&json!(true)),
+            "key collision must still deliver tombstones: {err:?}"
+        );
+        let cur = load_devices_raw(&paths).unwrap().unwrap();
+        assert!(cur.removed.contains_key(&id_x2) && !cur.devices.contains_key(&id_x2));
+        assert!(!cur.devices.contains_key(&id_bad_key));
+        assert!(
+            !std::fs::read_to_string(&auth_keys)
+                .unwrap()
+                .contains(&id_x2)
+        );
+
+        // (c) Expiring credential pushing tombstone for x3 + live device z3.
+        let id_bad_exp = "a3".repeat(16);
+        let mut push_exp = DevicesFile::default();
+        push_exp
+            .removed
+            .insert(id_x3.clone(), make_tomb("x3", "owner"));
+        push_exp
+            .devices
+            .insert(id_bad_exp.clone(), make_live(0xa3, "z3", "owner", None));
+        let mut exp_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": push_exp.to_toml_string()}),
+        );
+        exp_call.pinned = Some("owner".to_owned());
+        exp_call.credential_expires = Some(Timestamp::now() + SignedDuration::from_hours(1));
+        let err = node.call(exp_call).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied, "{err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|d| d.get("tombstones_delivered")),
+            Some(&json!(true)),
+            "expiring credential refusal must still deliver tombstones: {err:?}"
+        );
+        let cur = load_devices_raw(&paths).unwrap().unwrap();
+        assert!(cur.removed.contains_key(&id_x3) && !cur.devices.contains_key(&id_x3));
+        assert!(!cur.devices.contains_key(&id_bad_exp));
+        assert!(
+            !std::fs::read_to_string(&auth_keys)
+                .unwrap()
+                .contains(&id_x3)
+        );
+
+        // (d) Legacy single-stamp live entry + valid tombstone for x4.
+        let id_legacy = "a4".repeat(16);
+        let legacy_key = ed25519_public_key_from_seed(&[0xa4; 32]);
+        let legacy_with_tomb = format!(
+            "\
+version = 1
+
+[devices.{id_legacy}]
+name = \"old-format\"
+public_key = \"{legacy_key}\"
+principal = \"owner\"
+paired_at = \"{t0}\"
+paired_on = \"box-a\"
+updated_at = \"{t0}\"
+updated_on = \"box-a\"
+
+[removed.{id_x4}]
+name = \"x4\"
+principal = \"owner\"
+removed_at = \"{t1}\"
+removed_on = \"box-a\"
+"
+        );
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": legacy_with_tomb}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|d| d.get("tombstones_delivered")),
+            Some(&json!(true)),
+            "legacy single-stamp refusal must still deliver tombstones: {err:?}"
+        );
+        let cur = load_devices_raw(&paths).unwrap().unwrap();
+        assert!(cur.removed.contains_key(&id_x4) && !cur.devices.contains_key(&id_x4));
+        assert!(!cur.devices.contains_key(&id_legacy));
+        assert!(
+            !std::fs::read_to_string(&auth_keys)
+                .unwrap()
+                .contains(&id_x4)
+        );
+
+        // (e) Size-limit / tombstone-reserve refusal + valid tombstone for `id_holder`.
+        let mut near_full = cur.clone();
+        let make_pad_tomb = |idx: u32| DeviceTombstone {
+            name: format!("pad-{idx:04}-{}", "p".repeat(100)),
+            principal: "owner".to_owned(),
+            fingerprint: Some("SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            paired_at: Some(t0.clone()),
+            paired_on: Some("box-b".to_owned()),
+            paired_by: None,
+            removed_by: None,
+            removed_at: t0.clone(),
+            removed_on: "box-b".to_owned(),
+        };
+        let per_tomb = {
+            let mut one = DevicesFile::default();
+            one.removed
+                .insert(format!("f{:031x}", 0u32), make_pad_tomb(0));
+            one.to_toml_string().len() - "version = 1\n".len()
+        };
+        let init_n = ((MAX_DOCUMENT_BYTES - 3500) / per_tomb) as u32;
+        for i in 0..init_n {
+            near_full
+                .removed
+                .insert(format!("f{i:031x}"), make_pad_tomb(i));
+        }
+        let mut idx = init_n;
+        loop {
+            let mut probe = near_full.clone();
+            probe
+                .removed
+                .insert(format!("f{idx:031x}"), make_pad_tomb(idx));
+            if probe.to_toml_string().len() > MAX_DOCUMENT_BYTES - 150 {
+                break;
+            }
+            near_full = probe;
+            idx += 1;
+        }
+        std::fs::write(
+            paths.config_file("devices.toml"),
+            near_full.to_toml_string(),
+        )
+        .unwrap();
+
+        let id_big_z = "a5".repeat(16);
+        let mut push_size = DevicesFile::default();
+        push_size
+            .removed
+            .insert(id_holder.clone(), make_tomb("phone", "device:phone"));
+        push_size
+            .devices
+            .insert(id_big_z.clone(), make_live(0xa5, "z5", "owner", None));
+        assert!(
+            legion_tools::device::registry::devices_reserved_bytes(&merge_devices(
+                &near_full, &push_size
+            )) > MAX_DOCUMENT_BYTES,
+            "fixture must exceed tombstone reserve when adding z5"
+        );
+        let err = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": push_size.to_toml_string()}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
+        assert_eq!(
+            err.details
+                .as_ref()
+                .and_then(|d| d.get("tombstones_delivered")),
+            Some(&json!(true)),
+            "size-limit refusal must still deliver tombstones: {err:?}"
+        );
+        let after_size = load_devices_raw(&paths).unwrap().unwrap();
+        assert!(
+            after_size.removed.contains_key(&id_holder)
+                && !after_size.devices.contains_key(&id_holder),
+            "holder must be tombstoned even when live addition z5 exceeded size limit"
+        );
+        assert!(
+            !after_size.devices.contains_key(&id_big_z),
+            "live addition z5 must remain refused"
+        );
+        assert!(
+            !std::fs::read_to_string(&auth_keys)
+                .unwrap()
+                .contains(&id_holder),
+            "holder must be stripped from authorized_keys"
+        );
     }
 }
