@@ -244,9 +244,12 @@ is always recorded from the session context. Expiring credentials (such as expir
 tokens) cannot mint or modify permanent device access: locally, `device.invite`, `device.set`, and
 any `devices.toml` merge that adds or changes a live entry are refused (pure tombstones are still
 allowed locally so an expiring credential can revoke a device); across remote hops (`on`),
-forwarding `device.invite`, `token.add`, `device.set`, `config.write` for `devices.toml` or
-`policy.toml`, and `fleet.sync` `push`/`pull` is refused by the forwarding node because credential
-expiry is not carried over RPC.
+forwarding `device.invite`, `token.add`, `device.set`, `config.write` for `policy.toml` or any
+`devices.toml` containing live entries, and `fleet.sync` `push`/`pull` is refused by the forwarding
+node because credential expiry is not carried over RPC. A tombstone-only `config.write
+devices.toml` (containing no live entries) is allowed through the forwarding guard, and local
+`device.remove` / `fleet.sync direction=push` under an expiring credential sends only tombstones to
+peers, so a removal made with an expiring credential still reaches the fleet.
 
 **Trust rule for syncing paired devices:** a node trusts a paired device only if (a) it paired the
 device itself, (b) a caller with accepted credentials pushed it via `config.write` under this

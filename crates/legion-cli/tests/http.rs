@@ -2193,6 +2193,141 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
     );
     assert_eq!(allowed.status, 200, "{}", allowed.text());
     assert_eq!(allowed.json()["name"], json!("remote-phone"));
+
+    // S5: Both sides of tombstone-only propagation with an expiring credential.
+    // Seed `laptop` and `pi` with two shared live devices (`drop-fwd` and `drop-local`) plus one
+    // laptop-only live device (`stay-local`) that must NOT leak to `pi` via an expiring token.
+    let laptop_auth = fixture.home.home().join("laptop_authorized_keys");
+    let laptop_auth_literal = format!(
+        "'{}'",
+        laptop_auth.display().to_string().replace('\'', "''")
+    );
+    fixture.home.write_config(
+        "node.toml",
+        &format!("name = \"laptop\"\n\n[devices]\nauthorized_keys = {laptop_auth_literal}\n"),
+    );
+
+    let id_fwd = "aa".repeat(16);
+    let id_local = "bb".repeat(16);
+    let id_stay = "cc".repeat(16);
+    let now = legion_tools::device::registry::next_updated_timestamp(None).unwrap();
+    let key_fwd = legion_tools::device::keys::ed25519_public_key_from_seed(&[0xaa; 32]);
+    let key_local = legion_tools::device::keys::ed25519_public_key_from_seed(&[0xbb; 32]);
+    let key_stay = legion_tools::device::keys::ed25519_public_key_from_seed(&[0xcc; 32]);
+
+    let make_dev =
+        |name: &str, key: &str, principal: &str| legion_tools::device::registry::FleetDevice {
+            name: name.to_owned(),
+            public_key: key.to_owned(),
+            principal: principal.to_owned(),
+            role: None,
+            paired_at: now.clone(),
+            paired_on: "laptop".to_owned(),
+            paired_by: None,
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: now.clone(),
+            updated_on: "laptop".to_owned(),
+        };
+    let mut pi_devices = legion_tools::device::registry::DevicesFile::default();
+    pi_devices
+        .devices
+        .insert(id_fwd.clone(), make_dev("drop-fwd", &key_fwd, "phone"));
+    pi_devices.devices.insert(
+        id_local.clone(),
+        make_dev("drop-local", &key_local, "phone"),
+    );
+    pi.write_config("devices.toml", &pi_devices.to_toml_string());
+
+    let mut laptop_devices = pi_devices.clone();
+    laptop_devices
+        .devices
+        .insert(id_stay.clone(), make_dev("stay-local", &key_stay, "phone"));
+    fixture
+        .home
+        .write_config("devices.toml", &laptop_devices.to_toml_string());
+
+    // Side 1: Forwarding a tombstone-only `config.write devices.toml` with the expiring token is
+    // allowed and revokes `drop-fwd` on `pi`, while forwarding one with a live entry is refused.
+    let mut fwd_tomb = legion_tools::device::registry::DevicesFile::default();
+    fwd_tomb.removed.insert(
+        id_fwd.clone(),
+        legion_tools::device::registry::DeviceTombstone {
+            name: "drop-fwd".to_owned(),
+            principal: "phone".to_owned(),
+            paired_at: Some(now.clone()),
+            paired_on: Some("laptop".to_owned()),
+            removed_at: now.clone(),
+            removed_on: "laptop".to_owned(),
+        },
+    );
+    let fwd_ok = server.call(
+        &expiring_admin,
+        json!({
+            "tool": "config.write",
+            "on": "pi",
+            "args": {"document": "devices.toml", "content": fwd_tomb.to_toml_string()}
+        }),
+    );
+    assert_eq!(
+        fwd_ok.status,
+        200,
+        "tombstone-only forward failed: {}",
+        fwd_ok.text()
+    );
+
+    let mut fwd_with_live = fwd_tomb.clone();
+    fwd_with_live
+        .devices
+        .insert(id_stay.clone(), make_dev("stay-local", &key_stay, "phone"));
+    let fwd_live_denied = server.call(
+        &expiring_admin,
+        json!({
+            "tool": "config.write",
+            "on": "pi",
+            "args": {"document": "devices.toml", "content": fwd_with_live.to_toml_string()}
+        }),
+    );
+    assert_eq!(fwd_live_denied.status, 403, "{}", fwd_live_denied.text());
+    assert_eq!(fwd_live_denied.json()["code"], json!("denied"));
+
+    // Side 2: Local `device.remove` on `laptop` with the expiring token pushes tombstone-only to
+    // `pi` cleanly (`synced`, empty `still_trusted_by`) without pushing `stay-local` to `pi`.
+    let rem_local = server.call(
+        &expiring_admin,
+        json!({
+            "tool": "device.remove",
+            "args": {"id": id_local}
+        }),
+    );
+    assert_eq!(
+        rem_local.status,
+        200,
+        "local device.remove failed: {}",
+        rem_local.text()
+    );
+    let rem_json = rem_local.json();
+    assert_eq!(rem_json["removed"], json!(true), "{rem_json}");
+    assert_eq!(
+        rem_json["fleet"]["pi"]["status"],
+        json!("synced"),
+        "expiring-credential removal must reach peer pi: {rem_json}"
+    );
+    assert!(
+        rem_json.get("still_trusted_by").is_none(),
+        "still_trusted_by must be empty after synced tombstone push: {rem_json}"
+    );
+
+    let pi_devices_path = pi_home.join("config").join("devices.toml");
+    let pi_devices_after: legion_tools::device::registry::DevicesFile =
+        legion_core::config::parse(&pi_devices_path, &std::fs::read(&pi_devices_path).unwrap())
+            .unwrap();
+    assert!(pi_devices_after.removed.contains_key(&id_fwd));
+    assert!(pi_devices_after.removed.contains_key(&id_local));
+    assert!(
+        !pi_devices_after.devices.contains_key(&id_stay),
+        "laptop-only live device must NOT be pushed to pi by an expiring credential"
+    );
 }
 
 fn ui_assets_are_served_with_security_headers_and_guarded_api() {

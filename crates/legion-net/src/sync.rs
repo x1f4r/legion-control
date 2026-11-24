@@ -2268,7 +2268,7 @@ async fn sync_devices_document(
             // `device.set confirm=true`, so align outgoing confirmation fields with what the peer
             // already holds (never smuggling a confirmation over `config.write` or failing sync of
             // unrelated entries).
-            let outgoing = if caller_is_owner {
+            let mut outgoing = if caller_is_owner {
                 let mut aligned = local_devices.clone();
                 for (id, entry) in &mut aligned.devices {
                     match remote_devices.devices.get(id) {
@@ -2336,6 +2336,18 @@ async fn sync_devices_document(
                 scoped
             };
 
+            // An expiring credential may push ONLY tombstones to peers (never live device
+            // entries), so revocations made with an expiring credential still reach the fleet.
+            let mut skipped_live_due_to_expiry = false;
+            if ctx.credential_expires().is_some() && !outgoing.devices.is_empty() {
+                let full_after = merge_devices(&remote_devices, &outgoing);
+                let mut tombs_only = outgoing.clone();
+                tombs_only.devices.clear();
+                let tombs_after = merge_devices(&remote_devices, &tombs_only);
+                skipped_live_due_to_expiry = full_after != tombs_after;
+                outgoing = tombs_only;
+            }
+
             let filter_remote_tombstones = |remote_removed: &BTreeMap<
                 String,
                 legion_tools::device::registry::DeviceTombstone,
@@ -2374,6 +2386,20 @@ async fn sync_devices_document(
                 remote_after_push != remote_devices || (!remote.exists && !outgoing_is_empty);
 
             if !local_needs_tombstones && !remote_needs_push {
+                if skipped_live_due_to_expiry && let Some(limit) = ctx.credential_expires() {
+                    return error_outcome(
+                        ErrorBody::new(
+                            ErrorCode::Denied,
+                            format!(
+                                "The credential this call came with expires at {}, so it cannot push live paired devices to {machine}; only tombstones are allowed.",
+                                limit.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            ),
+                        )
+                        .with_hint(
+                            "Use a local shell or a non-expiring credential to push live paired devices.",
+                        ),
+                    );
+                }
                 if !dry_run
                     && local.hash == remote.hash
                     && let Some(ref lh) = local.hash

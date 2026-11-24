@@ -1452,7 +1452,20 @@ fn is_credential_minting_forward(tool: &str, args: &Value) -> bool {
     match tool {
         "device.invite" | "token.add" | "device.set" => true,
         "config.write" => match args.get("document").and_then(Value::as_str) {
-            Some("devices.toml" | "policy.toml") => true,
+            Some("devices.toml") => match args.get("content").and_then(Value::as_str) {
+                Some(content) => match legion_core::config::parse::<
+                    legion_tools::device::registry::DevicesFile,
+                >(
+                    std::path::Path::new("devices.toml"), content.as_bytes()
+                ) {
+                    // Allow tombstone-only `devices.toml` (no live entries, at least one
+                    // tombstone) so a removal made with an expiring credential still reaches peers.
+                    Ok(parsed) => !parsed.devices.is_empty() || parsed.removed.is_empty(),
+                    Err(_) => true,
+                },
+                None => true,
+            },
+            Some("policy.toml") => true,
             Some(_) => false,
             None => true,
         },
@@ -2478,6 +2491,105 @@ device = \"{pad_id}\"
             err3.code,
             ErrorCode::Denied,
             "local CLI owner must not be denied forwarding device.invite: {err3:?}"
+        );
+
+        fleet.close().await;
+    }
+
+    #[tokio::test]
+    async fn s5_expiring_credential_allows_only_tombstone_only_devices_write_forward() {
+        use jiff::{SignedDuration, Timestamp};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, DevicesFile, FleetDevice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("fleet.toml"),
+            "[machines.pi]\ncommand = [\"/nonexistent/legion-missing\"]\n",
+        )
+        .unwrap();
+
+        let mut registry = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        crate::sync::register(&mut registry, fleet.clone());
+        let node = Node::new(paths.clone(), registry);
+
+        let expires = Some(Timestamp::now() + SignedDuration::from_hours(1));
+        let now = Timestamp::now().to_string();
+
+        // 1. Live entry in devices.toml -> Denied on forwarding node.
+        let mut with_live = DevicesFile::default();
+        with_live.devices.insert(
+            "11".repeat(16),
+            FleetDevice {
+                name: "live".to_owned(),
+                public_key: ed25519_public_key_from_seed(&[0x11; 32]),
+                principal: "device:live".to_owned(),
+                role: Some("observer".to_owned()),
+                paired_at: now.clone(),
+                paired_on: "tower".to_owned(),
+                paired_by: None,
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: now.clone(),
+                updated_on: "tower".to_owned(),
+            },
+        );
+        let mut live_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": with_live.to_toml_string()}),
+        );
+        live_call.credential_expires = expires;
+        let err_live = fleet
+            .call_machine(&node, "pi", live_call)
+            .await
+            .unwrap_err();
+        assert_eq!(err_live.code, ErrorCode::Denied, "{err_live:?}");
+
+        // 2. Empty / invalid devices.toml -> Denied on forwarding node.
+        for bad in ["", "not = [valid toml"] {
+            let mut bad_call = Call::new(
+                Door::Http,
+                "config.write",
+                json!({"document": "devices.toml", "content": bad}),
+            );
+            bad_call.credential_expires = expires;
+            let err_bad = fleet.call_machine(&node, "pi", bad_call).await.unwrap_err();
+            assert_eq!(err_bad.code, ErrorCode::Denied, "{bad:?}: {err_bad:?}");
+        }
+
+        // 3. Tombstone-only devices.toml (no live entries, >= 1 tombstone) -> passes forwarding
+        //    guard (fails with Unreachable on missing binary rather than Denied).
+        let mut tomb_only = DevicesFile::default();
+        tomb_only.removed.insert(
+            "22".repeat(16),
+            DeviceTombstone {
+                name: "old".to_owned(),
+                principal: "device:old".to_owned(),
+                paired_at: None,
+                paired_on: None,
+                removed_at: now,
+                removed_on: "tower".to_owned(),
+            },
+        );
+        let mut tomb_call = Call::new(
+            Door::Http,
+            "config.write",
+            json!({"document": "devices.toml", "content": tomb_only.to_toml_string()}),
+        );
+        tomb_call.credential_expires = expires;
+        let err_tomb = fleet
+            .call_machine(&node, "pi", tomb_call)
+            .await
+            .unwrap_err();
+        assert_ne!(
+            err_tomb.code,
+            ErrorCode::Denied,
+            "tombstone-only devices.toml must pass expiring-credential forward guard: {err_tomb:?}"
         );
 
         fleet.close().await;
