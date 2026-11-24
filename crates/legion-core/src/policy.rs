@@ -625,6 +625,7 @@ pub struct Grant {
 struct CachedProtected {
     own_dirs: Vec<Result<OwnDir, (Place, PathBuf, Unresolved)>>,
     secrets: Vec<SecretPlace>,
+    secret_prefixes: Vec<SecretPrefix>,
     resolved_roots: Vec<Resolved>,
 }
 
@@ -1106,6 +1107,28 @@ impl Grant {
                     })));
                 }
             }
+            for prefix in &cache.secret_prefixes {
+                if prefix.matches_resolved(candidate) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{} may not create or replace {}: it is a staging file for {}.",
+                            self.principal,
+                            path.display(),
+                            prefix.label
+                        ),
+                    )
+                    .with_hint(format!(
+                        "Only roles with effect:admin may touch atomic-write staging files beside {}.",
+                        prefix.label
+                    ))
+                    .with_details(json!({
+                        "path": path,
+                        "place": "secret",
+                        "secret": prefix.label,
+                    })));
+                }
+            }
             Ok(())
         };
 
@@ -1128,10 +1151,14 @@ impl Grant {
     /// Resolves and caches Legion's own directories, secret locations, and configured roots once
     /// for the lifetime of this [`Grant`].
     fn protected_cache(&self) -> &CachedProtected {
-        self.protected_cache.get_or_init(|| CachedProtected {
-            own_dirs: self.compute_own_dirs(),
-            secrets: self.compute_secret_locations(),
-            resolved_roots: self.resolved_roots_best_effort(),
+        self.protected_cache.get_or_init(|| {
+            let (secrets, secret_prefixes) = self.compute_secret_locations();
+            CachedProtected {
+                own_dirs: self.compute_own_dirs(),
+                secrets,
+                secret_prefixes,
+                resolved_roots: self.resolved_roots_best_effort(),
+            }
         })
     }
 
@@ -1242,6 +1269,7 @@ impl Grant {
         let has_identities = entries.iter().any(|entry| entry.identity.is_some());
         ProtectedFilter {
             entries,
+            secret_prefixes: cache.secret_prefixes.clone(),
             explicit_roots,
             has_identities,
             fail_closed_reason,
@@ -1263,13 +1291,15 @@ impl Grant {
     }
 
     /// Well-known secret locations under `self.paths.home()` plus any top-level `secrets` from
-    /// `policy.toml`, resolved as far as they exist.
+    /// `policy.toml`, resolved as far as they exist, along with sibling staging-file prefixes
+    /// (`.<name>.legion-tmp-*`) beside active `authorized_keys` files.
     ///
     /// A secret location that cannot be resolved (for example a dangling symlink or an unreadable
     /// parent) is never silently dropped: it falls back to `resolve_keeping_last` and then to a
     /// lexical raw path so both `check_path` and directory walks still block it.
-    fn compute_secret_locations(&self) -> Vec<SecretPlace> {
-        let mut places = Vec::with_capacity(SECRET_LOCATIONS.len() + self.extra_secrets.len());
+    fn compute_secret_locations(&self) -> (Vec<SecretPlace>, Vec<SecretPrefix>) {
+        let mut places = Vec::with_capacity(SECRET_LOCATIONS.len() + self.extra_secrets.len() + 6);
+        let mut prefixes = Vec::new();
         let home_resolved = self.paths.home().and_then(|home| resolve(home).ok());
         if let Some(home) = self.paths.home() {
             for rel in SECRET_LOCATIONS {
@@ -1292,6 +1322,21 @@ impl Grant {
                     });
                 places.push(build_secret_place(format!("~/{rel}"), full, resolved));
             }
+            // If `~/.ssh/authorized_keys` is a symbolic link (for example into `~/dotfiles`),
+            // protect its resolved target and its `.legion.lock` / `.legion-tmp-*` siblings from
+            // non-admin file tools so a role with write access on `~/**` cannot edit the target
+            // directly. (Path guards apply to file tools, not to roles that allow `exec`.)
+            let default_auth_keys = home.join(".ssh").join("authorized_keys");
+            if std::fs::symlink_metadata(&default_auth_keys)
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                push_auth_keys_secret(
+                    &mut places,
+                    &mut prefixes,
+                    "~/.ssh/authorized_keys",
+                    default_auth_keys,
+                );
+            }
         }
         for extra in self.extra_secrets.iter() {
             let full = expand_tilde(Path::new(extra.as_str()), self.paths.home())
@@ -1306,7 +1351,8 @@ impl Grant {
             ));
         }
         // Protect Windows OpenSSH's administrator authorized_keys and host keys under
-        // `%ProgramData%\ssh` alongside `~/.ssh` so non-admin roles cannot plant SSH keys there.
+        // `%ProgramData%\ssh` alongside `~/.ssh` from non-admin file tools. (Path guards apply to
+        // file tools, not to roles that allow `exec`.)
         #[cfg(windows)]
         {
             let program_data = std::env::var_os("ProgramData")
@@ -1319,12 +1365,24 @@ impl Grant {
                 .unwrap_or_else(|_| raw_fallback_resolved(&full));
             places.push(build_secret_place(
                 r"%ProgramData%\ssh".to_owned(),
-                full,
+                full.clone(),
                 resolved,
             ));
+            let admin_auth = full.join("administrators_authorized_keys");
+            if std::fs::symlink_metadata(&admin_auth)
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                push_auth_keys_secret(
+                    &mut places,
+                    &mut prefixes,
+                    r"%ProgramData%\ssh\administrators_authorized_keys",
+                    admin_auth,
+                );
+            }
         }
-        // If `node.toml` points `[devices] authorized_keys` outside `~/.ssh`, protect that file as
-        // a secret location too so no non-admin file tool can reach the same edit as `device.*`.
+        // If `node.toml` configures `[devices] authorized_keys`, protect that file (following any
+        // symlink) together with its `.legion.lock` and `.legion-tmp-*` atomic-write siblings from
+        // non-admin file tools. (Path guards apply to file tools, not to roles that allow `exec`.)
         if let Ok(bytes) = std::fs::read(self.paths.config_file(crate::config::NodeFile::FILE))
             && let Ok(node) = crate::config::parse::<crate::config::NodeFile>(
                 &self.paths.config_file(crate::config::NodeFile::FILE),
@@ -1334,16 +1392,14 @@ impl Grant {
         {
             let full = expand_tilde(Path::new(&configured), self.paths.home())
                 .unwrap_or_else(|_| PathBuf::from(&configured));
-            let resolved = resolve(&full)
-                .or_else(|_| resolve_keeping_last(&full))
-                .unwrap_or_else(|_| raw_fallback_resolved(&full));
-            places.push(build_secret_place(
-                "[devices] authorized_keys".to_owned(),
+            push_auth_keys_secret(
+                &mut places,
+                &mut prefixes,
+                "[devices] authorized_keys",
                 full,
-                resolved,
-            ));
+            );
         }
-        places
+        (places, prefixes)
     }
 
     /// Refuses access to well-known secret locations for roles without `effect:admin`, unless the
@@ -1358,8 +1414,10 @@ impl Grant {
         if self.allows_effect(Effect::Admin) {
             return Ok(());
         }
-        let secrets = &self.protected_cache().secrets;
-        if secrets.is_empty() {
+        let cache = self.protected_cache();
+        let secrets = &cache.secrets;
+        let prefixes = &cache.secret_prefixes;
+        if secrets.is_empty() && prefixes.is_empty() {
             return Ok(());
         }
         let mut places = vec![Cow::Borrowed(resolved)];
@@ -1403,6 +1461,29 @@ impl Grant {
                 .with_details(json!({
                     "path": resolved.path(),
                     "secret": secret.label,
+                })));
+            }
+            for prefix in prefixes {
+                if !prefix.matches_resolved(place) {
+                    continue;
+                }
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "{} may not {} {}: it is a staging file for {}.",
+                        self.principal,
+                        access.verb(),
+                        given.display(),
+                        prefix.label
+                    ),
+                )
+                .with_hint(format!(
+                    "Only roles with effect:admin may touch atomic-write staging files beside {}.",
+                    prefix.label
+                ))
+                .with_details(json!({
+                    "path": resolved.path(),
+                    "secret": prefix.label,
                 })));
             }
         }
@@ -1543,6 +1624,144 @@ struct SecretPlace {
     dev_ino: Option<(u64, u64)>,
 }
 
+/// Protected sibling filename prefix inside one directory (used for atomic-write staging files
+/// `.<name>.legion-tmp-*` beside `authorized_keys`).
+#[derive(Clone, Debug)]
+struct SecretPrefix {
+    label: String,
+    reason: String,
+    raw_dir: PathBuf,
+    dir: Resolved,
+    dir_identity: Option<Arc<Handle>>,
+    file_prefix: String,
+}
+
+impl SecretPrefix {
+    fn matches_name(&self, name: &std::ffi::OsStr) -> bool {
+        let Some(name_str) = name.to_str() else {
+            return false;
+        };
+        if Platform::HOST.ignores_case() {
+            name_str
+                .to_ascii_lowercase()
+                .starts_with(&self.file_prefix.to_ascii_lowercase())
+        } else {
+            name_str.starts_with(&self.file_prefix)
+        }
+    }
+
+    fn matches_resolved(&self, place: &Resolved) -> bool {
+        let full = place.path();
+        let Some(name) = full.file_name() else {
+            return false;
+        };
+        if !self.matches_name(name) {
+            return false;
+        }
+        let parent_resolved = if place.link.is_some() {
+            Resolved::existing(place.existing.clone())
+        } else if !place.missing.is_empty() {
+            Resolved {
+                existing: place.existing.clone(),
+                missing: place.missing[..place.missing.len() - 1].to_vec(),
+                link: None,
+            }
+        } else {
+            let Some(parent) = place.existing.parent() else {
+                return false;
+            };
+            Resolved::existing(parent.to_path_buf())
+        };
+        let same_path = within_protected(&parent_resolved, &self.dir, Platform::HOST)
+            && within_protected(&self.dir, &parent_resolved, Platform::HOST);
+        if same_path {
+            return true;
+        }
+        self.dir_identity.as_deref().is_some_and(|id| {
+            parent_resolved.missing.is_empty()
+                && Handle::from_path(&parent_resolved.existing).ok().as_ref() == Some(id)
+        })
+    }
+
+    fn matches_raw_path(&self, path: &Path) -> bool {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        if !self.matches_name(name) {
+            return false;
+        }
+        let same_resolved = raw_path_within_resolved(parent, &self.dir, Platform::HOST)
+            && within_protected(&self.dir, &raw_fallback_resolved(parent), Platform::HOST);
+        let same_raw = raw_path_within_raw(parent, &self.raw_dir, Platform::HOST)
+            && raw_path_within_raw(&self.raw_dir, parent, Platform::HOST);
+        same_resolved
+            || same_raw
+            || self
+                .dir_identity
+                .as_deref()
+                .is_some_and(|id| Handle::from_path(parent).ok().as_ref() == Some(id))
+    }
+}
+
+/// Registers an `authorized_keys` path (following any symlink), its `.legion.lock` sibling, and
+/// its `.legion-tmp-*` atomic-write staging prefix as protected secret locations.
+fn push_auth_keys_secret(
+    places: &mut Vec<SecretPlace>,
+    prefixes: &mut Vec<SecretPrefix>,
+    label: &str,
+    full: PathBuf,
+) {
+    let resolved = resolve(&full)
+        .or_else(|_| resolve_keeping_last(&full))
+        .unwrap_or_else(|_| raw_fallback_resolved(&full));
+    let target_path = resolved.path();
+    places.push(build_secret_place(label.to_owned(), full.clone(), resolved));
+    // If `full` itself was a symbolic link, protect the symlink path too so a non-admin role
+    // cannot replace or unlink it either.
+    if std::fs::symlink_metadata(&full).is_ok_and(|meta| meta.file_type().is_symlink())
+        && let Ok(link_resolved) = resolve_keeping_last(&full)
+    {
+        places.push(build_secret_place(label.to_owned(), full, link_resolved));
+    }
+    let Some(parent) = target_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return;
+    };
+    let base = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("authorized_keys");
+
+    let lock_path = parent.join(format!(".{base}.legion.lock"));
+    let lock_resolved = resolve(&lock_path)
+        .or_else(|_| resolve_keeping_last(&lock_path))
+        .unwrap_or_else(|_| raw_fallback_resolved(&lock_path));
+    places.push(build_secret_place(
+        format!("{label} lock file"),
+        lock_path,
+        lock_resolved,
+    ));
+
+    let dir_resolved = resolve(parent)
+        .or_else(|_| resolve_keeping_last(parent))
+        .unwrap_or_else(|_| raw_fallback_resolved(parent));
+    let dir_identity = if dir_resolved.missing.is_empty() && dir_resolved.link.is_none() {
+        Handle::from_path(&dir_resolved.existing).ok().map(Arc::new)
+    } else {
+        None
+    };
+    prefixes.push(SecretPrefix {
+        label: label.to_owned(),
+        reason: format!(
+            "staging file beside {label} is protected; only roles with effect:admin may touch it"
+        ),
+        raw_dir: parent.to_path_buf(),
+        dir: dir_resolved,
+        dir_identity,
+        file_prefix: format!(".{base}.legion-tmp-"),
+    });
+}
+
 fn build_secret_place(label: String, raw_path: PathBuf, resolved: Resolved) -> SecretPlace {
     let identity = if resolved.missing.is_empty() && resolved.link.is_none() {
         Handle::from_path(&resolved.existing).ok().map(Arc::new)
@@ -1581,6 +1800,7 @@ const UNRESOLVABLE_LINK_REASON: &str =
 #[derive(Debug)]
 pub struct ProtectedFilter {
     entries: Vec<ProtectedEntry>,
+    secret_prefixes: Vec<SecretPrefix>,
     explicit_roots: Vec<ExplicitRoot>,
     has_identities: bool,
     fail_closed_reason: Option<(Place, String)>,
@@ -1610,6 +1830,7 @@ impl ProtectedFilter {
     pub fn allow_all() -> ProtectedFilter {
         ProtectedFilter {
             entries: Vec::new(),
+            secret_prefixes: Vec::new(),
             explicit_roots: Vec::new(),
             has_identities: false,
             fail_closed_reason: None,
@@ -1618,7 +1839,9 @@ impl ProtectedFilter {
 
     /// Whether this filter has no protected locations to skip and no fail-closed condition.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.fail_closed_reason.is_none()
+        self.entries.is_empty()
+            && self.secret_prefixes.is_empty()
+            && self.fail_closed_reason.is_none()
     }
 
     /// Returns the matching protected [`Place`] and human-readable reason if `path` (or the target
@@ -1715,6 +1938,11 @@ impl ProtectedFilter {
                 }
                 return Some((entry.place, entry.reason.as_str()));
             }
+            for prefix in &self.secret_prefixes {
+                if prefix.matches_resolved(&target) {
+                    return Some((Place::Secret, prefix.reason.as_str()));
+                }
+            }
             if let Some((place, ref reason)) = self.fail_closed_reason {
                 return Some((place, reason.as_str()));
             }
@@ -1767,6 +1995,11 @@ impl ProtectedFilter {
             }
             return Some((entry.place, entry.reason.as_str()));
         }
+        for prefix in &self.secret_prefixes {
+            if prefix.matches_raw_path(path) {
+                return Some((Place::Secret, prefix.reason.as_str()));
+            }
+        }
         if let Some((place, ref reason)) = self.fail_closed_reason {
             return Some((place, reason.as_str()));
         }
@@ -1792,6 +2025,11 @@ impl ProtectedFilter {
                 continue;
             }
             return Some((entry.place, entry.reason.as_str()));
+        }
+        for prefix in &self.secret_prefixes {
+            if prefix.matches_raw_path(path) {
+                return Some((Place::Secret, prefix.reason.as_str()));
+            }
         }
         None
     }
@@ -4007,5 +4245,115 @@ role = "parent_scoped"
             );
         }
         assert!(owner.check_path(&auth_keys, Access::Write).is_ok());
+
+        // Lock and atomic-write staging siblings beside configured authorized_keys are also closed.
+        let lock_sibling = ssh_dir.join(".authorized_keys.legion.lock");
+        let tmp_sibling = ssh_dir.join(".authorized_keys.legion-tmp-123-0-456");
+        let unrelated = ssh_dir.join("notes.txt");
+        for sibling in [&lock_sibling, &tmp_sibling] {
+            for grant in [&wide, &scoped] {
+                assert_eq!(
+                    grant.check_path(sibling, Access::Write).unwrap_err().code,
+                    ErrorCode::Denied,
+                    "{}",
+                    sibling.display()
+                );
+                assert_eq!(
+                    grant
+                        .check_create(sibling, CreateKind::File, false)
+                        .unwrap_err()
+                        .code,
+                    ErrorCode::Denied,
+                    "{}",
+                    sibling.display()
+                );
+                assert_eq!(
+                    grant.protected_filter().blocked(sibling).map(|(p, _)| p),
+                    Some(Place::Secret),
+                    "{}",
+                    sibling.display()
+                );
+            }
+            assert!(owner.check_path(sibling, Access::Write).is_ok());
+        }
+        assert!(scoped.check_path(&unrelated, Access::Write).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_authorized_keys_target_and_siblings_are_closed_to_non_admin_roles() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let dotfiles = home.join("dotfiles");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&dotfiles).unwrap();
+
+        let target_keys = dotfiles.join("authorized_keys");
+        std::fs::write(&target_keys, "# existing\n").unwrap();
+        symlink(&target_keys, home.join(".ssh").join("authorized_keys")).unwrap();
+
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        let pol = policy(
+            r#"
+default = "owner"
+
+[roles.home_writer]
+allow = ["effect:read", "effect:write"]
+paths = ["~/**"]
+
+[principals.helper]
+role = "home_writer"
+"#,
+        );
+        let helper = pol.grant("helper", &paths);
+        let owner = pol.grant("owner", &paths);
+
+        let lock_sibling = dotfiles.join(".authorized_keys.legion.lock");
+        let tmp_sibling = dotfiles.join(".authorized_keys.legion-tmp-99-1-12345");
+        let other_dotfile = dotfiles.join("gitconfig");
+
+        for protected_path in [&target_keys, &lock_sibling, &tmp_sibling] {
+            assert_eq!(
+                helper
+                    .check_path(protected_path, Access::Read)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Denied,
+                "read {}",
+                protected_path.display()
+            );
+            assert_eq!(
+                helper
+                    .check_path(protected_path, Access::Write)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Denied,
+                "write {}",
+                protected_path.display()
+            );
+            assert_eq!(
+                helper
+                    .check_create(protected_path, CreateKind::File, false)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Denied,
+                "create {}",
+                protected_path.display()
+            );
+            assert_eq!(
+                helper
+                    .protected_filter()
+                    .blocked(protected_path)
+                    .map(|(p, _)| p),
+                Some(Place::Secret),
+                "walk {}",
+                protected_path.display()
+            );
+            assert!(owner.check_path(protected_path, Access::Write).is_ok());
+        }
+        // Unrelated files in the same dotfiles directory remain writable by home_writer.
+        assert!(helper.check_path(&other_dotfile, Access::Write).is_ok());
     }
 }

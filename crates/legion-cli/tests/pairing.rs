@@ -723,7 +723,25 @@ fn non_admin_roles_cannot_edit_ssh_or_configured_authorized_keys_via_file_tools(
         assert_eq!(write.json()["code"], json!("denied"));
     }
 
-    // Sibling file in custom_dir is still writable by editor, proving only authorized_keys is blocked.
+    // Lock and atomic-write staging siblings beside [devices] authorized_keys are also denied.
+    for sibling_name in [
+        ".authorized_keys.legion.lock",
+        ".authorized_keys.legion-tmp-1-0-0",
+    ] {
+        let p = custom_dir.join(sibling_name);
+        let write = home.run(&[
+            "fs.write",
+            &format!("path={}", p.to_string_lossy()),
+            "content=evil",
+            "--as",
+            "helper",
+        ]);
+        assert_eq!(write.code, 1, "sibling {sibling_name} should be denied");
+        assert_eq!(write.json()["code"], json!("denied"));
+    }
+
+    // Sibling file in custom_dir is still writable by editor, proving only authorized_keys
+    // and its lock/staging siblings are blocked.
     let sibling = custom_dir.join("ok.txt");
     let ok_write = home.run(&[
         "fs.write",
@@ -733,6 +751,55 @@ fn non_admin_roles_cannot_edit_ssh_or_configured_authorized_keys_via_file_tools(
         "helper",
     ]);
     assert_eq!(ok_write.code, 0, "stderr={}", ok_write.stderr);
+
+    // On Unix, a symlinked ~/.ssh/authorized_keys target (e.g. ~/dotfiles/authorized_keys) and
+    // its lock/staging siblings are also closed to a non-admin role with write access on `~/**`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let dotfiles = home.home().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let linked_target = dotfiles.join("authorized_keys");
+        std::fs::write(&linked_target, "# linked\n").unwrap();
+        std::fs::remove_file(&default_auth).unwrap();
+        symlink(&linked_target, &default_auth).unwrap();
+
+        for target in [
+            linked_target.clone(),
+            dotfiles.join(".authorized_keys.legion.lock"),
+            dotfiles.join(".authorized_keys.legion-tmp-42-0-999"),
+        ] {
+            let write = home.run(&[
+                "fs.write",
+                &format!("path={}", target.to_string_lossy()),
+                "content=ssh-ed25519 AAAA evil",
+                "--as",
+                "helper",
+            ]);
+            assert_eq!(
+                write.code,
+                1,
+                "symlink target/sibling {} should be denied",
+                target.display()
+            );
+            assert_eq!(write.json()["code"], json!("denied"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&linked_target).unwrap(),
+            "# linked\n"
+        );
+
+        let other_dotfile = dotfiles.join("other.txt");
+        let ok_dotfile = home.run(&[
+            "fs.write",
+            &format!("path={}", other_dotfile.to_string_lossy()),
+            "content=ok",
+            "--as",
+            "helper",
+        ]);
+        assert_eq!(ok_dotfile.code, 0, "stderr={}", ok_dotfile.stderr);
+    }
 
     // And the device.* admin tools themselves are denied to editor.
     for tool in ["device.invite", "device.list", "device.remove"] {
