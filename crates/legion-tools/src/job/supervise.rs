@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use legion_core::{CancellationToken, Paths};
 use legion_os::OsError;
-use legion_os::lock::FileLock;
+use legion_os::lock::{FileLock, LockMode};
 use legion_os::run::{ChunkCallback, OutputChunk, RunOptions, run};
 use legion_os::shell::CommandSpec;
 
@@ -33,6 +33,9 @@ pub(super) const STATE_DIR_FLAG: &str = "--state-dir";
 
 /// How often the supervisor checks for `<job_dir>/cancel`.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the supervisor retries taking the exclusive job lock so a reader's brief shared probe
+/// landing between lock creation and locking never aborts startup.
+const SUPERVISOR_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Runs the hidden `job-supervise` subcommand when `args` starts with `"job-supervise"`.
 ///
@@ -148,10 +151,16 @@ async fn supervise(state_dir: &Path, id: &str) -> Result<(), String> {
     let dir = job_dir(state_dir, id);
     let lock_path = dir.join(LOCK_FILE);
 
-    let lock = match FileLock::try_lock_exclusive(&lock_path) {
+    let lock = match FileLock::acquire_async(
+        &lock_path,
+        LockMode::Exclusive,
+        Some(SUPERVISOR_LOCK_TIMEOUT),
+    )
+    .await
+    {
         Ok(guard) => guard,
-        Err(OsError::WouldBlock { .. }) => {
-            // Another supervisor already owns this job; exit without touching its state.
+        Err(OsError::WouldBlock { .. } | OsError::TimedOut { .. }) => {
+            // Another supervisor genuinely holds this job's lock; exit without touching its state.
             return Ok(());
         }
         Err(err) => {
@@ -367,4 +376,53 @@ fn describe_spawn_error(error: &OsError, record: &JobRecord) -> String {
 
 fn write_stderr(text: &str) {
     let _ = std::io::stderr().lock().write_all(text.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::job::store::{read_exit_record, write_job_record};
+
+    #[tokio::test]
+    async fn supervisor_retries_exclusive_lock_past_transient_shared_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let id = "lock-probe-race";
+        let dir = job_dir(&state_dir, id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let record = JobRecord {
+            id: id.to_owned(),
+            name: "probe-test".to_owned(),
+            key: None,
+            cmd: Some("echo lock-retry-ok".to_owned()),
+            argv: None,
+            cwd: None,
+            env_names: Vec::new(),
+            principal: "owner".to_owned(),
+            created: now_rfc3339(),
+            boot_id: "test-boot".to_owned(),
+            exclusive: false,
+            detach: None,
+        };
+        write_job_record(&dir, &record).unwrap();
+
+        // Simulate a reader holding a brief shared lock right as the supervisor starts.
+        let shared = FileLock::try_lock_shared(dir.join(LOCK_FILE)).unwrap();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = shared.unlock();
+        });
+
+        supervise(&state_dir, id).await.unwrap();
+        releaser.await.unwrap();
+
+        let exit = read_exit_record(&dir).expect("exit.json was not written");
+        assert_eq!(exit.outcome, ExitOutcome::Succeeded);
+        assert_eq!(exit.exit_code, Some(0));
+        let log = fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert_eq!(log.trim(), "lock-retry-ok");
+    }
 }
