@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use legion_core::config::ConfigStore;
-use legion_core::{Ctx, EventSink, Registry, ToolError};
+use legion_core::{Call, Ctx, EventSink, Registry, ToolError};
 use legion_proto::{Effect, ErrorBody, ErrorCode, HelloResult};
 use legion_tools::power::plan::Platform;
 use legion_tools::power::{Actuator, PowerTool, actuator, wol};
@@ -249,7 +249,7 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
     let mut skipped: Vec<Skipped> = Vec::new();
     let mut sent: Option<(String, Value)> = None;
     if entry.wake_via.is_empty() {
-        let reply = send_here(hands, ctx, &machine, dry_run).await?;
+        let reply = send_here(ctx, &machine, dry_run).await?;
         sent = Some((here.clone(), reply));
     }
     for helper in &entry.wake_via {
@@ -260,7 +260,7 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
             return Err(cancelled("power.wake"));
         }
         if *helper == here {
-            match send_here(hands, ctx, &machine, dry_run).await {
+            match send_here(ctx, &machine, dry_run).await {
                 Ok(reply) => sent = Some((here.clone(), reply)),
                 Err(error) => skipped.push(Skipped {
                     helper: helper.clone(),
@@ -358,27 +358,19 @@ async fn power_wake(hands: &Hands, ctx: &Ctx, args: WakeArgs) -> Result<WakeResu
 }
 
 /// Sends the packets from this machine, answering as power.wol would.
-async fn send_here(
-    hands: &Hands,
-    ctx: &Ctx,
-    machine: &str,
-    dry_run: bool,
-) -> Result<Value, ErrorBody> {
-    let reply = power_wol(
-        hands,
-        ctx,
-        WolArgs {
-            machine: machine.to_owned(),
-            dry_run,
-        },
-    )
-    .await?;
-    serde_json::to_value(reply).map_err(|error| {
-        ErrorBody::new(
-            ErrorCode::Internal,
-            format!("power.wol's reply cannot be written as JSON: {error}."),
-        )
-    })
+/// Sends the packets from this machine as a call to power.wol on this node, by the same principal
+/// through the same door: its policy decides and its audit log records it, exactly as when a
+/// helper is asked, so a role allowed power.wake but not power.wol cannot send packets here.
+async fn send_here(ctx: &Ctx, machine: &str, dry_run: bool) -> Result<Value, ErrorBody> {
+    let mut call = Call::new(
+        ctx.door(),
+        "power.wol",
+        json!({"machine": machine, "dry_run": dry_run}),
+    );
+    call.pinned = Some(ctx.principal().to_owned());
+    call.cancel = ctx.cancel_token().child_token();
+    call.hops = ctx.hops();
+    ctx.node().call(call).await
 }
 
 fn no_helper(machine: &str, skipped: &[Skipped]) -> ErrorBody {
@@ -952,6 +944,54 @@ mod tests {
             .unwrap();
         assert_eq!(itself["awake"], json!(true));
         assert!(fixture.fake.records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn waking_from_here_is_a_power_wol_call_by_the_same_principal() {
+        // tower cannot answer (its command does not exist) and has no helpers, so this node
+        // sends the packets itself.
+        let fixture = Fixture::new(
+            "[machines.tower]\ncommand = [\"legion-test-no-such-program\"]\nmac = \"02:00:00:00:00:01\"\n",
+        );
+        let policy = |allow: &str| {
+            format!(
+                "[principals.\"agent:test\"]\nrole = \"waker\"\n\n[roles.waker]\nallow = [{allow}]\n"
+            )
+        };
+        let wake_as_agent = || {
+            let mut call = Call::new(Door::Mcp, "power.wake", json!({"machine": "tower"}));
+            call.as_principal = Some("agent:test".to_owned());
+            fixture.node.call(call)
+        };
+        let config = fixture.dir.path().join("config");
+        std::fs::write(config.join("policy.toml"), policy("\"power.wake\"")).unwrap();
+        let error = wake_as_agent().await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Denied, "{error:?}");
+        assert!(error.message.contains("power.wol"), "{}", error.message);
+        assert!(fixture.datagrams().is_empty());
+
+        std::fs::write(
+            config.join("policy.toml"),
+            policy("\"power.wake\", \"power.wol\""),
+        )
+        .unwrap();
+        let woken = wake_as_agent().await.unwrap();
+        assert_eq!(woken["sent_by"], json!("pi"));
+        assert!(!fixture.datagrams().is_empty());
+        // And the audit log has it, under the caller's principal.
+        let audit =
+            std::fs::read_to_string(fixture.dir.path().join("state").join("audit.jsonl")).unwrap();
+        let wol: Vec<Value> = audit
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|entry| entry["tool"] == json!("power.wol"))
+            .collect();
+        assert_eq!(wol.len(), 2, "{audit}");
+        assert!(
+            wol.iter()
+                .all(|entry| entry["principal"] == json!("agent:test"))
+        );
+        assert_eq!(wol[0]["outcome"], json!("denied"), "{audit}");
     }
 
     #[test]
