@@ -59,6 +59,10 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 /// How long an ended stream is given to exit and say why on stderr.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
 
+/// How long a source that has sent the end of its archive is given to report that it exited
+/// cleanly; over a slow link the exit status can trail the last byte.
+const FINISH_WAIT: Duration = Duration::from_secs(10);
+
 /// How many paths a result lists in each of its lists; the counts are always whole.
 const MOST_LISTED: usize = 100;
 
@@ -1071,7 +1075,7 @@ impl Conn {
                 },
                 None => Ok(()),
             },
-            Process::Remote(handle) => match handle.collect_exit_info(EXIT_WAIT).await {
+            Process::Remote(handle) => match handle.collect_exit_info(FINISH_WAIT).await {
                 (Some(0), _) => Ok(()),
                 _ => Err(self.ended("before it finished").await),
             },
