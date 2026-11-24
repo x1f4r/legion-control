@@ -55,7 +55,7 @@ struct FleetPingResponse {
 
 /// Runs the extra environment, policy, and (unless `quick` is set) fleet checks and appends them.
 pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec<Check>) {
-    let exe_dir = std::env::current_exe()
+    let exe_dir = legion_core::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
     let login_path = query_login_shell_path(ctx).await;

@@ -165,12 +165,7 @@ impl Actuator for SystemActuator {
         log: Option<&'a Path>,
     ) -> BoxFuture<'a, Result<Vec<String>, ErrorBody>> {
         Box::pin(async move {
-            let exe = std::env::current_exe().map_err(|error| {
-                ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("legion cannot find its own program to schedule the action: {error}."),
-                )
-            })?;
+            let exe = legion_core::current_exe()?;
             let mut args = vec![
                 DELAY_MODE.to_owned(),
                 delay.as_secs().to_string(),

@@ -603,7 +603,7 @@ pub fn random_hex(byte_len: usize) -> Result<String, ErrorBody> {
 /// Called once at process startup so a previous `meta.update` that renamed a running executable
 /// aside leaves no stale binaries in the install directory.
 pub fn cleanup_old_binary() {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = legion_core::current_exe() {
         cleanup_old_binaries_next_to(&exe);
     }
 }
@@ -774,12 +774,7 @@ pub fn replace_executable(
 }
 
 async fn meta_update(ctx: &Ctx, args: UpdateArgs) -> Result<UpdateResult, ToolError> {
-    let current_exe = std::env::current_exe().map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!("Could not locate the running legion executable: {err}."),
-        )
-    })?;
+    let current_exe = legion_core::current_exe()?;
     let fetcher = SystemFetcher;
     run_meta_update(
         ctx.paths(),
@@ -838,6 +833,7 @@ async fn run_meta_update_with_key(
     args: UpdateArgs,
     cancel: CancellationToken,
 ) -> Result<UpdateResult, ErrorBody> {
+    let current_exe = legion_core::validate_recorded_exe(current_exe)?;
     let target = target_triple_for(os, arch)?;
     let explicit_version = args.version.is_some();
     let desired_version = match args.version {
@@ -1571,5 +1567,100 @@ mod tests {
             crate::floor::read_floor(&node_floor_path(&paths)),
             crate::floor::FloorState::Recorded(SemVer::parse("0.2.0").unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn consecutive_meta_updates_replace_recorded_path_and_refuse_missing_file() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("home"));
+        let exe = dir.path().join("legion");
+        fs::write(&exe, b"legion-0.1.0").unwrap();
+
+        let signing = SigningKey::from_bytes(&[0x66; 32]);
+        let pubkey = signing.verifying_key().to_bytes();
+        let target = "x86_64-unknown-linux-musl";
+
+        let mut files = HashMap::new();
+        for (ver, bytes) in [
+            ("0.2.0", b"legion-0.2.0-bytes".as_slice()),
+            ("0.3.0", b"legion-0.3.0-bytes".as_slice()),
+        ] {
+            let asset = artifact_filename(ver, target);
+            let sums = format!("{}  {asset}\n", sha256_bytes(bytes));
+            let sig =
+                crate::trust::encode_signature_bytes(&signing.sign(sums.as_bytes()).to_bytes());
+            files.insert(checksums_url(ver), sums.into_bytes());
+            files.insert(checksums_sig_url(ver), sig.into_bytes());
+            files.insert(artifact_url(ver, target), bytes.to_vec());
+        }
+        let fetcher = FakeFetcher::new("0.3.0", files);
+
+        // Two updates in a row against the same recorded path keep updating `legion` itself.
+        run_meta_update_with_key(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.1.0",
+            &exe,
+            false,
+            &pubkey,
+            UpdateArgs {
+                version: Some("0.2.0".to_owned()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"legion-0.2.0-bytes");
+
+        run_meta_update_with_key(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.2.0",
+            &exe,
+            false,
+            &pubkey,
+            UpdateArgs {
+                version: Some("0.3.0".to_owned()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"legion-0.3.0-bytes");
+        assert!(!dir.path().join("legion (deleted)").exists());
+
+        // Removing the recorded file causes a subsequent update to fail cleanly rather than
+        // creating an unrelated file.
+        fs::remove_file(&exe).unwrap();
+        let err = run_meta_update_with_key(
+            &paths,
+            &fetcher,
+            "linux",
+            "x86_64",
+            "0.3.0",
+            &exe,
+            false,
+            &pubkey,
+            UpdateArgs {
+                version: Some("0.3.0".to_owned()),
+                dry_run: false,
+                allow_downgrade: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Failed);
+        assert!(!exe.exists());
     }
 }
