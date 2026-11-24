@@ -7,11 +7,31 @@ pub mod store;
 
 use std::sync::Arc;
 
-use tauri::Manager;
+use tauri::webview::NewWindowResponse;
+use tauri::{Manager, Url, WebviewWindowBuilder};
 
 use crate::commands::SharedBackend;
 use crate::link_backend::LinkBackend;
 use crate::store::AppStore;
+
+/// Returns `true` only for the bundled app origin on the current platform.
+///
+/// Linux, macOS and iOS serve bundled assets from `tauri://localhost`; Android and Windows serve
+/// them from `http://tauri.localhost` (or `https://tauri.localhost` when HTTPS scheme is enabled).
+/// All other schemes, hosts, userinfo, or explicit ports are blocked from navigating the WebView.
+pub fn is_allowed_navigation_url(url: &Url) -> bool {
+    if !url.username().is_empty() || url.password().is_some() || url.port().is_some() {
+        return false;
+    }
+    #[cfg(any(target_os = "android", target_os = "windows"))]
+    {
+        matches!(url.scheme(), "http" | "https") && url.host_str() == Some("tauri.localhost")
+    }
+    #[cfg(not(any(target_os = "android", target_os = "windows")))]
+    {
+        url.scheme() == "tauri" && url.host_str() == Some("localhost")
+    }
+}
 
 /// Registers the official `tauri-plugin-barcode-scanner` Kotlin plugin on Android and keeps its
 /// `PluginHandle` in managed state so `commands::scan_invite` can invoke it directly from Rust.
@@ -57,6 +77,19 @@ pub fn run() {
         let backend = LinkBackend::from_store(store.clone());
         app.manage(store);
         app.manage(SharedBackend(Arc::new(backend)));
+
+        let window_config = app
+            .config()
+            .app
+            .windows
+            .first()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("missing main window config"))?;
+        WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+            .on_navigation(is_allowed_navigation_url)
+            .on_new_window(|_, _| NewWindowResponse::Deny)
+            .build()?;
+
         Ok(())
     });
 
@@ -113,4 +146,55 @@ pub fn run() {
     builder
         .run(tauri::generate_context!())
         .expect("error while running Legion application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_guard_allows_only_bundled_app_origin() -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(any(target_os = "android", target_os = "windows"))]
+        let allowed = [
+            "http://tauri.localhost/",
+            "http://tauri.localhost/index.html#/machines",
+            "https://tauri.localhost/",
+        ];
+        #[cfg(not(any(target_os = "android", target_os = "windows")))]
+        let allowed = [
+            "tauri://localhost/",
+            "tauri://localhost/index.html#/machines",
+        ];
+
+        for raw in allowed {
+            let url = Url::parse(raw)?;
+            assert!(
+                is_allowed_navigation_url(&url),
+                "expected app origin {raw} to be allowed"
+            );
+        }
+
+        let blocked = [
+            "https://example.com/",
+            "http://localhost:8080/",
+            "http://127.0.0.1/",
+            "http://tauri.localhost:9999/",
+            "http://user@tauri.localhost/",
+            "tauri://evil.example/",
+            "tauri://localhost:1234/",
+            "file:///etc/passwd",
+            "data:text/html,<h1>hi</h1>",
+            "javascript:alert(1)",
+            "about:blank",
+        ];
+
+        for raw in blocked {
+            let url = Url::parse(raw)?;
+            assert!(
+                !is_allowed_navigation_url(&url),
+                "expected external or unexpected URL {raw} to be blocked"
+            );
+        }
+        Ok(())
+    }
 }
