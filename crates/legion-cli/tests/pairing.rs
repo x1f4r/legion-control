@@ -680,10 +680,31 @@ fn legion_pair_prints_summary_qr_invite_and_commands_and_supports_invert_and_jso
             .starts_with("legion-invite-1.")
     );
 
+    // `--name` + `--role` creates `device:<name>` in policy.toml and issues the invite.
+    let role_pair = home.run(&[
+        "pair",
+        "--name",
+        "Work Tablet",
+        "--role",
+        "observer",
+        "--host",
+        "tower.example",
+        "--json",
+    ]);
+    assert_eq!(role_pair.code, 0, "stderr={}", role_pair.stderr);
+    let role_json = role_pair.json();
+    assert_eq!(role_json["principal"], json!("device:work-tablet"));
+    assert_eq!(role_json["role"], json!("observer"));
+
+    // Running plain `legion pair` non-interactively refuses rather than assuming a preset role.
+    let non_tty = home.run(&["pair"]);
+    assert_ne!(non_tty.code, 0);
+
     // `legion help pair` explains pairing in plain words.
     let help = home.run(&["help", "pair"]);
     assert_eq!(help.code, 0);
     assert!(help.stdout.contains("legion pair --as PRINCIPAL"));
+    assert!(help.stdout.contains("--role ROLE"));
     assert!(help.stdout.contains("--invert"));
 }
 

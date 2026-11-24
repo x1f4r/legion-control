@@ -89,8 +89,8 @@ export function StartView({ link, linkState, onConnected }) {
           <h2 class="start-heading">Pair this device with one of your machines.</h2>
           <p class="lede">One is enough: through it you reach the others. On that machine, run</p>
           <div class="code">
-            <code>legion pair --as phone</code>
-            <${CopyButton} text="legion pair --as phone" label="Copy command" iconOnly=${true} />
+            <code>legion pair</code>
+            <${CopyButton} text="legion pair" label="Copy command" iconOnly=${true} />
           </div>
           <p class="lede spaced">It shows a code. Scan it here, or paste the line under it.</p>
           <label class="field">

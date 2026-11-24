@@ -45,7 +45,7 @@ pub enum Command {
     },
     /// `legion gate --as P` or `legion gate --enrol ID`: the forced command of a restricted ssh key.
     Gate(GateCommand),
-    /// `legion pair --as P ...`: create a pairing invite and show it as a QR code and text.
+    /// `legion pair ...`: create a pairing invite and show it as a QR code and text.
     Pair(PairCommand),
     /// `legion cp <from> <to> …`: `fs.transfer` from a command line.
     Cp(CpCommand),
@@ -105,11 +105,16 @@ pub enum GateCommand {
     },
 }
 
-/// `legion pair --as P [--valid 15m] [--host H]... [--port N] [--user U] [--allow-owner] [--invert] [--on M] [--json]`.
+/// `legion pair [--name NAME] [--role ROLE] [--as P] [--valid 15m] [--host H]... [--port N] [--user U] [--allow-owner] [--invert] [--on M] [--json]`.
 #[derive(Debug, PartialEq)]
 pub struct PairCommand {
-    /// `--as`: the principal the paired device will act as.
-    pub principal: String,
+    /// `--as`: an existing principal from policy.toml the paired device will act as.
+    pub principal: Option<String>,
+    /// `--role`: role from policy.toml (or `owner` with `--allow-owner`) for a new `device:<name>`
+    /// principal.
+    pub role: Option<String>,
+    /// `--name`: device name used to create `device:<name>` when pairing with `--role`.
+    pub name: Option<String>,
     /// `--valid`: validity in minutes (`1..=1440`).
     pub valid_minutes: Option<u32>,
     /// `--host`: optional explicit hosts overriding automatic detection.
@@ -198,7 +203,7 @@ Usage:
   legion gate --as PRINCIPAL | --enrol ID
   legion serve [--listen ADDRESS]
   legion init [--name NAME] [--no-roles] [--dry-run] [--on MACHINE] [--json]
-  legion pair --as PRINCIPAL [--valid 15m] [--host HOST]... [--port PORT] [--user USER] [--invert] [--json]
+  legion pair [--name NAME] [--role ROLE] [--as PRINCIPAL] [--valid 15m] [--host HOST]... [--port PORT] [--user USER] [--invert] [--json]
   legion agents list | add AGENT --as PRINCIPAL [--full] [--scope SCOPE] [--allow-owner] [--dry-run] | remove AGENT [--scope SCOPE] [--dry-run]
   legion token add NAME PRINCIPAL [expires_days=N] [allow_owner=true] | list | remove NAME
   legion --version
@@ -272,27 +277,36 @@ always exactly `legion stream`. Each operation is allowed as the file tool it am
 
 /// `legion help pair`.
 pub const PAIR_HELP: &str = "\
-Usage: legion pair --as PRINCIPAL [--valid 15m] [--host HOST]... [--port PORT] [--user USER] [--allow-owner] [--invert] [--on MACHINE] [--json]
+Usage:
+  legion pair [--name NAME] [--role ROLE] [--valid 15m] [--host HOST]... [--port PORT] [--user USER] [--allow-owner] [--invert] [--on MACHINE] [--json]
+  legion pair --as PRINCIPAL [--valid 15m] [--host HOST]... [--port PORT] [--user USER] [--allow-owner] [--invert] [--on MACHINE] [--json]
 
 Creates a single-use pairing invite for a phone, tablet or other controller by running
 device.invite, then draws the invite as a QR code and prints the invite text on one line.
 
-The invite carries where to reach this machine over SSH, its pinned sshd host keys, and a
-single-use temporary key that expires automatically. When the device scans or pastes the invite,
-it connects once to hand over its own public key and receives a permanent key confined by
-`legion gate --as PRINCIPAL`.
+When run on a terminal without --as, --name, or --role, `legion pair` asks what to call the
+device and what it may do (listing the roles defined in policy.toml plus owner), creates a
+dedicated principal `device:<name>` in policy.toml if it does not exist, and issues the invite.
+No role or device name is preset. Use --as PRINCIPAL to pair under an existing principal instead.
 
-  --as P          principal from policy.toml that the paired device will act as (required)
+The invite carries where to reach this machine over SSH, its pinned sshd host keys, and a
+single-use temporary key that expires automatically. Once paired, the device is recorded in
+devices.toml and pushed to every reachable machine in fleet.toml.
+
+  --name NAME     device name for a new `device:<name>` principal (use with --role)
+  --role ROLE     role from policy.toml (or `owner` with --allow-owner) for `device:<name>`
+  --as P          existing principal from policy.toml to pair under instead of --name/--role
   --valid DUR     how long the invite stays valid (e.g. 15m, 1h, 24h; default 15m, max 24h)
   --host H        host name or address to put in the invite (repeatable; overrides detection)
-  --port N        SSH port on this machine (default 22)
+  --port N        SSH port on this machine (defaults to [devices] port in node.toml, or 22)
   --user U        OS account name on this machine (defaults to the current user)
-  --allow-owner   permit pairing a principal with the unrestricted owner role
+  --allow-owner   permit pairing with the unrestricted owner role
   --invert        swap QR code foreground and background (useful on light terminals)
   --on M          create the invite on machine M instead of this node
   --json          print the device.invite tool result as JSON
 
-Manage paired devices and pending invites with `legion device.list` and
+Manage paired devices and pending invites with `legion device.list`,
+`legion device.set name=<device> role=<role>` (or `rename=<new-name>`), and
 `legion device.remove name=<device>` (or `id=<invite>`).";
 
 /// `legion help gate`.
@@ -661,9 +675,11 @@ fn gate(rest: &[String]) -> Result<Command, UsageError> {
     }
 }
 
-/// `legion pair --as PRINCIPAL [--valid 15m] [--host H]... [--port N] [--user U] [--allow-owner] [--invert] [--on M] [--json]`.
+/// `legion pair [--name NAME] [--role ROLE] [--as PRINCIPAL] [--valid 15m] [--host H]... [--port N] [--user U] [--allow-owner] [--invert] [--on M] [--json]`.
 fn pair(rest: &[String]) -> Result<Command, UsageError> {
     let mut principal = None;
+    let mut role = None;
+    let mut device_name = None;
     let mut valid_minutes = None;
     let mut hosts = Vec::new();
     let mut port = None;
@@ -676,7 +692,7 @@ fn pair(rest: &[String]) -> Result<Command, UsageError> {
     while let Some(word) = words.next() {
         if !word.starts_with('-') {
             return Err(UsageError(format!(
-                "{word} was not expected here. Use --as PRINCIPAL and optional flags; see `legion help pair`."
+                "{word} was not expected here. Run `legion pair`, or pass --name/--role or --as PRINCIPAL; see `legion help pair`."
             )));
         }
         let (name, inline) = match word.split_once('=') {
@@ -703,6 +719,25 @@ fn pair(rest: &[String]) -> Result<Command, UsageError> {
                     .map_err(|error| UsageError(format!("--as: {}", error.message)))?;
                 if principal.replace(value).is_some() {
                     return Err(UsageError("--as is given twice.".to_owned()));
+                }
+            }
+            "--role" => {
+                let value = take_value(name)?;
+                legion_tools::device::registry::validate_role_name(&value)
+                    .map_err(|error| UsageError(format!("--role: {}", error.message)))?;
+                if role.replace(value).is_some() {
+                    return Err(UsageError("--role is given twice.".to_owned()));
+                }
+            }
+            "--name" => {
+                let value = take_value(name)?;
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(UsageError(
+                        "--name cannot be empty or contain control characters.".to_owned(),
+                    ));
+                }
+                if device_name.replace(value).is_some() {
+                    return Err(UsageError("--name is given twice.".to_owned()));
                 }
             }
             "--valid" => {
@@ -766,14 +801,16 @@ fn pair(rest: &[String]) -> Result<Command, UsageError> {
             _ => return Err(UsageError(format!("{name} is not an option of pair."))),
         }
     }
-    let principal = principal.ok_or_else(|| {
-        UsageError(
-            "pair needs --as: the principal from policy.toml the paired device will act as."
+    if principal.is_some() && (role.is_some() || device_name.is_some()) {
+        return Err(UsageError(
+            "pair takes either --as PRINCIPAL, or --name NAME and --role ROLE, not both."
                 .to_owned(),
-        )
-    })?;
+        ));
+    }
     Ok(Command::Pair(PairCommand {
         principal,
+        role,
+        name: device_name,
         valid_minutes,
         hosts,
         port,
@@ -1735,9 +1772,43 @@ mod tests {
             assert!(run(bad_gate).is_err(), "{bad_gate:?}");
         }
         assert_eq!(
+            run(&["pair"]),
+            Ok(Command::Pair(PairCommand {
+                principal: None,
+                role: None,
+                name: None,
+                valid_minutes: None,
+                hosts: Vec::new(),
+                port: None,
+                user: None,
+                allow_owner: false,
+                invert: false,
+                on: None,
+                json: false,
+            }))
+        );
+        assert_eq!(
+            run(&["pair", "--name", "pixel", "--role", "observer"]),
+            Ok(Command::Pair(PairCommand {
+                principal: None,
+                role: Some("observer".into()),
+                name: Some("pixel".into()),
+                valid_minutes: None,
+                hosts: Vec::new(),
+                port: None,
+                user: None,
+                allow_owner: false,
+                invert: false,
+                on: None,
+                json: false,
+            }))
+        );
+        assert_eq!(
             run(&["pair", "--as", "phone"]),
             Ok(Command::Pair(PairCommand {
-                principal: "phone".into(),
+                principal: Some("phone".into()),
+                role: None,
+                name: None,
                 valid_minutes: None,
                 hosts: Vec::new(),
                 port: None,
@@ -1768,7 +1839,9 @@ mod tests {
                 "--json",
             ]),
             Ok(Command::Pair(PairCommand {
-                principal: "phone".into(),
+                principal: Some("phone".into()),
+                role: None,
+                name: None,
                 valid_minutes: Some(90),
                 hosts: vec!["tower.example".into(), "100.64.0.10".into()],
                 port: Some(2222),
@@ -1786,8 +1859,10 @@ mod tests {
         assert_eq!(parse_valid_minutes("1d"), Ok(1440));
         assert_eq!(command_help("pair"), Some(PAIR_HELP));
         for bad_pair in [
-            &["pair"][..],
-            &["pair", "phone"],
+            &["pair", "phone"][..],
+            &["pair", "--as", "phone", "--role", "observer"],
+            &["pair", "--as", "phone", "--name", "pixel"],
+            &["pair", "--name", "   "],
             &["pair", "--as", "phone", "--valid", "0m"],
             &["pair", "--as", "phone", "--valid", "25h"],
             &["pair", "--as", "phone", "--valid", "30s"],

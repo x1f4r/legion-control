@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use jiff::{SignedDuration, Timestamp};
 use legion_core::config::{NodeFile, NodeName};
-use legion_core::policy::{Policy, Principal};
+use legion_core::policy::{NOBODY, OWNER, Policy, Principal};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Ctx, NoArgs, Registry, ToolError};
 use schemars::JsonSchema;
@@ -36,14 +36,18 @@ use self::authkeys::{
 use self::hosts::{HostArg, resolve_hosts};
 use self::keys::{
     InvitePayload, fingerprint_key_b64, generate_ephemeral_ed25519, generate_invite_id,
-    resolve_host_keys, validate_invite_id,
+    resolve_host_keys, validate_invite_id, validate_pairing_id,
 };
 use self::registry::{
-    DeviceTombstone, DevicesFile, adopt_legacy_devices_from_auth_keys, load_devices_raw,
-    lock_config, next_updated_timestamp, reconcile_authorized_keys_in_memory,
-    reconcile_device_principals_locked, save_devices_locked,
+    DEVICE_PRINCIPAL_PREFIX, DeviceTombstone, DevicesFile, adopt_legacy_devices_from_auth_keys,
+    load_devices_raw, lock_config, next_updated_timestamp, reconcile_authorized_keys_in_memory,
+    reconcile_device_principals_locked, save_devices_locked, upsert_policy_principal_locked,
+    validate_role_name,
 };
-use self::store::{InviteRecord, format_rfc3339, load_state, lock_auth_keys, save_state, sweep};
+use self::store::{
+    InviteRecord, format_rfc3339, load_state, lock_auth_keys, sanitise_device_name, save_state,
+    sweep,
+};
 
 /// Default invite validity in minutes.
 pub const DEFAULT_VALID_MINUTES: u32 = 15;
@@ -57,14 +61,14 @@ pub const MAX_VALID_MINUTES: u32 = 1440;
 /// Default SSH port for pairing invites.
 pub const DEFAULT_SSH_PORT: u16 = 22;
 
-/// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`, `device.endpoint`)
-/// and registers `devices.toml`.
+/// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`, `device.set`,
+/// `device.endpoint`) and registers `devices.toml`.
 pub fn register(registry: &mut Registry) {
     registry.add_document::<registry::DevicesFile>();
     registry.add_fn(
         "device.invite",
         Effect::Admin,
-        "Create a single-use pairing invite for a remote device to connect over SSH, pinned to one principal that policy.toml names and the caller could act as itself. Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for a principal with the owner role requires an owner caller and allow_owner=true.",
+        "Create a single-use pairing invite for a remote device to connect over SSH. Either give `role` and `name` (owner role only: creates principal `device:<name>` in policy.toml with that role if absent) or `principal` (an existing principal that policy.toml names and the caller could act as itself). Appends a temporary key with sshd's expiry-time and a forced enrolment command to authorized_keys, and returns the invite text once (never logged or stored). Inviting for the owner role requires an owner caller and allow_owner=true.",
         invite,
     );
     registry.add_fn(
@@ -72,6 +76,12 @@ pub fn register(registry: &mut Registry) {
         Effect::Admin,
         "List paired devices (from devices.toml, adopting pre-existing --pairing lines on first run) and pending pairing invites for principals the caller could act as, reconciling authorized_keys with devices.toml and sweeping any expired or used invites. For owner callers, also reports Legion lines in authorized_keys belonging to another or missing Legion home (marked with `foreign`, `missing_home`, and `home`).",
         list,
+    );
+    registry.add_fn(
+        "device.set",
+        Effect::Admin,
+        "Change a paired device's role (editing its principal in policy.toml) or rename it in devices.toml, reconciling authorized_keys and pushing the change to reachable fleet peers. Changing a role requires the owner role (plus allow_owner=true for the owner role) and is refused through an expiring credential.",
+        set_device,
     );
     registry.add_fn(
         "device.remove",
@@ -91,9 +101,18 @@ pub fn register(registry: &mut Registry) {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct InviteArgs {
-    /// The principal the paired device will act as. Must be named in policy.toml (or have the
-    /// owner role with allow_owner=true) and be one the caller could act as.
-    principal: String,
+    /// Existing principal in policy.toml the paired device will act as. Give either `principal`,
+    /// or both `role` and `name`.
+    #[serde(default)]
+    principal: Option<String>,
+    /// Role from policy.toml (or built-in `owner` with allow_owner=true, or `nobody`) for a new
+    /// `device:<name>` principal created atomically in policy.toml. Requires `name` and an owner
+    /// caller.
+    #[serde(default)]
+    role: Option<String>,
+    /// Device name used to create principal `device:<name>` when pairing with `role`.
+    #[serde(default)]
+    name: Option<String>,
     /// Minutes until the invite expires, from 1 to 1440 (default 15).
     #[serde(default = "default_valid_minutes")]
     #[schemars(range(min = 1, max = 1440))]
@@ -250,19 +269,6 @@ pub struct InviteResult {
 }
 
 async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> {
-    let principal = Principal::parse(&args.principal)?;
-    let principal = principal.as_str().to_owned();
-    let caller = Caller::of(ctx)?;
-    let role = caller.check_issue(
-        &principal,
-        args.allow_owner,
-        "a device invite",
-        format!(
-            "{principal} has the owner role: a paired device acting as it may do everything the account can over SSH, so it is not made unless asked for in so many words."
-        ),
-        "Give the device a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want.",
-    )?;
-
     // An expiring credential (such as an expiring HTTP token) must not mint a permanent SSH key.
     if let Some(limit) = ctx.credential_expires() {
         return Err(ErrorBody::new(
@@ -282,6 +288,106 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         )
         .with_hint("Use a duration between 1 minute and 1440 minutes (24 hours)."));
     }
+
+    let caller = Caller::of(ctx)?;
+    let (principal, role, invite_role, invite_device_name, create_device_principal) = match (
+        args.principal,
+        args.role,
+        args.name,
+    ) {
+        (Some(raw_principal), None, None) => {
+            let principal = Principal::parse(&raw_principal)?;
+            let principal = principal.as_str().to_owned();
+            let role = caller.check_issue(
+                &principal,
+                args.allow_owner,
+                "a device invite",
+                format!(
+                    "{principal} has the owner role: a paired device acting as it may do everything the account can over SSH, so it is not made unless asked for in so many words."
+                ),
+                "Give the device a principal with a narrower role in policy.toml, or pass allow_owner=true if this is really what you want.",
+            )?;
+            let recorded_role = principal
+                .starts_with(DEVICE_PRINCIPAL_PREFIX)
+                .then(|| role.clone());
+            (principal, role, recorded_role, None, false)
+        }
+        (None, Some(raw_role), Some(raw_name)) => {
+            if !caller.is_owner() {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    "Only a caller with the owner role may create a new device principal when pairing.",
+                )
+                .with_hint(
+                    "Run `device.invite` as the owner, or pass `principal` for your own existing principal.",
+                ));
+            }
+            validate_role_name(&raw_role)?;
+            if raw_role == OWNER && !args.allow_owner {
+                return Err(ErrorBody::new(
+                    ErrorCode::Denied,
+                    "The owner role may do everything the account can over SSH, so a device is not paired with it unless asked for in so many words.",
+                )
+                .with_hint(
+                    "Choose a narrower role from policy.toml, or pass allow_owner=true if this is really what you want.",
+                ));
+            }
+            let trimmed_name = raw_name.trim();
+            if trimmed_name.is_empty() || trimmed_name.chars().any(char::is_control) {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("{raw_name:?} is not a valid device name."),
+                )
+                .with_hint("Give a short name such as `pixel` or `tablet`."));
+            }
+            let policy = ctx.config().get::<Policy>()?;
+            let known_role =
+                raw_role == OWNER || raw_role == NOBODY || policy.roles.contains_key(&raw_role);
+            if !known_role {
+                let mut available: Vec<&str> = policy.roles.keys().map(String::as_str).collect();
+                available.push(OWNER);
+                return Err(ErrorBody::new(
+                    ErrorCode::NotFound,
+                    format!("policy.toml does not define role {raw_role:?}."),
+                )
+                .with_hint(format!(
+                    "Available roles: {}. Define custom roles in policy.toml or run `legion init`.",
+                    available.join(", ")
+                )));
+            }
+            let slug = sanitise_device_name(trimmed_name);
+            let principal = format!("{DEVICE_PRINCIPAL_PREFIX}{slug}");
+            Principal::parse(&principal)?;
+            (
+                principal,
+                raw_role.clone(),
+                Some(raw_role),
+                Some(slug),
+                true,
+            )
+        }
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Pass either `principal`, or `role` and `name`, not both.",
+            )
+            .with_hint("Use `role` + `name` to create `device:<name>`, or `principal` to reuse an existing principal."));
+        }
+        (None, Some(_), None) | (None, None, Some(_)) => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "`role` and `name` must be given together when pairing without `principal`.",
+            )
+            .with_hint("Pass both `name` and `role`, or pass an existing `principal`."));
+        }
+        (None, None, None) => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "device.invite requires either `principal`, or both `role` and `name`.",
+            )
+            .with_hint("No role or principal is built in; choose a role from policy.toml and a device name, or name an existing principal."));
+        }
+    };
 
     let node_file = ctx.config().get::<NodeFile>()?;
     let endpoint = detect_endpoint(ctx, &node_file, args.host, args.port, args.user).await?;
@@ -342,8 +448,8 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
     let record = InviteRecord {
         id: id.clone(),
         principal: principal.clone(),
-        role: None,
-        device_name: None,
+        role: invite_role,
+        device_name: invite_device_name.clone(),
         created,
         expires: expires.clone(),
         fingerprint: ephemeral.fingerprint,
@@ -351,9 +457,14 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
 
     let paths = ctx.paths().clone();
     let id_for_write = id.clone();
+    let principal_for_write = principal.clone();
+    let role_for_write = role.clone();
+    let node_name_for_write = ctx.node_name().to_owned();
+    let policy_for_adopt = ctx.config().get::<Policy>()?;
     blocking(move || {
         let _cfg_guard = lock_config(&paths)?;
         let target = resolve_target(&paths, &node_file)?;
+        let caller_account = caller_account_for_target(&target)?;
         let write_path = resolve_safe_write_path(&target, paths.home())?;
         verify_owner_matches_euid(
             &write_path,
@@ -362,6 +473,40 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
             legion_os::user::effective_uid(),
         )?;
         let _guard = lock_auth_keys(&target, &write_path)?;
+
+        if create_device_principal {
+            let devices_file = match load_devices_raw(&paths)? {
+                Some(file) => file,
+                None => {
+                    let auth_keys = self::authkeys::read_auth_keys(&write_path)?;
+                    let state = load_state(&paths).unwrap_or_default();
+                    adopt_legacy_devices_from_auth_keys(
+                        &paths,
+                        &node_name_for_write,
+                        &auth_keys,
+                        &target,
+                        caller_account.as_deref(),
+                        &state,
+                        &policy_for_adopt,
+                    )
+                }
+            };
+            if let Some(slug) = invite_device_name.as_deref()
+                && devices_file
+                    .devices
+                    .values()
+                    .any(|dev| dev.name == slug || dev.principal == principal_for_write)
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!("A paired device called {slug} already exists."),
+                )
+                .with_hint(
+                    "Choose a different device name, or remove the existing device first with `legion device.remove`.",
+                ));
+            }
+            upsert_policy_principal_locked(&paths, &principal_for_write, &role_for_write)?;
+        }
 
         commit_invite_and_state(
             &paths,
@@ -389,6 +534,330 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
         host_keys,
         host_keys_source,
     })
+}
+
+/// Arguments of `device.set`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetArgs {
+    /// Paired device name to update, as `device.list` shows it. Give `name` or `id`, not both.
+    #[serde(default)]
+    name: Option<String>,
+    /// Pairing id (32 lowercase hex characters) of the device to update. Give `name` or `id`, not
+    /// both.
+    #[serde(default)]
+    id: Option<String>,
+    /// New role from `policy.toml` (or built-in `owner` with `allow_owner=true`, or `nobody`).
+    /// Updates the device's principal in `policy.toml` and `devices.toml`.
+    #[serde(default)]
+    role: Option<String>,
+    /// New device name (sanitised to lowercase ASCII letters, digits, and `-`).
+    #[serde(default)]
+    rename: Option<String>,
+    /// Allow setting the device's role to `owner`, which may do everything the account can. Off
+    /// unless given as true.
+    #[serde(default)]
+    allow_owner: bool,
+}
+
+/// What `device.set` returns.
+#[derive(Debug, Serialize)]
+struct SetResult {
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_name: Option<String>,
+    principal: String,
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_role: Option<String>,
+}
+
+async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
+    enum SelectBy {
+        Name(String),
+        Id(String),
+    }
+
+    let selector = match (args.name, args.id) {
+        (Some(name), None) => {
+            if name.trim().is_empty() || name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("{name:?} is not a valid device name."),
+                )
+                .with_hint("Use a device name from `device.list`."));
+            }
+            SelectBy::Name(name)
+        }
+        (None, Some(id)) => {
+            validate_pairing_id(&id)?;
+            SelectBy::Id(id)
+        }
+        (Some(_), Some(_)) => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Give either `name` or `id`, not both.",
+            ));
+        }
+        (None, None) => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Give `name` or `id` to choose which paired device to update.",
+            )
+            .with_hint("Run `device.list` to see paired devices."));
+        }
+    };
+
+    if args.role.is_none() && args.rename.is_none() {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "device.set requires at least one of `role` or `rename`.",
+        )
+        .with_hint("Pass `role=<role>` to change permissions, or `rename=<new-name>` to rename."));
+    }
+
+    let caller = Caller::of(ctx)?;
+    if let Some(ref new_role) = args.role {
+        validate_role_name(new_role)?;
+        if !caller.is_owner() {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                "Only a caller with the owner role may change a paired device's role.",
+            )
+            .with_hint("Run `device.set` as the owner of this machine."));
+        }
+        if let Some(limit) = ctx.credential_expires() {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                format!(
+                    "The credential this call came with expires at {}, so it may not change a paired device's role.",
+                    format_rfc3339(limit)
+                ),
+            )
+            .with_hint("Run `device.set` from a local shell or a non-expiring owner credential."));
+        }
+        if new_role == OWNER && !args.allow_owner {
+            return Err(ErrorBody::new(
+                ErrorCode::Denied,
+                "The owner role may do everything the account can over SSH, so a device's role is not raised to owner unless asked for in so many words.",
+            )
+            .with_hint("Pass allow_owner=true if this is really what you want."));
+        }
+    }
+
+    let new_name = match args.rename {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("{raw:?} is not a valid device name."),
+                )
+                .with_hint("Use a short name such as `pixel` or `tablet`."));
+            }
+            Some(sanitise_device_name(trimmed))
+        }
+        None => None,
+    };
+
+    let node_file = ctx.config().get::<NodeFile>()?;
+    let policy = ctx.config().get::<Policy>()?;
+    let node_name = ctx.node_name().to_owned();
+    let valid_node_name = NodeName::try_from(node_name)
+        .map(|n| n.as_str().to_owned())
+        .unwrap_or_else(|_| "node".to_owned());
+    let paths = ctx.paths().clone();
+    let new_role = args.role;
+
+    blocking(move || {
+        let _cfg_guard = lock_config(&paths)?;
+        let target = resolve_target(&paths, &node_file)?;
+        let caller_account = caller_account_for_target(&target)?;
+        let write_path = resolve_safe_write_path(&target, paths.home())?;
+        verify_owner_matches_euid(
+            &write_path,
+            paths.home(),
+            target.is_default_home_ssh,
+            legion_os::user::effective_uid(),
+        )?;
+        let _auth_guard = lock_auth_keys(&target, &write_path)?;
+
+        let mut devices_file = match load_devices_raw(&paths)? {
+            Some(file) => file,
+            None => {
+                let auth_keys = self::authkeys::read_auth_keys(&write_path)?;
+                let state = load_state(&paths).unwrap_or_default();
+                adopt_legacy_devices_from_auth_keys(
+                    &paths,
+                    &valid_node_name,
+                    &auth_keys,
+                    &target,
+                    caller_account.as_deref(),
+                    &state,
+                    &policy,
+                )
+            }
+        };
+
+        let pairing_id = match &selector {
+            SelectBy::Id(id) => {
+                let Some(entry) = devices_file.devices.get(id) else {
+                    return Err(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        format!("There is no paired device with id {id}."),
+                    )
+                    .with_hint("Run `device.list` to see paired devices."));
+                };
+                if !caller.may_manage(&entry.principal) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        format!("There is no paired device with id {id}."),
+                    ));
+                }
+                id.clone()
+            }
+            SelectBy::Name(name) => {
+                let matches: Vec<String> = devices_file
+                    .devices
+                    .iter()
+                    .filter(|(_, entry)| entry.name == *name && caller.may_manage(&entry.principal))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                match matches.len() {
+                    0 => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::NotFound,
+                            format!("There is no paired device called {name}."),
+                        )
+                        .with_hint("Run `device.list` to see paired devices."));
+                    }
+                    1 => matches[0].clone(),
+                    _ => {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Conflict,
+                            format!(
+                                "Multiple paired devices are named {name} (pairing ids: {}).",
+                                matches.join(", ")
+                            ),
+                        )
+                        .with_hint("Pass `id=<pairing_id>` from `device.list` to choose which one to update."));
+                    }
+                }
+            }
+        };
+
+        let current_entry = devices_file
+            .devices
+            .get(&pairing_id)
+            .cloned()
+            .ok_or_else(|| ErrorBody::new(ErrorCode::Internal, "Matched device disappeared."))?;
+
+        if let Some(ref renamed) = new_name
+            && renamed != &current_entry.name
+            && devices_file
+                .devices
+                .iter()
+                .any(|(other_id, other)| other_id != &pairing_id && other.name == *renamed)
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!("Another paired device is already called {renamed}."),
+            )
+            .with_hint("Choose a different name."));
+        }
+
+        let previous_role_effective = policy.role_of(&current_entry.principal).0;
+        let final_role = if let Some(ref target_role) = new_role {
+            if current_entry.principal == OWNER {
+                return Err(ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    "This device is pinned to the built-in `owner` principal, whose role cannot be changed.",
+                )
+                .with_hint("Pair the device with `legion pair --role ...` so it gets its own `device:<name>` principal."));
+            }
+            let known_role = target_role == OWNER
+                || target_role == NOBODY
+                || policy.roles.contains_key(target_role);
+            if !known_role {
+                let mut available: Vec<&str> = policy.roles.keys().map(String::as_str).collect();
+                available.push(OWNER);
+                return Err(ErrorBody::new(
+                    ErrorCode::NotFound,
+                    format!("policy.toml does not define role {target_role:?}."),
+                )
+                .with_hint(format!(
+                    "Available roles: {}. Define custom roles in policy.toml first.",
+                    available.join(", ")
+                )));
+            }
+            upsert_policy_principal_locked(&paths, &current_entry.principal, target_role)?;
+            target_role.clone()
+        } else {
+            previous_role_effective.clone()
+        };
+
+        let mut updated_entry = current_entry.clone();
+        let previous_name = if let Some(ref renamed) = new_name
+            && renamed != &current_entry.name
+        {
+            updated_entry.name = renamed.clone();
+            Some(current_entry.name.clone())
+        } else {
+            None
+        };
+        let previous_role = if let Some(ref target_role) = new_role {
+            if updated_entry.principal.starts_with(DEVICE_PRINCIPAL_PREFIX) {
+                updated_entry.role = Some(target_role.clone());
+            }
+            (target_role != &previous_role_effective).then_some(previous_role_effective)
+        } else {
+            None
+        };
+
+        updated_entry.updated_at = next_updated_timestamp(Some(&current_entry.updated_at));
+        updated_entry.updated_on = valid_node_name;
+        devices_file
+            .devices
+            .insert(pairing_id.clone(), updated_entry.clone());
+
+        save_devices_locked(&paths, &devices_file)?;
+
+        let exe = legion_core::current_exe()?;
+        let shell = ForcedCommandShell::host()?;
+        edit_auth_keys_with_retry(&target, &write_path, |mut auth_keys| {
+            let (changed, _) = reconcile_authorized_keys_in_memory(
+                &mut auth_keys,
+                &devices_file,
+                &paths,
+                &target,
+                caller_account.as_deref(),
+                &exe,
+                shell,
+            )?;
+            Ok((changed.then_some(auth_keys), ()))
+        })?;
+
+        // Keep local state/devices.json metadata in step on rename.
+        if let Some(ref old_name) = previous_name
+            && let Ok(mut state) = load_state(&paths)
+            && let Some(mut rec) = state.devices.remove(old_name)
+        {
+            rec.name = updated_entry.name.clone();
+            state.devices.insert(updated_entry.name.clone(), rec);
+            let _ = save_state(&paths, &state);
+        }
+
+        Ok(SetResult {
+            id: pairing_id,
+            name: updated_entry.name,
+            previous_name,
+            principal: updated_entry.principal,
+            role: final_role,
+            previous_role,
+        })
+    })
+    .await
 }
 
 /// What `device.list` returns.
@@ -2506,5 +2975,122 @@ role = "owner"
         assert_eq!(inv["user"], ep["user"]);
         assert_eq!(inv["host_keys"], ep["host_keys"]);
         assert_eq!(inv["host_keys_source"], ep["host_keys_source"]);
+    }
+
+    #[tokio::test]
+    async fn role_pairing_creates_device_principal_and_device_set_updates_role_and_name() {
+        let h = Harness::new();
+
+        // Missing principal and missing role/name fails clearly (nothing preset).
+        let err = h.call("device.invite", json!({})).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+
+        // Non-owner admin cannot create a new `device:*` principal via role+name.
+        let err = h
+            .call_as(
+                "device.invite",
+                "tablet",
+                json!({"role": "observer", "name": "mini", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // Role `owner` requires `allow_owner=true`.
+        let err = h
+            .call(
+                "device.invite",
+                json!({"role": "owner", "name": "boss", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // Role + name creates `device:my-phone` in policy.toml and enrols under it.
+        let inv = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "My Phone", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inv["principal"], json!("device:my-phone"));
+        assert_eq!(inv["role"], json!("observer"));
+        let policy_after = h.node.config().get::<Policy>().unwrap();
+        assert_eq!(policy_after.role_of("device:my-phone").0, "observer");
+
+        let id = inv["id"].as_str().unwrap();
+        let dev_key = generate_ephemeral_ed25519().unwrap();
+        let req = format!(
+            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{}\",\"name\":\"ignored\"}}\n",
+            dev_key.public_key
+        );
+        let reply = run_enrol(&h.node, id, req.as_bytes()).await;
+        assert_eq!(
+            reply,
+            EnrolReply::Ok {
+                ok: true,
+                node: "tower".to_owned(),
+                principal: "device:my-phone".to_owned(),
+                role: "observer".to_owned(),
+                device: "my-phone".to_owned(),
+            }
+        );
+
+        // Non-owner admin cannot change a device's role via `device.set`.
+        let err = h
+            .call_as(
+                "device.set",
+                "tablet",
+                json!({"name": "my-phone", "role": "phone_admin"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // Raising role to `owner` via `device.set` requires `allow_owner=true`.
+        let err = h
+            .call("device.set", json!({"name": "my-phone", "role": "owner"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // Owner changes role to `phone_admin` and renames to `pocket-phone`.
+        let updated = h
+            .call(
+                "device.set",
+                json!({"name": "my-phone", "role": "phone_admin", "rename": "Pocket Phone"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated["name"], json!("pocket-phone"));
+        assert_eq!(updated["previous_name"], json!("my-phone"));
+        assert_eq!(updated["principal"], json!("device:my-phone"));
+        assert_eq!(updated["role"], json!("phone_admin"));
+        assert_eq!(updated["previous_role"], json!("observer"));
+
+        let policy_updated = h.node.config().get::<Policy>().unwrap();
+        assert_eq!(policy_updated.role_of("device:my-phone").0, "phone_admin");
+        let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(auth_text.contains("--device pocket-phone"), "{auth_text}");
+        assert!(
+            auth_text.contains("legion-device:pocket-phone"),
+            "{auth_text}"
+        );
+        assert!(!auth_text.contains("legion-device:my-phone"), "{auth_text}");
+
+        // Removing the device cleans up its unused `device:my-phone` principal from policy.toml.
+        let removed = h
+            .call("device.remove", json!({"name": "pocket-phone"}))
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], json!(true));
+        let policy_cleaned = h.node.config().get::<Policy>().unwrap();
+        assert!(
+            !policy_cleaned
+                .principals
+                .keys()
+                .any(|p| p.as_str() == "device:my-phone")
+        );
     }
 }
