@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use legion_os::OsError;
 use legion_os::atomic::{WriteOptions, write_atomic, write_atomic_from_reader};
 use legion_os::detach::{
-    DetachHandle, DetachOptions, ScopeProbeOverride, detached_active, spawn_detached,
-    spawn_detached_for_test, stop_detached,
+    DETACH_MARKER_ENV, DetachHandle, DetachOptions, ScopeProbeOverride, detached_active,
+    spawn_detached, spawn_detached_for_test, stop_detached,
 };
 use legion_os::lock::{FileLock, LockMode};
 use legion_os::procid::{self, ProcessId};
@@ -46,6 +46,9 @@ fn main() -> ExitCode {
     let tests: Vec<(&str, TestFn)> = vec![
         ("run_argv_echo_env_cwd_stdin_and_exit_code", || {
             Box::pin(test_run_argv_echo_env_cwd_stdin_and_exit_code())
+        }),
+        ("env_remove_drops_inherited_vars_in_run_and_detach", || {
+            Box::pin(test_env_remove_drops_inherited_vars_in_run_and_detach())
         }),
         ("run_shell_string_works_on_platform_shell", || {
             Box::pin(test_run_shell_string_works_on_platform_shell())
@@ -88,6 +91,9 @@ fn main() -> ExitCode {
             "detach_duplicate_names_get_distinct_scopes_and_isolate_stop",
             || Box::pin(test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop()),
         ),
+        ("detach_preserves_dollar_signs_in_argv_and_shell", || {
+            Box::pin(test_detach_preserves_dollar_signs_in_argv_and_shell())
+        }),
         (
             "detach_does_not_inherit_extra_open_file_descriptors",
             || Box::pin(test_detach_does_not_inherit_extra_open_file_descriptors()),
@@ -97,12 +103,20 @@ fn main() -> ExitCode {
             || Box::pin(test_detach_active_tracks_root_and_surviving_descendants()),
         ),
         (
+            "detach_orphan_proof_ignores_unmarked_and_mismatched_processes",
+            || Box::pin(test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes()),
+        ),
+        (
+            "detach_stop_without_scope_stops_reparented_setsid_grandchild",
+            || Box::pin(test_detach_stop_without_scope_stops_reparented_setsid_grandchild()),
+        ),
+        (
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
             || Box::pin(test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time()),
         ),
         (
-            "procid_kill_tree_stops_surviving_descendants_after_root_exits",
-            || Box::pin(test_procid_kill_tree_stops_surviving_descendants_after_root_exits()),
+            "procid_kill_tree_reports_unverified_orphans_after_root_exits",
+            || Box::pin(test_procid_kill_tree_reports_unverified_orphans_after_root_exits()),
         ),
         (
             "procid_kill_process_stops_only_verified_target_and_respects_force",
@@ -197,6 +211,11 @@ fn run_helper(mode: &str) -> ExitCode {
         "orphan_root_exit" => helper_orphan_root_exit(&args),
         "detach_fd_parent" => helper_detach_fd_parent(&args),
         "report_open_fds" => helper_report_open_fds(&args),
+        "env_remove_driver" => helper_env_remove_driver(&args),
+        "dump_env_vars" => helper_dump_env_vars(&args),
+        "dump_argv" => helper_dump_argv(&args),
+        "setsid_reparent_root" => helper_setsid_reparent_root(&args),
+        "setsid_reparent_mid" => helper_setsid_reparent_mid(&args),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -590,6 +609,169 @@ fn helper_report_open_fds(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn helper_env_remove_driver(args: &[String]) -> ExitCode {
+    let detach_out = PathBuf::from(&args[0]);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("helper tokio runtime");
+
+    // 1. Verify RunOptions::env_remove drops inherited vars and lets explicit `env` win.
+    let (spec, helper_env) = helper_spec("dump_env_vars", &[]);
+    let run_out = rt
+        .block_on(run(RunOptions::new(spec)
+            .envs(helper_env)
+            .env_remove("LEGION_DROP_ME")
+            .env_removes(["LEGION_DROP_TOO", "LEGION_RESET_ME"])
+            .env("LEGION_RESET_ME", "fresh-value")
+            .timeout(Duration::from_secs(10))))
+        .expect("run with env_remove failed");
+    assert!(run_out.success());
+    let text = run_out.stdout.text;
+    assert!(text.contains("LEGION_DROP_ME=<unset>"), "got: {text}");
+    assert!(text.contains("LEGION_DROP_TOO=<unset>"), "got: {text}");
+    assert!(text.contains("LEGION_KEEP_ME=keep-val"), "got: {text}");
+    assert!(text.contains("LEGION_RESET_ME=fresh-value"), "got: {text}");
+
+    // 2. Verify DetachOptions::env_remove drops inherited vars, lets explicit `env` win, and still
+    //    stamps a fresh `LEGION_DETACH_ID` matching `handle.marker` even when `LEGION_DETACH_ID`
+    //    is listed in `env_remove`.
+    let (dspec, denv) = helper_spec("dump_env_vars", &[]);
+    let handle = rt
+        .block_on(spawn_detached(
+            DetachOptions::new(dspec)
+                .name("env-remove")
+                .envs(denv)
+                .env_remove("LEGION_DROP_ME")
+                .env_removes(["LEGION_DROP_TOO", "LEGION_RESET_ME", DETACH_MARKER_ENV])
+                .env("LEGION_RESET_ME", "detached-fresh")
+                .stdout_path(&detach_out),
+        ))
+        .expect("spawn_detached with env_remove failed");
+    let expected_marker = handle
+        .marker
+        .as_deref()
+        .expect("spawn_detached should stamp DetachHandle.marker");
+
+    let detach_text = rt.block_on(wait_for_detached_file(
+        &detach_out,
+        Duration::from_secs(5),
+        &handle,
+        &[&detach_out],
+    ));
+    assert!(
+        detach_text.contains("LEGION_DROP_ME=<unset>"),
+        "got: {detach_text}"
+    );
+    assert!(
+        detach_text.contains("LEGION_DROP_TOO=<unset>"),
+        "got: {detach_text}"
+    );
+    assert!(
+        detach_text.contains("LEGION_KEEP_ME=keep-val"),
+        "got: {detach_text}"
+    );
+    assert!(
+        detach_text.contains("LEGION_RESET_ME=detached-fresh"),
+        "got: {detach_text}"
+    );
+    assert!(
+        detach_text.contains(&format!("{DETACH_MARKER_ENV}={expected_marker}")),
+        "expected fresh detach marker in child env, got: {detach_text}"
+    );
+    ExitCode::SUCCESS
+}
+
+fn helper_dump_env_vars(_args: &[String]) -> ExitCode {
+    for key in [
+        "LEGION_DROP_ME",
+        "LEGION_DROP_TOO",
+        "LEGION_KEEP_ME",
+        "LEGION_RESET_ME",
+        DETACH_MARKER_ENV,
+    ] {
+        let val = env::var(key).unwrap_or_else(|_| "<unset>".to_owned());
+        println!("{key}={val}");
+    }
+    let _ = io::stdout().flush();
+    ExitCode::SUCCESS
+}
+
+fn helper_dump_argv(args: &[String]) -> ExitCode {
+    let out_file = Path::new(&args[0]);
+    let joined = args[1..].join("\n") + "\n";
+    write_atomic(out_file, joined.as_bytes(), WriteOptions::default())
+        .expect("failed to write argv dump");
+    ExitCode::SUCCESS
+}
+
+/// Detached root that spawns an intermediate child which in turn starts a `setsid` grandchild and
+/// exits immediately, leaving the grandchild reparented outside the root's parent/group/session
+/// while the root itself keeps running.
+fn helper_setsid_reparent_root(args: &[String]) -> ExitCode {
+    let grandchild_id_file = &args[0];
+    let ignore_term = args.iter().any(|a| a == "--ignore-term");
+
+    let mut cmd = Command::new(current_exe());
+    cmd.env(HELPER_ENV, "setsid_reparent_mid")
+        .arg(grandchild_id_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if ignore_term {
+        cmd.arg("--ignore-term");
+    }
+    let status = cmd.status().expect("failed to run setsid_reparent_mid");
+    assert!(status.success());
+
+    // Keep the root alive so `stop_detached` runs while both root and the reparented `setsid`
+    // grandchild are live simultaneously.
+    std::thread::sleep(Duration::from_secs(30));
+    ExitCode::SUCCESS
+}
+
+fn helper_setsid_reparent_mid(args: &[String]) -> ExitCode {
+    let grandchild_id_file = &args[0];
+    let ignore_term = args.iter().any(|a| a == "--ignore-term");
+
+    #[cfg(unix)]
+    {
+        use process_wrap::std::{CommandWrap, ProcessSession};
+        let mut wrapped = CommandWrap::with_new(current_exe(), |cmd| {
+            cmd.env(HELPER_ENV, "sleep")
+                .args(["30000", grandchild_id_file])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if ignore_term {
+                cmd.arg("--ignore-term");
+            }
+        });
+        wrapped.wrap(ProcessSession);
+        let _child = wrapped.spawn().expect("failed to spawn setsid grandchild");
+    }
+    #[cfg(not(unix))]
+    {
+        let mut cmd = Command::new(current_exe());
+        cmd.env(HELPER_ENV, "sleep")
+            .args(["30000", grandchild_id_file])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if ignore_term {
+            cmd.arg("--ignore-term");
+        }
+        #[allow(clippy::zombie_processes)]
+        let _child = cmd.spawn().expect("failed to spawn grandchild");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(grandchild_id_file).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests
 // ---------------------------------------------------------------------------
@@ -694,6 +876,31 @@ async fn test_run_argv_echo_env_cwd_stdin_and_exit_code() {
     .unwrap();
     assert!(!fail.success());
     assert_eq!(fail.exit_code, Some(42));
+}
+
+async fn test_env_remove_drops_inherited_vars_in_run_and_detach() {
+    let dir = tempfile::tempdir().unwrap();
+    let detach_out = dir.path().join("detach-env.txt");
+    let detach_out_str = detach_out.to_string_lossy().into_owned();
+
+    // Launch a helper process with inherited LEGION_* variables so we never mutate this test
+    // runner's own environment.
+    let (spec, helper_env) = helper_spec("env_remove_driver", &[&detach_out_str]);
+    let res = run(RunOptions::new(spec)
+        .envs(helper_env)
+        .env("LEGION_DROP_ME", "secret-1")
+        .env("LEGION_DROP_TOO", "secret-2")
+        .env("LEGION_KEEP_ME", "keep-val")
+        .env("LEGION_RESET_ME", "old-val")
+        .timeout(Duration::from_secs(15)))
+    .await
+    .unwrap();
+    assert!(
+        res.success(),
+        "env_remove_driver failed: stdout={} stderr={}",
+        res.stdout.text,
+        res.stderr.text
+    );
 }
 
 async fn test_run_shell_string_works_on_platform_shell() {
@@ -1080,17 +1287,18 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
     assert!(!procid::is_alive(&subchild_id));
 
     #[cfg(unix)]
-    if let Some(ref unit) = handle.systemd_unit {
-        assert!(
-            unit.starts_with(&format!("legion-job-{job_name}-")) && unit.ends_with(".scope"),
-            "unexpected systemd scope unit name: {unit}"
-        );
+    {
+        if let Some(ref unit) = handle.systemd_unit {
+            assert!(
+                unit.starts_with(&format!("legion-job-{job_name}-")) && unit.ends_with(".scope"),
+                "unexpected systemd scope unit name: {unit}"
+            );
+        }
         assert!(
             !procid::is_alive(&setsid_id),
-            "setsid grandchild {setsid_id} survived stop_detached on systemd scope {unit}"
+            "setsid grandchild {setsid_id} survived stop_detached (systemd_unit={:?})",
+            handle.systemd_unit
         );
-    } else if procid::is_alive(&setsid_id) {
-        let _ = procid::kill_tree(&setsid_id, Duration::from_millis(200)).await;
     }
 }
 
@@ -1177,6 +1385,60 @@ async fn test_detach_duplicate_names_get_distinct_scopes_and_isolate_stop() {
         .unwrap();
     assert!(r1.all_gone);
     assert!(!procid::is_alive(&h1.process));
+}
+
+async fn test_detach_preserves_dollar_signs_in_argv_and_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv_out = dir.path().join("argv-dollars.txt");
+    let argv_out_str = argv_out.to_string_lossy().into_owned();
+
+    // 1. Exact argv with `$$`, `$HOME`, `${X}`, and a lone `$`.
+    let (spec, env_vars) = helper_spec("dump_argv", &[&argv_out_str, "$$", "$HOME", "${X}", "$"]);
+    let handle = spawn_detached(
+        DetachOptions::new(spec)
+            .name("dollar-argv")
+            .envs(env_vars)
+            .env("X", "must-not-expand"),
+    )
+    .await
+    .unwrap();
+
+    let got = wait_for_detached_file(&argv_out, Duration::from_secs(5), &handle, &[]).await;
+    let lines: Vec<&str> = got.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["$$", "$HOME", "${X}", "$"],
+        "systemd-run or launcher rewrote `$` arguments: {lines:?}"
+    );
+
+    // 2. Shell command containing `$$`, `$HOME`, `${X}`, and a lone `$` in single quotes.
+    #[cfg(unix)]
+    {
+        let shell_out = dir.path().join("shell-dollars.txt");
+        let shell_handle = spawn_detached(
+            DetachOptions::new(CommandSpec::shell(
+                "printf '%s|%s|%s|%s\\n' '$$' '$HOME' '${X}' '$'",
+            ))
+            .name("dollar-shell")
+            .env("X", "must-not-expand")
+            .stdout_path(&shell_out),
+        )
+        .await
+        .unwrap();
+
+        let shell_text = wait_for_detached_file(
+            &shell_out,
+            Duration::from_secs(5),
+            &shell_handle,
+            &[&shell_out],
+        )
+        .await;
+        assert_eq!(
+            shell_text.trim(),
+            "$$|$HOME|${X}|$",
+            "systemd-run corrupted `$` inside shell command string"
+        );
+    }
 }
 
 async fn test_detach_does_not_inherit_extra_open_file_descriptors() {
@@ -1313,6 +1575,148 @@ async fn test_detach_active_tracks_root_and_surviving_descendants() {
     }
 }
 
+async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_id_file = dir.path().join("proof-root.pid");
+    let child_id_file = dir.path().join("proof-child.pid");
+    let root_str = root_id_file.to_string_lossy().into_owned();
+    let child_str = child_id_file.to_string_lossy().into_owned();
+
+    let (spec, env_vars) = helper_spec("orphan_root_exit", &[&root_str, &child_str]);
+    let opts = DetachOptions::new(spec).name("orphan-proof").envs(env_vars);
+    let handle = spawn_detached_for_test(opts, ScopeProbeOverride::ForceNoSystemd)
+        .await
+        .unwrap();
+    assert!(handle.systemd_unit.is_none());
+    assert!(
+        handle.marker.is_some(),
+        "detached handle must carry a unique env marker"
+    );
+
+    let child_id = parse_procid(
+        &wait_for_detached_file(&child_id_file, Duration::from_secs(5), &handle, &[]).await,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while procid::is_alive(&handle.process) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!procid::is_alive(&handle.process));
+    assert!(procid::is_alive(&child_id));
+
+    // A handle referencing the same exited root PID with a DIFFERENT marker must NOT treat this
+    // orphan as active and must NOT kill it (simulating an unrelated process reusing the PID).
+    let wrong_marker = DetachHandle {
+        process: handle.process,
+        systemd_unit: None,
+        windows_job: None,
+        marker: Some("unrelated-job-marker-0000".into()),
+        warnings: Vec::new(),
+    };
+    assert!(
+        !detached_active(&wrong_marker).await.unwrap(),
+        "detached_active matched an orphan carrying a different marker"
+    );
+    let wrong_stop = stop_detached(&wrong_marker, Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert!(wrong_stop.all_gone, "unexpected report: {wrong_stop:?}");
+    assert!(
+        procid::is_alive(&child_id),
+        "stop_detached with a mismatched marker killed an unrelated orphan"
+    );
+
+    // A legacy handle with no marker, scope, or job must NOT treat an exited root's orphan as
+    // active and must report it in `unverified_survivors` without killing it.
+    let legacy_handle = DetachHandle {
+        process: handle.process,
+        systemd_unit: None,
+        windows_job: None,
+        marker: None,
+        warnings: Vec::new(),
+    };
+    assert!(
+        !detached_active(&legacy_handle).await.unwrap(),
+        "detached_active with no marker should return false after root exits"
+    );
+    let legacy_stop = stop_detached(&legacy_handle, Duration::from_millis(150))
+        .await
+        .unwrap();
+    assert!(!legacy_stop.all_gone);
+    assert!(legacy_stop.survivors.is_empty());
+    assert!(
+        legacy_stop.unverified_survivors.contains(&child_id),
+        "expected {child_id} in unverified_survivors, got {legacy_stop:?}"
+    );
+    assert!(
+        procid::is_alive(&child_id),
+        "legacy stop_detached without marker must not kill unverified orphan"
+    );
+
+    // The real handle carrying the matching marker proves ownership and stops the orphan cleanly.
+    assert!(detached_active(&handle).await.unwrap());
+    let real_stop = stop_detached(&handle, Duration::from_millis(300))
+        .await
+        .unwrap();
+    assert!(
+        real_stop.all_gone,
+        "real stop left survivors: {real_stop:?}"
+    );
+    assert!(real_stop.survivors.is_empty());
+    assert!(real_stop.unverified_survivors.is_empty());
+    assert!(!procid::is_alive(&child_id));
+    assert!(!detached_active(&handle).await.unwrap());
+}
+
+async fn test_detach_stop_without_scope_stops_reparented_setsid_grandchild() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for (label, extra) in [("normal", None), ("ignore-term", Some("--ignore-term"))] {
+        let grandchild_file = dir.path().join(format!("reparented-setsid-{label}.pid"));
+        let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+        let args: Vec<&str> = match extra {
+            Some(flag) => vec![&grandchild_str, flag],
+            None => vec![&grandchild_str],
+        };
+
+        let (spec, env_vars) = helper_spec("setsid_reparent_root", &args);
+        let opts = DetachOptions::new(spec)
+            .name(format!("setsid-noscope-{label}"))
+            .envs(env_vars);
+        let handle = spawn_detached_for_test(opts, ScopeProbeOverride::ForceNoSystemd)
+            .await
+            .unwrap();
+        assert!(handle.systemd_unit.is_none());
+        assert!(handle.marker.is_some());
+
+        let grandchild_id = parse_procid(
+            &wait_for_detached_file(&grandchild_file, Duration::from_secs(5), &handle, &[]).await,
+        );
+        assert!(procid::is_alive(&handle.process));
+        assert!(procid::is_alive(&grandchild_id));
+        assert!(detached_active(&handle).await.unwrap());
+
+        let report = stop_detached(&handle, Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(
+            report.all_gone,
+            "stop_detached without scope ({label}) left survivors: {report:?}"
+        );
+        assert!(report.survivors.is_empty());
+        assert!(report.unverified_survivors.is_empty());
+        assert!(!procid::is_alive(&handle.process));
+        assert!(
+            !procid::is_alive(&grandchild_id),
+            "reparented setsid grandchild {grandchild_id} ({label}) survived stop_detached without scope"
+        );
+        assert!(
+            !detached_active(&handle).await.unwrap(),
+            "detached_active still returned true after stop_detached ({label})"
+        );
+    }
+}
+
 async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time() {
     let dir = tempfile::tempdir().unwrap();
     let id_file = dir.path().join("live.pid");
@@ -1335,6 +1739,8 @@ async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time
         .await
         .unwrap();
     assert!(report.all_gone);
+    assert!(report.survivors.is_empty());
+    assert!(report.unverified_survivors.is_empty());
     assert!(
         procid::is_alive(&real_id),
         "kill_tree killed a live process whose start_time did not match"
@@ -1345,7 +1751,7 @@ async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time
     assert!(!procid::is_alive(&real_id));
 }
 
-async fn test_procid_kill_tree_stops_surviving_descendants_after_root_exits() {
+async fn test_procid_kill_tree_reports_unverified_orphans_after_root_exits() {
     let dir = tempfile::tempdir().unwrap();
     let root_id_file = dir.path().join("orphan_root.pid");
     let child_id_file = dir.path().join("orphan_child.pid");
@@ -1393,18 +1799,31 @@ async fn test_procid_kill_tree_stops_surviving_descendants_after_root_exits() {
         "child {child_id} should still be running after root exited"
     );
 
-    let report = procid::kill_tree(&root_id, Duration::from_millis(300))
+    // Plain `procid::kill_tree` without a detach marker must NOT kill orphans by session/group or
+    // parent_pid alone once the root has exited; it reports them in `unverified_survivors`.
+    let report = procid::kill_tree(&root_id, Duration::from_millis(200))
         .await
         .unwrap();
     assert!(
-        report.all_gone,
-        "kill_tree left surviving descendants after root exit: {report:?}"
+        !report.all_gone,
+        "expected all_gone == false when unverified orphan candidates exist: {report:?}"
     );
     assert!(report.survivors.is_empty());
     assert!(
-        !procid::is_alive(&child_id),
-        "surviving child {child_id} was not stopped by kill_tree after root exited"
+        report.unverified_survivors.contains(&child_id),
+        "expected surviving child {child_id} in unverified_survivors, got {report:?}"
     );
+    assert!(
+        procid::is_alive(&child_id),
+        "plain kill_tree killed unverified orphan {child_id} after root exited"
+    );
+
+    // Clean up the test helper directly by its own verified identity.
+    let gone = procid::kill_process(&child_id, true, Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert!(gone);
+    assert!(!procid::is_alive(&child_id));
 }
 
 async fn test_procid_kill_process_stops_only_verified_target_and_respects_force() {

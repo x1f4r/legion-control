@@ -76,6 +76,8 @@ pub struct RunOptions {
     pub cwd: Option<PathBuf>,
     /// Extra environment variables applied on top of the inherited environment.
     pub env: BTreeMap<OsString, OsString>,
+    /// Inherited environment variable names to drop before applying explicit [`Self::env`] entries.
+    pub env_remove: Vec<OsString>,
     /// Optional bytes written to the child's stdin before closing it; null stdin when `None`.
     pub stdin: Option<Vec<u8>>,
     /// Optional wall-clock timeout; exceeding it terminates the entire process tree.
@@ -96,6 +98,7 @@ impl fmt::Debug for RunOptions {
             .field("command", &self.command)
             .field("cwd", &self.cwd)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("env_remove", &self.env_remove)
             .field("stdin_len", &self.stdin.as_ref().map(Vec::len))
             .field("timeout", &self.timeout)
             .field("kill_grace", &self.kill_grace)
@@ -114,6 +117,7 @@ impl RunOptions {
             command,
             cwd: None,
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
             stdin: None,
             timeout: None,
             kill_grace: DEFAULT_KILL_GRACE,
@@ -145,6 +149,22 @@ impl RunOptions {
         for (k, v) in vars {
             self.env.insert(k.into(), v.into());
         }
+        self
+    }
+
+    /// Remove an inherited environment variable before explicit [`Self::env`] entries are applied.
+    pub fn env_remove(mut self, key: impl Into<OsString>) -> Self {
+        self.env_remove.push(key.into());
+        self
+    }
+
+    /// Remove multiple inherited environment variables before explicit [`Self::env`] entries are applied.
+    pub fn env_removes<I, K>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<OsString>,
+    {
+        self.env_remove.extend(keys.into_iter().map(Into::into));
         self
     }
 
@@ -274,6 +294,9 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let mut wrapped = CommandWrap::with_new(&resolved.program, |cmd| {
         cmd.args(&resolved.args);
         for key in &resolved.env_remove {
+            cmd.env_remove(key);
+        }
+        for key in &options.env_remove {
             cmd.env_remove(key);
         }
         for (key, value) in &options.env {

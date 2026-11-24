@@ -1,12 +1,14 @@
-//! Windows detached process launcher with WMI fallback.
+//! Windows detached process launcher with named Job Object boundary and WMI fallback.
 //!
 //! Primary path: `CreateProcessW` with `CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW |
-//! CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT` and a
+//! CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED` and a
 //! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` restricted strictly to the three freshly opened standard
-//! handles (`stdin` null, `stdout` and `stderr` log files or null). This places the process
-//! outside the caller's Job Object without opening visible console windows for console children
-//! (unlike `DETACHED_PROCESS`) and prevents any other inheritable handle in the parent process
-//! (such as parent stdout/stderr pipes) from leaking into the detached job.
+//! handles (`stdin` null, `stdout` and `stderr` log files or null) plus one read-only
+//! `JOB_OBJECT_QUERY` keepalive handle for the newly created named Job Object
+//! (`Local\legion-job-<marker>`). The child is assigned to the Job Object before `ResumeThread` so
+//! the job bounds the entire detached tree and [`detached_active`] / [`stop_detached`] can query
+//! and terminate it directly without risking PID-reuse mistakes; no caller file or pipe handles
+//! leak into the child.
 //!
 //! Fallback path: when the caller runs inside a Job Object that forbids breakaway (OpenSSH's
 //! `sshd` session job does), `CreateProcessW` returns `ERROR_ACCESS_DENIED`. In that case we
@@ -14,8 +16,10 @@
 //! WMI provider host (`wmiprvse.exe`) in its own service session to spawn the launcher. Because
 //! WMI creates the process from `wmiprvse.exe` rather than from our process, the detached target
 //! inherits **zero** handles from the caller process (its only open standard handles are the
-//! redirected pipes connected to the launcher's freshly opened append `FileStream`s).
+//! redirected pipes connected to the launcher's freshly opened append `FileStream`s), and
+//! `LEGION_DETACH_ID=<marker>` in its environment provides orphan proof after root exit.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -25,19 +29,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::atomic::{WriteOptions, write_atomic};
-use crate::procid::ProcessId;
+use crate::procid::{self, KillTreeReport, ProcessId};
 use crate::shell::{ResolvedCommand, encode_utf16le_base64, windows_cmdline_escape};
 use crate::win_proc::{self, DirectSpawnError};
 use crate::{OsError, Result};
 
 use super::{
-    DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE, build_wmi_create_script_for_cmdline,
-    build_wmi_launcher_script, merge_windows_env, parse_wmi_handoff, reconcile_wmi_identity,
-    resolve_wmi_program, validate_wmi_batch_target,
+    DETACH_MARKER_ENV, DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE,
+    build_windows_direct_launch, build_wmi_create_script_for_cmdline, build_wmi_launcher_script,
+    generate_detach_marker, merge_recheck_survivors, merge_windows_env, parse_wmi_handoff,
+    reconcile_wmi_identity, resolve_windows_job_name, resolve_wmi_program,
+    validate_wmi_batch_target,
 };
 
 const WMI_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const JOB_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 static WMI_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -73,8 +81,9 @@ pub(super) async fn spawn_detached(
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let env_remove_str: Vec<String> = resolved
-        .env_remove
+    let mut combined_env_remove_os = resolved.env_remove.clone();
+    combined_env_remove_os.extend(options.env_remove.iter().cloned());
+    let env_remove_str: Vec<String> = combined_env_remove_os
         .iter()
         .map(|key| key.to_string_lossy().into_owned())
         .collect();
@@ -92,58 +101,207 @@ pub(super) async fn spawn_detached(
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
     let merged_env = merge_windows_env(inherited_str, &env_remove_str, &overrides_str);
 
+    let marker = generate_detach_marker();
+    let job_name = resolve_windows_job_name(&marker);
+
+    let mut direct_env_overrides = options.env.clone();
+    direct_env_overrides
+        .retain(|k, _| !k.to_string_lossy().eq_ignore_ascii_case(DETACH_MARKER_ENV));
+    direct_env_overrides.insert(OsString::from(DETACH_MARKER_ENV), OsString::from(&marker));
+
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .and_then(|v| v.into_string().ok());
     let resolved_program = resolve_wmi_program(&program_display, &base_cwd, &merged_env);
-    let command_line = build_direct_command_line(&resolved_program, &args_vec)?;
+    let (application_name, command_line) =
+        build_windows_direct_launch(&resolved_program, &args_vec, system_root.as_deref())?;
 
     match win_proc::spawn_detached_direct(
         &program_display,
+        application_name.as_deref(),
         &command_line,
         options.cwd.as_deref(),
-        &resolved.env_remove,
-        &options.env,
+        &combined_env_remove_os,
+        &direct_env_overrides,
         options.stdout_path.as_deref(),
         options.stderr_path.as_deref(),
+        Some(&job_name),
     ) {
-        Ok(process) => {
+        Ok((process, windows_job)) => {
             // The detached child is already running and may still be reading a spilled `.ps1`
             // wrapper (which deletes itself as its first action); disarm caller-side removal.
             resolved.disarm_temp_script();
             Ok(DetachHandle {
                 process,
                 systemd_unit: None,
+                windows_job,
+                marker: Some(marker),
                 warnings: Vec::new(),
             })
         }
-        Err(DirectSpawnError::BreakawayRefused) => spawn_via_wmi(resolved, options).await,
+        Err(DirectSpawnError::BreakawayRefused) => spawn_via_wmi(resolved, options, marker).await,
         Err(DirectSpawnError::Other(err)) => Err(err),
     }
 }
 
-fn build_direct_command_line(program: &str, args: &[String]) -> Result<String> {
-    let trimmed = program.trim().trim_end_matches(['.', ' ']);
-    let lower = trimmed.to_ascii_lowercase();
-    let is_batch = lower.ends_with(".cmd") || lower.ends_with(".bat");
-    if is_batch {
-        validate_wmi_batch_target(program, args)?;
-        let mut inner = windows_cmdline_escape(program);
-        for arg in args {
-            inner.push(' ');
-            inner.push_str(&windows_cmdline_escape(arg));
+pub(super) async fn detached_active(handle: &DetachHandle) -> Result<bool> {
+    if let Some(ref job_name) = handle.windows_job {
+        let job_owned = job_name.clone();
+        let root = handle.process;
+        let job_check = tokio::task::spawn_blocking(move || -> Result<Option<bool>> {
+            if procid::is_alive(&root) {
+                return Ok(Some(true));
+            }
+            let Some(pids) = win_proc::query_job_active_pids(&job_owned)? else {
+                return Ok(None);
+            };
+            for pid in pids {
+                if !matches!(procid::of_pid(pid), Ok(None)) {
+                    return Ok(Some(true));
+                }
+            }
+            Ok(Some(false))
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("detached_active job worker task failed: {err}"),
+        })??;
+
+        if let Some(active) = job_check {
+            return Ok(active);
         }
-        return Ok(format!("cmd.exe /d /s /c \"{inner}\""));
     }
 
-    let mut line = windows_cmdline_escape(program);
-    for arg in args {
-        line.push(' ');
-        line.push_str(&windows_cmdline_escape(arg));
+    procid::tree_is_active_with_marker(&handle.process, handle.marker.as_deref()).await
+}
+
+pub(super) async fn stop_detached(
+    handle: &DetachHandle,
+    grace: Duration,
+) -> Result<KillTreeReport> {
+    let mut report = stop_detached_primary(handle, grace).await?;
+
+    // Re-check using the exact same marker rule as `detached_active` so `stop_detached` never
+    // reports `all_gone: true` while a marked descendant (for example on the WMI path or after a
+    // fallback) is still running.
+    if let Some(ref marker) = handle.marker {
+        let mut remaining = procid::find_marked_live_processes(marker).await?;
+        if !remaining.is_empty() {
+            let followup =
+                procid::kill_tree_with_marker(&handle.process, Some(marker), grace).await?;
+            for id in followup.unverified_survivors {
+                if !report
+                    .unverified_survivors
+                    .iter()
+                    .any(|existing| existing.pid == id.pid)
+                {
+                    report.unverified_survivors.push(id);
+                }
+            }
+            remaining = procid::find_marked_live_processes(marker).await?;
+        }
+        if procid::is_alive(&handle.process)
+            && !remaining.iter().any(|id| id.pid == handle.process.pid)
+        {
+            remaining.push(handle.process);
+        }
+        merge_recheck_survivors(&mut report, remaining);
     }
-    Ok(line)
+
+    Ok(report)
+}
+
+async fn stop_detached_primary(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
+    if let Some(ref job_name) = handle.windows_job {
+        let job_owned = job_name.clone();
+        let root = handle.process;
+        let terminated = tokio::task::spawn_blocking(move || {
+            let Some(mut tracked) = win_proc::terminate_named_job(&job_owned)? else {
+                return Ok(None);
+            };
+            if procid::is_alive(&root) && !tracked.iter().any(|id| id.pid == root.pid) {
+                tracked.push(root);
+            }
+            Ok::<_, OsError>(Some(tracked))
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("stop_detached job worker task failed: {err}"),
+        })??;
+
+        if let Some(tracked) = terminated {
+            let settle = JOB_SETTLE_TIMEOUT.max(grace.min(Duration::from_secs(5)));
+            let deadline = Instant::now() + settle;
+            loop {
+                let job_poll = job_name.clone();
+                let probe = tracked.clone();
+                let still_running = tokio::task::spawn_blocking(move || -> bool {
+                    if probe.iter().any(procid::is_alive) {
+                        return true;
+                    }
+                    if let Ok(Some(pids)) = win_proc::query_job_active_pids(&job_poll) {
+                        return pids
+                            .into_iter()
+                            .any(|pid| matches!(procid::of_pid(pid), Ok(Some(_))));
+                    }
+                    false
+                })
+                .await
+                .map_err(|err| OsError::Platform {
+                    detail: format!("stop_detached job settle task failed: {err}"),
+                })?;
+
+                if !still_running {
+                    return Ok(KillTreeReport {
+                        all_gone: true,
+                        survivors: Vec::new(),
+                        unverified_survivors: Vec::new(),
+                    });
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                tokio::time::sleep(JOB_POLL_INTERVAL.min(remaining)).await;
+            }
+
+            let job_final = job_name.clone();
+            let survivors = tokio::task::spawn_blocking(move || {
+                let mut left: Vec<ProcessId> =
+                    tracked.into_iter().filter(procid::is_alive).collect();
+                if let Ok(Some(pids)) = win_proc::query_job_active_pids(&job_final) {
+                    for pid in pids {
+                        if let Ok(Some(id)) = procid::of_pid(pid)
+                            && !left.iter().any(|existing| existing.pid == id.pid)
+                        {
+                            left.push(id);
+                        }
+                    }
+                }
+                left.sort_by_key(|id| id.pid);
+                left
+            })
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("stop_detached job survivor check failed: {err}"),
+            })?;
+
+            return Ok(KillTreeReport {
+                all_gone: survivors.is_empty(),
+                survivors,
+                unverified_survivors: Vec::new(),
+            });
+        }
+    }
+
+    procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await
 }
 
 async fn spawn_via_wmi(
     resolved: &ResolvedCommand,
     options: &DetachOptions,
+    marker: String,
 ) -> Result<DetachHandle> {
     let base_cwd = match options.cwd {
         Some(ref dir) => absolutize(dir)?,
@@ -178,9 +336,10 @@ async fn spawn_via_wmi(
     let env_remove: Vec<String> = resolved
         .env_remove
         .iter()
+        .chain(options.env_remove.iter())
         .map(|key| key.to_string_lossy().into_owned())
         .collect();
-    let overrides: Vec<(String, String)> = options
+    let mut overrides: Vec<(String, String)> = options
         .env
         .iter()
         .map(|(k, v)| {
@@ -190,6 +349,7 @@ async fn spawn_via_wmi(
             )
         })
         .collect();
+    overrides.push((DETACH_MARKER_ENV.to_owned(), marker.clone()));
     // Use `vars_os()` rather than `vars()` so unpaired UTF-16 surrogates in unrelated inherited
     // environment variables never panic.
     let inherited_env = std::env::vars_os()
@@ -310,6 +470,8 @@ async fn spawn_via_wmi(
     Ok(DetachHandle {
         process,
         systemd_unit: None,
+        windows_job: None,
+        marker: Some(marker),
         warnings: Vec::new(),
     })
 }
