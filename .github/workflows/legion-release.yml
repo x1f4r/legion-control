@@ -148,28 +148,14 @@ jobs:
         if: matrix.use_zigbuild
         with:
           version: '0.15.1'
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: matrix.use_zigbuild
-        with:
-          path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.24.1-${{ runner.os }}-${{ runner.arch }}
+      # Release builds never restore cached build trees (`target/`) or cached executables; install
+      # the pinned cargo-zigbuild fresh on every release run.
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-            cargo install --locked cargo-zigbuild --version 0.24.1
-          fi
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: release-${{ matrix.target }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: release-${{ matrix.target }}-
+          cargo install --locked cargo-zigbuild --version 0.24.1
       - name: Build release binary (zigbuild)
         if: matrix.use_zigbuild
         shell: bash

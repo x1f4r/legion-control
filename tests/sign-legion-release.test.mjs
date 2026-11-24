@@ -99,4 +99,5 @@ test('legion release workflow enforces main ancestry, --latest=false, and --prer
   assert.match(workflow, /--draft/);
   assert.doesNotMatch(workflow, /--draft=false\s+dist\//);
   assert.match(workflow, /gh release edit legion-vX\.Y\.Z --draft=false --latest=false/);
+  assert.doesNotMatch(workflow, /actions\/cache/);
 });
