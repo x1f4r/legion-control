@@ -360,13 +360,14 @@ pub(crate) fn windows_cmdline_escape(arg: &str) -> String {
     out
 }
 
-/// Wrap a PowerShell command string so stdout uses UTF-8 without a BOM, negative native crash
-/// exit codes (such as `0xC0000005`) survive intact, failing cmdlets report `1` without leaking a
-/// stale native exit code from an earlier command, and succeeding final commands exit `0`.
+/// Wrap a PowerShell command string so stdin and stdout use UTF-8 without a BOM, negative native
+/// crash exit codes (such as `0xC0000005`) survive intact, failing cmdlets report `1` without
+/// leaking a stale native exit code from an earlier command, and succeeding final commands exit
+/// `0`.
 ///
-/// With plain `-Command`, Windows PowerShell encodes stdout in the active OEM code page and
-/// collapses failing native exit codes to `1`. Running this wrapper fixes both issues for
-/// Windows PowerShell 5.1 and PowerShell 7.
+/// With plain `-Command`, Windows PowerShell decodes stdin and encodes stdout in the active OEM
+/// code page and collapses failing native exit codes to `1`. Running this wrapper fixes all three
+/// for Windows PowerShell 5.1 and PowerShell 7.
 #[allow(dead_code)]
 pub(crate) fn build_powershell_shell_wrapper(command: &str) -> String {
     build_powershell_shell_wrapper_with_cleanup(command, None)
@@ -386,6 +387,7 @@ pub(crate) fn build_powershell_shell_wrapper_with_cleanup(
     }
     lines.extend([
         "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)".to_owned(),
+        "[Console]::InputEncoding = [Console]::OutputEncoding".to_owned(),
         "$OutputEncoding = [Console]::OutputEncoding".to_owned(),
         "$global:LASTEXITCODE = $null".to_owned(),
         "$__legion_err_count = $Error.Count".to_owned(),
@@ -663,6 +665,7 @@ mod tests {
                 "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)"
             )
         );
+        assert!(wrapper.contains("[Console]::InputEncoding = [Console]::OutputEncoding"));
         assert!(wrapper.contains("$OutputEncoding = [Console]::OutputEncoding"));
         assert!(wrapper.contains("$global:LASTEXITCODE = $null"));
         assert!(wrapper.contains("$__legion_err_count = $Error.Count"));
