@@ -63,7 +63,7 @@ Every tool declares one of six effects:
 
 | Effect | Examples | What it promises (and does not promise) |
 | --- | --- | --- |
-| `read` | `meta.whoami`, `fs.read`, `sys.info`, `svc.status`, `power.status`, `audit.tail`, `device.endpoint` | Inspects state without changing files, processes, services, or power state. |
+| `read` | `meta.whoami`, `fs.read`, `sys.info`, `svc.status`, `power.status`, `audit.tail`, `device.endpoint`, `device.roles` | Inspects state without changing files, processes, services, or power state. |
 | `write` | `fs.write`, `fs.edit`, `fs.copy`, `fs.move`, `fs.mkdir`, `fs.transfer`, `proj.add` | Creates or modifies files and project entries. **`write` can replace content**: denying `fs.remove` prevents deleting files, not overwriting their bytes with something else. |
 | `destroy` | `fs.remove`, `sys.kill` | Removes files or directories or terminates processes. Replacing a whole directory counts as destroying it. |
 | `exec` | `exec.run`, `job.start`, `job.cancel`, `svc.start`, `svc.stop`, `svc.restart`, `proj.run`, `proj.clone`, `proj.pull` | Runs programs on the machine. **`exec` is as strong as the account**: `paths` does not contain what a command reads, writes, or launches. |
@@ -231,13 +231,18 @@ invokes `device.invite`, the live invite enters the agent's transcript, so run `
 your own terminal when you want to keep it out of agent transcripts.
 
 Creating, listing, updating, or removing invites and paired devices (`device.invite`,
-`device.list`, `device.set`, `device.remove`) requires `effect:admin`. `device.endpoint` is
-`effect:read` so paired controllers can discover fleet endpoints: any role with `read` learns the
+`device.list`, `device.set`, `device.remove`) requires `effect:admin`. `device.endpoint` and
+`device.roles` are `effect:read`: any role with `read` can call `device.endpoint` to learn the
 node name, candidate host names / Tailscale addresses, SSH port, OS account name, and public sshd
 host keys (with auto-discovered host-key scans cached briefly per node, and without exposing how
-host keys were resolved). Device management follows the same caller-scoping and `allow_owner` rules
+host keys were resolved), and can call `device.roles` to list only the roles this caller is allowed
+to hand out to a new device on that node (name, plain description matching `legion pair`, strongest
+effect, and `owner_strength`, returning an empty list for non-owner callers and exposing nothing
+else from `policy.toml`). Device management follows the same caller-scoping and `allow_owner` rules
 as `token.*`: creating a `device:<name>` principal or changing a device's role with `device.set`
-requires the `owner` role and `allow_owner=true` to grant `owner`. A paired device may create
+requires the `owner` role, and granting `owner` or any owner-strength role (any role that allows
+`effect:admin` or reaches an `admin` tool by name or glob) requires an `owner` caller and
+`allow_owner=true` (or `--allow-owner` / typed confirmation in `legion pair`). A paired device may create
 pairing invites only on the node it is connected to directly: forwarding `device.invite` (`on=`)
 from a paired device is refused with a hint to connect to that machine directly so `paired_by.device`
 is always recorded from the session context. Expiring credentials (such as expiring HTTP bearer
@@ -398,8 +403,9 @@ Tokens in `tokens.toml` (managed with `token.add`, `token.list`, and `token.remo
 
 1. **Caller scoping**: a caller may create, list, or remove tokens only for a principal it could
    itself act as (its own principal, or any principal when the caller has the `owner` role).
-2. **Owner-role tokens**: minting a token for any principal whose role is `owner` requires a caller
-   with the `owner` role **and** `allow_owner=true`:
+2. **Owner-strength tokens**: minting a token for any principal whose role is `owner` or allows any
+   `admin` tool (via `effect:admin`, `*`, glob, or tool name) requires a caller with the `owner`
+   role **and** `allow_owner=true`:
 
    ```sh
    legion token add my-owner owner

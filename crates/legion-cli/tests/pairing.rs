@@ -5208,3 +5208,86 @@ allow = [\"effect:read\"]
         "B's own phone must stay active on B"
     );
 }
+
+#[test]
+fn device_roles_cli_resolves_live_net_tools_and_scopes_to_caller() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"roles-box\"\n");
+    home.write_config(
+        "policy.toml",
+        r#"
+default = "owner"
+secrets = ["~/hidden-vault"]
+
+[roles.observer]
+allow = ["effect:read"]
+deny = ["audit.*"]
+paths = ["~/work/**"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+
+[roles.phone_admin]
+allow = ["effect:read", "effect:admin"]
+
+[principals.phone]
+role = "observer"
+
+[principals.tablet]
+role = "phone_admin"
+"#,
+    );
+
+    // Owner gets all roles resolved against the live binary's full tool registry (including
+    // `config.write` from `legion-net`), with no extra policy fields leaked.
+    let owner_run = home.run(&["device.roles", "--json"]);
+    assert_eq!(owner_run.code, 0, "{}", owner_run.stderr);
+    let owner_json = owner_run.json();
+    assert_eq!(owner_json["node"], json!("roles-box"));
+    assert!(!owner_run.stdout.contains("hidden-vault"));
+    assert!(!owner_run.stdout.contains("tablet"));
+
+    let roles = owner_json["roles"].as_array().unwrap();
+    let names: Vec<&str> = roles.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec!["observer", "phone_admin", "policy_writer", "owner"]
+    );
+
+    let pw = roles
+        .iter()
+        .find(|r| r["name"] == json!("policy_writer"))
+        .unwrap();
+    assert_eq!(pw["strongest_effect"], json!("admin"));
+    assert_eq!(pw["owner_strength"], json!(true));
+    assert!(
+        pw["description"]
+            .as_str()
+            .unwrap()
+            .contains("everything, including changing who may do what"),
+        "policy_writer description: {pw}"
+    );
+
+    let obs = roles
+        .iter()
+        .find(|r| r["name"] == json!("observer"))
+        .unwrap();
+    assert_eq!(obs["strongest_effect"], json!("read"));
+    assert_eq!(obs["owner_strength"], json!(false));
+    assert!(
+        obs["description"].as_str().unwrap().contains("look only"),
+        "observer description: {obs}"
+    );
+
+    // Non-owner callers (both `observer` and non-owner `effect:admin`) may call `device.roles`
+    // (`effect:read`) and receive an empty list, leaking nothing from policy.toml.
+    for principal in ["phone", "tablet"] {
+        let non_owner = home.run(&["device.roles", "--as", principal, "--json"]);
+        assert_eq!(non_owner.code, 0, "{principal}: {}", non_owner.stderr);
+        let parsed = non_owner.json();
+        assert_eq!(parsed["node"], json!("roles-box"));
+        assert_eq!(parsed["roles"], json!([]), "{principal}: {parsed}");
+        assert!(!non_owner.stdout.contains("policy_writer"));
+        assert!(!non_owner.stdout.contains("hidden-vault"));
+    }
+}

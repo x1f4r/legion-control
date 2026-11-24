@@ -62,7 +62,7 @@ pub const MAX_VALID_MINUTES: u32 = 1440;
 pub const DEFAULT_SSH_PORT: u16 = 22;
 
 /// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`, `device.set`,
-/// `device.endpoint`) and registers `devices.toml`.
+/// `device.endpoint`, `device.roles`) and registers `devices.toml`.
 pub fn register(registry: &mut Registry) {
     registry.add_document::<registry::DevicesFile>();
     registry.add_fn(
@@ -94,6 +94,12 @@ pub fn register(registry: &mut Registry) {
         Effect::Read,
         "Return how a paired device reaches this node over SSH: node name, candidate host names or Tailscale addresses, SSH port, OS account name, and pinned sshd public host keys. Uses the same detection as device.invite (honouring any [devices] settings in node.toml, caching auto-discovered host-key scans briefly per node). Call with on=\"all\" through any node to learn every machine's direct SSH endpoint.",
         endpoint,
+    );
+    registry.add_fn(
+        "device.roles",
+        Effect::Read,
+        "Return the roles this caller may assign to a newly paired device on this node: each role's name, one-line plain description (generated with the same analysis as `legion pair`), strongest allowed effect, and whether it is owner-strength (`owner` or any role allowing an `admin` tool). Lists only roles the caller is allowed to hand out (empty for callers without the `owner` role) and exposes nothing else from policy.toml.",
+        roles,
     );
 }
 
@@ -164,6 +170,31 @@ async fn endpoint(ctx: &Ctx, _args: NoArgs) -> Result<EndpointResult, ToolError>
     let node_file = ctx.config().get::<NodeFile>()?;
     let detected = detect_endpoint(ctx, &node_file, None, None, None, true).await?;
     Ok(detected.endpoint)
+}
+
+/// What `device.roles` returns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRolesResult {
+    /// Node name as configured in `node.toml` or derived from the hostname.
+    pub node: String,
+    /// Roles this caller is allowed to hand out to a newly paired device, ordered from narrowest
+    /// to broadest. Empty when the caller may not hand out roles for new devices.
+    pub roles: Vec<crate::roles::RoleSummary>,
+}
+
+async fn roles(ctx: &Ctx, _args: NoArgs) -> Result<DeviceRolesResult, ToolError> {
+    let caller = Caller::of(ctx)?;
+    let roles = if caller.is_owner() {
+        let policy = ctx.config().get::<Policy>()?;
+        let specs = ctx.node().specs();
+        crate::roles::role_summaries(&policy, &specs)
+    } else {
+        Vec::new()
+    };
+    Ok(DeviceRolesResult {
+        node: ctx.node_name().to_owned(),
+        roles,
+    })
 }
 
 async fn detect_endpoint(
@@ -6793,6 +6824,188 @@ role = "inviter"
             )
             .await
             .unwrap_or_else(|e| panic!("owner + allow_owner device.set role={role} failed: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn device_roles_returns_caller_allowed_roles_with_pair_descriptions_and_hides_policy_from_non_owners()
+     {
+        use legion_core::NoArgs;
+
+        let h = Harness::new();
+        let mut reg = crate::registry();
+        reg.add_fn(
+            "config.write",
+            Effect::Admin,
+            "Write a config file (test stub).",
+            |_ctx: &Ctx, _args: NoArgs| async { Ok(json!({})) },
+        );
+        let node = Node::new(h.node.paths().clone(), reg);
+
+        std::fs::write(
+            node.paths().config_file("policy.toml"),
+            r#"
+default = "owner"
+secrets = ["~/top-secret-vault"]
+
+[roles.empty_role]
+allow = []
+
+[roles.observer]
+allow = ["effect:read"]
+deny = ["audit.*"]
+paths = ["~/private-project/**"]
+
+[roles.editor]
+allow = ["effect:read", "effect:write"]
+deny = ["audit.*"]
+paths = ["~/private-project/**"]
+
+[roles.cleaner]
+allow = ["effect:read", "fs.remove"]
+
+[roles.unknown_ext]
+allow = ["effect:read", "custom.mystery"]
+
+[roles.power_user]
+allow = ["effect:read", "power.shutdown"]
+
+[roles.operator]
+allow = ["effect:read", "effect:write", "effect:exec", "effect:destroy"]
+deny = ["effect:power", "effect:admin"]
+
+[roles.policy_writer]
+allow = ["effect:read", "config.write"]
+
+[roles.phone_admin]
+allow = ["effect:read", "effect:admin"]
+
+[principals.phone]
+role = "observer"
+
+[principals.dev]
+role = "editor"
+
+[principals.ops]
+role = "operator"
+
+[principals.tablet]
+role = "phone_admin"
+
+[principals.secret_user]
+role = "observer"
+"#,
+        )
+        .unwrap();
+
+        // 1. `device.roles` is registered with Effect::Read.
+        let specs = node.specs();
+        let role_spec = specs
+            .iter()
+            .find(|s| s.name == "device.roles")
+            .expect("device.roles tool must be registered");
+        assert_eq!(role_spec.effect, Effect::Read);
+
+        // 2. Owner sees every role from policy.toml + built-in `owner`, in `legion pair`'s exact
+        //    order and with `legion pair`'s exact descriptions, plus strongest_effect and
+        //    owner_strength — and nothing else from policy.toml.
+        let owner_res = node
+            .call(Call::new(Door::Cli, "device.roles", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(owner_res["node"], json!("tower"), "{owner_res}");
+        let owner_text = serde_json::to_string(&owner_res).unwrap();
+        for leaked in [
+            "secret_user",
+            "top-secret-vault",
+            "private-project",
+            "audit.*",
+        ] {
+            assert!(
+                !owner_text.contains(leaked),
+                "device.roles must not expose {leaked:?} from policy.toml: {owner_text}"
+            );
+        }
+
+        let policy = node.config().get::<Policy>().unwrap();
+        let expected_choices = crate::roles::role_choices(&policy, &specs);
+        let returned = owner_res["roles"].as_array().unwrap();
+        let returned_pairs: Vec<(String, String)> = returned
+            .iter()
+            .map(|r| {
+                let obj = r.as_object().unwrap();
+                assert_eq!(
+                    obj.len(),
+                    4,
+                    "unexpected extra fields in role object: {obj:?}"
+                );
+                (
+                    obj["name"].as_str().unwrap().to_owned(),
+                    obj["description"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(returned_pairs, expected_choices);
+
+        let by_name = |name: &str| {
+            returned
+                .iter()
+                .find(|r| r["name"] == json!(name))
+                .unwrap_or_else(|| panic!("missing role {name} in {returned:?}"))
+        };
+        for (name, expected_effect, expected_owner_strength) in [
+            ("empty_role", Value::Null, false),
+            ("observer", json!("read"), false),
+            ("editor", json!("write"), false),
+            ("cleaner", json!("destroy"), false),
+            ("unknown_ext", Value::Null, false),
+            ("power_user", json!("power"), false),
+            ("operator", json!("exec"), false),
+            ("phone_admin", json!("admin"), true),
+            ("policy_writer", json!("admin"), true),
+            ("owner", json!("admin"), true),
+        ] {
+            let entry = by_name(name);
+            assert_eq!(
+                entry["strongest_effect"], expected_effect,
+                "role {name} strongest_effect mismatch: {entry}"
+            );
+            assert_eq!(
+                entry["owner_strength"],
+                json!(expected_owner_strength),
+                "role {name} owner_strength mismatch: {entry}"
+            );
+        }
+
+        // 3. Every non-owner caller (observer, editor, operator, and even non-owner admin
+        //    `tablet`) can call `device.roles` (it is Effect::Read) and receives an empty list,
+        //    leaking nothing from policy.toml.
+        for caller in ["phone", "dev", "ops", "tablet"] {
+            let mut call = Call::new(Door::Cli, "device.roles", json!({}));
+            call.pinned = Some(caller.to_owned());
+            let res = node
+                .call(call)
+                .await
+                .unwrap_or_else(|e| panic!("device.roles as {caller} should succeed: {e:?}"));
+            assert_eq!(res["node"], json!("tower"), "{caller}: {res}");
+            assert_eq!(
+                res["roles"],
+                json!([]),
+                "non-owner {caller} may not hand out roles and must get []: {res}"
+            );
+            let text = serde_json::to_string(&res).unwrap();
+            for hidden in [
+                "observer",
+                "policy_writer",
+                "phone_admin",
+                "secret_user",
+                "top-secret-vault",
+            ] {
+                assert!(
+                    !text.contains(hidden),
+                    "non-owner {caller} response leaked {hidden:?}: {text}"
+                );
+            }
         }
     }
 }
