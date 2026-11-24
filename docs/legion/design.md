@@ -278,6 +278,18 @@ How far a principal can be trusted depends on the door, and the design says so p
   and `legion stream`; anything else is refused.
 - **An HTTP token is a wall.** Each token maps to one principal.
 
+What the effects do and do not promise:
+
+- **`exec` is as strong as the account.** A command can read, write and start anything the
+  operating system lets the user do, so `paths` does not contain it: it only chooses where a
+  command starts. A role that needs a real boundary does not get `exec`.
+- **`write` can replace content; `destroy` removes things.** Denying `fs.remove` keeps files from
+  being deleted, not from being overwritten with something else. Replacing a whole directory
+  counts as destroying it.
+- **Legion's own configuration and state belong to `admin`.** No file tool reads or writes the
+  configuration or state directory for a role without the `admin` effect, whatever its `paths`
+  say, so a role cannot edit the policy that confines it or the log that records it.
+
 A door that pinned a principal ignores a different `as` in the request. Only a role with
 `delegate = true` (the owner's) may act as someone else. A forwarded call names its principal to
 the target, and the target applies its own policy to it.
