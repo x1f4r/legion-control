@@ -35,7 +35,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::Authenticated;
 
-use self::catalog::{Catalog, ON, summary};
+use self::catalog::{Catalog, CatalogCache, ON, summary};
 use self::events::{Forwarder, Level};
 
 /// The hint for a tool a compact session cannot find.
@@ -67,7 +67,7 @@ pub struct McpDoor {
     node: Node,
     router: Arc<dyn Router>,
     options: Options,
-    catalog: Arc<Catalog>,
+    catalog: Arc<CatalogCache>,
     /// Set when the door serves HTTP, where each request carries the principal its token stands
     /// for, rather than one principal for the whole session.
     http: Option<HttpLink>,
@@ -88,7 +88,7 @@ impl McpDoor {
         router: Arc<dyn Router>,
         options: Options,
     ) -> Result<McpDoor, ErrorBody> {
-        let catalog = Arc::new(Catalog::new(node.specs(), !options.compact)?);
+        let catalog = CatalogCache::new(&node, !options.compact)?;
         Ok(McpDoor {
             node,
             router,
@@ -100,13 +100,14 @@ impl McpDoor {
         })
     }
 
-    /// A door for one HTTP session or request, sharing the catalog built once for the server and
-    /// the server's call tracker, so shutting the server down waits for every call to be recorded.
+    /// A door for one HTTP session or request, sharing the catalog cache built once for the server
+    /// and the server's call tracker, so shutting the server down waits for every call to be
+    /// recorded.
     pub(crate) fn for_http(
         node: Node,
         router: Arc<dyn Router>,
         compact: bool,
-        catalog: Arc<Catalog>,
+        catalog: Arc<CatalogCache>,
         link: HttpLink,
         calls: TaskTracker,
     ) -> McpDoor {
@@ -124,9 +125,9 @@ impl McpDoor {
         }
     }
 
-    /// The catalog a door in this mode serves, for a server to build once and share.
-    pub(crate) fn catalog(node: &Node, compact: bool) -> Result<Arc<Catalog>, ErrorBody> {
-        Catalog::new(node.specs(), !compact).map(Arc::new)
+    /// The catalog cache a door in this mode serves, for a server to build once and share.
+    pub(crate) fn catalog(node: &Node, compact: bool) -> Result<Arc<CatalogCache>, ErrorBody> {
+        CatalogCache::new(node, !compact)
     }
 
     /// The principal a request acts as: the one the session was pinned to, or over HTTP the one
@@ -186,10 +187,8 @@ impl McpDoor {
     /// The tool a client names, when the principal may use it. A tool beyond its role is treated
     /// exactly like one that does not exist, so a session learns nothing about what it may not
     /// use.
-    fn visible<'a>(&'a self, grant: &Grant, name: &str) -> Option<&'a catalog::Entry> {
-        self.catalog
-            .get(name)
-            .filter(|entry| grant.allows(&entry.spec))
+    fn visible<'a>(catalog: &'a Catalog, grant: &Grant, name: &str) -> Option<&'a catalog::Entry> {
+        catalog.get(name).filter(|entry| grant.allows(&entry.spec))
     }
 
     /// The tools listed in full mode: those the principal may use, and none while the policy
@@ -200,7 +199,8 @@ impl McpDoor {
         let Ok(grant) = self.grant(context) else {
             return Vec::new();
         };
-        self.catalog
+        let catalog = self.catalog.current(&self.node);
+        catalog
             .entries()
             .iter()
             .filter(|entry| grant.allows(&entry.spec))
@@ -313,8 +313,12 @@ impl McpDoor {
             Ok(on) => on,
             Err(error) => return RouteOutcome::One(Err(error)),
         };
-        let tool = self.catalog.resolve(name);
-        self.rewrite_outcome(self.run(tool, Value::Object(args), on, context).await, tool)
+        let catalog = self.catalog.current(&self.node);
+        let tool = catalog.resolve(name).to_owned();
+        self.rewrite_outcome(
+            self.run(&tool, Value::Object(args), on, context).await,
+            &tool,
+        )
     }
 
     /// A call to one of the three tools compact mode serves.
@@ -324,15 +328,16 @@ impl McpDoor {
         args: JsonObject,
         context: &RequestContext<RoleServer>,
     ) -> RouteOutcome {
+        let catalog = self.catalog.current(&self.node);
         match name {
             compact::TOOLS => RouteOutcome::One(
                 compact::parse::<compact::ToolsArgs>(name, args)
-                    .and_then(|args| self.list_compact(args.family.as_deref(), context)),
+                    .and_then(|args| self.list_compact(&catalog, args.family.as_deref(), context)),
             ),
             compact::DESCRIBE => RouteOutcome::One(
                 compact::parse::<compact::DescribeArgs>(name, args).and_then(|args| {
                     let grant = self.grant(context)?;
-                    match self.visible(&grant, &args.tool) {
+                    match Self::visible(&catalog, &grant, &args.tool) {
                         Some(entry) => to_object(&entry.spec),
                         None => Err(self
                             .door_error(
@@ -349,13 +354,13 @@ impl McpDoor {
             ),
             compact::CALL => match compact::parse::<compact::CallArgs>(name, args) {
                 Ok(args) => {
-                    let tool = self.catalog.resolve(&args.tool);
+                    let tool = catalog.resolve(&args.tool).to_owned();
                     let tool_args = Value::Object(args.args.unwrap_or_default());
                     let on = match self.on(args.on) {
                         Ok(on) => on,
                         Err(error) => return RouteOutcome::One(Err(error)),
                     };
-                    self.rewrite_outcome(self.run(tool, tool_args, on, context).await, tool)
+                    self.rewrite_outcome(self.run(&tool, tool_args, on, context).await, &tool)
                 }
                 Err(error) => RouteOutcome::One(Err(error)),
             },
@@ -363,7 +368,7 @@ impl McpDoor {
                 let hint = match self
                     .grant(context)
                     .ok()
-                    .and_then(|grant| self.visible(&grant, other).map(|entry| entry.spec.name.clone()))
+                    .and_then(|grant| Self::visible(&catalog, &grant, other).map(|entry| entry.spec.name.clone()))
                 {
                     Some(tool) => format!("Run it with legion_call, giving tool \"{tool}\"."),
                     None => "This session serves legion_tools, legion_describe and legion_call; legion_call runs every other tool.".to_owned(),
@@ -381,6 +386,7 @@ impl McpDoor {
     /// `legion_tools`: the tools the principal may use, optionally of one family.
     fn list_compact(
         &self,
+        catalog: &Catalog,
         family: Option<&str>,
         context: &RequestContext<RoleServer>,
     ) -> Result<Value, ErrorBody> {
@@ -395,8 +401,7 @@ impl McpDoor {
             description: &'a str,
         }
         let grant = self.grant(context)?;
-        let allowed: Vec<&catalog::Entry> = self
-            .catalog
+        let allowed: Vec<&catalog::Entry> = catalog
             .entries()
             .iter()
             .filter(|entry| grant.allows(&entry.spec))

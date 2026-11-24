@@ -121,8 +121,8 @@ pub fn listen_address(text: &str) -> Result<SocketAddr, ErrorBody> {
 pub struct HttpDoor {
     node: Node,
     router: Arc<dyn Router>,
-    full: Arc<crate::mcp::catalog::Catalog>,
-    compact: Arc<crate::mcp::catalog::Catalog>,
+    full: Arc<crate::mcp::catalog::CatalogCache>,
+    compact: Arc<crate::mcp::catalog::CatalogCache>,
 }
 
 impl HttpDoor {
@@ -160,7 +160,7 @@ impl HttpDoor {
             limit: Arc::new(Semaphore::new(MAX_CALLS)),
         };
         let calls = TaskTracker::new();
-        let mcp = |compact: bool, catalog: Arc<crate::mcp::catalog::Catalog>| {
+        let mcp = |compact: bool, catalog: Arc<crate::mcp::catalog::CatalogCache>| {
             let (node, router, link, calls) = (
                 self.node.clone(),
                 Arc::clone(&self.router),
