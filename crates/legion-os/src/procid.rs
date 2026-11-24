@@ -177,6 +177,32 @@ fn parse_prefixed_u64(value: &str, prefix: &str) -> Option<u64> {
     rest.parse::<u64>().ok()
 }
 
+/// Stop a single verified process without signaling its process group or walking descendants.
+///
+/// Returns `Ok(true)` once the exact process identified by `identity` is no longer alive
+/// (including when it has already exited or its PID has been reused by another process), and
+/// `Ok(false)` if it remained alive past the post-kill settle timeout.
+///
+/// - **Unix:** sends `SIGTERM`, polls up to `grace`, and escalates to `SIGKILL`; when `force` is
+///   `true`, sends `SIGKILL` immediately without waiting for `grace`.
+/// - **Windows:** opens `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`,
+///   verifies its exact 100-ns `FILETIME` creation time while the held handle pins the PID against
+///   reuse, and calls `TerminateProcess` directly through that handle (both `force = false` and
+///   `force = true` terminate immediately via the pinned handle).
+pub async fn kill_process(identity: &ProcessId, force: bool, grace: Duration) -> Result<bool> {
+    if identity.pid == 0 {
+        return Err(OsError::InvalidArgument {
+            detail: "cannot terminate pid 0".into(),
+        });
+    }
+    if identity.pid == std::process::id() {
+        return Err(OsError::InvalidArgument {
+            detail: "refusing to terminate the current process".into(),
+        });
+    }
+    kill_process_impl(identity, force, grace).await
+}
+
 /// Stop a process and all of its descendants when the root is not a direct child of this process.
 ///
 /// Works even if the root process has already exited while descendants survive:
@@ -225,6 +251,18 @@ fn read_boot_id_impl() -> Result<String> {
 fn read_boot_id_impl() -> Result<String> {
     Err(OsError::Unsupported {
         detail: "boot id lookup is not supported on this platform".into(),
+    })
+}
+
+#[cfg(any(unix, windows))]
+async fn kill_process_impl(identity: &ProcessId, force: bool, grace: Duration) -> Result<bool> {
+    platform::kill_process(identity, force, grace).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn kill_process_impl(_identity: &ProcessId, _force: bool, _grace: Duration) -> Result<bool> {
+    Err(OsError::Unsupported {
+        detail: "single-process termination is not supported on this platform".into(),
     })
 }
 
@@ -463,6 +501,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OsError::InvalidArgument { .. }));
+    }
+
+    #[tokio::test]
+    async fn kill_process_refuses_current_process_and_zero_pid_and_handles_absent() {
+        let me = current().unwrap();
+        let err = kill_process(&me, false, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OsError::InvalidArgument { .. }));
+
+        let zero = ProcessId::new(0, 1);
+        let err = kill_process(&zero, true, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OsError::InvalidArgument { .. }));
+
+        let absent = ProcessId::new(i32::MAX as u32, 1);
+        let gone = kill_process(&absent, false, Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(gone);
+        assert!(is_alive(&me));
     }
 
     #[tokio::test]

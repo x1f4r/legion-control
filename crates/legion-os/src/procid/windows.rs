@@ -28,6 +28,50 @@ pub(super) fn boot_id() -> Result<String> {
     Ok(format!("boot-win-{unbiased}"))
 }
 
+pub(super) async fn kill_process(
+    identity: &ProcessId,
+    _force: bool,
+    grace: Duration,
+) -> Result<bool> {
+    let identity = *identity;
+
+    let outcome = tokio::task::spawn_blocking(move || win_proc::open_verify_terminate(&identity))
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_process worker task failed: {err}"),
+        })??;
+
+    match outcome {
+        TerminateOutcome::AlreadyGone | TerminateOutcome::IdentityMismatch => return Ok(true),
+        TerminateOutcome::AccessDenied => {
+            return Err(OsError::PermissionDenied {
+                detail: format!("permission denied terminating process {}", identity.pid),
+                source: None,
+            });
+        }
+        TerminateOutcome::Terminated => {}
+    }
+
+    let settle = SETTLE_TIMEOUT.max(grace.min(Duration::from_secs(5)));
+    let deadline = Instant::now() + settle;
+    loop {
+        let alive = tokio::task::spawn_blocking(move || is_alive(&identity))
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("kill_process settle task failed: {err}"),
+            })?;
+        if !alive {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     let identity = *identity;
     let own_pid = std::process::id();

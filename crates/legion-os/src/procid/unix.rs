@@ -169,6 +169,111 @@ pub(super) fn boot_id() -> Result<String> {
     Ok(format!("boot-sec-{secs}"))
 }
 
+pub(super) async fn kill_process(
+    identity: &ProcessId,
+    force: bool,
+    grace: Duration,
+) -> Result<bool> {
+    let raw_pid = i32::try_from(identity.pid).map_err(|_| OsError::InvalidArgument {
+        detail: format!("pid {} exceeds Unix pid_t range", identity.pid),
+    })?;
+    let nix_pid = Pid::from_raw(raw_pid);
+    let identity = *identity;
+
+    let initial_sig = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    let already_gone = tokio::task::spawn_blocking(move || -> Result<bool> {
+        if !is_alive(&identity) {
+            return Ok(true);
+        }
+        match kill(nix_pid, initial_sig) {
+            Ok(()) => Ok(false),
+            Err(Errno::ESRCH) => Ok(true),
+            Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                detail: format!("permission denied signaling process {}", identity.pid),
+                source: None,
+            }),
+            Err(err) => Err(OsError::Platform {
+                detail: format!("failed signaling process {}: {err}", identity.pid),
+            }),
+        }
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("kill_process worker task failed: {err}"),
+    })??;
+
+    if already_gone {
+        return Ok(true);
+    }
+
+    if !force {
+        let grace_deadline = Instant::now() + grace;
+        loop {
+            let alive = tokio::task::spawn_blocking(move || is_alive(&identity))
+                .await
+                .map_err(|err| OsError::Platform {
+                    detail: format!("kill_process poll task failed: {err}"),
+                })?;
+            if !alive {
+                return Ok(true);
+            }
+            let now = Instant::now();
+            if now >= grace_deadline {
+                break;
+            }
+            let remaining = grace_deadline.saturating_duration_since(now);
+            tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+        }
+
+        let gone_on_escalate = tokio::task::spawn_blocking(move || -> Result<bool> {
+            if !is_alive(&identity) {
+                return Ok(true);
+            }
+            match kill(nix_pid, Signal::SIGKILL) {
+                Ok(()) => Ok(false),
+                Err(Errno::ESRCH) => Ok(true),
+                Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                    detail: format!("permission denied escalating process {}", identity.pid),
+                    source: None,
+                }),
+                Err(err) => Err(OsError::Platform {
+                    detail: format!("failed sending SIGKILL to process {}: {err}", identity.pid),
+                }),
+            }
+        })
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("kill_process SIGKILL task failed: {err}"),
+        })??;
+
+        if gone_on_escalate {
+            return Ok(true);
+        }
+    }
+
+    let settle_deadline = Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        let alive = tokio::task::spawn_blocking(move || is_alive(&identity))
+            .await
+            .map_err(|err| OsError::Platform {
+                detail: format!("kill_process settle task failed: {err}"),
+            })?;
+        if !alive {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= settle_deadline {
+            return Ok(false);
+        }
+        let remaining = settle_deadline.saturating_duration_since(now);
+        tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
 pub(super) async fn kill_tree(identity: &ProcessId, grace: Duration) -> Result<KillTreeReport> {
     let raw_pid = i32::try_from(identity.pid).map_err(|_| OsError::InvalidArgument {
         detail: format!("pid {} exceeds Unix pid_t range", identity.pid),

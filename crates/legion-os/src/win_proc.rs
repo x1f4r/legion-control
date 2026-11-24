@@ -386,7 +386,6 @@ pub(crate) fn snapshot_processes() -> Result<Vec<ProcessSnapshotEntry>> {
 /// Open `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verify its
 /// exact 100-ns `FILETIME` creation time while the held handle pins the PID against reuse, and
 /// call `TerminateProcess` through that handle.
-#[allow(dead_code)]
 pub(crate) fn open_verify_terminate(identity: &ProcessId) -> Result<TerminateOutcome> {
     let desired = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
     // SAFETY: `OpenProcess` takes plain integer arguments and the returned handle is immediately

@@ -89,6 +89,10 @@ fn main() -> ExitCode {
             "procid_kill_tree_stops_surviving_descendants_after_root_exits",
             || Box::pin(test_procid_kill_tree_stops_surviving_descendants_after_root_exits()),
         ),
+        (
+            "procid_kill_process_stops_only_verified_target_and_respects_force",
+            || Box::pin(test_procid_kill_process_stops_only_verified_target_and_respects_force()),
+        ),
         ("atomic_write_interrupted_leaves_no_partial_file", || {
             Box::pin(test_atomic_write_interrupted_leaves_no_partial_file())
         }),
@@ -1037,6 +1041,92 @@ async fn test_procid_kill_tree_stops_surviving_descendants_after_root_exits() {
     assert!(
         !procid::is_alive(&child_id),
         "surviving child {child_id} was not stopped by kill_tree after root exited"
+    );
+}
+
+async fn test_procid_kill_process_stops_only_verified_target_and_respects_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild_file = dir.path().join("single_grandchild.pid");
+    let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+
+    // 1. Verify kill_process kills only the target PID (leaving its child running) and ignores
+    //    mismatched start times.
+    let mut parent = Command::new(current_exe())
+        .env(HELPER_ENV, "spawn_tree")
+        .arg(&grandchild_str)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut ready_line = String::new();
+    let mut reader = BufReader::new(parent.stdout.take().unwrap());
+    reader.read_line(&mut ready_line).unwrap();
+    assert_eq!(ready_line.trim(), "READY");
+
+    let parent_id = procid::of_pid(parent.id()).unwrap().unwrap();
+    let grandchild_id =
+        parse_procid(&wait_for_file(&grandchild_file, Duration::from_secs(5)).await);
+    assert!(procid::is_alive(&parent_id));
+    assert!(procid::is_alive(&grandchild_id));
+
+    let mismatched = ProcessId::new(parent_id.pid, parent_id.start_time.wrapping_add(7));
+    assert!(
+        procid::kill_process(&mismatched, true, Duration::from_millis(50))
+            .await
+            .unwrap()
+    );
+    assert!(
+        procid::is_alive(&parent_id),
+        "kill_process killed a process with mismatched start_time"
+    );
+
+    // Reap the direct child in a background thread so wait() does not leave a zombie blocking
+    // is_alive checks if needed (of_pid already treats zombies as not alive).
+    let gone = procid::kill_process(&parent_id, false, Duration::from_millis(300))
+        .await
+        .unwrap();
+    let _ = parent.wait();
+    assert!(gone);
+    assert!(!procid::is_alive(&parent_id));
+    assert!(
+        procid::is_alive(&grandchild_id),
+        "kill_process unexpectedly killed child process {grandchild_id}"
+    );
+
+    // Clean up the surviving grandchild via kill_process.
+    assert!(
+        procid::kill_process(&grandchild_id, true, Duration::from_millis(100))
+            .await
+            .unwrap()
+    );
+    assert!(!procid::is_alive(&grandchild_id));
+
+    // 2. Verify force = true kills a SIGTERM-ignoring process immediately without waiting grace.
+    let stubborn_file = dir.path().join("stubborn.pid");
+    let stubborn_str = stubborn_file.to_string_lossy().into_owned();
+    let mut stubborn = Command::new(current_exe())
+        .env(HELPER_ENV, "sleep")
+        .args(["30000", &stubborn_str, "--ignore-term"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stubborn_id = parse_procid(&wait_for_file(&stubborn_file, Duration::from_secs(5)).await);
+    let started = Instant::now();
+    let gone = procid::kill_process(&stubborn_id, true, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let _ = stubborn.wait();
+    assert!(gone);
+    assert!(!procid::is_alive(&stubborn_id));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "force = true waited for grace instead of killing immediately ({elapsed:?})"
     );
 }
 
