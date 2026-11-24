@@ -12,8 +12,8 @@ use tauri::State;
 use tauri::ipc::Channel;
 
 use crate::backend::{
-    AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, RepairResult,
-    UnpairResult,
+    AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, LearnResult,
+    RepairResult, UnpairResult,
 };
 
 /// Log line emitted when the web interface finishes its first paint.
@@ -187,6 +187,23 @@ pub async fn invalidate_sessions(backend: State<'_, SharedBackend>) -> Result<()
         let _ = backend;
         Ok(())
     }
+}
+
+/// Queries `device.endpoint` across the fleet through an answering node, updates learned direct
+/// routes in persistent storage, and returns the learn report plus updated state.
+#[tauri::command]
+pub async fn learn(backend: State<'_, SharedBackend>) -> Result<LearnResult, AppError> {
+    backend.0.learn().await
+}
+
+/// Explicitly accepts a pending host-key change reported for `node` and persists the new pins.
+#[tauri::command]
+pub async fn accept_identity_change(
+    backend: State<'_, SharedBackend>,
+    node: String,
+) -> Result<AppState, AppError> {
+    validate_label_size("Node name", &node)?;
+    backend.0.accept_identity_change(node).await
 }
 
 /// Returns a sensible default name for this device (model on mobile, host name on desktop).

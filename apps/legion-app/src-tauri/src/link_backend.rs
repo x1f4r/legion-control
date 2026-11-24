@@ -4,17 +4,23 @@
 //! rpc`) on desktops when a `legion` binary is installed. State is persisted atomically in
 //! [`AppStore`] without ever logging keys or invites.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use legion_link::{DeviceKey, Invite, Link, LinkConfig, NodeLink as LinkNode};
+use legion_link::proto::Target;
+use legion_link::{
+    DeviceKey, Invite, Link, LinkConfig, MachineRouteStatus, NodeLink as LinkNode, NodeOrigin,
+    Route, parse_optional_target, public_key_fingerprint,
+};
 use serde_json::Value;
 use tauri::ipc::Channel;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::backend::{
-    AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult, ErrorCode, Needs,
-    NodeLink, RepairInfo, RepairResult, UnpairResult,
+    AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult, ErrorCode,
+    IdentityChangedInfo, LearnResult, MachineRouteView, Needs, NodeLink, PairPendingPeer,
+    PairSummary, RepairInfo, RepairResult, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -23,11 +29,27 @@ use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 const LOCAL_NODE_ID: &str = "local";
 
+/// Read-only / door-level tools that may answer from any connected node when `on` is omitted,
+/// so the controller keeps working seamlessly when the originally paired node is off.
+fn is_any_node_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "meta.whoami"
+            | "meta.version"
+            | "fleet.list"
+            | "fleet.ping"
+            | "device.endpoint"
+            | "device.list"
+            | "device.invite"
+    )
+}
+
 /// Production backend implementation over [`legion_link::Link`].
 pub struct LinkBackend {
     store: AppStore,
     state: Mutex<BackendState>,
-    /// Serializes pairing/unpairing mutations so device key generation and store writes never race.
+    /// Serializes pairing/unpairing/learning mutations so device key generation and store writes
+    /// never race.
     mutate_lock: AsyncMutex<()>,
     next_call_seq: AtomicU64,
 }
@@ -38,12 +60,8 @@ struct BackendState {
     local_program: Option<String>,
     active_node: Option<String>,
     temporary_failover: bool,
+    last_paired: Option<PairSummary>,
     link: Link,
-}
-
-struct CandidateNode {
-    name: String,
-    is_implicit_local: bool,
 }
 
 impl LinkBackend {
@@ -106,6 +124,7 @@ impl LinkBackend {
                 local_program,
                 active_node,
                 temporary_failover: false,
+                last_paired: None,
                 link,
             }),
             mutate_lock: AsyncMutex::new(()),
@@ -132,7 +151,7 @@ impl LinkBackend {
         build_app_state(&guard, self.store.path())
     }
 
-    fn candidate_nodes(&self) -> Result<(Link, Vec<CandidateNode>), AppError> {
+    fn active_link_and_primary(&self) -> Result<(Link, Option<String>), AppError> {
         let guard = self
             .state
             .lock()
@@ -141,19 +160,14 @@ impl LinkBackend {
             return Err(err.clone());
         }
         let link = guard.link.clone();
-        let app_state = build_app_state(&guard, self.store.path());
-        let candidates = app_state
-            .nodes
-            .into_iter()
-            .map(|n| {
-                let is_implicit_local = n.via == "local" && guard.data.link.node(&n.node).is_none();
-                CandidateNode {
-                    name: n.node,
-                    is_implicit_local,
-                }
-            })
-            .collect();
-        Ok((link, candidates))
+        let primary = guard.active_node.clone().or_else(|| {
+            build_app_state(&guard, self.store.path())
+                .nodes
+                .into_iter()
+                .next()
+                .map(|n| n.node)
+        });
+        Ok((link, primary))
     }
 
     fn mark_temporary_failover(&self, node: &str) {
@@ -162,6 +176,9 @@ impl LinkBackend {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.store_error.is_some() {
+            return;
+        }
+        if guard.active_node.as_deref() == Some(node) {
             return;
         }
         guard.active_node = Some(node.to_owned());
@@ -186,47 +203,23 @@ impl Backend for LinkBackend {
 
     fn tools(&self, on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
         Box::pin(async move {
-            let (link, candidates) = self.candidate_nodes()?;
-            if candidates.is_empty() {
+            let (link, primary) = self.active_link_and_primary()?;
+            let Some(primary_name) = primary else {
                 return Err(AppError::not_paired());
+            };
+            let (answering, value) = link
+                .tools_any(Some(&primary_name), on)
+                .await
+                .map_err(AppError::from)?;
+            if answering != primary_name {
+                self.mark_temporary_failover(&answering);
             }
-
-            let primary = &candidates[0];
-            let mut last_err: Option<AppError> = None;
-            for (idx, candidate) in candidates.iter().enumerate() {
-                let effective_on = if idx == 0 {
-                    on.clone()
-                } else {
-                    match &on {
-                        Some(explicit) => Some(explicit.clone()),
-                        None if primary.is_implicit_local => break,
-                        None => Some(Value::String(primary.name.clone())),
-                    }
-                };
-                match link.tools(&candidate.name, effective_on).await {
-                    Ok(value) => {
-                        if idx > 0 {
-                            self.mark_temporary_failover(&candidate.name);
-                        }
-                        let tools = value
-                            .get("tools")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        return Ok(tools);
-                    }
-                    Err(body) => {
-                        let app_err = AppError::from(body);
-                        let retry_next = is_failover_error(&app_err);
-                        last_err = Some(app_err);
-                        if !retry_next {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            Err(last_err.unwrap_or_else(AppError::not_paired))
+            let tools = value
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Ok(tools)
         })
     }
 
@@ -236,60 +229,82 @@ impl Backend for LinkBackend {
         on_event: Option<Channel<Value>>,
     ) -> BoxFuture<'_, Result<Value, AppError>> {
         Box::pin(async move {
-            let (link, candidates) = self.candidate_nodes()?;
-            if candidates.is_empty() {
+            let (link, primary) = self.active_link_and_primary()?;
+            let Some(primary_name) = primary else {
                 return Err(AppError::not_paired());
-            }
-
-            let primary = &candidates[0];
+            };
             let call_id = self.next_call_id(request.id);
-            let mut last_err: Option<AppError> = None;
+            let parsed_target =
+                parse_optional_target(request.on.clone()).map_err(AppError::from)?;
 
-            for (idx, candidate) in candidates.iter().enumerate() {
-                let effective_on = if idx == 0 {
-                    request.on.clone()
-                } else {
-                    match &request.on {
-                        Some(explicit) => Some(explicit.clone()),
-                        None if primary.is_implicit_local => break,
-                        None => Some(Value::String(primary.name.clone())),
-                    }
-                };
-                let channel = on_event.clone();
-                let outcome = link
-                    .call_with_id(
-                        &call_id,
-                        &candidate.name,
-                        &request.tool,
-                        request.args.clone(),
-                        effective_on,
-                        move |event| {
-                            if let Some(ch) = &channel {
-                                let _ = ch.send(event);
-                            }
-                        },
-                    )
-                    .await;
+            let channel = on_event;
+            let emit = move |event| {
+                if let Some(ch) = &channel {
+                    let _ = ch.send(event);
+                }
+            };
 
-                match outcome {
-                    Ok(value) => {
-                        if idx > 0 {
-                            self.mark_temporary_failover(&candidate.name);
-                        }
-                        return Ok(value);
+            match parsed_target {
+                Some(Target::One(machine)) => {
+                    let routed = link
+                        .call_machine_with_id(&call_id, &machine, &request.tool, request.args, emit)
+                        .await
+                        .map_err(AppError::from)?;
+                    Ok(routed.value)
+                }
+                Some(Target::All | Target::Many(_)) => {
+                    let (answering, value) = link
+                        .call_any_with_id(
+                            Some(call_id),
+                            Some(&primary_name),
+                            &request.tool,
+                            request.args,
+                            request.on,
+                            emit,
+                        )
+                        .await
+                        .map_err(AppError::from)?;
+                    if answering != primary_name {
+                        self.mark_temporary_failover(&answering);
                     }
-                    Err(body) => {
-                        let app_err = AppError::from(body);
-                        let retry_next = is_failover_error(&app_err);
-                        last_err = Some(app_err);
-                        if !retry_next {
-                            break;
-                        }
+                    Ok(value)
+                }
+                None if is_any_node_tool(&request.tool) => {
+                    let (answering, value) = link
+                        .call_any_with_id(
+                            Some(call_id),
+                            Some(&primary_name),
+                            &request.tool,
+                            request.args,
+                            None,
+                            emit,
+                        )
+                        .await
+                        .map_err(AppError::from)?;
+                    if answering != primary_name {
+                        self.mark_temporary_failover(&answering);
                     }
+                    Ok(value)
+                }
+                None => {
+                    let routed = link
+                        .call_machine_with_id(
+                            &call_id,
+                            &primary_name,
+                            &request.tool,
+                            request.args,
+                            emit,
+                        )
+                        .await
+                        .map_err(AppError::from)?;
+                    if let Route::Relay { via } = &routed.route
+                        && via != &primary_name
+                    {
+                        self.mark_temporary_failover(via);
+                    }
+                    Ok(routed.value)
                 }
             }
-
-            Err(last_err.unwrap_or_else(AppError::not_paired))
         })
     }
 
@@ -361,6 +376,7 @@ impl Backend for LinkBackend {
                 .await
                 .map_err(AppError::from)?;
 
+            let pair_summary = build_pair_summary(&enrolled);
             let node_entry = LinkNode::from(enrolled.clone());
             let node_name = enrolled.node.clone();
             let meta = StoredNodeMeta {
@@ -383,6 +399,7 @@ impl Backend for LinkBackend {
                 guard.data = updated_data;
                 guard.active_node = Some(node_name);
                 guard.temporary_failover = false;
+                guard.last_paired = Some(pair_summary);
                 build_app_state(&guard, self.store.path())
             };
 
@@ -545,6 +562,7 @@ impl Backend for LinkBackend {
                 guard.store_error = None;
                 guard.active_node = active;
                 guard.temporary_failover = false;
+                guard.last_paired = None;
                 (old, build_app_state(&guard, self.store.path()))
             };
 
@@ -575,18 +593,139 @@ impl Backend for LinkBackend {
             Ok(())
         })
     }
+
+    fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+        Box::pin(async move {
+            self.require_healthy_store()?;
+            let link = {
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
+                guard.link.clone()
+            };
+
+            let report = link.learn().await.map_err(AppError::from)?;
+
+            let _mutation = self.mutate_lock.lock().await;
+            let state = {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
+                let live_cfg = guard.link.config();
+                let mut updated = guard.data.clone();
+                updated.link = persisted_link_config(&live_cfg, &guard.data.link);
+                let introducer_meta = updated.meta(&report.introducer).cloned();
+                for added_node in &report.added {
+                    if updated.meta(added_node).is_none()
+                        && let Some(meta) = &introducer_meta
+                    {
+                        updated.upsert_meta(StoredNodeMeta {
+                            node: added_node.clone(),
+                            role: meta.role.clone(),
+                            device: meta.device.clone(),
+                        });
+                    }
+                }
+                if updated != guard.data {
+                    self.store.save(&updated)?;
+                    guard.data = updated;
+                }
+                build_app_state(&guard, self.store.path())
+            };
+
+            Ok(LearnResult { report, state })
+        })
+    }
+
+    fn accept_identity_change(&self, node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+        Box::pin(async move {
+            self.require_healthy_store()?;
+            let trimmed = node.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::new(
+                    ErrorCode::InvalidArgs,
+                    "Node name cannot be empty.",
+                ));
+            }
+            let _mutation = self.mutate_lock.lock().await;
+            let state = {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
+                let _ = guard
+                    .link
+                    .accept_identity_change(trimmed)
+                    .map_err(AppError::from)?;
+                let live_cfg = guard.link.config();
+                let mut updated = guard.data.clone();
+                updated.link = persisted_link_config(&live_cfg, &guard.data.link);
+                self.store.save(&updated)?;
+                guard.data = updated;
+                build_app_state(&guard, self.store.path())
+            };
+            Ok(state)
+        })
+    }
 }
 
-/// Returns `true` only when `legion-link` proved the request never left this device (`details.sent
-/// == false`) and the failure was a transport-level unreachable or connect/handshake timeout.
-fn is_failover_error(err: &AppError) -> bool {
-    matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout)
-        && err
-            .details
-            .as_ref()
-            .and_then(|d| d.get(legion_link::DETAIL_SENT))
-            .and_then(Value::as_bool)
-            == Some(false)
+fn build_pair_summary(enrolled: &legion_link::Enrolled) -> PairSummary {
+    let mut synced = Vec::new();
+    let mut not_synced = Vec::new();
+    for (peer, outcome) in &enrolled.fleet {
+        if outcome.status == "synced" {
+            synced.push(peer.clone());
+        } else {
+            not_synced.push(PairPendingPeer {
+                node: peer.clone(),
+                reason: outcome.reason.clone(),
+            });
+        }
+    }
+    for pending in &enrolled.not_synced_to {
+        if !not_synced.iter().any(|p| &p.node == pending) {
+            not_synced.push(PairPendingPeer {
+                node: pending.clone(),
+                reason: None,
+            });
+        }
+    }
+    PairSummary {
+        node: enrolled.node.clone(),
+        device: enrolled.device.clone(),
+        role: enrolled.role.clone(),
+        synced,
+        not_synced,
+        sync_command: enrolled.sync_command.clone(),
+    }
+}
+
+/// Filters the implicit desktop `local` pipe out of `live_cfg` before persisting to `AppStore`
+/// unless the user explicitly persisted a node with that name.
+fn persisted_link_config(live_cfg: &LinkConfig, previous_persisted: &LinkConfig) -> LinkConfig {
+    let mut out = live_cfg.clone();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let had_persisted_local = previous_persisted.node(LOCAL_NODE_ID).is_some();
+        if !had_persisted_local {
+            out.nodes
+                .retain(|n| !(n.node == LOCAL_NODE_ID && n.target.is_none()));
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = previous_persisted;
+    out
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -640,7 +779,37 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
                 path: store_path.display().to_string(),
             }),
             can_scan,
+            routes: BTreeMap::new(),
+            last_paired: None,
         };
+    }
+
+    let raw_routes = state.link.route_status();
+    let mut routes: BTreeMap<String, MachineRouteView> = BTreeMap::new();
+    for (machine, status) in &raw_routes {
+        let view = match status {
+            MachineRouteStatus::Direct => MachineRouteView {
+                kind: "direct".to_owned(),
+                via: None,
+                introducer: None,
+            },
+            MachineRouteStatus::Relay { via } => MachineRouteView {
+                kind: "relay".to_owned(),
+                via: Some(via.clone()),
+                introducer: None,
+            },
+            MachineRouteStatus::NotSyncedYet { introducer, via } => MachineRouteView {
+                kind: "not_synced".to_owned(),
+                via: via.clone(),
+                introducer: introducer.clone(),
+            },
+            MachineRouteStatus::IdentityChanged { reported_by } => MachineRouteView {
+                kind: "identity_changed".to_owned(),
+                via: Some(reported_by.clone()),
+                introducer: None,
+            },
+        };
+        routes.insert(machine.clone(), view);
     }
 
     let mut nodes: Vec<NodeLink> = Vec::new();
@@ -657,6 +826,11 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             path: Some(local_path.clone()),
             temporary: state.temporary_failover
                 && state.active_node.as_deref() == Some(LOCAL_NODE_ID),
+            origin: "paired".to_owned(),
+            learned_from: None,
+            route: "direct".to_owned(),
+            route_via: None,
+            identity_changed: None,
         });
     }
 
@@ -669,6 +843,46 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         };
         let temporary =
             state.temporary_failover && state.active_node.as_deref() == Some(entry.node.as_str());
+        let origin = match entry.origin {
+            NodeOrigin::Paired => "paired",
+            NodeOrigin::Learned => "learned",
+        };
+        let identity_changed = entry.identity_changed.as_ref().map(|pending| {
+            let old_fingerprints = entry
+                .target
+                .as_ref()
+                .map(|t| {
+                    t.host_keys
+                        .iter()
+                        .filter_map(|k| public_key_fingerprint(k))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let new_fingerprints = pending
+                .target
+                .host_keys
+                .iter()
+                .filter_map(|k| public_key_fingerprint(k))
+                .collect();
+            IdentityChangedInfo {
+                reported_by: pending.reported_by.clone(),
+                hosts: pending.target.hosts.clone(),
+                port: pending.target.port,
+                old_fingerprints,
+                new_fingerprints,
+            }
+        });
+        let (route_kind, route_via) = match raw_routes.get(&entry.node) {
+            Some(MachineRouteStatus::IdentityChanged { reported_by }) => {
+                ("identity_changed".to_owned(), Some(reported_by.clone()))
+            }
+            Some(MachineRouteStatus::NotSyncedYet { introducer, via }) => (
+                "not_synced".to_owned(),
+                introducer.clone().or_else(|| via.clone()),
+            ),
+            Some(MachineRouteStatus::Relay { via }) => ("relay".to_owned(), Some(via.clone())),
+            _ => ("direct".to_owned(), None),
+        };
         nodes.push(NodeLink {
             node: entry.node.clone(),
             principal: entry
@@ -681,6 +895,11 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             via: via.to_owned(),
             path,
             temporary,
+            origin: origin.to_owned(),
+            learned_from: entry.learned_from.clone(),
+            route: route_kind,
+            route_via,
+            identity_changed,
         });
     }
 
@@ -701,6 +920,8 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         needs,
         repair: None,
         can_scan,
+        routes,
+        last_paired: state.last_paired.clone(),
     }
 }
 
@@ -1601,6 +1822,234 @@ mod tests {
             )
             .await?;
         assert_eq!(opens.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn learn_persists_direct_routes_handles_identity_change_and_keeps_working_when_a_is_off()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let key_a = DeviceKey::from_seed([1u8; 32]).public_key_line("a")?;
+        let key_b1 = DeviceKey::from_seed([2u8; 32]).public_key_line("b1")?;
+        let key_b2 = DeviceKey::from_seed([3u8; 32]).public_key_line("b2")?;
+
+        let mut initial = AppStoreData::default();
+        initial.link.device_key = Some(DeviceKey::from_seed([9u8; 32]).to_openssh()?);
+        initial.link.upsert_node(LinkNode::ssh(
+            "tower",
+            SshTarget {
+                hosts: vec!["tower.example".to_owned()],
+                port: 22,
+                user: "me".to_owned(),
+                host_keys: vec![key_a.clone()],
+            },
+            Some("device:pixel".to_owned()),
+        ));
+        initial.current_node = Some("tower".to_owned());
+        initial.upsert_meta(StoredNodeMeta {
+            node: "tower".to_owned(),
+            role: Some("owner".to_owned()),
+            device: Some("pixel".to_owned()),
+        });
+        store.save(&initial)?;
+
+        let tower_down = Arc::new(AtomicBool::new(false));
+        let rekey_b = Arc::new(AtomicBool::new(false));
+        let tower_down_c = Arc::clone(&tower_down);
+        let rekey_b_c = Arc::clone(&rekey_b);
+        let key_a_c = key_a.clone();
+        let key_b1_c = key_b1.clone();
+        let key_b2_c = key_b2.clone();
+
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let tower_down_c = Arc::clone(&tower_down_c);
+            let rekey_b_c = Arc::clone(&rekey_b_c);
+            let key_a_c = key_a_c.clone();
+            let key_b1_c = key_b1_c.clone();
+            let key_b2_c = key_b2_c.clone();
+            Box::pin(async move {
+                if entry.node == "tower" && tower_down_c.load(Ordering::SeqCst) {
+                    return Err(legion_link::proto::ErrorBody::new(
+                        legion_link::proto::ErrorCode::Unreachable,
+                        "tower is off",
+                    )
+                    .with_machine("tower"));
+                }
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            )
+                        } else if req.params.get("tool").and_then(Value::as_str)
+                            == Some("device.endpoint")
+                        {
+                            let b_key = if rekey_b_c.load(Ordering::SeqCst) {
+                                key_b2_c.clone()
+                            } else {
+                                key_b1_c.clone()
+                            };
+                            Response::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "results": {
+                                        "tower": {
+                                            "ok": {
+                                                "node": "tower",
+                                                "hosts": ["tower.example"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [key_a_c],
+                                            }
+                                        },
+                                        "pi": {
+                                            "ok": {
+                                                "node": "pi",
+                                                "hosts": ["pi.example"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [b_key],
+                                            }
+                                        }
+                                    }
+                                }),
+                            )
+                        } else {
+                            Response::ok(
+                                req.id,
+                                serde_json::json!({ "node": node_name, "ok": true }),
+                            )
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                        out.push('\n');
+                        if server_w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store.clone(), None, opener);
+        let learned = backend.learn().await?;
+        assert_eq!(learned.report.added, vec!["pi".to_owned()]);
+        assert_eq!(learned.state.nodes.len(), 2);
+        let pi_view = learned
+            .state
+            .nodes
+            .iter()
+            .find(|n| n.node == "pi")
+            .ok_or("pi missing from state")?;
+        assert_eq!(pi_view.origin, "learned");
+        assert_eq!(pi_view.learned_from.as_deref(), Some("tower"));
+        assert_eq!(pi_view.route, "direct");
+
+        // Persisted store now contains learned `pi`.
+        assert!(store.load()?.link.node("pi").is_some());
+
+        // Turn `tower` off: `fleet.list` (any-node) and direct calls to `pi` still succeed!
+        backend.invalidate_sessions().await?;
+        tower_down.store(true, Ordering::SeqCst);
+        let list_res = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "fleet.list".to_owned(),
+                    args: serde_json::json!({}),
+                    on: None,
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(list_res["node"], "pi");
+        let pi_call = backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.info".to_owned(),
+                    args: serde_json::json!({}),
+                    on: Some(Value::String("pi".to_owned())),
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(pi_call["node"], "pi");
+
+        // Rekey `pi` and learn again: `identity_changed` is flagged and persisted; accepting
+        // updates the persisted pins.
+        tower_down.store(false, Ordering::SeqCst);
+        rekey_b.store(true, Ordering::SeqCst);
+        let learned2 = backend.learn().await?;
+        assert_eq!(learned2.report.identity_changed, vec!["pi".to_owned()]);
+        let pi_warn = learned2
+            .state
+            .nodes
+            .iter()
+            .find(|n| n.node == "pi")
+            .ok_or("pi missing")?;
+        assert_eq!(pi_warn.route, "identity_changed");
+        let ic = pi_warn
+            .identity_changed
+            .as_ref()
+            .ok_or("expected identity_changed info")?;
+        assert_eq!(ic.reported_by, "tower");
+        assert!(!ic.old_fingerprints.is_empty());
+        assert!(!ic.new_fingerprints.is_empty());
+        assert_ne!(ic.old_fingerprints, ic.new_fingerprints);
+
+        let accepted_state = backend.accept_identity_change("pi".to_owned()).await?;
+        let pi_ok = accepted_state
+            .nodes
+            .iter()
+            .find(|n| n.node == "pi")
+            .ok_or("pi missing")?;
+        assert!(pi_ok.identity_changed.is_none());
+        assert_eq!(
+            store
+                .load()?
+                .link
+                .node("pi")
+                .and_then(|n| n.target.as_ref())
+                .map(|t| t.host_keys.clone()),
+            Some(vec![key_b2])
+        );
         Ok(())
     }
 }

@@ -121,7 +121,7 @@ pub use invite::{
     SshTimeouts,
 };
 #[cfg(feature = "ssh")]
-pub use key::DeviceKey;
+pub use key::{DeviceKey, public_key_fingerprint};
 pub use link::{
     DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, LearnReport, Link, LinkConfig, LinkOptions,
     MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,

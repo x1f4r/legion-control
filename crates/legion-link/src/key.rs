@@ -110,6 +110,13 @@ impl DeviceKey {
     }
 }
 
+/// Computes the OpenSSH SHA-256 fingerprint (`SHA256:...`) for a single-line OpenSSH public key.
+pub fn public_key_fingerprint(openssh_line: &str) -> Option<String> {
+    PublicKey::from_openssh(openssh_line.trim())
+        .ok()
+        .map(|k| k.fingerprint(HashAlg::Sha256).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
