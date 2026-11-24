@@ -41,7 +41,8 @@ jobs:
             os: windows-latest
             shell: powershell
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # The real power steps wait out a cancelled restart's ten minutes on top of the rest.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -237,12 +238,16 @@ jobs:
             "E2E_SSHD_LOG=$(Join-Path $programData 'logs\sshd.log')"
           ) | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
 
+      # --real-power: this runner is thrown away after the job, so here, and only here, the far node
+      # really schedules a restart and a shutdown and calls them off (steps l of the driver). If
+      # calling off ever fails, the job dies with its runner instead of reporting.
       - name: Run the scenario (Linux and macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: >-
           node scripts/legion-e2e.mjs --bin target/release/legion --work "$E2E_DIR/work"
           --far legion-e2e-far --gate legion-e2e-gate --far-home "$E2E_FAR_HOME" --far-bin "$E2E_FAR_BIN"
+          --real-power
       # From PowerShell rather than Git's bash, whose PATH would put Git's own ssh ahead of the
       # Windows OpenSSH client people use.
       - name: Run the scenario (Windows)
@@ -251,6 +256,7 @@ jobs:
         run: >-
           node scripts/legion-e2e.mjs --bin target/release/legion.exe --work "$env:E2E_DIR/work"
           --far legion-e2e-far --gate legion-e2e-gate --far-home "$env:E2E_FAR_HOME" --far-bin "$env:E2E_FAR_BIN"
+          --real-power
 
       # What there is to read when it fails: both audit logs, the doctor's answers, every call the
       # driver made, and sshd's log. None of it is key material, and the check below makes sure.
