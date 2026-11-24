@@ -1040,13 +1040,14 @@ step('g8 device.list shows the paired device and device.remove revokes its ssh k
   }
 }, ['g6']);
 
-step('g8b role-based pairing, device.set, and fleet.sync devices.toml pull across near and far', () => {
+step('g8b role-based pairing, device.set, and fleet.sync devices.toml pull and push across near and far', () => {
   const dir = path.join(opts.work, 'pair-fleet-keys');
   const nearAuth = path.join(dir, 'near_authorized_keys');
   const nearNodeTomlPath = path.join(nearHome, 'config', 'node.toml');
   const origNearNodeToml = fs.readFileSync(nearNodeTomlPath, 'utf8');
   let configuredFar = false;
   let enrolledOnFar = false;
+  let enrolledOnNear = false;
   try {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
@@ -1056,7 +1057,13 @@ step('g8b role-based pairing, device.set, and fleet.sync devices.toml pull acros
       ok('fs.write', { path: path.join(opts.farHome, 'config', 'node.toml'), content: farContent }, { on: 'far' });
       configuredFar = true;
     }
-    fs.writeFileSync(nearNodeTomlPath, `name = "near"\n\n[devices]\nauthorized_keys = ${lit(nearAuth)}\n`);
+    const nearHostKey = path.join(dir, 'near_host_ed25519_key');
+    const genNearHost = exec('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'near-host', '-f', nearHostKey]);
+    check(genNearHost.status === 0, 'ssh-keygen failed for near host key', genNearHost.stderr || genNearHost.stdout);
+    fs.writeFileSync(
+      nearNodeTomlPath,
+      `name = "near"\n\n[devices]\nauthorized_keys = ${lit(nearAuth)}\nhost_keys = [${lit(`${nearHostKey}.pub`)}]\n`,
+    );
 
     const invited = ok(
       'device.invite',
@@ -1161,8 +1168,130 @@ step('g8b role-based pairing, device.set, and fleet.sync devices.toml pull acros
     );
     const revoked = sshDirect(deviceKey, knownHosts, payload.user, payload.port, 'legion rpc');
     check(revoked.status !== 0, 'revoked e2e-fleet key still authenticated on far');
-    return 'role pairing, device.set, and devices.toml sync pull verified';
+
+    // Reverse direction (near -> far): enrol on near and push to far so far reconciles directly
+    // into its real authorized_keys (administrators_authorized_keys on Windows, sshd authorized_keys
+    // on macOS/Linux), upgrades role on push, and revokes on tombstone push.
+    const nearInvited = ok('device.invite', { name: 'E2E Pushed', role: 'observer', host: '127.0.0.1', port: 22 });
+    const nearPayload = decodeInvite(nearInvited.invite);
+    const pushedKey = path.join(dir, 'pushed_device_ed25519');
+    const genPushed = exec('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'e2e-pushed', '-f', pushedKey]);
+    check(genPushed.status === 0, 'ssh-keygen failed for near-pushed device key', genPushed.stderr || genPushed.stdout);
+    lockDownPrivateKey(pushedKey);
+    const pushedPub = fs.readFileSync(`${pushedKey}.pub`, 'utf8').trim();
+    const nearReqLine = `${JSON.stringify({ enrol: 1, id: nearPayload.id, public_key: pushedPub, name: 'ignored' })}\n`;
+    const nearEnrol = exec(near, ['gate', '--enrol', nearPayload.id, '--home', nearHome], {
+      env: nearEnv(),
+      input: nearReqLine,
+      timeout: 60_000,
+    });
+    check(nearEnrol.status === 0, `local near enrolment failed with exit ${nearEnrol.status}`, {
+      stdout: nearEnrol.stdout,
+      stderr: nearEnrol.stderr,
+    });
+    const nearReply = JSON.parse(nearEnrol.stdout.trim());
+    check(
+      nearReply.ok === true
+        && nearReply.principal === 'device:e2e-pushed'
+        && nearReply.role === 'observer'
+        && nearReply.device === 'e2e-pushed'
+        && nearReply.fleet?.far?.status === 'synced',
+      'near enrolment did not auto-push e2e-pushed to far',
+      nearReply,
+    );
+    enrolledOnNear = true;
+
+    const farAuthPath = windows
+      ? path.join(process.env.ProgramData ?? 'C:\\ProgramData', 'ssh', 'administrators_authorized_keys')
+      : opts.farAuthKeys;
+    if (farAuthPath) {
+      const contents = fs.readFileSync(farAuthPath, 'utf8');
+      check(contents.includes('legion-device:e2e-pushed'), `${farAuthPath} does not contain pushed legion-device:e2e-pushed line`);
+      if (windows && opts.farShell) {
+        const err = windowsForcedCommandError(contents, 'legion-device:e2e-pushed', opts.farShell);
+        check(err === null, err ?? '');
+      }
+    }
+
+    const parseRpcReplies = (stdout) => {
+      const map = new Map();
+      for (const line of stdout.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const msg = JSON.parse(trimmed);
+          if (msg.id !== undefined && msg.method === undefined) map.set(msg.id, msg);
+        } catch {
+          // Ignore non-JSON preamble lines.
+        }
+      }
+      return map;
+    };
+
+    const obsRpc = sshDirect(
+      pushedKey,
+      knownHosts,
+      payload.user,
+      payload.port,
+      'legion rpc',
+      [
+        JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'call', params: { tool: 'meta.whoami', args: {} } }),
+        JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'call', params: { tool: 'fs.write', args: { path: `${farRoot}/projects/pushed-nope.txt`, content: 'no\n' } } }),
+      ].join('\n') + '\n',
+    );
+    check(obsRpc.status === 0, `pushed observer rpc to far exited ${obsRpc.status}`, { stdout: obsRpc.stdout, stderr: obsRpc.stderr });
+    const obsReplies = parseRpcReplies(obsRpc.stdout);
+    check(
+      obsReplies.get(1)?.result?.node === 'far'
+        && obsReplies.get(1)?.result?.principal === 'device:e2e-pushed'
+        && obsReplies.get(1)?.result?.role === 'observer'
+        && obsReplies.get(1)?.result?.door === 'ssh',
+      'pushed device did not authenticate on far as device:e2e-pushed (observer)',
+      obsReplies.get(1),
+    );
+    check(obsReplies.get(2)?.error?.data?.code === 'denied', 'pushed observer was not denied fs.write on far', obsReplies.get(2));
+
+    // Upgrade role observer -> editor on near (auto-pushes to far) and verify write now succeeds on far.
+    const setPushed = ok('device.set', { name: 'e2e-pushed', role: 'editor' });
+    check(
+      setPushed.role === 'editor' && setPushed.fleet?.far?.status === 'synced',
+      'device.set on near did not push role upgrade to far',
+      setPushed,
+    );
+    const edRpc = sshDirect(
+      pushedKey,
+      knownHosts,
+      payload.user,
+      payload.port,
+      'legion rpc',
+      `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'call', params: { tool: 'fs.write', args: { path: `${farRoot}/projects/pushed-from-near.txt`, content: 'pushed\n' } } })}\n`,
+    );
+    check(edRpc.status === 0, `pushed editor rpc to far exited ${edRpc.status}`, { stdout: edRpc.stdout, stderr: edRpc.stderr });
+    const edReplies = parseRpcReplies(edRpc.stdout);
+    check(edReplies.get(1)?.result?.size === 7, 'fs.write on far failed after device.set push from near', edReplies.get(1));
+
+    // Remove on near (auto-pushes tombstone to far) and confirm far drops the key and refuses SSH.
+    const rmPushed = ok('device.remove', { name: 'e2e-pushed' });
+    enrolledOnNear = false;
+    check(
+      rmPushed.removed === true && rmPushed.fleet?.far?.status === 'synced',
+      'device.remove on near did not push tombstone to far',
+      rmPushed,
+    );
+    if (farAuthPath) {
+      check(
+        !fs.readFileSync(farAuthPath, 'utf8').includes('legion-device:e2e-pushed'),
+        `${farAuthPath} still contained legion-device:e2e-pushed after tombstone push from near`,
+      );
+    }
+    const pushedRevoked = sshDirect(pushedKey, knownHosts, payload.user, payload.port, 'legion rpc');
+    check(pushedRevoked.status !== 0, 'revoked e2e-pushed key still authenticated on far');
+
+    return 'role pairing, device.set, and bidirectional devices.toml pull and push reconcile verified';
   } finally {
+    if (enrolledOnNear) {
+      call('device.remove', { name: 'e2e-pushed' });
+    }
     if (enrolledOnFar) {
       call('device.remove', { name: 'e2e-fleet' }, { on: 'far' });
     }

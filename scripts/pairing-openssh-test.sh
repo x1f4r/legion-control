@@ -820,7 +820,37 @@ if "${ssh_base[@]}" -i "$work/fleet_phone_key" me@127.0.0.1 'legion rpc' </dev/n
   echo "fleet-phone still authenticated on box after fleet.sync revocation!" >&2
   exit 1
 fi
-echo "    two-node fleet device pairing, endpoint discovery, device.set, and offline revocation sync verified"
+
+# Trust rule check: planting an extra live owner entry on box2 must NOT be imported by box on push.
+ssh-keygen -q -t ed25519 -N '' -C 'planted@box2' -f "$work/planted_key"
+planted_pub="$(awk '{print $1 " " $2}' "$work/planted_key.pub")"
+python3 - "$box2_home/config/devices.toml" "$planted_pub" <<'PY'
+import datetime, sys
+path, pub = sys.argv[1], sys.argv[2]
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(
+        '\n[devices.dddddddddddddddddddddddddddddddd]\n'
+        'name = "planted-owner"\n'
+        f'public_key = "{pub}"\n'
+        'principal = "owner"\n'
+        'role = "owner"\n'
+        f'paired_at = "{now}"\n'
+        'paired_on = "box2"\n'
+        f'updated_at = "{now}"\n'
+        'updated_on = "box2"\n'
+    )
+PY
+legion fleet.sync direction=push documents='["devices.toml"]' --json >/dev/null
+if grep -q 'dddddddddddddddddddddddddddddddd' "$HOME/.config/legion/devices.toml"; then
+  echo "box imported live planted-owner entry from box2 during push!" >&2
+  exit 1
+fi
+if "${ssh_base[@]}" -i "$work/planted_key" me@127.0.0.1 'legion rpc' </dev/null >/dev/null 2>&1; then
+  echo "planted-owner key authenticated on box after push!" >&2
+  exit 1
+fi
+echo "    two-node fleet device pairing, endpoint discovery, device.set, offline revocation sync, and push trust rule verified"
 USER_EOF
 
 chmod 0755 /tmp/pairing-user-test.sh
