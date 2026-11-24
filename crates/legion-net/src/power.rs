@@ -494,14 +494,16 @@ async fn power_switch(
         .with_hint("Call power.switch from another machine, or power.restart here."));
     }
     let file = ctx.config().get::<FleetFile>()?;
-    if file.machine(&machine).is_none() {
+    let Some(entry) = file.machine(&machine) else {
         return Err(unknown_machine(&machine, &file, &here));
-    }
+    };
+    // A machine reached through a relay has no session of its own here.
+    let relayed = entry.via.is_some();
 
-    let before = look(hands, ctx, &machine, LOOK_TIMEOUT)
+    let before = look(hands, ctx, &machine, relayed, LOOK_TIMEOUT)
         .await
-        .map_err(|error| {
-            ErrorBody::new(
+        .map_err(|error| match error.code {
+            ErrorCode::Unreachable => ErrorBody::new(
                 ErrorCode::Unreachable,
                 format!(
                     "{machine} does not answer, so it cannot be restarted: {}",
@@ -509,7 +511,10 @@ async fn power_switch(
                 ),
             )
             .with_hint(format!("Wake it first with power.wake machine={machine}."))
-            .with_machine(&machine)
+            .with_machine(&machine),
+            // Denied, unsupported, not found: what it is, not a machine asleep.
+            _ if error.machine.is_some() => error,
+            _ => error.with_machine(&machine),
         })?;
     let Some(boot_before) = before.boot_id.clone() else {
         return Err(ErrorBody::new(
@@ -578,7 +583,7 @@ async fn power_switch(
         if left.is_zero() {
             break;
         }
-        match look(hands, ctx, &machine, left.min(LOOK_TIMEOUT)).await {
+        match look(hands, ctx, &machine, relayed, left.min(LOOK_TIMEOUT)).await {
             Ok(seen) if seen.boot_id.is_some() && seen.boot_id.as_deref() != Some(&boot_before) => {
                 let came_back = result(seen.system.clone(), true);
                 return match &args.into {
@@ -649,8 +654,12 @@ async fn look(
     hands: &Hands,
     ctx: &Ctx,
     machine: &str,
+    relayed: bool,
     timeout: Duration,
 ) -> Result<Seen, ErrorBody> {
+    if relayed {
+        return look_through_relay(hands, ctx, machine, timeout).await;
+    }
     let cancel = ctx.cancel_token().child_token();
     let config: &ConfigStore = ctx.config();
     let work = async {
@@ -678,6 +687,44 @@ async fn look(
                 format!("{machine} did not answer within {} seconds", timeout.as_secs()),
             ))
         }
+    }
+}
+
+/// The boot id and system of a machine reached through a relay, from its own power.status: the
+/// relay forwards the call, and the machine answers it.
+async fn look_through_relay(
+    hands: &Hands,
+    ctx: &Ctx,
+    machine: &str,
+    timeout: Duration,
+) -> Result<Seen, ErrorBody> {
+    let asked = hands.fleet.call_remote(
+        ctx,
+        machine,
+        "power.status",
+        json!({}),
+        EventSink::discard(),
+    );
+    // power.status only reads, so a call given up on here changes nothing there.
+    match tokio::time::timeout(timeout, asked).await {
+        Ok(Ok(status)) => Ok(Seen {
+            boot_id: status
+                .get("boot_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            system: status
+                .get("system")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(ErrorBody::new(
+            ErrorCode::Unreachable,
+            format!(
+                "{machine} did not answer through its relay within {} seconds",
+                timeout.as_secs()
+            ),
+        )),
     }
 }
 

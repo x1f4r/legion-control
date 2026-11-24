@@ -51,6 +51,10 @@ fn main() -> ExitCode {
             "switch_confirms_a_new_boot_in_the_expected_system",
             switch_confirms_a_new_boot_in_the_expected_system,
         ),
+        (
+            "switch_reaches_a_machine_through_a_relay",
+            switch_reaches_a_machine_through_a_relay,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -721,4 +725,65 @@ fn switch_confirms_a_new_boot_in_the_expected_system() {
     assert_eq!(stuck["details"]["boot_id"], json!("boot-4"));
     assert_eq!(linux.power_actions().len(), 3);
     assert!(windows.power_actions().is_empty());
+}
+
+const TOWER_LINUX: &str = "name = \"tower\"\nsystem = \"linux\"\nbusy = \"none\"\n[power]\nsudo = true\n[boot.windows]\narm = [\"arm-windows\"]\nverify = [\"verify-windows\"]\n";
+const TOWER_WINDOWS: &str = "name = \"tower\"\nsystem = \"windows\"\nbusy = \"none\"\n[power]\nsudo = true\n[boot.linux]\narm = [\"arm-linux\"]\nverify = [\"verify-linux\"]\n";
+
+fn switch_reaches_a_machine_through_a_relay() {
+    let laptop_machine = Machine::new("laptop", "boot-l");
+    let laptop = System::new("name = \"laptop\"\n");
+    let pi_machine = Machine::new("pi", "boot-p");
+    let pi = System::new("name = \"pi\"\n");
+    let tower = Machine::new("linux", "boot-1");
+    let linux = System::new(TOWER_LINUX);
+    let windows = System::new(TOWER_WINDOWS);
+    // Only the relay can reach tower.
+    pi.home.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.tower]\n\n[[machines.tower.systems]]\nname = \"linux\"\ncommand = {}\n\n[[machines.tower.systems]]\nname = \"windows\"\ncommand = {}\n",
+            linux.command(&tower, "linux"),
+            windows.command(&tower, "windows"),
+        ),
+    );
+    laptop.home.write_config(
+        "fleet.toml",
+        &format!(
+            "[machines.pi]\ncommand = {}\n\n[machines.tower]\nvia = \"pi\"\n",
+            pi.command(&pi_machine, "pi"),
+        ),
+    );
+
+    let switching = laptop.spawn(
+        &laptop_machine,
+        &["power.switch", "machine=tower", "into=windows", "wait_s=60"],
+    );
+    wait_until("tower's linux hands over the restart", || {
+        linux.power_actions().len() == 1
+    });
+    tower.set("windows", 2, "boot-2");
+    let (code, switched) = finish(switching);
+    assert_eq!(code, 0, "{switched}");
+    assert_eq!(switched["restarted"], json!(true), "{switched}");
+    assert_eq!(switched["from_system"], json!("linux"));
+    assert_eq!(switched["system"], json!("windows"));
+
+    // A refusal on the way keeps its own code: the relay does not know this principal.
+    laptop.home.write_config(
+        "policy.toml",
+        "[principals.\"agent:test\"]\nrole = \"operator\"\n\n[roles.operator]\nallow = [\"effect:read\", \"power.*\"]\n",
+    );
+    let refused = laptop.legion(
+        &laptop_machine,
+        &["power.switch", "machine=tower", "--as", "agent:test"],
+    );
+    assert_eq!(refused.code, 1);
+    assert_eq!(
+        refused.json()["code"],
+        json!("denied"),
+        "{}",
+        refused.stdout
+    );
+    assert_eq!(windows.power_actions().len(), 0);
 }
