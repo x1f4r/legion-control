@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use legion_link::proto::{ErrorCode, PROTOCOL};
 use legion_link::{
-    CancellationToken, DeviceKey, Invite, Link, LinkConfig, NodeLink, REASON_AUTH_FAILED,
-    SshTimeouts, enrol,
+    CancellationToken, DETAIL_SENT, DeviceKey, Invite, Link, LinkConfig, NodeLink,
+    REASON_AUTH_FAILED, REASON_DEVICE_REMOVED_OR_UNKNOWN, SshTimeouts, enrol,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -529,7 +529,8 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
     );
 
     // Once the revoked session has been invalidated, any new call attempts a fresh SSH connect
-    // and fails with Denied / auth_failed.
+    // and fails with Denied / device_removed_or_unknown (with sent=false because auth failed
+    // before the request left the client).
     let reconnect_err = if first_after.code == ErrorCode::Denied {
         first_after
     } else {
@@ -538,10 +539,9 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
             .expect_err("reconnecting after device.remove unexpectedly succeeded")
     };
     assert_eq!(reconnect_err.code, ErrorCode::Denied, "{reconnect_err}");
-    assert_eq!(
-        reconnect_err.details.as_ref().unwrap()["reason"],
-        json!(REASON_AUTH_FAILED)
-    );
+    let details = reconnect_err.details.as_ref().unwrap();
+    assert_eq!(details["reason"], json!(REASON_DEVICE_REMOVED_OR_UNKNOWN));
+    assert_eq!(details[DETAIL_SENT], json!(false));
 
     link.close().await;
 }

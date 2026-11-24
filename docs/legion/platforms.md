@@ -175,10 +175,18 @@ in-place replacement and point at `apt` or `pacman` instead.
 
 - Each Linux distribution above installs its package in a clean container, and then runs the
   real-ssh end-to-end script against it, on every change.
-- The Android app is built, installed in an emulator, paired with a real sshd through a real
-  invite, and driven through listing machines and running a tool.
-- The iOS app is built for the simulator on an iPhone and an iPad and launched there.
-- The desktop app is bundled on Linux, macOS and Windows and started once on each.
+- The Android app is built as a universal debug APK, installed and launched in a KVM emulator in CI
+  until the interface reports ready (capturing dark and light screenshots); the full end-to-end
+  pairing and SSH test (`apps/legion-app/e2e-android.sh`) runs against a real node and loopback
+  `sshd` locally (and can move into CI once `legion pair` merges to `main`).
+- The iOS app is built for the simulator, installed and launched on a current iPhone and iPad
+  simulator in CI until the interface reports ready (verifying iCloud backup exclusion on the app
+  data directory and capturing dark and light screenshots on both), alongside an unsigned device
+  `.ipa`.
+- The desktop app is bundled on Linux (`.deb` and AppImage), macOS (ad-hoc signed Apple Silicon
+  `.app` and `.dmg`) and Windows (NSIS installer `.exe`), started once on each runner (silently
+  installed first on Windows, under Xvfb on Linux), and verified to render until the interface
+  reports ready.
 - `legion-link` is cross-checked for the Android and iOS targets in the Rust job.
 
 ## Trade-offs taken
