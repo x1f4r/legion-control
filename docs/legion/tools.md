@@ -661,11 +661,12 @@ Wait until a background job is no longer starting or running and return the same
 
 Effect: `read`
 
-Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.
+Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. Passing acknowledge="devices-rollback" (owner role only) clears a recorded configuration rollback failure in the state directory and audits who acknowledged it; otherwise it writes nothing but a probe file in the state directory, which it removes.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `quick` | `boolean` | no | `false` | Skip checking whether remote machines in fleet.toml answer. |
+| `acknowledge` | `string` | no | - | Acknowledge and clear a recorded health failure (owner role only). Pass `devices-rollback` after verifying policy.toml and devices.toml to clear `state/devices-rollback-error.json` and audit who acknowledged it. |
 
 ### `meta.init`
 

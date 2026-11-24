@@ -251,22 +251,31 @@ devices.toml` (containing no live entries) is allowed through the forwarding gua
 `device.remove` / `fleet.sync direction=push` under an expiring credential sends only tombstones to
 peers, so a removal made with an expiring credential still reaches the fleet.
 
-**Two-writers rule for `devices.toml`:** only two things ever write `devices.toml`:
+**Two-writers rule for `devices.toml`:** in steady state, only two things ever write `devices.toml`:
 
 1. **The node's own device tools** (`device.invite` + enrolment, `device.set`, `device.remove`), which
    build entries and tombstones themselves from call context — nothing a caller supplies is copied
    into an entry except the tool's argument fields (name, role, and key at enrolment). Every
-   enrolled entry is stamped with `paired_at`, `paired_on`, `updated_at`, and `updated_on` from the
-   enrolling node's clock and name, and `paired_by` from the invite's recorded creator (principal
-   and, whenever the creator was a paired device of any role including `owner`, that device's
-   pairing id). After a local device tool succeeds, the node pushes its registry to reachable fleet
-   peers with its own `owner` authority rather than as the calling principal, attaching
-   `device_registry_push` audit metadata recorded on both nodes naming who triggered the push
-   (principal and device/pairing id). Only `devices.toml` travels this way.
+   enrolled entry is stamped with `paired_at`, `paired_on`, `updated_at`, `updated_on`, and
+   independent per-field stamps (`name_updated_at`/`name_updated_on` and
+   `role_updated_at`/`role_updated_on`) from the enrolling node's clock and name, and `paired_by`
+   from the invite's recorded creator (principal and, whenever the creator was a paired device of
+   any role including `owner`, that device's pairing id). `device.set` bumps only the stamp for the
+   field it changed (rename bumps `name_updated_*`, `role=` bumps `role_updated_*`, `confirm=true`
+   bumps `confirmed_at`). After a local device tool succeeds, the node pushes its registry to
+   reachable fleet peers with its own `owner` authority rather than as the calling principal,
+   attaching `device_registry_push` audit metadata recorded on both nodes naming who triggered the
+   push (`principal`, and `device`/`pairing_id` only when a paired device triggered it — left empty
+   for CLI-created invites). Only `devices.toml` travels this way.
 2. **An owner-authorised write**: `config.write devices.toml` and the `devices.toml` part of
    `fleet.sync` (`push` and `pull`) require the caller to hold the `owner` role on the node doing
    the writing, locally and on the receiving peer. Every other caller is refused (`fleet.sync` by a
    non-owner syncs the other documents and reports `devices.toml` as `skipped` with the reason).
+
+Adoption of older single-machine pairings is a **third, bootstrap-only writer**: it runs only when
+`devices.toml` does not exist yet on a node and builds entries strictly from this node's own records
+(`state/devices.json` entries matching `authorized_keys`). Once `devices.toml` exists, adoption
+never runs again.
 
 **Trust rule for syncing paired devices:** a node trusts a paired device only if (a) it paired the
 device itself, (b) an owner-authorised write (including a peer node's automatic device-registry
@@ -285,7 +294,18 @@ refuses assigning a marked, live, or previously tombstoned `device:*` principal 
 pairing id, and reconciliation never re-creates a `device:*` principal for a different id than the
 one that owned it. Merging `devices.toml` via `fleet.sync` or `config.write` refuses incoming
 timestamps more than 10 minutes in the future, refuses introducing duplicate live public keys,
-always merges with the local file (tombstones always win and can never be dropped by syncing),
+always merges with the local file (tombstones always win and can never be dropped by syncing).
+During a live-entry merge for the same pairing id, mutable fields (`name` and `role`) merge
+independently using their own `(name_updated_at, name_updated_on)` and
+`(role_updated_at, role_updated_on)` stamps (legacy entries with only `updated_at`/`updated_on`
+parse with both per-field stamps equal to `updated_at`/`updated_on`), so a stale rename pushed with
+node authority can never raise a role lowered on a peer, and a stale role change can never undo a
+newer rename. Immutable identity and pairing-provenance fields (`id`, `public_key`, `principal`,
+`paired_at`, `paired_on`, `paired_by`) must agree across peers; any disagreement is treated as a
+**conflict** (`conflict = true`, never "newest wins") — local confirmation is cleared with a
+warning, no `authorized_keys` line is written, any owned `device:*` principal stays restricted to
+`nobody`, `device.set` refuses changes, `legion gate` denies connections, and both `device.list`
+and `meta.doctor` flag the entry until it is removed with `legion device.remove`. Merging also
 refuses setting `confirmed_by`/`confirmed_at` or dropping `paired_by` on an existing entry even for
 owner callers (confirmation is only allowed through `device.set confirm=true`), rewrites any
 incoming tombstone matching a local live entry or local tombstone so its identity and pairing
@@ -303,18 +323,26 @@ exceeded by what `policy.toml` happens to say) receives no `authorized_keys` lin
 `meta.doctor`. If two live entries in `devices.toml` ever share a public key (or collide with a
 foreign line in `authorized_keys`), no `authorized_keys` line is written for any colliding entry
 and both `device.list` and `meta.doctor` warn loudly. Tombstones in `devices.toml` are permanent so
-removed devices cannot be resurrected and quarantine cannot be lifted by pruning. Any change whose
-resulting `devices.toml` would exceed 1 MiB is refused before saving (so a node never saves a file
-that can no longer be pushed); non-owner callers are also capped at 32 pending pairing invites per
-principal and refused enrolment or device removal once `devices.toml` would exceed half the limit
-(512 KiB) until an owner tidies up. If rolling back `policy.toml` or `devices.toml` after a partial
-`device.enrol` or `device.set` failure itself fails, the rollback error is reported loudly in the
-returned error and recorded for `meta.doctor` as a failing check.
+removed devices cannot be resurrected and quarantine cannot be lifted. A save or merge whose only
+effect is turning live entries into tombstones or adding tombstones is never refused for size; any
+change that adds or alters a live entry must fit under 1 MiB with every live entry counted at its
+worst-case tombstone size (1,049 bytes, reserving space so removing every live device always fits
+by construction and bounding how many devices a fleet has ever had — at least 999 devices even at
+maximum field lengths). Non-owner callers are also capped at 32 pending pairing invites per
+principal and refused enrolment or device removal once `devices.toml` (with the same tombstone
+reserve) would exceed 512 KiB, while an owner can still add within the 1 MiB reserve and remove
+existing devices with `legion device.remove` (never blocked by size). If rolling back `policy.toml`
+or `devices.toml` after a partial `device.enrol` or `device.set` failure itself fails, the rollback
+error is reported loudly in the returned error and recorded in `state/devices-rollback-error.json`
+for `meta.doctor` as a failing check; after verifying `policy.toml` and `devices.toml`, an owner
+can acknowledge and clear it with `legion meta.doctor acknowledge=devices-rollback` (which is
+owner-only and audited).
 
 Each device records `paired_by = { principal, device }` captured from the invite creator at pairing
 time. When a device is tombstoned, any live
 descendant with `paired_by.device == <tombstoned id>` and
-`paired_at >= tomb.removed_at - 10 minutes` (matching the 10-minute clock-skew bound) — and
+`paired_at >= tomb.removed_at - 10 minutes` (matching the 10-minute clock-skew bound; this
+hold-back assumes the machines' clocks agree within ten minutes) — and
 transitively its unconfirmed descendants — is automatically quarantined (omitted from
 `authorized_keys`, restricted to `nobody`, refused by `legion gate`, and flagged loudly in
 `device.list` and `meta.doctor`) until an owner explicitly confirms it locally on that node with
