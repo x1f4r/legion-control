@@ -2,8 +2,10 @@
 //! annotations.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode, Target, ToolSpec};
+use legion_core::{Node, Registry};
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
 
@@ -64,6 +66,40 @@ impl Catalog {
         Ok(Catalog { entries, aliases })
     }
 
+    /// Builds a catalog when extensions may be reloaded dynamically: built-in tools are kept
+    /// first, and any extension that would collide in full mode or declare its own `on` argument
+    /// is skipped rather than taking down a running door.
+    pub(crate) fn from_specs_lenient(
+        builtins: &Registry,
+        specs: Vec<ToolSpec>,
+        full: bool,
+    ) -> Catalog {
+        let (builtin_specs, extra_specs): (Vec<ToolSpec>, Vec<ToolSpec>) = specs
+            .into_iter()
+            .partition(|spec| builtins.get(&spec.name).is_some());
+        let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut entries = Vec::with_capacity(builtin_specs.len() + extra_specs.len());
+        for spec in builtin_specs {
+            let alias = mcp_name(&spec.name);
+            if let Ok(tool) = mcp_tool(&spec, full) {
+                aliases.entry(alias).or_default().push(spec.name.clone());
+                entries.push(Entry { spec, tool });
+            }
+        }
+        for spec in extra_specs {
+            let alias = mcp_name(&spec.name);
+            if full && aliases.contains_key(&alias) {
+                continue;
+            }
+            if let Ok(tool) = mcp_tool(&spec, full) {
+                aliases.entry(alias).or_default().push(spec.name.clone());
+                entries.push(Entry { spec, tool });
+            }
+        }
+        entries.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
+        Catalog { entries, aliases }
+    }
+
     /// Every tool, sorted by registry name.
     pub(crate) fn entries(&self) -> &[Entry] {
         &self.entries
@@ -85,6 +121,48 @@ impl Catalog {
             Some([only]) => only,
             _ => name,
         }
+    }
+}
+
+/// Keeps an MCP [`Catalog`] in step with [`Node::specs`] so long-lived MCP sessions pick up
+/// extensions added, changed or removed on disk without a restart.
+pub(crate) struct CatalogCache {
+    full: bool,
+    cached: Mutex<(Vec<ToolSpec>, Arc<Catalog>)>,
+}
+
+impl CatalogCache {
+    /// Validates built-in tools strictly (refusing built-in collisions or `on` conflicts in full
+    /// mode) and caches the initial catalog including any current extensions.
+    pub(crate) fn new(node: &Node, full: bool) -> Result<Arc<CatalogCache>, ErrorBody> {
+        Catalog::new(node.registry().specs(), full)?;
+        let specs = node.specs();
+        let catalog = Arc::new(Catalog::from_specs_lenient(
+            node.registry(),
+            specs.clone(),
+            full,
+        ));
+        Ok(Arc::new(CatalogCache {
+            full,
+            cached: Mutex::new((specs, catalog)),
+        }))
+    }
+
+    /// The catalog for `node`'s current specs, rebuilt only when `node.specs()` changed.
+    pub(crate) fn current(&self, node: &Node) -> Arc<Catalog> {
+        let specs = node.specs();
+        let mut guard = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.0 == specs {
+            return Arc::clone(&guard.1);
+        }
+        let catalog = Arc::new(Catalog::from_specs_lenient(
+            node.registry(),
+            specs.clone(),
+            self.full,
+        ));
+        guard.0 = specs;
+        guard.1 = Arc::clone(&catalog);
+        catalog
     }
 }
 

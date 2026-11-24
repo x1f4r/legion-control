@@ -77,21 +77,34 @@ impl Tokens {
     /// matched, so how long the answer takes does not say which entry was close. Expiry is checked
     /// only after, and the caller learns nothing about why a token was refused.
     pub fn verify(&self, presented: &str, now: Timestamp) -> Option<&str> {
+        self.verify_entry(presented, now)
+            .map(|(_, entry)| entry.principal.as_str())
+    }
+
+    /// [`Tokens::verify`], giving the token's name and entry, for a server that ties what a token
+    /// opened (an MCP session) to that token and ends it when the token goes.
+    pub fn verify_entry(&self, presented: &str, now: Timestamp) -> Option<(&str, &TokenEntry)> {
         let presented = blake3::hash(presented.as_bytes());
         let mut found = None;
-        for entry in self.tokens.values() {
+        for (name, entry) in &self.tokens {
             // blake3::Hash compares in constant time.
             let matches = parse_hash(&entry.hash).is_some_and(|stored| stored == presented);
             if matches && found.is_none() {
-                found = Some(entry);
+                found = Some((name.as_str(), entry));
             }
         }
-        let entry = found?;
-        let expired = entry
-            .expires
+        let (name, entry) = found?;
+        (!entry.expired(now)).then_some((name, entry))
+    }
+}
+
+impl TokenEntry {
+    /// Whether the token has stopped working by `now`. An expiry that cannot be read counts as
+    /// passed, since the file's loader refuses one anyway.
+    pub fn expired(&self, now: Timestamp) -> bool {
+        self.expires
             .as_deref()
-            .is_some_and(|expires| parse_time(expires).map_or(true, |expires| now >= expires));
-        (!expired).then(|| entry.principal.as_str())
+            .is_some_and(|expires| parse_time(expires).map_or(true, |expires| now >= expires))
     }
 }
 

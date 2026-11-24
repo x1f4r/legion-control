@@ -127,7 +127,8 @@ async fn doctor_checks_the_directories_and_every_configuration_file() {
             "node.toml",
             "policy.toml",
             "projects.toml",
-            "tokens.toml"
+            "tokens.toml",
+            "tools.d"
         ]
     );
     assert!(

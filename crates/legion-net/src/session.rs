@@ -1154,6 +1154,8 @@ mod tests {
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
                 systems: Vec::new(),
+                system: None,
+                boot_id: None,
             })
             .unwrap(),
         );

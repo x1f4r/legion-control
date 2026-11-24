@@ -12,6 +12,8 @@ base64.workspace = true
 legion-core.workspace = true
 legion-os.workspace = true
 legion-proto.workspace = true
+# Also the power tools' actuator and Wake-on-LAN, which power.wol, power.wake and power.switch
+# share with the local power tools.
 legion-tools.workspace = true
 legion-xfer.workspace = true
 schemars.workspace = true
@@ -22,6 +24,7 @@ tokio-util = { workspace = true, features = ["io-util"] }
 toml_edit.workspace = true
 
 [dev-dependencies]
+legion-tools = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 

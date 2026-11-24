@@ -37,7 +37,7 @@ pub(crate) async fn health(State(shared): State<Arc<Shared>>) -> Response<Body> 
 /// `GET /v1/tools`: the tools the token's principal may use. A policy that cannot be read lists
 /// nothing and says why, as every door fails closed.
 pub(crate) async fn tools(State(shared): State<Arc<Shared>>, request: Request) -> Response<Body> {
-    let Some(Authenticated(principal)) = request.extensions().get::<Authenticated>() else {
+    let Some(Authenticated { principal, .. }) = request.extensions().get::<Authenticated>() else {
         return reply::error(&no_principal());
     };
     match crate::grant(&shared.node, Some(principal)) {
@@ -74,7 +74,8 @@ struct CallBody {
 /// The call runs on a task of its own, so it still ends in the audit log when the client goes
 /// away; going away cancels it.
 pub(crate) async fn call(State(shared): State<Arc<Shared>>, request: Request) -> Response<Body> {
-    let Some(Authenticated(principal)) = request.extensions().get::<Authenticated>().cloned()
+    let Some(Authenticated { principal, .. }) =
+        request.extensions().get::<Authenticated>().cloned()
     else {
         return reply::error(&no_principal());
     };

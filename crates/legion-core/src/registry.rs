@@ -10,8 +10,40 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::config::{ConfigStore, Document, NodeFile};
+use crate::paths::Paths;
 use crate::policy::Policy;
 use crate::tool::{FnTool, Handler, Tool};
+
+/// One health check a [`ToolSource`] reports to `meta.doctor`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceCheck {
+    /// What was checked, such as `tools.d` or `tools.d/broken.toml`.
+    pub name: String,
+    /// Whether it is as it should be.
+    pub ok: bool,
+    /// What was found.
+    pub detail: String,
+    /// What to do about it, when something is wrong.
+    pub hint: Option<String>,
+}
+
+/// A reloadable source of tools consulted after the built-in [`Registry`].
+///
+/// Built-in tools are fixed once the node starts, while extension tools on disk can be added,
+/// changed or removed without restarting a long-lived door. [`Node`](crate::Node) checks its
+/// built-in registry first so built-ins always win, and then asks each registered source.
+pub trait ToolSource: Send + Sync + 'static {
+    /// Looks up one tool by name.
+    fn get(&self, paths: &Paths, builtins: &Registry, name: &str) -> Option<Arc<dyn Tool>>;
+
+    /// Every valid tool this source currently offers.
+    fn specs(&self, paths: &Paths, builtins: &Registry) -> Vec<ToolSpec>;
+
+    /// Health checks for `meta.doctor`, such as reporting extension files that did not parse.
+    fn checks(&self, _paths: &Paths, _builtins: &Registry) -> Vec<SourceCheck> {
+        Vec::new()
+    }
+}
 
 /// Every tool a node offers, by name, and every configuration document `meta.doctor` checks.
 ///
@@ -20,6 +52,7 @@ use crate::tool::{FnTool, Handler, Tool};
 pub struct Registry {
     tools: BTreeMap<String, Arc<dyn Tool>>,
     documents: Vec<DocumentInfo>,
+    sources: Vec<Arc<dyn ToolSource>>,
 }
 
 impl Default for Registry {
@@ -35,6 +68,7 @@ impl Registry {
         let mut registry = Registry {
             tools: BTreeMap::new(),
             documents: Vec::new(),
+            sources: Vec::new(),
         };
         registry.add_document::<NodeFile>();
         registry.add_document::<Policy>();
@@ -169,6 +203,16 @@ impl Registry {
     pub fn documents(&self) -> &[DocumentInfo] {
         &self.documents
     }
+
+    /// Registers a reloadable source of tools consulted after built-ins.
+    pub fn add_source(&mut self, source: impl ToolSource) {
+        self.sources.push(Arc::new(source));
+    }
+
+    /// The reloadable tool sources registered on this node.
+    pub fn sources(&self) -> &[Arc<dyn ToolSource>] {
+        &self.sources
+    }
 }
 
 impl fmt::Debug for Registry {
@@ -206,7 +250,7 @@ impl fmt::Debug for DocumentInfo {
 }
 
 /// `family.verb`, lower case, each part starting with a letter: `fs.read`, `job.start`.
-fn is_tool_name(name: &str) -> bool {
+pub fn is_tool_name(name: &str) -> bool {
     let mut parts = name.split('.');
     let part_fits = |part: &str| {
         part.chars().next().is_some_and(|c| c.is_ascii_lowercase())

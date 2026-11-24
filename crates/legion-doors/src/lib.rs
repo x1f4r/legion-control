@@ -14,11 +14,17 @@ use legion_core::policy::Policy;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::{Grant, Node};
 
-/// The principal an HTTP request's token stands for, put in the request's extensions once the
-/// token is verified. Every door behind the HTTP listener takes the principal from here and
-/// nowhere else.
-#[derive(Clone, Debug)]
-pub(crate) struct Authenticated(pub(crate) String);
+/// Who an HTTP request's token says it is, put in the request's extensions once the token is
+/// verified. Every door behind the HTTP listener takes the principal from here and nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Authenticated {
+    /// The principal the token stands for.
+    pub(crate) principal: String,
+    /// The token's name in `tokens.toml`.
+    pub(crate) token: String,
+    /// The token's stored hash, which tells a token apart from a later one given the same name.
+    pub(crate) hash: String,
+}
 
 /// What a caller pinned to `pinned` (or the policy's default when nothing pinned it) may use, or
 /// why that cannot be known. A policy file that does not parse grants nothing, the same as it does

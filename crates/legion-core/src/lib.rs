@@ -23,7 +23,7 @@ pub use ctx::{Ctx, Door, Event, EventSink};
 pub use node::{CANCEL_GRACE, Call, Node, VERSION};
 pub use paths::Paths;
 pub use policy::{Access, Grant, Place, Policy};
-pub use registry::{DocumentInfo, Registry};
+pub use registry::{DocumentInfo, Registry, SourceCheck, ToolSource, is_tool_name};
 pub use route::{Local, RouteOutcome, Router};
 pub use tool::{BoxFuture, Handler, NoArgs, Tool, ToolError, input_schema, parse_args};
 
