@@ -29,6 +29,7 @@ pub fn register_all(registry: &mut Registry) {
     job::register(registry);
     proj::register(registry);
     svc::register(registry);
+    power::register(registry);
     #[cfg(feature = "testing")]
     testing::register(registry);
 }
