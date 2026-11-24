@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 # Verify the full SSH device-pairing flow against a real sshd inside a clean Linux container
-# (for example ubuntu:22.04 with OpenSSH 8.9 or debian:12 with OpenSSH 9.2).
+# (for example ubuntu:22.04 with OpenSSH 8.9 or debian:12 with OpenSSH 9.2), exercising both the
+# system OpenSSH client and `legion-link`'s in-process SSH client (`link` example binary).
 #
 # Usage:
-#   bash scripts/pairing-openssh-test.sh <docker-image> [--bin <path-to-static-legion>]
+#   bash scripts/pairing-openssh-test.sh <docker-image> [--bin <static-legion>] [--link-bin <static-link>]
 #
-# Defaults to target/x86_64-unknown-linux-musl/release/legion. Build it first with:
+# Defaults to:
+#   target/x86_64-unknown-linux-musl/release/legion
+#   target/x86_64-unknown-linux-musl/release/examples/link
+#
+# Build both first with:
 #   cargo build --release --locked --target x86_64-unknown-linux-musl -p legion-cli
+#   CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl -p legion-link --features ssh --example link
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 IMAGE=""
 BIN="$ROOT/target/x86_64-unknown-linux-musl/release/legion"
+LINK_BIN="$ROOT/target/x86_64-unknown-linux-musl/release/examples/link"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,8 +31,17 @@ while [[ $# -gt 0 ]]; do
       BIN="${1#--bin=}"
       shift
       ;;
+    --link-bin)
+      [[ $# -ge 2 ]] || { echo "pairing-openssh-test: --link-bin needs a path" >&2; exit 2; }
+      LINK_BIN="$2"
+      shift 2
+      ;;
+    --link-bin=*)
+      LINK_BIN="${1#--link-bin=}"
+      shift
+      ;;
     -h|--help)
-      echo "Usage: bash scripts/pairing-openssh-test.sh <docker-image> [--bin <static-legion-bin>]"
+      echo "Usage: bash scripts/pairing-openssh-test.sh <docker-image> [--bin <static-legion>] [--link-bin <static-link>]"
       exit 0
       ;;
     -*)
@@ -45,28 +61,45 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$IMAGE" ]]; then
-  echo "Usage: bash scripts/pairing-openssh-test.sh <docker-image> [--bin <static-legion-bin>]" >&2
+  echo "Usage: bash scripts/pairing-openssh-test.sh <docker-image> [--bin <static-legion>] [--link-bin <static-link>]" >&2
   exit 2
 fi
 
 if [[ ! -x "$BIN" ]]; then
-  echo "pairing-openssh-test: executable not found at $BIN" >&2
+  echo "pairing-openssh-test: legion executable not found at $BIN" >&2
   echo "Build it with: cargo build --release --locked --target x86_64-unknown-linux-musl -p legion-cli" >&2
   exit 1
 fi
 BIN="$(cd -- "$(dirname -- "$BIN")" && pwd -P)/$(basename -- "$BIN")"
+
+if [[ ! -x "$LINK_BIN" ]]; then
+  echo "pairing-openssh-test: legion-link example executable not found at $LINK_BIN" >&2
+  echo "Build it with: CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --locked --target x86_64-unknown-linux-musl -p legion-link --features ssh --example link" >&2
+  exit 1
+fi
+LINK_BIN="$(cd -- "$(dirname -- "$LINK_BIN")" && pwd -P)/$(basename -- "$LINK_BIN")"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "pairing-openssh-test: docker is required" >&2
   exit 1
 fi
 
-echo "==> Running OpenSSH pairing verification in $IMAGE using $BIN"
+DOCKER_CMD=(docker)
+if ! docker info >/dev/null 2>&1; then
+  if sudo -n docker info >/dev/null 2>&1; then
+    DOCKER_CMD=(sudo docker)
+  else
+    echo "pairing-openssh-test: cannot reach Docker daemon (neither 'docker' nor 'sudo -n docker' succeeded)" >&2
+    exit 1
+  fi
+fi
 
-docker run --rm -i \
-  -v "$BIN:/usr/local/bin/legion:ro" \
-  "$IMAGE" \
-  bash -euo pipefail -s <<'CONTAINER_EOF'
+echo "==> Running OpenSSH pairing verification in $IMAGE"
+echo "    legion: $BIN"
+echo "    link:   $LINK_BIN"
+
+CONTAINER_SCRIPT="$(cat <<'CONTAINER_EOF'
+set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends openssh-server openssh-client openssl python3 >/dev/null
@@ -103,7 +136,9 @@ SSHD_CFG
 /usr/sbin/sshd -f /etc/ssh/sshd_config_legion -E /tmp/sshd-legion.log
 trap 'cat /tmp/sshd-legion.log >&2 || true' ERR
 
-su - me -s /bin/bash -c 'bash -euo pipefail -s' <<'USER_EOF'
+cat > /tmp/pairing-user-test.sh <<'USER_EOF'
+set -euo pipefail
+
 legion --version
 legion init --name box --json >/dev/null
 
@@ -115,8 +150,15 @@ allow = ["effect:read"]
 deny = ["audit.*"]
 paths = ["~/projects/**"]
 
+[roles.operator]
+allow = ["effect:read", "exec.run"]
+deny = ["audit.*", "fs.write"]
+
 [principals.phone]
 role = "observer"
+
+[principals.phone_link]
+role = "operator"
 POLICY
 mkdir -p "$HOME/projects"
 printf 'hello-from-container\n' > "$HOME/projects/note.txt"
@@ -148,6 +190,7 @@ invite_path, key_out, kh_out, id_out = sys.argv[1:5]
 with open(invite_path, "r", encoding="utf-8") as fh:
     res = json.load(fh)
 
+assert res["host_keys_source"].startswith("ssh-keyscan"), res
 invite = res["invite"]
 assert invite.startswith("legion-invite-1."), "bad invite prefix"
 raw = invite[len("legion-invite-1."):]
@@ -237,7 +280,7 @@ ssh_base=(
 enrol_req="$(python3 -c 'import json,sys; print(json.dumps({"enrol":1,"id":sys.argv[1],"public_key":sys.argv[2],"name":"Container Phone"}))' "$invite_id" "$device_pub")"
 enrol_reply="$(printf '%s\n' "$enrol_req" | "${ssh_base[@]}" -i "$work/temp_key" me@127.0.0.1 id)"
 python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r == {"ok":True,"node":"box","principal":"phone","role":"observer","device":"container-phone"}, r' "$enrol_reply"
-echo "    enrolled: $enrol_reply"
+echo "    enrolled (system ssh): $enrol_reply"
 
 # 4. Run a real legion rpc session with the enrolled device key.
 rpc_out="$(
@@ -264,7 +307,7 @@ assert replies[2]["result"]["role"] == "observer", replies[2]
 assert replies[3]["result"]["content"] == "hello-from-container\n", replies[3]
 assert replies[4]["error"]["data"]["code"] == "denied", replies[4]
 PY
-echo "    legion rpc session verified"
+echo "    legion rpc session verified (system ssh)"
 
 # 5. Arbitrary commands get legion gate refusal.
 set +e
@@ -330,7 +373,68 @@ if "${ssh_base[@]}" -i "$work/temp_key2" me@127.0.0.1 </dev/null >/dev/null 2>&1
   exit 1
 fi
 echo "    sshd expiry-time enforcement verified"
+
+# 9. End-to-end pairing and calls with the in-process legion-link client (`russh`).
+legion-link-cli keygen "$work/link_device_key" >/dev/null
+link_inv_json="$(legion device.invite principal=phone_link host=127.0.0.1 port=2222 --json)"
+python3 - "$link_inv_json" "$work/link_invite.txt" <<'PY'
+import json, os, sys
+res = json.loads(sys.argv[1])
+assert res["host_keys_source"].startswith("ssh-keyscan"), res
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(res["invite"] + "\n")
+PY
+
+link_enrol_out="$(legion-link-cli enrol \
+  --invite-file "$work/link_invite.txt" \
+  --key "$work/link_device_key" \
+  --name "Container Link Phone" \
+  --out "$work/link_config.json")"
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["node"]=="box" and r["principal"]=="phone_link" and r["role"]=="operator" and r["device"]=="container-link-phone", r' "$link_enrol_out"
+echo "    enrolled (legion-link): $link_enrol_out"
+
+link_tools_out="$(legion-link-cli tools --config "$work/link_config.json")"
+python3 -c 'import json,sys; names=[t["name"] for t in json.loads(sys.argv[1])["tools"]]; assert "meta.whoami" in names and "exec.run" in names, names' "$link_tools_out"
+
+link_whoami_out="$(legion-link-cli call --config "$work/link_config.json" meta.whoami '{}')"
+python3 -c 'import json,sys; w=json.loads(sys.argv[1]); assert w["principal"]=="phone_link" and w["role"]=="operator" and w["door"]=="rpc", w' "$link_whoami_out"
+
+link_exec_out="$(legion-link-cli call --config "$work/link_config.json" exec.run '{"cmd":"printf '\''from-legion-link\\n'\''"}' 2>"$work/link_exec.stderr")"
+python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["exit_code"]==0 and e["stdout"]=="from-legion-link\n", e' "$link_exec_out"
+grep -q 'from-legion-link' "$work/link_exec.stderr" || {
+  echo "expected streamed stdout event on stderr from legion-link-cli, got:" >&2
+  cat "$work/link_exec.stderr" >&2
+  exit 1
+}
+
+set +e
+link_denied_out="$(legion-link-cli call --config "$work/link_config.json" fs.write '{"path":"~/projects/blocked.txt","content":"x"}')"
+link_denied_rc=$?
+set -e
+[[ "$link_denied_rc" -eq 1 ]] || { echo "expected fs.write to fail with exit 1, got $link_denied_rc: $link_denied_out" >&2; exit 1; }
+python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["code"]=="denied", e' "$link_denied_out"
+echo "    legion-link tools, meta.whoami, streamed exec.run, and policy denial verified"
+
+legion device.remove name=container-link-phone --json >/dev/null
+set +e
+link_revoked_out="$(legion-link-cli call --config "$work/link_config.json" meta.whoami '{}')"
+link_revoked_rc=$?
+set -e
+[[ "$link_revoked_rc" -eq 1 ]] || { echo "expected revoked legion-link call to exit 1, got $link_revoked_rc: $link_revoked_out" >&2; exit 1; }
+python3 -c 'import json,sys; e=json.loads(sys.argv[1]); assert e["code"]=="denied" and e["details"]["reason"]=="auth_failed", e' "$link_revoked_out"
+echo "    legion-link revocation verified"
 USER_EOF
+
+chmod 0755 /tmp/pairing-user-test.sh
+su - me -s /bin/bash -c 'bash /tmp/pairing-user-test.sh' </dev/null
 
 echo "==> OpenSSH pairing verification passed"
 CONTAINER_EOF
+)"
+
+"${DOCKER_CMD[@]}" run --rm \
+  -v "$BIN:/usr/local/bin/legion:ro" \
+  -v "$LINK_BIN:/usr/local/bin/legion-link-cli:ro" \
+  "$IMAGE" \
+  bash -euo pipefail -c "$CONTAINER_SCRIPT"
