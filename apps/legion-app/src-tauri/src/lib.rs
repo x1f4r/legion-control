@@ -105,6 +105,7 @@ pub fn run() {
             commands::unpair,
             commands::select_node,
             commands::repair_store,
+            commands::invalidate_sessions,
             commands::device_name,
             commands::ready,
             commands::scan_invite,
@@ -122,6 +123,7 @@ pub fn run() {
             commands::unpair,
             commands::select_node,
             commands::repair_store,
+            commands::invalidate_sessions,
             commands::device_name,
             commands::ready,
             commands::scan_invite,
@@ -137,6 +139,7 @@ pub fn run() {
         commands::unpair,
         commands::select_node,
         commands::repair_store,
+        commands::invalidate_sessions,
         commands::device_name,
         commands::ready,
     ]);

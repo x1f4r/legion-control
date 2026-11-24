@@ -284,6 +284,9 @@ pub trait Backend: Send + Sync {
 
     /// Moves a damaged or unsupported state file aside and starts fresh.
     fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>>;
+
+    /// Closes cached transport sessions so the next call opens a fresh connection.
+    fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>>;
 }
 
 /// Fallback backend returning honest unpaired responses.
@@ -350,6 +353,10 @@ impl Backend for Unpaired {
                 "App state does not need repair.",
             ))
         })
+    }
+
+    fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async { Ok(()) })
     }
 }
 

@@ -263,6 +263,14 @@ export function createAppLink() {
     }
   }
 
+  async function invalidateSessions() {
+    try {
+      await invoke('invalidate_sessions');
+    } catch {
+      // Best-effort teardown on resume; subsequent calls still reconnect on error.
+    }
+  }
+
   async function scanInvite() {
     try {
       const reply = await invoke('scan_invite');
@@ -291,6 +299,7 @@ export function createAppLink() {
     unpair,
     selectNode,
     repairStore,
+    invalidateSessions,
     scanInvite,
   };
 }

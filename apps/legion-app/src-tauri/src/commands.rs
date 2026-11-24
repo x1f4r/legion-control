@@ -140,6 +140,21 @@ pub async fn repair_store(backend: State<'_, SharedBackend>) -> Result<RepairRes
     backend.0.repair_store().await
 }
 
+/// Closes cached sessions on mobile platforms after resuming from background or sleep so the next
+/// refresh opens fresh sockets instead of stalling on half-open TCP connections.
+#[tauri::command]
+pub async fn invalidate_sessions(backend: State<'_, SharedBackend>) -> Result<(), AppError> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        backend.0.invalidate_sessions().await
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = backend;
+        Ok(())
+    }
+}
+
 /// Returns a sensible default name for this device (model on mobile, host name on desktop).
 #[tauri::command]
 pub fn device_name() -> String {

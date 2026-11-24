@@ -370,27 +370,54 @@ function App() {
     };
   }, [link, hydrate]);
 
-  // Poll every 15 s while visible and refresh on window focus.
+  // Poll every 15 s while visible and refresh on resume/focus. On mobile resume from background,
+  // tear down cached SSH sessions before refreshing so waking a phone does not stall on half-open
+  // TCP sockets.
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
-    const onFocus = () => {
-      if (document.visibilityState === 'visible') {
+    let wasHidden = document.visibilityState === 'hidden';
+    let resuming = false;
+
+    const onVisibilityChange = async () => {
+      if (document.visibilityState === 'hidden') {
+        wasHidden = true;
+        return;
+      }
+      if (document.visibilityState !== 'visible') return;
+      if (wasHidden && typeof link.invalidateSessions === 'function') {
+        wasHidden = false;
+        resuming = true;
+        try {
+          await link.invalidateSessions();
+        } finally {
+          resuming = false;
+        }
+        refreshFleet(nodeInfo, { background: true });
+      } else {
+        wasHidden = false;
         refreshFleet(nodeInfo, { background: true });
       }
     };
+
+    const onFocus = () => {
+      if (document.visibilityState === 'visible' && !wasHidden && !resuming) {
+        refreshFleet(nodeInfo, { background: true });
+      }
+    };
+
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && !resuming) {
         refreshFleet(nodeInfo, { background: true });
       }
     }, POLL_MS);
     window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       window.clearInterval(timer);
       window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [linkState?.ready, nodeInfo, refreshFleet]);
+  }, [link, linkState?.ready, nodeInfo, refreshFleet]);
 
   const openConfirm = useCallback((req) => {
     if (!sheetHistoryRef.current) {

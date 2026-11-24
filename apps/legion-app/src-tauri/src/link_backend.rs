@@ -561,6 +561,20 @@ impl Backend for LinkBackend {
             })
         })
     }
+
+    fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+        Box::pin(async move {
+            let link = {
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.link.clone()
+            };
+            link.close().await;
+            Ok(())
+        })
+    }
 }
 
 /// Returns `true` only when `legion-link` proved the request never left this device (`details.sent
@@ -1472,6 +1486,118 @@ mod tests {
         let found = discover_local_legion_from(Some(&mixed_path), &[])
             .ok_or("expected canonical legion binary")?;
         assert_eq!(found, std::fs::canonicalize(&real_bin)?.to_string_lossy());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalidate_sessions_closes_cached_session_so_next_call_reconnects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = two_ssh_nodes_store(&dir)?;
+        let opens = Arc::new(AtomicUsize::new(0));
+        let opens_c = Arc::clone(&opens);
+
+        let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
+            let opens_c = Arc::clone(&opens_c);
+            Box::pin(async move {
+                opens_c.fetch_add(1, Ordering::SeqCst);
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap_or_else(|_| {
+                            Request::new(legion_link::proto::Id::Number(0), "", Value::Null)
+                        });
+                        let reply = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or(Value::Null),
+                            )
+                        } else {
+                            Response::ok(req.id, serde_json::json!({ "ok": true }))
+                        };
+                        let mut out = serde_json::to_string(&reply).unwrap_or_default();
+                        out.push('\n');
+                        if server_w.write_all(out.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        let _ = server_w.flush().await;
+                    }
+                });
+                legion_link::Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store, None, opener);
+        backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.info".to_owned(),
+                    args: serde_json::json!({}),
+                    on: None,
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        // Second call reuses the open session.
+        backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.info".to_owned(),
+                    args: serde_json::json!({}),
+                    on: None,
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        // Invalidating sessions tears down cached sockets so the next call opens a fresh one.
+        backend.invalidate_sessions().await?;
+        backend
+            .call(
+                CallRequest {
+                    id: None,
+                    tool: "sys.info".to_owned(),
+                    args: serde_json::json!({}),
+                    on: None,
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
         Ok(())
     }
 }
