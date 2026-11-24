@@ -3781,6 +3781,227 @@ role = \"ops\"
 }
 
 #[test]
+fn nit2_fleet_sync_pull_preserves_local_confirmation_or_clears_and_warns_on_mismatch() {
+    use legion_tools::device::registry::{
+        DeviceTombstone, DevicesFile, FleetDevice, PairedBy, next_updated_timestamp,
+    };
+
+    let node_a = Home::new();
+    let node_b = Home::new();
+    let auth_a = node_a.home().join("authorized_keys");
+    let auth_b = node_b.home().join("authorized_keys");
+    let home_a_legion = node_a.state().parent().unwrap().to_path_buf();
+    let home_b_legion = node_b.state().parent().unwrap().to_path_buf();
+
+    let policy = "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+";
+    node_a.write_config("policy.toml", policy);
+    node_b.write_config("policy.toml", policy);
+    node_a.write_config(
+        "node.toml",
+        &format!(
+            "name = \"a\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_a)
+        ),
+    );
+    node_b.write_config(
+        "node.toml",
+        &format!(
+            "name = \"b\"\n[devices]\nauthorized_keys = {}\n",
+            toml_literal(&auth_b)
+        ),
+    );
+    let bin = env!("CARGO_BIN_EXE_legion");
+    let fleet_a = if cfg!(windows) {
+        let script = node_b.home().join("run-b-pull.cmd");
+        let body = format!(
+            "@echo off\r\n\
+             set \"LEGION_HOME={}\"\r\n\
+             set \"HOME={}\"\r\n\
+             set \"USERPROFILE={}\"\r\n\
+             set \"XDG_CONFIG_HOME=\"\r\n\
+             set \"XDG_STATE_HOME=\"\r\n\
+             \"{}\" rpc\r\n",
+            home_b_legion.display(),
+            node_b.home().display(),
+            node_b.home().display(),
+            bin,
+        );
+        std::fs::write(&script, body).unwrap();
+        format!(
+            "[machines.b]\ncommand = [\"cmd.exe\", \"/D\", \"/C\", {}]\n",
+            toml_literal(&script),
+        )
+    } else {
+        let env_arg = format!("LEGION_HOME={}", home_b_legion.display());
+        format!(
+            "[machines.b]\ncommand = [\"env\", {}, {}, \"rpc\"]\n",
+            toml_literal(Path::new(&env_arg)),
+            toml_literal(Path::new(bin)),
+        )
+    };
+    node_a.write_config("fleet.toml", &fleet_a);
+
+    let id_parent = "aa".repeat(16);
+    let id_child = "bb".repeat(16);
+    let t0 = next_updated_timestamp(None).unwrap();
+    let t1 = next_updated_timestamp(Some(&t0)).unwrap();
+    let t2 = next_updated_timestamp(Some(&t1)).unwrap();
+    let t3 = next_updated_timestamp(Some(&t2)).unwrap();
+    let key1 = ed25519_public_key_from_seed(&[0xc1; 32]);
+    let key2 = ed25519_public_key_from_seed(&[0xc2; 32]);
+
+    let tomb_parent = DeviceTombstone {
+        name: "parent".to_owned(),
+        principal: "tablet".to_owned(),
+        fingerprint: None,
+        paired_at: Some(t0.clone()),
+        paired_on: Some("a".to_owned()),
+        paired_by: None,
+        removed_by: None,
+        removed_at: t0.clone(),
+        removed_on: "a".to_owned(),
+    };
+    let mut dev_a = DevicesFile::default();
+    dev_a.removed.insert(id_parent.clone(), tomb_parent.clone());
+    dev_a.devices.insert(
+        id_child.clone(),
+        FleetDevice {
+            name: "child-v1".to_owned(),
+            public_key: key1.clone(),
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: Some(id_parent.clone()),
+            }),
+            confirmed_by: Some("owner".to_owned()),
+            confirmed_at: Some(t1.clone()),
+            updated_at: t1.clone(),
+            updated_on: "a".to_owned(),
+        },
+    );
+    node_a.write_config("devices.toml", &dev_a.to_toml_string());
+
+    // Node B has a newer rename of the same child WITHOUT confirmation (same identity & provenance).
+    let mut dev_b = DevicesFile::default();
+    dev_b.removed.insert(id_parent.clone(), tomb_parent.clone());
+    dev_b.devices.insert(
+        id_child.clone(),
+        FleetDevice {
+            name: "child-renamed".to_owned(),
+            public_key: key1,
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0.clone(),
+            paired_on: "a".to_owned(),
+            paired_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: Some(id_parent.clone()),
+            }),
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t2,
+            updated_on: "b".to_owned(),
+        },
+    );
+    node_b.write_config("devices.toml", &dev_b.to_toml_string());
+
+    let pull1 = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=b",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(pull1.code, 0, "pull1 failed: {}", pull1.stderr);
+    let pull1_json = pull1.json();
+    let doc1 = &pull1_json["results"]["b"]["devices.toml"];
+    assert_eq!(doc1["status"], json!("pulled"), "{pull1_json}");
+    assert!(
+        doc1.get("warnings")
+            .and_then(|v| v.as_array())
+            .is_none_or(|w| w.is_empty()),
+        "matching pull must not warn: {pull1_json}"
+    );
+    let a_after1: DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(a_after1.devices[&id_child].name, "child-renamed");
+    assert_eq!(
+        a_after1.devices[&id_child].confirmed_by.as_deref(),
+        Some("owner")
+    );
+    assert_eq!(
+        a_after1.devices[&id_child].confirmed_at.as_deref(),
+        Some(t1.as_str())
+    );
+
+    // Now Node B has a newer edit that changes the child's public key: pull MUST clear
+    // confirmation and include a warning in the fleet.sync result.
+    let mut dev_b2 = DevicesFile::default();
+    dev_b2.removed.insert(id_parent.clone(), tomb_parent);
+    dev_b2.devices.insert(
+        id_child.clone(),
+        FleetDevice {
+            name: "child-renamed".to_owned(),
+            public_key: key2,
+            principal: "tablet".to_owned(),
+            role: None,
+            paired_at: t0,
+            paired_on: "a".to_owned(),
+            paired_by: Some(PairedBy {
+                principal: "tablet".to_owned(),
+                device: Some(id_parent),
+            }),
+            confirmed_by: None,
+            confirmed_at: None,
+            updated_at: t3,
+            updated_on: "b".to_owned(),
+        },
+    );
+    node_b.write_config("devices.toml", &dev_b2.to_toml_string());
+
+    let pull2 = node_a.run(&[
+        "fleet.sync",
+        "direction=pull",
+        "from=b",
+        "documents=[\"devices.toml\"]",
+    ]);
+    assert_eq!(pull2.code, 0, "pull2 failed: {}", pull2.stderr);
+    let pull2_json = pull2.json();
+    let doc2 = &pull2_json["results"]["b"]["devices.toml"];
+    assert_eq!(doc2["status"], json!("pulled"), "{pull2_json}");
+    let warnings2: Vec<&str> = doc2["warnings"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        warnings2
+            .iter()
+            .any(|w| w.to_ascii_lowercase().contains("confirmation") && w.contains(&id_child)),
+        "mismatching pull must warn that confirmation was cleared: {pull2_json}"
+    );
+    let a_after2: DevicesFile = legion_core::config::parse(
+        &home_a_legion.join("config").join("devices.toml"),
+        &std::fs::read(home_a_legion.join("config").join("devices.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(a_after2.devices[&id_child].confirmed_by, None);
+    assert_eq!(a_after2.devices[&id_child].confirmed_at, None);
+}
+
+#[test]
 fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
     use legion_tools::device::registry::DevicesFile;
 

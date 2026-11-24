@@ -768,6 +768,69 @@ pub fn rewrite_tombstones_from_local(local: &DevicesFile, incoming: &mut Devices
     }
 }
 
+impl FleetDevice {
+    /// Returns the identity or pairing-provenance fields that differ between `self` and `other`,
+    /// or an empty list when both describe the same paired identity and provenance (`public_key`,
+    /// `principal`, `paired_at`, `paired_on`, and `paired_by`).
+    pub fn identity_or_provenance_differences(&self, other: &FleetDevice) -> Vec<&'static str> {
+        let mut diffs = Vec::new();
+        let same_key = self.public_key == other.public_key
+            || match (
+                validate_ed25519_public_key(&self.public_key),
+                validate_ed25519_public_key(&other.public_key),
+            ) {
+                (Ok(a), Ok(b)) => a.wire_blob == b.wire_blob,
+                _ => false,
+            };
+        if !same_key {
+            diffs.push("public_key");
+        }
+        if self.principal != other.principal {
+            diffs.push("principal");
+        }
+        if self.paired_at != other.paired_at {
+            diffs.push("paired_at");
+        }
+        if self.paired_on != other.paired_on {
+            diffs.push("paired_on");
+        }
+        if self.paired_by != other.paired_by {
+            diffs.push("paired_by");
+        }
+        diffs
+    }
+}
+
+/// Preserves node-local `confirmed_by`/`confirmed_at` across a merge when the resulting live
+/// entry keeps the same identity and pairing provenance (`public_key`, `principal`, `paired_at`,
+/// `paired_on`, `paired_by`) as the local entry. Otherwise clears local confirmation and returns
+/// a warning naming each affected device and the changed fields.
+pub fn preserve_local_confirmations(local: &DevicesFile, merged: &mut DevicesFile) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (id, merged_entry) in &mut merged.devices {
+        let Some(local_entry) = local.devices.get(id) else {
+            continue;
+        };
+        if local_entry.confirmed_by.is_none() && local_entry.confirmed_at.is_none() {
+            continue;
+        }
+        let diffs = local_entry.identity_or_provenance_differences(merged_entry);
+        if diffs.is_empty() {
+            merged_entry.confirmed_by = local_entry.confirmed_by.clone();
+            merged_entry.confirmed_at = local_entry.confirmed_at.clone();
+        } else {
+            merged_entry.confirmed_by = None;
+            merged_entry.confirmed_at = None;
+            warnings.push(format!(
+                "Cleared local confirmation on device {} ({id}) because the incoming entry changed its identity or pairing provenance ({}).",
+                merged_entry.name,
+                diffs.join(", ")
+            ));
+        }
+    }
+    warnings
+}
+
 /// Pure CRDT merge of two [`DevicesFile`] states.
 ///
 /// Semilattice join laws guaranteed for all valid inputs:
@@ -2455,7 +2518,8 @@ pub fn apply_devices_merge_blocking(
     // a tombstone can never name a different principal than the device it removes.
     rewrite_tombstones_from_local(&local, &mut prepared_incoming);
 
-    let merged = merge_devices(&local, &prepared_incoming);
+    let mut merged = merge_devices(&local, &prepared_incoming);
+    let confirmation_warnings = preserve_local_confirmations(&local, &mut merged);
 
     // Every registry-owned (marked) principal belongs to exactly one pairing id: refuse, for
     // EVERY caller and at EVERY merge, any incoming or newly added/changed live entry whose
@@ -2616,7 +2680,8 @@ pub fn apply_devices_merge_blocking(
         tombstoned: newly_tombstoned.clone(),
     };
 
-    let mut warnings = reconcile_device_principals_locked(paths, &merged).map_err(after_save)?;
+    let mut warnings = confirmation_warnings;
+    warnings.extend(reconcile_device_principals_locked(paths, &merged).map_err(after_save)?);
     let reconciled_policy = match std::fs::read(&policy_path) {
         Ok(bytes) => parse::<Policy>(&policy_path, &bytes).map_err(after_save)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => Policy::default(),

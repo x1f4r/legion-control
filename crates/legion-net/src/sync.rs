@@ -31,7 +31,8 @@ use legion_os::lock::{FileLock, LockMode};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::device::registry::{
     DEVICES_VERSION, DeviceRegistryPushAudit, DevicesFile, MergeApplyError, MergeChange,
-    apply_devices_merge_blocking, merge_devices, rewrite_tombstones_from_local,
+    apply_devices_merge_blocking, merge_devices, preserve_local_confirmations,
+    rewrite_tombstones_from_local,
 };
 use legion_tools::device::sessions::{
     DEFAULT_TERMINATE_GRACE, terminate_device_sessions_for_target,
@@ -2130,21 +2131,13 @@ async fn sync_devices_document(
             // never live device entries from the peer.
             //
             // Confirmations (`confirmed_by`/`confirmed_at`) are node-local and only accepted via
-            // `device.set confirm=true`, so align outgoing confirmation fields with what the peer
-            // already holds (never smuggling a confirmation over `config.write` or failing sync of
-            // unrelated entries).
+            // `device.set confirm=true`, so strip them before sending; the receiving node
+            // preserves its own local confirmation when identity and pairing provenance match
+            // (and clears it with a warning otherwise).
             let mut outgoing = local_devices.clone();
-            for (id, entry) in &mut outgoing.devices {
-                match remote_devices.devices.get(id) {
-                    Some(prev_remote) => {
-                        entry.confirmed_by = prev_remote.confirmed_by.clone();
-                        entry.confirmed_at = prev_remote.confirmed_at.clone();
-                    }
-                    None => {
-                        entry.confirmed_by = None;
-                        entry.confirmed_at = None;
-                    }
-                }
+            for entry in outgoing.devices.values_mut() {
+                entry.confirmed_by = None;
+                entry.confirmed_at = None;
             }
 
             // An expiring credential may push ONLY tombstones to peers (never live device
@@ -2153,12 +2146,14 @@ async fn sync_devices_document(
             if ctx.credential_expires().is_some() && !outgoing.devices.is_empty() {
                 let mut full_preview = outgoing.clone();
                 rewrite_tombstones_from_local(&remote_devices, &mut full_preview);
-                let full_after = merge_devices(&remote_devices, &full_preview);
+                let mut full_after = merge_devices(&remote_devices, &full_preview);
+                let _ = preserve_local_confirmations(&remote_devices, &mut full_after);
                 let mut tombs_only = outgoing.clone();
                 tombs_only.devices.clear();
                 let mut tombs_preview = tombs_only.clone();
                 rewrite_tombstones_from_local(&remote_devices, &mut tombs_preview);
-                let tombs_after = merge_devices(&remote_devices, &tombs_preview);
+                let mut tombs_after = merge_devices(&remote_devices, &tombs_preview);
+                let _ = preserve_local_confirmations(&remote_devices, &mut tombs_after);
                 skipped_live_due_to_expiry = full_after != tombs_after;
                 outgoing = tombs_only;
             }
@@ -2174,7 +2169,8 @@ async fn sync_devices_document(
 
             let mut outgoing_preview = outgoing.clone();
             rewrite_tombstones_from_local(&remote_devices, &mut outgoing_preview);
-            let remote_after_push = merge_devices(&remote_devices, &outgoing_preview);
+            let mut remote_after_push = merge_devices(&remote_devices, &outgoing_preview);
+            let _ = preserve_local_confirmations(&remote_devices, &mut remote_after_push);
             let outgoing_is_empty = outgoing.devices.is_empty() && outgoing.removed.is_empty();
             let remote_needs_push =
                 remote_after_push != remote_devices || (!remote.exists && !outgoing_is_empty);
@@ -2433,22 +2429,16 @@ async fn sync_devices_document(
         SyncDirection::Pull => {
             // Explicit pull: merges the peer's live devices and tombstones into local `devices.toml`
             // without writing back to the peer. Confirmations are node-local (`device.set`), so
-            // align incoming `confirmed_by`/`confirmed_at` with what this node already holds.
+            // strip incoming confirmations; `preserve_local_confirmations` keeps this node's own
+            // confirmation when identity and pairing provenance match (and clears + warns otherwise).
             let mut sanitized_remote = remote_devices.clone();
-            for (id, entry) in &mut sanitized_remote.devices {
-                match local_devices.devices.get(id) {
-                    Some(prev_local) => {
-                        entry.confirmed_by = prev_local.confirmed_by.clone();
-                        entry.confirmed_at = prev_local.confirmed_at.clone();
-                    }
-                    None => {
-                        entry.confirmed_by = None;
-                        entry.confirmed_at = None;
-                    }
-                }
+            for entry in sanitized_remote.devices.values_mut() {
+                entry.confirmed_by = None;
+                entry.confirmed_at = None;
             }
             rewrite_tombstones_from_local(&local_devices, &mut sanitized_remote);
-            let sanitized_merged = merge_devices(&local_devices, &sanitized_remote);
+            let mut sanitized_merged = merge_devices(&local_devices, &sanitized_remote);
+            let _ = preserve_local_confirmations(&local_devices, &mut sanitized_merged);
             let sanitized_empty =
                 sanitized_merged.devices.is_empty() && sanitized_merged.removed.is_empty();
             let local_up_to_date =
@@ -4407,5 +4397,195 @@ role = \"ops\"
                 "{dir_name}: expected skip reason mentioning owner: {res}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn nit2_pull_and_merge_preserve_local_confirmation_on_matching_provenance_else_clear_and_warn()
+     {
+        use jiff::SignedDuration;
+        use legion_core::{Call, Door, Node, Paths};
+        use legion_tools::device::keys::ed25519_public_key_from_seed;
+        use legion_tools::device::registry::{DeviceTombstone, FleetDevice, PairedBy};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let auth_keys = dir.path().join("authorized_keys");
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let auth_escaped = auth_keys.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            paths.config_file("node.toml"),
+            format!("name = \"box-a\"\n[devices]\nauthorized_keys = \"{auth_escaped}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+default = \"owner\"
+
+[roles.ops]
+allow = [\"effect:read\", \"effect:admin\"]
+
+[principals.tablet]
+role = \"ops\"
+",
+        )
+        .unwrap();
+
+        let id_parent = "aa".repeat(16);
+        let id_child = "bb".repeat(16);
+        let now = Timestamp::now();
+        let t0 = (now - SignedDuration::from_mins(20)).to_string();
+        let t1 = (now - SignedDuration::from_mins(10)).to_string();
+        let t2 = (now - SignedDuration::from_mins(5)).to_string();
+        let t3 = (now - SignedDuration::from_mins(1)).to_string();
+        let child_key_1 = ed25519_public_key_from_seed(&[0xb1; 32]);
+        let child_key_2 = ed25519_public_key_from_seed(&[0xb2; 32]);
+
+        // Seed local node with a tombstoned parent and a locally confirmed child.
+        let mut local = DevicesFile::default();
+        local.removed.insert(
+            id_parent.clone(),
+            DeviceTombstone {
+                name: "parent".to_owned(),
+                principal: "tablet".to_owned(),
+                fingerprint: None,
+                paired_at: Some(t0.clone()),
+                paired_on: Some("box-a".to_owned()),
+                paired_by: None,
+                removed_by: None,
+                removed_at: t0.clone(),
+                removed_on: "box-a".to_owned(),
+            },
+        );
+        local.devices.insert(
+            id_child.clone(),
+            FleetDevice {
+                name: "child-v1".to_owned(),
+                public_key: child_key_1.clone(),
+                principal: "tablet".to_owned(),
+                role: None,
+                paired_at: t0.clone(),
+                paired_on: "box-a".to_owned(),
+                paired_by: Some(PairedBy {
+                    principal: "tablet".to_owned(),
+                    device: Some(id_parent.clone()),
+                }),
+                confirmed_by: Some("owner".to_owned()),
+                confirmed_at: Some(t1.clone()),
+                updated_at: t1.clone(),
+                updated_on: "box-a".to_owned(),
+            },
+        );
+        std::fs::write(paths.config_file("devices.toml"), local.to_toml_string()).unwrap();
+
+        let mut reg = legion_tools::registry();
+        let fleet = Fleet::new(&paths);
+        register(&mut reg, fleet);
+        let node = Node::new(paths.clone(), reg);
+
+        // 1. Newer edit arrives with `confirmed_by: None`, renaming `child-v1` -> `child-v2` with
+        //    IDENTICAL identity and pairing provenance (`public_key`, `principal`, `paired_at`,
+        //    `paired_on`, `paired_by`). Local confirmation MUST be preserved with no warnings.
+        let mut rename_incoming = DevicesFile::default();
+        rename_incoming.devices.insert(
+            id_child.clone(),
+            FleetDevice {
+                name: "child-v2".to_owned(),
+                public_key: child_key_1.clone(),
+                principal: "tablet".to_owned(),
+                role: None,
+                paired_at: t0.clone(),
+                paired_on: "box-a".to_owned(),
+                paired_by: Some(PairedBy {
+                    principal: "tablet".to_owned(),
+                    device: Some(id_parent.clone()),
+                }),
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: t2.clone(),
+                updated_on: "box-b".to_owned(),
+            },
+        );
+        let res1 = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": rename_incoming.to_toml_string()}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            res1.get("warnings")
+                .and_then(|v| v.as_array())
+                .is_none_or(|w| w.is_empty()),
+            "matching identity/provenance edit must not warn: {res1}"
+        );
+        let after1: DevicesFile = parse(
+            &paths.config_file("devices.toml"),
+            &std::fs::read(paths.config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        let dev1 = &after1.devices[&id_child];
+        assert_eq!(dev1.name, "child-v2");
+        assert_eq!(
+            dev1.confirmed_by.as_deref(),
+            Some("owner"),
+            "local confirmed_by must survive a newer edit with matching identity & provenance: {dev1:?}"
+        );
+        assert_eq!(dev1.confirmed_at.as_deref(), Some(t1.as_str()));
+
+        // 2. Newer edit arrives changing `public_key` (identity mismatch): local confirmation MUST
+        //    be cleared AND the result MUST warn loudly (and the device returns to quarantine!).
+        let mut key_change_incoming = DevicesFile::default();
+        key_change_incoming.devices.insert(
+            id_child.clone(),
+            FleetDevice {
+                name: "child-v2".to_owned(),
+                public_key: child_key_2,
+                principal: "tablet".to_owned(),
+                role: None,
+                paired_at: t0,
+                paired_on: "box-a".to_owned(),
+                paired_by: Some(PairedBy {
+                    principal: "tablet".to_owned(),
+                    device: Some(id_parent),
+                }),
+                confirmed_by: None,
+                confirmed_at: None,
+                updated_at: t3,
+                updated_on: "box-b".to_owned(),
+            },
+        );
+        let res2 = node
+            .call(Call::new(
+                Door::Cli,
+                "config.write",
+                json!({"document": "devices.toml", "content": key_change_incoming.to_toml_string()}),
+            ))
+            .await
+            .unwrap();
+        let warnings2: Vec<&str> = res2["warnings"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            warnings2
+                .iter()
+                .any(|w| w.to_ascii_lowercase().contains("confirmation") && w.contains(&id_child)),
+            "expected warning when local confirmation is cleared on identity change: {res2}"
+        );
+        let after2: DevicesFile = parse(
+            &paths.config_file("devices.toml"),
+            &std::fs::read(paths.config_file("devices.toml")).unwrap(),
+        )
+        .unwrap();
+        let dev2 = &after2.devices[&id_child];
+        assert_eq!(
+            dev2.confirmed_by, None,
+            "local confirmation must be cleared when incoming entry changes public_key: {dev2:?}"
+        );
+        assert_eq!(dev2.confirmed_at, None);
     }
 }
