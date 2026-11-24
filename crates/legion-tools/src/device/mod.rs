@@ -1523,4 +1523,68 @@ role = "owner"
         assert_eq!(list_b["devices"].as_array().unwrap().len(), 1);
         assert_eq!(list_b["devices"][0]["name"], json!("tablet"));
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enrol_replies_ok_when_authorized_keys_swap_succeeds_even_if_state_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if legion_os::user::effective_uid() == Some(0) {
+            return;
+        }
+        let h = Harness::new();
+        let inv = h
+            .call(
+                "device.invite",
+                json!({"principal": "phone", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id = inv["id"].as_str().unwrap().to_owned();
+        let device_key = generate_ephemeral_ed25519().unwrap();
+
+        // Make state_dir read-only (0500) so load_state succeeds, authorized_keys swap succeeds,
+        // and save_state fails with PermissionDenied.
+        let state_dir = h.node.paths().state_dir().to_path_buf();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let line = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": id,
+                "public_key": device_key.public_key,
+                "name": "Resilient Phone",
+            })
+        );
+        let reply = run_enrol(&h.node, &id, line.as_bytes()).await;
+
+        // Restore writable permissions so cleanup and device.list succeed.
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            reply,
+            EnrolReply::Ok {
+                ok: true,
+                node: "tower".to_owned(),
+                principal: "phone".to_owned(),
+                role: "observer".to_owned(),
+                device: "resilient-phone".to_owned(),
+            }
+        );
+
+        // authorized_keys has the permanent device line and no longer has the invite line.
+        let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
+        assert!(auth_text.contains("legion-device:resilient-phone"));
+        assert!(!auth_text.contains(&format!("legion-invite:{id}")));
+
+        // Even with stale/missing state metadata, device.list reports the paired device cleanly.
+        let listed = h.call("device.list", json!({})).await.unwrap();
+        assert_eq!(listed["invites"].as_array().unwrap().len(), 0);
+        let devices = listed["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["name"], json!("resilient-phone"));
+        assert_eq!(devices[0]["principal"], json!("phone"));
+        assert_eq!(devices[0]["fingerprint"], json!(device_key.fingerprint));
+    }
 }

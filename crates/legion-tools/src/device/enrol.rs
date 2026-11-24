@@ -514,17 +514,22 @@ fn process_enrol_blocking(
         }
     };
 
-    if let Err(error) = save_state(paths, &state) {
-        // authorized_keys already has the permanent line and no longer has the temp invite line,
-        // so surface the state error without leaving the invite reusable.
-        return (Some(principal), base_args, Err(error));
-    }
+    // authorized_keys is the source of truth and already holds the permanent device line (with the
+    // temporary invite line removed), and device.list tolerates missing metadata. If persisting
+    // state/devices.json fails after the swap, record the warning in the audit args and still reply
+    // ok: true so the controller does not mistakenly believe enrolment failed.
+    let state_warning = save_state(paths, &state).err().map(|error| error.message);
 
-    let audit_args = json!({
+    let mut audit_args = json!({
         "id": forced_id,
         "device": device_name,
         "fingerprint": fingerprint,
     });
+    if let Some(warning) = state_warning
+        && let Some(obj) = audit_args.as_object_mut()
+    {
+        obj.insert("state_warning".to_owned(), json!(warning));
+    }
     (
         Some(principal.clone()),
         audit_args,
