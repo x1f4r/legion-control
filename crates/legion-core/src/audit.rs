@@ -10,6 +10,7 @@
 //!
 //! - file contents, which a tool takes in a field named `content`, `contents`, `data`, `bytes`,
 //!   `body`, `stdin`, `old` or `new`;
+//! - values inside an object under a key named `env`, keeping the variable names;
 //! - values under a key that names a secret, however it is spelt (`password`, `X-API-Key`,
 //!   `apiKey`, `signing_key`, `auth`, …);
 //! - in a list of arguments, the value after a flag that takes a secret (`--password`, `-p`,
@@ -291,6 +292,9 @@ impl AuditLog {
 const CONTENT_KEYS: [&str; 8] = [
     "content", "contents", "data", "bytes", "body", "stdin", "old", "new",
 ];
+/// Keys whose object value holds name-to-secret pairs: the names are kept so the audit log shows
+/// what was set, while every value is replaced by its byte size.
+const SECRET_VALUE_MAP_KEYS: [&str; 1] = ["env"];
 const SECRET_WORDS: [&str; 12] = [
     "password",
     "passwd",
@@ -378,6 +382,17 @@ fn redact_value(key: Option<&str>, value: &Value) -> Value {
     if key.is_some_and(is_sensitive_key) {
         return size_of(value);
     }
+    if key.is_some_and(is_secret_value_map_key) {
+        return match value {
+            Value::Null => Value::Null,
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(name, val)| (name.clone(), size_of(val)))
+                    .collect::<Map<String, Value>>(),
+            ),
+            other => size_of(other),
+        };
+    }
     match value {
         Value::String(text) if text.len() > LONGEST_KEPT || looks_secret(text) => size_of(value),
         Value::Object(map) => Value::Object(
@@ -409,6 +424,11 @@ fn redact_value(key: Option<&str>, value: &Value) -> Value {
 /// A key or a flag's name the way the rules compare it: lower case, with `-` read as `_`.
 fn normalise(name: &str) -> String {
     name.to_ascii_lowercase().replace('-', "_")
+}
+
+fn is_secret_value_map_key(key: &str) -> bool {
+    let key = normalise(key);
+    SECRET_VALUE_MAP_KEYS.contains(&key.as_str())
 }
 
 fn is_sensitive_key(key: &str) -> bool {
@@ -557,7 +577,7 @@ mod tests {
             redacted["env"]["GITHUB_TOKEN"],
             json!({"redacted_bytes": 1})
         );
-        assert_eq!(redacted["env"]["LANG"], json!("C"));
+        assert_eq!(redacted["env"]["LANG"], json!({"redacted_bytes": 1}));
         assert_eq!(redacted["argv"][0], json!("mysql"));
         assert_eq!(redacted["argv"][1], json!({"redacted_bytes": 18}));
         assert_eq!(redacted["argv"][3], json!("db"));
@@ -664,6 +684,30 @@ mod tests {
         for key in ["key", "path", "author", "monkey", "keyboard"] {
             assert_eq!(redact(&json!({ key: "x" }))[key], json!("x"), "{key}");
         }
+    }
+
+    #[test]
+    fn env_object_keeps_names_and_redacts_every_value() {
+        let args = json!({
+            "cmd": "echo hi",
+            "env": {
+                "MYVAR": "supersecretvalue123",
+                "LANG": "C",
+                "EMPTY": "",
+            },
+        });
+        let redacted = redact(&args);
+        assert_eq!(redacted["cmd"], json!("echo hi"));
+        assert_eq!(
+            redacted["env"],
+            json!({
+                "MYVAR": {"redacted_bytes": 19},
+                "LANG": {"redacted_bytes": 1},
+                "EMPTY": {"redacted_bytes": 0},
+            })
+        );
+        assert_eq!(redact(&json!({"env": null}))["env"], Value::Null);
+        assert!(is_redacted(&redact(&json!({"env": "RAW=secret"}))["env"]));
     }
 
     #[test]

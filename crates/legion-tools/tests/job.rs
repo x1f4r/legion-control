@@ -539,6 +539,26 @@ async fn exit_code_env_secrecy_and_wait_are_reported() {
         .unwrap();
     assert_eq!(env_logs["content"], json!("passed-through"));
 
+    // Confirm `state/audit.jsonl` kept the env variable names while redacting every value,
+    // including plain-named variables like `LEGION_CHECK_VAL`.
+    let audit_text = fs::read_to_string(fixture.node.paths().audit_log()).unwrap();
+    assert!(!audit_text.contains(secret), "{audit_text}");
+    assert!(!audit_text.contains("passed-through"), "{audit_text}");
+    assert!(audit_text.contains("MY_API_SECRET"), "{audit_text}");
+    assert!(audit_text.contains("LEGION_CHECK_VAL"), "{audit_text}");
+    let env_start_entry: Value = audit_text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|entry| {
+            entry["tool"] == json!("job.start")
+                && entry["args"]["env"].get("LEGION_CHECK_VAL").is_some()
+        })
+        .unwrap();
+    assert_eq!(
+        env_start_entry["args"]["env"]["LEGION_CHECK_VAL"],
+        json!({"redacted_bytes": "passed-through".len()})
+    );
+
     // Cancelling a finished job is not an error and returns its final state.
     let cancel_finished = fixture.call("job.cancel", json!({"id": id})).await.unwrap();
     assert_eq!(cancel_finished["state"], json!("failed"));
