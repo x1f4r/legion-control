@@ -412,9 +412,12 @@ pub fn parse_porcelain(output: &str) -> Result<Porcelain, String> {
             }
             continue;
         }
-        let (kind, rest) = record.split_at(1.min(record.len()));
+        // The kind is one ASCII byte; anything else, whatever character it starts with, is an
+        // entry this does not know, and the rest is only sliced after an ASCII byte.
+        let kind = record.as_bytes().first().copied().unwrap_or_default();
+        let rest = if kind.is_ascii() { &record[1..] } else { "" };
         match kind {
-            "1" | "2" => {
+            b'1' | b'2' => {
                 let xy = rest
                     .trim_start()
                     .get(..2)
@@ -426,16 +429,16 @@ pub fn parse_porcelain(output: &str) -> Result<Porcelain, String> {
                 if flags.next().is_some_and(|y| y != '.') {
                     status.unstaged += 1;
                 }
-                if kind == "2" {
+                if kind == b'2' {
                     // A rename or copy: the path it came from is the next record.
                     records
                         .next()
                         .ok_or("a rename without the path it came from")?;
                 }
             }
-            "u" => status.conflicted += 1,
-            "?" => status.untracked += 1,
-            "!" => {}
+            b'u' => status.conflicted += 1,
+            b'?' => status.untracked += 1,
+            b'!' => {}
             _ => return Err(format!("unexpected entry {record:?}")),
         }
     }
@@ -912,6 +915,13 @@ mod tests {
             older.contains(&"-z") && older.contains(&"--porcelain=v2"),
             "{older:?}"
         );
+    }
+
+    #[test]
+    fn a_record_starting_with_any_character_is_refused_without_panicking() {
+        for record in ["é what", "😀", "\u{301}1 .M"] {
+            assert!(parse_porcelain(&z(&[record])).is_err(), "{record:?}");
+        }
     }
 
     #[test]
