@@ -935,25 +935,26 @@ impl AuthKeysFile {
     }
 }
 
+/// Strips trailing `\n` and optional `\r` from a raw `authorized_keys` line.
+fn strip_eol(raw: &[u8]) -> &[u8] {
+    let without_lf = raw.strip_suffix(b"\n").unwrap_or(raw);
+    without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+}
+
 /// Extracts and base64-decodes the SSH key wire blob from any `authorized_keys` line (foreign or
-/// Legion-managed), returning `None` for comments, blank lines, or unparseable lines.
+/// Legion-managed), parsing options, key type, and base64 as ASCII bytes so arbitrary non-UTF-8
+/// comment bytes cannot hide an existing key from duplicate detection.
 fn extract_line_key_blob(raw: &[u8]) -> Option<Vec<u8>> {
-    let body = raw
-        .strip_suffix(b"\n")
-        .unwrap_or(raw)
-        .strip_suffix(b"\r")
-        .unwrap_or_else(|| raw.strip_suffix(b"\n").unwrap_or(raw));
-    let text = std::str::from_utf8(body).ok()?;
-    let trimmed = text.trim_start_matches([' ', '\t']);
-    if trimmed.is_empty() || trimmed.starts_with('#') {
+    let body = trim_leading_ws_bytes(strip_eol(raw));
+    if body.is_empty() || body.starts_with(b"#") {
         return None;
     }
-    let (_, rest) = split_options_and_rest(trimmed);
-    let (key_type, after_type) = split_ws_token(rest)?;
-    if !is_known_ssh_key_type(key_type) {
+    let (_, rest) = split_options_and_rest_bytes(body);
+    let (key_type, after_type) = split_ws_token_bytes(rest)?;
+    if !is_known_ssh_key_type_bytes(key_type) {
         return None;
     }
-    let (key_b64, _) = split_ws_token(after_type)?;
+    let (key_b64, _) = split_ws_token_bytes(after_type)?;
     STANDARD.decode(key_b64).ok()
 }
 
@@ -1283,30 +1284,29 @@ pub(crate) fn ensure_parent_dir(dir: &Path, is_default_ssh_dir: bool) -> Result<
 }
 
 fn classify_line(raw: &[u8]) -> LineKind {
-    let body = raw
-        .strip_suffix(b"\n")
-        .unwrap_or(raw)
-        .strip_suffix(b"\r")
-        .unwrap_or_else(|| raw.strip_suffix(b"\n").unwrap_or(raw));
-    let Ok(text) = std::str::from_utf8(body) else {
-        return LineKind::Foreign;
-    };
-    let trimmed = text.trim_start_matches([' ', '\t']);
-    if trimmed.is_empty() || trimmed.starts_with('#') {
+    let trimmed = trim_leading_ws_bytes(strip_eol(raw));
+    if trimmed.is_empty() || trimmed.starts_with(b"#") {
         return LineKind::Foreign;
     }
 
-    let (options, rest) = split_options_and_rest(trimmed);
-    let Some((key_type, after_type)) = split_ws_token(rest) else {
+    let (options_bytes, rest) = split_options_and_rest_bytes(trimmed);
+    let Some((key_type, after_type)) = split_ws_token_bytes(rest) else {
         return LineKind::Foreign;
     };
-    if !is_known_ssh_key_type(key_type) {
+    if !is_known_ssh_key_type_bytes(key_type) {
         return LineKind::Foreign;
     }
-    let Some((key_b64, after_key)) = split_ws_token(after_type) else {
+    let Some((key_b64_bytes, after_key)) = split_ws_token_bytes(after_type) else {
         return LineKind::Foreign;
     };
-    let comment = after_key.trim_end_matches([' ', '\t']);
+    let Ok(key_b64) = std::str::from_utf8(key_b64_bytes) else {
+        return LineKind::Foreign;
+    };
+    let Ok(comment_raw) = std::str::from_utf8(after_key) else {
+        return LineKind::Foreign;
+    };
+    let options = options_bytes.and_then(|b| std::str::from_utf8(b).ok());
+    let comment = comment_raw.trim_end_matches([' ', '\t']);
     let parsed_cmd = options
         .and_then(|opts| extract_option_value(opts, "command"))
         .map(|cmd| parse_gate_command_flags(&cmd));
@@ -1346,27 +1346,38 @@ fn classify_line(raw: &[u8]) -> LineKind {
     LineKind::Foreign
 }
 
-/// Splits an `authorized_keys` line into `(optional_options, rest_starting_with_key_type)`,
-/// respecting OpenSSH double-quoted option strings and `\"` escapes.
-fn split_options_and_rest(line: &str) -> (Option<&str>, &str) {
-    if let Some((first, _)) = split_ws_token(line)
-        && is_known_ssh_key_type(first)
+fn trim_leading_ws_bytes(mut bytes: &[u8]) -> &[u8] {
+    while let Some(&first) = bytes.first() {
+        if first == b' ' || first == b'\t' {
+            bytes = &bytes[1..];
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+/// Splits an `authorized_keys` line (as raw bytes) into `(optional_options, rest_starting_with_key_type)`,
+/// respecting OpenSSH double-quoted option strings and `\"` escapes without requiring UTF-8 in the
+/// trailing comment.
+fn split_options_and_rest_bytes(line: &[u8]) -> (Option<&[u8]>, &[u8]) {
+    if let Some((first, _)) = split_ws_token_bytes(line)
+        && is_known_ssh_key_type_bytes(first)
     {
         return (None, line);
     }
-    let bytes = line.as_bytes();
     let mut i = 0;
     let mut in_quotes = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if in_quotes && bytes.get(i + 1) == Some(&b'"') => {
+    while i < line.len() {
+        match line[i] {
+            b'\\' if in_quotes && line.get(i + 1) == Some(&b'"') => {
                 i += 2;
                 continue;
             }
             b'"' => in_quotes = !in_quotes,
             b' ' | b'\t' if !in_quotes => {
                 let options = &line[..i];
-                let rest = line[i..].trim_start_matches([' ', '\t']);
+                let rest = trim_leading_ws_bytes(&line[i..]);
                 return (Some(options), rest);
             }
             _ => {}
@@ -1376,29 +1387,29 @@ fn split_options_and_rest(line: &str) -> (Option<&str>, &str) {
     (None, line)
 }
 
-fn split_ws_token(s: &str) -> Option<(&str, &str)> {
-    let s = s.trim_start_matches([' ', '\t']);
+fn split_ws_token_bytes(s: &[u8]) -> Option<(&[u8], &[u8])> {
+    let s = trim_leading_ws_bytes(s);
     if s.is_empty() {
         return None;
     }
-    match s.find([' ', '\t']) {
-        Some(idx) => Some((&s[..idx], s[idx..].trim_start_matches([' ', '\t']))),
-        None => Some((s, "")),
+    match s.iter().position(|&b| b == b' ' || b == b'\t') {
+        Some(idx) => Some((&s[..idx], trim_leading_ws_bytes(&s[idx..]))),
+        None => Some((s, &[])),
     }
 }
 
-fn is_known_ssh_key_type(token: &str) -> bool {
+fn is_known_ssh_key_type_bytes(token: &[u8]) -> bool {
     matches!(
         token,
-        "ssh-ed25519"
-            | "ssh-rsa"
-            | "ssh-dss"
-            | "ecdsa-sha2-nistp256"
-            | "ecdsa-sha2-nistp384"
-            | "ecdsa-sha2-nistp521"
-            | "sk-ssh-ed25519@openssh.com"
-            | "sk-ecdsa-sha2-nistp256@openssh.com"
-    ) || token.ends_with("-cert-v01@openssh.com")
+        b"ssh-ed25519"
+            | b"ssh-rsa"
+            | b"ssh-dss"
+            | b"ecdsa-sha2-nistp256"
+            | b"ecdsa-sha2-nistp384"
+            | b"ecdsa-sha2-nistp521"
+            | b"sk-ssh-ed25519@openssh.com"
+            | b"sk-ecdsa-sha2-nistp256@openssh.com"
+    ) || token.ends_with(b"-cert-v01@openssh.com")
 }
 
 /// Extracts and unquotes the value of `key="..."` from an OpenSSH options string.
@@ -2189,5 +2200,38 @@ Match Group users
         // 3. The test binary itself in target/ has no group-/world-writable ancestors.
         let current = std::env::current_exe().unwrap();
         assert!(verify_exe_not_group_or_world_writable(&current).is_ok());
+    }
+
+    #[test]
+    fn non_utf8_comment_on_foreign_line_still_blocks_duplicate_key_and_preserves_bytes() {
+        use crate::device::keys::{ed25519_public_key_from_seed, encode_ed25519_wire_blob};
+
+        let seed = [33_u8; 32];
+        let pubkey = ed25519_public_key_from_seed(&seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let blob = encode_ed25519_wire_blob(&signing.verifying_key().to_bytes());
+
+        // Plain key with invalid UTF-8 bytes in comment, plus an option-prefixed key with invalid UTF-8 comment.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(pubkey.as_bytes());
+        raw.extend_from_slice(b" foreign-\xff\xfe-comment\n");
+        let parsed = AuthKeysFile::parse(&raw);
+        assert_eq!(parsed.lines.len(), 1);
+        assert_eq!(parsed.lines[0].kind, LineKind::Foreign);
+        assert!(
+            parsed.contains_key_blob(&blob),
+            "non-UTF-8 comment must not hide the key from duplicate detection"
+        );
+        assert_eq!(parsed.to_bytes(), raw);
+
+        // Also with leading options before the key and invalid UTF-8 in the comment.
+        let mut raw_with_opts = Vec::new();
+        raw_with_opts.extend_from_slice(b"from=\"192.0.2.1\",restrict ");
+        raw_with_opts.extend_from_slice(pubkey.as_bytes());
+        raw_with_opts.extend_from_slice(b" \x80\x81\n");
+        let parsed_opts = AuthKeysFile::parse(&raw_with_opts);
+        assert_eq!(parsed_opts.lines[0].kind, LineKind::Foreign);
+        assert!(parsed_opts.contains_key_blob(&blob));
+        assert_eq!(parsed_opts.to_bytes(), raw_with_opts);
     }
 }

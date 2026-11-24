@@ -1587,4 +1587,46 @@ role = "owner"
         assert_eq!(devices[0]["principal"], json!("phone"));
         assert_eq!(devices[0]["fingerprint"], json!(device_key.fingerprint));
     }
+
+    #[tokio::test]
+    async fn enrol_rejects_duplicate_key_behind_non_utf8_foreign_comment() {
+        let h = Harness::new();
+        let existing_key = generate_ephemeral_ed25519().unwrap();
+        let mut foreign_raw = Vec::new();
+        foreign_raw.extend_from_slice(existing_key.public_key.as_bytes());
+        foreign_raw.extend_from_slice(b" legacy-\xff\xfe-comment\n");
+        std::fs::write(&h.auth_keys, &foreign_raw).unwrap();
+
+        let inv = h
+            .call(
+                "device.invite",
+                json!({"principal": "phone", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id = inv["id"].as_str().unwrap().to_owned();
+
+        let req = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": id,
+                "public_key": existing_key.public_key,
+                "name": "Duplicate Phone",
+            })
+        );
+        let reply = run_enrol(&h.node, &id, req.as_bytes()).await;
+        match reply {
+            EnrolReply::Err { ok: false, error } => {
+                assert_eq!(error.code, ErrorCode::Conflict);
+            }
+            other => {
+                panic!("expected Conflict refusal for non-UTF-8 foreign duplicate, got {other:?}")
+            }
+        }
+
+        // The original non-UTF-8 foreign line must remain untouched byte-for-byte.
+        let after = std::fs::read(&h.auth_keys).unwrap();
+        assert!(after.starts_with(&foreign_raw));
+    }
 }
