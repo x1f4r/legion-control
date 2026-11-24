@@ -565,6 +565,57 @@ fn pack_and_delete_never_go_through_a_link_inside_a_name() {
 }
 
 #[test]
+fn a_partial_file_beside_a_target_is_checked_like_the_target() {
+    let node = Node::new();
+    node.policy(
+        "[principals.boxed]\nrole = \"boxed\"\n[roles.boxed]\nallow = [\"effect:read\", \"effect:write\"]\npaths = [\"~/sandbox\"]\n",
+    );
+    // The role's root does not exist yet, so its partial file would sit outside it, in the home.
+    let outside = node.home().join("sandbox.legion-part");
+    fs::write(&outside, b"not yours").unwrap();
+
+    let ran = node.run(
+        Some("boxed"),
+        &json!({"op": "stat", "path": "~/sandbox"}),
+        b"",
+    );
+    let (line, _) = ran.ok().first();
+    assert_eq!(line["kind"], "missing");
+    assert!(line.get("partial").is_none(), "{line}");
+
+    let error = node
+        .run(
+            Some("boxed"),
+            &json!({"op": "put", "path": "~/sandbox", "size": 3, "hash": hash(b"abc")}),
+            b"abc",
+        )
+        .refused(ErrorCode::Denied);
+    assert!(
+        error["message"].as_str().unwrap().contains("legion-part"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"not yours");
+    assert!(!node.home().join("sandbox").exists());
+
+    // Inside the root, a partial file is used as before.
+    fs::create_dir_all(node.home().join("sandbox")).unwrap();
+    fs::write(node.home().join("sandbox/f.bin.legion-part"), b"ab").unwrap();
+    let ran = node.run(
+        Some("boxed"),
+        &json!({"op": "stat", "path": "~/sandbox/f.bin"}),
+        b"",
+    );
+    assert_eq!(ran.ok().first().0["partial"], 2);
+    let ran = node.run(
+        Some("boxed"),
+        &json!({"op": "put", "path": "~/sandbox/f.bin", "size": 3, "hash": hash(b"abc")}),
+        b"c",
+    );
+    assert_eq!(ran.ok().lines()[0], json!({"offset": 2}));
+    assert_eq!(fs::read(node.home().join("sandbox/f.bin")).unwrap(), b"abc");
+}
+
+#[test]
 fn each_operation_needs_what_the_file_tool_it_amounts_to_needs() {
     let node = Node::new();
     node.policy(CONFINED);

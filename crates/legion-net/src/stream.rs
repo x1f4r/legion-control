@@ -528,12 +528,17 @@ fn stat<W: Write>(
     if_size: Option<u64>,
     output: &mut W,
 ) -> Result<(), Failure> {
-    let path = resolve_root(grant, path, Access::Read)?;
+    // The partial file a `put` to this path would continue sits beside the path as given, a link
+    // kept as a link, and is only looked at when it may be read itself.
+    let given = grant.check_path(path, Access::Read)?;
     let partial = || {
-        legion_xfer::resume_offset(&path)
+        legion_xfer::part_path(&given)
             .ok()
+            .filter(|part| grant.check_path(part, Access::Read).is_ok())
+            .and_then(|_| legion_xfer::resume_offset(&given).ok())
             .filter(|len| *len > 0)
     };
+    let path = resolve_root(grant, path, Access::Read)?;
     let found = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -619,6 +624,10 @@ fn put<R: BufRead, W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let target = grant.check_path(path, Access::Write)?;
+    // The partial file beside the target is created, continued, truncated and removed, so it is
+    // held to what the target is: beside a role's root, it is outside it.
+    let part = legion_xfer::part_path(&target).map_err(xfer_error)?;
+    grant.check_path(&part, Access::Write)?;
     let hash: Hash = hash.parse().map_err(xfer_error)?;
     if fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
         return Err(Failure::Reply(
