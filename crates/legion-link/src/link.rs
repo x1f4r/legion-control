@@ -4,7 +4,7 @@
 //! sessions lazily, reuses live sessions, reconnects once when a session died before sending a
 //! request, cancels in-flight calls by caller-chosen call id, and closes idle sessions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -72,6 +72,54 @@ impl LinkConfig {
     }
 }
 
+/// How a [`NodeLink`] entry was obtained.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeOrigin {
+    /// Paired directly by the user via an invite (or a local desktop pipe).
+    #[default]
+    Paired,
+    /// Learned from another already-trusted node via `device.endpoint`.
+    Learned,
+}
+
+impl NodeOrigin {
+    fn is_paired(&self) -> bool {
+        matches!(self, Self::Paired)
+    }
+}
+
+/// Pending host-key change reported by `device.endpoint` for an already known node.
+///
+/// Old pinned host keys remain active in [`NodeLink::target`] until the caller explicitly accepts
+/// the change via [`Link::accept_identity_change`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingIdentityChange {
+    /// New SSH connection target (carrying the newly reported host keys).
+    pub target: SshTarget,
+    /// Trusted node whose authenticated session reported the changed host keys.
+    pub reported_by: String,
+}
+
+/// Summary returned by [`Link::learn`] and [`Link::learn_from`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnReport {
+    /// Trusted node whose authenticated session answered `device.endpoint`.
+    pub introducer: String,
+    /// Newly learned machines added to [`LinkConfig`].
+    pub added: Vec<String>,
+    /// Existing learned machines whose non-pin connection details (hosts/port/user) changed.
+    pub updated: Vec<String>,
+    /// Already known machines whose reported host keys differed from their saved pins; old pins
+    /// were kept and the entries were marked with [`NodeLink::identity_changed`].
+    pub identity_changed: Vec<String>,
+    /// Machines that returned an error during `device.endpoint` fan-out.
+    pub unreachable: Vec<String>,
+    /// Machines whose `device.endpoint` reply failed validation (for example mismatched node name
+    /// or malformed host keys).
+    pub rejected: Vec<String>,
+}
+
 /// One node entry inside [`LinkConfig`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeLink {
@@ -86,16 +134,47 @@ pub struct NodeLink {
     /// Principal this controller acts as on the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// Whether this entry was paired directly or learned from another trusted node.
+    #[serde(default, skip_serializing_if = "NodeOrigin::is_paired")]
+    pub origin: NodeOrigin,
+    /// Name of the trusted node that introduced this learned entry, if learned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_from: Option<String>,
+    /// Non-`None` when a later `device.endpoint` answer reported different host keys for this
+    /// already known machine. Old pins stay in `target` until accepted explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_changed: Option<PendingIdentityChange>,
 }
 
 impl NodeLink {
-    /// Creates an SSH node entry.
+    /// Creates a directly paired SSH node entry.
     pub fn ssh(node: impl Into<String>, target: SshTarget, principal: Option<String>) -> Self {
         NodeLink {
             node: node.into(),
             target: Some(target),
             local_program: None,
             principal,
+            origin: NodeOrigin::Paired,
+            learned_from: None,
+            identity_changed: None,
+        }
+    }
+
+    /// Creates a learned SSH node entry introduced by `learned_from`.
+    pub fn learned(
+        node: impl Into<String>,
+        target: SshTarget,
+        principal: Option<String>,
+        learned_from: impl Into<String>,
+    ) -> Self {
+        NodeLink {
+            node: node.into(),
+            target: Some(target),
+            local_program: None,
+            principal,
+            origin: NodeOrigin::Learned,
+            learned_from: Some(learned_from.into()),
+            identity_changed: None,
         }
     }
 
@@ -106,7 +185,18 @@ impl NodeLink {
             target: None,
             local_program: Some(program.into()),
             principal: None,
+            origin: NodeOrigin::Paired,
+            learned_from: None,
+            identity_changed: None,
         }
+    }
+
+    /// Returns `true` when two entries use the same transport target and principal.
+    fn same_transport(&self, other: &Self) -> bool {
+        self.node == other.node
+            && self.target == other.target
+            && self.local_program == other.local_program
+            && self.principal == other.principal
     }
 }
 
@@ -432,6 +522,236 @@ impl Link {
         self.forget(node).await
     }
 
+    /// Learns direct SSH endpoints for every answering machine in the fleet by calling
+    /// `device.endpoint` with `on: "all"` through the first configured node that answers.
+    ///
+    /// Rules enforced before updating [`LinkConfig`]:
+    /// - Answers are accepted only from an authenticated session to an already configured node
+    ///   (the introducer).
+    /// - Each answer's `node` field must match the machine key it is filed under.
+    /// - A learned entry never replaces the pinned host keys (or target) of a directly paired node.
+    /// - If a later answer reports different host keys for an already known machine, the old pins
+    ///   are kept and the entry is marked with [`NodeLink::identity_changed`].
+    pub async fn learn(&self) -> Result<LearnReport, ErrorBody> {
+        let candidates = self.ordered_candidates(None);
+        if candidates.is_empty() {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                "No configured nodes are available to learn fleet endpoints from.",
+            )
+            .with_hint("Pair with at least one machine first."));
+        }
+        let mut last_err: Option<ErrorBody> = None;
+        for candidate in candidates {
+            match self.learn_from(&candidate).await {
+                Ok(report) => return Ok(report),
+                Err(err) => {
+                    let retry = is_unsent_connect_error(&err)
+                        || (self.is_learned(&candidate)
+                            && is_unsent(&err)
+                            && is_device_removed_or_unknown(&err));
+                    last_err = Some(err);
+                    if !retry {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                "Could not reach any configured node to learn fleet endpoints.",
+            )
+        }))
+    }
+
+    /// Calls `device.endpoint` with `on: "all"` over an authenticated session to `introducer` and
+    /// applies the learned endpoints to [`LinkConfig`].
+    pub async fn learn_from(&self, introducer: &str) -> Result<LearnReport, ErrorBody> {
+        let value = self
+            .call_inner(
+                None,
+                introducer,
+                "device.endpoint",
+                json!({}),
+                Some(json!("all")),
+                |_| {},
+            )
+            .await?;
+        Ok(self.apply_learned_endpoints(introducer, value))
+    }
+
+    /// Explicitly accepts a pending host-key change recorded on `node`, replacing its pinned
+    /// [`NodeLink::target`] with the new target and retiring any cached session so the next call
+    /// connects using the accepted keys.
+    pub fn accept_identity_change(&self, node: &str) -> Result<NodeLink, ErrorBody> {
+        let updated = {
+            let mut cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = cfg
+                .nodes
+                .iter_mut()
+                .find(|n| n.node == node)
+                .ok_or_else(|| {
+                    ErrorBody::new(
+                        ErrorCode::NotFound,
+                        format!("No node named {node:?} is configured."),
+                    )
+                })?;
+            let pending = entry.identity_changed.take().ok_or_else(|| {
+                ErrorBody::new(
+                    ErrorCode::InvalidArgs,
+                    format!("Node {node:?} does not have a pending identity change."),
+                )
+            })?;
+            entry.target = Some(pending.target);
+            entry.clone()
+        };
+        self.retire_node(node);
+        Ok(updated)
+    }
+
+    fn ordered_candidates(&self, preferred: Option<&str>) -> Vec<String> {
+        let cfg = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out: Vec<String> = Vec::with_capacity(cfg.nodes.len());
+        if let Some(pref) = preferred
+            && cfg.nodes.iter().any(|n| n.node == pref)
+        {
+            out.push(pref.to_owned());
+        }
+        // Directly paired (and local) nodes first.
+        for n in &cfg.nodes {
+            if n.origin == NodeOrigin::Paired && !out.iter().any(|x| x == &n.node) {
+                out.push(n.node.clone());
+            }
+        }
+        // Learned nodes without a pending identity change next.
+        for n in &cfg.nodes {
+            if n.origin == NodeOrigin::Learned
+                && n.identity_changed.is_none()
+                && !out.iter().any(|x| x == &n.node)
+            {
+                out.push(n.node.clone());
+            }
+        }
+        // Remaining learned nodes last.
+        for n in &cfg.nodes {
+            if !out.iter().any(|x| x == &n.node) {
+                out.push(n.node.clone());
+            }
+        }
+        out
+    }
+
+    fn is_learned(&self, node: &str) -> bool {
+        self.inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .node(node)
+            .is_some_and(|n| n.origin == NodeOrigin::Learned)
+    }
+
+    fn apply_learned_endpoints(&self, introducer: &str, value: Value) -> LearnReport {
+        let mut report = LearnReport {
+            introducer: introducer.to_owned(),
+            ..LearnReport::default()
+        };
+
+        let entries: Vec<(String, Value)> =
+            if let Some(results) = value.get("results").and_then(Value::as_object) {
+                results
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            } else if value.get("node").is_some() {
+                vec![(introducer.to_owned(), json!({ "ok": value }))]
+            } else {
+                return report;
+            };
+
+        let mut validated: Vec<(String, SshTarget)> = Vec::new();
+        for (machine_key, item) in entries {
+            if item.get("error").is_some() {
+                report.unreachable.push(machine_key);
+                continue;
+            }
+            let Some(ok_val) = item.get("ok") else {
+                report.rejected.push(machine_key);
+                continue;
+            };
+            match parse_and_validate_endpoint(&machine_key, ok_val) {
+                Ok(target) => validated.push((machine_key, target)),
+                Err(()) => report.rejected.push(machine_key),
+            }
+        }
+
+        let mut cfg = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let introducer_principal = cfg.node(introducer).and_then(|n| n.principal.clone());
+
+        for (machine, new_target) in validated {
+            if let Some(existing) = cfg.nodes.iter_mut().find(|n| n.node == machine) {
+                let Some(old_target) = &mut existing.target else {
+                    // Local desktop pipe (`target: None`): never overwrite with an SSH target.
+                    continue;
+                };
+                if canonical_host_keys(&old_target.host_keys)
+                    != canonical_host_keys(&new_target.host_keys)
+                {
+                    // Keep the old pins and mark the entry as identity-changed until accepted.
+                    existing.identity_changed = Some(PendingIdentityChange {
+                        target: new_target,
+                        reported_by: introducer.to_owned(),
+                    });
+                    report.identity_changed.push(machine);
+                    continue;
+                }
+                existing.identity_changed = None;
+                if existing.origin == NodeOrigin::Paired {
+                    // A learned entry never replaces the pins or target of a directly paired node.
+                    continue;
+                }
+                let changed = old_target.hosts != new_target.hosts
+                    || old_target.port != new_target.port
+                    || old_target.user != new_target.user
+                    || existing.learned_from.as_deref() != Some(introducer);
+                old_target.hosts = new_target.hosts;
+                old_target.port = new_target.port;
+                old_target.user = new_target.user;
+                existing.learned_from = Some(introducer.to_owned());
+                if changed {
+                    report.updated.push(machine);
+                }
+            } else {
+                cfg.nodes.push(NodeLink::learned(
+                    machine.clone(),
+                    new_target,
+                    introducer_principal.clone(),
+                    introducer,
+                ));
+                report.added.push(machine);
+            }
+        }
+
+        report.added.sort();
+        report.updated.sort();
+        report.identity_changed.sort();
+        report.unreachable.sort();
+        report.rejected.sort();
+        report
+    }
+
     /// Sends a live `hello` to `node` (opening a session lazily if needed) and returns the
     /// `HelloResult` as JSON.
     pub async fn hello(&self, node: &str) -> Result<Value, ErrorBody> {
@@ -694,7 +1014,6 @@ impl Link {
         while closing.join_next().await.is_some() {}
     }
 
-    #[cfg(feature = "ssh")]
     fn retire_node(&self, node: &str) {
         let slot = self
             .inner
@@ -827,7 +1146,7 @@ impl Link {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(live) = guard.as_ref()
                 && live.session.is_alive()
-                && live.config_snapshot == entry
+                && live.config_snapshot.same_transport(&entry)
             {
                 live.touch();
                 return Ok(live.clone());
@@ -853,7 +1172,7 @@ impl Link {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(live) = guard.as_ref()
                 && live.session.is_alive()
-                && live.config_snapshot == entry
+                && live.config_snapshot.same_transport(&entry)
             {
                 live.touch();
                 return Ok(live.clone());
@@ -1068,6 +1387,78 @@ pub fn parse_optional_target(on: Option<Value>) -> Result<Option<Target>, ErrorB
         ErrorBody::new(ErrorCode::InvalidArgs, format!("on: {reason}."))
             .with_hint("Give on as a machine name, comma-separated names, a list of names, or \"all\", or omit it.")
     })
+}
+
+fn is_unsent(err: &ErrorBody) -> bool {
+    err.details
+        .as_ref()
+        .and_then(|d| d.get(crate::DETAIL_SENT))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+fn is_unsent_connect_error(err: &ErrorBody) -> bool {
+    is_unsent(err) && matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout)
+}
+
+fn is_device_removed_or_unknown(err: &ErrorBody) -> bool {
+    err.code == ErrorCode::Denied
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+}
+
+#[derive(Deserialize)]
+struct EndpointAnswer {
+    node: String,
+    hosts: Vec<String>,
+    port: u16,
+    user: String,
+    host_keys: Vec<String>,
+}
+
+fn parse_and_validate_endpoint(expected_machine: &str, value: &Value) -> Result<SshTarget, ()> {
+    let ep: EndpointAnswer = serde_json::from_value(value.clone()).map_err(|_| ())?;
+    if ep.node != expected_machine {
+        return Err(());
+    }
+    crate::invite::validate_token_field("node", &ep.node).map_err(|_| ())?;
+    crate::invite::validate_token_field("user", &ep.user).map_err(|_| ())?;
+    if ep.port == 0 || ep.hosts.is_empty() || ep.hosts.len() > 32 {
+        return Err(());
+    }
+    for host in &ep.hosts {
+        crate::invite::validate_token_field("hosts", host).map_err(|_| ())?;
+    }
+    if ep.host_keys.is_empty() || ep.host_keys.len() > 32 {
+        return Err(());
+    }
+    for (idx, line) in ep.host_keys.iter().enumerate() {
+        crate::invite::validate_openssh_public_key_line(idx, line).map_err(|_| ())?;
+    }
+    Ok(SshTarget {
+        hosts: ep.hosts,
+        port: ep.port,
+        user: ep.user,
+        host_keys: ep.host_keys,
+    })
+}
+
+/// Canonicalizes a list of OpenSSH public key lines to a sorted set of `"<algo> <base64>"` pairs
+/// so pin comparisons ignore comments, ordering, and duplicates.
+fn canonical_host_keys(lines: &[String]) -> BTreeSet<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let algo = parts.next()?;
+            let blob = parts.next()?;
+            Some(format!("{algo} {blob}"))
+        })
+        .collect()
 }
 
 fn mark_not_sent(mut err: ErrorBody) -> ErrorBody {
@@ -2315,5 +2706,248 @@ mod tests {
         let bad_link = Link::new(LinkConfig::default());
         let bad_err = bad_link.set_device_key("not a key".to_owned()).unwrap_err();
         assert_eq!(bad_err.code, ErrorCode::InvalidArgs);
+    }
+
+    fn test_host_key(seed: u8) -> String {
+        #[cfg(feature = "ssh")]
+        {
+            crate::key::DeviceKey::from_seed([seed; 32])
+                .public_key_line("host")
+                .unwrap()
+        }
+        #[cfg(not(feature = "ssh"))]
+        {
+            use base64::Engine;
+            use base64::engine::general_purpose::STANDARD;
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&(11u32).to_be_bytes());
+            blob.extend_from_slice(b"ssh-ed25519");
+            blob.extend_from_slice(&(32u32).to_be_bytes());
+            blob.extend_from_slice(&[seed; 32]);
+            format!("ssh-ed25519 {}", STANDARD.encode(blob))
+        }
+    }
+
+    fn spawn_endpoint_responder(
+        node: String,
+        responses: Arc<Mutex<Vec<Value>>>,
+    ) -> (
+        tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: Request = serde_json::from_str(&line).unwrap();
+                let resp = if req.method == method::HELLO {
+                    Response::ok(
+                        req.id,
+                        serde_json::to_value(HelloResult {
+                            node: node.clone(),
+                            version: "0.1.0".into(),
+                            build: None,
+                            protocol: PROTOCOL,
+                            os: "linux".into(),
+                            arch: "x86_64".into(),
+                            systems: vec![],
+                            system: None,
+                            boot_id: None,
+                        })
+                        .unwrap(),
+                    )
+                } else if req.method == method::CALL
+                    && req.params.get("tool").and_then(Value::as_str) == Some("device.endpoint")
+                {
+                    assert_eq!(req.params.get("on"), Some(&json!("all")));
+                    let next = responses.lock().unwrap().remove(0);
+                    Response::ok(req.id, next)
+                } else {
+                    Response::ok(req.id, json!({ "ok": true, "node": node }))
+                };
+                let _ = server_w
+                    .write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes())
+                    .await;
+                let _ = server_w.flush().await;
+            }
+        });
+        (client_r, client_w)
+    }
+
+    #[tokio::test]
+    async fn learn_validates_introducer_preserves_paired_pins_and_flags_identity_changes() {
+        let key_a = test_host_key(1);
+        let key_b1 = test_host_key(2);
+        let key_b2 = test_host_key(3);
+        let replies = Arc::new(Mutex::new(vec![
+            // First learn: introduces `pi`, includes `tower` (paired), rejects mismatched `spoof`,
+            // and marks `nas` unreachable.
+            json!({
+                "results": {
+                    "tower": {
+                        "ok": {
+                            "node": "tower",
+                            "hosts": ["other.example.net"],
+                            "port": 2222,
+                            "user": "someone",
+                            "host_keys": [key_a.clone()]
+                        }
+                    },
+                    "pi": {
+                        "ok": {
+                            "node": "pi",
+                            "hosts": ["pi.example.net", "100.64.0.9"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_b1.clone()]
+                        }
+                    },
+                    "spoof": {
+                        "ok": {
+                            "node": "other-name",
+                            "hosts": ["spoof.example.net"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_b1.clone()]
+                        }
+                    },
+                    "nas": {
+                        "error": {
+                            "code": "unreachable",
+                            "message": "nas is off"
+                        }
+                    }
+                }
+            }),
+            // Second learn: `pi` reports a new host key (`key_b2`) and `tower` also reports a new
+            // host key (`key_b2`). Neither pin may be silently overwritten.
+            json!({
+                "results": {
+                    "tower": {
+                        "ok": {
+                            "node": "tower",
+                            "hosts": ["tower.example.net"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_b2.clone()]
+                        }
+                    },
+                    "pi": {
+                        "ok": {
+                            "node": "pi",
+                            "hosts": ["pi.example.net"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_b2.clone()]
+                        }
+                    }
+                }
+            }),
+        ]));
+
+        let replies_c = Arc::clone(&replies);
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let replies_c = Arc::clone(&replies_c);
+            Box::pin(async move {
+                let (r, w) = spawn_endpoint_responder(entry.node.clone(), replies_c);
+                Session::open_io(r, w, &entry.node, None, Duration::from_secs(5), cancel).await
+            })
+        });
+
+        let tower_target = SshTarget {
+            hosts: vec!["tower.example.net".to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![key_a.clone()],
+        };
+        let initial_cfg = LinkConfig {
+            device_key: Some("dummy-key".to_owned()),
+            nodes: vec![NodeLink::ssh(
+                "tower",
+                tower_target.clone(),
+                Some("device:pixel".to_owned()),
+            )],
+        };
+        let link = Link::with_opener(initial_cfg, LinkOptions::default(), opener);
+
+        // 1. First learn adds `pi`, rejects `spoof`, notes `nas` unreachable, and never overwrites
+        //    directly paired `tower`'s target.
+        let r1 = link.learn().await.unwrap();
+        assert_eq!(r1.introducer, "tower");
+        assert_eq!(r1.added, vec!["pi".to_owned()]);
+        assert!(r1.identity_changed.is_empty());
+        assert_eq!(r1.rejected, vec!["spoof".to_owned()]);
+        assert_eq!(r1.unreachable, vec!["nas".to_owned()]);
+
+        let cfg1 = link.config();
+        let tower1 = cfg1.node("tower").unwrap();
+        assert_eq!(tower1.origin, NodeOrigin::Paired);
+        assert_eq!(tower1.target.as_ref(), Some(&tower_target));
+        assert!(tower1.identity_changed.is_none());
+
+        let pi1 = cfg1.node("pi").unwrap();
+        assert_eq!(pi1.origin, NodeOrigin::Learned);
+        assert_eq!(pi1.learned_from.as_deref(), Some("tower"));
+        assert_eq!(pi1.principal.as_deref(), Some("device:pixel"));
+        assert_eq!(pi1.target.as_ref().unwrap().host_keys, vec![key_b1.clone()]);
+        assert!(cfg1.node("spoof").is_none());
+
+        // 2. Second learn reports changed host keys for both `tower` and `pi`: old pins stay in
+        //    place and both entries are flagged `identity_changed`.
+        let r2 = link.learn().await.unwrap();
+        assert_eq!(
+            r2.identity_changed,
+            vec!["pi".to_owned(), "tower".to_owned()]
+        );
+
+        let cfg2 = link.config();
+        let pi2 = cfg2.node("pi").unwrap();
+        assert_eq!(pi2.target.as_ref().unwrap().host_keys, vec![key_b1.clone()]);
+        assert_eq!(
+            pi2.identity_changed.as_ref().unwrap().target.host_keys,
+            vec![key_b2.clone()]
+        );
+        assert_eq!(pi2.identity_changed.as_ref().unwrap().reported_by, "tower");
+
+        let tower2 = cfg2.node("tower").unwrap();
+        assert_eq!(
+            tower2.target.as_ref().unwrap().host_keys,
+            vec![key_a.clone()]
+        );
+        assert_eq!(
+            tower2.identity_changed.as_ref().unwrap().target.host_keys,
+            vec![key_b2.clone()]
+        );
+
+        // 3. Serializable config round-trips origin, learned_from, and identity_changed cleanly.
+        let encoded = serde_json::to_string(&cfg2).unwrap();
+        let decoded: LinkConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, cfg2);
+
+        // 4. Accepting the identity change promotes the new pins and clears the flag.
+        let accepted = link.accept_identity_change("pi").unwrap();
+        assert_eq!(
+            accepted.target.as_ref().unwrap().host_keys,
+            vec![key_b2.clone()]
+        );
+        assert!(accepted.identity_changed.is_none());
+        assert_eq!(
+            link.config()
+                .node("pi")
+                .unwrap()
+                .target
+                .as_ref()
+                .unwrap()
+                .host_keys,
+            vec![key_b2]
+        );
+
+        // Accepting again when no change is pending returns InvalidArgs.
+        let again = link.accept_identity_change("pi").unwrap_err();
+        assert_eq!(again.code, ErrorCode::InvalidArgs);
+
+        link.close().await;
     }
 }
