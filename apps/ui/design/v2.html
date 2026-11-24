@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legion interface, second pass: reference screens</title>
+<link rel="stylesheet" href="../styles.css">
+<style>
+  /* Laying the reference screens out. Nothing in this block ships. */
+  body { padding: 28px; display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; background: #000; height: auto; }
+  :root[data-theme="light"] body { background: #d9d6ce; }
+  .frame { position: relative; width: 390px; height: 820px; border-radius: 30px; overflow: hidden; outline: 1px solid #333; }
+  .frame.wide { width: 1100px; height: 720px; border-radius: 14px; }
+  .frame .shell { height: 100%; }
+  figcaption { font: 12px ui-monospace, monospace; color: #888; margin: 0 0 8px 6px; }
+  figure { margin: 0; }
+</style>
+<style>
+  /* ── Proposed additions to styles.css ─────────────────────────────────────────────────────────
+     Second pass, after first real use on a phone. The rules it follows:
+     1. Nothing on screen without a word saying what it is.
+     2. What is done every day sits in the lower half, in reach of the thumb. What is rare sits high.
+     3. Plain words first. Commands, exit codes and tool names appear only in technical view.
+     4. A machine that is off is simply off. It is not an event. */
+
+  /* The top of a screen says where you are and nothing else. No product name. */
+  .top { grid-area: bar; display: flex; align-items: flex-end; gap: 8px; padding: calc(env(safe-area-inset-top) + 18px) var(--pad) 10px; }
+  .top h1 { flex: 1; min-width: 0; margin: 0; font: 650 28px/1.1 var(--sans); letter-spacing: -0.02em; }
+  .top h1 small { display: block; margin-top: 5px; font: 400 14px/1.3 var(--sans); letter-spacing: 0; color: var(--dim); }
+  .top.sub h1 { font-size: 20px; }
+  .top .btn.icon { margin: 0 -8px -6px 0; color: var(--dim); }
+  .top .back { margin: 0 0 -6px -12px; }
+
+  /* A machine: its name, how it is in words, and three numbers that say what they are. */
+  .machine { display: grid; gap: 12px; padding: 14px; border-top: 1px solid var(--line); text-decoration: none; color: inherit; }
+  .machine:first-child { border-top: 0; }
+  .machine header { display: flex; align-items: center; gap: 10px; }
+  .machine header strong { font: 600 17px var(--mono); }
+  .machine header span:last-child { margin-left: auto; color: var(--dim); font-size: 13px; }
+  .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+  .stat { display: grid; gap: 5px; }
+  .stat span { display: flex; justify-content: space-between; font-size: 12px; color: var(--dim); }
+  .stat span b { font: 500 12px var(--mono); color: var(--text); }
+  .machine.off { grid-template-columns: 1fr auto; align-items: center; color: var(--dim); }
+  .machine.off header strong { font-weight: 500; }
+
+  /* How a thing went, in one word with a mark. */
+  .state { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--dim); white-space: nowrap; }
+  .state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .state.running { color: var(--text); }
+  .state.running::before { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+  .state.done::before { background: var(--dim); }
+  .state.failed { color: var(--bad); }
+  .state.failed::before { background: var(--bad); }
+
+  /* Inside a machine the bottom bar becomes that machine's parts. */
+  .nav.parts a { font-size: 12px; }
+
+  /* The command line sits at the bottom like a message box, with what it said above it. */
+  .dock { grid-area: dock; padding: 8px var(--pad) 10px; border-top: 1px solid var(--line); background: var(--bg); }
+  .app.docked { grid-template: "bar" auto "main" minmax(0, 1fr) "dock" auto "nav" auto / minmax(0, 1fr); }
+
+  /* Things to do, as large targets with a word and a sentence. */
+  .tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .tile { display: grid; gap: 4px; align-content: start; min-height: 86px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); text-align: left; }
+  .tile strong { font-weight: 600; }
+  .tile span { color: var(--dim); font-size: 13px; line-height: 1.35; }
+  .tile.na { opacity: 0.5; }
+
+  /* A setting: what it is, what it is now, and a way in. */
+  .row .value { color: var(--dim); font-size: 14px; }
+  .row .chev { color: var(--faint); font: 18px var(--mono); }
+  .swatches { display: flex; gap: 12px; padding: 14px; }
+  .swatches i { width: 34px; height: 34px; border-radius: 50%; background: var(--c); box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--line-strong); }
+  .swatches i.on { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--text); }
+  .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 4px; padding: 4px; border-radius: 12px; background: var(--raised); }
+  .seg button { height: 38px; border: 0; border-radius: 9px; background: none; color: var(--dim); font-weight: 500; }
+  .seg button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--line-strong); }
+
+  @container shell (min-width: 820px) {
+    .top { padding-left: 28px; padding-right: 28px; }
+    .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .nav .last { margin-top: auto; }
+  }
+</style>
+
+<svg hidden>
+  <symbol id="i-machines" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><path d="M7 7.25h.01M7 16.75h.01"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3.5 12h4l2.5-6 4 12 2.5-6h4"/></symbol>
+  <symbol id="i-actions" viewBox="0 0 24 24"><path d="M13 3.5 5.5 13.5H11l-1 7 7.5-10H12z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4 18 18M18 6l-1.6 1.6M7.6 16.4 6 18"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 5.5 8 12l6.5 6.5"/></symbol>
+  <symbol id="i-overview" viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-7M20.5 19h-17"/></symbol>
+  <symbol id="i-files" viewBox="0 0 24 24"><path d="M4 7.5a2 2 0 0 1 2-2h3.5l2 2H18a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 4v7"/><path d="M7.2 6.8a7 7 0 1 0 9.6 0"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><path d="M6 12h.01M12 12h.01M18 12h.01"/></symbol>
+</svg>
+
+<!-- ─────────────────────────────── Machines ─────────────────────────────── -->
+<figure>
+<figcaption>Machines. No product name; a gear, high up, for what is rare</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top">
+    <h1>Machines<small>3 are on, 1 is off</small></h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <div class="list">
+      <a class="machine" href="#">
+        <header><span class="dot busy"></span><strong>tower</strong><span>Busy · 2 things running</span></header>
+        <div class="stats">
+          <div class="stat"><span>Processor <b>71%</b></span><div class="meter high" style="--v:71"><i></i></div></div>
+          <div class="stat"><span>Memory <b>48%</b></span><div class="meter" style="--v:48"><i></i></div></div>
+          <div class="stat"><span>Disk <b>9%</b></span><div class="meter" style="--v:9"><i></i></div></div>
+        </div>
+      </a>
+      <a class="machine" href="#">
+        <header><span class="dot"></span><strong>pi</strong><span>Idle</span></header>
+        <div class="stats">
+          <div class="stat"><span>Processor <b>6%</b></span><div class="meter" style="--v:6"><i></i></div></div>
+          <div class="stat"><span>Memory <b>31%</b></span><div class="meter" style="--v:31"><i></i></div></div>
+          <div class="stat"><span>Disk <b>44%</b></span><div class="meter" style="--v:44"><i></i></div></div>
+        </div>
+      </a>
+      <a class="machine" href="#">
+        <header><span class="dot"></span><strong>studio</strong><span>Idle</span></header>
+        <div class="stats">
+          <div class="stat"><span>Processor <b>12%</b></span><div class="meter" style="--v:12"><i></i></div></div>
+          <div class="stat"><span>Memory <b>78%</b></span><div class="meter high" style="--v:78"><i></i></div></div>
+          <div class="stat"><span>Disk <b>93%</b></span><div class="meter full" style="--v:93"><i></i></div></div>
+        </div>
+      </a>
+    </div>
+    <p class="label">Off</p>
+    <div class="list">
+      <div class="machine off">
+        <header><span class="dot off"></span><strong>laptop</strong><span>Last on 14 days ago</span></header>
+        <button class="btn small">Wake</button>
+      </div>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#" aria-current="page"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── One machine ─────────────────────────────── -->
+<figure>
+<figcaption>One machine. The bottom bar becomes its parts; swipe sideways between them</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>tower<small>Busy · on for 11 hours</small></h1>
+  </header>
+  <main class="main">
+    <p class="label">Running now</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Photo backup</span><span class="sub">Started 1 hour ago</span></span><span class="state running">Running</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Build</span><span class="sub">Started 4 minutes ago</span></span><span class="state running">Running</span></a>
+    </div>
+    <p class="label">Health</p>
+    <div class="list">
+      <div class="gauge"><header><span>Processor</span><span>71% of 32 cores</span></header><div class="meter" style="--v:71"><i></i></div></div>
+      <div class="gauge"><header><span>Memory</span><span>29 of 60 GB</span></header><div class="meter" style="--v:48"><i></i></div></div>
+      <div class="gauge"><header><span>Disk</span><span>247 GB of 2.8 TB</span></header><div class="meter" style="--v:9"><i></i></div></div>
+      <div class="gauge"><header><span>Graphics memory</span><span>11 of 16 GB</span></header><div class="meter" style="--v:69"><i></i></div></div>
+    </div>
+  </main>
+  <nav class="nav parts">
+    <a href="#" aria-current="page"><svg><use href="#i-overview"/></svg>Overview</a>
+    <a href="#"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-power"/></svg>Power</a>
+    <a href="#"><svg><use href="#i-more"/></svg>More</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Activity, plain ─────────────────────────────── -->
+<figure>
+<figcaption>Activity, as everyone sees it</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top">
+    <h1>Activity</h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Running now</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Photo backup</span><span class="sub">tower · started 1 hour ago</span></span><span class="state running">Running</span></a>
+    </div>
+    <p class="label">Today</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Command</span><span class="sub">studio · 2 hours ago · took 3 seconds</span></span><span class="state done">Finished</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Tests for website</span><span class="sub">tower · 5 hours ago · took 2 minutes</span></span><span class="state failed">Failed</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Command</span><span class="sub">pi · 9 hours ago</span></span><span class="state">Stopped</span></a>
+    </div>
+    <p class="label">Yesterday</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Restart</span><span class="sub">studio · by this phone</span></span><span class="state done">Finished</span></a>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#" aria-current="page"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Activity, technical ─────────────────────────────── -->
+<figure>
+<figcaption>The same with technical details switched on</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top">
+    <h1>Activity</h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Running now</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Photo backup</span><span class="sub mono">rsync -a photos/ nas:photos/</span><span class="sub">tower · started 1 hour ago</span></span><span class="state running">Running</span></a>
+    </div>
+    <p class="label">Today</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Command</span><span class="sub mono">for i in 1 2 3; do echo tick; done</span><span class="sub">studio · 2 hours ago · 3.1 s</span></span><span class="state done">exit 0</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Tests for website</span><span class="sub mono">npm test</span><span class="sub">tower · 5 hours ago · 2 min 4 s</span></span><span class="state failed">exit 1</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Command</span><span class="sub mono">sleep 600</span><span class="sub">pi · 9 hours ago</span></span><span class="state">cancelled</span></a>
+    </div>
+  </main>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#" aria-current="page"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Actions ─────────────────────────────── -->
+<figure>
+<figcaption>Actions: what you can do, in words. Search sits at the bottom</figcaption>
+<div class="frame"><div class="shell"><div class="app docked">
+  <header class="top">
+    <h1>Actions</h1>
+    <button class="btn icon" aria-label="Settings"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <main class="main">
+    <p class="label">Power</p>
+    <div class="tiles">
+      <button class="tile"><strong>Sleep</strong><span>Put a machine to sleep</span></button>
+      <button class="tile"><strong>Wake</strong><span>Switch on one that is off</span></button>
+      <button class="tile"><strong>Restart</strong><span>Also into another system</span></button>
+      <button class="tile"><strong>Shut down</strong><span>Switch a machine off</span></button>
+    </div>
+    <p class="label">Files</p>
+    <div class="tiles">
+      <button class="tile"><strong>Browse</strong><span>Look at files on a machine</span></button>
+      <button class="tile"><strong>Copy</strong><span>From one machine to another</span></button>
+    </div>
+    <p class="label">Run</p>
+    <div class="tiles">
+      <button class="tile"><strong>Command</strong><span>Run one and see what it says</span></button>
+      <button class="tile na"><strong>Update Legion</strong><span>Only an owner can do this</span></button>
+    </div>
+  </main>
+  <div class="dock"><input class="input" placeholder="Find something to do" aria-label="Find something to do"></div>
+  <nav class="nav">
+    <a href="#"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#" aria-current="page"><svg><use href="#i-actions"/></svg>Actions</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── A command, from the bottom ─────────────────────────────── -->
+<figure>
+<figcaption>Running a command: you type at the bottom, it answers above</figcaption>
+<div class="frame"><div class="shell"><div class="app docked">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Command<small>on tower</small></h1>
+  </header>
+  <main class="main" style="display:flex;flex-direction:column;justify-content:flex-end">
+<pre class="out"><span class="meta">$ nvidia-smi --query-gpu=memory.used --format=csv</span>
+memory.used [MiB]
+11264 MiB
+<span class="meta">Finished · 0.2 s</span></pre>
+<pre class="out"><span class="meta">$ df -h /</span>
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p5  2.8T  247G  2.5T   9% /
+<span class="meta">Finished · 38 ms</span></pre>
+  </main>
+  <div class="dock">
+    <div class="prompt"><input placeholder="Type a command" aria-label="Command"><button class="btn primary" style="min-height:36px;padding:0 14px">Run</button></div>
+    <label class="switch" style="margin:4px 2px 0"><span class="dim" style="font-size:13px">Keep running after I leave</span><input type="checkbox"></label>
+  </div>
+  <nav class="nav parts">
+    <a href="#"><svg><use href="#i-overview"/></svg>Overview</a>
+    <a href="#"><svg><use href="#i-files"/></svg>Files</a>
+    <a href="#"><svg><use href="#i-power"/></svg>Power</a>
+    <a href="#" aria-current="page"><svg><use href="#i-more"/></svg>More</a>
+  </nav>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Settings ─────────────────────────────── -->
+<figure>
+<figcaption>Settings: a short list of doors, each to its own page</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Settings</h1>
+  </header>
+  <main class="main">
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">This phone</span><span class="sub">Pixel · may do everything except change permissions</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Connections</span><span class="sub">Paired with tower and pi</span></span><span class="chev">›</span></a>
+    </div>
+    <p class="label">How it looks and reads</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Appearance</span><span class="sub">Dark · green · medium text</span></span><span class="chev">›</span></a>
+      <label class="row"><span class="body"><span class="title">Technical details</span><span class="sub wrap">Show commands, exit codes and tool names</span></span><span class="switch" style="margin:0;min-height:0"><input type="checkbox"></span></label>
+    </div>
+    <p class="label">More</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Refreshing</span><span class="sub">Every 15 seconds while open</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">About</span><span class="sub">Version 0.1.0</span></span><span class="chev">›</span></a>
+    </div>
+  </main>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Connections ─────────────────────────────── -->
+<figure>
+<figcaption>Connections: what this phone reaches, and making new ones</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Connections</h1>
+  </header>
+  <main class="main">
+    <p class="label">This phone is paired with</p>
+    <div class="list">
+      <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title mono">tower</span><span class="sub">Used first · reaches pi, studio, laptop</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="dot"></span><span class="body"><span class="title mono">pi</span><span class="sub">Used when tower is off</span></span><span class="chev">›</span></a>
+    </div>
+    <p class="label">Make a connection</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Pair this phone with another machine</span><span class="sub wrap">Scan or paste the code that machine shows</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Let another device in</span><span class="sub wrap">Show a code for a phone, tablet or computer, and choose what it may do</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Add a machine to the fleet</span><span class="sub wrap">A computer with Legion that the others can reach</span></span><span class="chev">›</span></a>
+    </div>
+    <p class="label">Devices that may come in</p>
+    <div class="list">
+      <a class="row" href="#"><span class="body"><span class="title">Pixel <span class="chip">this phone</span></span><span class="sub">Everything except permissions · paired today</span></span><span class="chev">›</span></a>
+      <a class="row" href="#"><span class="body"><span class="title">Tablet</span><span class="sub">Look only · paired 3 days ago</span></span><span class="chev">›</span></a>
+    </div>
+  </main>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Appearance ─────────────────────────────── -->
+<figure>
+<figcaption>Appearance: its own page, with room to grow</figcaption>
+<div class="frame"><div class="shell"><div class="app">
+  <header class="top sub">
+    <button class="btn icon back" aria-label="Back"><svg><use href="#i-back"/></svg></button>
+    <h1>Appearance</h1>
+  </header>
+  <main class="main">
+    <p class="label">Light or dark</p>
+    <div class="seg"><button aria-pressed="true">Like the phone</button><button aria-pressed="false">Light</button><button aria-pressed="false">Dark</button></div>
+    <p class="label">Colour</p>
+    <div class="list"><div class="swatches">
+      <i class="on" style="--c:#b6f24a"></i><i style="--c:#6fc7ff"></i><i style="--c:#b79cf7"></i><i style="--c:#ffb057"></i><i style="--c:#ff7a9e"></i><i style="--c:#eceef0"></i>
+    </div></div>
+    <p class="label">Text size</p>
+    <div class="seg"><button aria-pressed="false">Small</button><button aria-pressed="true">Medium</button><button aria-pressed="false">Large</button></div>
+    <p class="label">Rows</p>
+    <div class="seg"><button aria-pressed="true">Roomy</button><button aria-pressed="false">Compact</button></div>
+    <p class="label">Machines show</p>
+    <div class="list">
+      <label class="row"><span class="body"><span class="title">Processor, memory and disk</span></span><span class="switch" style="margin:0;min-height:0"><input type="checkbox" checked></span></label>
+      <label class="row"><span class="body"><span class="title">Machines that are off</span></span><span class="switch" style="margin:0;min-height:0"><input type="checkbox" checked></span></label>
+    </div>
+  </main>
+</div></div></div>
+</figure>
+
+<!-- ─────────────────────────────── Wide ─────────────────────────────── -->
+<figure>
+<figcaption>Tablet and desktop: the same three places in a rail, the gear at its foot</figcaption>
+<div class="frame wide"><div class="shell"><div class="app">
+  <header class="top">
+    <h1>Machines<small>3 are on, 1 is off</small></h1>
+  </header>
+  <main class="main"><div class="split">
+    <section>
+      <div class="list">
+        <a class="machine" href="#" style="background:var(--raised)"><header><span class="dot busy"></span><strong>tower</strong><span>Busy · 2 things running</span></header><div class="stats"><div class="stat"><span>Processor <b>71%</b></span><div class="meter high" style="--v:71"><i></i></div></div><div class="stat"><span>Memory <b>48%</b></span><div class="meter" style="--v:48"><i></i></div></div><div class="stat"><span>Disk <b>9%</b></span><div class="meter" style="--v:9"><i></i></div></div></div></a>
+        <a class="machine" href="#"><header><span class="dot"></span><strong>pi</strong><span>Idle</span></header><div class="stats"><div class="stat"><span>Processor <b>6%</b></span><div class="meter" style="--v:6"><i></i></div></div><div class="stat"><span>Memory <b>31%</b></span><div class="meter" style="--v:31"><i></i></div></div><div class="stat"><span>Disk <b>44%</b></span><div class="meter" style="--v:44"><i></i></div></div></div></a>
+      </div>
+      <p class="label">Off</p>
+      <div class="list"><div class="machine off"><header><span class="dot off"></span><strong>laptop</strong><span>Last on 14 days ago</span></header><button class="btn small">Wake</button></div></div>
+    </section>
+    <section>
+      <h2 class="pane-title"><span class="dot busy"></span>tower</h2>
+      <div class="tabs" role="tablist"><button role="tab" aria-selected="true">Overview</button><button role="tab">Files</button><button role="tab">Power</button><button role="tab">Command</button><button role="tab">Services</button><button role="tab">Projects</button></div>
+      <div class="list">
+        <div class="gauge"><header><span>Processor</span><span>71% of 32 cores</span></header><div class="meter" style="--v:71"><i></i></div></div>
+        <div class="gauge"><header><span>Memory</span><span>29 of 60 GB</span></header><div class="meter" style="--v:48"><i></i></div></div>
+        <div class="gauge"><header><span>Disk</span><span>247 GB of 2.8 TB</span></header><div class="meter" style="--v:9"><i></i></div></div>
+      </div>
+    </section>
+  </div></main>
+  <nav class="nav">
+    <a href="#" aria-current="page"><svg><use href="#i-machines"/></svg>Machines</a>
+    <a href="#"><svg><use href="#i-activity"/></svg>Activity</a>
+    <a href="#"><svg><use href="#i-actions"/></svg>Actions</a>
+    <a href="#" class="last"><svg><use href="#i-gear"/></svg>Settings</a>
+  </nav>
+</div></div></div>
+</figure>
+</html>
