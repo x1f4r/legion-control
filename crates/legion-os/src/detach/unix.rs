@@ -25,7 +25,7 @@ use crate::{OsError, Result};
 
 use super::{
     DETACH_MARKER_ENV, DetachHandle, DetachOptions, ScopeProbeOverride, generate_detach_marker,
-    open_append_stdio,
+    merge_recheck_survivors, open_append_stdio,
 };
 
 #[cfg(target_os = "linux")]
@@ -450,12 +450,48 @@ pub(super) async fn stop_detached(
     handle: &DetachHandle,
     grace: Duration,
 ) -> Result<KillTreeReport> {
-    #[cfg(target_os = "linux")]
-    if let Some(ref unit) = handle.systemd_unit {
-        return stop_systemd_scope(unit, &handle.process, handle.marker.as_deref(), grace).await;
+    let mut report = {
+        #[cfg(target_os = "linux")]
+        if let Some(ref unit) = handle.systemd_unit {
+            stop_systemd_scope(unit, &handle.process, handle.marker.as_deref(), grace).await?
+        } else {
+            procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await?
+        }
+    };
+
+    // Post-stop re-check using the exact same rule as `detached_active`: if any marked process
+    // (such as a `setsid` grandchild spawned right before teardown) survived without a scope,
+    // run one bounded marker cleanup pass and report whatever still remains so `stop_detached`
+    // never claims `all_gone: true` while `detached_active` would return `true`.
+    if let Some(ref marker) = handle.marker {
+        let mut remaining = procid::find_marked_live_processes(marker).await?;
+        if !remaining.is_empty() {
+            let followup =
+                procid::kill_tree_with_marker(&handle.process, Some(marker), grace).await?;
+            for id in followup.unverified_survivors {
+                if !report
+                    .unverified_survivors
+                    .iter()
+                    .any(|existing| existing.pid == id.pid)
+                {
+                    report.unverified_survivors.push(id);
+                }
+            }
+            remaining = procid::find_marked_live_processes(marker).await?;
+        }
+        if procid::is_alive(&handle.process)
+            && !remaining.iter().any(|id| id.pid == handle.process.pid)
+        {
+            remaining.push(handle.process);
+        }
+        merge_recheck_survivors(&mut report, remaining);
     }
 
-    procid::kill_tree_with_marker(&handle.process, handle.marker.as_deref(), grace).await
+    Ok(report)
 }
 
 #[cfg(target_os = "linux")]

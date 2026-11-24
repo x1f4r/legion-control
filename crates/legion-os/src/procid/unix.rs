@@ -448,6 +448,74 @@ pub(super) async fn tree_is_active(identity: &ProcessId, marker: Option<&str>) -
     })?
 }
 
+pub(super) async fn find_marked_live_processes(marker: &str) -> Result<Vec<ProcessId>> {
+    let marker_owned = marker.to_owned();
+    let own_pid = std::process::id();
+    tokio::task::spawn_blocking(move || collect_live_marked_processes(&marker_owned, own_pid))
+        .await
+        .map_err(|err| OsError::Platform {
+            detail: format!("find_marked_live_processes worker task failed: {err}"),
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn collect_live_marked_processes(marker: &str, own_pid: u32) -> Vec<ProcessId> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 || pid == own_pid {
+            continue;
+        }
+        if check_env_marker(pid, crate::detach::DETACH_MARKER_ENV, marker)
+            == EnvMarkerCheck::Matched
+            && let Ok(Some(id)) = super::of_pid(pid)
+        {
+            found.push(id);
+        }
+    }
+    found.sort_by_key(|id| id.pid);
+    found
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_live_marked_processes(marker: &str, own_pid: u32) -> Vec<ProcessId> {
+    let Ok(mut system) = System::new() else {
+        return Vec::new();
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+
+    let mut found = Vec::new();
+    for (sys_pid, proc_info) in system.processes() {
+        if matches!(
+            proc_info.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ) {
+            continue;
+        }
+        let pid = sys_pid.as_u32();
+        if pid == 0 || pid == own_pid {
+            continue;
+        }
+        if check_env_marker(pid, crate::detach::DETACH_MARKER_ENV, marker)
+            == EnvMarkerCheck::Matched
+            && let Ok(Some(id)) = super::of_pid(pid)
+        {
+            found.push(id);
+        }
+    }
+    found.sort_by_key(|id| id.pid);
+    found
+}
+
 #[cfg(target_os = "linux")]
 fn has_live_marked_process(marker: &str, own_pid: u32) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -841,6 +909,21 @@ pub(super) async fn kill_tree(
             tracked.insert(identity.pid, identity);
             let live_leader = allow_group && getpgid(Some(root_nix_pid)).ok() == Some(root_nix_pid);
             collect_live_tree_into(&identity, root_nix_pid, live_leader, own_pid, &mut tracked);
+            // When a detach marker is present, also capture any `setsid` grandchild that escaped
+            // the root's process group or was reparented while `root` is still alive.
+            if let Some(ref marker_val) = marker_phase1 {
+                collect_marked_orphans_into(
+                    &identity,
+                    root_nix_pid,
+                    allow_group,
+                    allow_session,
+                    false,
+                    marker_val,
+                    own_pid,
+                    &mut tracked,
+                    &mut unverified,
+                );
+            }
 
             let target_pgid = if live_leader {
                 Some(root_nix_pid)
@@ -959,6 +1042,19 @@ pub(super) async fn kill_tree(
         if root_still_alive {
             let live_leader = allow_group && getpgid(Some(root_nix_pid)).ok() == Some(root_nix_pid);
             collect_live_tree_into(&identity, root_nix_pid, live_leader, own_pid, &mut tracked);
+            if let Some(ref marker_val) = marker_phase2 {
+                collect_marked_orphans_into(
+                    &identity,
+                    root_nix_pid,
+                    allow_group,
+                    allow_session,
+                    false,
+                    marker_val,
+                    own_pid,
+                    &mut tracked,
+                    &mut unverified,
+                );
+            }
         } else {
             collect_descendants_of_tracked_into(&identity, own_pid, &mut tracked);
             if let Some(ref marker_val) = marker_phase2 {

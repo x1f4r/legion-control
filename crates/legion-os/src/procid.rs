@@ -358,6 +358,24 @@ pub(crate) async fn tree_is_active_with_marker(
     tree_is_active_impl(identity, marker).await
 }
 
+/// Return every live (non-zombie) process whose environment contains `LEGION_DETACH_ID=<marker>`.
+///
+/// Uses the exact same environment-marker verification rule as [`tree_is_active_with_marker`] so
+/// `stop_detached` can re-check after stopping and report anything still active.
+pub(crate) async fn find_marked_live_processes(marker: &str) -> Result<Vec<ProcessId>> {
+    find_marked_live_processes_impl(marker).await
+}
+
+#[cfg(any(unix, windows))]
+async fn find_marked_live_processes_impl(marker: &str) -> Result<Vec<ProcessId>> {
+    platform::find_marked_live_processes(marker).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn find_marked_live_processes_impl(_marker: &str) -> Result<Vec<ProcessId>> {
+    Ok(Vec::new())
+}
+
 #[cfg(any(unix, windows))]
 async fn tree_is_active_impl(identity: &ProcessId, marker: Option<&str>) -> Result<bool> {
     platform::tree_is_active(identity, marker).await

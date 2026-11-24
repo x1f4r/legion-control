@@ -290,10 +290,35 @@ pub async fn detached_active(handle: &DetachHandle) -> Result<bool> {
 ///   `TerminateJobObject`, falling back to root plus `handle.marker` if the job object is no
 ///   longer openable.
 /// - **Without a scope or Job Object:** delegates to the marker-verified process-tree stopper
-///   (using `handle.marker` to prove orphan ownership once the root has exited, and leaving
-///   unverifiable candidates untouched in [`KillTreeReport::unverified_survivors`]).
+///   (using `handle.marker` to catch `setsid` grandchildren and prove orphan ownership once the
+///   root has exited, leaving unverifiable candidates untouched in
+///   [`KillTreeReport::unverified_survivors`]).
+///
+/// After stopping, re-checks using the same rule as [`detached_active`] and attempts to stop or
+/// report anything still running so `all_gone: true` is never returned while a matching detached
+/// process remains active.
 pub async fn stop_detached(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
     stop_detached_impl(handle, grace).await
+}
+
+/// Merge any processes still found live by the post-stop [`detached_active`] re-check into
+/// `report`, deduplicating by PID and updating [`KillTreeReport::all_gone`].
+pub(crate) fn merge_recheck_survivors(report: &mut KillTreeReport, remaining: Vec<ProcessId>) {
+    for id in remaining {
+        if !report
+            .survivors
+            .iter()
+            .any(|existing| existing.pid == id.pid)
+        {
+            report.survivors.push(id);
+        }
+    }
+    report.survivors.sort_by_key(|id| id.pid);
+    report
+        .unverified_survivors
+        .retain(|u| !report.survivors.iter().any(|s| s.pid == u.pid));
+    report.unverified_survivors.sort_by_key(|id| id.pid);
+    report.all_gone = report.survivors.is_empty() && report.unverified_survivors.is_empty();
 }
 
 /// Generate a unique ASCII token for [`DETACH_MARKER_ENV`] (`LEGION_DETACH_ID`) and Windows named
@@ -1493,6 +1518,30 @@ mod tests {
             Some(254)
         );
         assert_eq!(parse_systemd_major_version("unknown"), None);
+    }
+
+    #[test]
+    fn merge_recheck_survivors_flips_all_gone_and_deduplicates() {
+        let p1 = ProcessId::new(200, 10);
+        let p2 = ProcessId::new(100, 20);
+        let mut report = KillTreeReport {
+            all_gone: true,
+            survivors: Vec::new(),
+            unverified_survivors: vec![p2],
+        };
+        merge_recheck_survivors(&mut report, vec![p1, p2, p1]);
+        assert!(!report.all_gone);
+        assert_eq!(report.survivors, vec![p2, p1]);
+        assert!(report.unverified_survivors.is_empty());
+
+        let mut clean = KillTreeReport {
+            all_gone: true,
+            survivors: Vec::new(),
+            unverified_survivors: Vec::new(),
+        };
+        merge_recheck_survivors(&mut clean, Vec::new());
+        assert!(clean.all_gone);
+        assert!(clean.survivors.is_empty());
     }
 
     #[tokio::test]

@@ -86,6 +86,36 @@ pub(super) fn boot_id() -> Result<String> {
     Ok(format!("boot-win-{unbiased}"))
 }
 
+pub(super) async fn find_marked_live_processes(marker: &str) -> Result<Vec<ProcessId>> {
+    let marker_owned = marker.to_owned();
+    let own_pid = std::process::id();
+    tokio::task::spawn_blocking(move || -> Result<Vec<ProcessId>> {
+        let entries = win_proc::snapshot_processes()?;
+        let mut found = Vec::new();
+        for entry in entries {
+            if entry.pid == 0 || entry.pid == own_pid {
+                continue;
+            }
+            if win_proc::check_process_env_marker(
+                entry.pid,
+                crate::detach::DETACH_MARKER_ENV,
+                &marker_owned,
+            ) == EnvMarkerCheck::Matched
+                && let OpenPinnedOutcome::Pinned(proc_handle) =
+                    win_proc::open_pinned_query_only(entry.pid, false)
+            {
+                found.push(proc_handle.id);
+            }
+        }
+        found.sort_by_key(|id| id.pid);
+        Ok(found)
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("find_marked_live_processes worker task failed: {err}"),
+    })?
+}
+
 pub(super) async fn tree_is_active(identity: &ProcessId, marker: Option<&str>) -> Result<bool> {
     let identity = *identity;
     let marker_owned = marker.map(str::to_owned);
@@ -237,12 +267,23 @@ pub(super) async fn kill_tree(
             if root_pinned || root_live_unopened {
                 // While `root` is pinned in `pinned`, Windows cannot reuse `identity.pid`.
                 for pass in 0..MAX_WALK_PASSES {
-                    let newly_found = discover_and_terminate_pass(
+                    let mut newly_found = discover_and_terminate_pass(
                         &identity,
                         direct_child_max_start,
                         own_pid,
                         &mut pinned,
                     )?;
+                    if let Some(ref marker_val) = marker_owned {
+                        newly_found += discover_marked_orphans_pass(
+                            &identity,
+                            direct_child_max_start,
+                            false,
+                            marker_val,
+                            own_pid,
+                            &mut pinned,
+                            &mut unverified,
+                        )?;
+                    }
                     if newly_found == 0 && (pass > 0 || !root_pinned) {
                         break;
                     }

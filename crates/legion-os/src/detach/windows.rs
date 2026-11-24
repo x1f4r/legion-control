@@ -37,8 +37,9 @@ use crate::{OsError, Result};
 use super::{
     DETACH_MARKER_ENV, DetachHandle, DetachOptions, WINDOWS_WMI_MAX_CMDLINE,
     build_windows_direct_launch, build_wmi_create_script_for_cmdline, build_wmi_launcher_script,
-    generate_detach_marker, merge_windows_env, parse_wmi_handoff, reconcile_wmi_identity,
-    resolve_windows_job_name, resolve_wmi_program, validate_wmi_batch_target,
+    generate_detach_marker, merge_recheck_survivors, merge_windows_env, parse_wmi_handoff,
+    reconcile_wmi_identity, resolve_windows_job_name, resolve_wmi_program,
+    validate_wmi_batch_target,
 };
 
 const WMI_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -178,6 +179,39 @@ pub(super) async fn stop_detached(
     handle: &DetachHandle,
     grace: Duration,
 ) -> Result<KillTreeReport> {
+    let mut report = stop_detached_primary(handle, grace).await?;
+
+    // Re-check using the exact same marker rule as `detached_active` so `stop_detached` never
+    // reports `all_gone: true` while a marked descendant (for example on the WMI path or after a
+    // fallback) is still running.
+    if let Some(ref marker) = handle.marker {
+        let mut remaining = procid::find_marked_live_processes(marker).await?;
+        if !remaining.is_empty() {
+            let followup =
+                procid::kill_tree_with_marker(&handle.process, Some(marker), grace).await?;
+            for id in followup.unverified_survivors {
+                if !report
+                    .unverified_survivors
+                    .iter()
+                    .any(|existing| existing.pid == id.pid)
+                {
+                    report.unverified_survivors.push(id);
+                }
+            }
+            remaining = procid::find_marked_live_processes(marker).await?;
+        }
+        if procid::is_alive(&handle.process)
+            && !remaining.iter().any(|id| id.pid == handle.process.pid)
+        {
+            remaining.push(handle.process);
+        }
+        merge_recheck_survivors(&mut report, remaining);
+    }
+
+    Ok(report)
+}
+
+async fn stop_detached_primary(handle: &DetachHandle, grace: Duration) -> Result<KillTreeReport> {
     if let Some(ref job_name) = handle.windows_job {
         let job_owned = job_name.clone();
         let root = handle.process;

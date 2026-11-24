@@ -107,6 +107,10 @@ fn main() -> ExitCode {
             || Box::pin(test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes()),
         ),
         (
+            "detach_stop_without_scope_stops_reparented_setsid_grandchild",
+            || Box::pin(test_detach_stop_without_scope_stops_reparented_setsid_grandchild()),
+        ),
+        (
             "procid_kill_tree_leaves_process_untouched_on_mismatched_start_time",
             || Box::pin(test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time()),
         ),
@@ -210,6 +214,8 @@ fn run_helper(mode: &str) -> ExitCode {
         "env_remove_driver" => helper_env_remove_driver(&args),
         "dump_env_vars" => helper_dump_env_vars(&args),
         "dump_argv" => helper_dump_argv(&args),
+        "setsid_reparent_root" => helper_setsid_reparent_root(&args),
+        "setsid_reparent_mid" => helper_setsid_reparent_mid(&args),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -696,6 +702,73 @@ fn helper_dump_argv(args: &[String]) -> ExitCode {
     let joined = args[1..].join("\n") + "\n";
     write_atomic(out_file, joined.as_bytes(), WriteOptions::default())
         .expect("failed to write argv dump");
+    ExitCode::SUCCESS
+}
+
+/// Detached root that spawns an intermediate child which in turn starts a `setsid` grandchild and
+/// exits immediately, leaving the grandchild reparented outside the root's parent/group/session
+/// while the root itself keeps running.
+fn helper_setsid_reparent_root(args: &[String]) -> ExitCode {
+    let grandchild_id_file = &args[0];
+    let ignore_term = args.iter().any(|a| a == "--ignore-term");
+
+    let mut cmd = Command::new(current_exe());
+    cmd.env(HELPER_ENV, "setsid_reparent_mid")
+        .arg(grandchild_id_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if ignore_term {
+        cmd.arg("--ignore-term");
+    }
+    let status = cmd.status().expect("failed to run setsid_reparent_mid");
+    assert!(status.success());
+
+    // Keep the root alive so `stop_detached` runs while both root and the reparented `setsid`
+    // grandchild are live simultaneously.
+    std::thread::sleep(Duration::from_secs(30));
+    ExitCode::SUCCESS
+}
+
+fn helper_setsid_reparent_mid(args: &[String]) -> ExitCode {
+    let grandchild_id_file = &args[0];
+    let ignore_term = args.iter().any(|a| a == "--ignore-term");
+
+    #[cfg(unix)]
+    {
+        use process_wrap::std::{CommandWrap, ProcessSession};
+        let mut wrapped = CommandWrap::with_new(current_exe(), |cmd| {
+            cmd.env(HELPER_ENV, "sleep")
+                .args(["30000", grandchild_id_file])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if ignore_term {
+                cmd.arg("--ignore-term");
+            }
+        });
+        wrapped.wrap(ProcessSession);
+        let _child = wrapped.spawn().expect("failed to spawn setsid grandchild");
+    }
+    #[cfg(not(unix))]
+    {
+        let mut cmd = Command::new(current_exe());
+        cmd.env(HELPER_ENV, "sleep")
+            .args(["30000", grandchild_id_file])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if ignore_term {
+            cmd.arg("--ignore-term");
+        }
+        #[allow(clippy::zombie_processes)]
+        let _child = cmd.spawn().expect("failed to spawn grandchild");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(grandchild_id_file).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(15));
+    }
     ExitCode::SUCCESS
 }
 
@@ -1214,17 +1287,18 @@ async fn test_detach_survives_parent_exit_appends_logs_and_kill_tree_stops_tree(
     assert!(!procid::is_alive(&subchild_id));
 
     #[cfg(unix)]
-    if let Some(ref unit) = handle.systemd_unit {
-        assert!(
-            unit.starts_with(&format!("legion-job-{job_name}-")) && unit.ends_with(".scope"),
-            "unexpected systemd scope unit name: {unit}"
-        );
+    {
+        if let Some(ref unit) = handle.systemd_unit {
+            assert!(
+                unit.starts_with(&format!("legion-job-{job_name}-")) && unit.ends_with(".scope"),
+                "unexpected systemd scope unit name: {unit}"
+            );
+        }
         assert!(
             !procid::is_alive(&setsid_id),
-            "setsid grandchild {setsid_id} survived stop_detached on systemd scope {unit}"
+            "setsid grandchild {setsid_id} survived stop_detached (systemd_unit={:?})",
+            handle.systemd_unit
         );
-    } else if procid::is_alive(&setsid_id) {
-        let _ = procid::kill_tree(&setsid_id, Duration::from_millis(200)).await;
     }
 }
 
@@ -1592,6 +1666,55 @@ async fn test_detach_orphan_proof_ignores_unmarked_and_mismatched_processes() {
     assert!(real_stop.unverified_survivors.is_empty());
     assert!(!procid::is_alive(&child_id));
     assert!(!detached_active(&handle).await.unwrap());
+}
+
+async fn test_detach_stop_without_scope_stops_reparented_setsid_grandchild() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for (label, extra) in [("normal", None), ("ignore-term", Some("--ignore-term"))] {
+        let grandchild_file = dir.path().join(format!("reparented-setsid-{label}.pid"));
+        let grandchild_str = grandchild_file.to_string_lossy().into_owned();
+        let args: Vec<&str> = match extra {
+            Some(flag) => vec![&grandchild_str, flag],
+            None => vec![&grandchild_str],
+        };
+
+        let (spec, env_vars) = helper_spec("setsid_reparent_root", &args);
+        let opts = DetachOptions::new(spec)
+            .name(format!("setsid-noscope-{label}"))
+            .envs(env_vars);
+        let handle = spawn_detached_for_test(opts, ScopeProbeOverride::ForceNoSystemd)
+            .await
+            .unwrap();
+        assert!(handle.systemd_unit.is_none());
+        assert!(handle.marker.is_some());
+
+        let grandchild_id = parse_procid(
+            &wait_for_detached_file(&grandchild_file, Duration::from_secs(5), &handle, &[]).await,
+        );
+        assert!(procid::is_alive(&handle.process));
+        assert!(procid::is_alive(&grandchild_id));
+        assert!(detached_active(&handle).await.unwrap());
+
+        let report = stop_detached(&handle, Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(
+            report.all_gone,
+            "stop_detached without scope ({label}) left survivors: {report:?}"
+        );
+        assert!(report.survivors.is_empty());
+        assert!(report.unverified_survivors.is_empty());
+        assert!(!procid::is_alive(&handle.process));
+        assert!(
+            !procid::is_alive(&grandchild_id),
+            "reparented setsid grandchild {grandchild_id} ({label}) survived stop_detached without scope"
+        );
+        assert!(
+            !detached_active(&handle).await.unwrap(),
+            "detached_active still returned true after stop_detached ({label})"
+        );
+    }
 }
 
 async fn test_procid_kill_tree_leaves_process_untouched_on_mismatched_start_time() {
