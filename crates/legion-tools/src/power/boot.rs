@@ -229,6 +229,28 @@ pub fn describe(platform: Platform, target: &BootTarget) -> String {
     }
 }
 
+/// Whether this platform can arm the target at all, known without asking the machine anything.
+pub fn check_supported(
+    platform: Platform,
+    name: &str,
+    target: &BootTarget,
+) -> Result<(), ErrorBody> {
+    match (platform, target) {
+        (Platform::Macos, BootTarget::EfiLabel(_)) => Err(no_firmware_label_on_macos(name)),
+        _ => Ok(()),
+    }
+}
+
+fn no_firmware_label_on_macos(name: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Unsupported,
+        format!("Boot target {name} names a firmware entry, and macOS has no way for legion to set the firmware's next boot."),
+    )
+    .with_hint(format!(
+        "Give [boot.{name}] arm and verify commands instead of efi_label in node.toml."
+    ))
+}
+
 /// Looks the target's entry up now and says what arming it takes. Reads, changes nothing.
 pub async fn prepare(
     actuator: &dyn Actuator,
@@ -249,13 +271,7 @@ pub async fn prepare(
         BootTarget::EfiLabel(label) => label,
     };
     match platform {
-        Platform::Macos => Err(ErrorBody::new(
-            ErrorCode::Unsupported,
-            format!("Boot target {name} names a firmware entry, and macOS has no way for legion to set the firmware's next boot."),
-        )
-        .with_hint(format!(
-            "Give [boot.{name}] arm and verify commands instead of efi_label in node.toml."
-        ))),
+        Platform::Macos => Err(no_firmware_label_on_macos(name)),
         Platform::Linux => {
             let listing = read_efi(actuator, cancel, sudo).await?;
             let found = matching(&listing.entries, label, |entry| Some(&entry.label));
@@ -267,8 +283,10 @@ pub async fn prepare(
                     return Err(no_entry(name, label, &labels));
                 }
                 several => {
-                    let numbers: Vec<String> =
-                        several.iter().map(|e| format!("Boot{}", e.number)).collect();
+                    let numbers: Vec<String> = several
+                        .iter()
+                        .map(|e| format!("Boot{}", e.number))
+                        .collect();
                     return Err(several_entries(name, label, &numbers));
                 }
             };

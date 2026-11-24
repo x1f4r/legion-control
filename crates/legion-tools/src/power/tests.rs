@@ -341,6 +341,34 @@ async fn a_refusal_without_sudo_is_denied_and_names_the_setting() {
 }
 
 #[tokio::test]
+async fn a_call_that_could_never_work_says_why_before_the_busy_gate() {
+    // Unmonitored, so the gate would refuse; the target that cannot be armed here is named first.
+    let (node_toml, expected) = match here() {
+        Platform::Macos => (
+            "[boot.windows]\nefi_label = \"Windows Boot Manager\"\n",
+            ("power.restart", json!({"into": "windows"})),
+        ),
+        Platform::Windows => ("", ("power.sleep", json!({}))),
+        Platform::Linux => ("", ("power.restart", json!({"into": "windows"}))),
+    };
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new()
+            .without_program("psshutdown64.exe")
+            .without_program("psshutdown.exe"),
+        node_toml,
+    );
+    let (tool, args) = expected;
+    let error = fixture.call(tool, args).await.unwrap_err();
+    let wanted = if here() == Platform::Linux {
+        ErrorCode::NotFound
+    } else {
+        ErrorCode::Unsupported
+    };
+    assert_eq!(error.code, wanted, "{error:?}");
+    assert!(fixture.fake.records().is_empty());
+}
+
+#[tokio::test]
 async fn sudo_refusing_the_command_is_denied_with_the_exact_command() {
     if here() == Platform::Windows {
         return;

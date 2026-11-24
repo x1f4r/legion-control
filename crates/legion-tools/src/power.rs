@@ -365,13 +365,16 @@ async fn act(
     let what = request.action.phrase();
     let cancel = ctx.cancel_token();
 
+    // What can be known without asking the machine anything, before the busy gate, so a call that
+    // could never work says why at once.
     let target = match &request.into {
         None => None,
-        Some(name) => Some((name.as_str(), find_target(&file, name)?)),
+        Some(name) => {
+            let target = find_target(&file, name)?;
+            boot::check_supported(platform, name, target)?;
+            Some((name.as_str(), target))
+        }
     };
-    if !request.force {
-        gate(actuator, ctx, &file, what).await?;
-    }
     let plan = plan::action_plan(
         platform,
         request.action,
@@ -380,6 +383,9 @@ async fn act(
         file.power.sleep.as_deref(),
         &|name| actuator.find_program(name),
     )?;
+    if !request.force {
+        gate(actuator, ctx, &file, what).await?;
+    }
     if let Some(check) = &plan.check {
         ask(actuator, ctx, platform, sudo, what, check, &plan.argv).await?;
     }
