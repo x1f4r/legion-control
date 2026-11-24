@@ -6,9 +6,11 @@
 //! seed, the principal being paired, and an expiry timestamp.
 
 use std::fmt;
+use std::str::FromStr;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use jiff::Timestamp;
 use legion_proto::{ErrorBody, ErrorCode};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -17,6 +19,16 @@ use zeroize::{Zeroize, Zeroizing};
 pub const INVITE_PREFIX: &str = "legion-invite-1.";
 /// Supported invite payload version.
 pub const INVITE_VERSION: u32 = 1;
+/// Maximum byte length accepted for raw invite text before decoding (16 KiB).
+pub const MAX_INVITE_LEN: usize = 16 * 1024;
+/// Maximum byte length of identifier and host fields inside an invite.
+const MAX_FIELD_LEN: usize = 255;
+/// Maximum number of hosts listed in one invite.
+const MAX_HOSTS: usize = 32;
+/// Maximum number of host keys listed in one invite.
+const MAX_HOST_KEYS: usize = 32;
+/// Maximum byte length of a single OpenSSH public host key line.
+const MAX_HOST_KEY_LEN: usize = 4096;
 
 /// Pinned SSH connection target for a paired node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +92,16 @@ impl Invite {
     /// client-side because clocks can skew and the node's sshd/enrolment handler is authoritative.
     pub fn parse(text: &str) -> Result<Self, ErrorBody> {
         let trimmed = text.trim();
+        if trimmed.len() > MAX_INVITE_LEN {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Invite text is too large ({} bytes; maximum is {MAX_INVITE_LEN} bytes).",
+                    trimmed.len()
+                ),
+            )
+            .with_hint("Paste only the single invite string printed by `legion pair`."));
+        }
         let Some(encoded) = trimmed.strip_prefix(INVITE_PREFIX) else {
             if let Some(rest) = trimmed.strip_prefix("legion-invite-")
                 && let Some((ver, _)) = rest.split_once('.')
@@ -195,14 +217,25 @@ impl Invite {
             )
             .with_hint("Update the app or generate a new invite from a compatible legion node."));
         }
-        if self.id.trim().is_empty() {
-            return Err(missing_field("id"));
-        }
-        if self.node.trim().is_empty() {
-            return Err(missing_field("node"));
-        }
-        if self.hosts.is_empty() || self.hosts.iter().any(|h| h.trim().is_empty()) {
+        validate_token_field("id", &self.id)?;
+        validate_token_field("node", &self.node)?;
+        validate_token_field("user", &self.user)?;
+        validate_token_field("principal", &self.principal)?;
+        if self.hosts.is_empty() {
             return Err(missing_field("hosts"));
+        }
+        if self.hosts.len() > MAX_HOSTS {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Invite lists too many hosts ({}; maximum is {MAX_HOSTS}).",
+                    self.hosts.len()
+                ),
+            )
+            .with_hint("Generate a fresh invite with `legion pair`."));
+        }
+        for host in &self.hosts {
+            validate_token_field("hosts", host)?;
         }
         if self.port == 0 {
             return Err(
@@ -210,19 +243,136 @@ impl Invite {
                     .with_hint("Generate a fresh invite with `legion pair`."),
             );
         }
-        if self.user.trim().is_empty() {
-            return Err(missing_field("user"));
-        }
-        if self.host_keys.is_empty() || self.host_keys.iter().any(|k| k.trim().is_empty()) {
+        if self.host_keys.is_empty() {
             return Err(missing_field("host_keys"));
         }
-        if self.principal.trim().is_empty() {
-            return Err(missing_field("principal"));
+        if self.host_keys.len() > MAX_HOST_KEYS {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Invite lists too many host keys ({}; maximum is {MAX_HOST_KEYS}).",
+                    self.host_keys.len()
+                ),
+            )
+            .with_hint("Generate a fresh invite with `legion pair`."));
+        }
+        for (index, key_line) in self.host_keys.iter().enumerate() {
+            validate_openssh_public_key_line(index, key_line)?;
         }
         if self.expires.trim().is_empty() {
             return Err(missing_field("expires"));
         }
+        Timestamp::from_str(&self.expires).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Invite field `expires` is not a valid RFC 3339 timestamp: {err}."),
+            )
+            .with_hint("Generate a fresh invite with `legion pair`.")
+        })?;
         let _ = self.key_seed()?;
+        Ok(())
+    }
+}
+
+fn validate_token_field(field: &str, value: &str) -> Result<(), ErrorBody> {
+    if value.is_empty() {
+        return Err(missing_field(field));
+    }
+    if value.len() > MAX_FIELD_LEN {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "Invite field `{field}` is too long ({} bytes; maximum is {MAX_FIELD_LEN}).",
+                value.len()
+            ),
+        )
+        .with_hint("Generate a fresh invite with `legion pair`."));
+    }
+    if value.starts_with('-') {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Invite field `{field}` cannot begin with `-`."),
+        )
+        .with_hint("Generate a fresh invite with `legion pair`."));
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Invite field `{field}` cannot contain whitespace or control characters."),
+        )
+        .with_hint("Generate a fresh invite with `legion pair`."));
+    }
+    Ok(())
+}
+
+fn validate_openssh_public_key_line(index: usize, line: &str) -> Result<(), ErrorBody> {
+    if line.len() > MAX_HOST_KEY_LEN {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Invite host key #{index} exceeds {MAX_HOST_KEY_LEN} bytes."),
+        )
+        .with_hint("Generate a fresh invite with `legion pair`."));
+    }
+    if line.chars().any(|c| c.is_control()) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Invite host key #{index} cannot contain control characters."),
+        )
+        .with_hint("Use single-line OpenSSH public keys such as `ssh-ed25519 AAAA...`."));
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(missing_field("host_keys"));
+    }
+    #[cfg(feature = "ssh")]
+    {
+        russh::keys::PublicKey::from_openssh(trimmed).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Invite host key #{index} is not a valid OpenSSH public key: {err}."),
+            )
+            .with_hint("Use OpenSSH public key lines such as `ssh-ed25519 AAAA...`.")
+        })?;
+        Ok(())
+    }
+    #[cfg(not(feature = "ssh"))]
+    {
+        let mut parts = trimmed.split_whitespace();
+        let Some(algo) = parts.next() else {
+            return Err(missing_field("host_keys"));
+        };
+        let Some(blob_b64) = parts.next() else {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Invite host key #{index} is missing its base64 key blob."),
+            )
+            .with_hint("Use OpenSSH public key lines such as `ssh-ed25519 AAAA...`."));
+        };
+        let blob = STANDARD.decode(blob_b64).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Invite host key #{index} has invalid base64: {err}."),
+            )
+            .with_hint("Use OpenSSH public key lines such as `ssh-ed25519 AAAA...`.")
+        })?;
+        // RFC 4253 key blobs begin with a big-endian u32 length-prefixed algorithm identifier.
+        if blob.len() < 4 {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Invite host key #{index} blob is truncated."),
+            )
+            .with_hint("Use OpenSSH public key lines such as `ssh-ed25519 AAAA...`."));
+        }
+        let alg_len = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+        if blob.len() <= 4 + alg_len || &blob[4..4 + alg_len] != algo.as_bytes() {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!(
+                    "Invite host key #{index} blob does not match its declared algorithm `{algo}`."
+                ),
+            )
+            .with_hint("Use OpenSSH public key lines such as `ssh-ed25519 AAAA...`."));
+        }
         Ok(())
     }
 }
@@ -542,6 +692,9 @@ mod tests {
 
     use super::*;
 
+    const SAMPLE_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea";
+
     fn sample_seed_b64() -> String {
         STANDARD.encode([7u8; 32])
     }
@@ -554,11 +707,18 @@ mod tests {
             hosts: vec!["tower.example.net".to_owned(), "100.64.0.7".to_owned()],
             port: 22,
             user: "me".to_owned(),
-            host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockHostKey".to_owned()],
+            host_keys: vec![SAMPLE_HOST_KEY.to_owned()],
             key: sample_seed_b64(),
             principal: "phone".to_owned(),
             expires: "2026-11-24T12:00:00Z".to_owned(),
         }
+    }
+
+    fn encode_raw(value: &serde_json::Value) -> String {
+        format!(
+            "{INVITE_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap())
+        )
     }
 
     #[test]
@@ -570,16 +730,13 @@ mod tests {
             "hosts": ["tower.example.net", "100.64.0.7"],
             "port": 22,
             "user": "me",
-            "host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockHostKey"],
+            "host_keys": [SAMPLE_HOST_KEY],
             "key": sample_seed_b64(),
             "principal": "phone",
             "expires": "2026-11-24T12:00:00Z",
             "future_extra_field": {"nested": true}
         });
-        let text = format!(
-            "  {INVITE_PREFIX}{}  \n",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
-        );
+        let text = format!("  {}  \n", encode_raw(&payload));
         let parsed = Invite::parse(&text).unwrap();
         assert_eq!(parsed, sample_invite());
         assert_eq!(*parsed.key_seed().unwrap(), [7u8; 32]);
@@ -604,16 +761,12 @@ mod tests {
             "hosts": ["tower.example.net"],
             "port": 22,
             "user": "me",
-            "host_keys": ["ssh-ed25519 AAAA"],
+            "host_keys": [SAMPLE_HOST_KEY],
             "key": sample_seed_b64(),
             "principal": "phone",
             "expires": "2026-11-24T12:00:00Z"
         });
-        let text = format!(
-            "{INVITE_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wrong_v).unwrap())
-        );
-        let err = Invite::parse(&text).unwrap_err();
+        let err = Invite::parse(&encode_raw(&wrong_v)).unwrap_err();
         assert_eq!(err.code, ErrorCode::Unsupported);
     }
 
@@ -630,15 +783,11 @@ mod tests {
             "hosts": ["tower.example.net"],
             "port": 22,
             "user": "me",
-            "host_keys": ["ssh-ed25519 AAAA"],
+            "host_keys": [SAMPLE_HOST_KEY],
             "key": sample_seed_b64(),
             "expires": "2026-11-24T12:00:00Z"
         });
-        let text = format!(
-            "{INVITE_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&missing).unwrap())
-        );
-        let err = Invite::parse(&text).unwrap_err();
+        let err = Invite::parse(&encode_raw(&missing)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
 
         // Wrong key length (not 32 bytes).
@@ -649,17 +798,66 @@ mod tests {
             "hosts": ["tower.example.net"],
             "port": 22,
             "user": "me",
-            "host_keys": ["ssh-ed25519 AAAA"],
+            "host_keys": [SAMPLE_HOST_KEY],
             "key": STANDARD.encode([1u8; 16]),
             "principal": "phone",
             "expires": "2026-11-24T12:00:00Z"
         });
-        let text = format!(
-            "{INVITE_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&short_key).unwrap())
-        );
-        let err = Invite::parse(&text).unwrap_err();
+        let err = Invite::parse(&encode_raw(&short_key)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
+    }
+
+    #[test]
+    fn rejects_oversized_invite_before_decoding() {
+        let huge = format!("{INVITE_PREFIX}{}", "A".repeat(MAX_INVITE_LEN + 1));
+        let err = Invite::parse(&huge).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+        assert!(err.message.contains("too large"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_control_chars_whitespace_leading_dash_and_overlong_fields() {
+        let bad_values = [
+            "bad\nval".to_owned(),
+            "bad\x00val".to_owned(),
+            "has space".to_owned(),
+            "-leading-dash".to_owned(),
+            "a".repeat(MAX_FIELD_LEN + 1),
+        ];
+        for bad in &bad_values {
+            for field in ["id", "node", "user", "principal"] {
+                let mut v = serde_json::to_value(sample_invite()).unwrap();
+                v[field] = json!(bad);
+                let err = Invite::parse(&encode_raw(&v)).unwrap_err();
+                assert_eq!(err.code, ErrorCode::InvalidArgs, "{field}={bad:?}");
+            }
+            let mut v = serde_json::to_value(sample_invite()).unwrap();
+            v["hosts"] = json!([bad]);
+            let err = Invite::parse(&encode_raw(&v)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "hosts={bad:?}");
+        }
+    }
+
+    #[test]
+    fn validates_expires_as_rfc3339_and_parses_host_keys() {
+        for bad_expires in ["tomorrow", "2026-11-24", "2026-11-24 12:00:00", "not-a-date"] {
+            let mut v = serde_json::to_value(sample_invite()).unwrap();
+            v["expires"] = json!(bad_expires);
+            let err = Invite::parse(&encode_raw(&v)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad_expires:?}");
+        }
+
+        for bad_key in [
+            "not-a-key",
+            "ssh-ed25519 not-valid-base64!!!",
+            "ssh-ed25519 AAAA",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea\ninjected",
+        ] {
+            let mut v = serde_json::to_value(sample_invite()).unwrap();
+            v["host_keys"] = json!([bad_key]);
+            let err = Invite::parse(&encode_raw(&v)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad_key:?}");
+        }
     }
 
     #[test]

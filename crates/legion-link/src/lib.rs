@@ -56,7 +56,7 @@ pub mod stderr;
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
-pub use invite::{Enrolled, INVITE_PREFIX, INVITE_VERSION, Invite, SshTarget};
+pub use invite::{Enrolled, INVITE_PREFIX, INVITE_VERSION, Invite, MAX_INVITE_LEN, SshTarget};
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{

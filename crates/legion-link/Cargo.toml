@@ -19,6 +19,7 @@ schemars = ["dep:schemars"]
 [dependencies]
 base64.workspace = true
 getrandom = { workspace = true, optional = true }
+jiff.workspace = true
 legion-proto.workspace = true
 russh = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
