@@ -23,6 +23,7 @@ use legion_os::shell::CommandSpec;
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::binfmt::verify_binary_matches_target;
 use legion_tools::floor::{SemVer, check_version_transition, commit_floor, machine_floor_path};
+use legion_tools::package::{PackageManager, managed_fleet_install_error};
 use legion_tools::trust::RELEASE_PUBLIC_KEY;
 use legion_tools::update::{
     ParsedVersion, ReleaseFetcher, SystemFetcher, artifact_url, dist_cache_binary,
@@ -70,7 +71,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(InstallTool {
         spec: ToolSpec {
             name: "fleet.install".to_owned(),
-            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.".to_owned(),
+            description: "Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Refuses to overwrite a remote binary managed by a system package manager (such as `deb` or `pacman`) and reports the package manager's upgrade command instead. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.".to_owned(),
             effect: Effect::Admin,
             input_schema: input_schema::<InstallArgs>(),
         },
@@ -559,11 +560,23 @@ fn windows_dest_assignment(program: Option<&str>) -> Result<String, ErrorBody> {
 }
 
 /// Fixed remote Unix command that resolves which `legion` path a session will execute (honoring
-/// `PATH` and any configured `program`) and checks whether that destination is writable.
+/// `PATH` and any configured `program`), checks whether it is owned by a system package manager,
+/// and checks whether that destination is writable.
 pub fn unix_resolve_dest_command(program: Option<&str>) -> Result<String, ErrorBody> {
     let assign = unix_dest_assignment(program)?;
     Ok(format!(
         "sh -c '{assign}; printf \"LEGION_DEST=%s\\n\" \"$d\"; \
+if [ -e \"$d\" ]; then \
+r=$(readlink -f \"$d\" 2>/dev/null || printf \"%s\" \"$d\"); \
+rdir=$(dirname \"$r\"); \
+if [ \"$(basename \"$rdir\")\" = \"bin\" ]; then \
+m=\"$(dirname \"$rdir\")/lib/legion/managed-by\"; \
+if [ -f \"$m\" ]; then \
+mb=$(head -n 1 \"$m\" 2>/dev/null | tr -d \"\\r\\n\\t \" || true); \
+if [ -n \"$mb\" ]; then printf \"LEGION_MANAGED_BY=%s\\n\" \"$mb\"; fi; \
+fi; \
+fi; \
+fi; \
 if [ -d \"$d\" ]; then printf \"LEGION_WRITABLE=dir\\n\"; exit 0; fi; \
 pdir=$(dirname \"$d\"); while [ ! -e \"$pdir\" ] && [ \"$pdir\" != \"/\" ] && [ \"$pdir\" != \".\" ]; do pdir=$(dirname \"$pdir\"); done; \
 if [ -w \"$pdir\" ] && ( [ ! -e \"$d\" ] || [ -w \"$d\" ] || [ -w \"$(dirname \"$d\")\" ] ); then printf \"LEGION_WRITABLE=yes\\n\"; else printf \"LEGION_WRITABLE=no\\n\"; fi'"
@@ -634,12 +647,15 @@ pub struct ResolvedDestination {
     pub writable: bool,
     /// Whether the destination path currently names a directory instead of a file.
     pub is_dir: bool,
+    /// System package manager that owns the resolved binary, if any.
+    pub managed_by: Option<PackageManager>,
 }
 
 /// Parses the output of [`unix_resolve_dest_command`] or [`windows_resolve_dest_command`].
 pub fn parse_remote_dest_probe(output: &str) -> Option<ResolvedDestination> {
     let mut path = None;
     let mut writable = None;
+    let mut managed_by = None;
     for line in output.lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix("LEGION_DEST=")
             && !rest.is_empty()
@@ -647,6 +663,8 @@ pub fn parse_remote_dest_probe(output: &str) -> Option<ResolvedDestination> {
             path = Some(rest.to_owned());
         } else if let Some(rest) = line.strip_prefix("LEGION_WRITABLE=") {
             writable = Some(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix("LEGION_MANAGED_BY=") {
+            managed_by = PackageManager::parse(rest);
         }
     }
     let path = path?;
@@ -655,6 +673,7 @@ pub fn parse_remote_dest_probe(output: &str) -> Option<ResolvedDestination> {
         path,
         writable: w == "yes",
         is_dir: w == "dir",
+        managed_by,
     })
 }
 
@@ -1063,6 +1082,14 @@ async fn run_fleet_install_with_key(
         cancel.clone(),
     )
     .await?;
+
+    if let Some(manager) = &resolved_dest.managed_by {
+        return Err(managed_fleet_install_error(
+            manager,
+            &resolved_dest.path,
+            &args.machine,
+        ));
+    }
 
     let remote_display_path = resolved_dest.path.clone();
 
@@ -1496,6 +1523,7 @@ async fn resolve_remote_destination(
         path: fallback,
         writable: true,
         is_dir: false,
+        managed_by: None,
     })
 }
 
@@ -2898,5 +2926,73 @@ program = "/opt/legion/legion"
         assert_eq!(res.previous_version.as_deref(), Some("0.1.0"));
         assert_eq!(res.installed_version, "0.1.0");
         assert_eq!(res.build.as_deref(), Some("222222222222, modified"));
+    }
+
+    #[tokio::test]
+    async fn fleet_install_refuses_package_managed_remote_without_copying_anything() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let fleet = sample_fleet();
+        let local_bin = dir.path().join("legion-custom");
+        fs::write(
+            &local_bin,
+            fake_binary("x86_64-unknown-linux-musl", b"local-binary"),
+        )
+        .unwrap();
+
+        let parsed = parse_remote_dest_probe(
+            "LEGION_DEST=/usr/bin/legion\nLEGION_MANAGED_BY=deb\nLEGION_WRITABLE=no\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.managed_by, Some(PackageManager::Deb));
+        assert!(!parsed.writable);
+
+        for (marker, expected_hint) in [("deb", "apt-get install"), ("pacman", "pacman")] {
+            let mut backend = FakeInstallBackend::linux_x86_64("0.2.0", Some("0.1.0"), "0.2.0");
+            // Even if writable=yes (e.g. root SSH), package-managed installs must still be refused.
+            backend.dest_probe_output = Some(RemoteCommandOutput {
+                success: true,
+                stdout: format!(
+                    "LEGION_DEST=/usr/bin/legion\nLEGION_MANAGED_BY={marker}\nLEGION_WRITABLE=yes\n"
+                ),
+                stderr: String::new(),
+            });
+
+            for (dry_run, from) in [
+                (false, None),
+                (true, None),
+                (false, Some(local_bin.display().to_string())),
+            ] {
+                let err = run_fleet_install(
+                    &paths,
+                    &fleet,
+                    "laptop",
+                    &backend,
+                    InstallArgs {
+                        machine: "tower".to_owned(),
+                        version: None,
+                        from,
+                        dry_run,
+                        allow_downgrade: false,
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.code, ErrorCode::Unsupported);
+                assert_eq!(err.machine.as_deref(), Some("tower"));
+                assert!(err.message.contains("/usr/bin/legion"), "{}", err.message);
+                assert!(
+                    err.hint.as_deref().unwrap().contains(expected_hint),
+                    "{:?}",
+                    err.hint
+                );
+                assert_eq!(err.details.as_ref().unwrap()["managed_by"], marker);
+            }
+
+            assert!(backend.download_log.lock().unwrap().is_empty());
+            assert!(backend.scp_log.lock().unwrap().is_empty());
+            assert!(backend.session_checks.lock().unwrap().is_empty());
+        }
     }
 }

@@ -1,0 +1,92 @@
+.TH LEGION 1 "2026" "legion" "User Commands"
+.SH NAME
+legion \- remote control node and CLI for managing machines
+.SH SYNOPSIS
+.B legion
+.I tool
+[\fIkey\fR=\fIvalue\fR ...] [\fB\-\-args\fR \fIJSON\fR|\fB\-\fR]
+[\fB\-\-on\fR \fImachine\fR] [\fB\-\-as\fR \fIprincipal\fR] [\fB\-\-json\fR]
+.br
+.B legion
+.B help
+[\fItool\fR]
+.br
+.B legion
+.B tools
+[\fB\-\-json\fR]
+.br
+.B legion
+.B init
+[\fB\-\-name\fR \fIname\fR] [\fB\-\-no\-roles\fR] [\fB\-\-dry\-run\fR]
+.br
+.B legion
+.B cp
+.I from to
+[\fB\-\-delete\fR] [\fB\-\-checksum\fR] [\fB\-\-dry\-run\fR]
+.br
+.B legion
+.B serve
+[\fB\-\-listen\fR \fIaddress\fR]
+.SH DESCRIPTION
+.B legion
+is a single executable that exposes the same set of system, file, command,
+background job, service, project, power, and fleet tools on every machine over
+the command line, SSH (\fBlegion rpc\fR), MCP (\fBlegion mcp\fR), and a
+loopback HTTP server (\fBlegion serve\fR).
+.PP
+Every call is checked against the node's policy and recorded in an append-only
+audit log.
+.SH COMMANDS
+.TP
+.B legion init
+Create starter \fInode.toml\fR and \fIpolicy.toml\fR files where they do not
+already exist.
+.TP
+.B legion tools
+List every tool registered on this node, including local extensions in
+\fItools.d/\fR.
+.TP
+.B legion help \fR[\fItool\fR]
+Show usage or the full description and argument schema for one tool.
+.TP
+.B legion \fItool\fR \fR[\fIkey\fR=\fIvalue\fR ...]
+Run a tool locally, or on another machine named in \fIfleet.toml\fR with
+\fB\-\-on\fR \fImachine\fR (or \fB\-\-on all\fR).
+.TP
+.B legion cp \fIfrom to\fR
+Copy a file or directory tree between machines with resume and sync support.
+.TP
+.B legion serve
+Serve the node's tools over HTTP on loopback only (127.0.0.1:7117 by default).
+.TP
+.B legion rpc\fR, \fBlegion mcp\fR, \fBlegion stream\fR, \fBlegion gate
+Protocol endpoints for SSH transport, AI agents, bulk file transfers, and
+restricted SSH keys.
+.TP
+.B legion agents\fR, \fBlegion token
+Register the MCP server with coding agents, or manage bearer tokens for
+\fBlegion serve\fR.
+.TP
+.B legion \-\-version
+Print the installed version and build revision.
+.SH FILES
+.TP
+.I ~/.config/legion/
+Configuration directory (or \fI$XDG_CONFIG_HOME/legion\fR): \fInode.toml\fR,
+\fIfleet.toml\fR, \fIpolicy.toml\fR, \fIprojects.toml\fR, \fItokens.toml\fR,
+and \fItools.d/*.toml\fR.
+.TP
+.I ~/.local/state/legion/
+State directory (or \fI$XDG_STATE_HOME/legion\fR): \fIaudit.jsonl\fR,
+\fIjobs/\fR, and \fIsync/\fR.
+.TP
+.I /usr/lib/systemd/user/legion\-serve.service
+Optional systemd user unit for \fBlegion serve\fR (not enabled by default).
+.SH ENVIRONMENT
+.TP
+.B LEGION_HOME
+Override both configuration and state directories with
+\fI$LEGION_HOME/config\fR and \fI$LEGION_HOME/state\fR.
+.SH SEE ALSO
+Run \fBlegion help\fR for full CLI usage and \fBlegion tools\fR for every tool.
+Project homepage: https://github.com/x1f4r/legion-control

@@ -15,8 +15,8 @@ CI:
 
 | Platform | Target triple | Asset name |
 | --- | --- | --- |
-| Linux x86-64 (static musl) | `x86_64-unknown-linux-musl` | `legion-<ver>-x86_64-unknown-linux-musl` |
-| Linux arm64 (static musl) | `aarch64-unknown-linux-musl` | `legion-<ver>-aarch64-unknown-linux-musl` |
+| Linux x86-64 (static musl) | `x86_64-unknown-linux-musl` | `legion-<ver>-x86_64-unknown-linux-musl`, `legion_<ver>-1_amd64.deb` |
+| Linux arm64 (static musl) | `aarch64-unknown-linux-musl` | `legion-<ver>-aarch64-unknown-linux-musl`, `legion_<ver>-1_arm64.deb` |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `legion-<ver>-aarch64-apple-darwin` |
 | macOS Intel | `x86_64-apple-darwin` | `legion-<ver>-x86_64-apple-darwin` |
 | Windows x86-64 (static CRT) | `x86_64-pc-windows-msvc` | `legion-<ver>-x86_64-pc-windows-msvc.exe` |
@@ -24,6 +24,44 @@ CI:
 32-bit ARM Linux is not supported (use a 64-bit OS image on Raspberry Pi). Native Windows ARM64
 binaries are not published yet; the Windows installer and `fleet.install` warn and install the
 x86-64 binary to run under emulation (or build from source natively).
+
+### Install on Debian or Ubuntu
+
+Download `legion_<ver>-1_amd64.deb` (or `arm64`), `SHA256SUMS`, and `SHA256SUMS.sig` from the
+`legion-v<ver>` release, verify the signature and checksum as shown in
+[Manual install or building from source](#manual-install-or-building-from-source), and install with
+`apt-get`:
+
+```sh
+sudo apt-get install ./legion_<ver>-1_amd64.deb
+```
+
+The package installs `/usr/bin/legion`, the manual page (`man legion`), and an optional systemd user
+unit at `/usr/lib/systemd/user/legion-serve.service` (disabled by default; enable it with
+`systemctl --user enable --now legion-serve.service`). Package-managed installations refuse
+`meta.update` and `fleet.install` so `apt` remains the single owner of `/usr/bin/legion`; upgrade by
+installing the newer `.deb` with `sudo apt-get install ./legion_<ver>-1_amd64.deb`, and remove with
+`sudo apt-get remove legion` (your configuration under `~/.config/legion` is kept).
+
+### Install on Arch
+
+Two `PKGBUILD` files live in `packaging/arch/`: `packaging/arch/PKGBUILD` (`legion`, built from
+source at a `legion-v<ver>` tag) and `packaging/arch/legion-bin/PKGBUILD` (`legion-bin`, wrapping
+the released static binary). From a checkout:
+
+```sh
+# From a published release tag (or inside packaging/arch/legion-bin for the static binary)
+cd packaging/arch
+makepkg -si
+
+# Or build directly from the local checkout before a tag exists
+bash packaging/arch/build-local.sh source target/packages
+sudo pacman -U target/packages/legion-*-x86_64.pkg.tar.zst
+```
+
+Remove with `sudo pacman -R legion` (your configuration under `~/.config/legion` is kept). As with
+`.deb`, package-managed installations refuse `meta.update` and `fleet.install` and direct you to
+`pacman`. See `packaging/README.md` for full build and packaging details.
 
 ### Linux and macOS (installer script)
 

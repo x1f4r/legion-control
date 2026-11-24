@@ -275,7 +275,7 @@ Discover peer machines from `tailscale status --json` using their MagicDNS names
 
 Effect: `admin`
 
-Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.
+Install or upgrade the legion binary on a machine in fleet.toml using only ssh and scp. Refuses to overwrite a remote binary managed by a system package manager (such as `deb` or `pacman`) and reports the package manager's upgrade command instead. Detects the remote OS and architecture, verifies the offline Ed25519 signature (SHA256SUMS.sig) against the compiled-in release key and checks SHA-256 (for both downloaded and cached releases, with no skip flag; passing `from=<local file>` is the only way to install an unsigned binary, where the admin naming the file vouches for it), copies it atomically into place, and opens a normal session to verify the installed version.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -620,17 +620,17 @@ Wait until a background job is no longer starting or running and return the same
 
 | Tool | Effect | Description |
 | --- | --- | --- |
-| `meta.doctor` | `read` | Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). |
+| `meta.doctor` | `read` | Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). |
 | `meta.init` | `admin` | Create starter node.toml and policy.toml files where they do not already exist, leaving every existing file untouched so it is safe to run again. |
 | `meta.update` | `admin` | Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. |
-| `meta.version` | `read` | Say which build of legion this node runs, the protocol it speaks, and its operating system and architecture. |
+| `meta.version` | `read` | Say which build of legion this node runs, how it was installed, the protocol it speaks, and its operating system and architecture. |
 | `meta.whoami` | `read` | Say who the caller is on this node: the principal and role it acts as, the door it came through, the directories file tools are confined to, and the tools it may use. |
 
 ### `meta.doctor`
 
 Effect: `read`
 
-Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.
+Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -652,7 +652,7 @@ Create starter node.toml and policy.toml files where they do not already exist, 
 
 Effect: `admin`
 
-Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. Release downloads require a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it) and SHA-256 verification; passing `from=<local file>` installs an unsigned binary that the admin naming the file vouches for. Checks binary format and architecture, enforces downgrade protection unless `allow_downgrade` is set, stages and runs `--version` preflight, keeps the previous binary as `.prev` (restoring it if the replaced binary does not run), and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.
+Replace this node's legion binary with an offline-signed GitHub release artifact or a local binary passed with `from`. Refuses installations managed by a system package manager (such as `deb` or `pacman`) and points at the package manager's upgrade command instead. Release downloads require a valid Ed25519 SHA256SUMS.sig matching the public key compiled into legion (no flag can bypass it) and SHA-256 verification; passing `from=<local file>` installs an unsigned binary that the admin naming the file vouches for. Checks binary format and architecture, enforces downgrade protection unless `allow_downgrade` is set, stages and runs `--version` preflight, keeps the previous binary as `.prev` (restoring it if the replaced binary does not run), and replaces atomically. On Windows, renames the running executable aside first so it can be cleaned up on the next start.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -665,7 +665,7 @@ Replace this node's legion binary with an offline-signed GitHub release artifact
 
 Effect: `read`
 
-Say which build of legion this node runs, the protocol it speaks, and its operating system and architecture.
+Say which build of legion this node runs, how it was installed, the protocol it speaks, and its operating system and architecture.
 
 Takes no arguments.
 

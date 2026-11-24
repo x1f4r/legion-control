@@ -1,0 +1,47 @@
+[package]
+name = "legion-link"
+description = "The client side of the Legion wire: multiplexed sessions over any pipe, in-process SSH, device keys, invites, and the Link facade."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# In-process SSH pipe via russh (using the `ring` crypto backend), DeviceKey, and enrolment.
+ssh = ["dep:russh", "dep:getrandom", "tokio/net"]
+# Desktop-only child-process pipe (`legion rpc` over stdio).
+local = ["tokio/process"]
+# Optional JSON Schema derives for shared wire/command enums used by legion-net.
+schemars = ["dep:schemars"]
+
+[dependencies]
+base64.workspace = true
+getrandom = { workspace = true, optional = true }
+jiff.workspace = true
+legion-proto.workspace = true
+russh = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[[example]]
+name = "link"
+path = "examples/link.rs"
+required-features = ["ssh"]
+
+[[test]]
+name = "sshd"
+path = "tests/sshd.rs"
+required-features = ["ssh"]
+
+[lints]
+workspace = true

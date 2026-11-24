@@ -338,7 +338,7 @@ pub struct NodeFile {
 }
 
 /// The `[serve]` table of `node.toml`: what `legion serve` accepts besides this machine itself.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeConfig {
     /// Browser pages allowed to call this API, by origin (`https://app.example.net`). Their
@@ -352,6 +352,24 @@ pub struct ServeConfig {
     /// Any other `Host` is refused, which is what stops a DNS rebinding page from reaching it.
     #[serde(default)]
     pub hosts: Vec<String>,
+    /// Whether `legion serve` serves the built-in web interface at `/`. Enabled by default; set
+    /// `ui = false` to serve only the HTTP API and MCP endpoints.
+    #[serde(default = "default_true")]
+    pub ui: bool,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            origins: Vec::new(),
+            hosts: Vec::new(),
+            ui: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The `[devices]` table of `node.toml`: where paired devices' SSH keys and host keys are read.
@@ -798,6 +816,12 @@ verify = ["check-next-entry", "Other"]
         assert_eq!(unmonitored.busy, None);
         assert!(unmonitored.boot.is_empty());
         assert!(!unmonitored.power.sudo);
+        assert!(unmonitored.serve.ui);
+
+        let no_ui = node("[serve]\nui = false\n").unwrap();
+        assert!(!no_ui.serve.ui);
+        let empty_serve = node("[serve]\n").unwrap();
+        assert!(empty_serve.serve.ui);
     }
 
     #[test]

@@ -1,0 +1,199 @@
+name: Legion packages
+# Build the static Linux binary, package it as a .deb, and verify installation, real tools, real
+# loopback OpenSSH interop, systemd unit verification, self-update refusal, upgrade, and removal on
+# every supported Linux distribution.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - LICENSE
+      - crates/**
+      - packaging/**
+      - scripts/legion-distro-test.sh
+      - .github/workflows/legion-packages.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - LICENSE
+      - crates/**
+      - packaging/**
+      - scripts/legion-distro-test.sh
+      - .github/workflows/legion-packages.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: legion-packages-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# Every action is pinned to the commit of the release named beside it, matching checks.yml.
+jobs:
+  build-amd64:
+    name: Build Linux amd64 static binary and .deb
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust and musl target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-pkg-amd64-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-pkg-amd64-
+      - name: Install musl-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools
+      - name: Build static legion binary (x86_64-unknown-linux-musl)
+        shell: bash
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          LEGION_BUILD_REV: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p legion-cli
+          file target/x86_64-unknown-linux-musl/release/legion
+      - name: Build amd64 .deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/^[^"]*"|".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          bash packaging/deb/build-deb.sh \
+            target/x86_64-unknown-linux-musl/release/legion \
+            amd64 \
+            "$version" \
+            target/packages
+          ls -lh target/packages/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: legion-pkg-amd64
+          path: |
+            target/packages/legion_*_amd64.deb
+            target/x86_64-unknown-linux-musl/release/legion
+          if-no-files-found: error
+
+  verify-amd64:
+    name: Verify (${{ matrix.image }})
+    needs: build-amd64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            mode: deb
+          - image: debian:13
+            mode: deb
+          - image: ubuntu:22.04
+            mode: deb
+          - image: ubuntu:24.04
+            mode: deb
+          - image: ubuntu:26.04
+            mode: deb
+          - image: archlinux:latest
+            mode: pkgbuild
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: legion-pkg-amd64
+          path: target/pkg-artifact
+      - name: Run distribution verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.mode }}" == "deb" ]]; then
+            deb="$(find target/pkg-artifact -type f -name 'legion_*_amd64.deb' | head -n 1)"
+            bash scripts/legion-distro-test.sh "${{ matrix.image }}" "$deb"
+          else
+            static_bin="$(find target/pkg-artifact -type f -name 'legion' | head -n 1)"
+            chmod 0755 "$static_bin"
+            LEGION_STATIC_BIN="$static_bin" bash scripts/legion-distro-test.sh "${{ matrix.image }}" pkgbuild
+          fi
+
+  verify-arm64:
+    name: Verify arm64 .deb (ubuntu:24.04 on ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust and musl target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup target add aarch64-unknown-linux-musl
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-pkg-arm64-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-pkg-arm64-
+      - name: Install musl-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools
+      - name: Build static arm64 binary and .deb
+        shell: bash
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          LEGION_BUILD_REV: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-unknown-linux-musl -p legion-cli
+          file target/aarch64-unknown-linux-musl/release/legion
+          version="$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/^[^"]*"|".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          bash packaging/deb/build-deb.sh \
+            target/aarch64-unknown-linux-musl/release/legion \
+            arm64 \
+            "$version" \
+            target/packages
+      - name: Verify arm64 .deb in ubuntu:24.04 container
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find target/packages -maxdepth 1 -type f -name 'legion_*_arm64.deb' | head -n 1)"
+          bash scripts/legion-distro-test.sh ubuntu:24.04 "$deb"

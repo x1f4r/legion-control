@@ -12,8 +12,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub use doctor::{
-    FleetPingEntry, check_executable_on_path, check_linux_lingering, check_policy_exec_roles,
-    check_ssh_on_path, extract_login_path, fleet_ping_checks, parse_linger_output,
+    FleetPingEntry, check_executable_on_path, check_installation, check_linux_lingering,
+    check_policy_exec_roles, check_ssh_on_path, extract_login_path, fleet_ping_checks,
+    parse_linger_output,
 };
 pub use init::{InitResult, render_node_toml, render_policy_toml};
 
@@ -22,7 +23,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.version",
         Effect::Read,
-        "Say which build of legion this node runs, the protocol it speaks, and its operating system and architecture.",
+        "Say which build of legion this node runs, how it was installed, the protocol it speaks, and its operating system and architecture.",
         version,
     );
     registry.add_fn(
@@ -34,7 +35,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. It writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
     init::register(registry);
@@ -51,6 +52,8 @@ pub struct Version {
     /// The source revision of legion, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<&'static str>,
+    /// How this binary was installed (`deb`, `pacman`, or `standalone`).
+    pub install: String,
     /// The protocol it speaks.
     pub protocol: u32,
     /// The node's name.
@@ -62,10 +65,12 @@ pub struct Version {
 }
 
 async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
+    let exe = legion_core::current_exe().ok();
     Ok(Version {
         name: "legion",
         version: VERSION,
         build: BUILD,
+        install: crate::package::install_method(exe.as_deref()),
         protocol: PROTOCOL,
         node: ctx.node_name().to_owned(),
         os: ctx.os(),

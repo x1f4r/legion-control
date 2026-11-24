@@ -124,6 +124,10 @@ fn main() -> ExitCode {
             "expiring_token_cannot_forward_credential_minting_tools",
             expiring_token_cannot_forward_credential_minting_tools,
         ),
+        (
+            "ui_assets_are_served_with_security_headers_and_guarded_api",
+            ui_assets_are_served_with_security_headers_and_guarded_api,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -2143,4 +2147,122 @@ fn expiring_token_cannot_forward_credential_minting_tools() {
     );
     assert_eq!(allowed.status, 200, "{}", allowed.text());
     assert_eq!(allowed.json()["name"], json!("remote-phone"));
+}
+
+fn ui_assets_are_served_with_security_headers_and_guarded_api() {
+    const EXPECTED_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture.home);
+
+    // Public UI assets are served without a token with strict security headers and ETag.
+    for (path, expected_type) in [
+        ("/", "text/html; charset=utf-8"),
+        ("/styles.css", "text/css; charset=utf-8"),
+        ("/app.js", "text/javascript; charset=utf-8"),
+        (
+            "/manifest.webmanifest",
+            "application/manifest+json; charset=utf-8",
+        ),
+        ("/icons/legion.svg", "image/svg+xml"),
+    ] {
+        let reply = server.get(path, None);
+        assert_eq!(reply.status, 200, "{path}: {}", reply.text());
+        assert_eq!(reply.header("content-type"), Some(expected_type), "{path}");
+        assert_eq!(reply.header("cache-control"), Some("no-cache"), "{path}");
+        assert_eq!(
+            reply.header("content-security-policy"),
+            Some(EXPECTED_CSP),
+            "{path}"
+        );
+        assert_eq!(
+            reply.header("x-content-type-options"),
+            Some("nosniff"),
+            "{path}"
+        );
+        assert_eq!(
+            reply.header("referrer-policy"),
+            Some("no-referrer"),
+            "{path}"
+        );
+        let etag = reply.header("etag").expect("missing ETag").to_owned();
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+
+        let cached = http(server.port, "GET", path, &[("If-None-Match", etag)], b"");
+        assert_eq!(cached.status, 304, "{path}");
+    }
+
+    // API paths still require a token even while UI assets are public.
+    assert_eq!(server.get("/v1/tools", None).status, 401);
+    assert_eq!(
+        server
+            .post("/v1/call", None, &json!({"tool": "meta.whoami"}))
+            .status,
+        401
+    );
+    assert_eq!(server.post("/mcp", None, &json!({})).status, 401);
+
+    // `?all=1` lists unavailable tools for the UI while plain `/v1/tools` remains filtered.
+    let all_tools = server.get("/v1/tools?all=1", Some(&fixture.phone));
+    assert_eq!(all_tools.status, 200);
+    let all_json = all_tools.json();
+    let all_names: Vec<&str> = all_json["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(all_names.contains(&"exec.run"), "{all_names:?}");
+    assert!(all_names.contains(&"power.restart"), "{all_names:?}");
+
+    // Same-origin browser calls from the served UI succeed, while cross-origin calls stay 403.
+    let mut same_headers = auth(Some(&fixture.phone));
+    same_headers.push(("Content-Type", "application/json".to_owned()));
+    same_headers.push(("Origin", format!("http://127.0.0.1:{}", server.port)));
+    let same = http(
+        server.port,
+        "POST",
+        "/v1/call",
+        &same_headers,
+        br#"{"tool":"meta.whoami","args":{}}"#,
+    );
+    assert_eq!(same.status, 200, "{}", same.text());
+
+    let mut evil_headers = auth(Some(&fixture.phone));
+    evil_headers.push(("Content-Type", "application/json".to_owned()));
+    evil_headers.push(("Origin", "https://evil.example".to_owned()));
+    let evil = http(
+        server.port,
+        "POST",
+        "/v1/call",
+        &evil_headers,
+        br#"{"tool":"meta.whoami","args":{}}"#,
+    );
+    assert_eq!(evil.status, 403, "{}", evil.text());
+
+    // Traversal, directories, and excluded reference/test files are never served.
+    for path in [
+        "/../node.toml",
+        "/%2e%2e/node.toml",
+        "/icons/../../node.toml",
+        "/design/prototype.html",
+        "/lib/",
+        "/lib/test/format.test.mjs",
+        "/vendor/README.md",
+    ] {
+        let with_token = server.get(path, Some(&fixture.phone));
+        assert_eq!(with_token.status, 404, "{path}");
+        let without_token = server.get(path, None);
+        assert_ne!(without_token.status, 200, "{path}");
+    }
+
+    // Turning the interface off in node.toml disables `/` and assets immediately.
+    fixture
+        .home
+        .write_config("node.toml", "name = \"laptop\"\n\n[serve]\nui = false\n");
+    assert_eq!(server.get("/", Some(&fixture.phone)).status, 404);
+    assert_eq!(server.get("/app.js", Some(&fixture.phone)).status, 404);
+    assert_eq!(server.get("/", None).status, 401);
+    assert_eq!(server.get("/v1/health", None).status, 200);
+    assert_eq!(server.get("/v1/tools", Some(&fixture.phone)).status, 200);
 }

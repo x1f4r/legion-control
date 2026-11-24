@@ -49,14 +49,17 @@ arm = ["sudo", "-n", "grub-reboot", "Rescue"]
 verify = ["sh", "-c", "grub-editenv list | grep -qx 'next_entry=Rescue'"]
 disarm = ["sudo", "-n", "grub-editenv", "-", "unset", "next_entry"]
 
-# Extra hosts and browser origins accepted by `legion serve` (for example behind Tailscale Serve).
+# Extra hosts, browser origins, and web interface toggle for `legion serve` (for example behind Tailscale Serve).
 [serve]
 hosts = ["tower.example.ts.net"]
 origins = ["https://app.example.net"]
+# Set false to turn off the built-in web interface at `/`.
+ui = true
 
 # Optional overrides for device pairing (`legion pair` / `device.*`).
 # When omitted, Legion edits ~/.ssh/authorized_keys (or %ProgramData%\ssh\administrators_authorized_keys
-# on Windows administrator accounts) and reads sshd's public host keys from /etc/ssh (or %ProgramData%\ssh).
+# on Windows administrator accounts) and discovers sshd's public host keys via ssh-keyscan (falling back
+# to /etc/ssh or %ProgramData%\ssh).
 # [devices]
 # authorized_keys = "/home/me/.ssh/authorized_keys"
 # host_keys = ["/etc/ssh/ssh_host_ed25519_key.pub"]
