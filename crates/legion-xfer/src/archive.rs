@@ -141,19 +141,29 @@ where
 ///
 /// Convenience wrapper over [`unpack_filtered`] that accepts every valid entry.
 pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
-    unpack_filtered(root, reader, |_, _| true)
+    unpack_impl(root, reader, false, |_, _| true)
 }
 
 /// Safely extracts a tar stream from `reader` into `root`, consulting `filter` before writing each
 /// entry.
 ///
 /// Refuses absolute paths, `..` traversal, backslashes, colons, Windows reserved names, hard links,
-/// unsupported special file types, and any entry whose ancestor symlink would escape `root`. When
-/// `filter` returns `false`, the entry's bytes are drained to keep the stream aligned, nothing is
-/// written for it, and it is recorded in [`UnpackReport::skipped`]. Regular files are streamed to
-/// sibling temporary files, synced, and renamed into place so an interrupted unpack never leaves a
-/// partial file at its destination path.
-pub fn unpack_filtered<R, F>(root: &Path, reader: R, mut filter: F) -> Result<UnpackReport>
+/// unsupported special file types, any entry whose ancestor symlink would escape `root`, and any
+/// entry traversing a symlink created earlier in the same archive. `filter` receives the true
+/// destination path relative to `root` after resolving existing ancestor symlinks so symlinks
+/// inside `root` cannot bypass path filters. When `filter` returns `false`, the entry's bytes are
+/// drained to keep the stream aligned, nothing is written for it, and it is recorded in
+/// [`UnpackReport::skipped`]. Regular files are streamed to sibling temporary files, synced, and
+/// renamed into place so an interrupted unpack never leaves a partial file at its destination path.
+pub fn unpack_filtered<R, F>(root: &Path, reader: R, filter: F) -> Result<UnpackReport>
+where
+    R: Read,
+    F: FnMut(&str, EntryKind) -> bool,
+{
+    unpack_impl(root, reader, true, filter)
+}
+
+fn unpack_impl<R, F>(root: &Path, reader: R, filtered: bool, mut filter: F) -> Result<UnpackReport>
 where
     R: Read,
     F: FnMut(&str, EntryKind) -> bool,
@@ -169,6 +179,7 @@ where
     let mut seen_lower: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut written_exact: BTreeSet<String> = BTreeSet::new();
     let mut written_ancestors: BTreeSet<String> = BTreeSet::new();
+    let mut written_symlinks: BTreeSet<String> = BTreeSet::new();
     let mut deferred_dirs: Vec<DeferredDir> = Vec::new();
     // Batch parent directory syncs per unique touched directory rather than calling fsync after
     // every small file, keeping durability before unpack returns while avoiding O(files) redundant
@@ -213,7 +224,22 @@ where
             }
         };
 
-        if !filter(&rel, kind) {
+        if filtered && has_ancestor_in(&segments, &written_symlinks) {
+            return Err(Error::UnsafeArchiveEntry {
+                entry: rel,
+                reason: "entry traverses a symlink created earlier in this archive".to_string(),
+            });
+        }
+
+        let effective_rel = resolve_effective_rel_path(root, &canonical_root, &segments, &rel)?;
+        if filtered && has_path_ancestor_in(&effective_rel, &written_symlinks) {
+            return Err(Error::UnsafeArchiveEntry {
+                entry: rel,
+                reason: "entry traverses a symlink created earlier in this archive".to_string(),
+            });
+        }
+
+        if filtered && !filter(&effective_rel, kind) {
             let expected_size = entry.size();
             let drained = io::copy(&mut entry, &mut io::sink())?;
             if kind == EntryKind::File && drained != expected_size {
@@ -228,7 +254,7 @@ where
                 });
             }
             report.skipped.push(SkippedEntry {
-                path: rel,
+                path: effective_rel,
                 reason: "skipped by entry filter".to_string(),
             });
             continue;
@@ -377,6 +403,8 @@ where
                     remove_stale_part_file(&dest);
                     dirs_to_sync.insert(parent);
                     record_written(&mut written_exact, &mut written_ancestors, &rel);
+                    written_symlinks.insert(rel.clone());
+                    written_symlinks.insert(effective_rel);
                     report.symlinks.push(rel);
                 } else {
                     report.skipped.push(SkippedEntry {
@@ -631,6 +659,125 @@ fn record_seen_with_ancestors(seen_lower: &mut BTreeMap<String, BTreeSet<String>
             _ => break,
         }
     }
+}
+
+fn has_ancestor_in(segments: &[String], set: &BTreeSet<String>) -> bool {
+    if segments.len() < 2 || set.is_empty() {
+        return false;
+    }
+    let mut prefix = String::new();
+    for seg in &segments[..segments.len() - 1] {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(seg);
+        if set.contains(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_path_ancestor_in(path: &str, set: &BTreeSet<String>) -> bool {
+    if set.is_empty() {
+        return false;
+    }
+    let mut current = path;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        if set.contains(parent) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Resolves the true relative path under `canonical_root` that `segments` will write to, following
+/// any existing in-root ancestor symlinks without creating directories on disk.
+fn resolve_effective_rel_path(
+    root: &Path,
+    canonical_root: &Path,
+    segments: &[String],
+    rel: &str,
+) -> Result<String> {
+    let Some((final_seg, parents)) = segments.split_last() else {
+        return Err(Error::UnsafeArchiveEntry {
+            entry: rel.to_string(),
+            reason: "empty path".to_string(),
+        });
+    };
+
+    let mut cur = root.to_path_buf();
+    let mut uncreated_start = parents.len();
+
+    for (idx, seg) in parents.iter().enumerate() {
+        let candidate = cur.join(seg);
+        match fs::symlink_metadata(&candidate) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                cur = candidate;
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let resolved =
+                    fs::canonicalize(&candidate).map_err(|_| Error::UnsafeArchiveEntry {
+                        entry: rel.to_string(),
+                        reason: "ancestor symlink cannot be resolved inside destination root"
+                            .to_string(),
+                    })?;
+                if !resolved.starts_with(canonical_root) {
+                    return Err(Error::UnsafeArchiveEntry {
+                        entry: rel.to_string(),
+                        reason: "ancestor symlink escapes destination root".to_string(),
+                    });
+                }
+                if !resolved.is_dir() {
+                    return Err(Error::UnsafeArchiveEntry {
+                        entry: rel.to_string(),
+                        reason: "ancestor symlink does not point to a directory".to_string(),
+                    });
+                }
+                cur = resolved;
+            }
+            Ok(_) => {
+                return Err(Error::Conflict {
+                    path: candidate,
+                    reason: "non-directory exists at ancestor path".to_string(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                uncreated_start = idx;
+                break;
+            }
+            Err(err) => return Err(classify_io(&candidate, err)),
+        }
+    }
+
+    let canonical_existing = fs::canonicalize(&cur).map_err(|e| classify_io(&cur, e))?;
+    let rel_existing = canonical_existing
+        .strip_prefix(canonical_root)
+        .map_err(|_| Error::UnsafeArchiveEntry {
+            entry: rel.to_string(),
+            reason: "resolved parent directory escapes destination root".to_string(),
+        })?;
+
+    let mut effective_parts: Vec<String> = Vec::new();
+    for comp in rel_existing.components() {
+        let std::path::Component::Normal(os) = comp else {
+            continue;
+        };
+        let s = os.to_str().ok_or_else(|| Error::UnsafeArchiveEntry {
+            entry: rel.to_string(),
+            reason: "resolved ancestor path is not valid UTF-8".to_string(),
+        })?;
+        effective_parts.push(s.to_string());
+    }
+    for seg in &parents[uncreated_start..] {
+        effective_parts.push(seg.clone());
+    }
+    effective_parts.push(final_seg.clone());
+    Ok(effective_parts.join("/"))
 }
 
 /// Ensures every ancestor component exists inside `canonical_root` without following any symlink
@@ -1340,5 +1487,54 @@ mod tests {
             second_plan.is_empty(),
             "expected empty second plan for pre-1970 file, got {second_plan:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpack_filtered_blocks_symlink_bypass_into_disallowed_subdir() {
+        // Case 1: archive creates symlink `public/l -> ../private` and then writes `public/l/owned`.
+        let dst1 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dst1.path().join("public")).unwrap();
+        fs::create_dir_all(dst1.path().join("private")).unwrap();
+
+        let tar1 = build_raw_tar(&[
+            ("public/l", EntryType::Symlink, b"", Some("../private")),
+            ("public/l/owned", EntryType::Regular, b"pwned", None),
+        ]);
+        let err = unpack_filtered(dst1.path(), Cursor::new(tar1), |path, _| {
+            path == "public" || path.starts_with("public/")
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::UnsafeArchiveEntry { .. }), "{err:?}");
+        assert!(!dst1.path().join("private/owned").exists());
+
+        // Case 2: pre-existing symlink `public/l -> ../private` in root. Filter must see the real
+        // resolved path `private/owned` (and `private/sub/owned`) and reject it without creating
+        // anything under `private/`.
+        let dst2 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dst2.path().join("public")).unwrap();
+        fs::create_dir_all(dst2.path().join("private")).unwrap();
+        std::os::unix::fs::symlink("../private", dst2.path().join("public/l")).unwrap();
+
+        let tar2 = build_raw_tar(&[
+            ("public/l/owned", EntryType::Regular, b"nope", None),
+            ("public/l/sub/deep", EntryType::Regular, b"nope", None),
+            ("public/ok.txt", EntryType::Regular, b"yes", None),
+        ]);
+        let mut seen_by_filter = Vec::new();
+        let report = unpack_filtered(dst2.path(), Cursor::new(tar2), |path, _| {
+            seen_by_filter.push(path.to_string());
+            path == "public" || path.starts_with("public/")
+        })
+        .unwrap();
+
+        assert_eq!(
+            seen_by_filter,
+            vec!["private/owned", "private/sub/deep", "public/ok.txt"]
+        );
+        assert_eq!(report.files, vec!["public/ok.txt"]);
+        assert!(!dst2.path().join("private/owned").exists());
+        assert!(!dst2.path().join("private/sub").exists());
+        assert_eq!(fs::read(dst2.path().join("public/ok.txt")).unwrap(), b"yes");
     }
 }
