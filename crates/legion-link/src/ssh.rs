@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::command::{RemoteOs, Subcommand, remote_command};
+pub use crate::invite::SshTimeouts;
 use crate::invite::SshTarget;
 use crate::key::DeviceKey;
 use crate::session::{Session, TransportHandle};
@@ -35,30 +36,6 @@ pub const REASON_UNREACHABLE: &str = "unreachable";
 
 /// Internal duplex buffer size between the SSH channel pump tasks and the session streams.
 const CHANNEL_BUFFER_BYTES: usize = 64 * 1024;
-
-/// Timeouts and keepalive settings for an in-process SSH connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SshTimeouts {
-    /// Per-host TCP connect + SSH handshake + auth timeout.
-    pub connect: Duration,
-    /// Timeout for the Legion `hello` handshake once the exec channel is open.
-    pub handshake: Duration,
-    /// Interval between SSH keepalive probes when the connection is quiet (`None` disables).
-    pub keepalive_interval: Option<Duration>,
-    /// Number of unanswered keepalives before closing the connection.
-    pub keepalive_max: usize,
-}
-
-impl Default for SshTimeouts {
-    fn default() -> Self {
-        SshTimeouts {
-            connect: Duration::from_secs(10),
-            handshake: Duration::from_secs(10),
-            keepalive_interval: Some(Duration::from_secs(15)),
-            keepalive_max: 3,
-        }
-    }
-}
 
 /// A live in-process SSH exec channel split into async stdin/stdout streams and a lifecycle handle.
 pub struct SshPipe {

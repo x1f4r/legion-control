@@ -56,12 +56,14 @@ pub mod stderr;
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
-pub use invite::{Enrolled, INVITE_PREFIX, INVITE_VERSION, Invite, MAX_INVITE_LEN, SshTarget};
+pub use invite::{
+    Enrolled, INVITE_PREFIX, INVITE_VERSION, Invite, MAX_INVITE_LEN, SshTarget, SshTimeouts,
+};
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_IDLE_TIMEOUT, Link, LinkConfig, LinkOptions, NodeLink,
-    SessionOpener, parse_optional_target,
+    DEFAULT_IDLE_TIMEOUT, Link, LinkConfig, LinkOptions, NodeLink, SessionOpener,
+    parse_optional_target,
 };
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
@@ -69,7 +71,7 @@ pub use session::{
 #[cfg(feature = "ssh")]
 pub use ssh::{
     REASON_AUTH_FAILED, REASON_HOST_KEY_MISMATCH, REASON_TIMEOUT, REASON_UNREACHABLE, SshPipe,
-    SshPipeHandle, SshTimeouts,
+    SshPipeHandle,
 };
 pub use stderr::StderrTail;
 

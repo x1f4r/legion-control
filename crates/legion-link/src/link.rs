@@ -19,13 +19,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::invite::{Enrolled, SshTarget};
+use crate::invite::{Enrolled, SshTarget, SshTimeouts};
 use crate::session::{CallError, Session};
 
 /// Default idle duration after which unused sessions are closed (matches `legion serve`).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Default handshake timeout for opening a session or probing `hello`.
-pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounded event queue between a session's reader task and a caller's event callback.
 const EVENT_QUEUE: usize = 256;
 
@@ -125,20 +123,15 @@ impl From<Enrolled> for NodeLink {
 pub struct LinkOptions {
     /// Close an open session once it has been idle with no active calls for at least this long.
     pub idle_timeout: Duration,
-    /// Timeout for `hello` handshakes and live `hello` probes.
-    pub handshake_timeout: Duration,
-    /// SSH-specific connect/handshake/keepalive timeouts when the `ssh` feature is enabled.
-    #[cfg(feature = "ssh")]
-    pub ssh_timeouts: crate::ssh::SshTimeouts,
+    /// Connect, handshake, and keepalive timeouts (used by SSH and local pipes alike).
+    pub ssh_timeouts: SshTimeouts,
 }
 
 impl Default for LinkOptions {
     fn default() -> Self {
         LinkOptions {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
-            #[cfg(feature = "ssh")]
-            ssh_timeouts: crate::ssh::SshTimeouts::default(),
+            ssh_timeouts: SshTimeouts::default(),
         }
     }
 }
@@ -309,7 +302,7 @@ impl Link {
         let cancel = CancellationToken::new();
         let live = self.get_or_open(node, cancel.clone()).await?;
         let _flight = live.acquire_flight();
-        let timeout = self.inner.options.handshake_timeout;
+        let timeout = self.inner.options.ssh_timeouts.handshake;
         let result = match live.session.hello(timeout, cancel.clone()).await {
             Ok(hello) => Ok(hello),
             Err(CallError::NotWritten(_)) => {
@@ -458,16 +451,16 @@ impl Link {
             None
         };
 
+        let live = self.get_or_open(node, cancel.clone()).await?;
+        let _flight = live.acquire_flight();
+
         let params = CallParams {
             tool: tool.to_owned(),
             args,
-            as_principal: None,
+            as_principal: live.config_snapshot.principal.clone(),
             on: target,
             hops: 0,
         };
-
-        let live = self.get_or_open(node, cancel.clone()).await?;
-        let _flight = live.acquire_flight();
 
         match self
             .run_call_with_events(&live.session, params.clone(), cancel.clone(), &mut events)
@@ -478,7 +471,9 @@ impl Link {
                 self.invalidate_if_same(node, &live.session);
                 let fresh = self.get_or_open(node, cancel.clone()).await?;
                 let _flight2 = fresh.acquire_flight();
-                self.run_call_with_events(&fresh.session, params, cancel, &mut events)
+                let mut retry_params = params;
+                retry_params.as_principal = fresh.config_snapshot.principal.clone();
+                self.run_call_with_events(&fresh.session, retry_params, cancel, &mut events)
                     .await
                     .map_err(|err| self.handle_call_error(node, &fresh.session, err))
             }
@@ -794,7 +789,7 @@ async fn default_open_session(
             return crate::local::open_local_session(
                 _program,
                 &entry.node,
-                options.handshake_timeout,
+                options.ssh_timeouts.handshake,
                 cancel,
             )
             .await;

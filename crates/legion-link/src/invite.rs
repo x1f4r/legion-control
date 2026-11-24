@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -41,6 +42,30 @@ pub struct SshTarget {
     pub user: String,
     /// OpenSSH public key lines pinned for this node (no trust on first use).
     pub host_keys: Vec<String>,
+}
+
+/// Timeouts and keepalive settings for connecting to a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SshTimeouts {
+    /// Per-host TCP connect + SSH handshake + auth timeout.
+    pub connect: Duration,
+    /// Timeout for the Legion `hello` handshake (and live `hello` probes / enrolment reply).
+    pub handshake: Duration,
+    /// Interval between SSH keepalive probes when the connection is quiet (`None` disables).
+    pub keepalive_interval: Option<Duration>,
+    /// Number of unanswered keepalives before closing the connection.
+    pub keepalive_max: usize,
+}
+
+impl Default for SshTimeouts {
+    fn default() -> Self {
+        SshTimeouts {
+            connect: Duration::from_secs(10),
+            handshake: Duration::from_secs(10),
+            keepalive_interval: Some(Duration::from_secs(15)),
+            keepalive_max: 3,
+        }
+    }
 }
 
 /// Parsed pairing invite produced by `legion pair` / `device.invite`.
