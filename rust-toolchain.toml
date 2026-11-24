@@ -1,0 +1,6 @@
+# The compiler every build of the Rust workspace uses, here and in CI, so a lint or a behaviour that
+# changes with a new release arrives in a change of its own. rustup reads this file and installs it.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
