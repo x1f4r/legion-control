@@ -513,6 +513,26 @@ async fn one_power_action_is_carried_out_at_a_time() {
 }
 
 #[tokio::test]
+async fn a_pending_action_is_reported_before_a_busy_machine() {
+    let fixture = Fixture::with_node_toml(
+        RecordingActuator::new().reply(Reply::new(&["is-rendering"], 0, "blender\n")),
+        "[[busy.probes]]\nname = \"render\"\nrun = [\"is-rendering\"]\n[power]\nsudo = true\nsleep = [\"go-to-sleep\"]\n",
+    );
+    fixture
+        .call("power.sleep", json!({"force": true}))
+        .await
+        .unwrap();
+    // Busy and something pending: the pending action is what the caller hears about.
+    let second = fixture.call("power.sleep", json!({})).await.unwrap_err();
+    assert_eq!(second.code, ErrorCode::Conflict, "{second:?}");
+    let dry = fixture
+        .call("power.sleep", json!({"dry_run": true}))
+        .await
+        .unwrap();
+    assert_eq!(dry["would_refuse"]["code"], json!("conflict"), "{dry}");
+}
+
+#[tokio::test]
 async fn a_runner_from_an_earlier_call_holds_up_the_next_one() {
     let fixture = Fixture::with_node_toml(RecordingActuator::new(), IDLE_WITH_SUDO);
     let dir = pending::dir(fixture.node.paths());
@@ -709,7 +729,8 @@ async fn status_reports_the_last_action_and_how_it_ended() {
         into: Some("windows".to_owned()),
         argv: strings(&["sudo", "-n", "systemctl", "reboot"]),
         since: "2026-11-24T10:00:00Z".to_owned(),
-        ran_at: "2026-11-24T10:00:03Z".to_owned(),
+        ran_at: Some("2026-11-24T10:00:03Z".to_owned()),
+        fate: None,
         exit_code: Some(1),
         timed_out: false,
         said: "sudo: a password is required".to_owned(),
