@@ -19,6 +19,7 @@ pub mod sys;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod token;
+pub mod update;
 pub mod xfer;
 
 use legion_core::Registry;

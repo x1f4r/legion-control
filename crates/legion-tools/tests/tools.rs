@@ -107,7 +107,7 @@ async fn whoami_lists_what_the_caller_may_use() {
     assert_eq!(phone["paths"], json!(["~/projects"]));
     assert_eq!(
         phone["tools"],
-        json!(["meta.init", "meta.version", "meta.whoami"])
+        json!(["meta.init", "meta.update", "meta.version", "meta.whoami"])
     );
 }
 

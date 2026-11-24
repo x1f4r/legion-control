@@ -38,6 +38,7 @@ pub fn register(registry: &mut Registry) {
         doctor,
     );
     init::register(registry);
+    crate::update::register(registry);
 }
 
 /// What `meta.version` returns.

@@ -5,6 +5,7 @@
 //! (`sh`, `sleep`, `/tmp`) and keeping helper stdout/stderr completely free of test-harness noise.
 
 #![deny(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
 use std::env;
 use std::fs;
