@@ -12,6 +12,7 @@ pub mod authkeys;
 pub mod enrol;
 pub mod hosts;
 pub mod keys;
+pub mod registry;
 pub mod sessions;
 pub mod store;
 
@@ -51,8 +52,10 @@ pub const MAX_VALID_MINUTES: u32 = 1440;
 /// Default SSH port for pairing invites.
 pub const DEFAULT_SSH_PORT: u16 = 22;
 
-/// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`).
+/// Adds the `device` tools (`device.invite`, `device.list`, `device.remove`) and registers
+/// `devices.toml`.
 pub fn register(registry: &mut Registry) {
+    registry.add_document::<registry::DevicesFile>();
     registry.add_fn(
         "device.invite",
         Effect::Admin,
