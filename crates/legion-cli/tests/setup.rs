@@ -180,6 +180,45 @@ fn run_helper(args: &[String]) -> ExitCode {
             eprintln!("connection refused");
             ExitCode::from(1)
         }
+        // wrong-protocol: answers hello claiming an unsupported protocol version.
+        "wrong-protocol" => {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            println!(
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "node": "oldbox",
+                        "version": "0.0.1",
+                        "protocol": 99,
+                        "os": "linux",
+                        "arch": "x86_64",
+                        "systems": []
+                    }
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        // bad-hello: answers hello with a malformed result object.
+        "bad-hello" => {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            println!(
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"unexpected": true}
+                })
+            );
+            ExitCode::SUCCESS
+        }
         // fake-claude <state_file> <log_file> <argv...>
         "fake-claude" => {
             let state_file = Path::new(&rest[0]);
@@ -941,11 +980,12 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
     );
     laptop.write_config("fleet.toml", &fleet_toml);
 
-    // Full doctor pings fleet machines concurrently and warns on operator allowing exec (even with no paths).
+    // Full doctor pings fleet machines concurrently: an unreachable machine is a warning (leaving
+    // the node healthy) and operator allowing exec is warned too.
     let full = laptop.run(&["meta.doctor"]);
     assert_eq!(full.code, 0, "{}", full.stderr);
     let full_json = full.json();
-    assert_eq!(full_json["ok"], json!(false), "{full_json}");
+    assert_eq!(full_json["ok"], json!(true), "{full_json}");
     let checks = full_json["checks"].as_array().unwrap();
 
     let pi_check = checks
@@ -957,7 +997,13 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
         .iter()
         .find(|c| c["name"] == json!("fleet: ghost"))
         .unwrap();
-    assert_eq!(ghost_check["ok"], json!(false), "{ghost_check}");
+    assert_eq!(ghost_check["ok"], json!(true), "{ghost_check}");
+    assert_eq!(ghost_check["warning"], json!(true), "{ghost_check}");
+    let ghost_detail = ghost_check["detail"].as_str().unwrap();
+    assert!(
+        ghost_detail.contains("ghost") && ghost_detail.contains("off"),
+        "{ghost_check}"
+    );
 
     let policy_warn = checks
         .iter()
@@ -971,6 +1017,40 @@ fn meta_doctor_fleet_reachability_quick_and_policy_warning() {
         detail.contains("as strong as the account, admin included"),
         "{policy_warn}"
     );
+
+    // A machine answering with a different protocol or an unparseable hello reply stays a failure.
+    let self_bin = std::env::current_exe().unwrap();
+    let helper_argv = |mode: &str| {
+        vec![
+            self_bin.display().to_string(),
+            HELPER_FLAG.to_owned(),
+            mode.to_owned(),
+        ]
+    };
+    let bad_fleet_toml = format!(
+        "[machines.oldbox]\ncommand = {}\n\n[machines.garbled]\ncommand = {}\n",
+        toml_argv(&helper_argv("wrong-protocol")),
+        toml_argv(&helper_argv("bad-hello")),
+    );
+    laptop.write_config("fleet.toml", &bad_fleet_toml);
+    let bad_proto = laptop.run(&["meta.doctor"]);
+    assert_eq!(bad_proto.code, 0, "{}", bad_proto.stderr);
+    let bad_json = bad_proto.json();
+    assert_eq!(bad_json["ok"], json!(false), "{bad_json}");
+    let bad_checks = bad_json["checks"].as_array().unwrap();
+    let oldbox = bad_checks
+        .iter()
+        .find(|c| c["name"] == json!("fleet: oldbox"))
+        .unwrap();
+    assert_eq!(oldbox["ok"], json!(false), "{oldbox}");
+    let garbled = bad_checks
+        .iter()
+        .find(|c| c["name"] == json!("fleet: garbled"))
+        .unwrap();
+    assert_eq!(garbled["ok"], json!(false), "{garbled}");
+
+    // Restore original fleet.toml before testing quick=true.
+    laptop.write_config("fleet.toml", &fleet_toml);
 
     // quick=true skips fleet reachability checks so the local node reports healthy.
     let quick = laptop.run(&["meta.doctor", "quick=true"]);

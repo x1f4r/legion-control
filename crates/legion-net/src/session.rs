@@ -924,28 +924,46 @@ fn format_handshake_unreachable(
     exit_code: Option<i32>,
     stderr_text: &str,
 ) -> ErrorBody {
-    let message = match failure {
-        HandshakeFailure::Eof => match exit_code {
-            Some(code) => format!(
-                "Could not open a legion session on {machine}: the connection closed before hello (exit status {code})."
+    let (code, message, details) = match failure {
+        HandshakeFailure::Eof => (
+            ErrorCode::Unreachable,
+            match exit_code {
+                Some(code) => format!(
+                    "Could not open a legion session on {machine}: the connection closed before hello (exit status {code})."
+                ),
+                None => format!(
+                    "Could not open a legion session on {machine}: the connection closed before hello."
+                ),
+            },
+            None,
+        ),
+        HandshakeFailure::TooMuchNoise { lines, bytes } => (
+            ErrorCode::Unreachable,
+            format!(
+                "Could not open a legion session on {machine}: received {lines} non-protocol lines ({bytes} bytes) before hello."
             ),
-            None => format!(
-                "Could not open a legion session on {machine}: the connection closed before hello."
+            Some(json!({"reason": "non_protocol_output"})),
+        ),
+        HandshakeFailure::BadHelloResult(reason) => (
+            ErrorCode::Failed,
+            format!(
+                "Could not open a legion session on {machine}: hello reply was invalid ({reason})."
             ),
-        },
-        HandshakeFailure::TooMuchNoise { lines, bytes } => format!(
-            "Could not open a legion session on {machine}: received {lines} non-protocol lines ({bytes} bytes) before hello."
+            None,
         ),
-        HandshakeFailure::BadHelloResult(reason) => format!(
-            "Could not open a legion session on {machine}: hello reply was invalid ({reason})."
+        HandshakeFailure::RemoteError(err) => (
+            ErrorCode::Failed,
+            format!(
+                "Could not open a legion session on {machine}: {}",
+                err.message
+            ),
+            None,
         ),
-        HandshakeFailure::RemoteError(err) => format!(
-            "Could not open a legion session on {machine}: {}",
-            err.message
+        HandshakeFailure::Io(err) => (
+            ErrorCode::Unreachable,
+            format!("Could not open a legion session on {machine}: {err}."),
+            None,
         ),
-        HandshakeFailure::Io(err) => {
-            format!("Could not open a legion session on {machine}: {err}.")
-        }
         HandshakeFailure::Unsupported(err) => return err.clone().with_machine(machine),
     };
     let hint = if !stderr_text.is_empty() {
@@ -953,9 +971,13 @@ fn format_handshake_unreachable(
     } else {
         format!("Check that {machine} is reachable and that `legion rpc` can be started on it.")
     };
-    ErrorBody::new(ErrorCode::Unreachable, message)
+    let mut err = ErrorBody::new(code, message)
         .with_hint(hint)
-        .with_machine(machine)
+        .with_machine(machine);
+    if let Some(details) = details {
+        err = err.with_details(details);
+    }
+    err
 }
 
 #[allow(clippy::too_many_arguments)]
