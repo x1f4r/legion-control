@@ -53,6 +53,10 @@ fn main() -> ExitCode {
             "secret_locations_refused_and_skipped_in_recursive_tools",
             secret_locations_refused_and_skipped_in_recursive_tools,
         ),
+        (
+            "fleet_sync_ext_define_dotted_filename_runs_on_peer",
+            fleet_sync_ext_define_dotted_filename_runs_on_peer,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -1055,4 +1059,71 @@ role = \"ssh_allowed\"
     // Owner (admin) is not blocked.
     let owner_read = home.run(&["fs.read", "path=~/.ssh/id_ed25519"]);
     assert_eq!(owner_read.code, 0, "{}", owner_read.stdout);
+}
+
+fn fleet_sync_ext_define_dotted_filename_runs_on_peer() {
+    let laptop = Home::new();
+    let pi = Home::new();
+
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    pi.write_config("node.toml", "name = \"pi\"\n");
+    let fleet_toml = format!("[machines.pi]\ncommand = {}\n", toml_argv(&run_argv(&pi)));
+    laptop.write_config("fleet.toml", &fleet_toml);
+
+    // Define an extension tool using ext.define, which writes tools.d/<family>.<verb>.toml.
+    let defined = laptop.run(&[
+        "ext.define",
+        "name=demo.greet",
+        "description=Greet from synced extension.",
+        "effect=read",
+        "cmd=echo hello_from_synced_ext",
+    ]);
+    assert_eq!(defined.code, 0, "{}", defined.stdout);
+    assert!(
+        config_dir(&laptop)
+            .join("tools.d")
+            .join("demo.greet.toml")
+            .is_file()
+    );
+
+    // config.list must include the dotted tools.d filename.
+    let listed = laptop.run(&["config.list"]);
+    assert_eq!(listed.code, 0, "{}", listed.stdout);
+    assert!(
+        listed.json()["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|doc| doc == &json!("tools.d/demo.greet.toml")),
+        "{}",
+        listed.stdout
+    );
+
+    // Default fleet.sync push discovers and syncs tools.d/demo.greet.toml to pi.
+    let pushed = laptop.run(&["fleet.sync", "direction=push"]);
+    assert_eq!(pushed.code, 0, "{}", pushed.stdout);
+    assert_eq!(
+        pushed.json()["results"]["pi"]["tools.d/demo.greet.toml"]["status"],
+        json!("pushed"),
+        "{}",
+        pushed.stdout
+    );
+    assert!(
+        config_dir(&pi)
+            .join("tools.d")
+            .join("demo.greet.toml")
+            .is_file()
+    );
+
+    // The synced extension tool executes on pi.
+    let ran = pi.run(&["demo.greet"]);
+    assert_eq!(ran.code, 0, "{}", ran.stdout);
+    assert!(
+        ran.json()["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hello_from_synced_ext"),
+        "{}",
+        ran.stdout
+    );
 }

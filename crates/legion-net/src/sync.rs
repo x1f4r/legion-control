@@ -49,7 +49,7 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOLS_D_PREFIX: &str = "tools.d/";
 
 /// Maximum length of a `tools.d` file name (including `.toml`).
-const MAX_TOOLS_D_NAME: usize = 64;
+const MAX_TOOLS_D_NAME: usize = 128;
 
 /// Registers `config.list`, `config.read`, `config.write`, and `fleet.sync`.
 pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
@@ -178,10 +178,10 @@ impl SharedDocument {
                     return Err(ErrorBody::new(
                         ErrorCode::InvalidArgs,
                         format!(
-                            "{other:?} is not a valid tools.d document name: use tools.d/<name>.toml with a bare file name made of ASCII letters, digits, - and _."
+                            "{other:?} is not a valid tools.d document name: use tools.d/<name>.toml with a bare file name made of ASCII letters, digits, -, _ and internal dots (no leading dot, trailing dot, or `..`)."
                         ),
                     )
-                    .with_hint("Name a single .toml file directly under tools.d/, such as tools.d/deploy.toml."));
+                    .with_hint("Name a single .toml file directly under tools.d/, such as tools.d/gpu.free.toml."));
                 }
                 Err(ErrorBody::new(
                     ErrorCode::InvalidArgs,
@@ -274,6 +274,9 @@ fn is_valid_tools_d_filename(name: &str) -> bool {
     if stem.is_empty() || name.len() > MAX_TOOLS_D_NAME {
         return false;
     }
+    if stem.ends_with('.') || stem.contains("..") {
+        return false;
+    }
     let starts_ok = stem
         .chars()
         .next()
@@ -281,7 +284,7 @@ fn is_valid_tools_d_filename(name: &str) -> bool {
     starts_ok
         && stem
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn validate_tools_d_toml(path: &Path, content: &str) -> Result<(), ErrorBody> {
@@ -1538,18 +1541,32 @@ mod tests {
             SharedDocument::parse("tools.d/deploy.toml").unwrap(),
             SharedDocument::ToolExt("deploy.toml".to_owned())
         );
+        assert_eq!(
+            SharedDocument::parse("tools.d/gpu.free.toml").unwrap(),
+            SharedDocument::ToolExt("gpu.free.toml".to_owned())
+        );
+        assert_eq!(
+            SharedDocument::parse("tools.d/a.b.c.toml").unwrap(),
+            SharedDocument::ToolExt("a.b.c.toml".to_owned())
+        );
 
+        let too_long = format!("tools.d/{}.toml", "a".repeat(MAX_TOOLS_D_NAME));
         for rejected in [
             "node.toml",
             "tokens.toml",
             "other.toml",
             "../policy.toml",
             "tools.d/",
+            "tools.d/.toml",
             "tools.d/.hidden.toml",
             "tools.d/sub/a.toml",
+            "tools.d/sub/a.b.toml",
             "tools.d/a.json",
             "tools.d/a\\b.toml",
             "tools.d/..toml",
+            "tools.d/a..toml",
+            "tools.d/a..b.toml",
+            too_long.as_str(),
         ] {
             let err = SharedDocument::parse(rejected).unwrap_err();
             assert_eq!(err.code, ErrorCode::InvalidArgs, "{rejected}");
