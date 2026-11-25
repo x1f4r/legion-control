@@ -30,6 +30,7 @@ export function createBrowserImmersive({
 } = {}) {
   let wakeWanted = false;
   let wakeSentinel = null;
+  let wakeInFlight = null;
   let wakeVisListenerInstalled = false;
   let lastVideo = null;
 
@@ -138,31 +139,40 @@ export function createBrowserImmersive({
     };
   }
 
-  async function acquireWakeLock() {
-    if (!wakeWanted || wakeSentinel) return;
-    if (!nav?.wakeLock || typeof nav.wakeLock.request !== 'function') return;
-    if (doc && doc.visibilityState === 'hidden') return;
-    try {
-      const sentinel = await nav.wakeLock.request('screen');
-      if (!wakeWanted) {
-        try {
-          await sentinel.release();
-        } catch {
-          // Ignore release failure.
+  function acquireWakeLock() {
+    if (!wakeWanted || wakeSentinel) return Promise.resolve();
+    if (wakeInFlight) return wakeInFlight;
+    if (!nav?.wakeLock || typeof nav.wakeLock.request !== 'function') return Promise.resolve();
+    if (doc && doc.visibilityState === 'hidden') return Promise.resolve();
+    const req = (async () => {
+      try {
+        const sentinel = await nav.wakeLock.request('screen');
+        if (!wakeWanted || wakeSentinel) {
+          try {
+            await sentinel.release();
+          } catch {
+            // Ignore release failure.
+          }
+          return;
         }
-        return;
+        wakeSentinel = sentinel;
+        sentinel.addEventListener?.(
+          'release',
+          () => {
+            if (wakeSentinel === sentinel) wakeSentinel = null;
+          },
+          { once: true },
+        );
+      } catch {
+        // Wake Lock can be refused (battery saver, background tab); fail silently.
+      } finally {
+        if (wakeInFlight === req) {
+          wakeInFlight = null;
+        }
       }
-      wakeSentinel = sentinel;
-      sentinel.addEventListener?.(
-        'release',
-        () => {
-          if (wakeSentinel === sentinel) wakeSentinel = null;
-        },
-        { once: true },
-      );
-    } catch {
-      // Wake Lock can be refused (battery saver, background tab); fail silently.
-    }
+    })();
+    wakeInFlight = req;
+    return req;
   }
 
   function handleVisibilityChange() {

@@ -571,6 +571,70 @@ test('createBrowserImmersive requests fullscreen on viewer element, falls back t
   assert.equal(webkitEntered, 1);
 });
 
+test('createBrowserImmersive keeps one in-flight wakeLock request and never leaks locks across rapid toggles', async () => {
+  const pendingGrants = [];
+  let activeCount = 0;
+  let totalRequested = 0;
+  let totalReleased = 0;
+
+  const fakeNav = {
+    wakeLock: {
+      request() {
+        totalRequested += 1;
+        return new Promise((resolve) => {
+          pendingGrants.push(() => {
+            activeCount += 1;
+            let released = false;
+            resolve({
+              addEventListener() {},
+              async release() {
+                if (released) return;
+                released = true;
+                activeCount -= 1;
+                totalReleased += 1;
+              },
+            });
+          });
+        });
+      },
+    },
+  };
+
+  const fakeDoc = {
+    visibilityState: 'visible',
+    addEventListener() {},
+    removeEventListener() {},
+  };
+
+  const api = createBrowserImmersive({ doc: fakeDoc, nav: fakeNav });
+
+  // Case 1: true -> false -> true while the first slow grant is still in flight.
+  const p1 = api.keepScreenOn(true);
+  const p2 = api.keepScreenOn(false);
+  const p3 = api.keepScreenOn(true);
+  assert.equal(totalRequested, 1, 'must keep only one in-flight wakeLock request');
+  assert.equal(pendingGrants.length, 1);
+
+  pendingGrants.shift()();
+  await Promise.all([p1, p2, p3]);
+  assert.equal(activeCount, 1);
+  assert.equal(totalReleased, 0);
+
+  // Release -> zero locks remain held.
+  await api.keepScreenOn(false);
+  assert.equal(activeCount, 0);
+  assert.equal(totalReleased, 1);
+
+  // Case 2: true -> false while request is still in flight -> released immediately upon grant.
+  const p4 = api.keepScreenOn(true);
+  const p5 = api.keepScreenOn(false);
+  assert.equal(totalRequested, 2);
+  pendingGrants.shift()();
+  await Promise.all([p4, p5]);
+  assert.equal(activeCount, 0);
+  assert.equal(totalReleased, 2);
+});
+
 test('createFullscreenController owns state, history entry, and external platform exits as a single source of truth', async () => {
   const stack = [{ state: null, hash: '#/files/tower/Videos?view=A.mp4' }];
   let idx = 0;
