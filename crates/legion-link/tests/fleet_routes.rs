@@ -1424,3 +1424,132 @@ async fn real_two_sshd_direct_and_relayed_put_if_exists_fail_refuses_raced_file_
     drop(sshd_b);
     link.close().await;
 }
+
+#[tokio::test]
+async fn real_two_sshd_learn_surfaces_name_mismatch_rejection_from_node() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!("skipping two-sshd name_mismatch learn test: sshd/ssh-keygen unavailable");
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        panic!(
+            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
+        );
+    };
+
+    let root = strict_tempdir();
+    let user_a = root.path().join("home-a");
+    let user_b = root.path().join("home-b");
+    let home_a = root.path().join("legion-a");
+    let home_b = root.path().join("legion-b");
+    let auth_a = user_a.join(".ssh").join("authorized_keys");
+    let auth_b = user_b.join(".ssh").join("authorized_keys");
+
+    for dir in [
+        home_a.join("config"),
+        home_b.join("config"),
+        user_a.join(".ssh"),
+        user_b.join(".ssh"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+    }
+    #[cfg(unix)]
+    for dir in [&user_a, &user_b, &user_a.join(".ssh"), &user_b.join(".ssh")] {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd_a) = ManagedSshd::new(&root.path().join("sshd-a"), &auth_a, &user_a) else {
+        return;
+    };
+    let Some(sshd_b) = ManagedSshd::new(&root.path().join("sshd-b"), &auth_b, &user_b) else {
+        return;
+    };
+
+    // Node A is `tower`; Node B explicitly names itself `someones-laptop` while `tower`'s
+    // `fleet.toml` addresses it as `studio`. Forwarding `device.endpoint` from `tower` to `studio`
+    // must produce main's real `conflict` + `details.kind = "name_mismatch"`, and `Link::learn()`
+    // must surface that as a `name_mismatch` rejection rather than `unreachable`.
+    fs::write(
+        home_a.join("config/node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            sshd_a.port,
+            sshd_a.user,
+            toml_literal(&auth_a),
+            toml_literal(&sshd_a.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home_b.join("config/node.toml"),
+        format!(
+            "name = \"someones-laptop\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            sshd_b.port,
+            sshd_b.user,
+            toml_literal(&auth_b),
+            toml_literal(&sshd_b.host_key_pub),
+        ),
+    )
+    .unwrap();
+    let policy = "default = \"owner\"\n";
+    fs::write(home_a.join("config/policy.toml"), policy).unwrap();
+    fs::write(home_b.join("config/policy.toml"), policy).unwrap();
+
+    let node_b_exec = root.path().join("node-b.sh");
+    write_node_wrapper(&node_b_exec, &legion_bin, &home_b, &user_b);
+    fs::write(
+        home_a.join("config/fleet.toml"),
+        format!(
+            "[machines.tower]\nssh = \"127.0.0.1\"\n\n[machines.studio]\ncommand = [{}, \"rpc\"]\n",
+            toml_literal(&node_b_exec),
+        ),
+    )
+    .unwrap();
+
+    let invite_out = run_legion(
+        &legion_bin,
+        &home_a,
+        &user_a,
+        &[
+            "device.invite",
+            "name=pixel",
+            "role=owner",
+            "allow_owner=true",
+        ],
+    );
+    let invite_text = invite_out["invite"].as_str().unwrap();
+    let link = Link::with_options(
+        LinkConfig::default(),
+        LinkOptions {
+            allow_loopback_endpoints: true,
+            ..LinkOptions::default()
+        },
+    );
+    link.pair(invite_text, "pixel").await.unwrap();
+
+    let report = link.learn().await.unwrap();
+    assert!(
+        !report.unreachable.contains(&"studio".to_owned()),
+        "real name_mismatch from tower must never be classified as unreachable: {report:?}"
+    );
+    assert!(
+        link.config().node("studio").is_none(),
+        "mismatched node must not be learned into LinkConfig"
+    );
+    let studio_rej = report
+        .rejected_details
+        .iter()
+        .find(|r| r.machine == "studio")
+        .unwrap_or_else(|| panic!("expected studio rejection in {report:?}"));
+    assert_eq!(studio_rej.code, "name_mismatch", "{studio_rej:?}");
+    assert_eq!(studio_rej.reported_by.as_deref(), Some("tower"));
+    assert!(
+        studio_rej.reason.contains("someones-laptop"),
+        "expected node's real mismatch sentence naming someones-laptop: {}",
+        studio_rej.reason
+    );
+
+    drop(sshd_a);
+    drop(sshd_b);
+    link.close().await;
+}

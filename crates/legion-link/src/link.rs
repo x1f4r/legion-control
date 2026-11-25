@@ -7743,6 +7743,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: "0.1.0".to_owned(),
                                     build: None,
                                     protocol: PROTOCOL,
@@ -8285,6 +8287,8 @@ mod tests {
                                     req.id,
                                     serde_json::to_value(HelloResult {
                                         node: node_for_rpc.clone(),
+                                        node_explicit: None,
+                                        node_id: None,
                                         version: "0.1.0".to_owned(),
                                         build: None,
                                         protocol: PROTOCOL,
@@ -8618,6 +8622,8 @@ mod tests {
                                     req.id,
                                     serde_json::to_value(HelloResult {
                                         node: "tower".to_owned(),
+                                        node_explicit: None,
+                                        node_id: None,
                                         version: VERSION.to_owned(),
                                         build: None,
                                         protocol: PROTOCOL,
@@ -8941,6 +8947,8 @@ mod tests {
                                 req.id,
                                 serde_json::to_value(legion_proto::HelloResult {
                                     node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
                                     version: legion_proto::VERSION.to_owned(),
                                     build: None,
                                     protocol: legion_proto::PROTOCOL,
