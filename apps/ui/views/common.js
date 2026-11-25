@@ -2,6 +2,7 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
+import { formatErrorForDisplay } from '../lib/errors.js';
 import { clampPct, formatElapsed, meterLevel, tokenizeCode } from '../lib/format.js';
 import { classifyRowSwipe } from '../lib/gestures.js';
 import { qrSvgData } from '../lib/qr.js';
@@ -61,19 +62,18 @@ export function Notice({
     deviceNoun ||
     (typeof document !== 'undefined' && document.documentElement?.dataset?.deviceNoun) ||
     'device';
-  const reason = error?.details?.reason;
-  const isRemovedPlain =
-    !isTech && !title && error?.code === 'denied' && reason === 'device_removed_or_unknown';
-  const heading = isRemovedPlain
-    ? `${error.machine || 'This machine'} no longer lets this ${noun} in. It may have been removed there.`
-    : title || (error ? error.message : message);
-  const detail = isRemovedPlain ? null : (hint ?? (error ? error.hint : null));
-  const machine = isRemovedPlain ? '' : error?.machine ? `${error.machine}: ` : '';
-  const canRepair =
-    error?.code === 'denied' &&
-    (reason === 'device_removed_or_unknown' ||
-      reason === 'auth_failed' ||
-      reason === 'host_key_mismatch');
+  const formatted = formatErrorForDisplay({
+    error,
+    title,
+    message,
+    hint,
+    technical: isTech,
+    deviceNoun: noun,
+  });
+  const heading = formatted.heading;
+  const detail = formatted.detail;
+  const machine = formatted.machinePrefix;
+  const canRepair = formatted.canRepair;
   if (!heading) return null;
   const cls = [
     'notice',
@@ -106,6 +106,28 @@ export function Notice({
                   `
                 : null}
             </div>
+          `
+        : null}
+    </div>
+  `;
+}
+
+// Quiet one-line note shown once on an older machine's screen and at the top of its Files.
+export function OlderMachineNote({ machine, version = null, build = null, missing = [], technical = false }) {
+  if (!machine || !Array.isArray(missing) || missing.length === 0) return null;
+  const verParts = [
+    version ? String(version) : null,
+    build ? `(${String(build).slice(0, 12)})` : null,
+  ].filter(Boolean);
+  const verLabel = verParts.join(' ');
+  return html`
+    <div class="older-note" role="status">
+      <p>${machine} runs an older Legion, so some things are simpler here.</p>
+      ${technical
+        ? html`
+            <p class="older-note-tech mono">
+              ${verLabel ? `${verLabel} · ` : ''}Missing: ${missing.join(', ')}
+            </p>
           `
         : null}
     </div>
