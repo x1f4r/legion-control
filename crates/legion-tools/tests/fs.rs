@@ -2271,3 +2271,177 @@ async fn list_find_and_stat_report_category_and_mime_for_regular_files_only() {
         assert!(st_link.get("mime").is_none());
     }
 }
+
+#[tokio::test]
+async fn list_supports_natural_sort_modified_size_categories_and_paging() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.work.join("dir10")).unwrap();
+    std::fs::create_dir_all(f.work.join("dir2")).unwrap();
+    std::fs::create_dir_all(f.work.join("AlphaDir")).unwrap();
+
+    let write_with_mtime = |name: &str, bytes: &[u8], secs: u64| {
+        let p = f.work.join(name);
+        let file = std::fs::File::create(&p).unwrap();
+        std::io::Write::write_all(&mut &file, bytes).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    };
+    write_with_mtime("file10.jpg", &[0u8; 50], 1_700_000_100);
+    write_with_mtime("file2.png", &[0u8; 200], 1_700_000_300);
+    write_with_mtime("Beta.txt", &[0u8; 10], 1_700_000_200);
+    write_with_mtime("alpha.mp4", &[0u8; 500], 1_700_000_050);
+
+    // Default natural case-insensitive name order, directories first.
+    let natural = f
+        .call("fs.list", json!({"path": "~/projects"}))
+        .await
+        .unwrap();
+    let names = |v: &Value| -> Vec<String> {
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(&natural),
+        vec![
+            "AlphaDir",
+            "dir2",
+            "dir10",
+            "alpha.mp4",
+            "Beta.txt",
+            "file2.png",
+            "file10.jpg"
+        ]
+    );
+    assert_eq!(natural["total"], json!(7));
+    assert_eq!(natural["truncated"], json!(false));
+
+    // Descending name order still keeps directories first.
+    let desc_name = f
+        .call("fs.list", json!({"path": "~/projects", "order": "desc"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&desc_name),
+        vec![
+            "dir10",
+            "dir2",
+            "AlphaDir",
+            "file10.jpg",
+            "file2.png",
+            "Beta.txt",
+            "alpha.mp4"
+        ]
+    );
+
+    // Sort by size descending: directories still first, files largest to smallest.
+    let by_size = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "sort": "size", "order": "desc"}),
+        )
+        .await
+        .unwrap();
+    let file_names_size: Vec<&str> = by_size["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == json!("file"))
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        file_names_size,
+        vec!["alpha.mp4", "file2.png", "file10.jpg", "Beta.txt"]
+    );
+    // First 3 entries are still directories.
+    assert!(
+        by_size["entries"].as_array().unwrap()[..3]
+            .iter()
+            .all(|e| e["kind"] == json!("dir"))
+    );
+
+    // Sort by modified descending: newest files first.
+    let by_mtime = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "sort": "modified", "order": "desc"}),
+        )
+        .await
+        .unwrap();
+    let file_names_mtime: Vec<&str> = by_mtime["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == json!("file"))
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        file_names_mtime,
+        vec!["file2.png", "Beta.txt", "file10.jpg", "alpha.mp4"]
+    );
+
+    // Category filter keeps directories and only matching files.
+    let images = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "categories": ["image"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&images),
+        vec!["AlphaDir", "dir2", "dir10", "file2.png", "file10.jpg"]
+    );
+    assert_eq!(images["total"], json!(5));
+    assert_eq!(images["truncated"], json!(false));
+
+    // Paging with `offset` and `limit` reports accurate `total` and `truncated`.
+    let page1 = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 0, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&page1), vec!["AlphaDir", "dir2", "dir10"]);
+    assert_eq!(page1["total"], json!(7));
+    assert_eq!(page1["truncated"], json!(true));
+
+    let page2 = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 3, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&page2), vec!["alpha.mp4", "Beta.txt", "file2.png"]);
+    assert_eq!(page2["total"], json!(7));
+    assert_eq!(page2["truncated"], json!(true));
+
+    let page3 = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 6, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&page3), vec!["file10.jpg"]);
+    assert_eq!(page3["total"], json!(7));
+    assert_eq!(page3["truncated"], json!(false));
+
+    let past_end = f
+        .call(
+            "fs.list",
+            json!({"path": "~/projects", "offset": 20, "limit": 3}),
+        )
+        .await
+        .unwrap();
+    assert!(past_end["entries"].as_array().unwrap().is_empty());
+    assert_eq!(past_end["total"], json!(7));
+    assert_eq!(past_end["truncated"], json!(false));
+}

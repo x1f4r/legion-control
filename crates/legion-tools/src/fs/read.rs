@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, check_fs_path,
-    check_regular_file, format_blake3, format_mtime, is_hidden, map_io_error, path_to_string,
-    platform, run_blocking,
+    Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, SortField, SortOrder,
+    cancelled_error, check_fs_path, check_regular_file, compare_by_sort, format_blake3,
+    format_mtime, is_hidden, map_io_error, path_to_string, platform, run_blocking,
 };
 
 const MAX_LIST_DEPTH: u32 = 8;
@@ -29,13 +29,13 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.list",
         Effect::Read,
-        "List entries in a directory up to a bounded depth and count, directories first then by name, reporting symbolic links without following them.",
+        "List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, and symbolic links reported without following them.",
         list,
     );
     registry.add_fn(
         "fs.stat",
         Effect::Read,
-        "Return metadata for a path (kind, size, modification time, Unix mode, readonly flag, and symbolic link target) without following a symbolic link.",
+        "Return metadata for a path (kind, size, modification time, Unix mode, readonly flag, symbolic link target, and file category and MIME type) without following a symbolic link.",
         stat,
     );
     registry.add_fn(
@@ -69,6 +69,18 @@ struct ListArgs {
     #[serde(default = "default_list_limit")]
     #[schemars(range(min = 1, max = 5000))]
     limit: u32,
+    /// Number of matching entries to skip before returning up to `limit`.
+    #[serde(default)]
+    offset: u64,
+    /// Field to sort by within directories and within non-directories (`name`, `modified`, or `size`).
+    #[serde(default)]
+    sort: SortField,
+    /// Sort direction (`asc` or `desc`). Directories always come first regardless of order.
+    #[serde(default)]
+    order: SortOrder,
+    /// Optional list of file categories to include; directories are always kept.
+    #[serde(default)]
+    categories: Option<Vec<Category>>,
 }
 
 fn default_list_depth() -> u32 {
@@ -106,6 +118,7 @@ struct ListEntry {
 struct ListResult {
     path: String,
     entries: Vec<ListEntry>,
+    total: usize,
     truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skipped: Vec<String>,
@@ -136,6 +149,10 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
     let max_depth = args.depth;
     let include_hidden = args.hidden;
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
+    let offset = usize::try_from(args.offset).unwrap_or(usize::MAX);
+    let sort = args.sort;
+    let order = args.order;
+    let categories = args.categories;
 
     run_blocking(ctx, "fs.list", move |cancel, mut progress| {
         let meta = fs::metadata(&root).map_err(|error| map_io_error("list", &root, error))?;
@@ -150,30 +167,39 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
         let reply_bytes = serde_json::to_vec(&ListResult {
             path: root_str.clone(),
             entries: Vec::new(),
-            truncated: false,
+            total: usize::MAX,
+            truncated: true,
             skipped: Vec::new(),
         })
-        .map_or(64, |v| v.len());
+        .map_or(96, |v| v.len());
         let mut entries = Vec::new();
         let mut skipped = Vec::new();
-        let mut truncated = false;
+        let mut total: usize = 0;
+        let mut page_full = false;
         let mut state = ListWalk {
             max_depth,
             include_hidden,
             limit,
+            offset,
+            sort,
+            order,
+            categories: categories.as_deref(),
             reply_bytes,
             own_dirs: &own_dirs,
             cancel: &cancel,
             progress: &mut progress,
             entries: &mut entries,
             skipped: &mut skipped,
-            truncated: &mut truncated,
+            total: &mut total,
+            page_full: &mut page_full,
         };
         list_dir(&root, 1, &mut state)?;
         skipped.sort();
+        let truncated = offset.saturating_add(entries.len()) < total;
         Ok(ListResult {
             path: root_str,
             entries,
+            total,
             truncated,
             skipped,
         })
@@ -185,13 +211,18 @@ struct ListWalk<'a> {
     max_depth: u32,
     include_hidden: bool,
     limit: usize,
+    offset: usize,
+    sort: SortField,
+    order: SortOrder,
+    categories: Option<&'a [Category]>,
     reply_bytes: usize,
     own_dirs: &'a OwnDirFilter,
     cancel: &'a CancellationToken,
     progress: &'a mut Progress,
     entries: &'a mut Vec<ListEntry>,
     skipped: &'a mut Vec<String>,
-    truncated: &'a mut bool,
+    total: &'a mut usize,
+    page_full: &'a mut bool,
 }
 
 fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolError> {
@@ -206,7 +237,14 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         Err(_) => return Ok(()),
     };
 
-    let mut children: Vec<(String, PathBuf, fs::Metadata, EntryKind)> = Vec::new();
+    let mut children: Vec<(
+        String,
+        PathBuf,
+        fs::Metadata,
+        EntryKind,
+        Option<Category>,
+        Option<&'static str>,
+    )> = Vec::new();
     for item in read_dir {
         if walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
@@ -229,65 +267,84 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
             continue;
         }
         let kind = EntryKind::from_file_type(meta.file_type());
-        children.push((name, child_path, meta, kind));
+        let (category, mime) = if kind == EntryKind::File {
+            let info = classify_path(&child_path);
+            (Some(info.category), Some(info.mime))
+        } else {
+            (None, None)
+        };
+        if let Some(wanted) = walk.categories
+            && kind != EntryKind::Dir
+            && !category.is_some_and(|cat| wanted.contains(&cat))
+        {
+            continue;
+        }
+        children.push((name, child_path, meta, kind, category, mime));
     }
 
     children.sort_by(|a, b| {
         let a_rank = usize::from(a.3 != EntryKind::Dir);
         let b_rank = usize::from(b.3 != EntryKind::Dir);
-        a_rank.cmp(&b_rank).then_with(|| a.0.cmp(&b.0))
+        a_rank.cmp(&b_rank).then_with(|| {
+            compare_by_sort(
+                walk.sort,
+                walk.order,
+                &a.0,
+                &b.0,
+                a.2.modified().ok(),
+                b.2.modified().ok(),
+                a.2.len(),
+                b.2.len(),
+            )
+        })
     });
 
-    for (name, child_path, meta, kind) in children {
+    for (name, child_path, meta, kind, category, mime) in children {
         if walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
         }
-        if walk.entries.len() == walk.limit {
-            *walk.truncated = true;
-            return Ok(());
+        let index = *walk.total;
+        *walk.total = walk.total.saturating_add(1);
+
+        if index >= walk.offset && !*walk.page_full {
+            if walk.entries.len() == walk.limit {
+                *walk.page_full = true;
+            } else {
+                let target = if kind == EntryKind::Symlink {
+                    fs::read_link(&child_path)
+                        .ok()
+                        .map(|link| path_to_string(&link))
+                } else {
+                    None
+                };
+                let entry = ListEntry {
+                    name,
+                    path: path_to_string(&child_path),
+                    kind,
+                    size: meta.len(),
+                    mtime: format_mtime(&meta),
+                    mode: platform::unix_mode(&meta),
+                    target,
+                    category,
+                    mime: mime.map(str::to_owned),
+                };
+                let entry_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len())
+                    + usize::from(!walk.entries.is_empty());
+                if !walk.entries.is_empty()
+                    && walk.reply_bytes.saturating_add(entry_bytes) > MAX_REPLY_BYTES
+                {
+                    *walk.page_full = true;
+                } else {
+                    walk.reply_bytes = walk.reply_bytes.saturating_add(entry_bytes);
+                    walk.entries.push(entry);
+                    let count = walk.entries.len();
+                    walk.progress.maybe_emit(|| json!({"entries": count}));
+                }
+            }
         }
-        let target = if kind == EntryKind::Symlink {
-            fs::read_link(&child_path)
-                .ok()
-                .map(|link| path_to_string(&link))
-        } else {
-            None
-        };
-        let (category, mime) = if kind == EntryKind::File {
-            let info = classify_path(&child_path);
-            (Some(info.category), Some(info.mime.to_owned()))
-        } else {
-            (None, None)
-        };
-        let entry = ListEntry {
-            name,
-            path: path_to_string(&child_path),
-            kind,
-            size: meta.len(),
-            mtime: format_mtime(&meta),
-            mode: platform::unix_mode(&meta),
-            target,
-            category,
-            mime,
-        };
-        let entry_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len())
-            + usize::from(!walk.entries.is_empty());
-        if !walk.entries.is_empty()
-            && walk.reply_bytes.saturating_add(entry_bytes) > MAX_REPLY_BYTES
-        {
-            *walk.truncated = true;
-            return Ok(());
-        }
-        walk.reply_bytes = walk.reply_bytes.saturating_add(entry_bytes);
-        walk.entries.push(entry);
-        let count = walk.entries.len();
-        walk.progress.maybe_emit(|| json!({"entries": count}));
 
         if kind == EntryKind::Dir && depth < walk.max_depth {
             list_dir(&child_path, depth + 1, walk)?;
-            if *walk.truncated {
-                return Ok(());
-            }
         }
     }
     Ok(())
