@@ -5,6 +5,13 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use legion_os::atomic::{
+    FileClaimIdentity, FileIdentity, RenameNoReplaceError, claim_identity_from_file,
+    file_identity_from_file, rename_no_replace as os_rename_no_replace,
+    replace_file as os_replace_file, symlink_claim_identity as os_symlink_claim_identity,
+    symlink_file_identity as os_symlink_file_identity,
+};
+
 use crate::error::{Result, classify_io};
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -23,21 +30,77 @@ pub(crate) fn next_temp_id() -> u64 {
     TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Returns `true` when `name` matches one of this crate's own temporary file patterns.
-pub(crate) fn is_internal_temp_name(name: &str) -> bool {
+/// Single authoritative predicate for names Legion itself creates in user folders.
+///
+/// Used by manifests, transfers, deletion, sweeps, and sync so internal temporaries and partials
+/// are never mistaken for user files. Visible recovery intermediates for two-step case renames
+/// (`legion-renaming-*`) are intentionally excluded so an interrupted rename stays visible and
+/// recoverable rather than disappearing from listings.
+pub fn is_legion_internal_name(name: &str) -> bool {
     name.ends_with(".legion-part")
         || ((name.starts_with(".legion-unpack-")
             || name.starts_with(".legion-link-")
-            || name.starts_with(".legion-CaseProbe-"))
+            || name.starts_with(".legion-CaseProbe-")
+            || name.starts_with(".legion-NormProbe-")
+            || name.starts_with(".legion-move-probe-"))
+            && name.ends_with(".tmp"))
+        || (name.starts_with('.') && name.contains(".legion-tmp-"))
+}
+
+/// Returns `true` when `name` is an ephemeral Legion temporary in a user folder that is safe to
+/// remove opportunistically once older than `STALE_TEMP_AGE` and unlocked.
+pub fn is_sweepable_temp_name(name: &str) -> bool {
+    (name.starts_with(".legion-put-") && name.ends_with(".legion-part"))
+        || ((name.starts_with(".legion-unpack-")
+            || name.starts_with(".legion-link-")
+            || name.starts_with(".legion-CaseProbe-")
+            || name.starts_with(".legion-NormProbe-")
+            || name.starts_with(".legion-move-probe-"))
             && name.ends_with(".tmp"))
 }
 
-/// Replaces `to` with `from` using a single rename call.
-///
-/// Centralized here so a future shared retrying rename (needed on Windows when indexers hold a
-/// target briefly) can replace this body in one place.
+/// Returns `true` when `name` matches one of this crate's own temporary file patterns.
+pub(crate) fn is_internal_temp_name(name: &str) -> bool {
+    is_legion_internal_name(name)
+}
+
+/// Replaces `to` with `from` using the shared platform-aware atomic rename (including Windows
+/// sharing-violation retries).
 pub(crate) fn replace_file(from: &Path, to: &Path) -> Result<()> {
-    fs::rename(from, to).map_err(|e| classify_io(to, e))
+    os_replace_file(from, to).map_err(|e| match e {
+        legion_os::OsError::Io { source, .. } => classify_io(to, source),
+        other => classify_io(to, io::Error::other(other.to_string())),
+    })
+}
+
+/// Atomically renames `from` to `to` only when `to` does not exist.
+pub(crate) fn rename_no_replace(
+    from: &Path,
+    to: &Path,
+) -> std::result::Result<(), RenameNoReplaceError> {
+    os_rename_no_replace(from, to)
+}
+
+/// Returns the filesystem identity `(dev, ino, nlink)` of `path` without following symlinks.
+pub(crate) fn symlink_file_identity(path: &Path) -> io::Result<FileIdentity> {
+    os_symlink_file_identity(path)
+}
+
+/// Returns the filesystem identity `(dev, ino, nlink)` of an open [`File`].
+#[allow(dead_code)]
+pub(crate) fn open_file_identity(file: &File) -> io::Result<FileIdentity> {
+    file_identity_from_file(file)
+}
+
+/// Returns the strong claim/temp identity `(dev, ino, nlink, ctime, btime)` of `path` without
+/// following symlinks.
+pub(crate) fn symlink_claim_identity(path: &Path) -> io::Result<FileClaimIdentity> {
+    os_symlink_claim_identity(path)
+}
+
+/// Returns the strong claim/temp identity `(dev, ino, nlink, ctime, btime)` of an open [`File`].
+pub(crate) fn open_claim_identity(file: &File) -> io::Result<FileClaimIdentity> {
+    claim_identity_from_file(file)
 }
 
 /// Flushes directory metadata to durable storage on Unix after a rename or entry creation.
@@ -143,6 +206,20 @@ pub(crate) fn create_symlink_atomic(target: &Path, dest: &Path) -> Result<bool> 
             Err(err) => return Err(classify_io(&tmp, err)),
         }
     }
+}
+
+/// Creates a symbolic link on Unix without replacing an existing entry, returning `Ok(true)`.
+///
+/// Fails with [`io::ErrorKind::AlreadyExists`] atomically if `dest` already exists.
+#[cfg(unix)]
+pub(crate) fn create_symlink_no_replace(target: &Path, dest: &Path) -> io::Result<bool> {
+    std::os::unix::fs::symlink(target, dest).map(|()| true)
+}
+
+/// Skips symlink creation on Windows, where creating symlinks normally requires elevation.
+#[cfg(not(unix))]
+pub(crate) fn create_symlink_no_replace(_target: &Path, _dest: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Skips symlink creation on Windows, where creating symlinks normally requires elevation.

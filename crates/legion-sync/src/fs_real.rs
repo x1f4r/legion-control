@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use legion_os::atomic::{
-    WriteOptions, available_space, exchange_files, file_change_id, rename_no_replace,
-    replace_with_backup, same_device, write_atomic,
+    WriteOptions, available_space, exchange_files, file_change_id,
+    rename_no_replace_or_link as rename_no_replace, replace_with_backup, same_device, write_atomic,
 };
 use legion_xfer::hash::hash_reader;
 use legion_xfer::{EntryKind, Hash, Timestamp};

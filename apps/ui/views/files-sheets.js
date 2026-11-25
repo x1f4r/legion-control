@@ -95,12 +95,6 @@ export function SendToSheet({
   const canMove = isSameMachine
     ? Boolean(sourceCaps?.hasMove || sourceCaps?.hasTransferMove)
     : Boolean(sourceCaps?.hasTransferMove);
-  const moveNeedsNewerLegion =
-    !isSameMachine &&
-    Boolean(sourceCaps?.known) &&
-    Boolean(sourceCaps?.hasTransfer) &&
-    Boolean(sourceCaps?.hasRemove) &&
-    !sourceCaps?.hasTransferMove;
 
   useEffect(() => {
     if (!canMove && mode === 'move') setMode('copy');
@@ -199,7 +193,7 @@ export function SendToSheet({
   ].filter(Boolean);
 
   const isDeviceDest = dest === '__device__';
-  const effectiveMode = isDeviceDest ? 'copy' : mode;
+  const effectiveMode = !isDeviceDest && canMove ? mode : 'copy';
   const confirmLabel = isDeviceDest
     ? `Download to this ${deviceNoun}`
     : dest === sourceMachine
@@ -390,28 +384,24 @@ export function SendToSheet({
     <${Sheet} title=${title} onClose=${onClose}>
       <p class="sheet-sub">${subParts.join(' · ')}</p>
 
-      ${!isDeviceDest
+      ${!isDeviceDest && canMove
         ? html`
             <div class="seg" role="group" aria-label="Copy or move">
               <button
                 type="button"
-                aria-pressed=${mode === 'copy' ? 'true' : 'false'}
+                aria-pressed=${effectiveMode === 'copy' ? 'true' : 'false'}
                 onClick=${() => setMode('copy')}
               >
                 Copy
               </button>
               <button
                 type="button"
-                aria-pressed=${mode === 'move' ? 'true' : 'false'}
-                disabled=${!canMove}
+                aria-pressed=${effectiveMode === 'move' ? 'true' : 'false'}
                 onClick=${() => setMode('move')}
               >
                 Move
               </button>
             </div>
-            ${moveNeedsNewerLegion
-              ? html`<p class="sheet-note">${sourceMachine} needs a newer Legion to move files between machines. You can still copy them.</p>`
-              : null}
           `
         : null}
 
@@ -578,7 +568,7 @@ export function SendToSheet({
                   </button>
                 `;
               })}
-              ${caps?.hasDownload && mode !== 'move'
+              ${caps?.hasDownload && effectiveMode !== 'move'
                 ? html`
                     <button
                       type="button"

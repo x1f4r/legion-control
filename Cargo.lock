@@ -1315,6 +1315,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1415,11 +1416,13 @@ dependencies = [
  "blake3",
  "globset",
  "legion-os",
+ "same-file",
  "serde",
  "serde_json",
  "tar",
  "tempfile",
  "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]
