@@ -1021,22 +1021,24 @@ Security and lifecycle guarantees:
 - **Tickets, revocation bounds, and audit durability**: 256 random bits bound to one bearer token,
   one principal, one machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies
   are capped at 16 KiB). Permissions are checked as `fs.read` when the ticket is minted, on every
-  `GET` or `HEAD`, and on an independent 1-second liveness timer per active stream (not tied to
-  body polling or client read speed). Active content sockets cap `SO_SNDBUF` at 128 KiB, and
-  revoking a token, tightening `policy.toml`, or crossing the 6-hour hard limit cancels the
-  connection first (before flushing audit records), stops handing bytes to the socket, discards
-  server buffers, releases any remote pipe, and sends TCP RST (`SO_LINGER(0)`). That guarantees
-  server-side cutoff within ~2 seconds even for slow (20 KB/s) or completely stalled readers, with
-  at most one send buffer plus one 64 KiB write (~192 KiB) handed to the socket between revocation
-  and cutoff and zero bytes after cutoff; bytes already received into the client OS's own TCP
-  receive buffer before revocation cannot be taken back and stay drainable by the client (varying
-  by OS, e.g. ~128–256 KiB on Linux loopback and ~512–700 KiB on macOS loopback). Tickets expire
-  using a suspend-safe clock (15 minutes after last use, 6 hours absolute maximum), are capped at
-  128 per token (evicting the oldest), and are never logged. Minting writes one durable
-  `content.ticket` entry; the first `GET` or `HEAD` on a ticket writes one durable `content.open`
-  entry immediately so every access survives `SIGKILL` or power loss; ongoing reads coalesce to at
-  most one `content.read` summary per ticket per minute (and `stream.get` on remote nodes) with
-  request count and bytes served.
+  `GET` or `HEAD`, on an independent 1-second liveness timer per active stream (not tied to body
+  polling or client read speed), and immediately before yielding another 64 KiB frame after socket
+  backpressure. Active content sockets request `SO_SNDBUF = 128 KiB` before sending the response
+  (effective kernel buffer varies by OS: 256 KiB on Linux due to kernel doubling, ~128–147 KiB on
+  macOS, 128 KiB on Windows), and revoking a token, tightening `policy.toml`, or crossing the
+  6-hour hard limit cancels the connection first (before flushing audit records), stops handing
+  bytes to the socket, discards server buffers, releases any remote pipe, and sends TCP RST
+  (`SO_LINGER(0)`). That guarantees server-side cutoff within ~2 seconds even for slow (20 KB/s) or
+  completely stalled readers, with at most the kernel's effective send buffer plus one 64 KiB write
+  handed to the socket between revocation and cutoff and zero bytes after cutoff; bytes already
+  received into the client OS's own TCP receive buffer before revocation cannot be taken back and
+  stay drainable by the client (varying by OS, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB
+  on macOS loopback). Tickets expire using a suspend-safe clock (15 minutes after last use, 6 hours
+  absolute maximum), are capped at 128 per token (evicting the oldest), and are never logged.
+  Minting writes one durable `content.ticket` entry; the first `GET` or `HEAD` on a ticket writes
+  one durable `content.open` entry immediately so every access survives `SIGKILL` or power loss;
+  ongoing reads coalesce to at most one `content.read` summary per ticket per minute (and
+  `stream.get` on remote nodes) with request count and bytes served.
 - **Headers and isolation**: every reply carries `X-Content-Type-Options: nosniff`,
   `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Cache-Control:
   private, no-store`, and unconditionally

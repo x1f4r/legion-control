@@ -542,12 +542,14 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         .unwrap_or_else(PoisonError::into_inner)
         .take();
     if let Some((ticket, counter)) = opened {
-        if let Some(ctrl) = conn_ctrl
+        let body_guard = if let Some(ctrl) = conn_ctrl
             && response.status().is_success()
             && !response.body().is_end_stream()
         {
             let watch_shared = Arc::clone(&shared);
             let watch_source = Arc::clone(&source);
+            let watch_ticket = ticket.clone();
+            let watch_ctrl = ctrl.clone();
             let watch_interval = shared
                 .content_liveness_interval
                 .max(Duration::from_millis(50));
@@ -555,19 +557,29 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                 loop {
                     tokio::select! {
                         biased;
+                        () = watch_ctrl.abort.cancelled() => {
+                            let removed = watch_shared
+                                .content_tickets
+                                .revoke_holder_hashes(&watch_ticket.holder);
+                            watch_shared
+                                .content_audit
+                                .flush_removed(&watch_shared.node, &removed)
+                                .await;
+                            break;
+                        }
                         () = stop_watcher.cancelled() => break,
                         () = watch_shared.link.shutdown.cancelled() => break,
                         () = tokio::time::sleep(watch_interval) => {
-                            let live = watch_shared.content_tickets.is_live(&ticket.key_hash)
-                                && watch_source.check_live(&ticket).is_ok();
+                            let live = watch_shared.content_tickets.is_live(&watch_ticket.key_hash)
+                                && watch_source.check_live(&watch_ticket).is_ok();
                             if !live {
                                 // Abort the TCP connection first so zero further bytes can be
                                 // handed to the socket while the revoked ticket's audit summary
                                 // flushes to disk.
-                                ctrl.abort.cancel();
+                                watch_ctrl.abort.cancel();
                                 let removed = watch_shared
                                     .content_tickets
-                                    .revoke_holder_hashes(&ticket.holder);
+                                    .revoke_holder_hashes(&watch_ticket.holder);
                                 watch_shared
                                     .content_audit
                                     .flush_removed(&watch_shared.node, &removed)
@@ -578,11 +590,20 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                     }
                 }
             });
-        }
+            Some(BackpressureLiveness {
+                shared: Arc::clone(&shared),
+                source: Arc::clone(&source),
+                ticket,
+                ctrl,
+            })
+        } else {
+            None
+        };
         response.map(|body| {
             Body::new(AuditCountingBody {
                 inner: body,
                 counter,
+                backpressure_check: body_guard,
             })
         })
     } else {
@@ -591,9 +612,17 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
     }
 }
 
+struct BackpressureLiveness {
+    shared: Arc<Shared>,
+    source: Arc<DoorContentSource>,
+    ticket: Ticket,
+    ctrl: ConnectionControl,
+}
+
 struct AuditCountingBody {
     inner: legion_content::ContentBody,
     counter: Arc<AtomicU64>,
+    backpressure_check: Option<BackpressureLiveness>,
 }
 
 impl http_body::Body for AuditCountingBody {
@@ -604,6 +633,25 @@ impl http_body::Body for AuditCountingBody {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(ref check) = self.backpressure_check {
+            if check.ctrl.abort.is_cancelled() {
+                return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "content stream was revoked",
+                ))));
+            }
+            if check.ctrl.backpressured.swap(false, Ordering::AcqRel) {
+                let live = check.shared.content_tickets.is_live(&check.ticket.key_hash)
+                    && check.source.check_live(&check.ticket).is_ok();
+                if !live {
+                    check.ctrl.abort.cancel();
+                    return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "content ticket revoked",
+                    ))));
+                }
+            }
+        }
         let poll = Pin::new(&mut self.inner).poll_frame(cx);
         if let std::task::Poll::Ready(Some(Ok(ref frame))) = poll
             && let Some(data) = frame.data_ref()

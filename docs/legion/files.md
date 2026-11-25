@@ -170,19 +170,23 @@ interface's origin. So content is served from a **content address**: a URL holdi
   4 KiB; `POST /v1/content` bodies are capped at 16 KiB). It is checked as `fs.read` when made, on
   every request, and while a response streams: an independent 1-second liveness watcher per active
   stream (not tied to client read speed or body polling) re-checks the bearer token, `policy.toml`,
-  and the 6-hour hard cap. Each active content socket lowers `SO_SNDBUF` to 128 KiB, and as soon as
-  the watcher detects revocation it cancels the connection first (before flushing audit records to
+  and the 6-hour hard cap, and whenever a write resumes after socket backpressure the body re-checks
+  liveness before yielding another 64 KiB frame. Each active content socket requests `SO_SNDBUF =
+  128 KiB` before sending the response (the effective kernel buffer varies by OS: Linux doubles it
+  to 256 KiB for bookkeeping; macOS sets ~128–147 KiB; Windows sets 128 KiB), and as soon as
+  revocation is detected the server cancels the connection first (before flushing audit records to
   disk), hands no further bytes to the socket, discards its own buffered bytes, releases its remote
   pipe, and resets the TCP connection (`SO_LINGER(0)`) to drop the server's unsent kernel send
   queue. What this guarantees: server-side cutoff within ~2 seconds even for slow (e.g. 20 KB/s) or
-  completely stalled readers, at most one send buffer plus one 64 KiB write (~192 KiB) handed to
-  the socket between revocation and cutoff, and zero bytes written after the cutoff decision. What
-  the server cannot guarantee: bytes already transmitted and accepted into the peer's own TCP
-  receive buffer (or in flight on the network) before revocation cannot be recalled, so a reader
-  may still drain whatever its OS had already buffered (which varies by OS and receive-buffer
-  autotuning, e.g. ~128–256 KiB on Linux loopback and ~512–700 KiB on macOS loopback). Expiry uses
-  a suspend-safe clock (the maximum of wall-clock and monotonic elapsed time): 15 minutes after its
-  last use and 6 hours at most, capped per holder (128, LRU eviction) and globally.
+  completely stalled readers, at most the kernel's effective send buffer plus one 64 KiB write
+  handed to the socket between revocation and cutoff, and zero bytes handed to the socket after the
+  cutoff decision. What the server cannot guarantee: bytes already transmitted and accepted into
+  the peer's own TCP receive buffer (or in flight on the network) before revocation cannot be
+  recalled, so a reader may still drain whatever its OS had already buffered (which varies by OS
+  and receive-buffer autotuning, e.g. ~128–256 KiB on Linux loopback and ~384–650 KiB on macOS
+  loopback). Expiry uses a suspend-safe clock (the maximum of wall-clock and monotonic elapsed
+  time): 15 minutes after its last use and 6 hours at most, capped per holder (128, LRU eviction)
+  and globally.
 - The address answers `GET` and `HEAD` with single-range support (`Range`, `If-Range`, a strong
   `ETag` from size, modification time, and Unix file identity, `206` and `416` done properly),
   streaming with backpressure and never reading a file into memory.

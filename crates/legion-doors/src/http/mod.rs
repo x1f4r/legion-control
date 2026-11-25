@@ -36,7 +36,7 @@ use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -192,6 +192,9 @@ pub(crate) const CONTENT_SOCKET_SNDBUF: usize = 128 * 1024;
 pub(crate) struct ConnectionControl {
     pub(crate) active: Arc<AtomicUsize>,
     pub(crate) abort: CancellationToken,
+    /// Set by `MonitoredTcpStream` whenever a content write blocks on a full socket (`Poll::Pending`),
+    /// so the content body immediately re-checks revocation on resume before writing another frame.
+    pub(crate) backpressured: Arc<AtomicBool>,
 }
 
 /// The HTTP door over one node.
@@ -203,6 +206,8 @@ pub struct HttpDoor {
     content_limits: ContentStreamLimits,
     /// Total bytes handed to OS TCP sockets while a content response stream is active.
     content_socket_bytes: Arc<AtomicU64>,
+    /// Effective `SO_SNDBUF` reported back by `getsockopt` after setting `CONTENT_SOCKET_SNDBUF`.
+    content_socket_sndbuf: Arc<AtomicUsize>,
 }
 
 impl HttpDoor {
@@ -217,6 +222,7 @@ impl HttpDoor {
             router,
             content_limits: ContentStreamLimits::default(),
             content_socket_bytes: Arc::new(AtomicU64::new(0)),
+            content_socket_sndbuf: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -229,6 +235,11 @@ impl HttpDoor {
     #[cfg(test)]
     fn content_socket_bytes(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.content_socket_bytes)
+    }
+
+    #[cfg(test)]
+    fn content_socket_sndbuf(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.content_socket_sndbuf)
     }
 
     /// Serves connections from `listener` until `shutdown` completes, then stops accepting,
@@ -352,11 +363,14 @@ impl HttpDoor {
             };
             let active_streams = Arc::new(AtomicUsize::new(0));
             let conn_abort = CancellationToken::new();
+            let backpressured = Arc::new(AtomicBool::new(false));
             let monitored = MonitoredTcpStream::new(
                 stream,
                 Arc::clone(&active_streams),
                 conn_abort.clone(),
+                Arc::clone(&backpressured),
                 Arc::clone(&self.content_socket_bytes),
+                Arc::clone(&self.content_socket_sndbuf),
                 content_limits.write_idle_timeout,
                 content_limits.min_rate_window,
                 content_limits.min_rate_bytes,
@@ -366,6 +380,7 @@ impl HttpDoor {
                 flag: ConnectionControl {
                     active: active_streams,
                     abort: conn_abort.clone(),
+                    backpressured,
                 },
             };
             let closing = closing.clone();
@@ -497,7 +512,9 @@ struct MonitoredTcpStream {
     inner: TcpStream,
     active: Arc<AtomicUsize>,
     abort: CancellationToken,
+    backpressured: Arc<AtomicBool>,
     socket_bytes: Arc<AtomicU64>,
+    effective_sndbuf: Arc<AtomicUsize>,
     sndbuf_applied: bool,
     write_idle_timeout: Duration,
     min_rate_window: Duration,
@@ -519,11 +536,14 @@ impl Drop for MonitoredTcpStream {
 }
 
 impl MonitoredTcpStream {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         inner: TcpStream,
         active: Arc<AtomicUsize>,
         abort: CancellationToken,
+        backpressured: Arc<AtomicBool>,
         socket_bytes: Arc<AtomicU64>,
+        effective_sndbuf: Arc<AtomicUsize>,
         write_idle_timeout: Duration,
         min_rate_window: Duration,
         min_rate_bytes: u64,
@@ -532,7 +552,9 @@ impl MonitoredTcpStream {
             inner,
             active,
             abort,
+            backpressured,
             socket_bytes,
+            effective_sndbuf,
             sndbuf_applied: false,
             write_idle_timeout,
             min_rate_window,
@@ -573,7 +595,11 @@ impl MonitoredTcpStream {
             return write_op(&mut self.inner, cx);
         }
         if !self.sndbuf_applied {
-            let _ = socket2::SockRef::from(&self.inner).set_send_buffer_size(CONTENT_SOCKET_SNDBUF);
+            let sock = socket2::SockRef::from(&self.inner);
+            let _ = sock.set_send_buffer_size(CONTENT_SOCKET_SNDBUF);
+            if let Ok(actual) = sock.send_buffer_size() {
+                self.effective_sndbuf.store(actual, Ordering::Release);
+            }
             self.sndbuf_applied = true;
         }
         self.monitoring_active = true;
@@ -606,6 +632,7 @@ impl MonitoredTcpStream {
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => {
+                self.backpressured.store(true, Ordering::Release);
                 let since = *self.blocked_since.get_or_insert(now);
                 let write_idle_timeout = self.write_idle_timeout;
                 let stall = self
@@ -1419,7 +1446,9 @@ mod tests {
             server,
             Arc::clone(&active),
             CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicUsize::new(0)),
             Duration::from_secs(5),
             Duration::from_millis(120),
             64 * 1024,
@@ -1484,7 +1513,9 @@ mod tests {
             server,
             active,
             CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicUsize::new(0)),
             Duration::from_secs(5),
             Duration::from_millis(200),
             512 * 1024,
@@ -1574,6 +1605,7 @@ allow = [\"effect:read\"]
 
         let door = HttpDoor::new(node.clone(), Arc::new(legion_core::Local)).unwrap();
         let socket_bytes = door.content_socket_bytes();
+        let socket_sndbuf = door.content_socket_sndbuf();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let shutdown = CancellationToken::new();
@@ -1619,10 +1651,21 @@ allow = [\"effect:read\"]
                 .any(|e| e["tool"] == "content.read" && e["principal"] == principal)
         };
 
-        // Upper bound on bytes the server may hand to the OS socket after the revocation instant:
-        // at most one send buffer (128 KiB) plus one 64 KiB chunk write before the 1s watcher cuts
-        // the connection, and zero bytes after the abort decision.
-        let max_post_revoke_socket_bytes = (CONTENT_SOCKET_SNDBUF + 64 * 1024) as u64;
+        // Wait until the initial loopback burst fills OS buffers and settles (no new socket writes
+        // for 50ms) so `written_at_revoke` never counts bytes still in flight from the pre-revoke
+        // startup burst.
+        async fn wait_for_buffer_settle(socket_bytes: &AtomicU64) {
+            let deadline = Instant::now() + Duration::from_millis(600);
+            let mut prev = socket_bytes.load(Ordering::Acquire);
+            while Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let cur = socket_bytes.load(Ordering::Acquire);
+                if cur == prev && cur > 0 {
+                    return;
+                }
+                prev = cur;
+            }
+        }
 
         // 1. Slow 20 KB/s reader.
         let slow_url = mint(port, &slow_tok, &big_file).await;
@@ -1634,8 +1677,24 @@ allow = [\"effect:read\"]
         read_headers(&mut slow_conn).await;
         let mut chunk = [0u8; 4096];
         slow_conn.read_exact(&mut chunk).await.unwrap();
-        // Let the initial loopback burst fill OS buffers before revocation.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_buffer_settle(&socket_bytes).await;
+
+        let effective_sndbuf = socket_sndbuf.load(Ordering::Acquire);
+        assert!(
+            effective_sndbuf > 0,
+            "expected getsockopt(SO_SNDBUF) to be recorded when content stream started"
+        );
+        // Server-side bound on bytes handed to the socket between revocation and cutoff:
+        // at most the kernel-reported effective SO_SNDBUF plus one 64 KiB frame write, and zero
+        // bytes after the abort decision.
+        let max_post_revoke_socket_bytes = (effective_sndbuf + 64 * 1024) as u64;
+        eprintln!(
+            "content revocation SO_SNDBUF ({}): requested={} effective={} bound={}",
+            std::env::consts::OS,
+            CONTENT_SOCKET_SNDBUF,
+            effective_sndbuf,
+            max_post_revoke_socket_bytes
+        );
 
         node.call(legion_core::Call::new(
             legion_core::Door::Cli,
@@ -1686,9 +1745,17 @@ allow = [\"effect:read\"]
             "server must hand zero bytes to socket after abort decision"
         );
         let written_after_revoke = written_final.saturating_sub(written_at_revoke);
+        eprintln!(
+            "slow reader ({}): effective_sndbuf={} written_after_revoke={} cut={:?} client_drained={}",
+            std::env::consts::OS,
+            effective_sndbuf,
+            written_after_revoke,
+            server_cut_elapsed,
+            client_after_revoke
+        );
         assert!(
             written_after_revoke <= max_post_revoke_socket_bytes,
-            "server handed too many bytes to socket after revocation for slow reader: {written_after_revoke} > {max_post_revoke_socket_bytes} (cut at {server_cut_elapsed:?}, client drained {client_after_revoke})"
+            "server handed too many bytes to socket after revocation for slow reader: {written_after_revoke} > {max_post_revoke_socket_bytes} (effective SO_SNDBUF={effective_sndbuf}, cut at {server_cut_elapsed:?}, client drained {client_after_revoke})"
         );
         assert!(
             client_after_revoke < 4 * 1024 * 1024,
@@ -1705,7 +1772,7 @@ allow = [\"effect:read\"]
         read_headers(&mut stalled_conn).await;
         let mut initial = [0u8; 16 * 1024];
         stalled_conn.read_exact(&mut initial).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_buffer_settle(&socket_bytes).await;
 
         node.call(legion_core::Call::new(
             legion_core::Door::Cli,
@@ -1740,16 +1807,24 @@ allow = [\"effect:read\"]
         );
         let stalled_written_after_revoke =
             stalled_written_final.saturating_sub(stalled_written_at_revoke);
-        assert!(
-            stalled_written_after_revoke <= max_post_revoke_socket_bytes,
-            "server handed too many bytes to socket after revocation for stalled reader: {stalled_written_after_revoke} > {max_post_revoke_socket_bytes} (cut at {stalled_cut_elapsed:?})"
-        );
         let mut stalled_tail = Vec::new();
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
             stalled_conn.read_to_end(&mut stalled_tail),
         )
         .await;
+        eprintln!(
+            "stalled reader ({}): effective_sndbuf={} written_after_revoke={} cut={:?} client_drained={}",
+            std::env::consts::OS,
+            effective_sndbuf,
+            stalled_written_after_revoke,
+            stalled_cut_elapsed,
+            stalled_tail.len()
+        );
+        assert!(
+            stalled_written_after_revoke <= max_post_revoke_socket_bytes,
+            "server handed too many bytes to socket after revocation for stalled reader: {stalled_written_after_revoke} > {max_post_revoke_socket_bytes} (effective SO_SNDBUF={effective_sndbuf}, cut at {stalled_cut_elapsed:?})"
+        );
         assert!(
             stalled_tail.len() < 4 * 1024 * 1024,
             "stalled client drained unreasonably large tail: {} bytes",
