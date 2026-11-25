@@ -1451,17 +1451,13 @@ function App() {
           });
           return;
         }
-        if (kind === 'uncertain') {
+        if (kind === 'uncertain' || kind === 'not_finished') {
           showToastRef.current(message, {
             tone: 'error',
             actionLabel: retryable ? 'Try again' : null,
             onAction: retryable ? () => ctrl.retryPair() : null,
             ttlMs: 12000,
           });
-          return;
-        }
-        if (kind === 'not_enrolled') {
-          showToastRef.current(message, { ttlMs: 8000 });
           return;
         }
         const summary = plainErrorMessage(error, 'Pairing failed.', {

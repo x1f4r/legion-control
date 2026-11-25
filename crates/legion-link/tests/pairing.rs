@@ -1653,3 +1653,149 @@ async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
     );
     link_y.close().await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up_pairing() {
+    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() || find_tool("flock").is_none() {
+        eprintln!(
+            "skipping real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up_pairing: sshd/ssh-keygen/flock unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!("skipping: built `legion` binary not found");
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        return;
+    };
+    fs::write(
+        config_dir.join("node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(&sshd.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n[roles.operator]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+    let inv_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=phone",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv_text = inv_res["invite"].as_str().unwrap().to_owned();
+
+    // Hold `config.lock` so the machine receives the enrolment request and waits before committing.
+    let config_lock = legion_home.join("state").join("sync").join("config.lock");
+    let Some(mut holder) = hold_flock(&config_lock) else {
+        return;
+    };
+
+    let key = DeviceKey::generate().unwrap();
+    let link = Link::new(LinkConfig {
+        device_key: Some(key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let cancel = CancellationToken::new();
+    let accepted_before = sshd.log().matches("Accepted publickey").count();
+    let task = {
+        let link = link.clone();
+        let inv = inv_text.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move { link.pair_cancellable(&inv, "phone", cancel).await })
+    };
+    wait_sshd_accepted(&sshd, accepted_before + 1).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    cancel.cancel();
+
+    let err = task
+        .await
+        .unwrap()
+        .expect_err("cancel while blocked on config.lock must stop waiting");
+    assert_eq!(err.code, ErrorCode::Cancelled, "{err}");
+    let details = err
+        .details
+        .as_ref()
+        .expect("post-send cancel must include details");
+    assert_eq!(details[DETAIL_SENT], json!(true));
+    assert_eq!(
+        details["outcome"],
+        json!("not_finished"),
+        "post-send cancel must report outcome `not_finished` rather than falsely claiming nothing was saved: {err}"
+    );
+    assert!(
+        !err.message
+            .to_ascii_lowercase()
+            .contains("nothing was saved"),
+        "post-send cancel must never claim 'Nothing was saved': {err}"
+    );
+    assert!(
+        err.message
+            .contains("had not finished pairing when Legion checked"),
+        "expected honest post-send cancel message: {err}"
+    );
+
+    // Release `config.lock`: the machine now finishes the in-flight enrolment cleanly.
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let key_b64 = key
+        .public_key_line("phone")
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !fs::read_to_string(&auth_keys)
+        .unwrap_or_default()
+        .contains(&key_b64)
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        fs::read_to_string(&auth_keys)
+            .unwrap_or_default()
+            .contains(&key_b64),
+        "machine finished enrolling the in-flight request after lock release"
+    );
+
+    // Pairing again with the SAME kept invite picks up the finished pairing automatically.
+    let picked_up = link.pair(&inv_text, "phone").await.unwrap_or_else(|e| {
+        panic!("retrying the same invite should pick up finished pairing: {e}")
+    });
+    assert_eq!(picked_up.node, "tower");
+    assert_eq!(picked_up.principal, "device:phone");
+    assert!(picked_up.recovered);
+    assert!(link.config().node("tower").is_some());
+    link.close().await;
+}

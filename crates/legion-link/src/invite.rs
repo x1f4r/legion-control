@@ -576,15 +576,18 @@ mod enrol_client {
         .with_details(json!({ crate::DETAIL_SENT: false }))
     }
 
-    fn cancelled_not_enrolled_error(node: &str) -> ErrorBody {
+    fn cancelled_not_finished_error(node: &str) -> ErrorBody {
         ErrorBody::new(
             ErrorCode::Cancelled,
-            format!("Pairing with {node} was stopped. Nothing was saved."),
+            format!(
+                "Stopped waiting. {node} had not finished pairing when Legion checked. If it finishes, pairing again picks it up."
+            ),
         )
+        .with_hint("Keep this invite and try pairing again to check whether it finished.")
         .with_machine(node)
         .with_details(json!({
             crate::DETAIL_SENT: true,
-            "outcome": "not_enrolled",
+            "outcome": "not_finished",
         }))
     }
 
@@ -742,7 +745,7 @@ mod enrol_client {
                     return match probe().await {
                         ProbeOutcome::Confirmed(enrolled) => Ok(*enrolled),
                         ProbeOutcome::NotEnrolled => {
-                            Err(cancelled_not_enrolled_error(&invite.node))
+                            Err(cancelled_not_finished_error(&invite.node))
                         }
                         ProbeOutcome::Unreachable => Err(cancelled_uncertain_error(&invite.node)),
                     };
@@ -1941,8 +1944,9 @@ mod tests {
         assert!(late_confirmed.recovered);
         assert_eq!(late_cancel_probes.load(Ordering::SeqCst), 1);
 
-        // 5d. Cancel after request left when machine definitively says no (`NotEnrolled`):
-        //     returns Cancelled with `sent: true, outcome: "not_enrolled"`.
+        // 5d. Cancel after request left when machine had not enrolled yet (`NotEnrolled`):
+        //     returns Cancelled with `sent: true, outcome: "not_finished"` and honest wording
+        //     (never falsely claiming "Nothing was saved").
         let cancel_denied = CancellationToken::new();
         let cancel_denied_attempt = cancel_denied.clone();
         let denied_err = enrol_client::enrol_flow(
@@ -1967,7 +1971,19 @@ mod tests {
         );
         assert_eq!(
             denied_err.details.as_ref().unwrap()["outcome"],
-            json!("not_enrolled")
+            json!("not_finished")
+        );
+        assert!(
+            !denied_err
+                .message
+                .to_ascii_lowercase()
+                .contains("nothing was saved"),
+            "{}",
+            denied_err.message
+        );
+        assert_eq!(
+            denied_err.message,
+            "Stopped waiting. tower had not finished pairing when Legion checked. If it finishes, pairing again picks it up."
         );
 
         // 5e. Cancel after request left when machine is unreachable (`Unreachable`):

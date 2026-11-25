@@ -51,9 +51,9 @@ export function classifyPairError(err, nodeName = '', deviceNoun = 'device') {
     const message =
       (typeof err?.message === 'string' && err.message.trim()) ||
       (target
-        ? `Pairing with ${target} was stopped. Nothing was saved.`
-        : 'Pairing was stopped. Nothing was saved.');
-    return { kind: 'not_enrolled', message, retryable: false, restorable: false };
+        ? `Stopped waiting. ${target} had not finished pairing when Legion checked. If it finishes, pairing again picks it up.`
+        : 'Stopped waiting. The machine had not finished pairing when Legion checked. If it finishes, pairing again picks it up.');
+    return { kind: 'not_finished', message, retryable: true, restorable: false };
   }
   const existingPrincipal =
     typeof err?.details?.existing_principal === 'string'
@@ -259,7 +259,7 @@ export function createPairingController({
           return { ok: false, outcome };
         }
 
-        if (outcome.kind === 'uncertain') {
+        if (outcome.kind === 'uncertain' || outcome.kind === 'not_finished') {
           // Keep the invite (even if scanned) so "Try again" checks the same invite.
           update({
             inFlight: false,
@@ -274,34 +274,10 @@ export function createPairingController({
           });
           if (!onScreen && typeof onBackgroundOutcome === 'function') {
             onBackgroundOutcome({
-              kind: 'uncertain',
+              kind: outcome.kind,
               message: outcome.message,
               node: node || err?.machine || '',
               retryable: true,
-              startedScreen: screen,
-            });
-          }
-          return { ok: false, outcome };
-        }
-
-        if (outcome.kind === 'not_enrolled') {
-          update({
-            inFlight: false,
-            cancelling: false,
-            error: null,
-            notice: {
-              kind: 'neutral',
-              title: outcome.message,
-              retryable: false,
-              node: node || err?.machine || '',
-            },
-          });
-          if (!onScreen && typeof onBackgroundOutcome === 'function') {
-            onBackgroundOutcome({
-              kind: 'not_enrolled',
-              message: outcome.message,
-              node: node || err?.machine || '',
-              retryable: false,
               startedScreen: screen,
             });
           }

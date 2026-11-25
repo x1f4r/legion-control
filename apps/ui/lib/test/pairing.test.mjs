@@ -99,20 +99,32 @@ test('cancel after send when confirmation already arrived saves pairing and repo
   assert.equal(ctrl.getState().inFlight, false);
 });
 
-test('cancel after send with machine saying no is never swallowed', async () => {
+test('cancel after send when machine had not finished yet stays honest, keeps invite, and allows Try again', async () => {
   const invite = makeFakeInvite('tower');
+  const seenInvites = [];
+  let attempt = 0;
   const ctrl = createPairingController({
     link: {
-      pair(_inv, _name, { signal }) {
-        return new Promise((_resolve, reject) => {
-          signal.addEventListener('abort', () => {
-            reject({
-              code: 'cancelled',
-              message: 'Pairing with tower was stopped. Nothing was saved.',
-              machine: 'tower',
-              details: { sent: true, outcome: 'not_enrolled' },
+      pair(inv, _name, { signal }) {
+        seenInvites.push(inv);
+        attempt += 1;
+        if (attempt === 1) {
+          return new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => {
+              reject({
+                code: 'cancelled',
+                message:
+                  'Stopped waiting. tower had not finished pairing when Legion checked. If it finishes, pairing again picks it up.',
+                machine: 'tower',
+                details: { sent: true, outcome: 'not_finished' },
+              });
             });
           });
+        }
+        return Promise.resolve({
+          ready: true,
+          nodes: [{ node: 'tower' }],
+          last_paired: { node: 'tower', device: 'phone', role: 'operator', synced: [], not_synced: [] },
         });
       },
     },
@@ -123,10 +135,18 @@ test('cancel after send with machine saying no is never swallowed', async () => 
   ctrl.cancelPair();
   const res = await pending;
   assert.equal(res.ok, false);
-  assert.equal(res.outcome.kind, 'not_enrolled');
-  assert.equal(ctrl.getState().notice?.title, 'Pairing with tower was stopped. Nothing was saved.');
-  assert.equal(ctrl.getState().notice?.retryable, false);
+  assert.equal(res.outcome.kind, 'not_finished');
+  assert.equal(
+    ctrl.getState().notice?.title,
+    'Stopped waiting. tower had not finished pairing when Legion checked. If it finishes, pairing again picks it up.',
+  );
+  assert.equal(ctrl.getState().notice?.title.toLowerCase().includes('nothing was saved'), false);
+  assert.equal(ctrl.getState().notice?.retryable, true);
   assert.equal(ctrl.getState().invite, invite);
+
+  const retry = await ctrl.retryPair();
+  assert.equal(retry.ok, true);
+  assert.deepEqual(seenInvites, [invite, invite]);
 });
 
 test('cancel after send when machine unreachable keeps scanned invite and Try again reuses it', async () => {
@@ -250,7 +270,17 @@ test('classifyPairError never swallows post-send cancelled without details.sent=
   );
   assert.equal(
     classifyPairError({ code: 'cancelled', details: null }, 'tower').kind,
-    'not_enrolled',
+    'not_finished',
+  );
+  assert.equal(
+    classifyPairError({ code: 'cancelled', details: null }, 'tower').retryable,
+    true,
+  );
+  assert.equal(
+    classifyPairError({ code: 'cancelled', details: null }, 'tower')
+      .message.toLowerCase()
+      .includes('nothing was saved'),
+    false,
   );
 });
 
