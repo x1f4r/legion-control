@@ -455,10 +455,12 @@ export function createAppLink() {
           window.removeEventListener('focus', onFg);
           window.removeEventListener('pageshow', onFg);
         };
+        // Cold-launching com.apple.Preferences and switching back on a busy CI simulator runner
+        // can take over two minutes (observed 121s on macos-latest); give the transition 3 minutes.
         const timer = window.setTimeout(() => {
           cleanup();
           reject(new Error('Timed out waiting for app suspend/resume cycle'));
-        }, 45000);
+        }, 180000);
         const onBg = () => {
           sawBackground = true;
         };
@@ -557,8 +559,8 @@ export function createAppLink() {
         // can now background and foreground the app.
         await invoke('media_check_report', { report: { ...report, resume_ok: false } }).catch(() => {});
         await waitForAppResume();
-        // Give native resume hook a beat to probe/rebind the loopback listener if needed.
-        await new Promise((r) => window.setTimeout(r, 400));
+        // Mint immediately on resume: content_url probes and recovers the loopback listener
+        // synchronously under its lock without relying on an arbitrary sleep.
         const [imgAfter, vidAfter] = await Promise.all([
           contentUrl({ machine: spec.machine, path: spec.image_path }),
           contentUrl({ machine: spec.machine, path: spec.video_path }),

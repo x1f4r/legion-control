@@ -782,15 +782,26 @@ jobs:
               if [ "$media_ok" -eq 1 ] && [ "$resume_triggered" -eq 0 ]; then
                 echo "Backgrounding and resuming Legion on $kind to verify loopback survival..."
                 resume_triggered=1
+                local resume_t0 resume_t1
+                resume_t0="$(date +%s)"
                 xcrun simctl launch "$udid" com.apple.Preferences >/dev/null || true
                 sleep 3
                 xcrun simctl launch "$udid" com.x1f4r.legion >/dev/null || true
+                resume_t1="$(date +%s)"
+                echo "$kind background/resume switch completed in $((resume_t1 - resume_t0))s"
               fi
               if [ "$resume_triggered" -eq 1 ] && [ "$resume_ok" -eq 0 ] && [ -f "$media_out" ]; then
-                if node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.exit(r.ok && r.resume_ok === true ? 0 : 1);' "$media_out"; then
+                local resume_status
+                resume_status="$(node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); if (r.ok && r.resume_ok === true) { console.log("pass"); } else if (r.ok === false) { console.log("fail"); } else { console.log("pending"); }' "$media_out")"
+                if [ "$resume_status" = "pass" ]; then
                   echo "$kind post-resume loopback media check passed after ${i}s"
                   cat "$media_out"
                   resume_ok=1
+                elif [ "$resume_status" = "fail" ]; then
+                  echo "$kind post-resume loopback media check reported failure after ${i}s:"
+                  cat "$media_out"
+                  media_failed=1
+                  break
                 fi
               fi
               if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ] && [ "$resume_ok" -eq 1 ]; then
@@ -811,6 +822,10 @@ jobs:
             cat "$stderr_log" || true
             if [ "$found" -ne 1 ] || [ "$media_ok" -ne 1 ] || [ "$resume_ok" -ne 1 ]; then
               echo "Failed waiting for $kind ready ($found), media check ($media_ok), resume ($resume_ok)"
+              if [ -f "$media_out" ]; then
+                echo "--- $kind media-result.json ---"
+                cat "$media_out" || true
+              fi
               cat "$media_work/sshd.log" || true
               ls -la "$data_dir/Library/Application Support" || true
               xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-timeout.png" || true

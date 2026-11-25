@@ -449,7 +449,7 @@ impl AppContentServer {
         let suffix = if download { "?download=1" } else { "" };
         let url = match self.mode {
             ContentMountMode::Loopback => {
-                let port = self.ensure_loopback_listener().await?;
+                let port = self.ensure_live_loopback_listener().await?;
                 format!(
                     "http://127.0.0.1:{port}/v1/content/{}/{encoded_name}{suffix}",
                     issued.id
@@ -513,18 +513,11 @@ impl AppContentServer {
         if self.mode != ContentMountMode::Loopback {
             return Ok(None);
         }
+        let _guard = self.listener_lock.lock().await;
         let Some(port) = self.loopback_port() else {
             return Ok(None);
         };
-        let alive = matches!(
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
-            )
-            .await,
-            Ok(Ok(_))
-        );
-        if alive {
+        if Self::loopback_port_alive(port).await {
             return Ok(Some(port));
         }
 
@@ -534,10 +527,19 @@ impl AppContentServer {
         if self.tickets.is_empty() {
             return Ok(None);
         }
-        let new_port = self
-            .ensure_loopback_listener_prefer_port(Some(port))
-            .await?;
+        let new_port = self.bind_loopback_listener_locked(Some(port)).await?;
         Ok(Some(new_port))
+    }
+
+    async fn loopback_port_alive(port: u16) -> bool {
+        matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+            )
+            .await,
+            Ok(Ok(_))
+        )
     }
 
     /// Returns the peak concurrent custom-scheme response bytes buffered so far.
@@ -635,18 +637,25 @@ impl AppContentServer {
         }
     }
 
-    async fn ensure_loopback_listener(self: &Arc<Self>) -> Result<u16, AppError> {
-        self.ensure_loopback_listener_prefer_port(None).await
+    /// Ensures a loopback listener is bound and accepting TCP connections before returning a
+    /// freshly minted URL. Serialized under `listener_lock` with `probe_or_recover_loopback` so
+    /// concurrent post-resume mints never hand out a dead port or double-bind.
+    async fn ensure_live_loopback_listener(self: &Arc<Self>) -> Result<u16, AppError> {
+        let _guard = self.listener_lock.lock().await;
+        if let Some(port) = self.loopback_port() {
+            if Self::loopback_port_alive(port).await {
+                return Ok(port);
+            }
+            self.teardown_listener_if_port(port);
+            return self.bind_loopback_listener_locked(Some(port)).await;
+        }
+        self.bind_loopback_listener_locked(None).await
     }
 
-    async fn ensure_loopback_listener_prefer_port(
+    async fn bind_loopback_listener_locked(
         self: &Arc<Self>,
         preferred_port: Option<u16>,
     ) -> Result<u16, AppError> {
-        if let Some(port) = self.loopback_port() {
-            return Ok(port);
-        }
-        let _guard = self.listener_lock.lock().await;
         if let Some(port) = self.loopback_port() {
             return Ok(port);
         }
@@ -2891,5 +2900,183 @@ mod tests {
         let broken =
             collect_bounded_response(err_resp, 1024 * 1024, &budget, &buffered, &peak).await;
         assert_eq!(broken.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn suspend_drops_loopback_listener_and_evicts_parked_streams_then_resume_recovers_cleanly()
+     {
+        let image_bytes = b"\x89PNG\r\n\x1a\nresume-image-payload".to_vec();
+        // Large enough to exceed loopback TCP buffers so a paused client triggers idle parking.
+        let movie_bytes: Vec<u8> = (0..(12 * 1024 * 1024))
+            .map(|i| ((i * 31 + 7) % 251) as u8)
+            .collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/photo.png".to_owned(), image_bytes.clone());
+        files.insert("/home/me/movie.bin".to_owned(), movie_bytes.clone());
+
+        let backend = Arc::new(MockContentBackend::with_options(
+            files,
+            LinkOptions {
+                max_parked_streams: 1,
+                ..LinkOptions::default()
+            },
+            Some(legion_link::content::WindowPolicy {
+                initial_bytes: 256 * 1024,
+                max_bytes: 256 * 1024,
+            }),
+        ));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+
+        // 1) Before suspension: mint and open two streams on the cap-1 pool so stream 1 parks
+        // and is evicted when stream 2 parks.
+        let pre1 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let pre2 = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let port_before = server.loopback_port().unwrap();
+        let path1 = pre1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port_before}"))
+            .unwrap();
+        let path2 = pre2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port_before}"))
+            .unwrap();
+
+        let mut s1 = TcpStream::connect(("127.0.0.1", port_before))
+            .await
+            .unwrap();
+        s1.write_all(
+            format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port_before}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (st1, head1, mut body1) = read_http_head_and_prefix(&mut s1, 4096).await;
+        assert_eq!(st1, 200, "{head1}");
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        let mut s2 = TcpStream::connect(("127.0.0.1", port_before))
+            .await
+            .unwrap();
+        s2.write_all(
+            format!(
+                "GET {path2} HTTP/1.1\r\nHost: 127.0.0.1:{port_before}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (st2, head2, _body2) = read_http_head_and_prefix(&mut s2, 4096).await;
+        assert_eq!(st2, 200, "{head2}");
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+
+        // 2) Simulate OS background suspension reclaiming the listening socket while the stale
+        // ListenerHandle is still recorded in `server.listener`.
+        {
+            let guard = server.listener.lock().unwrap();
+            if let Some(h) = guard.as_ref() {
+                h.shutdown.cancel();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Pre-suspend evicted stream aborts cleanly strictly before Content-Length.
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match s1.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body1.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert!(body1.len() < movie_bytes.len());
+        assert_eq!(body1, &movie_bytes[..body1.len()]);
+        drop(s2);
+
+        // 3) Resume: race `probe_or_recover_loopback()` against concurrent `mint_url()` calls
+        // (matching iOS `WindowEvent::Resumed` racing with immediate post-resume UI requests).
+        let (probe_res, img_res, vid_res) = tokio::join!(
+            server.probe_or_recover_loopback(),
+            server.mint_url("tower", "/home/me/photo.png", false),
+            server.mint_url("tower", "/home/me/movie.bin", false),
+        );
+        let recovered_port = probe_res
+            .unwrap()
+            .expect("probe must see or recover a live loopback listener");
+        let img_ticket = img_res.unwrap();
+        let vid_ticket = vid_res.unwrap();
+        assert_eq!(server.loopback_port(), Some(recovered_port));
+
+        let expected_origin = format!("http://127.0.0.1:{recovered_port}");
+        let img_path = img_ticket
+            .url
+            .strip_prefix(&expected_origin)
+            .expect("image URL must point to recovered live port");
+        let vid_path = vid_ticket
+            .url
+            .strip_prefix(&expected_origin)
+            .expect("video URL must point to recovered live port");
+
+        // First requests after resume must succeed byte-exact without error.
+        let (img_status, img_head, img_body) = raw_http(
+            recovered_port,
+            &format!(
+                "GET {img_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(img_status, 200, "{img_head}");
+        assert_eq!(img_body, image_bytes);
+
+        let (vid_status, vid_head, vid_tail) = raw_http(
+            recovered_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
+                body1.len()
+            ),
+        )
+        .await;
+        assert_eq!(vid_status, 206, "{vid_head}");
+        body1.extend_from_slice(&vid_tail);
+        assert_eq!(body1, movie_bytes);
+
+        // 4) Simulate a long suspension where the listener was completely torn down and all
+        // tickets were cleared: the very first post-resume `mint_url` recreates the listener.
+        server.shutdown();
+        assert_eq!(server.loopback_port(), None);
+        let after_long = server
+            .mint_url("tower", "/home/me/photo.png", false)
+            .await
+            .unwrap();
+        let long_port = server
+            .loopback_port()
+            .expect("mint_url must recreate loopback listener after full teardown");
+        let long_path = after_long
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{long_port}"))
+            .unwrap();
+        let (long_status, long_head, long_body) = raw_http(
+            long_port,
+            &format!(
+                "GET {long_path} HTTP/1.1\r\nHost: 127.0.0.1:{long_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(long_status, 200, "{long_head}");
+        assert_eq!(long_body, image_bytes);
+
+        server.shutdown();
     }
 }
