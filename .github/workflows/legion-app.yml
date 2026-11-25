@@ -253,7 +253,11 @@ jobs:
         working-directory: apps/legion-app
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
-        run: cargo tauri build --bundles deb,appimage
+        # The cached target directory can hold bundles from an earlier run under another name.
+        run: |
+          set -euo pipefail
+          rm -rf src-tauri/target/release/bundle
+          cargo tauri build --bundles deb,appimage
       - name: Verify deb package metadata does not collide with node package
         run: |
           set -euo pipefail
