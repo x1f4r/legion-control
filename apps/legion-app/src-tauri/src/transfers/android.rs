@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 
 use crate::backend::{AppError, BoxFuture, ErrorCode};
 use crate::transfers::{
@@ -135,9 +135,12 @@ pub struct AndroidTransferPlatform {
     plugin: Mutex<Option<Arc<AndroidTransferPluginHandle>>>,
     manager: Mutex<Weak<TransferManager>>,
     client: Mutex<Option<Arc<BridgeClient>>>,
+    client_generation: AtomicU64,
     unmetered_wifi: AtomicBool,
     notification_permission_asked: AtomicBool,
-    latest_summary: Mutex<Option<QueueNotificationSummary>>,
+    latest_summary: Mutex<Option<(u64, QueueNotificationSummary)>>,
+    summary_seq: AtomicU64,
+    sync_notify: Notify,
 }
 
 impl AndroidTransferPlatform {
@@ -173,9 +176,12 @@ impl AndroidTransferPlatform {
             plugin: Mutex::new(None),
             manager: Mutex::new(Weak::new()),
             client: Mutex::new(None),
+            client_generation: AtomicU64::new(0),
             unmetered_wifi: AtomicBool::new(true),
             notification_permission_asked: AtomicBool::new(false),
             latest_summary: Mutex::new(None),
+            summary_seq: AtomicU64::new(0),
+            sync_notify: Notify::new(),
         });
 
         let std_listener =
@@ -204,6 +210,11 @@ impl AndroidTransferPlatform {
                     );
                 }
             }
+        });
+
+        let sync_platform = Arc::clone(&platform);
+        crate::transfers::spawn_bg(async move {
+            sync_platform.sync_loop().await;
         });
 
         Ok(platform)
@@ -296,27 +307,12 @@ impl AndroidTransferPlatform {
             if let Some(prev) = slot.replace(Arc::clone(&client)) {
                 prev.fail_all();
             }
+            self.client_generation.fetch_add(1, Ordering::AcqRel);
         }
         log::info!(target: "legion-transfers", "Android LocalSocket transfer bridge connected");
 
-        // Flush any queued notification state immediately upon bridge connection.
-        if let Some(summary) = self
-            .latest_summary
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            && (summary.active_count > 0 || summary.paused_count > 0)
-        {
-            let sync_client = Arc::clone(&client);
-            tokio::spawn(async move {
-                let _ = sync_client
-                    .call(
-                        "syncService",
-                        serde_json::to_value(summary).unwrap_or(Value::Null),
-                    )
-                    .await;
-            });
-        }
+        // Wake the ordered sync worker so any active or paused transfers flush immediately.
+        self.sync_notify.notify_one();
 
         let mut line = String::new();
         loop {
@@ -415,6 +411,58 @@ impl AndroidTransferPlatform {
                 });
             }
             _ => {}
+        }
+    }
+
+    async fn sync_loop(self: Arc<Self>) {
+        let mut last_sent: Option<(u64, u64)> = None;
+        loop {
+            let client = self
+                .client
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let client_gen = self.client_generation.load(Ordering::Acquire);
+            let latest = self
+                .latest_summary
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+
+            if let (Some(client), Some((seq, summary))) = (client, latest)
+                && last_sent != Some((client_gen, seq))
+            {
+                let fresh_connection = last_sent.map(|(g, _)| g) != Some(client_gen);
+                if fresh_connection && summary.active_count == 0 && summary.paused_count == 0 {
+                    last_sent = Some((client_gen, seq));
+                    continue;
+                }
+                match client
+                    .call(
+                        "syncService",
+                        serde_json::to_value(&summary).unwrap_or(Value::Null),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        last_sent = Some((client_gen, seq));
+                        continue;
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            target: "legion-transfers",
+                            "Android syncService failed: {}",
+                            err.message
+                        );
+                        tokio::select! {
+                            () = self.sync_notify.notified() => {}
+                            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        }
+                        continue;
+                    }
+                }
+            }
+            self.sync_notify.notified().await;
         }
     }
 
@@ -693,25 +741,12 @@ impl TransferPlatform for AndroidTransferPlatform {
     }
 
     fn on_queue_updated(&self, summary: QueueNotificationSummary) {
+        let seq = self.summary_seq.fetch_add(1, Ordering::AcqRel) + 1;
         *self
             .latest_summary
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary.clone());
-        let client = self
-            .client
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(client) = client {
-            crate::transfers::spawn_bg(async move {
-                let _ = client
-                    .call(
-                        "syncService",
-                        serde_json::to_value(summary).unwrap_or(Value::Null),
-                    )
-                    .await;
-            });
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((seq, summary));
+        self.sync_notify.notify_one();
     }
 
     fn on_transfer_completed(&self, transfer: &DeviceTransfer) {

@@ -12,12 +12,16 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -107,6 +111,7 @@ class TransferForegroundService : Service() {
     val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
 
     if (activeCount > 0) {
+      nm?.cancel(PAUSED_NOTIFICATION_ID)
       val notification = buildOngoingNotification(this, summary, isActive = true)
       if (!inForeground.get() || ensureForegroundFirst) {
         try {
@@ -128,6 +133,9 @@ class TransferForegroundService : Service() {
     }
 
     if (pausedCount > 0) {
+      // Detach/stop the dataSync foreground service cleanly so Android's 6-hour rolling quota
+      // stops immediately, then show the paused notification under its own ID so Android never
+      // races an ongoing FGS detach against an in-place update on ONGOING_NOTIFICATION_ID.
       val notification = buildOngoingNotification(this, summary, isActive = false)
       if (ensureForegroundFirst && !inForeground.get()) {
         runCatching {
@@ -141,16 +149,18 @@ class TransferForegroundService : Service() {
       }
       if (inForeground.getAndSet(false) || ensureForegroundFirst) {
         runCatching {
-          ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_DETACH)
+          ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         }
       }
-      notifySafely(this, nm, ONGOING_NOTIFICATION_ID, notification)
+      nm?.cancel(ONGOING_NOTIFICATION_ID)
+      notifySafely(this, nm, PAUSED_NOTIFICATION_ID, notification)
       stopSelf()
       return
     }
 
     // Queue empty.
     if (ensureForegroundFirst && !inForeground.get()) {
+      nm?.cancel(PAUSED_NOTIFICATION_ID)
       promoteMinimalAndStop(0)
       return
     }
@@ -160,6 +170,7 @@ class TransferForegroundService : Service() {
       }
     }
     nm?.cancel(ONGOING_NOTIFICATION_ID)
+    nm?.cancel(PAUSED_NOTIFICATION_ID)
     stopSelf()
   }
 
@@ -171,6 +182,7 @@ class TransferForegroundService : Service() {
       }
     }
     nm?.cancel(ONGOING_NOTIFICATION_ID)
+    nm?.cancel(PAUSED_NOTIFICATION_ID)
     stopSelf()
   }
 
@@ -180,13 +192,18 @@ class TransferForegroundService : Service() {
     const val CHANNEL_COMPLETE = "legion_transfers_complete"
     const val ONGOING_NOTIFICATION_ID = 4101
     private const val TIMEOUT_NOTIFICATION_ID = 4102
+    private const val PAUSED_NOTIFICATION_ID = 4103
     private const val COMPLETE_NOTIFICATION_BASE = 4200
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile
     private var runningInstance: TransferForegroundService? = null
 
     @Volatile
     private var latestSummary: JSONObject? = null
+
+    @Volatile
+    private var lastLoggedShape: String = ""
 
     fun ensureChannels(context: Context) {
       val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
@@ -215,13 +232,39 @@ class TransferForegroundService : Service() {
     }
 
     fun sync(context: Context, summary: JSONObject) {
+      val appCtx = context.applicationContext
+      if (Looper.myLooper() == Looper.getMainLooper()) {
+        syncOnMain(appCtx, summary)
+        return
+      }
+      val latch = CountDownLatch(1)
+      mainHandler.post {
+        try {
+          syncOnMain(appCtx, summary)
+        } finally {
+          latch.countDown()
+        }
+      }
+      runCatching { latch.await(5L, TimeUnit.SECONDS) }
+    }
+
+    private fun syncOnMain(context: Context, summary: JSONObject) {
       ensureChannels(context)
       latestSummary = summary
       val activeCount = summary.optInt("activeCount", 0)
       val pausedCount = summary.optInt("pausedCount", 0)
+      val canPause = summary.optBoolean("canPause", false)
+      val canResume = summary.optBoolean("canResume", false)
+      val shape = "active=$activeCount paused=$pausedCount canPause=$canPause canResume=$canResume"
+      if (shape != lastLoggedShape) {
+        lastLoggedShape = shape
+        Log.i(TAG, "Transfer notification state: $shape title=${summary.optString("title", "")}")
+      }
+      val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
       val instance = runningInstance
 
       if (activeCount > 0) {
+        nm?.cancel(PAUSED_NOTIFICATION_ID)
         if (instance != null) {
           instance.applySummary(summary, ensureForegroundFirst = false)
         } else {
@@ -230,7 +273,6 @@ class TransferForegroundService : Service() {
             ContextCompat.startForegroundService(context, intent)
           } catch (e: Exception) {
             Log.w(TAG, "Background foreground-service start disallowed: ${e.message}")
-            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             val fallback = buildOngoingNotification(context, summary, isActive = false)
             notifySafely(context, nm, ONGOING_NOTIFICATION_ID, fallback)
           }
@@ -242,9 +284,9 @@ class TransferForegroundService : Service() {
         if (instance != null) {
           instance.applySummary(summary, ensureForegroundFirst = false)
         } else {
-          val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+          nm?.cancel(ONGOING_NOTIFICATION_ID)
           val pausedNotification = buildOngoingNotification(context, summary, isActive = false)
-          notifySafely(context, nm, ONGOING_NOTIFICATION_ID, pausedNotification)
+          notifySafely(context, nm, PAUSED_NOTIFICATION_ID, pausedNotification)
         }
         return
       }
@@ -252,8 +294,8 @@ class TransferForegroundService : Service() {
       if (instance != null) {
         instance.stopServiceCleanly()
       } else {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         nm?.cancel(ONGOING_NOTIFICATION_ID)
+        nm?.cancel(PAUSED_NOTIFICATION_ID)
       }
     }
 
