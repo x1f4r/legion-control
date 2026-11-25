@@ -179,6 +179,10 @@ export function computeFileCapabilities({
   const hasRead = hasTool('fs.read');
   const hasFind = hasTool('fs.find');
   const hasThumb = hasTool('fs.thumb');
+  const hasTags = hasTool('fs.tags');
+  const thumbSpec = isKnown ? map.get('fs.thumb') : null;
+  const thumbMaxSize = Number(thumbSpec?.input_schema?.properties?.size?.maximum) || 512;
+  const hasAudioCovers = hasThumb && (hasTags || thumbMaxSize >= 1024);
   const hasFav = hasTool('fav.list');
   const hasFavWrite = hasFav && hasTool('fav.add') && hasTool('fav.remove');
   const hasSync = hasTool('sync.list');
@@ -237,6 +241,9 @@ export function computeFileCapabilities({
     hasFindEnhanced,
     hasFindFilters,
     hasThumb,
+    hasTags,
+    hasAudioCovers,
+    thumbMaxSize,
     hasFav,
     hasFavWrite,
     hasSync,

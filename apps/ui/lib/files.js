@@ -268,12 +268,13 @@ export function entryIconName(entry) {
 }
 
 /**
- * Whether an entry can request a server thumbnail (`fs.thumb` supports pictures and video posters).
+ * Whether an entry can request a server thumbnail (`fs.thumb` supports pictures, video posters,
+ * and audio covers on machines advertising `hasAudioCovers`).
  */
-export function isThumbEligible(entry) {
+export function isThumbEligible(entry, { includeAudio = false } = {}) {
   if (!entry || entry.kind === 'dir') return false;
   const cat = entryCategory(entry);
-  return cat === 'image' || cat === 'video';
+  return cat === 'image' || cat === 'video' || (includeAudio && cat === 'audio');
 }
 
 /**

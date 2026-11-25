@@ -402,7 +402,54 @@ export function createAppLink() {
       video_origin: '',
       ipc_isolation_ok: null,
       resume_ok: spec.verify_resume ? false : null,
+      immersive_check: null,
       error: null,
+    };
+
+    const verifyDesktopImmersive = async () => {
+      const waitTick = () => new Promise((r) => window.setTimeout(r, 150));
+      const initial = await invoke('window_is_fullscreen');
+      const entered = await immersive(true, { orientation: 'landscape' });
+      await waitTick();
+      const during = await invoke('window_is_fullscreen');
+      const left = await immersive(false);
+      await waitTick();
+      const afterLeave = await invoke('window_is_fullscreen');
+
+      // Verify a window that was already full screen stays full screen after leaving immersive.
+      await invoke('debug_set_window_fullscreen', { fullscreen: true });
+      await waitTick();
+      const preFullscreen = await invoke('window_is_fullscreen');
+      await immersive(true, { orientation: 'landscape' });
+      await waitTick();
+      const duringPreFullscreen = await invoke('window_is_fullscreen');
+      await immersive(false);
+      await waitTick();
+      const afterPreFullscreen = await invoke('window_is_fullscreen');
+      await invoke('debug_set_window_fullscreen', { fullscreen: false });
+      await waitTick();
+      const cleanedUp = await invoke('window_is_fullscreen');
+
+      const ok =
+        initial === false &&
+        entered?.active === true &&
+        during === true &&
+        left?.active === false &&
+        afterLeave === false &&
+        preFullscreen === true &&
+        duringPreFullscreen === true &&
+        afterPreFullscreen === true &&
+        cleanedUp === false;
+      return {
+        ok,
+        initial,
+        during,
+        afterLeave,
+        preFullscreen,
+        duringPreFullscreen,
+        afterPreFullscreen,
+        cleanedUp,
+      };
     };
 
     try {
@@ -442,6 +489,10 @@ export function createAppLink() {
         );
       }
 
+      if (spec.verify_immersive) {
+        report.immersive_check = await verifyDesktopImmersive();
+      }
+
       const mediaPass =
         report.image_width > 0 &&
         report.image_height > 0 &&
@@ -449,7 +500,8 @@ export function createAppLink() {
         report.video_height > 0 &&
         (typeof spec.seek_to !== 'number' ||
           (typeof vidResult.seekedTime === 'number' && Math.abs(vidResult.seekedTime - spec.seek_to) < 5)) &&
-        (report.ipc_isolation_ok === null || report.ipc_isolation_ok === true);
+        (report.ipc_isolation_ok === null || report.ipc_isolation_ok === true) &&
+        (report.immersive_check === null || report.immersive_check.ok === true);
       report.ok = mediaPass;
 
       if (spec.verify_resume && mediaPass) {
@@ -1077,6 +1129,130 @@ export function createAppLink() {
     }
   }
 
+  let desktopImmersiveActive = false;
+  const immersiveListeners = new Set();
+
+  function notifyImmersiveListeners(active) {
+    for (const listener of immersiveListeners) {
+      try {
+        listener(Boolean(active));
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function androidBridge() {
+    if (typeof window === 'undefined') return null;
+    const bridge = window.__LEGION_ANDROID__;
+    return bridge && typeof bridge.setImmersive === 'function' ? bridge : null;
+  }
+
+  function iosImmersiveHandler() {
+    if (typeof window === 'undefined') return null;
+    const handler = window.webkit?.messageHandlers?.legionImmersive;
+    return handler && typeof handler.postMessage === 'function' ? handler : null;
+  }
+
+  function canImmersive() {
+    if (androidBridge()) return true;
+    if (iosImmersiveHandler()) return true;
+    if (iosPlatform) return false;
+    return Boolean(tauriCore());
+  }
+
+  async function immersive(on, options = {}) {
+    const active = Boolean(on);
+    const orientation = typeof options?.orientation === 'string' ? options.orientation : 'none';
+
+    const android = androidBridge();
+    if (android) {
+      const ok = await Promise.resolve(android.setImmersive(active, orientation)).catch(() => false);
+      return { active: Boolean(ok), mode: 'android' };
+    }
+
+    const ios = iosImmersiveHandler();
+    if (ios) {
+      try {
+        ios.postMessage({ type: 'immersive', on: active, orientation });
+        return { active, mode: 'ios' };
+      } catch {
+        return { active: false, mode: 'ios' };
+      }
+    }
+
+    if (iosPlatform) {
+      return { active: false, mode: 'ios' };
+    }
+
+    try {
+      const res = await invoke('window_set_immersive', { on: active });
+      desktopImmersiveActive = Boolean(res?.active);
+      return {
+        active: desktopImmersiveActive,
+        fullscreen: Boolean(res?.fullscreen),
+        mode: 'desktop',
+      };
+    } catch {
+      desktopImmersiveActive = false;
+      return { active: false, fullscreen: false, mode: 'desktop' };
+    }
+  }
+
+  function onImmersiveChange(listener) {
+    if (typeof listener !== 'function') return () => {};
+    immersiveListeners.add(listener);
+    const isDesktop = !androidBridge() && !iosPlatform;
+    let onResize = null;
+    if (isDesktop && typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      onResize = () => {
+        if (!desktopImmersiveActive) return;
+        invoke('window_is_fullscreen')
+          .then((fs) => {
+            if (desktopImmersiveActive && fs === false) {
+              desktopImmersiveActive = false;
+              invoke('window_set_immersive', { on: false }).catch(() => {});
+              notifyImmersiveListeners(false);
+            }
+          })
+          .catch(() => {});
+      };
+      window.addEventListener('resize', onResize);
+    }
+    return () => {
+      immersiveListeners.delete(listener);
+      if (onResize && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('resize', onResize);
+      }
+    };
+  }
+
+  async function keepScreenOn(on) {
+    const active = Boolean(on);
+    const android = androidBridge();
+    if (android && typeof android.setKeepScreenOn === 'function') {
+      try {
+        android.setKeepScreenOn(active);
+      } catch {
+        // Ignore bridge errors.
+      }
+      return active;
+    }
+    const ios = iosImmersiveHandler();
+    if (ios) {
+      try {
+        ios.postMessage({ type: 'keep_screen_on', on: active });
+      } catch {
+        // Ignore bridge errors.
+      }
+      return active;
+    }
+    if (!iosPlatform && tauriCore()) {
+      await invoke('set_keep_screen_on', { on: active }).catch(() => {});
+    }
+    return active;
+  }
+
   const link = {
     kind: 'app',
     supportsContent: true,
@@ -1111,6 +1287,10 @@ export function createAppLink() {
     onTransferEvent,
     transferSettings,
     setTransferSettings,
+    immersive,
+    canImmersive,
+    onImmersiveChange,
+    keepScreenOn,
   };
 
   // On iOS/iPadOS, native file-picker uploads and open-in-another-app are not yet wired; omit

@@ -566,3 +566,103 @@ test('createAppLink advertises content support and remembers unsupported remote 
     }
   }
 });
+
+test('createAppLink routes immersive and keepScreenOn across Android, iOS, and desktop Tauri', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+  try {
+    // 1. Android bridge
+    const androidImmersive = [];
+    const androidKeep = [];
+    globalThis.window = {
+      __LEGION_ANDROID__: {
+        setImmersive: (on, orientation) => {
+          androidImmersive.push({ on, orientation });
+          return Promise.resolve(on);
+        },
+        setKeepScreenOn: (on) => androidKeep.push(on),
+      },
+      __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+    };
+    const androidLink = createAppLink();
+    assert.equal(androidLink.canImmersive(), true);
+    assert.deepEqual(await androidLink.immersive(true, { orientation: 'landscape' }), { active: true, mode: 'android' });
+    assert.deepEqual(await androidLink.immersive(false), { active: false, mode: 'android' });
+    await androidLink.keepScreenOn(true);
+    await androidLink.keepScreenOn(false);
+    assert.deepEqual(androidImmersive, [
+      { on: true, orientation: 'landscape' },
+      { on: false, orientation: 'none' },
+    ]);
+    assert.deepEqual(androidKeep, [true, false]);
+
+    // 2. iOS bridge
+    const iosMessages = [];
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15' },
+    });
+    globalThis.window = {
+      webkit: {
+        messageHandlers: {
+          legionImmersive: {
+            postMessage: (msg) => iosMessages.push(msg),
+          },
+        },
+      },
+      __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+    };
+    const iosLink = createAppLink();
+    assert.equal(iosLink.canImmersive(), true);
+    await iosLink.immersive(true, { orientation: 'portrait' });
+    await iosLink.keepScreenOn(true);
+    await iosLink.immersive(false);
+    assert.deepEqual(iosMessages, [
+      { type: 'immersive', on: true, orientation: 'portrait' },
+      { type: 'keep_screen_on', on: true },
+      { type: 'immersive', on: false, orientation: 'none' },
+    ]);
+
+    // 3. Desktop Tauri commands
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15' },
+    });
+    const desktopCalls = [];
+    globalThis.window = {
+      __TAURI__: {
+        core: {
+          invoke(command, payload) {
+            desktopCalls.push({ command, payload });
+            if (command === 'window_set_immersive') {
+              return Promise.resolve({ active: payload.on, fullscreen: payload.on });
+            }
+            return Promise.resolve();
+          },
+        },
+      },
+    };
+    const desktopLink = createAppLink();
+    assert.equal(desktopLink.canImmersive(), true);
+    assert.deepEqual(await desktopLink.immersive(true, { orientation: 'landscape' }), {
+      active: true,
+      fullscreen: true,
+      mode: 'desktop',
+    });
+    await desktopLink.keepScreenOn(true);
+    await desktopLink.immersive(false);
+    await desktopLink.keepScreenOn(false);
+    assert.deepEqual(desktopCalls, [
+      { command: 'window_set_immersive', payload: { on: true } },
+      { command: 'set_keep_screen_on', payload: { on: true } },
+      { command: 'window_set_immersive', payload: { on: false } },
+      { command: 'set_keep_screen_on', payload: { on: false } },
+    ]);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});

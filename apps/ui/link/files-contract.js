@@ -70,6 +70,19 @@
  *
  * @property {(listener: (transfers: DeviceTransfer[]) => void) => () => void} [onTransferEvent]
  *   Subscribe to live device transfer queue progress and state updates. Returns an unsubscribe fn.
+ *
+ * @property {(on: boolean, options?: { orientation?: 'landscape' | 'portrait' | 'none', element?: Element | null, video?: HTMLVideoElement | null }) => Promise<{ active: boolean, mode?: string, fullscreen?: boolean } | boolean | void>} [immersive]
+ *   Enter or leave full-screen / hidden-system-bars mode for the viewer.
+ *
+ * @property {(options?: { element?: Element | null, video?: HTMLVideoElement | null }) => boolean} [canImmersive]
+ *   Reports whether this platform or browser can enter immersive full screen. When false, the
+ *   full-screen button is omitted rather than disabled.
+ *
+ * @property {(listener: (active: boolean) => void) => () => void} [onImmersiveChange]
+ *   Subscribe to platform-initiated full-screen exits (such as browser Esc or window controls).
+ *
+ * @property {(on: boolean) => Promise<boolean | void> | void} [keepScreenOn]
+ *   Keep the display awake while a video plays and release the hold on pause, end, or close.
  */
 
 export const DEVICE_TRANSFER_STATES = Object.freeze([
