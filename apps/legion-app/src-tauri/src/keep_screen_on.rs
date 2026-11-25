@@ -34,22 +34,13 @@ pub struct DesktopKeepScreenOn {
 }
 
 impl DesktopKeepScreenOn {
-    /// Acquires or releases the desktop screen-awake hold (best-effort, silent if unavailable).
-    pub fn set(&self, on: bool) {
+    /// Acquires or releases the desktop screen-awake hold, returning whether a real OS hold is
+    /// actually active afterward (`false` whenever neither portal/ScreenSaver, `caffeinate`, nor
+    /// `SetThreadExecutionState` succeeded, or after releasing).
+    pub fn set(&self, on: bool) -> bool {
         #[cfg(target_os = "linux")]
         {
-            let mut guard = self
-                .hold
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if on {
-                if guard.is_some() {
-                    return;
-                }
-                *guard = acquire_linux_dbus_hold();
-            } else if let Some(hold) = guard.take() {
-                hold.release();
-            }
+            self.set_linux_with(on, acquire_linux_dbus_hold)
         }
 
         #[cfg(target_os = "macos")]
@@ -62,12 +53,16 @@ impl DesktopKeepScreenOn {
                 if let Some(child) = guard.as_mut()
                     && child.try_wait().ok().flatten().is_none()
                 {
-                    return;
+                    return true;
                 }
                 *guard = spawn_macos_caffeinate();
-            } else if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+                guard.is_some()
+            } else {
+                if let Some(mut child) = guard.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                false
             }
         }
 
@@ -80,21 +75,52 @@ impl DesktopKeepScreenOn {
             if on {
                 let hold =
                     guard.get_or_insert_with(legion_os::display_awake::DisplayAwakeHold::new);
-                hold.set(true);
-            } else if let Some(mut hold) = guard.take() {
-                hold.set(false);
+                let active = hold.set(true);
+                if !active {
+                    *guard = None;
+                }
+                active
+            } else {
+                if let Some(mut hold) = guard.take() {
+                    let _ = hold.set(false);
+                }
+                false
             }
         }
 
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let _ = (&self._mobile, on);
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_linux_with<F>(&self, on: bool, acquire: F) -> bool
+    where
+        F: FnOnce() -> Option<LinuxInhibitHold>,
+    {
+        let mut guard = self
+            .hold
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if on {
+            if guard.is_some() {
+                return true;
+            }
+            *guard = acquire();
+            guard.is_some()
+        } else {
+            if let Some(hold) = guard.take() {
+                hold.release();
+            }
+            false
         }
     }
 
     /// Releases any active display-idle inhibition immediately.
     pub fn release(&self) {
-        self.set(false);
+        let _ = self.set(false);
     }
 
     /// Reports whether this holder currently owns an active inhibition.
@@ -275,10 +301,21 @@ mod tests {
     fn desktop_keep_screen_on_releases_cleanly_on_set_false_and_drop() {
         let keeper = DesktopKeepScreenOn::default();
         assert!(!keeper.is_active());
-        keeper.set(true);
-        keeper.set(false);
+        let acquired = keeper.set(true);
+        assert_eq!(acquired, keeper.is_active());
+        assert!(!keeper.set(false));
         assert!(!keeper.is_active());
-        keeper.set(true);
+        let _ = keeper.set(true);
         drop(keeper);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keep_screen_on_reports_false_when_neither_portal_nor_screensaver_is_available() {
+        let keeper = DesktopKeepScreenOn::default();
+        assert!(!keeper.set_linux_with(true, || None));
+        assert!(!keeper.is_active());
+        assert!(!keeper.set_linux_with(false, || None));
+        assert!(!keeper.is_active());
     }
 }

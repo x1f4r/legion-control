@@ -5,11 +5,11 @@
 //! run on the same thread; the OS also clears the thread's execution state automatically if the
 //! process terminates for any reason.
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
 
 enum Msg {
-    Set(bool),
+    Set(bool, SyncSender<bool>),
     Shutdown,
 }
 
@@ -23,16 +23,17 @@ pub struct DisplayAwakeHold {
 
 impl DisplayAwakeHold {
     /// Starts a new hold backed by the platform display-awake primitive (Windows
-    /// `SetThreadExecutionState`; no-op on other platforms).
+    /// `SetThreadExecutionState`; returns `false` on non-Windows platforms).
     pub fn new() -> Self {
         Self::with_applier(apply_platform_display_awake)
     }
 
-    /// Starts a new hold backed by a custom state applier, allowing deterministic unit testing of
-    /// single-thread affinity, idempotency, and drop cleanup on every OS.
+    /// Starts a new hold backed by a custom state applier returning whether the hold is active
+    /// after applying the requested state, allowing deterministic unit testing of single-thread
+    /// affinity, honest failure reporting, idempotency, and drop cleanup on every OS.
     pub fn with_applier<F>(mut apply: F) -> Self
     where
-        F: FnMut(bool) + Send + 'static,
+        F: FnMut(bool) -> bool + Send + 'static,
     {
         let (tx, rx) = mpsc::channel::<Msg>();
         let handle = thread::Builder::new()
@@ -41,17 +42,22 @@ impl DisplayAwakeHold {
                 let mut held = false;
                 while let Ok(msg) = rx.recv() {
                     match msg {
-                        Msg::Set(on) => {
+                        Msg::Set(on, reply) => {
                             if on != held {
-                                apply(on);
-                                held = on;
+                                if on {
+                                    held = apply(true);
+                                } else {
+                                    let _ = apply(false);
+                                    held = false;
+                                }
                             }
+                            let _ = reply.send(held);
                         }
                         Msg::Shutdown => break,
                     }
                 }
                 if held {
-                    apply(false);
+                    let _ = apply(false);
                 }
             })
             .ok();
@@ -63,16 +69,23 @@ impl DisplayAwakeHold {
         }
     }
 
-    /// Enables or clears the display-awake hold.
-    pub fn set(&mut self, on: bool) {
+    /// Enables or clears the display-awake hold, returning whether the hold is actually active
+    /// afterward (`true` only when `on` is `true` and the platform primitive succeeded).
+    pub fn set(&mut self, on: bool) -> bool {
         if self.active == on {
-            return;
+            return self.active;
         }
-        if let Some(tx) = &self.tx
-            && tx.send(Msg::Set(on)).is_ok()
-        {
-            self.active = on;
+        let Some(tx) = &self.tx else {
+            self.active = false;
+            return false;
+        };
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if tx.send(Msg::Set(on, reply_tx)).is_err() {
+            self.active = false;
+            return false;
         }
+        self.active = reply_rx.recv().unwrap_or(false);
+        self.active
     }
 
     /// Reports whether the hold is currently active.
@@ -101,7 +114,7 @@ impl Drop for DisplayAwakeHold {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn apply_platform_display_awake(on: bool) {
+fn apply_platform_display_awake(on: bool) -> bool {
     use windows::Win32::System::Power::{
         ES_CONTINUOUS, ES_DISPLAY_REQUIRED, SetThreadExecutionState,
     };
@@ -112,12 +125,15 @@ fn apply_platform_display_awake(on: bool) {
         ES_CONTINUOUS
     };
     // SAFETY: `SetThreadExecutionState` takes only a bitmask for the calling thread with no
-    // pointers, lifetimes, or aliasing invariants.
-    let _ = unsafe { SetThreadExecutionState(flags) };
+    // pointers, lifetimes, or aliasing invariants. A non-zero return value reports success.
+    let prev = unsafe { SetThreadExecutionState(flags) };
+    on && prev.0 != 0
 }
 
 #[cfg(not(windows))]
-fn apply_platform_display_awake(_on: bool) {}
+fn apply_platform_display_awake(_on: bool) -> bool {
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -136,15 +152,16 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push((thread::current().id(), on));
+                on
             });
             assert!(!hold.is_active());
-            hold.set(true);
-            hold.set(true); // idempotent
+            assert!(hold.set(true));
+            assert!(hold.set(true)); // idempotent
             assert!(hold.is_active());
-            hold.set(false);
-            hold.set(false); // idempotent
+            assert!(!hold.set(false));
+            assert!(!hold.set(false)); // idempotent
             assert!(!hold.is_active());
-            hold.set(true);
+            assert!(hold.set(true));
             assert!(hold.is_active());
             // Drop while still active -> worker must clear with `false` before exiting.
         }
@@ -165,5 +182,14 @@ mod tests {
             log.iter().all(|(tid, _)| *tid == worker_tid),
             "every SetThreadExecutionState transition must happen on the same owned thread"
         );
+    }
+
+    #[test]
+    fn display_awake_hold_reports_false_when_applier_fails() {
+        let mut hold = DisplayAwakeHold::with_applier(|_| false);
+        assert!(!hold.set(true));
+        assert!(!hold.is_active());
+        assert!(!hold.set(false));
+        assert!(!hold.is_active());
     }
 }

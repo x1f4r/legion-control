@@ -745,7 +745,10 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
           androidImmersive.push({ on, orientation });
           return Promise.resolve(on);
         },
-        setKeepScreenOn: (on) => androidKeep.push(on),
+        setKeepScreenOn: (on) => {
+          androidKeep.push(on);
+          return Promise.resolve(Boolean(on));
+        },
       },
       __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
     };
@@ -753,8 +756,8 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
     assert.equal(androidLink.canImmersive(), true);
     assert.deepEqual(await androidLink.immersive(true, { orientation: 'landscape' }), { active: true, mode: 'android' });
     assert.deepEqual(await androidLink.immersive(false), { active: false, mode: 'android' });
-    await androidLink.keepScreenOn(true);
-    await androidLink.keepScreenOn(false);
+    assert.equal(await androidLink.keepScreenOn(true), true);
+    assert.equal(await androidLink.keepScreenOn(false), false);
     assert.deepEqual(androidImmersive, [
       { on: true, orientation: 'landscape' },
       { on: false, orientation: 'none' },
@@ -802,6 +805,9 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
             if (command === 'window_set_immersive') {
               return Promise.resolve({ active: payload.on, fullscreen: payload.on });
             }
+            if (command === 'set_keep_screen_on') {
+              return Promise.resolve(Boolean(payload.on));
+            }
             return Promise.resolve();
           },
         },
@@ -814,15 +820,29 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
       fullscreen: true,
       mode: 'desktop',
     });
-    await desktopLink.keepScreenOn(true);
+    assert.equal(await desktopLink.keepScreenOn(true), true);
     await desktopLink.immersive(false);
-    await desktopLink.keepScreenOn(false);
+    assert.equal(await desktopLink.keepScreenOn(false), false);
     assert.deepEqual(desktopCalls, [
       { command: 'window_set_immersive', payload: { on: true } },
       { command: 'set_keep_screen_on', payload: { on: true } },
       { command: 'window_set_immersive', payload: { on: false } },
       { command: 'set_keep_screen_on', payload: { on: false } },
     ]);
+
+    // When desktop backend reports false (e.g. Linux without portal or ScreenSaver), keepScreenOn reports false honestly.
+    globalThis.window = {
+      __TAURI__: {
+        core: {
+          invoke(command) {
+            if (command === 'set_keep_screen_on') return Promise.resolve(false);
+            return Promise.resolve();
+          },
+        },
+      },
+    };
+    const unavailableDesktopLink = createAppLink();
+    assert.equal(await unavailableDesktopLink.keepScreenOn(true), false);
   } finally {
     if (prevWindow === undefined) delete globalThis.window;
     else globalThis.window = prevWindow;

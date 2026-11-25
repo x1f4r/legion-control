@@ -189,7 +189,7 @@ export function createBrowserImmersive({
         doc.addEventListener?.('visibilitychange', handleVisibilityChange);
       }
       await acquireWakeLock();
-      return true;
+      return Boolean(wakeSentinel);
     }
     if (doc && wakeVisListenerInstalled) {
       wakeVisListenerInstalled = false;

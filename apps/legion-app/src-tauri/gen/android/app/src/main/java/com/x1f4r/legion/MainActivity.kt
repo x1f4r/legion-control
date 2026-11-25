@@ -132,9 +132,18 @@ class MainActivity : TauriActivity() {
         }
       }
       "keep_screen_on" -> {
+        val requestId = msg.optInt("id", -1)
         val on = msg.optBoolean("on", false)
         runOnUiThread {
-          applyKeepScreenOn(on)
+          val active = applyKeepScreenOn(on)
+          if (requestId >= 0) {
+            val payload = JSONObject().apply {
+              put("type", "keep_screen_on_ack")
+              put("id", requestId)
+              put("active", active)
+            }
+            runCatching { replyProxy.postMessage(payload.toString()) }
+          }
         }
       }
     }
@@ -190,13 +199,14 @@ class MainActivity : TauriActivity() {
     attachedWebView?.setBackgroundColor(Color.BLACK)
   }
 
-  private fun applyKeepScreenOn(on: Boolean) {
+  private fun applyKeepScreenOn(on: Boolean): Boolean {
     val active = immersiveState.setKeepScreenOn(on)
     if (active) {
       window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     } else {
       window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
+    return active
   }
 
   private fun resetPlayerWindowState() {
@@ -483,11 +493,11 @@ class MainActivity : TauriActivity() {
               delete pending[msg.id];
               resolve(granted);
             }
-          } else if (msg.type === 'immersive_ack') {
-            var resolveImmersive = pending[msg.id];
-            if (resolveImmersive) {
+          } else if (msg.type === 'immersive_ack' || msg.type === 'keep_screen_on_ack') {
+            var resolveAck = pending[msg.id];
+            if (resolveAck) {
               delete pending[msg.id];
-              resolveImmersive(Boolean(msg.active));
+              resolveAck(Boolean(msg.active));
             }
           }
         };
@@ -530,11 +540,20 @@ class MainActivity : TauriActivity() {
             });
           },
           setKeepScreenOn: function(on){
-            try {
-              bridge.postMessage(JSON.stringify({ type: 'keep_screen_on', on: Boolean(on) }));
-            } catch (_) {
-              // Ignore if bridge is unavailable.
-            }
+            return new Promise(function(resolve){
+              var id = nextId++;
+              pending[id] = resolve;
+              try {
+                bridge.postMessage(JSON.stringify({
+                  type: 'keep_screen_on',
+                  id: id,
+                  on: Boolean(on)
+                }));
+              } catch (_) {
+                delete pending[id];
+                resolve(false);
+              }
+            });
           }
         };
 

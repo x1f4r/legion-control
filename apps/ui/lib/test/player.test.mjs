@@ -607,11 +607,31 @@ test('createBrowserImmersive requests fullscreen on viewer element, falls back t
   assert.deepEqual(observed, [true, false]);
   unsub();
 
-  // Wake lock acquire + release.
-  await api.keepScreenOn(true);
+  // Wake lock acquire + release reports actual held state.
+  assert.equal(await api.keepScreenOn(true), true);
   assert.equal(wakeRequested, 1);
-  await api.keepScreenOn(false);
+  assert.equal(await api.keepScreenOn(false), false);
   assert.equal(wakeReleased, 1);
+
+  // Without Wake Lock API, when hidden, or when denied, keepScreenOn honestly returns false.
+  const noWakeApi = createBrowserImmersive({ doc: { visibilityState: 'visible', addEventListener() {}, removeEventListener() {} }, nav: {} });
+  assert.equal(await noWakeApi.keepScreenOn(true), false);
+
+  const deniedWakeApi = createBrowserImmersive({
+    doc: { visibilityState: 'visible', addEventListener() {}, removeEventListener() {} },
+    nav: {
+      wakeLock: {
+        request: () => Promise.reject(new Error('Battery saver')),
+      },
+    },
+  });
+  assert.equal(await deniedWakeApi.keepScreenOn(true), false);
+
+  const hiddenWakeApi = createBrowserImmersive({
+    doc: { visibilityState: 'hidden', addEventListener() {}, removeEventListener() {} },
+    nav: fakeNav,
+  });
+  assert.equal(await hiddenWakeApi.keepScreenOn(true), false);
 
   // iPhone Safari fallback (`webkitEnterFullscreen`) when Fullscreen API is disabled.
   let webkitEntered = 0;

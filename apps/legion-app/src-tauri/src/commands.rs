@@ -390,11 +390,14 @@ pub fn window_is_fullscreen(
     }
 }
 
-/// Enables or releases the desktop keep-screen-on hold during video playback.
+/// Enables or releases the desktop keep-screen-on hold during video playback, returning whether a
+/// real OS screen-awake hold is active afterward.
 #[tauri::command]
-pub fn set_keep_screen_on(keep: State<'_, DesktopKeepScreenOn>, on: bool) -> Result<(), AppError> {
-    keep.set(on);
-    Ok(())
+pub fn set_keep_screen_on(
+    keep: State<'_, DesktopKeepScreenOn>,
+    on: bool,
+) -> Result<bool, AppError> {
+    Ok(keep.set(on))
 }
 
 /// Debug/test-only helper to flip the main desktop window's real OS/WM full-screen state directly

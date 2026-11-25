@@ -1728,11 +1728,11 @@ export function createAppLink() {
       const android = androidBridge();
       if (typeof android?.setKeepScreenOn === 'function') {
         try {
-          android.setKeepScreenOn(active);
+          const result = await Promise.resolve(android.setKeepScreenOn(active));
+          return result === undefined ? false : Boolean(result);
         } catch {
-          // Ignore bridge errors.
+          return false;
         }
-        return active;
       }
       return false;
     }
@@ -1746,8 +1746,11 @@ export function createAppLink() {
       }
     }
     if (cap.mode === 'desktop') {
-      await invoke('set_keep_screen_on', { on: active }).catch(() => {});
-      return active;
+      try {
+        return Boolean(await invoke('set_keep_screen_on', { on: active }));
+      } catch {
+        return false;
+      }
     }
     return false;
   }
