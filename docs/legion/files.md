@@ -89,28 +89,46 @@ node.
   refused before any byte moves otherwise. Before any source file is removed, each `(source_dir,
   dest_dir)` directory pair is probed with a unique marker (cached per pair within a transfer) so
   moving a file, tree, or bind-mounted or symlinked subfolder onto itself is caught regardless of
-  machine names, devices, or mounts; when a probe finds the same directory, encounters a network
-  file system (such as NFS, SMB/CIFS, SSHFS, 9p, or a remote drive), or cannot conclude, the copy
-  completes, the source is kept, and the report names which folders could not be told apart and
-  why. Source removal runs only while holding exclusive per-path locks in the node's state
-  directory on both source and destination taken in a fixed `(machine, path)` order (with a short
-  renewable lease, a per-principal active lock bound, and a retryable `conflict` when busy telling
-  the caller the copy finished, the source was kept, and running the transfer again will finish
-  the move), re-verifying under those locks that the destination still exists, is distinct from
-  the source, and matches its recorded identity, size, and modification time (or re-hashing when
-  they differ). Case-only or Unicode-normalization-only renames within one directory on one
-  machine try a direct rename first and fall back to a recoverable two-step rename through a
-  visible intermediate name (`legion-renaming-*`) recorded under the node's state directory only
-  when direct rename is a no-op; interrupted two-step renames are completed or reversed on the
-  next `fs.list`, `manifest`, or transfer touching that directory. During a transfer, resumable
-  copies keep `<name>.legion-part` beside the destination, and brief `.legion-put-*`,
+  machine names, devices, or mounts. Filesystem locality is three-valued (`local`, `network`, or
+  `unknown`): only provably local filesystems (excluding unverified FUSE mounts such as `mergerfs`,
+  `bindfs`, or `encfs`, network filesystems such as NFS, SMB/CIFS, SSHFS, 9p, or remote drives, and
+  any OS error) may conclude that two directories are distinct or identical, and a held probe
+  marker stays open for the lifetime of its pipe and must explicitly confirm it remained held after
+  the check. Whenever a probe finds the same directory, encounters a network or unverified/unknown
+  filesystem, or cannot confirm the held marker, the copy completes, the source is kept, and the
+  report names which folders could not be told apart and why. Source removal runs only while holding
+  exclusive per-path move locks in the node's state directory on both source and destination taken
+  in a fixed `(machine, path)` order (with a per-principal active lock bound and a retryable
+  `conflict` when busy telling the caller the copy finished, the source was kept, and running the
+  transfer again will finish the move). Each lock belongs to its stream pipe and is returned with
+  an unguessable `lock_id`: an independent background task renews the lease every third of the
+  lease period (and `renew` replies `held` or `lost` so a silent or paused holder learns
+  immediately when a lock is lost, with no artificial total-hold cap while the holder stays alive).
+  Every move `delete` carries that `lock_id`, pins the lock on the executing node for the duration
+  of the request so slow hashing cannot expire a live lock, and verifies per file — after hashing
+  and immediately before unlinking — that `lock_id` is still live and covers that path; otherwise
+  `delete` refuses with `conflict` ("copy finished, source kept") and removes nothing. Under those
+  locks the transfer also re-verifies that the destination still exists, is distinct from the
+  source, and matches its recorded identity, size, and modification time (or re-hashes when they
+  differ). Case-only or Unicode-normalization-only renames within one directory on one machine try
+  a direct rename first and fall back to a recoverable two-step rename through a visible
+  intermediate name (`legion-renaming-*`) recorded under the node's state directory only when
+  direct rename is a no-op (using atomic no-replace primitives for every step and rollback, never
+  a plain replacing rename onto an unclaimed name). Interrupted two-step renames are completed or
+  reversed on the next write operation touching that directory, or on `fs.list` ONLY for intents in
+  the exact listed directory and ONLY when the caller is also allowed `fs.write` there (never
+  touching ancestor directories or writing on behalf of a read-only caller). During a transfer,
+  resumable copies keep `<name>.legion-part` beside the destination, and brief `.legion-put-*`,
   `.legion-unpack-*.tmp`, and `.legion-move-probe-*.tmp` temporaries (as well as visible
-  `legion-renaming-*` entries during two-step renames) may appear beside the destination and are
-  swept automatically by recorded file identity and age if a process is killed; lock, metadata,
-  claim, temp-ownership, and rename recovery sidecars live under the node's state directory. A
-  tree is verified file by file and a source file is removed only once its copy is verified; an
-  interrupted move (even if the transfer worker is killed mid-flight) leaves every file in at least
-  one place.
+  `legion-renaming-*` entries during two-step renames) may appear beside the destination. Only
+  temporaries and empty claims backed by an explicit ownership record under the node's state
+  directory whose recorded `(dev, ino, ctime, btime)` identity matches (together with single link
+  and 0-byte size for claims and probe markers) are ever swept automatically; files without an
+  ownership record (including leftovers from older versions) are never deleted by name and age.
+  Lock, metadata, pin, claim, temp-ownership, and rename recovery sidecars live under the node's
+  state directory. A tree is verified file by file and a source file is removed only once its copy
+  is verified; an interrupted move (even if the transfer worker is killed mid-flight) leaves every
+  file in at least one place.
 - `background`: start the transfer as a job on the node that runs it and return
   `{job: {id, machine}}` at once. The job belongs to the caller's principal (and pairing id when
   started by a paired device), is listed by `job.list` with `kind: "transfer"` and a `title` a
@@ -143,20 +161,27 @@ see the same list.
   `fav.remove`: `{id}`.
 
 They live in `favorites.toml` beside `policy.toml`, a shared document like `devices.toml` but
-with no bearing on access: each entry carries independent last-writer-wins registers (existence,
-base fields, label, and pinned) ordered by `(updated_at, updated_on)` so merging is commutative,
-associative, and idempotent with no trimming inside the merge. Creation limits are enforced by the
-`fav.*` tools, oversized received documents are refused whole, and removals older than 90 days
-relative to the document's own newest stamp are dropped identically by every node. Because
-tombstones expire after 90 days, a favourite removed while another machine was offline for more
-than 90 days can reappear when that machine reconnects and syncs. Entries stamped more than 24
-hours in the future are skipped individually with a warning, and machines booting with an unset
-clock stamp at least at the binary's build time. A node that changes it pushes it to the peers it
-can reach (coalescing rapid bursts), and `fleet.sync` and the sync runner carry it to the rest.
-`fav.list` leaves out entries outside the caller's `paths`; existing entries whose path is not
-valid on the reading node's operating system are still listed with a note and remain removable by
-id. One list per fleet is deliberate for now; a list per person waits for people to exist in the
-model.
+with no bearing on access. Each favourite's `id` is derived deterministically from `(machine,
+normalized path)` (a shortened BLAKE3 hash), so two offline machines starring the same target
+converge to one entry and adding an already-starred target returns it. Entries merge by
+incarnation-ordered last-writer-wins: a strictly newer removal or re-add replaces an older
+incarnation completely, while two live copies of the same incarnation merge their base, label, and
+pinned fields independently by per-field timestamps so concurrent offline edits to different fields
+are both kept. Removal tombstones carry only `id`, `removed_at`, and `removed_on` (never paths or
+labels), keeping merging commutative, associative, and idempotent with no trimming inside the
+merge. Creation limits (1,000 local live entries) are enforced by `fav.add`, received documents are
+bounded consistently (up to 2,000 live entries, 4,000 compact tombstones, and 4 MiB serialized so
+the maximum document always fits within the byte limit), oversized received documents are refused
+whole, and removals older than 90 days relative to the document's own newest stamp are dropped
+identically by every node. Because tombstones expire after 90 days, a favourite removed while
+another machine was offline for more than 90 days can reappear when that machine reconnects and
+syncs. Entries stamped more than 24 hours in the future are skipped individually with a warning,
+and machines booting with an unset clock stamp at least at the binary's build time. A node that
+changes it pushes it to the peers it can reach (coalescing rapid bursts), and `fleet.sync` and the
+sync runner carry it to the rest. `fav.list` leaves out entries outside the caller's `paths`;
+existing entries whose path is not valid on the reading node's operating system are still listed
+with a note and remain removable by id. One list per fleet is deliberate for now; a list per person
+waits for people to exist in the model.
 
 ### Sync folders
 
