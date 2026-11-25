@@ -961,7 +961,7 @@ curl -sS http://127.0.0.1:7117/v1/health
 ```
 
 ```json
-{"ok":true,"node":"tower","version":"0.1.0"}
+{"ok":true,"node":"tower","version":"0.1.0","content":true}
 ```
 
 List allowed tools for the token's principal:
@@ -1018,15 +1018,21 @@ curl -sSI 'http://127.0.0.1:7117/v1/content/<ticket>/clip.mp4?download=1'
 
 Security and lifecycle guarantees:
 
-- **Tickets and revocation**: 256 random bits bound to one bearer token, one principal, one
-  machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies are capped at 16
-  KiB). Permissions are checked as `fs.read` when the ticket is minted, on every `GET` or `HEAD`,
-  and periodically while streaming (every 2 MiB or 2 seconds), so revoking the token, tightening
-  `policy.toml`, or crossing the 6-hour hard limit cuts off active downloads. Tickets expire using
-  a suspend-safe clock (15 minutes after last use, 6 hours absolute maximum), are capped at 128 per
-  token (evicting the oldest), and are never logged; minting writes one `content.ticket` audit
-  entry and successful reads coalesce to at most one `content.read` (and `stream.get` on remote
-  nodes) per ticket per minute with request count and bytes served.
+- **Tickets, revocation bounds, and audit durability**: 256 random bits bound to one bearer token,
+  one principal, one machine, and one bounded file path (at most 4 KiB; `POST /v1/content` bodies
+  are capped at 16 KiB). Permissions are checked as `fs.read` when the ticket is minted, on every
+  `GET` or `HEAD`, and on an independent 1-second liveness timer per active stream (not tied to
+  body polling or client read speed). Active content sockets cap `SO_SNDBUF` at 128 KiB (about 256
+  KiB kernel send buffer on Linux), and revoking a token, tightening `policy.toml`, or crossing the
+  6-hour hard limit cancels the stream immediately, discards buffered bytes, releases its remote
+  pipe, and sends TCP RST (`SO_LINGER(0)`) — cutting off even slow (20 KB/s) or completely stalled
+  readers within ~2 seconds, with at most the bytes already in the peer's own TCP receive buffer
+  (~256 KiB on loopback) left to drain. Tickets expire using a suspend-safe clock (15 minutes after
+  last use, 6 hours absolute maximum), are capped at 128 per token (evicting the oldest), and are
+  never logged. Minting writes one durable `content.ticket` entry; the first `GET` or `HEAD` on a
+  ticket writes one durable `content.open` entry immediately so every access survives `SIGKILL` or
+  power loss; ongoing reads coalesce to at most one `content.read` summary per ticket per minute
+  (and `stream.get` on remote nodes) with request count and bytes served.
 - **Headers and isolation**: every reply carries `X-Content-Type-Options: nosniff`,
   `Cross-Origin-Resource-Policy: same-origin`, `Referrer-Policy: no-referrer`, `Cache-Control:
   private, no-store`, and unconditionally
@@ -1048,16 +1054,19 @@ Security and lifecycle guarantees:
   default-src 'none'` block cross-origin reads, no-cors embeds, framing, and script execution.
 - **History and exposure**: a content address remains usable for up to 6 hours while in active use
   and appears in browser history if opened directly in a tab; damage is limited because it grants
-  read-only access to one file, expires after 15 minutes idle or 6 hours total, stops immediately
-  when the token or `fs.read` policy is revoked, and never caches or executes in the interface's
-  origin.
+  read-only access to one file, expires after 15 minutes idle or 6 hours total, cuts off active
+  readers within ~2 seconds when the token or `fs.read` policy is revoked, and never caches or
+  executes in the interface's origin.
 - **Concurrency and slow-reader protection**: active content streams are capped per ticket (8), per
   holder (16), and globally (64), answering `429 Too Many Requests` with `Retry-After` and
   `Connection: close`, and stalled or overly slow readers are disconnected after a write-idle
   timeout (15 s) or minimum transfer rate window (40 KiB / 10 s) so API and UI routes stay
   responsive. Remote reads reuse warm `keep_open` `legion stream` pipes from a dedicated per-target
-  content pool (separate from transfers and RPC), reading in bounded windows with per-holder fair
-  sharing and returning `503 Service Unavailable` with `Retry-After` if acquiring a pipe times out.
+  content pool (separate from transfers and RPC, which never share permits with content), reading in
+  bounded windows with per-holder fair sharing and returning `503 Service Unavailable` with
+  `Retry-After` if acquiring a pipe times out. The web UI reads `"content": true` from `/v1/health`
+  once and remembers per-machine `unsupported` replies for the session so older remote nodes fall
+  back cleanly without breaking supported machines.
 
 ### Event stream (SSE)
 

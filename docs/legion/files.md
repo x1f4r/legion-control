@@ -136,13 +136,30 @@ resumes from an offset.
 `legion stream`'s `get` gains `length` and optional `keep_open: true`. Its reply line becomes
 `{size, offset, length, mtime, file_id?, keep_open?}` followed by exactly `length` bytes (to the
 end when absent), and a `{"done": true}` line when `keep_open` is active so one remote `legion
-stream` pipe can serve many consecutive range requests without re-handshaking. `legion-link` gains
-`Link::open_content(machine, path, offset, length)`, which opens that operation on the session the
-link already has for that machine (a new exec channel on the ssh connection, or a child for a local
-node, capped below OpenSSH's default `MaxSessions` of 10 and chunked so an unread stream never
-stalls the shared SSH connection) and returns the size, modification time, file identity, and an
-async reader. It follows the routing rules calls follow: it names its machine and never goes
-somewhere else.
+stream` pipe can serve many consecutive range requests without re-handshaking. An idle remote
+`legion stream` process exits after 120 seconds of inactivity.
+
+`legion-link` gains `Link::open_content(machine, path, offset, length)`, which opens that operation
+on the session the link already has for that machine (a new exec channel on the ssh connection, or
+a child for a local node) and returns the size, modification time, file identity, and an async
+reader. On SSH connections:
+
+- **Slots and fair waiting**: at most 8 active content channels run on one SSH connection (strictly
+  below OpenSSH's default `MaxSessions` of 10, leaving room for RPC). When all 8 slots are actively
+  reading, further opens wait fairly in FIFO order up to the SSH connect timeout before returning a
+  retryable `busy` error; a permit is held until `sshd` confirms channel close (`SSH_MSG_CHANNEL_CLOSE`).
+- **Parking and transparent reopening**: a stream holds an SSH channel and slot only while actively
+  read. After ~2 seconds of reader inactivity, `ContentStream` parks its channel — closing the SSH
+  channel and freeing its slot while keeping already-buffered bytes (within a bounded per-channel
+  window cap). On the next read after parking, or after any idle close (remote 120-second idle
+  timeout or SSH session reconnect), it transparently reopens at the exact next byte offset,
+  verifying `(size, mtime, file_id)` (failing cleanly if the file changed on disk) with bounded
+  consecutive retries.
+- **Misbehaving-remote bounds**: active remote reads enforce a 30-second per-window progress
+  timeout (armed only while waiting on a live channel, never while parked) and a cap of 32
+  consecutive `{"busy": true}` lines.
+
+It follows the routing rules calls follow: it names its machine and never goes somewhere else.
 
 ### Content addresses
 
@@ -151,11 +168,16 @@ interface's origin. So content is served from a **content address**: a URL holdi
 
 - A ticket is 256 random bits, made for one principal, one machine, and one bounded path (at most
   4 KiB; `POST /v1/content` bodies are capped at 16 KiB). It is checked as `fs.read` when made, on
-  every request, and periodically while a response streams (every 2 MiB or 2 seconds), so revoking
-  a token, tightening `policy.toml`, or crossing the 6-hour hard cap stops an in-progress download.
-  Expiry uses a suspend-safe clock (the maximum of wall-clock and monotonic elapsed time): 15
-  minutes after its last use and 6 hours at most, capped per holder (128, LRU eviction) and
-  globally.
+  every request, and while a response streams: an independent 1-second liveness watcher per active
+  stream (not tied to client read speed or body polling) re-checks the bearer token, `policy.toml`,
+  and the 6-hour hard cap. Each active content socket lowers `SO_SNDBUF` to 128 KiB (about 256 KiB
+  kernel send buffer on Linux), and on revocation the server immediately cancels the stream,
+  discards all buffered bytes, releases its remote pipe, and resets the TCP connection
+  (`SO_LINGER(0)`) so the server stops sending within ~2 seconds even for slow (e.g. 20 KB/s) or
+  completely stalled readers, leaving at most the bytes already delivered to the peer's own TCP
+  receive buffer (~256 KiB on loopback) drainable. Expiry uses a suspend-safe clock (the maximum of
+  wall-clock and monotonic elapsed time): 15 minutes after its last use and 6 hours at most, capped
+  per holder (128, LRU eviction) and globally.
 - The address answers `GET` and `HEAD` with single-range support (`Range`, `If-Range`, a strong
   `ETag` from size, modification time, and Unix file identity, `206` and `416` done properly),
   streaming with backpressure and never reading a file into memory.
@@ -175,31 +197,37 @@ interface's origin. So content is served from a **content address**: a URL holdi
   `Retry-After`, and `Connection: close`, and stalled or overly slow readers are closed after an
   idle write timeout (15 s) or minimum progress window (40 KiB / 10 s) so one holder cannot starve
   the API or UI.
-- **Audit coalescing**: minting a ticket writes one `content.ticket` entry (never logging the
-  ticket id); successful reads coalesce to at most one `content.read` entry per ticket per minute
-  (and one `stream.get` entry per principal/path per minute on a remote node) with request count
-  and bytes served.
+- **Audit durability and coalescing**: minting a ticket writes one durable `content.ticket` entry
+  (never logging the ticket id); the first `GET` or `HEAD` on a ticket immediately writes one
+  durable `content.open` entry (`who`, `machine`, `path`) before streaming bytes so every access
+  survives a hard process kill (`SIGKILL`) or power loss; ongoing reads coalesce to at most one
+  `content.read` summary per ticket per minute (and one `stream.get` entry per principal/path per
+  minute on a remote node) with request count and bytes served, flushed on expiry, revocation, or
+  clean shutdown.
 - **Lifetime and browser history**: a content address stays usable for up to 6 hours while in active
   use and will appear in browser history if opened directly in a tab. Damage is bounded because the
   ticket is read-only to one file, expires after 15 minutes of idleness (and 6 hours unconditionally),
-  dies immediately if the bearer token or `fs.read` policy is revoked, carries `Cache-Control:
-  private, no-store` and `Referrer-Policy: no-referrer`, and renders only in a sandboxed opaque
-  origin with `frame-ancestors 'none'`. If a third-party page somehow obtains a ticket, `Origin`
-  checks block cross-origin `fetch()` unless explicitly listed, `Cross-Origin-Resource-Policy:
-  same-origin` blocks no-cors subresource embedding, `frame-ancestors 'none'` blocks framing, and
-  `sandbox; default-src 'none'` isolates any top-level navigation.
+  cuts off active readers within ~2 seconds when the bearer token or `fs.read` policy is revoked,
+  carries `Cache-Control: private, no-store` and `Referrer-Policy: no-referrer`, and renders only in
+  a sandboxed opaque origin with `frame-ancestors 'none'`. If a third-party page somehow obtains a
+  ticket, `Origin` checks block cross-origin `fetch()` unless explicitly listed,
+  `Cross-Origin-Resource-Policy: same-origin` blocks no-cors subresource embedding,
+  `frame-ancestors 'none'` blocks framing, and `sandbox; default-src 'none'` isolates any top-level
+  navigation.
 
 One module (crate `legion-content`) holds the ticket table, the range handling, concurrency limits,
 the `Host`/`Origin` guard, and the headers, over a small trait that opens a byte range. Two things
 mount it:
 
-- **The HTTP door**: `POST /v1/content` (bearer token) with `{on, path}` returns
+- **The HTTP door**: `GET /v1/health` advertises `"content": true` so the web UI enables content
+  addresses once on connect and remembers per-machine `unsupported` replies for the session when
+  browsing an older remote node. `POST /v1/content` (bearer token) with `{on, path}` returns
   `{url, expires_in}`; the URL is `/v1/content/<ticket>/<file name>` on the same origin, with
   `Cross-Origin-Resource-Policy: same-origin` always set (origins listed in `[serve] origins` read
   content via CORS `fetch()` or `crossorigin`, not no-cors embedding). The door reads remote files
   in bounded windows over a dedicated pool of warm `keep_open` `legion stream` pipes per target
-  machine, separate from transfer and RPC pipes, with per-holder fair sharing and a short acquire
-  timeout (`503 Service Unavailable` with `Retry-After`).
+  machine, separate from transfer and RPC pipes (which never share permits with content), with
+  per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts the same module on a listener bound to `127.0.0.1` on a
   port the system picks, reading through `Link::open_content`. The interface asks the native
   command `content_url({machine, path})` for an address. The ticket in the path is the only
