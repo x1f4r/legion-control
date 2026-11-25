@@ -118,6 +118,34 @@ enum PendingChange {
     RefreshDiskStatOnly { record: IndexRecord },
 }
 
+fn is_busy_live_error<F: SyncFs>(fs: &F, err: &SyncError) -> bool {
+    matches!(
+        err,
+        SyncError::Fs {
+            kind: FsErrorKind::Busy,
+            ..
+        }
+    ) || (fs.capabilities().windows_naming
+        && matches!(
+            err,
+            SyncError::Fs {
+                kind: FsErrorKind::PermissionDenied,
+                ..
+            }
+        ))
+}
+
+/// Returns `true` when `path` is confirmed absent on disk (`Ok(None)`). Transient sharing or
+/// delete-pending errors treat the entry as still present so scans never invent a deletion.
+fn is_confirmed_absent_live<F: SyncFs>(fs: &F, path: &str) -> Result<bool> {
+    match fs.stat_live(path) {
+        Ok(None) => Ok(true),
+        Ok(Some(_)) => Ok(false),
+        Err(err) if is_busy_live_error(fs, &err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 /// Returns `true` if `candidate` equals or lies under any skipped/unreadable path.
 pub fn is_under_skipped(candidate: &str, skipped: &[(String, String)]) -> bool {
     skipped.iter().any(|(skip_path, _)| {
@@ -504,7 +532,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         for p in moved_paths {
             if let Some(pd) = meta.pending_deletions.remove(&p) {
                 brake_meta_dirty = true;
-                if fs.stat_live(&p)?.is_none() {
+                if is_confirmed_absent_live(fs, &p)? {
                     matched_move_deletes.push(pd.old_record);
                 }
             }
@@ -584,7 +612,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             brake_meta_dirty = true;
             for (p, pd) in drained {
                 if !is_under_skipped(&p, &report.skipped_errors)
-                    && fs.stat_live(&p)?.is_none()
+                    && is_confirmed_absent_live(fs, &p)?
                     && !deletes.iter().any(|d| d.path == p)
                 {
                     deletes.push(pd.old_record);
@@ -700,7 +728,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         for p in ready_files {
             if let Some(pd) = meta.pending_deletions.remove(&p) {
                 brake_meta_dirty = true;
-                if fs.stat_live(&p)?.is_none() {
+                if is_confirmed_absent_live(fs, &p)? {
                     if pd.old_record.kind == EntryKind::File
                         && !window.emitted_deletions.iter().any(|(ep, _)| ep == &p)
                     {
@@ -728,7 +756,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         for p in ready_dirs {
             if let Some(pd) = meta.pending_deletions.remove(&p) {
                 brake_meta_dirty = true;
-                if fs.stat_live(&p)?.is_none() {
+                if is_confirmed_absent_live(fs, &p)? {
                     deletes.push(pd.old_record);
                 }
             }
@@ -1015,9 +1043,15 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
         .map(|(p, _)| p.clone())
         .collect();
     for p in ready_files {
+        let absent = match fs.stat_live(&p) {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(err) if is_busy_live_error(fs, &err) => continue,
+            Err(err) => return Err(err),
+        };
         if let Some(pd) = meta.pending_deletions.remove(&p) {
             dirty = true;
-            if fs.stat_live(&p)?.is_none() {
+            if absent {
                 if pd.old_record.kind == EntryKind::File
                     && !window.emitted_deletions.iter().any(|(ep, _)| ep == &p)
                 {
@@ -1041,9 +1075,15 @@ pub fn flush_settled_deletions<F: SyncFs, S: IndexStore>(
         .map(|(p, _)| p.clone())
         .collect();
     for p in ready_dirs {
+        let absent = match fs.stat_live(&p) {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(err) if is_busy_live_error(fs, &err) => continue,
+            Err(err) => return Err(err),
+        };
         if let Some(pd) = meta.pending_deletions.remove(&p) {
             dirty = true;
-            if fs.stat_live(&p)?.is_none() {
+            if absent {
                 deletes.push(pd.old_record);
             }
         }
@@ -1151,7 +1191,11 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
             detail: "index store is not initialized".to_string(),
         })?;
     let prev = store.get_record(&clean)?;
-    let disk_opt = fs.stat_live(&clean)?;
+    let disk_opt = match fs.stat_live(&clean) {
+        Ok(opt) => opt,
+        Err(err) if is_busy_live_error(fs, &err) => return Ok(SingleRescanOutcome::Unstable),
+        Err(err) => return Err(err),
+    };
 
     match (prev, disk_opt) {
         (None, None) => {
@@ -1277,9 +1321,18 @@ pub fn rescan_single_path_with_force<F: SyncFs, S: IndexStore>(
                     | Err(SyncError::Conflict { .. }) => {
                         return Ok(SingleRescanOutcome::Unstable);
                     }
+                    Err(err) if is_busy_live_error(fs, &err) => {
+                        return Ok(SingleRescanOutcome::Unstable);
+                    }
                     Err(err) => return Err(err),
                 };
-                let after = fs.stat_live(&clean)?;
+                let after = match fs.stat_live(&clean) {
+                    Ok(opt) => opt,
+                    Err(err) if is_busy_live_error(fs, &err) => {
+                        return Ok(SingleRescanOutcome::Unstable);
+                    }
+                    Err(err) => return Err(err),
+                };
                 let stable = after.as_ref().is_some_and(|m| {
                     m.kind == EntryKind::File
                         && m.size == disk_meta.size

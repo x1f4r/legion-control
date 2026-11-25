@@ -123,17 +123,22 @@ enum SafeReplaceResult {
     LiveChangedAfterDisplace { binned: bool },
     /// Path changed before placement; `staged_tmp` is still our un-exchanged staged download.
     RaceBeforePlace,
+    /// Target path is currently locked, in use, or pending deletion; no user bytes were lost and
+    /// the record should be deferred cleanly without failing the rest of the page.
+    Deferred { reason: String, binned: bool },
 }
 
 enum SafeDeleteResult {
     Deleted,
     RaceChanged,
+    Deferred(String),
 }
 
 enum AncestorOutcome {
     Ready,
     ChangedRetry,
     Unstable,
+    Busy(String),
 }
 
 fn is_mid_apply_race_error(err: &SyncError) -> bool {
@@ -147,6 +152,39 @@ fn is_mid_apply_race_error(err: &SyncError) -> bool {
                 ..
             }
     )
+}
+
+fn is_live_busy_error<F: SyncFs>(fs: &F, err: &SyncError) -> bool {
+    matches!(
+        err,
+        SyncError::Fs {
+            kind: FsErrorKind::Busy,
+            ..
+        }
+    ) || (fs.capabilities().windows_naming
+        && matches!(
+            err,
+            SyncError::Fs {
+                kind: FsErrorKind::PermissionDenied,
+                ..
+            }
+        ))
+}
+
+fn is_replace_partial_failure(err: &SyncError) -> bool {
+    matches!(
+        err,
+        SyncError::Fs {
+            kind: FsErrorKind::ReplaceUnableToRemoveReplaced
+                | FsErrorKind::ReplaceUnableToMoveReplacement
+                | FsErrorKind::ReplaceUnableToMoveReplacement2,
+            ..
+        }
+    )
+}
+
+fn busy_defer_reason(path: &str) -> String {
+    format!("'{path}' is currently in use by another program")
 }
 
 /// Recovers any incomplete [`PendingOp`] left by a crash or error and cleans only proven
@@ -369,11 +407,12 @@ fn recover_place<F: SyncFs, S: IndexStore>(
     if disk_matches_snapshot(fs, &path, &expected_local)?
         && !matches!(expected_local, ExpectedLocalSnapshot::Missing)
     {
+        let mut displaced_binned = false;
         for cand in [claim_tmp.as_deref(), staged_tmp.as_deref()]
             .into_iter()
             .flatten()
         {
-            let _ = salvage_pending_tmp(
+            if salvage_pending_tmp(
                 fs,
                 store,
                 cand,
@@ -382,7 +421,9 @@ fn recover_place<F: SyncFs, S: IndexStore>(
                 bin_entry.as_ref(),
                 expected_staged,
                 now,
-            )?;
+            )? {
+                displaced_binned = true;
+            }
         }
         let persisted_bin = bin_entry_if_present(fs, bin_entry.clone())?;
         if persisted_bin.is_none()
@@ -390,12 +431,20 @@ fn recover_place<F: SyncFs, S: IndexStore>(
         {
             let _ = fs.remove_bin_file(&bin_meta_name(&b.id));
         }
-        let batch = StoreBatch {
-            upsert_bin: persisted_bin.into_iter().collect(),
-            set_pending_op: Some(None),
-            ..StoreBatch::default()
-        };
-        store.apply_batch(batch)?;
+        if displaced_binned {
+            mark_needs_rescan_and_clear_pending(
+                store,
+                &[&path],
+                persisted_bin.into_iter().collect(),
+            )?;
+        } else {
+            let batch = StoreBatch {
+                upsert_bin: persisted_bin.into_iter().collect(),
+                set_pending_op: Some(None),
+                ..StoreBatch::default()
+            };
+            store.apply_batch(batch)?;
+        }
         return Ok(());
     }
 
@@ -1173,8 +1222,17 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
             update_disk_metadata,
         } => {
             let existing = store.get_record(&record.path)?;
-            if !record.deleted && !disk_matches_index(fs, &record.path, existing.as_ref())? {
-                return handle_local_changed(fs, store, &record.path, now);
+            if !record.deleted {
+                match disk_matches_index(fs, &record.path, existing.as_ref()) {
+                    Ok(true) => {}
+                    Ok(false) => return handle_local_changed(fs, store, &record.path, now),
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&record.path),
+                        });
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             if update_disk_metadata && !record.deleted {
                 apply_live_metadata(fs, &record.path, record.mtime, record.mode)?;
@@ -1302,14 +1360,29 @@ pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
                 reason: format!("ancestor of '{to_path}' is currently being written"),
             });
         }
+        AncestorOutcome::Busy(reason) => return Ok(ApplyOutcome::Deferred { reason }),
     }
 
     let existing_from = store.get_record(&from_path)?;
-    if !disk_matches_index(fs, &from_path, existing_from.as_ref())? {
-        return handle_local_changed(fs, store, &from_path, now);
+    match disk_matches_index(fs, &from_path, existing_from.as_ref()) {
+        Ok(true) => {}
+        Ok(false) => return handle_local_changed(fs, store, &from_path, now),
+        Err(err) if is_live_busy_error(fs, &err) => {
+            return Ok(ApplyOutcome::Deferred {
+                reason: busy_defer_reason(&from_path),
+            });
+        }
+        Err(err) => return Err(err),
     }
-    if fs.stat_live(&to_path)?.is_some() {
-        return handle_local_changed(fs, store, &to_path, now);
+    match fs.stat_live(&to_path) {
+        Ok(Some(_)) => return handle_local_changed(fs, store, &to_path, now),
+        Ok(None) => {}
+        Err(err) if is_live_busy_error(fs, &err) => {
+            return Ok(ApplyOutcome::Deferred {
+                reason: busy_defer_reason(&to_path),
+            });
+        }
+        Err(err) => return Err(err),
     }
 
     let expected_from = snapshot_local(existing_from.as_ref());
@@ -1337,6 +1410,12 @@ pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
             | Err(SyncError::Conflict { .. }) => {
                 mark_needs_rescan_and_clear_pending(store, &[&from_path, &to_path], Vec::new())?;
                 return handle_local_changed(fs, store, &from_path, now);
+            }
+            Err(err) if is_live_busy_error(fs, &err) => {
+                clear_pending_op(store)?;
+                return Ok(ApplyOutcome::Deferred {
+                    reason: busy_defer_reason(&from_path),
+                });
             }
             Err(err) => return Err(err),
         }
@@ -1684,6 +1763,12 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
                 out.fallback_records.push(target);
                 continue;
             }
+            Err(err) if is_live_busy_error(fs, &err) => {
+                let _ = fs.remove_tmp(&tmp);
+                out.deferred
+                    .push((remote_seq, path.clone(), busy_defer_reason(&path)));
+                continue;
+            }
             Err(err) => {
                 let _ = fs.remove_tmp(&tmp);
                 for (_, _, rem_tmp, _) in synced_iter {
@@ -1870,6 +1955,10 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                 reason: format!("ancestor of '{path}' is actively changing"),
             });
         }
+        Ok(AncestorOutcome::Busy(reason)) => {
+            cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()])?;
+            return Ok(ApplyOutcome::Deferred { reason });
+        }
         Err(err) => {
             if !err.is_crash() {
                 let _ = cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()]);
@@ -1880,9 +1969,24 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
 
     // 3. Re-check local disk against our index before replacing anything.
     let existing = store.get_record(&path)?;
-    if !disk_matches_index(fs, &path, existing.as_ref())? {
-        cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()])?;
-        return handle_local_changed(fs, store, &path, now);
+    match disk_matches_index(fs, &path, existing.as_ref()) {
+        Ok(true) => {}
+        Ok(false) => {
+            cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()])?;
+            return handle_local_changed(fs, store, &path, now);
+        }
+        Err(err) if is_live_busy_error(fs, &err) => {
+            cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()])?;
+            return Ok(ApplyOutcome::Deferred {
+                reason: busy_defer_reason(&path),
+            });
+        }
+        Err(err) => {
+            if !err.is_crash() {
+                let _ = cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()]);
+            }
+            return Err(err);
+        }
     }
 
     if let Some(ref loc) = existing
@@ -1978,6 +2082,18 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                     clear_pending_op(store)?;
                     return handle_local_changed(fs, store, &path, now);
                 }
+                SafeReplaceResult::Deferred { reason, binned } => {
+                    if binned {
+                        mark_needs_rescan_and_clear_pending(
+                            store,
+                            &[&path],
+                            vec![b_entry.clone()],
+                        )?;
+                    } else {
+                        clear_pending_op(store)?;
+                    }
+                    return Ok(ApplyOutcome::Deferred { reason });
+                }
             }
         }
 
@@ -2007,6 +2123,13 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                                 clear_pending_op(store)?;
                                 return handle_local_changed(fs, store, &path, now);
                             }
+                            SafeDeleteResult::Deferred(reason) => {
+                                if let Some(ref tmp) = staged_tmp {
+                                    let _ = fs.remove_tmp(tmp);
+                                }
+                                clear_pending_op(store)?;
+                                return Ok(ApplyOutcome::Deferred { reason });
+                            }
                         }
                     }
                 }
@@ -2023,6 +2146,15 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                         }
                         clear_pending_op(store)?;
                         return handle_local_changed(fs, store, &path, now);
+                    }
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        if let Some(ref tmp) = staged_tmp {
+                            let _ = fs.remove_tmp(tmp);
+                        }
+                        clear_pending_op(store)?;
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&path),
+                        });
                     }
                     Err(err) => return Err(err),
                 },
@@ -2042,6 +2174,15 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                         }
                         clear_pending_op(store)?;
                         return handle_local_changed(fs, store, &path, now);
+                    }
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        if let Some(ref tmp) = staged_tmp {
+                            let _ = fs.remove_tmp(tmp);
+                        }
+                        clear_pending_op(store)?;
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&path),
+                        });
                     }
                     Err(err) => return Err(err),
                 },
@@ -2067,6 +2208,21 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                             let _ = fs.remove_tmp(tmp);
                             return on_place_race(store, persisted_bins);
                         }
+                        Err(err) if is_live_busy_error(fs, &err) => {
+                            let _ = fs.remove_tmp(tmp);
+                            if persisted_bins.is_empty() {
+                                clear_pending_op(store)?;
+                            } else {
+                                mark_needs_rescan_and_clear_pending(
+                                    store,
+                                    &[&path],
+                                    persisted_bins,
+                                )?;
+                            }
+                            return Ok(ApplyOutcome::Deferred {
+                                reason: busy_defer_reason(&path),
+                            });
+                        }
                         Err(err) => return Err(err),
                     }
                 }
@@ -2087,6 +2243,16 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                     Err(err) if is_mid_apply_race_error(&err) => {
                         return on_place_race(store, persisted_bins);
                     }
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        if persisted_bins.is_empty() {
+                            clear_pending_op(store)?;
+                        } else {
+                            mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
+                        }
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&path),
+                        });
+                    }
                     Err(err) => return Err(err),
                 }
                 record_disk_stat(fs, &path, &mut target)?;
@@ -2104,6 +2270,16 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                     Ok(()) => {}
                     Err(err) if is_mid_apply_race_error(&err) => {
                         return on_place_race(store, persisted_bins);
+                    }
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        if persisted_bins.is_empty() {
+                            clear_pending_op(store)?;
+                        } else {
+                            mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
+                        }
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&path),
+                        });
                     }
                     Err(err) => return Err(err),
                 }
@@ -2137,8 +2313,15 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
     let path = tombstone.path.clone();
     let existing = store.get_record(&path)?;
 
-    if !disk_matches_index(fs, &path, existing.as_ref())? {
-        return handle_local_changed(fs, store, &path, now);
+    match disk_matches_index(fs, &path, existing.as_ref()) {
+        Ok(true) => {}
+        Ok(false) => return handle_local_changed(fs, store, &path, now),
+        Err(err) if is_live_busy_error(fs, &err) => {
+            return Ok(ApplyOutcome::Deferred {
+                reason: busy_defer_reason(&path),
+            });
+        }
+        Err(err) => return Err(err),
     }
 
     // Item H: inspect directories before deleting!
@@ -2153,6 +2336,11 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
             Ok(c) => c,
             Err(err) if is_mid_apply_race_error(&err) => {
                 return handle_local_changed(fs, store, &path, now);
+            }
+            Err(err) if is_live_busy_error(fs, &err) => {
+                return Ok(ApplyOutcome::Deferred {
+                    reason: busy_defer_reason(&path),
+                });
             }
             Err(err) => return Err(err),
         };
@@ -2273,6 +2461,18 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                         }
                         return Ok(ApplyOutcome::LocalChangedRetry);
                     }
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        let _ = fs.remove_bin_file(&bin_meta_name(&entry.id));
+                        if !litter_bins.is_empty() {
+                            let _ = store.apply_batch(StoreBatch {
+                                upsert_bin: litter_bins,
+                                ..StoreBatch::default()
+                            });
+                        }
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&child_rel),
+                        });
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -2297,6 +2497,17 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                         store.apply_batch(batch)?;
                     }
                     return Ok(ApplyOutcome::LocalChangedRetry);
+                }
+                Err(err) if is_live_busy_error(fs, &err) => {
+                    if !litter_bins.is_empty() {
+                        let _ = store.apply_batch(StoreBatch {
+                            upsert_bin: litter_bins,
+                            ..StoreBatch::default()
+                        });
+                    }
+                    return Ok(ApplyOutcome::Deferred {
+                        reason: busy_defer_reason(&path),
+                    });
                 }
                 Err(err) => return Err(err),
             }
@@ -2350,6 +2561,10 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                                 clear_pending_op(store)?;
                                 return handle_local_changed(fs, store, &path, now);
                             }
+                            SafeDeleteResult::Deferred(reason) => {
+                                clear_pending_op(store)?;
+                                return Ok(ApplyOutcome::Deferred { reason });
+                            }
                         }
                     }
                 }
@@ -2363,6 +2578,12 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                     Err(err) if is_mid_apply_race_error(&err) => {
                         clear_pending_op(store)?;
                         return handle_local_changed(fs, store, &path, now);
+                    }
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        clear_pending_op(store)?;
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&path),
+                        });
                     }
                     Err(err) => return Err(err),
                 },
@@ -2379,6 +2600,12 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                     | Err(SyncError::Conflict { .. }) => {
                         clear_pending_op(store)?;
                         return handle_local_changed(fs, store, &path, now);
+                    }
+                    Err(err) if is_live_busy_error(fs, &err) => {
+                        clear_pending_op(store)?;
+                        return Ok(ApplyOutcome::Deferred {
+                            reason: busy_defer_reason(&path),
+                        });
                     }
                     Err(err) => return Err(err),
                 },
@@ -2445,9 +2672,24 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
 
     // 2. Re-check local disk at `orig_path` did not change since scan.
     let existing = store.get_record(&orig_path)?;
-    if !disk_matches_index(fs, &orig_path, existing.as_ref())? {
-        cleanup_staged_tmps(fs, store, &[winner_tmp.as_deref()])?;
-        return handle_local_changed(fs, store, &orig_path, now);
+    match disk_matches_index(fs, &orig_path, existing.as_ref()) {
+        Ok(true) => {}
+        Ok(false) => {
+            cleanup_staged_tmps(fs, store, &[winner_tmp.as_deref()])?;
+            return handle_local_changed(fs, store, &orig_path, now);
+        }
+        Err(err) if is_live_busy_error(fs, &err) => {
+            cleanup_staged_tmps(fs, store, &[winner_tmp.as_deref()])?;
+            return Ok(ApplyOutcome::Deferred {
+                reason: busy_defer_reason(&orig_path),
+            });
+        }
+        Err(err) => {
+            if !err.is_crash() {
+                let _ = cleanup_staged_tmps(fs, store, &[winner_tmp.as_deref()]);
+            }
+            return Err(err);
+        }
     }
 
     // 3. Assign a fresh independent version vector to the conflict copy (Item A).
@@ -2505,6 +2747,19 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                                 Vec::new(),
                             )?;
                             return handle_local_changed(fs, store, &orig_path, now);
+                        }
+                        Err(err) if is_live_busy_error(fs, &err) => {
+                            if let Some(ref wt) = winner_tmp {
+                                let _ = fs.remove_tmp(wt);
+                            }
+                            mark_needs_rescan_and_clear_pending(
+                                store,
+                                &[&orig_path, &conflict_path],
+                                Vec::new(),
+                            )?;
+                            return Ok(ApplyOutcome::Deferred {
+                                reason: busy_defer_reason(&orig_path),
+                            });
                         }
                         Err(err) => return Err(err),
                     }
@@ -2579,6 +2834,19 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                             )?;
                             return handle_local_changed(fs, store, &orig_path, now);
                         }
+                        Err(err) if is_live_busy_error(fs, &err) => {
+                            if let Some(ref wt) = winner_tmp {
+                                let _ = fs.remove_tmp(wt);
+                            }
+                            mark_needs_rescan_and_clear_pending(
+                                store,
+                                &[&orig_path, &conflict_path],
+                                Vec::new(),
+                            )?;
+                            return Ok(ApplyOutcome::Deferred {
+                                reason: busy_defer_reason(&orig_path),
+                            });
+                        }
                         Err(err) => return Err(err),
                     }
                 }
@@ -2629,6 +2897,19 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                             }
                             clear_pending_op(store)?;
                             return handle_local_changed(fs, store, &orig_path, now);
+                        }
+                        Err(err) if is_live_busy_error(fs, &err) => {
+                            if let Some(ref wt) = winner_tmp {
+                                let _ = fs.remove_tmp(wt);
+                            }
+                            mark_needs_rescan_and_clear_pending(
+                                store,
+                                &[&orig_path, &conflict_path],
+                                Vec::new(),
+                            )?;
+                            return Ok(ApplyOutcome::Deferred {
+                                reason: busy_defer_reason(&orig_path),
+                            });
                         }
                         Err(err) => return Err(err),
                     }
@@ -2699,6 +2980,18 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                                 peer.member_id(),
                             )?;
                             return handle_local_changed_after_displace(fs, store, &orig_path, now);
+                        }
+                        Err(err) if is_live_busy_error(fs, &err) => {
+                            let _ = fs.remove_tmp(tmp);
+                            commit_loser_if_still_on_disk(
+                                store,
+                                loser_record,
+                                persisted_bins,
+                                peer.member_id(),
+                            )?;
+                            return Ok(ApplyOutcome::Deferred {
+                                reason: busy_defer_reason(&orig_path),
+                            });
                         }
                         Err(err) => return Err(err),
                     }
@@ -2843,9 +3136,24 @@ fn apply_conflict_remote_loses<F: SyncFs, S: IndexStore>(
 
     // 2. Re-check local winner at `orig_path` did not change since scan.
     let existing = store.get_record(&orig_path)?;
-    if !disk_matches_index(fs, &orig_path, existing.as_ref())? {
-        cleanup_staged_tmps(fs, store, &[loser_tmp.as_deref()])?;
-        return handle_local_changed(fs, store, &orig_path, now);
+    match disk_matches_index(fs, &orig_path, existing.as_ref()) {
+        Ok(true) => {}
+        Ok(false) => {
+            cleanup_staged_tmps(fs, store, &[loser_tmp.as_deref()])?;
+            return handle_local_changed(fs, store, &orig_path, now);
+        }
+        Err(err) if is_live_busy_error(fs, &err) => {
+            cleanup_staged_tmps(fs, store, &[loser_tmp.as_deref()])?;
+            return Ok(ApplyOutcome::Deferred {
+                reason: busy_defer_reason(&orig_path),
+            });
+        }
+        Err(err) => {
+            if !err.is_crash() {
+                let _ = cleanup_staged_tmps(fs, store, &[loser_tmp.as_deref()]);
+            }
+            return Err(err);
+        }
     }
 
     if bump_winner_clock {
@@ -2896,6 +3204,13 @@ fn apply_conflict_remote_loses<F: SyncFs, S: IndexStore>(
                                     Vec::new(),
                                 )?;
                                 return handle_local_changed(fs, store, &conflict_path, now);
+                            }
+                            Err(err) if is_live_busy_error(fs, &err) => {
+                                let _ = fs.remove_tmp(tmp);
+                                clear_pending_op(store)?;
+                                return Ok(ApplyOutcome::Deferred {
+                                    reason: busy_defer_reason(&conflict_path),
+                                });
                             }
                             Err(err) => return Err(err),
                         }
@@ -2976,12 +3291,17 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
 ) -> Result<AncestorOutcome> {
     for anc in ancestors(rel_path) {
         let mut existing = store.get_record(anc)?;
-        if !disk_matches_index(fs, anc, existing.as_ref())? {
-            match rescan_single_path(fs, store, anc, now)? {
+        match disk_matches_index(fs, anc, existing.as_ref()) {
+            Ok(true) => {}
+            Ok(false) => match rescan_single_path(fs, store, anc, now)? {
                 SingleRescanOutcome::Unstable => return Ok(AncestorOutcome::Unstable),
                 SingleRescanOutcome::Updated(rec) => existing = Some(*rec),
                 SingleRescanOutcome::Unchanged => existing = store.get_record(anc)?,
+            },
+            Err(err) if is_live_busy_error(fs, &err) => {
+                return Ok(AncestorOutcome::Busy(busy_defer_reason(anc)));
             }
+            Err(err) => return Err(err),
         }
 
         match existing {
@@ -2992,6 +3312,9 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                         Err(err) if is_mid_apply_race_error(&err) => {
                             let _ = rescan_single_path(fs, store, anc, now)?;
                             return Ok(AncestorOutcome::ChangedRetry);
+                        }
+                        Err(err) if is_live_busy_error(fs, &err) => {
+                            return Ok(AncestorOutcome::Busy(busy_defer_reason(anc)));
                         }
                         Err(err) => return Err(err),
                     }
@@ -3067,6 +3390,10 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                                         clear_pending_op(store)?;
                                         let _ = rescan_single_path(fs, store, anc, now)?;
                                         return Ok(AncestorOutcome::ChangedRetry);
+                                    }
+                                    Err(err) if is_live_busy_error(fs, &err) => {
+                                        clear_pending_op(store)?;
+                                        return Ok(AncestorOutcome::Busy(busy_defer_reason(anc)));
                                     }
                                     Err(err) => return Err(err),
                                 }
@@ -3156,6 +3483,10 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                                         clear_pending_op(store)?;
                                         let _ = rescan_single_path(fs, store, anc, now)?;
                                         return Ok(AncestorOutcome::ChangedRetry);
+                                    }
+                                    Err(err) if is_live_busy_error(fs, &err) => {
+                                        clear_pending_op(store)?;
+                                        return Ok(AncestorOutcome::Busy(busy_defer_reason(anc)));
                                     }
                                     Err(err) => return Err(err),
                                 }
@@ -3637,6 +3968,21 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
                             .to_string(),
                     });
                 }
+                SafeReplaceResult::Deferred { reason, binned } => {
+                    if binned {
+                        mark_needs_rescan_and_clear_pending(
+                            store,
+                            &[&target_path],
+                            vec![rep_bin.clone()],
+                        )?;
+                    } else {
+                        clear_pending_op(store)?;
+                    }
+                    return Err(SyncError::Conflict {
+                        path: target_path,
+                        reason,
+                    });
+                }
             }
         } else {
             // Move aside existing non-file or cross-kind entry safely first.
@@ -3666,6 +4012,16 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
                                     return Err(SyncError::Conflict {
                                         path: target_path,
                                         reason: "file on disk changed during restore".to_string(),
+                                    });
+                                }
+                                SafeDeleteResult::Deferred(reason) => {
+                                    if let Some(ref st) = staged_tmp {
+                                        let _ = fs.remove_tmp(st);
+                                    }
+                                    clear_pending_op(store)?;
+                                    return Err(SyncError::Conflict {
+                                        path: target_path,
+                                        reason,
                                     });
                                 }
                             }
@@ -3890,6 +4246,13 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
                                             .to_string(),
                                     });
                                 }
+                                SafeDeleteResult::Deferred(reason) => {
+                                    clear_pending_op(store)?;
+                                    return Err(SyncError::Conflict {
+                                        path: clean_conflict,
+                                        reason,
+                                    });
+                                }
                             }
                         }
                     }
@@ -4073,6 +4436,13 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
                                                     .to_string(),
                                         });
                                     }
+                                    SafeDeleteResult::Deferred(reason) => {
+                                        clear_pending_op(store)?;
+                                        return Err(SyncError::Conflict {
+                                            path: orig_path,
+                                            reason,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -4199,12 +4569,27 @@ fn safe_replace_live_file<F: SyncFs, S: IndexStore>(
         }
         Ok(false) => {}
         Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeReplaceResult::RaceBeforePlace),
+        Err(err) if is_live_busy_error(fs, &err) => {
+            if fs.stat_tmp(staged_tmp)?.is_some()
+                && tmp_matches_hash(fs, staged_tmp, target.hash, target.size)?
+            {
+                let _ = fs.remove_tmp(staged_tmp);
+            }
+            return Ok(SafeReplaceResult::Deferred {
+                reason: busy_defer_reason(live_path),
+                binned: false,
+            });
+        }
         Err(err) => return Err(err),
     }
 
     // Path 2: atomic replace with backup (`ReplaceFileW` on Windows).
     // Same principle: NO blind swap-back! Identify `claim_tmp` by hash -> bin or conflict copy,
     // then verify `live_path` (re-hashing since Windows `file_identity` is `None`).
+    // Explicitly handles all three documented `ReplaceFileW` partial-failure codes
+    // (`ERROR_UNABLE_TO_REMOVE_REPLACED` 1175, `ERROR_UNABLE_TO_MOVE_REPLACEMENT` 1176,
+    // `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` 1177) plus sharing/delete-pending errors so user bytes
+    // are never lost and a locked file defers cleanly without aborting the page.
     match fs.replace_live_with_tmp_backup(staged_tmp, live_path, claim_tmp) {
         Ok(true) => {
             let binned =
@@ -4222,6 +4607,20 @@ fn safe_replace_live_file<F: SyncFs, S: IndexStore>(
             return Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned });
         }
         Ok(false) => {}
+        Err(err) if is_replace_partial_failure(&err) || is_live_busy_error(fs, &err) => {
+            return recover_replace_partial_failure(
+                fs,
+                store,
+                staged_tmp,
+                claim_tmp,
+                live_path,
+                expected_old_hash,
+                expected_old_size,
+                bin_entry,
+                target,
+                now,
+            );
+        }
         Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeReplaceResult::RaceBeforePlace),
         Err(err) => return Err(err),
     }
@@ -4230,12 +4629,24 @@ fn safe_replace_live_file<F: SyncFs, S: IndexStore>(
     match fs.move_live_to_tmp_no_replace(live_path, claim_tmp) {
         Ok(()) => {}
         Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeReplaceResult::RaceBeforePlace),
+        Err(err) if is_live_busy_error(fs, &err) => {
+            if fs.stat_tmp(staged_tmp)?.is_some()
+                && tmp_matches_hash(fs, staged_tmp, target.hash, target.size)?
+            {
+                let _ = fs.remove_tmp(staged_tmp);
+            }
+            return Ok(SafeReplaceResult::Deferred {
+                reason: busy_defer_reason(live_path),
+                binned: false,
+            });
+        }
         Err(err) => return Err(err),
     }
 
     if !tmp_matches_hash(fs, claim_tmp, Some(expected_old_hash), expected_old_size)? {
         // Put-back result is ALWAYS handled: if the person already created a newer file at
-        // `live_path`, preserve `claim_tmp` as a conflict copy instead of leaving it in tmp.
+        // `live_path` (or `live_path` is locked/delete-pending), preserve `claim_tmp` as a
+        // conflict copy instead of leaving it in tmp.
         put_back_or_preserve_tmp(fs, store, claim_tmp, live_path, now)?;
         return Ok(SafeReplaceResult::RaceBeforePlace);
     }
@@ -4256,6 +4667,133 @@ fn safe_replace_live_file<F: SyncFs, S: IndexStore>(
             let _ = fs.remove_tmp(staged_tmp);
             Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned: true })
         }
+        Err(err) if is_live_busy_error(fs, &err) => {
+            if fs.stat_tmp(staged_tmp)?.is_some()
+                && tmp_matches_hash(fs, staged_tmp, target.hash, target.size)?
+            {
+                let _ = fs.remove_tmp(staged_tmp);
+            }
+            // Old file was moved to bin before `live_path` became blocked; try restoring it so
+            // `live_path` is not left absent on disk.
+            if !bin_entry.storage_name.is_empty() && fs.stat_bin(&bin_entry.storage_name)?.is_some()
+            {
+                let rt = next_tmp_name("putback");
+                register_staged_tmp(store, &rt)?;
+                let restored = if fs.copy_bin_to_tmp(&bin_entry.storage_name, &rt).is_ok() {
+                    let _ = prepare_staged_tmp_metadata(
+                        fs,
+                        &rt,
+                        bin_entry.original_mtime,
+                        bin_entry.mode,
+                    );
+                    match fs.commit_tmp_to_live_no_replace(&rt, live_path) {
+                        Ok(()) => {
+                            let _ = fs.remove_bin_file(&bin_entry.storage_name);
+                            let _ = fs.remove_bin_file(&bin_meta_name(&bin_entry.id));
+                            Some(Ok(()))
+                        }
+                        Err(e) if is_mid_apply_race_error(&e) => {
+                            let _ = fs.remove_tmp(&rt);
+                            Some(Err(true))
+                        }
+                        Err(_) => {
+                            let _ = fs.remove_tmp(&rt);
+                            Some(Err(false))
+                        }
+                    }
+                } else {
+                    let _ = fs.remove_tmp(&rt);
+                    None
+                };
+                unregister_staged_tmp(store, &rt)?;
+                match restored {
+                    Some(Ok(())) => {
+                        return Ok(SafeReplaceResult::Deferred {
+                            reason: busy_defer_reason(live_path),
+                            binned: false,
+                        });
+                    }
+                    Some(Err(true)) => {
+                        return Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned: true });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(SafeReplaceResult::Deferred {
+                reason: busy_defer_reason(live_path),
+                binned: true,
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Inspects on-disk state after a Windows `ReplaceFileW` partial failure (`1175`, `1176`, `1177`)
+/// or sharing violation, ensuring displaced bytes in `claim_tmp` are restored to `live_path`,
+/// binned if a newer file took `live_path`, or preserved as a live conflict copy — never lost.
+#[allow(clippy::too_many_arguments)]
+fn recover_replace_partial_failure<F: SyncFs, S: IndexStore>(
+    fs: &F,
+    store: &mut S,
+    staged_tmp: &str,
+    claim_tmp: &str,
+    live_path: &str,
+    expected_old_hash: Hash,
+    expected_old_size: u64,
+    bin_entry: &BinEntry,
+    target: &IndexRecord,
+    now: Timestamp,
+) -> Result<SafeReplaceResult> {
+    if fs.stat_tmp(staged_tmp)?.is_some() {
+        if tmp_matches_hash(fs, staged_tmp, target.hash, target.size)? {
+            let _ = fs.remove_tmp(staged_tmp);
+        } else {
+            preserve_tmp_as_conflict_copy(fs, store, staged_tmp, live_path, now)?;
+        }
+    }
+
+    if fs.stat_tmp(claim_tmp)?.is_none() {
+        return Ok(SafeReplaceResult::Deferred {
+            reason: busy_defer_reason(live_path),
+            binned: false,
+        });
+    }
+
+    let matches_expected_old =
+        tmp_matches_hash(fs, claim_tmp, Some(expected_old_hash), expected_old_size)?;
+
+    match fs.commit_tmp_to_live_no_replace(claim_tmp, live_path) {
+        Ok(()) => {
+            if matches_expected_old {
+                Ok(SafeReplaceResult::Deferred {
+                    reason: busy_defer_reason(live_path),
+                    binned: false,
+                })
+            } else {
+                Ok(SafeReplaceResult::RaceBeforePlace)
+            }
+        }
+        Err(err) if is_mid_apply_race_error(&err) => {
+            let binned = if matches_expected_old {
+                write_bin_meta_file(fs, bin_entry)?;
+                fs.move_tmp_to_bin_no_replace(claim_tmp, &bin_entry.storage_name)?;
+                true
+            } else {
+                preserve_tmp_as_conflict_copy(fs, store, claim_tmp, live_path, now)?;
+                false
+            };
+            Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned })
+        }
+        Err(err) if is_live_busy_error(fs, &err) => {
+            // `live_path` cannot accept the put-back (for example delete-pending on Windows).
+            // Preserve `claim_tmp` as a live conflict copy so zero user bytes can be lost; if
+            // `claim_tmp` itself is locked, propagating `Err` keeps `PendingOp::Place` armed.
+            preserve_tmp_as_conflict_copy(fs, store, claim_tmp, live_path, now)?;
+            Ok(SafeReplaceResult::Deferred {
+                reason: busy_defer_reason(live_path),
+                binned: false,
+            })
+        }
         Err(err) => Err(err),
     }
 }
@@ -4274,6 +4812,9 @@ fn safe_delete_live_file<F: SyncFs, S: IndexStore>(
     match fs.move_live_to_tmp_no_replace(live_path, claim_tmp) {
         Ok(()) => {}
         Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeDeleteResult::RaceChanged),
+        Err(err) if is_live_busy_error(fs, &err) => {
+            return Ok(SafeDeleteResult::Deferred(busy_defer_reason(live_path)));
+        }
         Err(err) => return Err(err),
     }
 
@@ -4959,7 +5500,7 @@ fn put_back_or_preserve_tmp<F: SyncFs, S: IndexStore>(
 ) -> Result<()> {
     match fs.commit_tmp_to_live_no_replace(tmp_name, live_path) {
         Ok(()) => Ok(()),
-        Err(err) if is_mid_apply_race_error(&err) => {
+        Err(err) if is_mid_apply_race_error(&err) || is_live_busy_error(fs, &err) => {
             preserve_tmp_as_conflict_copy(fs, store, tmp_name, live_path, now)?;
             Ok(())
         }
