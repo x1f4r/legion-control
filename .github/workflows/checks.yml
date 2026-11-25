@@ -9,8 +9,12 @@ on:
         description: Run only the Windows Rust job
         type: boolean
         default: false
+      macos_pipe_relay_only:
+        description: Run only the macOS pipe and stream_relay tests
+        type: boolean
+        default: false
       repeat_count:
-        description: Number of times to run the Windows process and job tests (1-15)
+        description: Number of times to run targeted tests (1-15)
         type: number
         default: 1
 permissions:
@@ -26,7 +30,7 @@ concurrency:
 jobs:
   scripts:
     name: Scripts and UI (${{ matrix.os }})
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
     strategy:
       fail-fast: false
       matrix:
@@ -42,8 +46,50 @@ jobs:
           node-version: 24
       - run: bash scripts/check.sh scripts
 
+  macos-pipe-relay:
+    name: macOS pipe and stream_relay
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_pipe_relay_only }}
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Run macOS pipe and stream_relay tests
+        env:
+          REPEAT_COUNT: ${{ inputs.repeat_count }}
+        run: |
+          set -euo pipefail
+          case "$REPEAT_COUNT" in
+            ''|*[!0-9]*)
+              echo "repeat_count must be an integer between 1 and 15 (got '$REPEAT_COUNT')" >&2
+              exit 2
+              ;;
+          esac
+          if [ "$REPEAT_COUNT" -lt 1 ] || [ "$REPEAT_COUNT" -gt 15 ]; then
+            echo "repeat_count must be between 1 and 15 (got '$REPEAT_COUNT')" >&2
+            exit 2
+          fi
+          for i in $(seq 1 "$REPEAT_COUNT"); do
+            echo "=== macOS pipe and stream_relay run $i/$REPEAT_COUNT ==="
+            cargo test -p legion-os --lib pipe:: --locked -- --nocapture
+            cargo test -p legion-cli --test stream_relay --locked
+          done
+
   rust:
     name: Rust (${{ matrix.os }})
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.macos_pipe_relay_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -210,7 +256,7 @@ jobs:
 
   private-data:
     name: Private data
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -229,7 +275,7 @@ jobs:
 
   shellcheck:
     name: ShellCheck
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -243,7 +289,7 @@ jobs:
 
   powershell:
     name: PSScriptAnalyzer
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -262,7 +308,7 @@ jobs:
 
   ui-browser:
     name: UI browser
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -292,7 +338,7 @@ jobs:
 
   rust-move-between-places:
     name: Rust move-between-places (ubuntu-latest)
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows_rust_only }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

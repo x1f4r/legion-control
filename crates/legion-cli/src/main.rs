@@ -371,7 +371,7 @@ async fn serve_stream(
     let outcome = tokio::select! {
         result = &mut served => Some(result),
         () = revoke_abort.cancelled() => {
-            tokio::time::timeout(Duration::from_millis(500), served)
+            tokio::time::timeout(Duration::from_millis(750), served)
                 .await
                 .ok()
         }
