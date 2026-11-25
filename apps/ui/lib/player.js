@@ -19,7 +19,7 @@ export const VOLUME_STEP = 0.1;
 export const SEEK_FLASH_MS = 600;
 export const PLAYBACK_SPEEDS = Object.freeze([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]);
 
-const RESUME_STORAGE_KEY = 'legion.player.resume.v1';
+export const RESUME_STORAGE_KEY = 'legion.player.resume.v1';
 
 // ── Time & spoken value formatting ───────────────────────────────────────────────────────────
 
@@ -259,11 +259,37 @@ export function createResumeStore(
     }
   }
 
+  function renameMachine(oldName, newName) {
+    const from = String(oldName || '').trim();
+    const to = String(newName || '').trim();
+    if (!from || !to || from === to) return false;
+    const prefix = `${from}\0`;
+    const map = readAll();
+    let changed = false;
+    const next = { ...map };
+    for (const key of Object.keys(map)) {
+      if (!key.startsWith(prefix)) continue;
+      const destKey = `${to}\0${key.slice(prefix.length)}`;
+      if (!Object.prototype.hasOwnProperty.call(next, destKey)) {
+        next[destKey] = map[key];
+      }
+      delete next[key];
+      changed = true;
+    }
+    if (lastWriteKey && lastWriteKey.startsWith(prefix)) {
+      lastWriteKey = `${to}\0${lastWriteKey.slice(prefix.length)}`;
+    }
+    if (changed) {
+      writeAll(prune(next));
+    }
+    return changed;
+  }
+
   function count() {
     return Object.keys(readAll()).length;
   }
 
-  return { load, save, savePeriodic, clear, count };
+  return { load, save, savePeriodic, clear, renameMachine, count };
 }
 
 // ── Controlled-clock video overlay, tap/double-tap, pending-seek, and stall controller ───────

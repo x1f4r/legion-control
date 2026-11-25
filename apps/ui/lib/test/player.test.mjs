@@ -33,6 +33,7 @@ import {
   RESUME_MAX_ENTRIES,
   RESUME_MIN_DURATION_S,
   RESUME_SAVE_INTERVAL_MS,
+  RESUME_STORAGE_KEY,
   shouldMusicPrevRestart,
   STALL_SPINNER_DELAY_MS,
   stripFileExtension,
@@ -414,6 +415,38 @@ test('resume store throttles periodic writes to at most every 10 s while pause, 
   assert.equal(store.savePeriodic(idB, 15, 1200, clock.now()), true);
   assert.equal(writes, 5);
   assert.equal(store.load(idB, 1200), 15);
+});
+
+test('resume store renameMachine moves local and placeholder entries onto the resolved node name without clobbering existing ones', () => {
+  const storage = createMemoryStorage();
+  const store = createResumeStore(storage);
+  assert.equal(RESUME_STORAGE_KEY, 'legion.player.resume.v1');
+
+  const localMovie = { machine: 'local', path: '/home/me/Videos/Film.mp4', size: 1000, mtime: 'm1' };
+  const pendingTrack = { machine: 'This computer', path: '/home/me/Music/Set.flac', size: 2000, mtime: 'm2' };
+  const conflictLocal = { machine: 'local', path: '/home/me/Videos/Both.mp4', size: 3000, mtime: 'm3' };
+  const conflictNative = { machine: 'studio', path: '/home/me/Videos/Both.mp4', size: 3000, mtime: 'm3' };
+  const otherMachine = { machine: 'tower', path: '/home/me/Videos/Film.mp4', size: 1000, mtime: 'm1' };
+
+  store.save(localMovie, 420, 1800, 100);
+  store.save(pendingTrack, 610, 2400, 200);
+  store.save(conflictLocal, 150, 1800, 300);
+  store.save(conflictNative, 900, 1800, 400);
+  store.save(otherMachine, 333, 1800, 500);
+
+  assert.equal(store.renameMachine('local', 'studio'), true);
+  assert.equal(store.renameMachine('This computer', 'studio'), true);
+  assert.equal(store.renameMachine('local', 'studio'), false);
+
+  assert.equal(store.load(localMovie, 1800), null);
+  assert.equal(store.load({ ...localMovie, machine: 'studio' }, 1800), 420);
+  assert.equal(store.load(pendingTrack, 2400), null);
+  assert.equal(store.load({ ...pendingTrack, machine: 'studio' }, 2400), 610);
+  // Existing entry under the real machine name wins over the older local entry.
+  assert.equal(store.load(conflictNative, 1800), 900);
+  assert.equal(store.load(conflictLocal, 1800), null);
+  // Unrelated machines are untouched.
+  assert.equal(store.load(otherMachine, 1800), 333);
 });
 
 // ── Queue, Music metadata, formatting, wire extractors, and keys ─────────────────────────────
