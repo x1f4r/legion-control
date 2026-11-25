@@ -162,6 +162,9 @@ pub struct ContentStreamLimits {
     pub audit_coalesce_window: Duration,
     /// Interval between background session/ticket/audit sweeps (default 10s).
     pub sweep_interval: Duration,
+    /// Interval between independent mid-stream revocation and policy checks on active content
+    /// responses (default 1s).
+    pub liveness_check_interval: Duration,
 }
 
 impl Default for ContentStreamLimits {
@@ -173,14 +176,23 @@ impl Default for ContentStreamLimits {
             min_rate_bytes: 40 * 1024,
             audit_coalesce_window: content::DEFAULT_AUDIT_COALESCE_WINDOW,
             sweep_interval: SWEEP,
+            liveness_check_interval: Duration::from_secs(1),
         }
     }
 }
 
-/// Request extension injected per TCP connection so streaming content bodies can enable write
-/// stall and minimum-rate enforcement on their underlying socket.
+/// Socket send-buffer cap applied when a TCP connection streams a content response (128 KiB),
+/// bounding kernel-buffered bytes on revocation without hurting loopback or LAN throughput.
+pub(crate) const CONTENT_SOCKET_SNDBUF: usize = 128 * 1024;
+
+/// Request extension injected per TCP connection so streaming content bodies can enable socket
+/// send-buffer bounding, write-stall / minimum-rate enforcement, and immediate RST abort on
+/// revocation.
 #[derive(Clone)]
-pub(crate) struct ConnectionStreamFlag(pub(crate) Arc<AtomicUsize>);
+pub(crate) struct ConnectionControl {
+    pub(crate) active: Arc<AtomicUsize>,
+    pub(crate) abort: CancellationToken,
+}
 
 /// The HTTP door over one node.
 pub struct HttpDoor {
@@ -278,6 +290,7 @@ impl HttpDoor {
             content_tickets: Arc::new(TicketTable::new()),
             content_limiter: ContentLimiter::with_limits(content_limits.concurrency),
             content_audit: ContentAuditCoalescer::with_window(content_limits.audit_coalesce_window),
+            content_liveness_interval: content_limits.liveness_check_interval,
             node: self.node.clone(),
             router: Arc::clone(&self.router),
             port: local.port(),
@@ -330,16 +343,21 @@ impl HttpDoor {
                 },
             };
             let active_streams = Arc::new(AtomicUsize::new(0));
+            let conn_abort = CancellationToken::new();
             let monitored = MonitoredTcpStream::new(
                 stream,
                 Arc::clone(&active_streams),
+                conn_abort.clone(),
                 content_limits.write_idle_timeout,
                 content_limits.min_rate_window,
                 content_limits.min_rate_bytes,
             );
             let service = InjectConnectionFlag {
                 inner: TowerToHyperService::new(app.clone()),
-                flag: ConnectionStreamFlag(active_streams),
+                flag: ConnectionControl {
+                    active: active_streams,
+                    abort: conn_abort.clone(),
+                },
             };
             let closing = closing.clone();
             connections.spawn(async move {
@@ -351,6 +369,12 @@ impl HttpDoor {
                 let connection = builder.serve_connection(TokioIo::new(monitored), service);
                 tokio::pin!(connection);
                 tokio::select! {
+                    biased;
+                    () = conn_abort.cancelled() => {
+                        // Drop `connection` immediately so `MonitoredTcpStream::drop` applies
+                        // SO_LINGER(0) (TCP RST) to discard kernel-buffered bytes and drops the
+                        // active content body, buffers, and remote stream pipe at once.
+                    }
                     _ = connection.as_mut() => {}
                     () = closing.cancelled() => {
                         connection.as_mut().graceful_shutdown();
@@ -394,6 +418,8 @@ pub(crate) struct Shared {
     content_limiter: ContentLimiter,
     /// Coalesced per-ticket `content.read` audit tracker.
     content_audit: ContentAuditCoalescer,
+    /// Interval between independent mid-stream liveness/revocation checks.
+    content_liveness_interval: Duration,
 }
 
 impl Shared {
@@ -426,11 +452,12 @@ impl Shared {
     }
 }
 
-/// Hyper service adapter that injects [`ConnectionStreamFlag`] into every request on a TCP
-/// connection so streaming content responses can activate socket-level stall and rate limits.
+/// Hyper service adapter that injects [`ConnectionControl`] into every request on a TCP
+/// connection so streaming content responses can activate socket-level stall/rate limits, send
+/// buffer bounds, and immediate revocation abort.
 struct InjectConnectionFlag {
     inner: TowerToHyperService<axum::Router>,
-    flag: ConnectionStreamFlag,
+    flag: ConnectionControl,
 }
 
 impl hyper::service::Service<axum::http::Request<hyper::body::Incoming>> for InjectConnectionFlag {
@@ -460,6 +487,8 @@ impl hyper::service::Service<axum::http::Request<hyper::body::Incoming>> for Inj
 struct MonitoredTcpStream {
     inner: TcpStream,
     active: Arc<AtomicUsize>,
+    abort: CancellationToken,
+    sndbuf_applied: bool,
     write_idle_timeout: Duration,
     min_rate_window: Duration,
     min_rate_bytes: u64,
@@ -471,10 +500,19 @@ struct MonitoredTcpStream {
     rate_sleep: Option<Pin<Box<Sleep>>>,
 }
 
+impl Drop for MonitoredTcpStream {
+    fn drop(&mut self) {
+        if self.abort.is_cancelled() {
+            let _ = socket2::SockRef::from(&self.inner).set_linger(Some(Duration::ZERO));
+        }
+    }
+}
+
 impl MonitoredTcpStream {
     fn new(
         inner: TcpStream,
         active: Arc<AtomicUsize>,
+        abort: CancellationToken,
         write_idle_timeout: Duration,
         min_rate_window: Duration,
         min_rate_bytes: u64,
@@ -482,6 +520,8 @@ impl MonitoredTcpStream {
         Self {
             inner,
             active,
+            abort,
+            sndbuf_applied: false,
             write_idle_timeout,
             min_rate_window,
             min_rate_bytes,
@@ -508,11 +548,22 @@ impl MonitoredTcpStream {
         cx: &mut Context<'_>,
         write_op: impl FnOnce(&mut TcpStream, &mut Context<'_>) -> Poll<io::Result<usize>>,
     ) -> Poll<io::Result<usize>> {
+        if self.abort.is_cancelled() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "content stream was revoked",
+            )));
+        }
         if self.active.load(Ordering::Acquire) == 0 {
             if self.monitoring_active {
                 self.reset_monitoring();
             }
             return write_op(&mut self.inner, cx);
+        }
+        if !self.sndbuf_applied {
+            let _ = socket2::SockRef::from(&self.inner)
+                .set_send_buffer_size(CONTENT_SOCKET_SNDBUF);
+            self.sndbuf_applied = true;
         }
         self.monitoring_active = true;
 
@@ -1355,6 +1406,7 @@ mod tests {
         let mut monitored = MonitoredTcpStream::new(
             server,
             Arc::clone(&active),
+            CancellationToken::new(),
             Duration::from_secs(5),
             Duration::from_millis(120),
             64 * 1024,
@@ -1418,6 +1470,7 @@ mod tests {
         let mut monitored = MonitoredTcpStream::new(
             server,
             active,
+            CancellationToken::new(),
             Duration::from_secs(5),
             Duration::from_millis(200),
             512 * 1024,

@@ -140,6 +140,14 @@ fn main() -> ExitCode {
             "content_remote_starvation_isolation_and_mid_stream_revocation",
             content_remote_starvation_isolation_and_mid_stream_revocation,
         ),
+        (
+            "content_revocation_aborts_slow_and_stalled_readers_within_bound",
+            content_revocation_aborts_slow_and_stalled_readers_within_bound,
+        ),
+        (
+            "content_first_use_audit_survives_sigkill",
+            content_first_use_audit_survives_sigkill,
+        ),
     ];
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -3648,4 +3656,271 @@ allow = []
     );
 
     server.stop();
+}
+
+fn content_revocation_aborts_slow_and_stalled_readers_within_bound() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"laptop\"\n");
+    home.write_config(
+        "policy.toml",
+        "\
+[principals.slow]
+role = \"observer\"
+
+[principals.stalled]
+role = \"observer\"
+
+[principals.admin]
+role = \"owner\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/projects/**\"]
+",
+    );
+    let slow_token = make_token(&home, &["slow-tok", "slow"]);
+    let stalled_token = make_token(&home, &["stalled-tok", "stalled"]);
+    let admin_token = make_token(&home, &["admin-tok", "admin", "allow_owner=true"]);
+
+    let projects = home.home().join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    let big_path = projects.join("movie.bin");
+    let big_len = 16 * 1024 * 1024usize;
+    let big_bytes: Vec<u8> = (0..big_len).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&big_path, &big_bytes).unwrap();
+
+    let mut server = Server::start(&home);
+
+    // 1. Slow 20 KB/s reader: token removal must reset the connection within ~2 seconds and bound
+    //    total bytes received after revocation (well under 512 KiB, never megabytes / 120 seconds).
+    let mint_slow = http(
+        server.port,
+        "POST",
+        "/v1/content",
+        &[
+            ("Authorization", format!("Bearer {slow_token}")),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+        br#"{"path":"~/projects/movie.bin"}"#,
+    );
+    assert_eq!(mint_slow.status, 200, "{}", mint_slow.text());
+    let slow_url = mint_slow.json()["url"].as_str().unwrap().to_owned();
+
+    let mut slow_conn = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    slow_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        slow_conn,
+        "GET {slow_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    slow_conn.flush().unwrap();
+    let mut slow_reader = BufReader::new(slow_conn);
+    let (status, _) = read_head(&mut slow_reader);
+    assert_eq!(status, 200);
+
+    // Read a few small chunks at ~20 KB/s before revoking the token.
+    let mut chunk = [0u8; 4096];
+    slow_reader.read_exact(&mut chunk).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let rm_slow = server.call(
+        &admin_token,
+        json!({"tool": "token.remove", "args": {"name": "slow-tok"}}),
+    );
+    assert_eq!(rm_slow.status, 200, "{}", rm_slow.text());
+    let revoked_at = Instant::now();
+
+    // Keep pacing at 20 KB/s until the server's independent liveness watcher flushes the revoked
+    // ticket's `content.read` audit record and resets the TCP connection (must happen within ~2s).
+    let mut server_cut_at: Option<Duration> = None;
+    let mut bytes_after_revoke = 0usize;
+    let mut eof_or_reset = false;
+    while revoked_at.elapsed() < Duration::from_secs(4) {
+        if server_cut_at.is_none()
+            && home.audit().iter().any(|e| {
+                e["tool"] == "content.read"
+                    && e["principal"] == "slow"
+                    && e["args"]["path"] == "~/projects/movie.bin"
+            })
+        {
+            server_cut_at = Some(revoked_at.elapsed());
+        }
+        match slow_reader.read(&mut chunk) {
+            Ok(0) | Err(_) => {
+                eof_or_reset = true;
+                break;
+            }
+            Ok(n) => {
+                bytes_after_revoke += n;
+                if server_cut_at.is_some() {
+                    // Server has already reset the socket; drain any bytes that had already
+                    // landed in the client's own receive buffer before the RST arrived.
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    if !eof_or_reset {
+        let mut tail = Vec::new();
+        let _ = slow_reader.read_to_end(&mut tail);
+        bytes_after_revoke += tail.len();
+    }
+    let server_cut_elapsed = server_cut_at.expect(
+        "expected server liveness watcher to revoke, flush audit, and reset 20 KB/s reader within 4s",
+    );
+    assert!(
+        server_cut_elapsed <= Duration::from_secs(3),
+        "expected server to abort 20 KB/s reader within ~2s of revocation, took {server_cut_elapsed:?}"
+    );
+    assert!(
+        bytes_after_revoke <= 512 * 1024,
+        "expected bounded post-revocation bytes (<= 512 KiB), got {bytes_after_revoke} bytes (server cut at {server_cut_elapsed:?})"
+    );
+
+    // 2. Completely stalled reader (stops calling read altogether): token removal must reset the
+    //    connection independently of body polling within ~2 seconds.
+    let mint_stalled = http(
+        server.port,
+        "POST",
+        "/v1/content",
+        &[
+            ("Authorization", format!("Bearer {stalled_token}")),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+        br#"{"path":"~/projects/movie.bin"}"#,
+    );
+    assert_eq!(mint_stalled.status, 200, "{}", mint_stalled.text());
+    let stalled_url = mint_stalled.json()["url"].as_str().unwrap().to_owned();
+
+    let mut stalled_conn = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    stalled_conn
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    write!(
+        stalled_conn,
+        "GET {stalled_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+    stalled_conn.flush().unwrap();
+    let mut stalled_reader = BufReader::new(stalled_conn);
+    let (status, _) = read_head(&mut stalled_reader);
+    assert_eq!(status, 200);
+    let mut initial = [0u8; 16 * 1024];
+    stalled_reader.read_exact(&mut initial).unwrap();
+
+    // Stop reading completely and revoke the token.
+    let rm_stalled = server.call(
+        &admin_token,
+        json!({"tool": "token.remove", "args": {"name": "stalled-tok"}}),
+    );
+    assert_eq!(rm_stalled.status, 200, "{}", rm_stalled.text());
+    let stalled_revoked_at = Instant::now();
+
+    // Wait for the server's independent liveness watcher to revoke and reset the stalled socket
+    // while the client never reads a single byte.
+    let mut stalled_cut_at: Option<Duration> = None;
+    while stalled_revoked_at.elapsed() < Duration::from_secs(4) {
+        if home.audit().iter().any(|e| {
+            e["tool"] == "content.read"
+                && e["principal"] == "stalled"
+                && e["args"]["path"] == "~/projects/movie.bin"
+        }) {
+            stalled_cut_at = Some(stalled_revoked_at.elapsed());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stalled_cut_elapsed = stalled_cut_at
+        .expect("expected server liveness watcher to abort stalled reader within 4s");
+    assert!(
+        stalled_cut_elapsed <= Duration::from_secs(3),
+        "stalled reader was not aborted promptly after revocation: {stalled_cut_elapsed:?}"
+    );
+
+    let mut tail = Vec::new();
+    let read_res = stalled_reader.read_to_end(&mut tail);
+    assert!(
+        read_res.is_err() || initial.len() + tail.len() < big_len,
+        "stalled reader must be aborted early after revocation (got {} / {big_len} bytes)",
+        initial.len() + tail.len()
+    );
+    assert!(
+        tail.len() <= 512 * 1024,
+        "stalled reader received too many buffered bytes after revocation: {} bytes",
+        tail.len()
+    );
+
+    server.stop();
+}
+
+fn content_first_use_audit_survives_sigkill() {
+    let home = Home::new();
+    home.write_config("node.toml", "name = \"laptop\"\n");
+    home.write_config(
+        "policy.toml",
+        "\
+[principals.phone]
+role = \"observer\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [\"~/docs/**\"]
+",
+    );
+    let token = make_token(&home, &["phone-tok", "phone"]);
+    let docs = home.home().join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join("secret.txt"), b"durable audit payload").unwrap();
+
+    let mut server = Server::start(&home);
+    let mint = http(
+        server.port,
+        "POST",
+        "/v1/content",
+        &[
+            ("Authorization", format!("Bearer {token}")),
+            ("Content-Type", "application/json".to_owned()),
+        ],
+        br#"{"path":"~/docs/secret.txt"}"#,
+    );
+    assert_eq!(mint.status, 200, "{}", mint.text());
+    let url = mint.json()["url"].as_str().unwrap().to_owned();
+
+    // First use of the ticket (one range GET).
+    let first = http(
+        server.port,
+        "GET",
+        &url,
+        &[("Range", "bytes=0-6".to_owned())],
+        b"",
+    );
+    assert_eq!(first.status, 206);
+    assert_eq!(first.body, b"durable");
+
+    // Kill the door abruptly (SIGKILL on Unix / TerminateProcess on Windows) before any
+    // coalescing window or graceful shutdown flush can run.
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+
+    let audit = home.audit();
+    let opens: Vec<&Value> = audit
+        .iter()
+        .filter(|e| {
+            e["tool"] == "content.open"
+                && e["principal"] == "phone"
+                && e["target"] == "laptop"
+                && e["outcome"] == "ok"
+                && e["args"]["path"] == "~/docs/secret.txt"
+        })
+        .collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "expected immediate durable content.open audit entry surviving hard kill: {audit:?}"
+    );
 }

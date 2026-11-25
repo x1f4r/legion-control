@@ -31,6 +31,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::header::{CACHE_CONTROL, HeaderValue, RETRY_AFTER};
 use axum::http::{Response, StatusCode};
+use http_body::Body as _;
 use legion_content::{
     ContentSource, ContentTime, CorpPolicy, MAX_PATH_BYTES, OpenRangeError, OpenedRange,
     ServeOptions, StreamHooks, Ticket, TicketRequest, encode_path_segment, extract_file_name,
@@ -43,8 +44,9 @@ use legion_core::{ContentError, ContentRequest, Door, Node};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ConnectionStreamFlag, Shared, read_body_limited, reply};
+use super::{ConnectionControl, Shared, read_body_limited, reply};
 use crate::Authenticated;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum JSON request body accepted by `POST /v1/content` (16 KiB).
 pub(crate) const MAX_CREATE_BODY: usize = 16 * 1024;
@@ -103,10 +105,10 @@ impl ContentAuditCoalescer {
         }
     }
 
-    /// Registers one successful range open for `ticket` and returns the shared byte counter for
-    /// the streaming body.
-    fn record_open(&self, ticket: &Ticket) -> Arc<AtomicU64> {
+    /// Registers one successful range open for `ticket` and returns `(bytes_counter, is_first_use)`.
+    fn record_open(&self, ticket: &Ticket) -> (Arc<AtomicU64>, bool) {
         let mut buckets = self.buckets.lock().unwrap_or_else(PoisonError::into_inner);
+        let is_first_use = !buckets.contains_key(&ticket.key_hash);
         let bucket = buckets
             .entry(ticket.key_hash)
             .or_insert_with(|| TicketAuditBucket {
@@ -120,7 +122,7 @@ impl ContentAuditCoalescer {
                 last_flushed: Instant::now(),
             });
         bucket.requests = bucket.requests.saturating_add(1);
-        Arc::clone(&bucket.bytes_served)
+        (Arc::clone(&bucket.bytes_served), is_first_use)
     }
 
     /// Flushes any bucket whose coalescing window has elapsed.
@@ -451,23 +453,29 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
     response
 }
 
-/// RAII guard that activates per-connection write-stall and minimum-rate monitoring while a
-/// content response body is actively streaming.
+/// RAII guard that activates per-connection write-stall, minimum-rate, and send-buffer limits
+/// while a content response body is streaming, and stops the independent revocation watcher when
+/// the response ends.
 struct ActiveContentStreamGuard {
     conn_active: Option<Arc<AtomicUsize>>,
+    stop_watcher: CancellationToken,
 }
 
 impl ActiveContentStreamGuard {
-    fn new(flag: Option<Arc<AtomicUsize>>) -> Self {
+    fn new(flag: Option<Arc<AtomicUsize>>, stop_watcher: CancellationToken) -> Self {
         if let Some(ref counter) = flag {
             counter.fetch_add(1, Ordering::Release);
         }
-        Self { conn_active: flag }
+        Self {
+            conn_active: flag,
+            stop_watcher,
+        }
     }
 }
 
 impl Drop for ActiveContentStreamGuard {
     fn drop(&mut self) {
+        self.stop_watcher.cancel();
         if let Some(ref counter) = self.conn_active {
             counter.fetch_sub(1, Ordering::Release);
         }
@@ -491,21 +499,22 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         );
     };
 
-    let bytes_slot: Arc<Mutex<Option<Arc<AtomicU64>>>> = Arc::new(Mutex::new(None));
+    let open_slot: Arc<Mutex<Option<(Ticket, Arc<AtomicU64>)>>> = Arc::new(Mutex::new(None));
     let source = Arc::new(DoorContentSource {
         shared: Arc::clone(&shared),
-        bytes_slot: Arc::clone(&bytes_slot),
+        open_slot: Arc::clone(&open_slot),
     });
 
-    let conn_flag = request
-        .extensions()
-        .get::<ConnectionStreamFlag>()
-        .map(|f| Arc::clone(&f.0));
+    let conn_ctrl = request.extensions().get::<ConnectionControl>().cloned();
+    let stop_watcher = CancellationToken::new();
 
     let hooks = StreamHooks {
         limiter: Some(shared.content_limiter.clone()),
         bytes_served: None,
-        active_guard: Some(Box::new(ActiveContentStreamGuard::new(conn_flag))),
+        active_guard: Some(Box::new(ActiveContentStreamGuard::new(
+            conn_ctrl.as_ref().map(|c| Arc::clone(&c.active)),
+            stop_watcher.clone(),
+        ))),
     };
 
     let response = handle_request(
@@ -518,18 +527,55 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         request.headers(),
         ServeOptions {
             corp: CorpPolicy::SameOrigin,
+            liveness_check_interval: shared.content_liveness_interval,
             ..ServeOptions::default()
         },
         hooks,
     )
     .await;
 
-    // Wrap the streaming body with the ticket's coalesced byte counter when `open_range` succeeded.
-    let bucket_counter = bytes_slot
+    // Wrap the streaming body with the ticket's coalesced byte counter and start an independent
+    // revocation watcher that aborts the TCP connection (TCP RST) even when a slow or stalled
+    // reader prevents body polling.
+    let opened = open_slot
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take();
-    if let Some(counter) = bucket_counter {
+    if let Some((ticket, counter)) = opened {
+        if let Some(ctrl) = conn_ctrl
+            && response.status().is_success()
+            && !response.body().is_end_stream()
+        {
+            let watch_shared = Arc::clone(&shared);
+            let watch_source = Arc::clone(&source);
+            let watch_interval = shared
+                .content_liveness_interval
+                .max(Duration::from_millis(50));
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = stop_watcher.cancelled() => break,
+                        () = watch_shared.link.shutdown.cancelled() => break,
+                        () = tokio::time::sleep(watch_interval) => {
+                            let live = watch_shared.content_tickets.is_live(&ticket.key_hash)
+                                && watch_source.check_live(&ticket).is_ok();
+                            if !live {
+                                let removed = watch_shared
+                                    .content_tickets
+                                    .revoke_holder_hashes(&ticket.holder);
+                                watch_shared
+                                    .content_audit
+                                    .flush_removed(&watch_shared.node, &removed)
+                                    .await;
+                                ctrl.abort.cancel();
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
         response.map(|body| {
             Body::new(AuditCountingBody {
                 inner: body,
@@ -537,6 +583,7 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
             })
         })
     } else {
+        stop_watcher.cancel();
         response.map(Body::new)
     }
 }
@@ -574,7 +621,7 @@ impl http_body::Body for AuditCountingBody {
 
 struct DoorContentSource {
     shared: Arc<Shared>,
-    bytes_slot: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    open_slot: Arc<Mutex<Option<(Ticket, Arc<AtomicU64>)>>>,
 }
 
 impl ContentSource for DoorContentSource {
@@ -624,11 +671,29 @@ impl ContentSource for DoorContentSource {
                 .await
             {
                 Ok(opened) => {
-                    let counter = self.shared.content_audit.record_open(ticket);
+                    let (counter, first_use) = self.shared.content_audit.record_open(ticket);
+                    if first_use {
+                        // Write one durable audit line immediately when a ticket is first used so
+                        // an access is always on record even if the door is killed before the
+                        // coalesced summary flushes.
+                        let args = json!({ "path": ticket.path });
+                        self.shared
+                            .node
+                            .record_audit(
+                                ticket.machine.clone(),
+                                Some(ticket.principal.clone()),
+                                Door::Http,
+                                "content.open".to_owned(),
+                                &args,
+                                started,
+                                &Ok(Value::Null),
+                            )
+                            .await;
+                    }
                     *self
-                        .bytes_slot
+                        .open_slot
                         .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Some(counter);
+                        .unwrap_or_else(PoisonError::into_inner) = Some((ticket.clone(), counter));
                     Ok(OpenedRange {
                         size: opened.size,
                         offset: opened.offset,
