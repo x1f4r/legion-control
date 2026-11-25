@@ -145,8 +145,8 @@ fn validate_incoming_record_detailed(
     remote: &IndexRecord,
     meta: &FolderMeta,
 ) -> std::result::Result<String, RecordValidationError> {
-    let clean_path =
-        validate_sync_path(&remote.path).map_err(|err| RecordValidationError::Invalid(err.to_string()))?;
+    let clean_path = validate_sync_path(&remote.path)
+        .map_err(|err| RecordValidationError::Invalid(err.to_string()))?;
 
     if validate_member_id(&remote.modified_by).is_err() {
         return Err(RecordValidationError::Invalid(format!(

@@ -128,6 +128,25 @@ enum SafeDeleteResult {
     RaceChanged,
 }
 
+enum AncestorOutcome {
+    Ready,
+    ChangedRetry,
+    Unstable,
+}
+
+fn is_mid_apply_race_error(err: &SyncError) -> bool {
+    matches!(
+        err,
+        SyncError::Conflict { .. }
+            | SyncError::Fs {
+                kind: FsErrorKind::NotFound
+                    | FsErrorKind::AlreadyExists
+                    | FsErrorKind::DirectoryNotEmpty,
+                ..
+            }
+    )
+}
+
 /// Recovers any incomplete [`PendingOp`] left by a crash or error and cleans only proven
 /// engine-written staged downloads from `.legion-sync/tmp/`, rescuing any unknown bytes into the
 /// live tree as conflict copies.
@@ -433,6 +452,7 @@ fn recover_place<F: SyncFs, S: IndexStore>(
                                 &mut target_record,
                                 staged_meta.as_ref(),
                                 true,
+                                now,
                             )? {
                                 commit_records_and_clear_pending(
                                     fs,
@@ -519,23 +539,8 @@ fn recover_place<F: SyncFs, S: IndexStore>(
                 mark_needs_rescan_and_clear_pending(store, &[&path], Vec::new())?;
                 return Ok(());
             }
-            EntryKind::Dir => {
-                fs.create_dir_all_live(&path)?;
-                record_disk_stat(fs, &path, &mut target_record)?;
-                let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
-                commit_records_and_clear_pending(
-                    fs,
-                    store,
-                    vec![target_record],
-                    persisted_bin.into_iter().collect(),
-                    Vec::new(),
-                    Vec::new(),
-                )?;
-                return Ok(());
-            }
-            EntryKind::Symlink => {
-                if let Some(ref target) = target_record.link_target {
-                    fs.create_symlink_live(&path, target)?;
+            EntryKind::Dir => match fs.create_dir_all_live(&path) {
+                Ok(()) => {
                     record_disk_stat(fs, &path, &mut target_record)?;
                     let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
                     commit_records_and_clear_pending(
@@ -547,6 +552,29 @@ fn recover_place<F: SyncFs, S: IndexStore>(
                         Vec::new(),
                     )?;
                     return Ok(());
+                }
+                Err(err) if is_mid_apply_race_error(&err) => {}
+                Err(err) => return Err(err),
+            },
+            EntryKind::Symlink => {
+                if let Some(ref target) = target_record.link_target {
+                    match fs.create_symlink_live(&path, target) {
+                        Ok(()) => {
+                            record_disk_stat(fs, &path, &mut target_record)?;
+                            let persisted_bin = bin_entry_if_present(fs, bin_entry)?;
+                            commit_records_and_clear_pending(
+                                fs,
+                                store,
+                                vec![target_record],
+                                persisted_bin.into_iter().collect(),
+                                Vec::new(),
+                                Vec::new(),
+                            )?;
+                            return Ok(());
+                        }
+                        Err(err) if is_mid_apply_race_error(&err) => {}
+                        Err(err) => return Err(err),
+                    }
                 }
             }
         }
@@ -752,14 +780,18 @@ fn recover_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     false
                 }
             }
-            EntryKind::Dir => {
-                fs.create_dir_all_live(&orig_path)?;
-                true
-            }
+            EntryKind::Dir => match fs.create_dir_all_live(&orig_path) {
+                Ok(()) => true,
+                Err(err) if is_mid_apply_race_error(&err) => false,
+                Err(err) => return Err(err),
+            },
             EntryKind::Symlink => {
                 if let Some(ref target) = winner_record.link_target {
-                    fs.create_symlink_live(&orig_path, target)?;
-                    true
+                    match fs.create_symlink_live(&orig_path, target) {
+                        Ok(()) => true,
+                        Err(err) if is_mid_apply_race_error(&err) => false,
+                        Err(err) => return Err(err),
+                    }
                 } else {
                     false
                 }
@@ -774,6 +806,7 @@ fn recover_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     &mut winner_record,
                     staged_meta.as_ref(),
                     true,
+                    now,
                 )?
             } else {
                 record_disk_stat(fs, &orig_path, &mut winner_record)?;
@@ -1112,9 +1145,10 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
             record.conflict_of = derive_conflict_of(&record, &meta);
             let chain = meta.advance_chain_fingerprint(seq, record.head_fingerprint());
             if record.deleted {
-                let encoded = encode_deletion_log_entries(&[
-                    FolderDeletionLogEntry::from_tombstone(&record),
-                ])?;
+                let encoded =
+                    encode_deletion_log_entries(&[FolderDeletionLogEntry::from_tombstone(
+                        &record,
+                    )])?;
                 fs.append_deletion_log(&encoded)?;
             }
             let mut batch = StoreBatch {
@@ -1143,6 +1177,9 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
             if update_disk_metadata && !record.deleted {
                 apply_live_metadata(fs, &record.path, record.mtime, record.mode)?;
                 let p = record.path.clone();
+                if fs.stat_live(&p)?.is_none() {
+                    return handle_local_changed(fs, store, &p, now);
+                }
                 record_disk_stat(fs, &p, &mut record)?;
             }
             let path = record.path.clone();
@@ -1255,10 +1292,14 @@ pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
     let from_path = from_record.path.clone();
     let to_path = to_record.path.clone();
 
-    if !ensure_ancestors_are_dirs(fs, store, &to_path, now)? {
-        return Ok(ApplyOutcome::Deferred {
-            reason: format!("ancestor of '{to_path}' is currently being written"),
-        });
+    match ensure_ancestors_are_dirs(fs, store, &to_path, now)? {
+        AncestorOutcome::Ready => {}
+        AncestorOutcome::ChangedRetry => return Ok(ApplyOutcome::LocalChangedRetry),
+        AncestorOutcome::Unstable => {
+            return Ok(ApplyOutcome::Deferred {
+                reason: format!("ancestor of '{to_path}' is currently being written"),
+            });
+        }
     }
 
     let existing_from = store.get_record(&from_path)?;
@@ -1290,8 +1331,9 @@ pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
             Err(SyncError::Fs {
                 kind: FsErrorKind::NotFound,
                 ..
-            }) => {
-                clear_pending_op(store)?;
+            })
+            | Err(SyncError::Conflict { .. }) => {
+                mark_needs_rescan_and_clear_pending(store, &[&from_path, &to_path], Vec::new())?;
                 return handle_local_changed(fs, store, &from_path, now);
             }
             Err(err) => return Err(err),
@@ -1300,17 +1342,26 @@ pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
         // Verify the renamed file still holds the expected hash/size (if a person edited
         // `from_path` right before rename, put it back without ignoring errors).
         if let Some(expected_hash) = to_record.hash {
-            let (actual_hash, actual_size) = fs.hash_live(&to_path)?;
+            let (actual_hash, actual_size) = match fs.hash_live(&to_path) {
+                Ok(pair) => pair,
+                Err(err) if is_mid_apply_race_error(&err) => {
+                    mark_needs_rescan_and_clear_pending(
+                        store,
+                        &[&from_path, &to_path],
+                        Vec::new(),
+                    )?;
+                    let _ = rescan_single_path(fs, store, &from_path, now)?;
+                    return handle_local_changed(fs, store, &to_path, now);
+                }
+                Err(err) => return Err(err),
+            };
             if actual_hash != expected_hash || actual_size != to_record.size {
                 match fs.rename_live_to_live_no_replace(&to_path, &from_path) {
                     Ok(()) => {
                         clear_pending_op(store)?;
                         return handle_local_changed(fs, store, &from_path, now);
                     }
-                    Err(SyncError::Fs {
-                        kind: FsErrorKind::AlreadyExists | FsErrorKind::NotFound,
-                        ..
-                    }) => {
+                    Err(err) if is_mid_apply_race_error(&err) => {
                         // A person already created a new file at `from_path` (or moved `to_path`);
                         // keep both intact and mark both for rescan.
                         mark_needs_rescan_and_clear_pending(
@@ -1327,7 +1378,7 @@ pub fn apply_local_rename<F: SyncFs, S: IndexStore>(
         }
 
         apply_live_metadata(fs, &to_path, to_record.mtime, to_record.mode)?;
-        if !verify_and_record_placed_stat(fs, &to_path, &mut to_record, None, true)? {
+        if !verify_and_record_placed_stat(fs, &to_path, &mut to_record, None, true, now)? {
             mark_needs_rescan_and_clear_pending(store, &[&from_path, &to_path], Vec::new())?;
             return handle_local_changed(fs, store, &to_path, now);
         }
@@ -1406,11 +1457,17 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
                                 created_ancestors.insert(anc.to_string());
                                 continue;
                             }
-                            None => {
-                                fs.create_dir_all_live(anc)?;
-                                created_ancestors.insert(anc.to_string());
-                                continue;
-                            }
+                            None => match fs.create_dir_all_live(anc) {
+                                Ok(()) => {
+                                    created_ancestors.insert(anc.to_string());
+                                    continue;
+                                }
+                                Err(err) if is_mid_apply_race_error(&err) => {
+                                    ancestor_ok = false;
+                                    break;
+                                }
+                                Err(err) => return Err(err),
+                            },
                             Some(_) => {
                                 ancestor_ok = false;
                                 break;
@@ -1426,7 +1483,10 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
                     ancestor_ok = false;
                     break;
                 }
-                if !ensure_ancestors_are_dirs(fs, store, &path, now)? {
+                if !matches!(
+                    ensure_ancestors_are_dirs(fs, store, &path, now)?,
+                    AncestorOutcome::Ready
+                ) {
                     ancestor_ok = false;
                     break;
                 }
@@ -1508,6 +1568,7 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
                 &mut tmps_to_unregister,
                 &mut needs_rescan_paths,
                 &mut out,
+                now,
             )?;
         }
     }
@@ -1549,6 +1610,7 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
     tmps_to_unregister: &mut Vec<String>,
     needs_rescan_paths: &mut Vec<String>,
     out: &mut BatchApplyResult,
+    now: Timestamp,
 ) -> Result<()> {
     // Phase 1: sync EVERY staged file in the chunk to durable storage and apply mtime + mode on
     // the staged file BEFORE any rename into the live tree.
@@ -1615,10 +1677,7 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
         let path = target.path.clone();
         match fs.commit_tmp_to_live_no_replace_deferred_dir_sync(&tmp, &path) {
             Ok(()) => {}
-            Err(SyncError::Fs {
-                kind: FsErrorKind::AlreadyExists,
-                ..
-            }) => {
+            Err(err) if is_mid_apply_race_error(&err) => {
                 let _ = fs.remove_tmp(&tmp);
                 out.fallback_records.push(target);
                 continue;
@@ -1650,6 +1709,7 @@ fn place_staged_chunk<F: SyncFs, S: IndexStore>(
             &mut target,
             staged_meta.as_ref(),
             false,
+            now,
         ) {
             Ok(v) => v,
             Err(err) => {
@@ -1771,8 +1831,15 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
             context: format!("remote record for {path}"),
             detail: "live file record missing BLAKE3 hash".to_string(),
         })?;
-        match fetch_and_verify_to_tmp(fs, store, peer, &path, target.size, expected_hash, fetch_opts)
-        {
+        match fetch_and_verify_to_tmp(
+            fs,
+            store,
+            peer,
+            &path,
+            target.size,
+            expected_hash,
+            fetch_opts,
+        ) {
             Ok(tmp) => {
                 let sm = prepare_staged_tmp_metadata(fs, &tmp, target.mtime, target.mode)?;
                 (Some(tmp), sm)
@@ -1790,8 +1857,12 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
 
     // 2. Ensure ancestors are live directories.
     match ensure_ancestors_are_dirs(fs, store, &path, now) {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(AncestorOutcome::Ready) => {}
+        Ok(AncestorOutcome::ChangedRetry) => {
+            cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()])?;
+            return Ok(ApplyOutcome::LocalChangedRetry);
+        }
+        Ok(AncestorOutcome::Unstable) => {
             cleanup_staged_tmps(fs, store, &[staged_tmp.as_deref()])?;
             return Ok(ApplyOutcome::Deferred {
                 reason: format!("ancestor of '{path}' is actively changing"),
@@ -1844,11 +1915,7 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
         bin_entry: bin_entry.clone(),
         expected_local,
     };
-    write_pending_op_and_unregister_tmps(
-        store,
-        pending,
-        staged_tmp.iter().cloned().collect(),
-    )?;
+    write_pending_op_and_unregister_tmps(store, pending, staged_tmp.iter().cloned().collect())?;
 
     let res: Result<ApplyOutcome> = (|| {
         let existing_live = existing.as_ref().filter(|r| !r.deleted);
@@ -1941,13 +2008,22 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                         }
                     }
                 }
-                EntryKind::Symlink => {
-                    if let Some(ref b_entry) = bin_entry {
-                        write_bin_meta_file(fs, b_entry)?;
-                        persisted_bins.push(b_entry.clone());
+                EntryKind::Symlink => match fs.remove_symlink_live(&path) {
+                    Ok(()) => {
+                        if let Some(ref b_entry) = bin_entry {
+                            write_bin_meta_file(fs, b_entry)?;
+                            persisted_bins.push(b_entry.clone());
+                        }
                     }
-                    fs.remove_symlink_live(&path)?;
-                }
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        if let Some(ref tmp) = staged_tmp {
+                            let _ = fs.remove_tmp(tmp);
+                        }
+                        clear_pending_op(store)?;
+                        return handle_local_changed(fs, store, &path, now);
+                    }
+                    Err(err) => return Err(err),
+                },
                 EntryKind::Dir => match fs.remove_empty_dir_live(&path) {
                     Ok(()) => {}
                     Err(SyncError::Fs {
@@ -1957,12 +2033,13 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                     Err(SyncError::Fs {
                         kind: FsErrorKind::DirectoryNotEmpty,
                         ..
-                    }) => {
+                    })
+                    | Err(SyncError::Conflict { .. }) => {
                         if let Some(ref tmp) = staged_tmp {
                             let _ = fs.remove_tmp(tmp);
                         }
                         clear_pending_op(store)?;
-                        return Ok(ApplyOutcome::LocalChangedRetry);
+                        return handle_local_changed(fs, store, &path, now);
                     }
                     Err(err) => return Err(err),
                 },
@@ -1975,10 +2052,7 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                 if let Some(ref tmp) = staged_tmp {
                     match fs.commit_tmp_to_live_no_replace(tmp, &path) {
                         Ok(()) => {}
-                        Err(SyncError::Fs {
-                            kind: FsErrorKind::AlreadyExists,
-                            ..
-                        }) => {
+                        Err(err) if is_mid_apply_race_error(&err) => {
                             let _ = fs.remove_tmp(tmp);
                             mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
                             return handle_local_changed(fs, store, &path, now);
@@ -1992,13 +2066,21 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                     &mut target,
                     staged_meta.as_ref(),
                     true,
+                    now,
                 )? {
                     mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
                     return handle_local_changed(fs, store, &path, now);
                 }
             }
             EntryKind::Dir => {
-                fs.create_dir_all_live(&path)?;
+                match fs.create_dir_all_live(&path) {
+                    Ok(()) => {}
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
+                        return handle_local_changed(fs, store, &path, now);
+                    }
+                    Err(err) => return Err(err),
+                }
                 record_disk_stat(fs, &path, &mut target)?;
             }
             EntryKind::Symlink => {
@@ -2012,10 +2094,7 @@ fn apply_fetch<F: SyncFs, S: IndexStore>(
                         })?;
                 match fs.create_symlink_live(&path, link_target) {
                     Ok(()) => {}
-                    Err(SyncError::Fs {
-                        kind: FsErrorKind::AlreadyExists,
-                        ..
-                    }) => {
+                    Err(err) if is_mid_apply_race_error(&err) => {
                         mark_needs_rescan_and_clear_pending(store, &[&path], persisted_bins)?;
                         return handle_local_changed(fs, store, &path, now);
                     }
@@ -2063,7 +2142,13 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
         if store.has_live_descendant(&path)? {
             return Ok(ApplyOutcome::LocalChangedRetry);
         }
-        let children = fs.list_dir_live(&path)?;
+        let children = match fs.list_dir_live(&path) {
+            Ok(c) => c,
+            Err(err) if is_mid_apply_race_error(&err) => {
+                return handle_local_changed(fs, store, &path, now);
+            }
+            Err(err) => return Err(err),
+        };
         if !children.is_empty() {
             let held_back_paths: BTreeSet<String> = store
                 .list_held_back()?
@@ -2117,9 +2202,8 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                 let mut tomb = tombstone;
                 tomb.seq = seq;
                 let chain = meta.advance_chain_fingerprint(seq, tomb.head_fingerprint());
-                let encoded = encode_deletion_log_entries(&[
-                    FolderDeletionLogEntry::from_tombstone(&tomb),
-                ])?;
+                let encoded =
+                    encode_deletion_log_entries(&[FolderDeletionLogEntry::from_tombstone(&tomb)])?;
                 fs.append_deletion_log(&encoded)?;
                 let batch = StoreBatch {
                     folder_meta: Some(meta),
@@ -2144,7 +2228,19 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
             // move each litter file to the local bin and remove the directory!
             let mut litter_bins = Vec::new();
             for (child_rel, cm) in litter_files {
-                let (h, sz) = fs.hash_live(&child_rel)?;
+                let (h, sz) = match fs.hash_live(&child_rel) {
+                    Ok(pair) => pair,
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        if !litter_bins.is_empty() {
+                            let _ = store.apply_batch(StoreBatch {
+                                upsert_bin: litter_bins,
+                                ..StoreBatch::default()
+                            });
+                        }
+                        return Ok(ApplyOutcome::LocalChangedRetry);
+                    }
+                    Err(err) => return Err(err),
+                };
                 let entry = build_raw_bin_entry(
                     &child_rel,
                     EntryKind::File,
@@ -2158,8 +2254,20 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                     now,
                 );
                 write_bin_meta_file(fs, &entry)?;
-                fs.move_live_to_bin_no_replace(&child_rel, &entry.storage_name)?;
-                litter_bins.push(entry);
+                match fs.move_live_to_bin_no_replace(&child_rel, &entry.storage_name) {
+                    Ok(()) => litter_bins.push(entry),
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        let _ = fs.remove_bin_file(&bin_meta_name(&entry.id));
+                        if !litter_bins.is_empty() {
+                            let _ = store.apply_batch(StoreBatch {
+                                upsert_bin: litter_bins,
+                                ..StoreBatch::default()
+                            });
+                        }
+                        return Ok(ApplyOutcome::LocalChangedRetry);
+                    }
+                    Err(err) => return Err(err),
+                }
             }
 
             match fs.remove_empty_dir_live(&path) {
@@ -2171,7 +2279,8 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                 Err(SyncError::Fs {
                     kind: FsErrorKind::DirectoryNotEmpty,
                     ..
-                }) => {
+                })
+                | Err(SyncError::Conflict { .. }) => {
                     // Another file appeared concurrently; save litter bin records and retry.
                     if !litter_bins.is_empty() {
                         let batch = StoreBatch {
@@ -2237,13 +2346,19 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                         }
                     }
                 }
-                EntryKind::Symlink => {
-                    if let Some(ref b_entry) = bin_entry {
-                        write_bin_meta_file(fs, b_entry)?;
-                        persisted_bins.push(b_entry.clone());
+                EntryKind::Symlink => match fs.remove_symlink_live(&path) {
+                    Ok(()) => {
+                        if let Some(ref b_entry) = bin_entry {
+                            write_bin_meta_file(fs, b_entry)?;
+                            persisted_bins.push(b_entry.clone());
+                        }
                     }
-                    fs.remove_symlink_live(&path)?;
-                }
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        clear_pending_op(store)?;
+                        return handle_local_changed(fs, store, &path, now);
+                    }
+                    Err(err) => return Err(err),
+                },
                 EntryKind::Dir => match fs.remove_empty_dir_live(&path) {
                     Ok(()) => {}
                     Err(SyncError::Fs {
@@ -2253,9 +2368,10 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                     Err(SyncError::Fs {
                         kind: FsErrorKind::DirectoryNotEmpty,
                         ..
-                    }) => {
+                    })
+                    | Err(SyncError::Conflict { .. }) => {
                         clear_pending_op(store)?;
-                        return Ok(ApplyOutcome::LocalChangedRetry);
+                        return handle_local_changed(fs, store, &path, now);
                     }
                     Err(err) => return Err(err),
                 },
@@ -2305,12 +2421,8 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
             fetch_opts,
         ) {
             Ok(tmp) => {
-                let sm = prepare_staged_tmp_metadata(
-                    fs,
-                    &tmp,
-                    winner_record.mtime,
-                    winner_record.mode,
-                )?;
+                let sm =
+                    prepare_staged_tmp_metadata(fs, &tmp, winner_record.mtime, winner_record.mode)?;
                 (Some(tmp), sm)
             }
             Err(err) if is_peer_file_changed_error(&err) => {
@@ -2356,11 +2468,7 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
         conflict_already_present,
         expected_local,
     };
-    write_pending_op_and_unregister_tmps(
-        store,
-        pending,
-        winner_tmp.iter().cloned().collect(),
-    )?;
+    write_pending_op_and_unregister_tmps(store, pending, winner_tmp.iter().cloned().collect())?;
 
     let res: Result<ApplyOutcome> = (|| {
         let mut persisted_bins = Vec::new();
@@ -2380,14 +2488,15 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                             clear_pending_op(store)?;
                             return handle_local_changed(fs, store, &conflict_path, now);
                         }
-                        Err(SyncError::Fs {
-                            kind: FsErrorKind::NotFound,
-                            ..
-                        }) => {
+                        Err(err) if is_mid_apply_race_error(&err) => {
                             if let Some(ref wt) = winner_tmp {
                                 let _ = fs.remove_tmp(wt);
                             }
-                            clear_pending_op(store)?;
+                            mark_needs_rescan_and_clear_pending(
+                                store,
+                                &[&orig_path, &conflict_path],
+                                Vec::new(),
+                            )?;
                             return handle_local_changed(fs, store, &orig_path, now);
                         }
                         Err(err) => return Err(err),
@@ -2396,7 +2505,22 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     // expected local bytes (if a person edited `orig_path` in the race window,
                     // put it back without ignoring errors).
                     if let Some(expected_hash) = loser_record.hash {
-                        let (actual_hash, actual_size) = fs.hash_live(&conflict_path)?;
+                        let (actual_hash, actual_size) = match fs.hash_live(&conflict_path) {
+                            Ok(pair) => pair,
+                            Err(err) if is_mid_apply_race_error(&err) => {
+                                if let Some(ref wt) = winner_tmp {
+                                    let _ = fs.remove_tmp(wt);
+                                }
+                                mark_needs_rescan_and_clear_pending(
+                                    store,
+                                    &[&orig_path, &conflict_path],
+                                    Vec::new(),
+                                )?;
+                                let _ = rescan_single_path(fs, store, &conflict_path, now)?;
+                                return handle_local_changed(fs, store, &orig_path, now);
+                            }
+                            Err(err) => return Err(err),
+                        };
                         if actual_hash != expected_hash || actual_size != loser_record.size {
                             if let Some(ref wt) = winner_tmp {
                                 let _ = fs.remove_tmp(wt);
@@ -2406,10 +2530,7 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                                     clear_pending_op(store)?;
                                     return handle_local_changed(fs, store, &orig_path, now);
                                 }
-                                Err(SyncError::Fs {
-                                    kind: FsErrorKind::AlreadyExists | FsErrorKind::NotFound,
-                                    ..
-                                }) => {
+                                Err(err) if is_mid_apply_race_error(&err) => {
                                     mark_needs_rescan_and_clear_pending(
                                         store,
                                         &[&orig_path, &conflict_path],
@@ -2428,10 +2549,7 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     if let Some(ref target) = loser_record.link_target {
                         match fs.create_symlink_live(&conflict_path, target) {
                             Ok(()) => {}
-                            Err(SyncError::Fs {
-                                kind: FsErrorKind::AlreadyExists,
-                                ..
-                            }) => {
+                            Err(err) if is_mid_apply_race_error(&err) => {
                                 if let Some(ref wt) = winner_tmp {
                                     let _ = fs.remove_tmp(wt);
                                 }
@@ -2441,10 +2559,34 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                             Err(err) => return Err(err),
                         }
                     }
-                    fs.remove_symlink_live(&orig_path)?;
+                    match fs.remove_symlink_live(&orig_path) {
+                        Ok(()) => {}
+                        Err(err) if is_mid_apply_race_error(&err) => {
+                            if let Some(ref wt) = winner_tmp {
+                                let _ = fs.remove_tmp(wt);
+                            }
+                            mark_needs_rescan_and_clear_pending(
+                                store,
+                                &[&orig_path, &conflict_path],
+                                Vec::new(),
+                            )?;
+                            return handle_local_changed(fs, store, &orig_path, now);
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
                 EntryKind::Dir => {
-                    fs.create_dir_all_live(&conflict_path)?;
+                    match fs.create_dir_all_live(&conflict_path) {
+                        Ok(()) => {}
+                        Err(err) if is_mid_apply_race_error(&err) => {
+                            if let Some(ref wt) = winner_tmp {
+                                let _ = fs.remove_tmp(wt);
+                            }
+                            clear_pending_op(store)?;
+                            return handle_local_changed(fs, store, &conflict_path, now);
+                        }
+                        Err(err) => return Err(err),
+                    }
                     let _ = fs.remove_empty_dir_live(&orig_path);
                 }
             }
@@ -2456,7 +2598,17 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
             // Identical conflict copy already exists; safely move old orig to bin (never unlink
             // bytes moved out of the person's tree!).
             match loser_record.kind {
-                EntryKind::Symlink => fs.remove_symlink_live(&orig_path)?,
+                EntryKind::Symlink => match fs.remove_symlink_live(&orig_path) {
+                    Ok(()) => {}
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        if let Some(ref wt) = winner_tmp {
+                            let _ = fs.remove_tmp(wt);
+                        }
+                        clear_pending_op(store)?;
+                        return handle_local_changed(fs, store, &orig_path, now);
+                    }
+                    Err(err) => return Err(err),
+                },
                 EntryKind::Dir => {
                     let _ = fs.remove_empty_dir_live(&orig_path);
                 }
@@ -2464,10 +2616,7 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     let claim = next_tmp_name("confclaim");
                     match fs.move_live_to_tmp_no_replace(&orig_path, &claim) {
                         Ok(()) => {}
-                        Err(SyncError::Fs {
-                            kind: FsErrorKind::NotFound,
-                            ..
-                        }) => {
+                        Err(err) if is_mid_apply_race_error(&err) => {
                             if let Some(ref wt) = winner_tmp {
                                 let _ = fs.remove_tmp(wt);
                             }
@@ -2508,10 +2657,7 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                 if let Some(ref tmp) = winner_tmp {
                     match fs.commit_tmp_to_live_no_replace(tmp, &orig_path) {
                         Ok(()) => {}
-                        Err(SyncError::Fs {
-                            kind: FsErrorKind::AlreadyExists,
-                            ..
-                        }) => {
+                        Err(err) if is_mid_apply_race_error(&err) => {
                             let _ = fs.remove_tmp(tmp);
                             commit_records_and_clear_pending(
                                 fs,
@@ -2533,6 +2679,7 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                     &mut winner_record,
                     winner_staged_meta.as_ref(),
                     true,
+                    now,
                 )? {
                     commit_records_and_clear_pending(
                         fs,
@@ -2547,7 +2694,22 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                 }
             }
             EntryKind::Dir => {
-                fs.create_dir_all_live(&orig_path)?;
+                match fs.create_dir_all_live(&orig_path) {
+                    Ok(()) => {}
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        commit_records_and_clear_pending(
+                            fs,
+                            store,
+                            vec![loser_record],
+                            persisted_bins,
+                            vec![(peer.member_id().to_string(), conflict_path)],
+                            Vec::new(),
+                        )?;
+                        mark_needs_rescan(store, &[&orig_path])?;
+                        return handle_local_changed(fs, store, &orig_path, now);
+                    }
+                    Err(err) => return Err(err),
+                }
                 record_disk_stat(fs, &orig_path, &mut winner_record)?;
             }
             EntryKind::Symlink => {
@@ -2561,10 +2723,7 @@ fn apply_conflict_local_loses<F: SyncFs, S: IndexStore>(
                         })?;
                 match fs.create_symlink_live(&orig_path, link_target) {
                     Ok(()) => {}
-                    Err(SyncError::Fs {
-                        kind: FsErrorKind::AlreadyExists,
-                        ..
-                    }) => {
+                    Err(err) if is_mid_apply_race_error(&err) => {
                         commit_records_and_clear_pending(
                             fs,
                             store,
@@ -2693,10 +2852,7 @@ fn apply_conflict_remote_loses<F: SyncFs, S: IndexStore>(
                     if let Some(ref tmp) = loser_tmp {
                         match fs.commit_tmp_to_live_no_replace(tmp, &conflict_path) {
                             Ok(()) => {}
-                            Err(SyncError::Fs {
-                                kind: FsErrorKind::AlreadyExists,
-                                ..
-                            }) => {
+                            Err(err) if is_mid_apply_race_error(&err) => {
                                 let _ = fs.remove_tmp(tmp);
                                 mark_needs_rescan_and_clear_pending(
                                     store,
@@ -2714,17 +2870,25 @@ fn apply_conflict_remote_loses<F: SyncFs, S: IndexStore>(
                         &mut loser_record,
                         loser_staged_meta.as_ref(),
                         true,
+                        now,
                     )? {
-                        mark_needs_rescan_and_clear_pending(
-                            store,
-                            &[&conflict_path],
-                            Vec::new(),
-                        )?;
+                        mark_needs_rescan_and_clear_pending(store, &[&conflict_path], Vec::new())?;
                         return handle_local_changed(fs, store, &conflict_path, now);
                     }
                 }
                 EntryKind::Dir => {
-                    fs.create_dir_all_live(&conflict_path)?;
+                    match fs.create_dir_all_live(&conflict_path) {
+                        Ok(()) => {}
+                        Err(err) if is_mid_apply_race_error(&err) => {
+                            mark_needs_rescan_and_clear_pending(
+                                store,
+                                &[&conflict_path],
+                                Vec::new(),
+                            )?;
+                            return handle_local_changed(fs, store, &conflict_path, now);
+                        }
+                        Err(err) => return Err(err),
+                    }
                     record_disk_stat(fs, &conflict_path, &mut loser_record)?;
                 }
                 EntryKind::Symlink => {
@@ -2736,10 +2900,7 @@ fn apply_conflict_remote_loses<F: SyncFs, S: IndexStore>(
                     })?;
                     match fs.create_symlink_live(&conflict_path, link_target) {
                         Ok(()) => {}
-                        Err(SyncError::Fs {
-                            kind: FsErrorKind::AlreadyExists,
-                            ..
-                        }) => {
+                        Err(err) if is_mid_apply_race_error(&err) => {
                             clear_pending_op(store)?;
                             return handle_local_changed(fs, store, &conflict_path, now);
                         }
@@ -2776,12 +2937,12 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
     store: &mut S,
     rel_path: &str,
     now: Timestamp,
-) -> Result<bool> {
+) -> Result<AncestorOutcome> {
     for anc in ancestors(rel_path) {
         let mut existing = store.get_record(anc)?;
         if !disk_matches_index(fs, anc, existing.as_ref())? {
             match rescan_single_path(fs, store, anc, now)? {
-                SingleRescanOutcome::Unstable => return Ok(false),
+                SingleRescanOutcome::Unstable => return Ok(AncestorOutcome::Unstable),
                 SingleRescanOutcome::Updated(rec) => existing = Some(*rec),
                 SingleRescanOutcome::Unchanged => existing = store.get_record(anc)?,
             }
@@ -2790,7 +2951,14 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
         match existing {
             Some(ref rec) if !rec.deleted && rec.kind == EntryKind::Dir => {
                 if fs.stat_live(anc)?.is_none() {
-                    fs.create_dir_all_live(anc)?;
+                    match fs.create_dir_all_live(anc) {
+                        Ok(()) => {}
+                        Err(err) if is_mid_apply_race_error(&err) => {
+                            let _ = rescan_single_path(fs, store, anc, now)?;
+                            return Ok(AncestorOutcome::ChangedRetry);
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
             }
             Some(rec) if !rec.deleted && rec.kind != EntryKind::Dir => {
@@ -2852,40 +3020,47 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                 };
                 write_pending_op(store, pending)?;
 
-                let anc_res: Result<bool> = (|| {
+                let anc_res: Result<AncestorOutcome> = (|| {
                     let mut persisted_bins = Vec::new();
                     if !already {
                         match loser.kind {
                             EntryKind::File => {
                                 match fs.rename_live_to_live_no_replace(anc, &conflict_path) {
                                     Ok(()) => {}
-                                    Err(SyncError::Fs {
-                                        kind: FsErrorKind::AlreadyExists | FsErrorKind::NotFound,
-                                        ..
-                                    }) => {
+                                    Err(err) if is_mid_apply_race_error(&err) => {
                                         clear_pending_op(store)?;
                                         let _ = rescan_single_path(fs, store, anc, now)?;
-                                        return Ok(false);
+                                        return Ok(AncestorOutcome::ChangedRetry);
                                     }
                                     Err(err) => return Err(err),
                                 }
                                 if let Some(expected_hash) = loser.hash {
-                                    let (actual_hash, actual_size) =
-                                        fs.hash_live(&conflict_path)?;
+                                    let (actual_hash, actual_size) = match fs
+                                        .hash_live(&conflict_path)
+                                    {
+                                        Ok(pair) => pair,
+                                        Err(err) if is_mid_apply_race_error(&err) => {
+                                            mark_needs_rescan_and_clear_pending(
+                                                store,
+                                                &[anc, &conflict_path],
+                                                Vec::new(),
+                                            )?;
+                                            let _ =
+                                                rescan_single_path(fs, store, &conflict_path, now)?;
+                                            let _ = rescan_single_path(fs, store, anc, now)?;
+                                            return Ok(AncestorOutcome::ChangedRetry);
+                                        }
+                                        Err(err) => return Err(err),
+                                    };
                                     if actual_hash != expected_hash || actual_size != loser.size {
                                         match fs.rename_live_to_live_no_replace(&conflict_path, anc)
                                         {
                                             Ok(()) => {
                                                 clear_pending_op(store)?;
                                                 let _ = rescan_single_path(fs, store, anc, now)?;
-                                                return Ok(false);
+                                                return Ok(AncestorOutcome::ChangedRetry);
                                             }
-                                            Err(SyncError::Fs {
-                                                kind:
-                                                    FsErrorKind::AlreadyExists
-                                                    | FsErrorKind::NotFound,
-                                                ..
-                                            }) => {
+                                            Err(err) if is_mid_apply_race_error(&err) => {
                                                 mark_needs_rescan_and_clear_pending(
                                                     store,
                                                     &[anc, &conflict_path],
@@ -2898,7 +3073,7 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                                                     now,
                                                 )?;
                                                 let _ = rescan_single_path(fs, store, anc, now)?;
-                                                return Ok(false);
+                                                return Ok(AncestorOutcome::ChangedRetry);
                                             }
                                             Err(err) => return Err(err),
                                         }
@@ -2908,9 +3083,29 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                             }
                             EntryKind::Symlink => {
                                 if let Some(ref target) = loser.link_target {
-                                    fs.create_symlink_live(&conflict_path, target)?;
+                                    match fs.create_symlink_live(&conflict_path, target) {
+                                        Ok(()) => {}
+                                        Err(err) if is_mid_apply_race_error(&err) => {
+                                            clear_pending_op(store)?;
+                                            let _ = rescan_single_path(fs, store, anc, now)?;
+                                            return Ok(AncestorOutcome::ChangedRetry);
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
                                 }
-                                fs.remove_symlink_live(anc)?;
+                                match fs.remove_symlink_live(anc) {
+                                    Ok(()) => {}
+                                    Err(err) if is_mid_apply_race_error(&err) => {
+                                        mark_needs_rescan_and_clear_pending(
+                                            store,
+                                            &[anc, &conflict_path],
+                                            Vec::new(),
+                                        )?;
+                                        let _ = rescan_single_path(fs, store, anc, now)?;
+                                        return Ok(AncestorOutcome::ChangedRetry);
+                                    }
+                                    Err(err) => return Err(err),
+                                }
                             }
                             EntryKind::Dir => {}
                         }
@@ -2921,13 +3116,10 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                                 let claim = next_tmp_name("ancclaim");
                                 match fs.move_live_to_tmp_no_replace(anc, &claim) {
                                     Ok(()) => {}
-                                    Err(SyncError::Fs {
-                                        kind: FsErrorKind::NotFound,
-                                        ..
-                                    }) => {
+                                    Err(err) if is_mid_apply_race_error(&err) => {
                                         clear_pending_op(store)?;
                                         let _ = rescan_single_path(fs, store, anc, now)?;
-                                        return Ok(false);
+                                        return Ok(AncestorOutcome::ChangedRetry);
                                     }
                                     Err(err) => return Err(err),
                                 }
@@ -2935,7 +3127,7 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                                     put_back_or_preserve_tmp(fs, store, &claim, anc, now)?;
                                     mark_needs_rescan_and_clear_pending(store, &[anc], Vec::new())?;
                                     let _ = rescan_single_path(fs, store, anc, now)?;
-                                    return Ok(false);
+                                    return Ok(AncestorOutcome::ChangedRetry);
                                 }
                                 if let Some(b_entry) = build_bin_entry(
                                     Some(&rec),
@@ -2950,11 +3142,38 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                                     preserve_tmp_as_conflict_copy(fs, store, &claim, anc, now)?;
                                 }
                             }
-                            EntryKind::Symlink => fs.remove_symlink_live(anc)?,
+                            EntryKind::Symlink => match fs.remove_symlink_live(anc) {
+                                Ok(()) => {}
+                                Err(err) if is_mid_apply_race_error(&err) => {
+                                    clear_pending_op(store)?;
+                                    let _ = rescan_single_path(fs, store, anc, now)?;
+                                    return Ok(AncestorOutcome::ChangedRetry);
+                                }
+                                Err(err) => return Err(err),
+                            },
                             EntryKind::Dir => {}
                         }
                     }
-                    fs.create_dir_all_live(anc)?;
+                    match fs.create_dir_all_live(anc) {
+                        Ok(()) => {}
+                        Err(err) if is_mid_apply_race_error(&err) => {
+                            // A person wrote a new non-directory at `anc` right after we moved the
+                            // previous entry aside! Commit `loser` (already safely at
+                            // `conflict_path`), rescan `anc`, and retry so both entries survive.
+                            commit_records_and_clear_pending(
+                                fs,
+                                store,
+                                vec![loser],
+                                persisted_bins,
+                                Vec::new(),
+                                Vec::new(),
+                            )?;
+                            mark_needs_rescan(store, &[anc])?;
+                            let _ = rescan_single_path(fs, store, anc, now)?;
+                            return Ok(AncestorOutcome::ChangedRetry);
+                        }
+                        Err(err) => return Err(err),
+                    }
                     record_disk_stat(fs, anc, &mut dir_record)?;
                     commit_records_and_clear_pending(
                         fs,
@@ -2964,14 +3183,22 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                         Vec::new(),
                         Vec::new(),
                     )?;
-                    Ok(true)
+                    Ok(AncestorOutcome::Ready)
                 })();
-                if !recover_on_non_crash_error(fs, store, anc_res, now)? {
-                    return Ok(false);
+                match recover_on_non_crash_error(fs, store, anc_res, now)? {
+                    AncestorOutcome::Ready => {}
+                    other => return Ok(other),
                 }
             }
             prev_deleted_or_none => {
-                fs.create_dir_all_live(anc)?;
+                match fs.create_dir_all_live(anc) {
+                    Ok(()) => {}
+                    Err(err) if is_mid_apply_race_error(&err) => {
+                        let _ = rescan_single_path(fs, store, anc, now)?;
+                        return Ok(AncestorOutcome::ChangedRetry);
+                    }
+                    Err(err) => return Err(err),
+                }
                 let mut meta = load_meta_required(store)?;
                 let was_deleted = prev_deleted_or_none.is_some();
                 let mut version = prev_deleted_or_none
@@ -3002,9 +3229,10 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
                 };
                 let chain = meta.advance_chain_fingerprint(seq, dir_rec.head_fingerprint());
                 if was_deleted {
-                    let encoded = encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
-                        path: anc.to_string(),
-                    }])?;
+                    let encoded =
+                        encode_deletion_log_entries(&[FolderDeletionLogEntry::Revived {
+                            path: anc.to_string(),
+                        }])?;
                     fs.append_deletion_log(&encoded)?;
                 }
                 let batch = StoreBatch {
@@ -3017,7 +3245,7 @@ fn ensure_ancestors_are_dirs<F: SyncFs, S: IndexStore>(
             }
         }
     }
-    Ok(true)
+    Ok(AncestorOutcome::Ready)
 }
 
 /// Assigns a fresh independent version vector to `loser_record` (Decision A).
@@ -3153,7 +3381,10 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
         }
     }
 
-    if !ensure_ancestors_are_dirs(fs, store, &target_path, now)? {
+    if !matches!(
+        ensure_ancestors_are_dirs(fs, store, &target_path, now)?,
+        AncestorOutcome::Ready
+    ) {
         return Err(SyncError::Conflict {
             path: target_path,
             reason: "an ancestor file is still being written; retry restoring".to_string(),
@@ -3217,8 +3448,7 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
                 }
                 return Err(err);
             }
-            let sm =
-                prepare_staged_tmp_metadata(fs, &tmp_name, entry.original_mtime, entry.mode)?;
+            let sm = prepare_staged_tmp_metadata(fs, &tmp_name, entry.original_mtime, entry.mode)?;
             (Some(tmp_name), sm)
         }
         EntryKind::Symlink | EntryKind::Dir => (None, None),
@@ -3426,6 +3656,7 @@ pub fn restore_from_bin<F: SyncFs, S: IndexStore>(
                         &mut restored_record,
                         staged_meta.as_ref(),
                         true,
+                        now,
                     )? {
                         mark_needs_rescan_and_clear_pending(
                             store,
@@ -3768,8 +3999,7 @@ pub fn resolve_conflict<F: SyncFs, S: IndexStore>(
                                 (claim_tmp.as_deref(), bin_entry.as_ref(), orig.hash)
                             {
                                 match safe_delete_live_file(
-                                    fs, store, &orig_path, claim, old_hash, orig.size, b_entry,
-                                    now,
+                                    fs, store, &orig_path, claim, old_hash, orig.size, b_entry, now,
                                 )? {
                                     SafeDeleteResult::Deleted => {
                                         persisted_bins.push(b_entry.clone());
@@ -3903,16 +4133,13 @@ fn safe_replace_live_file<F: SyncFs, S: IndexStore>(
                     preserve_tmp_as_conflict_copy(fs, store, staged_tmp, live_path, now)?;
                     false
                 };
-            if verify_and_record_placed_stat(fs, live_path, target, staged_meta, true)? {
+            if verify_and_record_placed_stat(fs, live_path, target, staged_meta, true, now)? {
                 return Ok(SafeReplaceResult::Replaced { binned });
             }
             return Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned });
         }
         Ok(false) => {}
-        Err(SyncError::Fs {
-            kind: FsErrorKind::NotFound,
-            ..
-        }) => return Ok(SafeReplaceResult::RaceBeforePlace),
+        Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeReplaceResult::RaceBeforePlace),
         Err(err) => return Err(err),
     }
 
@@ -3930,26 +4157,20 @@ fn safe_replace_live_file<F: SyncFs, S: IndexStore>(
                     preserve_tmp_as_conflict_copy(fs, store, claim_tmp, live_path, now)?;
                     false
                 };
-            if verify_and_record_placed_stat(fs, live_path, target, staged_meta, true)? {
+            if verify_and_record_placed_stat(fs, live_path, target, staged_meta, true, now)? {
                 return Ok(SafeReplaceResult::Replaced { binned });
             }
             return Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned });
         }
         Ok(false) => {}
-        Err(SyncError::Fs {
-            kind: FsErrorKind::NotFound,
-            ..
-        }) => return Ok(SafeReplaceResult::RaceBeforePlace),
+        Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeReplaceResult::RaceBeforePlace),
         Err(err) => return Err(err),
     }
 
     // Path 3: claim-then-rename fallback (safe against race edits AND race creates).
     match fs.move_live_to_tmp_no_replace(live_path, claim_tmp) {
         Ok(()) => {}
-        Err(SyncError::Fs {
-            kind: FsErrorKind::NotFound,
-            ..
-        }) => return Ok(SafeReplaceResult::RaceBeforePlace),
+        Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeReplaceResult::RaceBeforePlace),
         Err(err) => return Err(err),
     }
 
@@ -3965,16 +4186,13 @@ fn safe_replace_live_file<F: SyncFs, S: IndexStore>(
 
     match fs.commit_tmp_to_live_no_replace(staged_tmp, live_path) {
         Ok(()) => {
-            if verify_and_record_placed_stat(fs, live_path, target, staged_meta, true)? {
+            if verify_and_record_placed_stat(fs, live_path, target, staged_meta, true, now)? {
                 Ok(SafeReplaceResult::Replaced { binned: true })
             } else {
                 Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned: true })
             }
         }
-        Err(SyncError::Fs {
-            kind: FsErrorKind::AlreadyExists,
-            ..
-        }) => {
+        Err(err) if is_mid_apply_race_error(&err) => {
             // `staged_tmp` was never placed; it is still our staged download.
             let _ = fs.remove_tmp(staged_tmp);
             Ok(SafeReplaceResult::LiveChangedAfterDisplace { binned: true })
@@ -3996,10 +4214,7 @@ fn safe_delete_live_file<F: SyncFs, S: IndexStore>(
 ) -> Result<SafeDeleteResult> {
     match fs.move_live_to_tmp_no_replace(live_path, claim_tmp) {
         Ok(()) => {}
-        Err(SyncError::Fs {
-            kind: FsErrorKind::NotFound,
-            ..
-        }) => return Ok(SafeDeleteResult::RaceChanged),
+        Err(err) if is_mid_apply_race_error(&err) => return Ok(SafeDeleteResult::RaceChanged),
         Err(err) => return Err(err),
     }
 
@@ -4430,7 +4645,11 @@ fn disk_matches_snapshot<F: SyncFs>(
             if actual_size != *size {
                 return Ok(false);
             }
-            let (actual_hash, read_len) = fs.hash_live(path)?;
+            let (actual_hash, read_len) = match fs.hash_live(path) {
+                Ok(pair) => pair,
+                Err(err) if is_mid_apply_race_error(&err) => return Ok(false),
+                Err(err) => return Err(err),
+            };
             Ok(read_len == *size && actual_hash == *hash)
         }
         _ => Ok(false),
@@ -4468,7 +4687,11 @@ fn disk_matches_record<F: SyncFs>(fs: &F, path: &str, rec: &IndexRecord) -> Resu
             if m.size != rec.size {
                 return Ok(false);
             }
-            let (actual_hash, read_len) = fs.hash_live(path)?;
+            let (actual_hash, read_len) = match fs.hash_live(path) {
+                Ok(pair) => pair,
+                Err(err) if is_mid_apply_race_error(&err) => return Ok(false),
+                Err(err) => return Err(err),
+            };
             Ok(read_len == rec.size && rec.hash == Some(actual_hash))
         }
     }
@@ -4595,6 +4818,7 @@ fn verify_and_record_placed_stat<F: SyncFs>(
     target: &mut IndexRecord,
     staged_meta: Option<&FsMeta>,
     verify_recent_mtime: bool,
+    now: Timestamp,
 ) -> Result<bool> {
     let Some(live_meta) = fs.stat_live(live_path)? else {
         return Ok(false);
@@ -4614,10 +4838,11 @@ fn verify_and_record_placed_stat<F: SyncFs>(
             return Ok(false);
         }
         // Same device+inode and unchanged mtime after pre-placement metadata. If `mtime` is
-        // close to current wall-clock time (where an immediate in-place overwrite of the same
+        // close to current clock time (where an immediate in-place overwrite of the same
         // inode could share the same coarse kernel mtime tick), confirm the bytes by hash too.
-        need_hash_check =
-            verify_recent_mtime && is_within_recent_wall_clock(live_meta.mtime, 2);
+        need_hash_check = verify_recent_mtime
+            && (live_meta.mtime.secs.abs_diff(now.secs) <= 2
+                || is_within_recent_wall_clock(live_meta.mtime, 2));
     }
 
     if need_hash_check {
@@ -4659,10 +4884,7 @@ fn put_back_or_preserve_tmp<F: SyncFs, S: IndexStore>(
 ) -> Result<()> {
     match fs.commit_tmp_to_live_no_replace(tmp_name, live_path) {
         Ok(()) => Ok(()),
-        Err(SyncError::Fs {
-            kind: FsErrorKind::AlreadyExists,
-            ..
-        }) => {
+        Err(err) if is_mid_apply_race_error(&err) => {
             preserve_tmp_as_conflict_copy(fs, store, tmp_name, live_path, now)?;
             Ok(())
         }
@@ -4689,6 +4911,8 @@ fn preserve_tmp_as_conflict_copy<F: SyncFs, S: IndexStore>(
     let file_mode = tmp_meta.as_ref().and_then(|m| m.mode);
 
     let mut chosen_path = None;
+    let mut base_path = original_path;
+    let basename = original_path.rsplit('/').next().unwrap_or("recovered-file");
     for attempt in 0u32..10_000 {
         let disambig = if attempt == 0 {
             None
@@ -4696,7 +4920,7 @@ fn preserve_tmp_as_conflict_copy<F: SyncFs, S: IndexStore>(
             Some((attempt + 1).to_string())
         };
         let cand = conflict_copy_path(
-            original_path,
+            base_path,
             &meta.local_member,
             file_mtime,
             hash6,
@@ -4711,6 +4935,13 @@ fn preserve_tmp_as_conflict_copy<F: SyncFs, S: IndexStore>(
                 kind: FsErrorKind::AlreadyExists,
                 ..
             }) => continue,
+            Err(err) if is_mid_apply_race_error(&err) && base_path != basename => {
+                // An ancestor of `original_path` was replaced with a non-directory concurrently;
+                // fall back to placing the rescued conflict copy at the folder root so bytes are
+                // never lost.
+                base_path = basename;
+                continue;
+            }
             Err(err) => return Err(err),
         }
     }
@@ -4720,7 +4951,7 @@ fn preserve_tmp_as_conflict_copy<F: SyncFs, S: IndexStore>(
         None => {
             let token = random_hex_token();
             let cand = conflict_copy_path(
-                original_path,
+                base_path,
                 &meta.local_member,
                 file_mtime,
                 hash6,
@@ -4754,8 +4985,7 @@ fn preserve_tmp_as_conflict_copy<F: SyncFs, S: IndexStore>(
         conflict_of: None,
         conflict_dismissed: false,
     };
-    rec.conflict_of =
-        derive_conflict_of(&rec, &meta).or_else(|| Some(original_path.to_string()));
+    rec.conflict_of = derive_conflict_of(&rec, &meta).or_else(|| Some(original_path.to_string()));
     let chain = meta.advance_chain_fingerprint(seq, rec.head_fingerprint());
     let batch = StoreBatch {
         folder_meta: Some(meta),

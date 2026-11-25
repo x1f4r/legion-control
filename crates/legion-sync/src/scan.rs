@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
-use crate::error::Result;
+use crate::error::{FsErrorKind, Result, SyncError};
 use crate::model::{
     DeletionBrake, DeletionBrakeConfig, DeletionWindowState, FolderDeletionLogEntry, IndexRecord,
     MAX_ANCESTRY_HASHES, PendingLocalDeletion, ProblemKind, SyncProblem,
@@ -370,8 +370,9 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             .iter()
             .map(String::as_str)
             .collect();
-        meta.needs_rescan
-            .retain(|p| unstable_set.contains(p.as_str()) || is_under_skipped(p, &report.skipped_errors));
+        meta.needs_rescan.retain(|p| {
+            unstable_set.contains(p.as_str()) || is_under_skipped(p, &report.skipped_errors)
+        });
         if meta.needs_rescan.len() != before {
             kept_dirs_changed = true;
         }
@@ -1254,7 +1255,17 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 return Ok(SingleRescanOutcome::Unchanged);
             }
             let hash = if disk_meta.kind == EntryKind::File {
-                let (h, bytes_read) = fs.hash_live(&clean)?;
+                let (h, bytes_read) = match fs.hash_live(&clean) {
+                    Ok(pair) => pair,
+                    Err(SyncError::Fs {
+                        kind: FsErrorKind::NotFound,
+                        ..
+                    })
+                    | Err(SyncError::Conflict { .. }) => {
+                        return Ok(SingleRescanOutcome::Unstable);
+                    }
+                    Err(err) => return Err(err),
+                };
                 let after = fs.stat_live(&clean)?;
                 let stable = after.as_ref().is_some_and(|m| {
                     m.kind == EntryKind::File
@@ -1692,7 +1703,15 @@ pub fn disk_matches_index<F: SyncFs>(
                     if !mtime_ok || mode_changed(rec.mode, disk.mode) {
                         return Ok(false);
                     }
-                    let (actual_hash, bytes_read) = fs.hash_live(path)?;
+                    let (actual_hash, bytes_read) = match fs.hash_live(path) {
+                        Ok(pair) => pair,
+                        Err(SyncError::Fs {
+                            kind: FsErrorKind::NotFound,
+                            ..
+                        })
+                        | Err(SyncError::Conflict { .. }) => return Ok(false),
+                        Err(err) => return Err(err),
+                    };
                     Ok(bytes_read == rec.size && rec.hash == Some(actual_hash))
                 }
             }

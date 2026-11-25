@@ -43,7 +43,8 @@ const BIN_ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bi
 const HELD_BACK_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("held_back_v2");
 const DELETED_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("deleted_history");
 const STAGED_TMPS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("staged_tmps");
-const SEQ_FINGERPRINTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("seq_fingerprints");
+const SEQ_FINGERPRINTS_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("seq_fingerprints");
 const PROBLEMS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("problems");
 const DEFERRALS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("deferrals");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -138,7 +139,10 @@ impl RedbIndexStore {
                     .check_integrity()
                     .map_err(|err| damaged_err(&path_label, err))?;
                 if !intact {
-                    return Err(damaged_err(&path_label, "redb integrity check returned false"));
+                    return Err(damaged_err(
+                        &path_label,
+                        "redb integrity check returned false",
+                    ));
                 }
 
                 // Read-only verification BEFORE opening any write transaction so a newer schema or
