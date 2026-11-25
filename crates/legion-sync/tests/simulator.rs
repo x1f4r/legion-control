@@ -31,13 +31,14 @@ use std::time::Instant;
 
 use legion_sync::path::{
     check_fs_compatibility, fs_equivalence_key, is_descendant_of, parse_conflict_copy_path,
-    validate_flat_internal_name,
+    validate_flat_internal_name, validate_staged_tmp_token,
 };
 use legion_sync::{
-    BinEntry, ConflictChoice, DeletionBrakeConfig, DeletionBrakeDecision, FetchOptions,
-    FolderConfig, FolderMarker, FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry,
-    FsWalkResult, HeldBackRecord, INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher,
-    InboundDeletionBrakeDecision, IndexRecord, IndexStore, MAX_VERSION_COUNTER, MemberId,
+    BinEntry, ConflictChoice, DeletionBrakeConfig, DeletionBrakeDecision,
+    FORCED_ROTATION_COOLDOWN_SECS, FORCED_ROTATION_WEEK_WINDOW_SECS, FetchOptions, FolderConfig,
+    FolderMarker, FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry, FsWalkResult,
+    HeldBackRecord, INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher, InboundDeletionBrakeDecision,
+    IndexRecord, IndexStore, MAX_FORCED_ROTATIONS_PER_WEEK, MAX_VERSION_COUNTER, MemberId,
     MemberState, MemoryIndexStore, Peer, PeerAckView, PeerCursor, PeerHandshake, PendingOp,
     ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, ScanOptions, StoreBatch,
     SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector, is_internal_sync_path,
@@ -159,6 +160,8 @@ impl SimNode {
 struct SimBinData {
     bytes: Vec<u8>,
     hash: Option<Hash>,
+    mtime: Timestamp,
+    gen_id: u64,
 }
 
 /// Canonical tree representation used for convergence assertions (Invariant a).
@@ -287,6 +290,8 @@ struct HonestSimFs {
     mid_apply: RefCell<Vec<MidApplyHook>>,
     has_mid_apply: Cell<bool>,
     mid_apply_fired: RefCell<Vec<MidApplyFired>>,
+    free_space_budget: Cell<Option<u64>>,
+    separate_mount_prefix: RefCell<Option<String>>,
 }
 
 impl HonestSimFs {
@@ -312,7 +317,33 @@ impl HonestSimFs {
             mid_apply: RefCell::new(Vec::new()),
             has_mid_apply: Cell::new(false),
             mid_apply_fired: RefCell::new(Vec::new()),
+            free_space_budget: Cell::new(None),
+            separate_mount_prefix: RefCell::new(None),
         }
+    }
+
+    fn set_free_space(&self, bytes: Option<u64>) {
+        self.free_space_budget.set(bytes);
+    }
+
+    fn set_separate_mount(&self, prefix: Option<&str>) {
+        *self.separate_mount_prefix.borrow_mut() = prefix.map(str::to_string);
+    }
+
+    fn user_modify_bin_file(&self, storage_name: &str, bytes: Vec<u8>, mtime: Timestamp) -> Hash {
+        let h = hash_bytes(&bytes);
+        let gen_id = self.alloc_gen();
+        let mut bin = self.bin.borrow_mut();
+        bin.insert(
+            storage_name.to_string(),
+            SimBinData {
+                bytes,
+                hash: Some(h),
+                mtime,
+                gen_id,
+            },
+        );
+        h
     }
 
     fn snapshot(&self) -> FsSnapshot {
@@ -349,6 +380,8 @@ impl HonestSimFs {
             mid_apply: RefCell::new(Vec::new()),
             has_mid_apply: Cell::new(false),
             mid_apply_fired: RefCell::new(Vec::new()),
+            free_space_budget: Cell::new(None),
+            separate_mount_prefix: RefCell::new(None),
         }
     }
 
@@ -1372,7 +1405,7 @@ impl SyncFs for HonestSimFs {
     }
 
     fn create_tmp(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         let (before, after) = self.tick_fault();
         if let Some(kind) = before {
             return Err(Self::fault_err("create_tmp", kind));
@@ -1386,7 +1419,7 @@ impl SyncFs for HonestSimFs {
     }
 
     fn open_tmp_append(&self, tmp_name: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         let (before, after) = self.tick_fault();
         if let Some(kind) = before {
             return Err(Self::fault_err("open_tmp_append", kind));
@@ -1407,7 +1440,7 @@ impl SyncFs for HonestSimFs {
     }
 
     fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         let tmp = self.tmp.lock().unwrap();
         let tm = self.tmp_meta.borrow().get(tmp_name).copied();
         Ok(tmp.get(tmp_name).map(|b| {
@@ -1434,7 +1467,7 @@ impl SyncFs for HonestSimFs {
         mtime: Timestamp,
         mode: Option<u32>,
     ) -> legion_sync::Result<()> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         let effective_mode = if self.caps.windows_naming {
             None
         } else {
@@ -1454,7 +1487,7 @@ impl SyncFs for HonestSimFs {
     }
 
     fn hash_tmp(&self, tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         let tmp = self.tmp.lock().unwrap();
         match tmp.get(tmp_name) {
             Some(bytes) => Ok((hash_bytes(bytes), bytes.len() as u64)),
@@ -1467,7 +1500,7 @@ impl SyncFs for HonestSimFs {
     }
 
     fn remove_tmp(&self, tmp_name: &str) -> legion_sync::Result<()> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         self.tmp.lock().unwrap().remove(tmp_name);
         Ok(())
     }
@@ -1481,7 +1514,7 @@ impl SyncFs for HonestSimFs {
         tmp_name: &str,
         live_rel: &str,
     ) -> legion_sync::Result<()> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         let clean = self.check_live_path(live_rel)?;
         self.guard_platform(&clean, EntryKind::File)?;
         if self.is_unreadable(&clean) {
@@ -1553,7 +1586,7 @@ impl SyncFs for HonestSimFs {
     }
 
     fn exchange_tmp_with_live(&self, tmp_name: &str, live_rel: &str) -> legion_sync::Result<bool> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         let clean = self.check_live_path(live_rel)?;
         self.guard_platform(&clean, EntryKind::File)?;
         if !self.supports_exchange {
@@ -1629,7 +1662,7 @@ impl SyncFs for HonestSimFs {
         tmp_name: &str,
     ) -> legion_sync::Result<()> {
         let clean = self.check_live_path(live_rel)?;
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         self.wrap_mut("move_live_to_tmp_no_replace", true, || {
             let mut live = self.live.borrow_mut();
             let mut tmp = self.tmp.lock().unwrap();
@@ -1682,7 +1715,7 @@ impl SyncFs for HonestSimFs {
         tmp_name: &str,
         bin_data_name: &str,
     ) -> legion_sync::Result<()> {
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         validate_flat_internal_name(bin_data_name)?;
         self.wrap_mut("move_tmp_to_bin_no_replace", false, || {
             let mut tmp = self.tmp.lock().unwrap();
@@ -1699,8 +1732,21 @@ impl SyncFs for HonestSimFs {
                 detail: "tmp not found".to_string(),
                 kind: FsErrorKind::NotFound,
             })?;
+            let (mtime, _, gen_id) = self.tmp_meta.borrow_mut().remove(tmp_name).unwrap_or((
+                Timestamp::new(0, 0),
+                Some(0o600),
+                self.alloc_gen(),
+            ));
             let hash = Some(hash_bytes(&bytes));
-            bin.insert(bin_data_name.to_string(), SimBinData { bytes, hash });
+            bin.insert(
+                bin_data_name.to_string(),
+                SimBinData {
+                    bytes,
+                    hash,
+                    mtime,
+                    gen_id,
+                },
+            );
             Ok(())
         })
     }
@@ -1730,12 +1776,20 @@ impl SyncFs for HonestSimFs {
                 });
             };
             match live.remove(&actual) {
-                Some(SimNode::File { bytes, hash, .. }) => {
+                Some(SimNode::File {
+                    bytes,
+                    hash,
+                    mtime,
+                    gen_id,
+                    ..
+                }) => {
                     bin.insert(
                         bin_data_name.to_string(),
                         SimBinData {
                             bytes,
                             hash: Some(hash),
+                            mtime,
+                            gen_id,
                         },
                     );
                     Ok(())
@@ -1759,11 +1813,14 @@ impl SyncFs for HonestSimFs {
     fn write_bin_meta(&self, meta_name: &str, bytes: &[u8]) -> legion_sync::Result<()> {
         validate_flat_internal_name(meta_name)?;
         self.wrap_mut("write_bin_meta", false, || {
+            let gen_id = self.alloc_gen();
             self.bin.borrow_mut().insert(
                 meta_name.to_string(),
                 SimBinData {
                     bytes: bytes.to_vec(),
                     hash: None,
+                    mtime: Timestamp::new(0, 0),
+                    gen_id,
                 },
             );
             Ok(())
@@ -1780,10 +1837,10 @@ impl SyncFs for HonestSimFs {
         Ok(self.bin.borrow().get(bin_name).map(|d| FsMeta {
             kind: EntryKind::File,
             size: d.bytes.len() as u64,
-            mtime: Timestamp::new(0, 0),
+            mtime: d.mtime,
             mode: Some(0o600),
             link_target: None,
-            change_id: None,
+            change_id: Some(d.gen_id),
             file_identity: None,
         }))
     }
@@ -1805,7 +1862,7 @@ impl SyncFs for HonestSimFs {
 
     fn copy_bin_to_tmp(&self, bin_data_name: &str, tmp_name: &str) -> legion_sync::Result<()> {
         validate_flat_internal_name(bin_data_name)?;
-        validate_flat_internal_name(tmp_name)?;
+        validate_staged_tmp_token(tmp_name)?;
         self.wrap_mut("copy_bin_to_tmp", false, || {
             let bytes = self
                 .bin
@@ -1822,6 +1879,61 @@ impl SyncFs for HonestSimFs {
         })
     }
 
+    fn move_bin_to_live_no_replace(
+        &self,
+        bin_data_name: &str,
+        live_rel: &str,
+    ) -> legion_sync::Result<()> {
+        validate_flat_internal_name(bin_data_name)?;
+        let clean = self.check_live_path(live_rel)?;
+        self.guard_platform(&clean, EntryKind::File)?;
+        self.wrap_mut("move_bin_to_live_no_replace", false, || {
+            let mut live = self.live.borrow_mut();
+            if self.resolve_existing_key(&live, &clean).is_some() {
+                return Err(SyncError::Fs {
+                    path: Some(clean),
+                    detail: "destination already exists".to_string(),
+                    kind: FsErrorKind::AlreadyExists,
+                });
+            }
+            let data =
+                self.bin
+                    .borrow_mut()
+                    .remove(bin_data_name)
+                    .ok_or_else(|| SyncError::Fs {
+                        path: Some(bin_data_name.to_string()),
+                        detail: "bin file not found".to_string(),
+                        kind: FsErrorKind::NotFound,
+                    })?;
+            let hash = data.hash.unwrap_or_else(|| hash_bytes(&data.bytes));
+            for anc in legion_sync::path::ancestors(&clean) {
+                if self.resolve_existing_key(&live, anc).is_none() {
+                    live.insert(
+                        anc.to_string(),
+                        SimNode::Dir {
+                            mtime: Timestamp::new(0, 0),
+                        },
+                    );
+                }
+            }
+            live.insert(
+                clean,
+                SimNode::File {
+                    bytes: data.bytes,
+                    hash,
+                    mtime: data.mtime,
+                    mode: if self.caps.windows_naming {
+                        None
+                    } else {
+                        Some(0o644)
+                    },
+                    gen_id: self.alloc_gen(),
+                },
+            );
+            Ok(())
+        })
+    }
+
     fn remove_bin_file(&self, bin_name: &str) -> legion_sync::Result<()> {
         validate_flat_internal_name(bin_name)?;
         self.bin.borrow_mut().remove(bin_name);
@@ -1830,6 +1942,17 @@ impl SyncFs for HonestSimFs {
 
     fn list_bin(&self) -> legion_sync::Result<Vec<String>> {
         Ok(self.bin.borrow().keys().cloned().collect())
+    }
+
+    fn available_space_for(&self, _rel_path: &str) -> legion_sync::Result<Option<u64>> {
+        Ok(self.free_space_budget.get())
+    }
+
+    fn needs_local_staging(&self, rel_path: &str) -> legion_sync::Result<bool> {
+        let mount = self.separate_mount_prefix.borrow();
+        Ok(mount
+            .as_deref()
+            .is_some_and(|prefix| rel_path == prefix || is_descendant_of(rel_path, prefix)))
     }
 }
 
@@ -1954,6 +2077,17 @@ impl IndexStore for FaultyIndexStore {
 
     fn get_deleted_history(&self, path: &str) -> legion_sync::Result<Vec<Hash>> {
         self.inner.get_deleted_history(path)
+    }
+
+    fn get_deleted_history_version(
+        &self,
+        path: &str,
+    ) -> legion_sync::Result<Option<VersionVector>> {
+        self.inner.get_deleted_history_version(path)
+    }
+
+    fn list_deleted_history_versions(&self) -> legion_sync::Result<Vec<(String, VersionVector)>> {
+        self.inner.list_deleted_history_versions()
     }
 
     fn load_pending_op(&self) -> legion_sync::Result<Option<PendingOp>> {
@@ -2172,6 +2306,10 @@ impl Peer for SimPeer<'_> {
             }
         }
     }
+
+    fn report_hash_mismatch(&self, path: &str) {
+        self.engine.note_serve_hash_mismatch(path);
+    }
 }
 
 struct SimMember {
@@ -2370,6 +2508,27 @@ impl SimWorld {
     fn fail(&self, msg: String) -> ! {
         if !self.record_trace {
             run_one_seed(self.root_seed, true);
+        }
+        if std::env::var("LEGION_SYNC_DEBUG").is_ok() {
+            for m in &self.members {
+                if !m.active {
+                    continue;
+                }
+                eprintln!(
+                    "DEBUG {} meta={:?}\n  tree={:?}\n  bin={:?}\n  held={:?}\n  probs={:?}",
+                    m.id,
+                    m.engine.meta().ok().map(|mt| (
+                        mt.incarnation,
+                        mt.local_seq,
+                        mt.pruned_incarnations,
+                        mt.kept_deleted_dirs
+                    )),
+                    m.engine.fs().live_tree(&m.ignore),
+                    m.engine.list_bin().ok(),
+                    m.engine.store().list_held_back().ok(),
+                    m.engine.store().list_problems().ok(),
+                );
+            }
         }
         let trace_dump = self.trace.join("\n  ");
         panic!(
@@ -2952,8 +3111,17 @@ impl SimWorld {
         }
 
         match res {
-            Ok(_) => {
-                self.log(|| format!("sync {dst_id} <- {src_id}"));
+            Ok(rep) => {
+                self.log(|| {
+                    if non_crash_fs || rep.held_back > 0 || rep.deferred > 0 {
+                        format!(
+                            "sync {dst_id} <- {src_id} ok(applied={},held={},def={},non_crash_fs={non_crash_fs})",
+                            rep.applied, rep.held_back, rep.deferred
+                        )
+                    } else {
+                        format!("sync {dst_id} <- {src_id}")
+                    }
+                });
             }
             Err(err) if err.is_crash() && crashed => {
                 let crash_in_recover = self.rng.chance(1, 3);
@@ -3521,8 +3689,13 @@ impl SimWorld {
                                     let r0 = ref_m.engine.store().get_record(k).unwrap();
                                     let r1 = other.engine.store().get_record(k).unwrap();
                                     diff_records.push_str(&format!(
-                                        "\n  diff {k:?}:\n    {}: {:?}\n    {}: {:?}",
-                                        ref_m.id, r0, other.id, r1
+                                        "\n  diff {k:?}:\n    {} tree={:?} rec={:?}\n    {} tree={:?} rec={:?}",
+                                        ref_m.id,
+                                        ref_tree.get(k),
+                                        r0,
+                                        other.id,
+                                        other_tree.get(k),
+                                        r1
                                     ));
                                 }
                             }
@@ -4604,6 +4777,10 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
                 caller_acked: None,
                 caller_pull_matches: None,
                 caller_regressed: false,
+                caller_rejoining: false,
+                refused_from_caller: None,
+                pruned_incarnations: Vec::new(),
+                known_incarnations: BTreeMap::new(),
             })
         }
         fn records_since(
@@ -5611,6 +5788,10 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
                 caller_acked: None,
                 caller_pull_matches: Some(true),
                 caller_regressed: false,
+                caller_rejoining: false,
+                refused_from_caller: None,
+                pruned_incarnations: Vec::new(),
+                known_incarnations: BTreeMap::new(),
             })
         }
         fn records_since(
@@ -5719,6 +5900,793 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
     let _ = root_seed;
 }
 
+/// Scenario 15: Two joiners carrying the exact same old USB copy meet each other BEFORE meeting
+/// any member that saw the deletion (both with active tombstone and after tombstone GC), plus
+/// intentional re-creation after GC (`r1`, `r17`).
+fn run_two_joiners_same_old_copy_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let mut mk = |id: &str, members: &[&str]| {
+        let mut cfg = FolderConfig::new(
+            "sim",
+            id.to_string(),
+            members.iter().map(|s| (*s).to_string()),
+        );
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), true),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+
+    let mut m0 = mk("m0", &["m0", "m1"]);
+    let mut m1 = mk("m1", &["m0", "m1"]);
+    let old_bytes = format!("old-tax-return-{seed}").into_bytes();
+    let old_h = hash_bytes(&old_bytes);
+    let keep_bytes = format!("keep-{seed}").into_bytes();
+    let keep_h = hash_bytes(&keep_bytes);
+
+    m0.fs()
+        .user_write_file("old.pdf", old_bytes.clone(), old_h, t0);
+    m0.fs()
+        .user_write_file("keep.txt", keep_bytes.clone(), keep_h, t0);
+    m0.scan(t0).unwrap();
+    for _ in 0..2 {
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t0)
+            .unwrap();
+        m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t0)
+            .unwrap();
+    }
+
+    // m0 deletes old.pdf; optionally sync + GC tombstones across m0 and m1.
+    let t1 = Timestamp::new(t0.secs + 10, 0);
+    m0.fs().user_remove_recursive("old.pdf");
+    m0.scan(t1).unwrap();
+    let do_gc = (seed & 1) == 0;
+    if do_gc {
+        for _ in 0..3 {
+            m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
+                .unwrap();
+            m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t1)
+                .unwrap();
+        }
+        assert!(m0.store().get_record("old.pdf").unwrap().is_none());
+        assert!(m1.store().get_record("old.pdf").unwrap().is_none());
+    } else {
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
+            .unwrap();
+    }
+
+    // Two new joiners (m2, m3) start from the exact same old USB copy!
+    let all4 = ["m0", "m1", "m2", "m3"];
+    m0.add_member("m2").unwrap();
+    m0.add_member("m3").unwrap();
+    m1.add_member("m2").unwrap();
+    m1.add_member("m3").unwrap();
+    let mut m2 = mk("m2", &all4);
+    let mut m3 = mk("m3", &all4);
+    let t2 = Timestamp::new(t0.secs + 20, 0);
+    for m in [&mut m2, &mut m3] {
+        m.fs()
+            .user_write_file("old.pdf", old_bytes.clone(), old_h, t0);
+        m.fs()
+            .user_write_file("keep.txt", keep_bytes.clone(), keep_h, t0);
+        m.scan(t2).unwrap();
+    }
+
+    // Joiners meet EACH OTHER first before meeting m0 or m1!
+    m2.pull_from_peer(&SimPeer::new(&m3, "m2", "m3", PeerFault::None), t2)
+        .unwrap();
+    m3.pull_from_peer(&SimPeer::new(&m2, "m3", "m2", PeerFault::None), t2)
+        .unwrap();
+
+    // Now sync all 4 in varied order (starting with non-originator m1 on half the seeds).
+    let t3 = Timestamp::new(t0.secs + 30, 0);
+    let mut es = [m0, m1, m2, m3];
+    let first_pair = if (seed & 2) == 0 { (1, 2) } else { (2, 1) };
+    {
+        let (a, b) = first_pair;
+        let (x, y) = if a < b {
+            let (l, r) = es.split_at_mut(b);
+            (&mut l[a], &r[0])
+        } else {
+            let (l, r) = es.split_at_mut(a);
+            (&mut r[0], &l[b])
+        };
+        let x_id = x.meta().unwrap().local_member;
+        let y_id = y.meta().unwrap().local_member;
+        x.pull_from_peer(&SimPeer::new(y, &x_id, &y_id, PeerFault::None), t3)
+            .unwrap();
+    }
+    for _ in 0..4 {
+        for a in 0..4 {
+            for b in 0..4 {
+                if a == b {
+                    continue;
+                }
+                let (x, y) = if a < b {
+                    let (l, r) = es.split_at_mut(b);
+                    (&mut l[a], &r[0])
+                } else {
+                    let (l, r) = es.split_at_mut(a);
+                    (&mut r[0], &l[b])
+                };
+                let x_id = x.meta().unwrap().local_member;
+                let y_id = y.meta().unwrap().local_member;
+                x.pull_from_peer(&SimPeer::new(y, &x_id, &y_id, PeerFault::None), t3)
+                    .unwrap();
+            }
+        }
+    }
+
+    for e in &es {
+        assert_eq!(
+            e.fs().live_file_hash("old.pdf"),
+            None,
+            "seed={root_seed}: deleted old.pdf resurrected on {}",
+            e.meta().unwrap().local_member
+        );
+        assert_eq!(e.fs().live_file_hash("keep.txt"), Some(keep_h));
+    }
+
+    // Intentional re-creation on m1 after seeing the deletion MUST sync out everywhere.
+    if (seed & 4) == 0 {
+        let t4 = Timestamp::new(t0.secs + 40, 0);
+        es[1]
+            .fs()
+            .user_write_file("old.pdf", old_bytes.clone(), old_h, t4);
+        es[1].scan(t4).unwrap();
+        for _ in 0..3 {
+            for a in 0..4 {
+                for b in 0..4 {
+                    if a == b {
+                        continue;
+                    }
+                    let (x, y) = if a < b {
+                        let (l, r) = es.split_at_mut(b);
+                        (&mut l[a], &r[0])
+                    } else {
+                        let (l, r) = es.split_at_mut(a);
+                        (&mut r[0], &l[b])
+                    };
+                    let x_id = x.meta().unwrap().local_member;
+                    let y_id = y.meta().unwrap().local_member;
+                    x.pull_from_peer(&SimPeer::new(y, &x_id, &y_id, PeerFault::None), t4)
+                        .unwrap();
+                }
+            }
+        }
+        for e in &es {
+            assert_eq!(
+                e.fs().live_file_hash("old.pdf"),
+                Some(old_h),
+                "seed={root_seed}: intentionally recreated old.pdf did not sync to {}",
+                e.meta().unwrap().local_member
+            );
+        }
+    }
+}
+
+/// Scenario 16: Lifetime of index rebuilds/rotations with deterministic VV incarnation pruning,
+/// verifying bounded per-member key counts, convergence across 2 or 3 members, and commutativity
+/// of pruning with merging (`r4`).
+fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let three_members = (seed & 1) == 1;
+    let names: Vec<&str> = if three_members {
+        vec!["m0", "m1", "m2"]
+    } else {
+        vec!["m0", "m1"]
+    };
+    let n = names.len();
+    let mut es: Vec<SyncEngine<HonestSimFs, FaultyIndexStore>> = names
+        .iter()
+        .map(|id| {
+            let mut cfg = FolderConfig::new(
+                "sim",
+                (*id).to_string(),
+                names.iter().map(|s| (*s).to_string()),
+            );
+            cfg.initial_incarnation = Some(rng.next_u64() | 1);
+            let mut e = SyncEngine::open(
+                cfg,
+                HonestSimFs::new(FsCapabilities::unix(), true),
+                FaultyIndexStore::new(),
+            )
+            .unwrap();
+            e.set_deletion_brake(brake_disabled());
+            e
+        })
+        .collect();
+
+    for i in 0..3 {
+        let b = format!("base-{i}-{seed}").into_bytes();
+        let h = hash_bytes(&b);
+        es[0].fs().user_write_file(&format!("f{i}.txt"), b, h, t0);
+    }
+    es[0].scan(t0).unwrap();
+    let sync_rounds =
+        |es: &mut [SyncEngine<HonestSimFs, FaultyIndexStore>], now: Timestamp, rounds: usize| {
+            let len = es.len();
+            for _ in 0..rounds {
+                for a in 0..len {
+                    for b in 0..len {
+                        if a == b {
+                            continue;
+                        }
+                        let (x, y) = if a < b {
+                            let (l, r) = es.split_at_mut(b);
+                            (&mut l[a], &r[0])
+                        } else {
+                            let (l, r) = es.split_at_mut(a);
+                            (&mut r[0], &l[b])
+                        };
+                        let x_id = x.meta().unwrap().local_member;
+                        let y_id = y.meta().unwrap().local_member;
+                        x.pull_from_peer(&SimPeer::new(y, &x_id, &y_id, PeerFault::None), now)
+                            .unwrap();
+                    }
+                }
+            }
+        };
+    sync_rounds(&mut es, t0, 2);
+
+    // Run 6 consecutive index wipes + rebuilds of m1 so deterministic VV pruning exercises
+    // multi-generation retirement across all members while keeping 50M-seed runs fast.
+    for rot in 1..=6i64 {
+        let now = Timestamp::new(t0.secs + rot * 100, 0);
+        let snap = es[1].fs().snapshot();
+        let mut cfg = FolderConfig::new(
+            "sim",
+            "m1".to_string(),
+            names.iter().map(|s| (*s).to_string()),
+        );
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut rebuilt = SyncEngine::open(
+            cfg,
+            HonestSimFs::from_snapshot(snap),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        rebuilt.set_deletion_brake(brake_disabled());
+        assert!(rebuilt.is_index_damaged());
+        rebuilt.rebuild_from_disk(now).unwrap();
+        es[1] = rebuilt;
+
+        sync_rounds(&mut es, Timestamp::new(now.secs + 1, 0), 2);
+
+        // Edit f1.txt on m1 after rebuild and sync everywhere.
+        let body = format!("edit-after-rebuild-{rot}-{seed}").into_bytes();
+        let h = hash_bytes(&body);
+        es[1]
+            .fs()
+            .user_write_file("f1.txt", body, h, Timestamp::new(now.secs + 10, 0));
+        es[1].scan(Timestamp::new(now.secs + 10, 0)).unwrap();
+        sync_rounds(&mut es, Timestamp::new(now.secs + 12, 0), 3);
+
+        for idx in 0..n {
+            assert_eq!(
+                es[idx].fs().live_file_hash("f1.txt"),
+                Some(h),
+                "seed={root_seed} rot={rot}: member {} did not receive f1.txt",
+                names[idx]
+            );
+            assert_eq!(
+                es[idx].store().held_back_count().unwrap(),
+                0,
+                "seed={root_seed} rot={rot}: unexpected held-back on {}",
+                names[idx]
+            );
+        }
+        // Deterministic pruning keeps m1's key count bounded on every converged member.
+        let rec0 = es[0].store().get_record("f1.txt").unwrap().unwrap();
+        let m1_keys = rec0
+            .version
+            .iter()
+            .filter(|(k, _)| k.member == "m1")
+            .count();
+        assert!(
+            m1_keys <= 2,
+            "seed={root_seed} rot={rot}: expected <= 2 m1 keys after pruning, got {m1_keys}"
+        );
+        // Check projection commutativity with merging across members' pruned sets.
+        let p0 = es[0].meta().unwrap().pruned_incarnations;
+        let p1 = es[1].meta().unwrap().pruned_incarnations;
+        let rec1 = es[1].store().get_record("f1.txt").unwrap().unwrap();
+        let union: BTreeSet<VersionKey> = p0.union(&p1).cloned().collect();
+        assert_eq!(
+            rec0.version.merge(&rec1.version).pruned_for_compare(&union),
+            rec0.version
+                .pruned_for_compare(&union)
+                .merge(&rec1.version.pruned_for_compare(&union))
+        );
+    }
+}
+
+/// Scenario 17: Late write through an already-open file handle after a displaced file enters
+/// `.legion-sync/bin` — rescued as a live conflict copy by scan, restore, or expiry (`r7`).
+fn run_late_write_into_bin_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let mut mk = |id: &str| {
+        let mut cfg = FolderConfig::new("sim", id.to_string(), ["m0".into(), "m1".into()]);
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), true),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+    let mut m0 = mk("m0");
+    let mut m1 = mk("m1");
+
+    let v1 = format!("old-mailbox-{seed}").into_bytes();
+    let v1_h = hash_bytes(&v1);
+    m0.fs().user_write_file("mail.mbox", v1, v1_h, t0);
+    m0.scan(t0).unwrap();
+    m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t0)
+        .unwrap();
+
+    // m0 replaces mail.mbox; m1 pulls so m1's old copy enters `.legion-sync/bin`.
+    let t1 = Timestamp::new(t0.secs + 10, 0);
+    let v2 = format!("newer-mailbox-{seed}").into_bytes();
+    let v2_h = hash_bytes(&v2);
+    m0.fs().user_write_file("mail.mbox", v2, v2_h, t1);
+    m0.scan(t1).unwrap();
+    m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
+        .unwrap();
+
+    let bin = m1.list_bin().unwrap();
+    assert_eq!(bin.len(), 1);
+    let bin_entry = bin[0].clone();
+
+    // Held-open handle writes new bytes into the binned file!
+    let t2 = Timestamp::new(t0.secs + 20, 0);
+    let late_bytes = format!("old-mailbox-{seed}+NEW-MESSAGE-THROUGH-OPEN-HANDLE").into_bytes();
+    let late_h = m1
+        .fs()
+        .user_modify_bin_file(&bin_entry.storage_name, late_bytes, t2);
+
+    match seed % 3 {
+        0 => {
+            // Scan detects modified bin entry and promotes it to a conflict copy.
+            m1.scan(Timestamp::new(t2.secs + 1, 0)).unwrap();
+        }
+        1 => {
+            // Restore promotes instead of failing HashMismatch!
+            let restored = m1
+                .restore_from_bin(
+                    &bin_entry.id,
+                    Some("restored.mbox"),
+                    RestoreStrategy::FailIfExists,
+                    Timestamp::new(t2.secs + 1, 0),
+                )
+                .unwrap();
+            assert!(!restored.is_empty());
+        }
+        _ => {
+            // Expiry verifies hash and promotes instead of erasing!
+            let expired = m1
+                .expire_bin(Timestamp::new(t2.secs + 31 * 86_400, 0))
+                .unwrap();
+            assert!(
+                expired.is_empty(),
+                "seed={root_seed}: modified bin entry must not be expired"
+            );
+        }
+    }
+
+    let t3 = Timestamp::new(t2.secs + 5, 0);
+    m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t3)
+        .unwrap();
+    assert!(
+        m1.fs().all_live_hashes().contains(&late_h),
+        "seed={root_seed}: late handle write lost on m1"
+    );
+    assert!(
+        m0.fs().all_live_hashes().contains(&late_h),
+        "seed={root_seed}: late handle write did not sync to m0"
+    );
+    assert_eq!(m1.fs().live_file_hash("mail.mbox"), Some(v2_h));
+    assert_eq!(m0.fs().live_file_hash("mail.mbox"), Some(v2_h));
+}
+
+/// Scenario 18: Single-record local placement failures (free-space pre-check, separate mount
+/// staging beside destination, single-record permission error) hold back only the failing record,
+/// let unrelated records continue, surface the problem on both sides via handshake, and recover
+/// once the local condition clears (`r12`, `r14`).
+fn run_local_placement_failures_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let mut mk = |id: &str| {
+        let mut cfg = FolderConfig::new("sim", id.to_string(), ["m0".into(), "m1".into()]);
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), true),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+    let mut m0 = mk("m0");
+    let mut m1 = mk("m1");
+
+    // Seed initial doc0 + separate mount staging under VMs/.
+    m1.fs().set_separate_mount(Some("VMs"));
+    let doc0_v1 = b"doc0-v1".to_vec();
+    m0.fs()
+        .user_write_file("doc0.txt", doc0_v1.clone(), hash_bytes(&doc0_v1), t0);
+    let vm_v1 = format!("vm-notes-{seed}").into_bytes();
+    let vm_h = hash_bytes(&vm_v1);
+    m0.fs().user_write_file("VMs/notes.txt", vm_v1, vm_h, t0);
+    m0.scan(t0).unwrap();
+    m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t0)
+        .unwrap();
+    assert_eq!(m1.fs().live_file_hash("VMs/notes.txt"), Some(vm_h));
+
+    // Now add an oversized video (larger than m1's free space), small docs, and a doc0 edit.
+    let t1 = Timestamp::new(t0.secs + 10, 0);
+    let big = vec![b'V'; 16 * 1024];
+    let big_h = hash_bytes(&big);
+    m0.fs().user_write_file("video.mkv", big, big_h, t1);
+    for i in 1..=5 {
+        let b = format!("small-{i}-{seed}").into_bytes();
+        let h = hash_bytes(&b);
+        m0.fs().user_write_file(&format!("doc{i}.txt"), b, h, t1);
+    }
+    let doc0_v2 = format!("doc0-edited-{seed}").into_bytes();
+    let doc0_v2_h = hash_bytes(&doc0_v2);
+    m0.fs().user_write_file("doc0.txt", doc0_v2, doc0_v2_h, t1);
+    m0.scan(t1).unwrap();
+
+    // Limit free space on m1 so video.mkv fails pre-check (8 KiB free < 16 KiB + margin),
+    // OR inject reactive NoSpace on the first file write on odd seeds.
+    let precheck_mode = (seed & 1) == 0;
+    if precheck_mode {
+        m1.fs().set_free_space(Some(8 * 1024));
+    } else {
+        m1.fs().arm_non_crash_fault(0, FsErrorKind::NoSpace);
+    }
+    let rep = m1
+        .pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t1)
+        .unwrap();
+    assert!(
+        rep.held_back >= 1,
+        "seed={root_seed}: expected single failing record held back"
+    );
+    assert_eq!(
+        m1.fs().live_file_hash("doc0.txt"),
+        Some(doc0_v2_h),
+        "seed={root_seed}: doc0 edit must not be blocked by failing record"
+    );
+    let arrived_small = (1..=5)
+        .filter(|i| m1.fs().live_file_hash(&format!("doc{i}.txt")).is_some())
+        .count();
+    if precheck_mode {
+        assert_eq!(
+            arrived_small, 5,
+            "seed={root_seed}: all 5 small docs must arrive when only video.mkv exceeds free space"
+        );
+        assert!(
+            m1.fs().live_file_hash("video.mkv").is_none(),
+            "seed={root_seed}: oversized video.mkv must be held back before fetching"
+        );
+    } else {
+        assert!(
+            arrived_small >= 4,
+            "seed={root_seed}: unrelated small docs must still arrive after single reactive ENOSPC (got {arrived_small}/5)"
+        );
+    }
+    assert!(
+        matches!(m1.status().unwrap().state, MemberState::Problem { .. }),
+        "seed={root_seed}: m1 must report Problem, not UpToDate or Syncing"
+    );
+
+    // Sender m0 learns via handshake that m1 refused a record!
+    m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t1)
+        .unwrap();
+    assert!(
+        matches!(
+            m0.status().unwrap().state,
+            MemberState::Problem { ref problems, .. }
+                if problems.iter().any(|p| p.kind == ProblemKind::PeerRefusedRecords)
+        ),
+        "seed={root_seed}: m0 must surface PeerRefusedRecords from handshake"
+    );
+
+    // Free space becomes available -> next pull resolves held-back record and clears both sides!
+    m1.fs().set_free_space(None);
+    m1.fs().disarm_fault();
+    let t2 = Timestamp::new(t0.secs + 20, 0);
+    m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t2)
+        .unwrap();
+    m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t2)
+        .unwrap();
+    assert_eq!(m1.fs().live_file_hash("video.mkv"), Some(big_h));
+    for i in 1..=5 {
+        assert!(
+            m1.fs().live_file_hash(&format!("doc{i}.txt")).is_some(),
+            "seed={root_seed}: doc{i}.txt must arrive once space is available"
+        );
+    }
+    assert_eq!(m1.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(m0.status().unwrap().state, MemberState::UpToDate);
+}
+
+/// Scenario 19: Index loss during the 30-second deletion settle hold (`r9`) — held deletions
+/// written to `.legion-sync/deletions.log` survive rebuild without resurrecting deleted files,
+/// while files recreated during the hold emit `Revived` and remain live.
+fn run_index_loss_during_hold_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let brake = DeletionBrakeConfig {
+        min_deleted_files: 6,
+        min_deleted_percent: 25,
+        settle_secs: 30,
+        window_secs: 600,
+    };
+    let mut mk = |id: &str| {
+        let mut cfg = FolderConfig::new("sim", id.to_string(), ["m0".into(), "m1".into()]);
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        cfg.deletion_brake = brake;
+        SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), true),
+            FaultyIndexStore::new(),
+        )
+        .unwrap()
+    };
+    let mut m0 = mk("m0");
+    let mut m1 = mk("m1");
+
+    let mut hashes = Vec::new();
+    for i in 0..12 {
+        let b = format!("hold-file-{i}-{seed}").into_bytes();
+        let h = hash_bytes(&b);
+        hashes.push(h);
+        m0.fs().user_write_file(&format!("f{i}.txt"), b, h, t0);
+    }
+    m0.scan(t0).unwrap();
+    for _ in 0..2 {
+        m1.pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t0)
+            .unwrap();
+        m0.pull_from_peer(&SimPeer::new(&m1, "m0", "m1", PeerFault::None), t0)
+            .unwrap();
+    }
+
+    // Delete f0 and f1 on m1 and scan once (inside the 30-second settle hold!).
+    let t1 = Timestamp::new(t0.secs + 10, 0);
+    m1.fs().user_remove_recursive("f0.txt");
+    m1.fs().user_remove_recursive("f1.txt");
+    let s1 = m1.scan(t1).unwrap();
+    assert_eq!(s1.deleted, 0, "deletions should still be held");
+    assert_eq!(m1.meta().unwrap().pending_deletions.len(), 2);
+
+    // On half the seeds, revive f1 during the hold before wiping the index.
+    let revive_f1 = (seed & 1) == 1;
+    let revived_h = if revive_f1 {
+        let rb = format!("revived-f1-{seed}").into_bytes();
+        let rh = hash_bytes(&rb);
+        m1.fs()
+            .user_write_file("f1.txt", rb, rh, Timestamp::new(t1.secs + 5, 0));
+        m1.scan(Timestamp::new(t1.secs + 5, 0)).unwrap();
+        Some(rh)
+    } else {
+        None
+    };
+
+    // Lose m1's index DURING the 30-second hold!
+    let snap = m1.fs().snapshot();
+    let mut cfg = FolderConfig::new("sim", "m1".to_string(), ["m0".into(), "m1".into()]);
+    cfg.deletion_brake = brake;
+    let mut m1_rebuilt = SyncEngine::open(
+        cfg,
+        HonestSimFs::from_snapshot(snap),
+        FaultyIndexStore::new(),
+    )
+    .unwrap();
+    assert!(m1_rebuilt.is_index_damaged());
+    let t2 = Timestamp::new(t1.secs + 10, 0);
+    m1_rebuilt.rebuild_from_disk(t2).unwrap();
+
+    for _ in 0..3 {
+        m0.pull_from_peer(&SimPeer::new(&m1_rebuilt, "m0", "m1", PeerFault::None), t2)
+            .unwrap();
+        m1_rebuilt
+            .pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t2)
+            .unwrap();
+    }
+
+    assert_eq!(
+        m0.fs().live_file_hash("f0.txt"),
+        None,
+        "seed={root_seed}: held deletion f0 was forgotten on rebuild"
+    );
+    assert_eq!(m1_rebuilt.fs().live_file_hash("f0.txt"), None);
+    if let Some(rh) = revived_h {
+        assert_eq!(m0.fs().live_file_hash("f1.txt"), Some(rh));
+        assert_eq!(m1_rebuilt.fs().live_file_hash("f1.txt"), Some(rh));
+    } else {
+        assert_eq!(m0.fs().live_file_hash("f1.txt"), None);
+        assert_eq!(m1_rebuilt.fs().live_file_hash("f1.txt"), None);
+    }
+    for (i, h) in hashes.iter().enumerate().skip(2) {
+        assert_eq!(m0.fs().live_file_hash(&format!("f{i}.txt")), Some(*h));
+        assert_eq!(
+            m1_rebuilt.fs().live_file_hash(&format!("f{i}.txt")),
+            Some(*h)
+        );
+    }
+}
+
+/// Scenario 20: A lying peer repeatedly claiming regressions is bounded to at most 1 rotation/day
+/// per peer and 3/week total, surfaces a clear problem naming the peer, never cuts off honest
+/// syncing with other members, and clears the stale problem once the peer behaves (`r11`).
+fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    struct RegressionLiar<'a> {
+        inner: SimPeer<'a>,
+        lie: bool,
+    }
+    impl Peer for RegressionLiar<'_> {
+        fn member_id(&self) -> &str {
+            self.inner.member_id()
+        }
+        fn handshake(&self, c: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
+            let mut h = self.inner.handshake(c)?;
+            if self.lie {
+                h.caller_regressed = true;
+            }
+            Ok(h)
+        }
+        fn records_since(
+            &self,
+            a: u64,
+            b: u64,
+            l: usize,
+            c: Option<&AtomicBool>,
+        ) -> legion_sync::Result<RecordsPage> {
+            self.inner.records_since(a, b, l, c)
+        }
+        fn fetch_file(
+            &self,
+            p: &str,
+            h: Hash,
+            o: &FetchOptions,
+        ) -> legion_sync::Result<Box<dyn Read + Send>> {
+            self.inner.fetch_file(p, h, o)
+        }
+    }
+
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let all = ["tower", "pi", "nas"];
+    let mut mk = |id: &str| {
+        let mut cfg =
+            FolderConfig::new("sim", id.to_string(), all.iter().map(|s| (*s).to_string()));
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), true),
+            FaultyIndexStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+    let mut tower = mk("tower");
+    let mut pi = mk("pi");
+    let mut nas = mk("nas");
+
+    let base = format!("base-{seed}").into_bytes();
+    tower
+        .fs()
+        .user_write_file("f.txt", base.clone(), hash_bytes(&base), t0);
+    tower.scan(t0).unwrap();
+    for _ in 0..2 {
+        pi.pull_from_peer(&SimPeer::new(&tower, "pi", "tower", PeerFault::None), t0)
+            .unwrap();
+        nas.pull_from_peer(&SimPeer::new(&tower, "nas", "tower", PeerFault::None), t0)
+            .unwrap();
+        tower
+            .pull_from_peer(&SimPeer::new(&pi, "tower", "pi", PeerFault::None), t0)
+            .unwrap();
+        tower
+            .pull_from_peer(&SimPeer::new(&nas, "tower", "nas", PeerFault::None), t0)
+            .unwrap();
+    }
+
+    let mut rotations = 0usize;
+    let mut prev_inc = pi.meta().unwrap().incarnation;
+    let mut week_rot_times: Vec<i64> = Vec::new();
+    // 10 ticks spaced every 12 hours (5 days < 7-day week window): at most 3 rotations total!
+    for step in 1..=10i64 {
+        let now = Timestamp::new(
+            t0.secs + step * (FORCED_ROTATION_COOLDOWN_SECS as i64 / 2),
+            0,
+        );
+        let _ = pi.pull_from_peer(
+            &RegressionLiar {
+                inner: SimPeer::new(&nas, "pi", "nas", PeerFault::None),
+                lie: true,
+            },
+            now,
+        );
+        let inc = pi.meta().unwrap().incarnation;
+        if inc != prev_inc {
+            rotations += 1;
+            prev_inc = inc;
+            week_rot_times.push(now.secs);
+            if week_rot_times.len() >= 2 {
+                let gap = week_rot_times[week_rot_times.len() - 1]
+                    - week_rot_times[week_rot_times.len() - 2];
+                assert!(
+                    gap >= FORCED_ROTATION_COOLDOWN_SECS as i64,
+                    "seed={root_seed}: rotated twice inside 1 day (gap={gap})"
+                );
+            }
+        }
+        // Honest work on pi ALWAYS reaches tower!
+        let work = format!("pi-work-{step}-{seed}").into_bytes();
+        let wh = hash_bytes(&work);
+        pi.fs()
+            .user_write_file("f.txt", work, wh, Timestamp::new(now.secs + 10, 0));
+        pi.scan(Timestamp::new(now.secs + 10, 0)).unwrap();
+        tower
+            .pull_from_peer(
+                &SimPeer::new(&pi, "tower", "pi", PeerFault::None),
+                Timestamp::new(now.secs + 11, 0),
+            )
+            .unwrap();
+        pi.pull_from_peer(
+            &SimPeer::new(&tower, "pi", "tower", PeerFault::None),
+            Timestamp::new(now.secs + 12, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            tower.fs().live_file_hash("f.txt"),
+            Some(wh),
+            "seed={root_seed} step={step}: tower did not get pi's work"
+        );
+        assert_eq!(tower.store().held_back_count().unwrap(), 0);
+    }
+
+    assert!(
+        rotations <= MAX_FORCED_ROTATIONS_PER_WEEK,
+        "seed={root_seed}: expected <= {MAX_FORCED_ROTATIONS_PER_WEEK} rotations inside 1 week, got {rotations}"
+    );
+    assert!(
+        matches!(
+            pi.status().unwrap().state,
+            MemberState::Problem { ref problems, .. }
+                if problems.iter().any(|p| p.kind == ProblemKind::PeerRollbackRateLimited)
+        ),
+        "seed={root_seed}: pi must report PeerRollbackRateLimited"
+    );
+
+    // Once nas stops lying and sends an honest handshake, the stale rate-limit problem clears.
+    let later = Timestamp::new(t0.secs + FORCED_ROTATION_WEEK_WINDOW_SECS as i64 + 100, 0);
+    pi.pull_from_peer(&SimPeer::new(&nas, "pi", "nas", PeerFault::None), later)
+        .unwrap();
+    assert!(
+        !pi.store()
+            .list_problems()
+            .unwrap()
+            .iter()
+            .any(|(_, p)| p.kind == ProblemKind::PeerRollbackRateLimited),
+        "seed={root_seed}: stale PeerRollbackRateLimited did not clear after honest handshake"
+    );
+}
+
 fn run_one_seed(seed: u64, record_trace: bool) {
     // Every seed runs the dense randomized schedule (all faults, mid-apply human edits before &
     // after swap/claim, bin restore, conflict resolution, clock jumps both ways, directory renames,
@@ -5734,10 +6702,10 @@ fn run_one_seed(seed: u64, record_trace: bool) {
     world.run_schedule(32);
 
     // Every seed also hits a dedicated deep scenario on a clean modulo cadence so across 50M
-    // seeds EACH scenario runs >3,100,000 independent times!
-    match seed % 16 {
+    // seeds EACH scenario runs >2,300,000 independent times!
+    match seed % 21 {
         0 => run_long_partition_zombie_seed(seed, seed ^ 0x5555_5555, record_trace),
-        1 | 15 => run_conflict_and_delete_vs_edit_seed(seed, seed ^ 0xAAAA_AAAA, record_trace),
+        1 => run_conflict_and_delete_vs_edit_seed(seed, seed ^ 0xAAAA_AAAA, record_trace),
         2 => run_heterogeneous_and_case_rename_seed(seed, seed ^ 0x3333_3333, record_trace),
         3 => run_backup_reinstall_and_join_old_copy_seed(seed, seed ^ 0x7777_7777, record_trace),
         4 => run_duplicate_member_id_seed(seed, seed ^ 0x9999_9999, record_trace),
@@ -5757,7 +6725,12 @@ fn run_one_seed(seed: u64, record_trace: bool) {
             seed ^ 0xF0F0_F0F0,
             record_trace,
         ),
-        _ => {}
+        15 => run_two_joiners_same_old_copy_seed(seed, seed ^ 0x1357_2468, record_trace),
+        16 => run_lifetime_rotations_and_vv_pruning_seed(seed, seed ^ 0x2468_1357, record_trace),
+        17 => run_late_write_into_bin_seed(seed, seed ^ 0x369C_F258, record_trace),
+        18 => run_local_placement_failures_seed(seed, seed ^ 0x48C0_159D, record_trace),
+        19 => run_index_loss_during_hold_seed(seed, seed ^ 0x5AD1_6BE2, record_trace),
+        _ => run_lying_peer_regression_rate_limit_seed(seed, seed ^ 0x6BE2_7CF3, record_trace),
     }
 }
 
@@ -5805,13 +6778,13 @@ fn run_seed_range_parallel(start_seed: u64, count: u64) -> (std::time::Duration,
 /// 5,000,000-seed review run (257640, 859170, 1381582, 1845682, 2777393, 4395930).
 const REGRESSION_SEEDS: &[u64] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 42, 55, 78, 95, 97, 99, 128, 196, 249, 302, 316, 444, 759,
-    951, 1137, 1225, 1326, 1337, 1346, 1435, 1451, 1476, 1532, 1576, 1617, 2026, 2478, 5635, 11338,
-    15197, 19883, 25021, 25180, 27850, 31444, 32580, 35879, 48566, 56498, 60211, 85172, 89687,
-    90830, 94963, 257640, 338474, 521801, 612202, 656614, 834066, 859170, 1234029, 1252407,
-    1276023, 1381582, 1442864, 1631700, 1735939, 1845682, 1905590, 2132430, 2242736, 2469631,
-    2508764, 2770489, 2777393, 2838112, 2844675, 2972224, 3137180, 3286448, 3660488, 3804523,
-    3954961, 4066064, 4319726, 4377839, 4395930, 4560644, 4628071, 4717156, 6102439, 6250401,
-    8730315, 9067232, 13635160, 17469556, 18877611, 19447454, 37147542,
+    951, 1137, 1225, 1326, 1337, 1346, 1435, 1451, 1476, 1532, 1576, 1617, 2026, 2478, 5635, 11146,
+    11338, 15197, 19883, 25021, 25180, 27850, 31444, 32580, 35879, 48566, 49954, 56498, 60211,
+    71221, 85172, 85757, 89687, 90830, 94963, 257640, 338474, 521801, 612202, 656614, 834066,
+    859170, 1234029, 1252407, 1276023, 1381582, 1442864, 1631700, 1735939, 1845682, 1905590,
+    2132430, 2242736, 2469631, 2508764, 2770489, 2777393, 2838112, 2844675, 2972224, 3137180,
+    3286448, 3660488, 3804523, 3954961, 4066064, 4319726, 4377839, 4395930, 4560644, 4628071,
+    4717156, 6102439, 6250401, 8730315, 9067232, 13635160, 17469556, 18877611, 19447454, 37147542,
 ];
 
 #[test]
@@ -5839,6 +6812,12 @@ fn simulator_all_dedicated_scenarios() {
         run_index_wipe_and_explicit_rebuild_seed(s, s ^ 0x6666_6666, true);
         run_deletion_brake_and_inbound_brake_seed(s, s ^ 0x8888_8888, true);
         run_adversary_counters_rotation_and_symlinks_seed(s, s ^ 0xF0F0_F0F0, true);
+        run_two_joiners_same_old_copy_seed(s, s ^ 0x1357_2468, true);
+        run_lifetime_rotations_and_vv_pruning_seed(s, s ^ 0x2468_1357, true);
+        run_late_write_into_bin_seed(s, s ^ 0x369C_F258, true);
+        run_local_placement_failures_seed(s, s ^ 0x48C0_159D, true);
+        run_index_loss_during_hold_seed(s, s ^ 0x5AD1_6BE2, true);
+        run_lying_peer_regression_rate_limit_seed(s, s ^ 0x6BE2_7CF3, true);
     }
 }
 
