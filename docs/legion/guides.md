@@ -885,21 +885,47 @@ What happens during pairing:
    agent puts the live invite into that agent's conversation transcript. Run `legion pair` directly
    in your own terminal whenever you do not want an agent transcript to see the invite.
 2. The device scans the QR code or pastes the invite, connects over SSH verifying the pinned host
-   key, and sends its own newly generated Ed25519 public key and name.
-3. `legion gate --enrol <id>` validates the invite and public key under locks on shared config and
-   `authorized_keys`, enforces exact UTC expiry from `state/devices.json` (an expired temporary
-   key stops working at its exact expiry because `legion gate --enrol` refuses it and the expired
-   line is swept on the next `device.*` command), refuses enrolling the invite's own temporary key
-   or any key already present in `authorized_keys` or `devices.toml`, writes the device to
-   `devices.toml` beside `policy.toml`, reconciles `authorized_keys` so the temporary line is
-   replaced by a permanent
-   `restrict,command="<legion> gate --as <principal> --device <name> --pairing <id> ..."` line
-   pinning a random per-pairing id and the node's config and state directories, records non-secret
-   metadata in `state/devices.json`, pushes `devices.toml` in parallel to reachable machines in
-   `fleet.toml` (reporting per-machine outcomes under `fleet`), and writes an audit record
-   (`door: "ssh"`, `tool: "device.enrol"`, `device: "<name>"`). The temporary key immediately stops
-   working. Every subsequent call served through `legion gate` is reported and audited with
-   `door: "ssh"` (and `device: "<name>"` when `--device` is set).
+   key, and sends its own newly generated Ed25519 public key, name, and an OpenSSH `SSHSIG`
+   (`legion-enrol` namespace) proof of possession binding the invite id, canonical public key,
+   machine name, and pinned host-key fingerprints. When talking to an older node that rejects the
+   `proof` field as unknown, the client falls back once without `proof` on a fresh channel over the
+   same pinned host keys. If you cancel before the enrolment request leaves the device, nothing was
+   sent or saved; if you cancel after sending, Legion reports that the machine had not finished
+   pairing when checked, keeps the invite, and lets you try again to pick up the pairing if it
+   finishes.
+3. `legion gate --enrol <id>` validates the invite, public key, and proof under locks on shared
+   config and `authorized_keys`, enforces exact UTC expiry from `state/devices.json` (an expired
+   temporary key stops working at its exact expiry because `legion gate --enrol` refuses it and the
+   expired line is swept on the next `device.*` command), and refuses enrolling the invite's own
+   temporary key. An invalid `proof` is refused with `denied` without changing state. Every newly
+   enrolled device starts locally marked unconfirmed in `state/devices.json` (never in fleet-synced
+   `devices.toml`, so older nodes still parse `devices.toml` cleanly and fleet merges never clear
+   local unconfirmed state) until that device opens its first real authenticated `legion gate`
+   session on this machine. If the same public key is already enrolled as a single local
+   unconfirmed leftover, a valid `proof` replaces it in place with whatever the new invite grants
+   (and removes any leftover unused `device:*` principal); without a valid proof (such as an older
+   client), replacement is refused with a plain `conflict` and no extra details. If the key is
+   already confirmed (or matches any other key in `authorized_keys` or `devices.toml`), enrolment
+   refuses with `conflict` (returning existing-pairing details only when `proof` verified), and
+   every `conflict` consumes the invite immediately from both `authorized_keys` and
+   `state/devices.json`. On a `conflict` for a dedicated `device:` invite, the app probes the
+   machine with its own device key against the pinned host keys so **Restore pairing** works
+   reliably even against older nodes that omit conflict details, while post-send `not_found` and
+   `auth_failed` recovery probes run only for dedicated `device:` principals (never shared
+   principals).
+4. Enrolment commits in a crash-safe four-step order: (a) record the local unconfirmed entry and
+   device metadata in `state/devices.json` (keeping the invite in `state/devices.json`), (b) write
+   `policy.toml` and `devices.toml`, (c) append the permanent
+   `restrict,command="<legion> gate --as <principal> --device <name> --pairing <id> ..."` line to
+   `authorized_keys` while keeping the invite line intact, and (d) remove the invite line from
+   `authorized_keys` and the invite record from `state/devices.json`. Startup (`serve`, `rpc`,
+   `mcp`, `gate`) and every `device.*` command repair any interrupted enrolment by removing
+   leftover invites and restoring missing `authorized_keys` lines for committed `devices.toml`
+   entries. Enrolment then pushes `devices.toml` in parallel to reachable machines in `fleet.toml`
+   (reporting per-machine outcomes under `fleet`) and writes an audit record (`door: "ssh"`,
+   `tool: "device.enrol"`, `device: "<name>"`). The temporary key immediately stops working. Every
+   subsequent call served through `legion gate` is reported and audited with `door: "ssh"` (and
+   `device: "<name>"` when `--device` is set).
 
 ### Managing devices across the fleet (`device.list`, `device.set`, `device.endpoint`, `device.remove`)
 
@@ -929,8 +955,10 @@ fleet.sync direction=pull from=<machine> documents='["devices.toml"]'` explicitl
 (`fleet.sync direction=status` compares read-only).
 
 - **List devices and invites**: `legion device.list` reconciles `authorized_keys` with
-  `devices.toml`, sweeps expired invites recorded by this home, and shows each device's `id`,
-  `name`, `principal`, effective `role`, `fingerprint`, `added`, `paired_on`, and any collision,
+  `devices.toml`, repairs any interrupted enrolment, sweeps expired invites recorded by this home,
+  and shows each device's `id`, `name`, `principal`, effective `role`, `fingerprint`, `added`,
+  `paired_on`, optional `unconfirmed: true` (for devices paired locally that have not yet opened
+  their first `legion gate` session), and any collision,
   immutable-field conflict, role-tie conflict, unmarked-principal, or quarantine `status`. For owner callers, it also
   shows Legion lines pointing at another or deleted Legion home (`foreign: true`,
   `missing_home: true`, `home`). `meta.doctor` warns about orphaned keys, unmarked `device:*`
