@@ -21,8 +21,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
     ConflictingIdentityInfo, ContentTarget, DisagreementEntryView, DisagreementView, ErrorCode,
-    IdentityChangedInfo, LearnRejectionView, LearnResult, MachineRouteView, Needs, NodeLink,
-    PairPendingPeer, PairSummary, RepairInfo, RepairResult, TransferCapabilities, UnpairResult,
+    IdentityChangedInfo, LearnRejectionView, LearnResult, LearnedDirectIdentity, MachineRouteView,
+    Needs, NodeLink, PairPendingPeer, PairSummary, RepairInfo, RepairResult, TransferCapabilities,
+    UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -136,9 +137,12 @@ struct BackendState {
     /// a removed or replaced pairing die immediately.
     pairing_epochs: HashMap<String, u64>,
     /// Monotonic fleet epoch for tickets issued to relayed-only fleet machines (not directly
-    /// configured on this device). Bumped on unpair, repair, or identity change so revoking any
-    /// relay immediately invalidates relayed tickets too.
+    /// configured on this device). Bumped on pair, unpair, repair, or identity change so any new
+    /// or changed pairing invalidates previously minted fleet tickets immediately.
     fleet_pairing_epoch: u64,
+    /// Fleet pairing epoch in which each learned direct node was added during this session, so a
+    /// `fleet:<epoch>` ticket can only upgrade to an entry learned during its own epoch.
+    learned_fleet_epochs: HashMap<String, u64>,
     next_pairing_epoch: u64,
     link: Link,
 }
@@ -154,6 +158,15 @@ impl BackendState {
         let epoch = self.alloc_epoch();
         self.fleet_pairing_epoch = epoch;
         epoch
+    }
+
+    fn prune_learned_fleet_epochs(&mut self) {
+        let link_cfg = &self.data.link;
+        self.learned_fleet_epochs.retain(|node, _| {
+            link_cfg
+                .node(node)
+                .is_some_and(|n| n.origin == NodeOrigin::Learned)
+        });
     }
 
     fn set_fresh_epoch(&mut self, node: &str) -> u64 {
@@ -206,6 +219,17 @@ fn parse_pairing_holder(holder: &str) -> Option<(&str, u64)> {
 
 fn parse_fleet_holder(holder: &str) -> Option<u64> {
     holder.strip_prefix("fleet:")?.parse::<u64>().ok()
+}
+
+fn canonical_host_keys(keys: &[String]) -> Vec<String> {
+    let mut canonical = std::collections::BTreeSet::new();
+    for line in keys {
+        let mut parts = line.split_whitespace();
+        if let (Some(kind), Some(data)) = (parts.next(), parts.next()) {
+            canonical.insert(format!("{kind} {data}"));
+        }
+    }
+    canonical.into_iter().collect()
 }
 
 impl LinkBackend {
@@ -275,6 +299,7 @@ impl LinkBackend {
             learn_rejections: Vec::new(),
             pairing_epochs: HashMap::new(),
             fleet_pairing_epoch: 1,
+            learned_fleet_epochs: HashMap::new(),
             next_pairing_epoch: 2,
             link,
         };
@@ -628,6 +653,8 @@ impl Backend for LinkBackend {
                 guard.disagreements.retain(|d| d.machine != node_name);
                 guard.learn_rejections.retain(|r| r.machine != node_name);
                 guard.set_fresh_epoch(&node_name);
+                guard.bump_fleet_epoch();
+                guard.learned_fleet_epochs.remove(&node_name);
                 build_app_state(&guard, self.store.path())
             };
 
@@ -707,6 +734,7 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.sync_pairing_epochs();
                 guard.bump_fleet_epoch();
+                guard.prune_learned_fleet_epochs();
                 guard.disagreements.retain_mut(|d| {
                     if d.machine == trimmed {
                         return false;
@@ -822,6 +850,7 @@ impl Backend for LinkBackend {
                 guard.disagreements.clear();
                 guard.learn_rejections.clear();
                 guard.pairing_epochs.clear();
+                guard.learned_fleet_epochs.clear();
                 guard.bump_fleet_epoch();
                 guard.sync_pairing_epochs();
                 (old, build_app_state(&guard, self.store.path()))
@@ -892,6 +921,20 @@ impl Backend for LinkBackend {
                     guard.data = updated;
                     guard.sync_pairing_epochs();
                 }
+                let current_fleet_epoch = guard.fleet_pairing_epoch;
+                for added in &report.added {
+                    if guard
+                        .data
+                        .link
+                        .node(added)
+                        .is_some_and(|n| n.origin == NodeOrigin::Learned)
+                    {
+                        guard
+                            .learned_fleet_epochs
+                            .insert(added.clone(), current_fleet_epoch);
+                    }
+                }
+                guard.prune_learned_fleet_epochs();
                 guard.disagreements = report
                     .disagreement_details
                     .iter()
@@ -969,6 +1012,7 @@ impl Backend for LinkBackend {
                     .map_err(AppError::from)?;
                 guard.data = updated;
                 guard.set_fresh_epoch(trimmed);
+                guard.learned_fleet_epochs.remove(trimmed);
                 guard.bump_fleet_epoch();
                 build_app_state(&guard, self.store.path())
             };
@@ -1057,6 +1101,32 @@ impl Backend for LinkBackend {
                 Some(ep) => ep,
                 None => guard.set_fresh_epoch(&entry.node),
             };
+            let learned_identity = if entry.origin == NodeOrigin::Learned {
+                let from_paired_introducer = entry.learned_from.as_deref().is_some_and(|intro| {
+                    guard
+                        .data
+                        .link
+                        .node(intro)
+                        .is_some_and(|n| n.origin == NodeOrigin::Paired)
+                });
+                let host_keys = entry
+                    .target
+                    .as_ref()
+                    .map(|t| canonical_host_keys(&t.host_keys))
+                    .unwrap_or_default();
+                guard
+                    .learned_fleet_epochs
+                    .get(&entry.node)
+                    .copied()
+                    .filter(|_| !host_keys.is_empty())
+                    .map(|learned_fleet_epoch| LearnedDirectIdentity {
+                        learned_fleet_epoch,
+                        from_paired_introducer,
+                        host_keys,
+                    })
+            } else {
+                None
+            };
             let principal = entry.principal.unwrap_or_else(|| {
                 if entry.local_program.is_some() {
                     "local".to_owned()
@@ -1070,6 +1140,7 @@ impl Backend for LinkBackend {
                 machine: entry.node.clone(),
                 principal,
                 holder: format_pairing_holder(&entry.node, epoch),
+                learned_identity,
             });
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1086,6 +1157,7 @@ impl Backend for LinkBackend {
                 machine: trimmed.to_owned(),
                 principal: "local".to_owned(),
                 holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
+                learned_identity: None,
             });
         }
         let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
@@ -1100,6 +1172,7 @@ impl Backend for LinkBackend {
             machine: trimmed.to_owned(),
             principal: "device".to_owned(),
             holder: format_fleet_holder(guard.fleet_pairing_epoch),
+            learned_identity: None,
         })
     }
 
@@ -3048,6 +3121,144 @@ mod tests {
                 .ok_or("expected NotPaired error")?
                 .code,
             ErrorCode::NotPaired
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pair_bumps_fleet_epoch_and_learn_stamps_learned_direct_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use legion_link::proto::{
+            HelloResult, PROTOCOL, Request as ProtoReq, Response as ProtoResp, VERSION,
+        };
+        use legion_link::{Session, SessionOpener, SshTarget};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let studio_key = DeviceKey::from_seed([81u8; 32]).public_key_line("studio")?;
+        let mut initial = AppStoreData::default();
+        initial.link.device_key = Some(DeviceKey::from_seed([80u8; 32]).to_openssh()?);
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let studio_key_for_opener = studio_key.clone();
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let node_name = entry.node.clone();
+            let studio_key = studio_key_for_opener.clone();
+            Box::pin(async move {
+                let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(server_in);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let Ok(req) = serde_json::from_str::<ProtoReq>(&line) else {
+                            break;
+                        };
+                        let reply = if req.method == "hello" {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap_or_default(),
+                            )
+                        } else {
+                            ProtoResp::ok(
+                                req.id,
+                                serde_json::json!({
+                                    "results": {
+                                        "studio": {
+                                            "ok": {
+                                                "node": "studio",
+                                                "hosts": ["studio.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [studio_key],
+                                            }
+                                        }
+                                    }
+                                }),
+                            )
+                        };
+                        if let Ok(encoded) = serde_json::to_string(&reply) {
+                            let _ = server_out
+                                .write_all(format!("{encoded}\n").as_bytes())
+                                .await;
+                        }
+                        line.clear();
+                    }
+                });
+                Session::open_io(
+                    client_in,
+                    client_out,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let backend = LinkBackend::with_opener(store, None, opener);
+        let before_learn = backend.content_target("studio")?;
+        assert!(before_learn.holder.starts_with("fleet:"));
+        assert!(before_learn.learned_identity.is_none());
+        let fleet_epoch =
+            parse_fleet_holder(&before_learn.holder).ok_or("expected fleet:<epoch> holder")?;
+
+        // Learning `studio` from paired introducer `tower` records learned_identity in the same
+        // fleet epoch without bumping `fleet_pairing_epoch`.
+        let learned = backend.learn().await?;
+        assert_eq!(learned.report.added, vec!["studio".to_owned()]);
+        assert!(backend.is_pairing_holder_live(&before_learn.holder));
+        let after_learn = backend.content_target("studio")?;
+        assert!(after_learn.holder.starts_with("pairing:studio:"));
+        let id = after_learn
+            .learned_identity
+            .ok_or("learned entry must carry learned_identity")?;
+        assert!(id.from_paired_introducer);
+        assert_eq!(id.learned_fleet_epoch, fleet_epoch);
+        assert_eq!(id.host_keys, canonical_host_keys(&[studio_key]));
+
+        // Simulating a direct `pair()` update bumps `fleet_pairing_epoch` and replaces `studio`
+        // with a Paired entry, revoking the old `fleet:` holder and clearing `learned_identity`.
+        {
+            let mut guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            let paired_studio = LinkNode::ssh(
+                "studio",
+                SshTarget {
+                    hosts: vec!["other-studio.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![DeviceKey::from_seed([82u8; 32]).public_key_line("studio")?],
+                },
+                Some("device:pixel".to_owned()),
+            );
+            guard.data.link.upsert_node(paired_studio);
+            guard.set_fresh_epoch("studio");
+            guard.bump_fleet_epoch();
+            guard.learned_fleet_epochs.remove("studio");
+        }
+        assert!(
+            !backend.is_pairing_holder_live(&before_learn.holder),
+            "pairing must invalidate prior fleet holders"
+        );
+        let after_pair = backend.content_target("studio")?;
+        assert!(
+            after_pair.learned_identity.is_none(),
+            "paired entry must never look like a learned upgrade target"
         );
         Ok(())
     }

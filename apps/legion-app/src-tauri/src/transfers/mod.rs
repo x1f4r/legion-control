@@ -5211,6 +5211,7 @@ mod tests {
                 machine: "tower".to_owned(),
                 principal: "phone".to_owned(),
                 holder: "pairing:tower:1".to_owned(),
+                learned_identity: None,
             })
         }
         fn is_pairing_holder_live(&self, holder: &str) -> bool {
@@ -8085,6 +8086,7 @@ mod tests {
                     machine: machine.to_owned(),
                     principal: "device:pixel".to_owned(),
                     holder,
+                    learned_identity: None,
                 })
             }
             fn is_pairing_holder_live(&self, _: &str) -> bool {
@@ -8833,6 +8835,7 @@ mod tests {
                     machine: machine.to_owned(),
                     principal: "device:pixel".to_owned(),
                     holder: "fleet:1".to_owned(),
+                    learned_identity: None,
                 })
             }
             fn is_pairing_holder_live(&self, _: &str) -> bool {

@@ -316,10 +316,85 @@ impl Drop for ActiveStreamGuard {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FleetDirectBinding {
+    holder: String,
+    host_keys: Vec<String>,
+}
+
+fn parse_fleet_holder(holder: &str) -> Option<u64> {
+    holder.strip_prefix("fleet:")?.parse::<u64>().ok()
+}
+
 struct LinkContentSource {
     backend: Arc<dyn Backend>,
     tickets: Arc<TicketTable>,
     ticket_cancels: Arc<Mutex<HashMap<[u8; 32], CancellationToken>>>,
+    fleet_bindings: Arc<Mutex<HashMap<[u8; 32], FleetDirectBinding>>>,
+}
+
+impl LinkContentSource {
+    fn authorize_target(
+        &self,
+        ticket: &Ticket,
+        target: &crate::backend::ContentTarget,
+    ) -> Result<(), OpenRangeError> {
+        if !self.backend.is_pairing_holder_live(&ticket.holder) {
+            return Err(OpenRangeError::TicketRevoked);
+        }
+        let Some(ticket_fleet_epoch) = parse_fleet_holder(&ticket.holder) else {
+            return if target.holder == ticket.holder {
+                Ok(())
+            } else {
+                Err(OpenRangeError::TicketRevoked)
+            };
+        };
+
+        let mut bindings = self
+            .fleet_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(bound) = bindings.get(&ticket.key_hash) {
+            // Once a `fleet:<epoch>` ticket has upgraded to a learned direct entry, it is
+            // permanently bound to that exact holder and pinned host-key identity; any change
+            // (new pairing, host-key change, or bouncing back to fleet) revokes the ticket.
+            let Some(identity) = target.learned_identity.as_ref() else {
+                return Err(OpenRangeError::TicketRevoked);
+            };
+            if target.holder == bound.holder
+                && identity.from_paired_introducer
+                && identity.learned_fleet_epoch == ticket_fleet_epoch
+                && identity.host_keys == bound.host_keys
+            {
+                return Ok(());
+            }
+            return Err(OpenRangeError::TicketRevoked);
+        }
+
+        if target.holder == ticket.holder {
+            return Ok(());
+        }
+
+        // First move from `fleet:<epoch>` to a direct entry: allowed at most once, and only to an
+        // entry learned (not paired) from a paired introducer during this ticket's fleet epoch.
+        let Some(identity) = target.learned_identity.as_ref() else {
+            return Err(OpenRangeError::TicketRevoked);
+        };
+        if !identity.from_paired_introducer
+            || identity.learned_fleet_epoch != ticket_fleet_epoch
+            || identity.host_keys.is_empty()
+        {
+            return Err(OpenRangeError::TicketRevoked);
+        }
+        bindings.insert(
+            ticket.key_hash,
+            FleetDirectBinding {
+                holder: target.holder.clone(),
+                host_keys: identity.host_keys.clone(),
+            },
+        );
+        Ok(())
+    }
 }
 
 impl ContentSource for LinkContentSource {
@@ -330,21 +405,11 @@ impl ContentSource for LinkContentSource {
         length: Option<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<OpenedRange, OpenRangeError>> + Send + 'a>> {
         Box::pin(async move {
-            if !self.backend.is_pairing_holder_live(&ticket.holder) {
-                return Err(OpenRangeError::TicketRevoked);
-            }
             let target = match self.backend.content_target(&ticket.machine) {
                 Ok(target) => target,
                 Err(_) => return Err(OpenRangeError::TicketRevoked),
             };
-            // Allow an active relayed (`fleet:<epoch>`) ticket whose fleet epoch is still live
-            // to keep serving seamlessly when background `learn()` upgrades that machine to a
-            // direct (`pairing:<machine>:<epoch>`) route mid-playback.
-            let upgraded_from_fleet = ticket.holder.starts_with("fleet:")
-                && self.backend.is_pairing_holder_live(&ticket.holder);
-            if target.holder != ticket.holder && !upgraded_from_fleet {
-                return Err(OpenRangeError::TicketRevoked);
-            }
+            self.authorize_target(ticket, &target)?;
 
             let stream_cancel = {
                 let mut map = self
@@ -362,6 +427,10 @@ impl ContentSource for LinkContentSource {
                 {
                     token.cancel();
                 }
+                self.fleet_bindings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&ticket.key_hash);
                 return Err(OpenRangeError::TicketRevoked);
             }
 
@@ -389,10 +458,11 @@ impl ContentSource for LinkContentSource {
     }
 
     fn check_live(&self, ticket: &Ticket) -> Result<(), OpenRangeError> {
-        if !self.backend.is_pairing_holder_live(&ticket.holder) {
-            return Err(OpenRangeError::TicketRevoked);
-        }
-        Ok(())
+        let target = match self.backend.content_target(&ticket.machine) {
+            Ok(target) => target,
+            Err(_) => return Err(OpenRangeError::TicketRevoked),
+        };
+        self.authorize_target(ticket, &target)
     }
 }
 
@@ -445,6 +515,7 @@ pub struct AppContentServer {
     request_log: Mutex<VecDeque<ContentRequestLog>>,
     ticket_statuses: Mutex<VecDeque<TicketStatusEntry>>,
     ticket_cancels: Arc<Mutex<HashMap<[u8; 32], CancellationToken>>>,
+    fleet_bindings: Arc<Mutex<HashMap<[u8; 32], FleetDirectBinding>>>,
 }
 
 impl AppContentServer {
@@ -497,10 +568,12 @@ impl AppContentServer {
     ) -> Self {
         let tickets = Arc::new(TicketTable::with_config(ticket_config));
         let ticket_cancels = Arc::new(Mutex::new(HashMap::new()));
+        let fleet_bindings = Arc::new(Mutex::new(HashMap::new()));
         let source = Arc::new(LinkContentSource {
             backend: Arc::clone(&backend),
             tickets: Arc::clone(&tickets),
             ticket_cancels: Arc::clone(&ticket_cancels),
+            fleet_bindings: Arc::clone(&fleet_bindings),
         });
         let conn_cap = max_loopback_connections.max(1);
         let budget_units = custom_scheme_total_memory_budget_bytes
@@ -529,6 +602,7 @@ impl AppContentServer {
             request_log: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
             ticket_statuses: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
             ticket_cancels,
+            fleet_bindings,
         }
     }
 
@@ -749,6 +823,10 @@ impl AppContentServer {
         {
             token.cancel();
         }
+        self.fleet_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key_hash);
     }
 
     fn prune_dead_ticket_cancels(&self) {
@@ -770,6 +848,10 @@ impl AppContentServer {
         for token in dead {
             token.cancel();
         }
+        self.fleet_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|h, _| self.tickets.contains_hash(h));
     }
 
     /// Revokes the single content ticket identified by `raw_url` immediately and cancels any
@@ -813,6 +895,10 @@ impl AppContentServer {
         for tok in tokens {
             tok.cancel();
         }
+        self.fleet_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Revokes every ticket and immediately stops any active loopback listener.
@@ -2047,6 +2133,7 @@ mod tests {
                 machine: "tower".to_owned(),
                 principal: "phone".to_owned(),
                 holder: self.holder.clone(),
+                learned_identity: None,
             })
         }
         fn is_pairing_holder_live(&self, holder: &str) -> bool {
@@ -3349,10 +3436,39 @@ mod tests {
             }
             fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
                 // Phone is paired ONLY with `tower`; `studio` routes via the link with fleet holder.
-                let holder = if self.link.config().node(machine).is_some() {
-                    format!("pairing:{machine}:1")
+                let cfg = self.link.config();
+                let (holder, learned_identity) = if let Some(entry) = cfg.node(machine) {
+                    let learned_identity = if entry.origin == legion_link::NodeOrigin::Learned {
+                        let from_paired_introducer =
+                            entry.learned_from.as_deref().is_some_and(|intro| {
+                                cfg.node(intro)
+                                    .is_some_and(|n| n.origin == legion_link::NodeOrigin::Paired)
+                            });
+                        let host_keys = entry
+                            .target
+                            .as_ref()
+                            .map(|t| {
+                                let mut set = std::collections::BTreeSet::new();
+                                for line in &t.host_keys {
+                                    let mut parts = line.split_whitespace();
+                                    if let (Some(k), Some(d)) = (parts.next(), parts.next()) {
+                                        set.insert(format!("{k} {d}"));
+                                    }
+                                }
+                                set.into_iter().collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (!host_keys.is_empty()).then_some(crate::backend::LearnedDirectIdentity {
+                            learned_fleet_epoch: 1,
+                            from_paired_introducer,
+                            host_keys,
+                        })
+                    } else {
+                        None
+                    };
+                    (format!("pairing:{machine}:1"), learned_identity)
                 } else {
-                    "fleet:1".to_owned()
+                    ("fleet:1".to_owned(), None)
                 };
                 Ok(ContentTarget {
                     link: self.link.clone(),
@@ -3360,6 +3476,7 @@ mod tests {
                     machine: machine.to_owned(),
                     principal: "device:pixel".to_owned(),
                     holder,
+                    learned_identity,
                 })
             }
             fn is_pairing_holder_live(&self, _holder: &str) -> bool {
@@ -4703,6 +4820,7 @@ mod tests {
                     machine: machine.to_owned(),
                     principal: "device:pixel".to_owned(),
                     holder: "fleet:1".to_owned(),
+                    learned_identity: None,
                 })
             }
             fn is_pairing_holder_live(&self, _holder: &str) -> bool {
@@ -5201,6 +5319,7 @@ mod tests {
                     machine: machine.to_owned(),
                     principal: "phone".to_owned(),
                     holder: "fleet:1".to_owned(),
+                    learned_identity: None,
                 })
             }
             fn is_pairing_holder_live(&self, _holder: &str) -> bool {
@@ -5310,6 +5429,460 @@ mod tests {
         );
         assert_eq!(count_live_pids(&tower_pids), 0);
         assert_eq!(count_live_pids(&studio_pids), 0);
+
+        server.shutdown();
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn fleet_ticket_binds_once_to_learned_identity_and_revokes_on_new_pairing_or_identity_change()
+     {
+        use crate::backend::LearnedDirectIdentity;
+
+        let media_bytes: Vec<u8> = (0..64 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let media_arc = Arc::new(media_bytes.clone());
+        let tower_key = legion_link::DeviceKey::from_seed([71u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+        let studio_key_a = legion_link::DeviceKey::from_seed([72u8; 32])
+            .public_key_line("studio")
+            .unwrap();
+        let studio_key_b = legion_link::DeviceKey::from_seed([73u8; 32])
+            .public_key_line("studio")
+            .unwrap();
+        let canonical = |k: &str| {
+            let mut parts = k.split_whitespace();
+            format!("{} {}", parts.next().unwrap(), parts.next().unwrap())
+        };
+        let key_a_canon = canonical(&studio_key_a);
+        let key_b_canon = canonical(&studio_key_b);
+
+        struct SimpleMediaOpener {
+            payload: Arc<Vec<u8>>,
+        }
+
+        impl StreamOpener for SimpleMediaOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if req["op"] == json!("relay") {
+                            &req["request"]
+                        } else {
+                            &req
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 77u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let opener: SessionOpener = {
+            let payload = Arc::clone(&media_arc);
+            Arc::new(move |entry, _, cancel| {
+                let payload = Arc::clone(&payload);
+                let node_name = entry.node.clone();
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(8 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+                    let node_for_rpc = node_name.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_for_rpc.clone(),
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: Arc::new(SimpleMediaOpener { payload }),
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![tower_key],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        #[derive(Clone)]
+        struct MutableTargetState {
+            live_fleet_epoch: u64,
+            studio_holder: String,
+            studio_learned: Option<LearnedDirectIdentity>,
+        }
+
+        struct MutableFleetBackend {
+            link: Link,
+            state: Arc<Mutex<MutableTargetState>>,
+        }
+
+        impl Backend for MutableFleetBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                let st = self.state.lock().unwrap().clone();
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder: st.studio_holder,
+                    learned_identity: st.studio_learned,
+                })
+            }
+            fn is_pairing_holder_live(&self, holder: &str) -> bool {
+                let st = self.state.lock().unwrap();
+                parse_fleet_holder(holder) == Some(st.live_fleet_epoch)
+            }
+        }
+
+        let target_state = Arc::new(Mutex::new(MutableTargetState {
+            live_fleet_epoch: 1,
+            studio_holder: "fleet:1".to_owned(),
+            studio_learned: None,
+        }));
+        let backend = Arc::new(MutableFleetBackend {
+            link: link.clone(),
+            state: Arc::clone(&target_state),
+        });
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let get_range = |port: u16, path: String, range: &'static str| async move {
+            raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://tauri.localhost\r\nRange: {range}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await
+        };
+
+        // 1) Fleet ticket upgrades once to a learned direct entry from a paired introducer during
+        //    the ticket's epoch, keeps working on that bound identity, and is revoked immediately
+        //    if the learned entry's pinned host keys later change (even if fleet epoch didn't bump).
+        let t1 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let p1 = t1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, body) = get_range(port, p1.clone(), "bytes=0-1023").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &media_bytes[0..=1023]);
+
+        // Learn `studio` with key A during epoch 1 -> first move succeeds and binds to key A.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:2".to_owned();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 1,
+                from_paired_introducer: true,
+                host_keys: vec![key_a_canon.clone()],
+            });
+        }
+        let (st, head, body) = get_range(port, p1.clone(), "bytes=1024-2047").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &media_bytes[1024..=2047]);
+        // Subsequent range read with identical bound identity still succeeds.
+        let (st, head, _) = get_range(port, p1.clone(), "bytes=2048-3071").await;
+        assert_eq!(st, 206, "{head}");
+
+        // Now learned entry's identity changes to key B -> ticket MUST be refused with 404!
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 1,
+                from_paired_introducer: true,
+                host_keys: vec![key_b_canon.clone()],
+            });
+        }
+        let (st, head, _) = get_range(port, p1.clone(), "bytes=3072-4095").await;
+        assert_eq!(
+            st, 404,
+            "ticket bound to key A must be refused when learned host keys change to key B: {head}"
+        );
+
+        // 2) Once moved to a direct entry, a fleet ticket cannot bounce back to `fleet:` or move
+        //    to a second direct entry.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "fleet:1".to_owned();
+            st.studio_learned = None;
+        }
+        let t2 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p2 = t2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:3".to_owned();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 1,
+                from_paired_introducer: true,
+                host_keys: vec![key_a_canon.clone()],
+            });
+        }
+        let (st, head, _) = get_range(port, p2.clone(), "bytes=0-511").await;
+        assert_eq!(st, 206, "{head}");
+        // Bouncing back to fleet or to a new pairing epoch holder ends the ticket.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "fleet:1".to_owned();
+            st.studio_learned = None;
+        }
+        let (st, head, _) = get_range(port, p2.clone(), "bytes=512-1023").await;
+        assert_eq!(
+            st, 404,
+            "already-upgraded fleet ticket must not fall back to fleet: {head}"
+        );
+
+        // 3) A new direct `pair()` under the same name `studio` ends the open `fleet:` ticket
+        //    (both because `learned_identity` is None for Paired entries AND because `pair()`
+        //    bumps `fleet_pairing_epoch`).
+        {
+            let mut st = target_state.lock().unwrap();
+            st.live_fleet_epoch = 2;
+            st.studio_holder = "fleet:2".to_owned();
+            st.studio_learned = None;
+        }
+        let t3 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p3 = t3
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, _) = get_range(port, p3.clone(), "bytes=0-511").await;
+        assert_eq!(st, 206, "{head}");
+        // Even if the fleet epoch hadn't bumped yet, a Paired entry (`learned_identity: None`)
+        // must refuse the fleet ticket.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:4".to_owned();
+            st.studio_learned = None;
+        }
+        let (st, head, _) = get_range(port, p3.clone(), "bytes=512-1023").await;
+        assert_eq!(
+            st, 404,
+            "fleet ticket must never move to a directly Paired entry: {head}"
+        );
+        // And bumping fleet epoch (as `LinkBackend::pair()` does) also ends it.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.live_fleet_epoch = 3;
+        }
+        let (st, head, _) = get_range(port, p3.clone(), "bytes=512-1023").await;
+        assert_eq!(
+            st, 404,
+            "bumping fleet epoch on pair must revoke ticket: {head}"
+        );
+
+        // 4) A learned entry from a non-paired introducer or from another fleet epoch is refused.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.live_fleet_epoch = 4;
+            st.studio_holder = "fleet:4".to_owned();
+            st.studio_learned = None;
+        }
+        let t4 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p4 = t4
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:5".to_owned();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 4,
+                from_paired_introducer: false,
+                host_keys: vec![key_a_canon.clone()],
+            });
+        }
+        let (st, head, _) = get_range(port, p4.clone(), "bytes=0-511").await;
+        assert_eq!(
+            st, 404,
+            "fleet ticket must refuse learned entry from non-paired introducer: {head}"
+        );
+
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 3,
+                from_paired_introducer: true,
+                host_keys: vec![key_a_canon],
+            });
+        }
+        let (st, head, _) = get_range(port, p4, "bytes=0-511").await;
+        assert_eq!(
+            st, 404,
+            "fleet ticket must refuse learned entry from another epoch: {head}"
+        );
 
         server.shutdown();
         link.close().await;

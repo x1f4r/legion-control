@@ -427,6 +427,18 @@ impl TransferCapabilities {
     }
 }
 
+/// Identity metadata for a learned direct entry, used to bind a `fleet:<epoch>` content ticket
+/// at most once to the exact learned machine identity that upgraded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LearnedDirectIdentity {
+    /// Fleet pairing epoch during which this learned entry was added.
+    pub learned_fleet_epoch: u64,
+    /// True when `learned_from` names a currently directly paired introducer.
+    pub from_paired_introducer: bool,
+    /// Canonical sorted set of pinned SSH host keys (`<type> <base64>`).
+    pub host_keys: Vec<String>,
+}
+
 /// Resolved link handle and pairing holder identity for content serving and device transfers.
 #[derive(Clone)]
 pub struct ContentTarget {
@@ -442,6 +454,9 @@ pub struct ContentTarget {
     /// Opaque holder string bound to this pairing epoch (`pairing:<link_node>:<epoch>` or
     /// `fleet:<epoch>` for relayed-only machines).
     pub holder: String,
+    /// Populated only when this target resolves to a direct learned entry (never for directly
+    /// paired entries, local pipes, or unlearned relayed-only fleet machines).
+    pub learned_identity: Option<LearnedDirectIdentity>,
 }
 
 /// Snapshot returned by the `state` command.

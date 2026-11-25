@@ -162,6 +162,7 @@ pub async fn cancel(
 #[tauri::command]
 pub async fn pair(
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
     invite: String,
     name: Option<String>,
 ) -> Result<AppState, AppError> {
@@ -174,7 +175,9 @@ pub async fn pair(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_device_name);
     validate_label_size("Device name", &resolved_name)?;
-    backend.0.pair(invite, resolved_name).await
+    let state = backend.0.pair(invite, resolved_name).await?;
+    content.0.revoke_stale_pairings();
+    Ok(state)
 }
 
 /// Removes a paired node from this device and revokes any content tickets issued under it.
