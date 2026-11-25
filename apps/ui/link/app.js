@@ -355,28 +355,45 @@ export function createAppLink() {
           }
 
           // 3) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
-          // Wait for load/error plus a brief settle window so any framed script would have time to
-          // postMessage. When CSP `default-src 'none'` or WebView2's `on_navigation` blocks the
-          // navigation before commit, the iframe can remain on its initial untouched empty
-          // `about:blank` document (which inherits the app origin and receives Tauri's
-          // `withGlobalTauri` init script on WebView2). Only fail if content actually framed into
-          // a same-origin document (navigated away from `about:blank` or populated DOM) or ran
-          // script.
+          // End the wait as soon as the frame is conclusively cross-origin (SecurityError on
+          // location.href) or fires load/error, capping silent CSP cancellations at 400 ms. When
+          // CSP `default-src 'none'` or WebView2's `on_navigation` blocks navigation before
+          // commit, the iframe can remain on its initial untouched empty `about:blank` document
+          // (which inherits the app origin and receives Tauri's `withGlobalTauri` init script on
+          // WebView2). Only fail if content actually framed into a same-origin document (navigated
+          // away from `about:blank` or populated DOM) or ran script.
           const iframe = document.createElement('iframe');
           iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:10px;height:10px;';
-          let settleIframe;
-          const iframeSettled = new Promise((resolve) => {
-            settleIframe = resolve;
+          const isIframeCrossOrigin = () => {
+            try {
+              void iframe.contentWindow?.location?.href;
+              return false;
+            } catch {
+              return true;
+            }
+          };
+          await new Promise((resolve) => {
+            let done = false;
+            const finish = (graceMs = 0) => {
+              if (done) return;
+              done = true;
+              window.clearTimeout(capTimer);
+              window.clearInterval(pollTimer);
+              if (graceMs > 0 && !isIframeCrossOrigin()) {
+                window.setTimeout(resolve, graceMs);
+              } else {
+                resolve();
+              }
+            };
+            const capTimer = window.setTimeout(() => finish(0), 400);
+            const pollTimer = window.setInterval(() => {
+              if (scriptProbe || isIframeCrossOrigin()) finish(0);
+            }, 40);
+            iframe.addEventListener('load', () => finish(50), { once: true });
+            iframe.addEventListener('error', () => finish(0), { once: true });
+            iframe.src = ticket.url;
+            document.body.appendChild(iframe);
           });
-          iframe.addEventListener('load', () => settleIframe(), { once: true });
-          iframe.addEventListener('error', () => settleIframe(), { once: true });
-          iframe.src = ticket.url;
-          document.body.appendChild(iframe);
-          await Promise.race([
-            iframeSettled,
-            new Promise((r) => window.setTimeout(r, 800)),
-          ]);
-          await new Promise((r) => window.setTimeout(r, 200));
 
           let iframeLeak = null;
           try {
@@ -486,7 +503,15 @@ export function createAppLink() {
         const alreadyPaired =
           Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
         if (!alreadyPaired) {
-          await pair(spec.invite, 'ci-media');
+          try {
+            await pair(spec.invite, 'ci-media');
+          } catch (pairErr) {
+            if (pairErr?.code !== 'timeout') throw pairErr;
+            // On a cold CI simulator runner, the initial SSH handshake can exceed 10s without
+            // consuming the invite; retry pairing once.
+            await new Promise((r) => window.setTimeout(r, 500));
+            await pair(spec.invite, 'ci-media');
+          }
         }
       }
 
