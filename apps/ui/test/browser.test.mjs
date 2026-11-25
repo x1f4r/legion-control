@@ -12,6 +12,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import './files-browser.mjs';
+import './live-refresh-browser.mjs';
 import './machine-browser.mjs';
 import './player-browser.mjs';
 

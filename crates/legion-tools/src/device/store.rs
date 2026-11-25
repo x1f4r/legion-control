@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn sanitises_and_deduplicates_device_names() {
-        assert_eq!(sanitise_device_name("My Pixel 10 Pro!"), "my-pixel-10-pro");
+        assert_eq!(sanitise_device_name("My Phone 12 Max!"), "my-phone-12-max");
         assert_eq!(sanitise_device_name("   ---   "), "device");
         assert_eq!(sanitise_device_name("phone\ninjected"), "phone-injected");
         assert_eq!(sanitise_device_name("a".repeat(60).as_str()).len(), 32);

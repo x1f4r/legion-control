@@ -13,6 +13,7 @@ function ActionDetail({
   snapshot,
   nodeInfo,
   link,
+  folderChanges = null,
   allowedSet,
   technical,
   onRequestConfirm,
@@ -333,6 +334,7 @@ function ActionDetail({
         machines=${machines}
         runningJobs=${snapshot?.runningJobs || []}
         link=${link}
+        folderChanges=${folderChanges}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
         onEnsureAwake=${onEnsureAwake}
@@ -348,6 +350,7 @@ export function ActionsView({
   nodeInfo,
   snapshot,
   link,
+  folderChanges = null,
   settings,
   wide,
   query,
@@ -367,6 +370,7 @@ export function ActionsView({
         nodeInfo=${nodeInfo}
         snapshot=${snapshot}
         link=${link}
+        folderChanges=${folderChanges}
         wide=${wide}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
@@ -396,6 +400,7 @@ export function ActionsView({
         snapshot=${snapshot}
         nodeInfo=${nodeInfo}
         link=${link}
+        folderChanges=${folderChanges}
         allowedSet=${allowedSet}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
