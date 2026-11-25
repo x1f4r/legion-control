@@ -2327,6 +2327,7 @@ test('Files viewer recovers expired and door-restarted video playback, reports h
     );
 
     assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
     await ctx.close();
   } finally {
     await browser.close();
