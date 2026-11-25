@@ -242,6 +242,8 @@ pub fn run() {
         app.manage(SharedContentServer(content_server));
         app.manage(SharedTransfers(Arc::clone(&transfers)));
         app.manage(SharedUpdater(Arc::clone(&updater)));
+        app.manage(commands::DesktopImmersiveState::default());
+        app.manage(commands::DesktopKeepScreenOn::default());
 
         let window = build_main_webview_window(app.handle())?;
 
@@ -300,6 +302,9 @@ pub fn run() {
                 commands::update_set_auto,
                 commands::update_dismiss_notice,
                 commands::update_maybe_auto_install,
+                commands::window_set_immersive,
+                commands::window_is_fullscreen,
+                commands::set_keep_screen_on,
                 $($extra,)*
             ]
         };
@@ -323,6 +328,7 @@ pub fn run() {
         commands::scan_invite,
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
         commands::transfer_upload_test_files,
     ));
 
@@ -335,6 +341,7 @@ pub fn run() {
         commands::scan_invite,
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
     ));
 
     #[cfg(all(any(target_os = "android", target_os = "ios"), not(debug_assertions)))]
@@ -348,6 +355,7 @@ pub fn run() {
     let builder = builder.invoke_handler(legion_invoke_handler!(
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
         commands::transfer_upload_test_files,
     ));
 
@@ -359,6 +367,7 @@ pub fn run() {
     let builder = builder.invoke_handler(legion_invoke_handler!(
         commands::media_check_spec,
         commands::media_check_report,
+        commands::debug_set_window_fullscreen,
     ));
 
     #[cfg(all(
@@ -447,6 +456,9 @@ pub fn run() {
             }
         }
         RunEvent::Exit => {
+            app_handle
+                .state::<commands::DesktopKeepScreenOn>()
+                .release();
             app_handle.state::<SharedTransfers>().0.shutdown();
             app_handle.state::<SharedContentServer>().0.shutdown();
         }

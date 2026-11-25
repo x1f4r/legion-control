@@ -5,8 +5,10 @@ use std::fs;
 use std::io::Write;
 #[cfg(debug_assertions)]
 use std::path::Path;
-use std::sync::Arc;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -110,6 +112,244 @@ pub enum ScanInviteResult {
 
 /// Shared backend state registered with Tauri.
 pub struct SharedBackend(pub Arc<dyn Backend>);
+
+/// Tracks whether the desktop window was already full screen before entering immersive mode so
+/// leaving restores the previous window state.
+#[derive(Default)]
+pub struct DesktopImmersiveState {
+    previous_fullscreen: Mutex<Option<bool>>,
+}
+
+impl DesktopImmersiveState {
+    /// Transitions into immersive mode, recording `currently_fullscreen` only when entering from
+    /// the inactive state. Returns the target full-screen flag (`true`).
+    pub fn enter(&self, currently_fullscreen: bool) -> bool {
+        let mut guard = self
+            .previous_fullscreen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            *guard = Some(currently_fullscreen);
+        }
+        true
+    }
+
+    /// Leaves immersive mode and returns `Some(previous_fullscreen)` if immersive mode was active,
+    /// or `None` when already inactive.
+    pub fn leave(&self) -> Option<bool> {
+        let mut guard = self
+            .previous_fullscreen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take()
+    }
+
+    /// Returns whether immersive mode is currently active.
+    pub fn is_active(&self) -> bool {
+        let guard = self
+            .previous_fullscreen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.is_some()
+    }
+}
+
+/// Result returned by [`window_set_immersive`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImmersiveResult {
+    /// Whether immersive mode is active after this call.
+    pub active: bool,
+    /// Whether the window is full screen after this call.
+    pub fullscreen: bool,
+}
+
+/// Holds an optional desktop display-idle inhibitor process while video playback requests keeping
+/// the screen awake. Always released when toggled off or when the app exits.
+#[derive(Default)]
+pub struct DesktopKeepScreenOn {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    inhibitor: Mutex<Option<Child>>,
+}
+
+impl DesktopKeepScreenOn {
+    /// Acquires or releases the desktop screen-awake hold (best-effort, silent if unavailable).
+    pub fn set(&self, on: bool) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let mut guard = self
+                .inhibitor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if on {
+                if let Some(child) = guard.as_mut()
+                    && child.try_wait().ok().flatten().is_none()
+                {
+                    return;
+                }
+                *guard = spawn_desktop_inhibitor();
+            } else if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let _ = on;
+        }
+    }
+
+    /// Releases any active display-idle inhibitor on shutdown.
+    pub fn release(&self) {
+        self.set(false);
+    }
+}
+
+impl Drop for DesktopKeepScreenOn {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_desktop_inhibitor() -> Option<Child> {
+    Command::new("systemd-inhibit")
+        .args([
+            "--what=idle",
+            "--who=Legion",
+            "--why=Playing video",
+            "sleep",
+            "86400",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_desktop_inhibitor() -> Option<Child> {
+    let pid = std::process::id().to_string();
+    Command::new("caffeinate")
+        .args(["-d", "-w", &pid])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+#[cfg(all(
+    not(any(target_os = "android", target_os = "ios")),
+    not(target_os = "linux"),
+    not(target_os = "macos")
+))]
+fn spawn_desktop_inhibitor() -> Option<Child> {
+    None
+}
+
+/// Enters or leaves immersive mode on the main desktop window, restoring its pre-immersive
+/// full-screen state when leaving.
+#[tauri::command]
+pub fn window_set_immersive(
+    window: tauri::WebviewWindow,
+    state: State<'_, DesktopImmersiveState>,
+    on: bool,
+) -> Result<ImmersiveResult, AppError> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if on {
+            let currently_fullscreen = window.is_fullscreen().unwrap_or(false);
+            let target = state.enter(currently_fullscreen);
+            if !currently_fullscreen {
+                window.set_fullscreen(target).map_err(|err| {
+                    AppError::new(
+                        ErrorCode::Failed,
+                        format!("Could not enter full screen: {err}"),
+                    )
+                })?;
+            }
+            let fullscreen = window.is_fullscreen().unwrap_or(target);
+            Ok(ImmersiveResult {
+                active: true,
+                fullscreen,
+            })
+        } else {
+            if let Some(previous) = state.leave() {
+                window.set_fullscreen(previous).map_err(|err| {
+                    AppError::new(
+                        ErrorCode::Failed,
+                        format!("Could not leave full screen: {err}"),
+                    )
+                })?;
+            }
+            let fullscreen = window.is_fullscreen().unwrap_or(false);
+            Ok(ImmersiveResult {
+                active: false,
+                fullscreen,
+            })
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (window, state);
+        Ok(ImmersiveResult {
+            active: on,
+            fullscreen: on,
+        })
+    }
+}
+
+/// Reports whether the main desktop window is currently full screen.
+#[tauri::command]
+pub fn window_is_fullscreen(window: tauri::WebviewWindow) -> Result<bool, AppError> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        window.is_fullscreen().map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not read window full-screen state: {err}"),
+            )
+        })
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = window;
+        Ok(false)
+    }
+}
+
+/// Enables or releases the desktop keep-screen-on hold during video playback.
+#[tauri::command]
+pub fn set_keep_screen_on(keep: State<'_, DesktopKeepScreenOn>, on: bool) -> Result<(), AppError> {
+    keep.set(on);
+    Ok(())
+}
+
+/// Debug/test-only helper to put the main desktop window into full screen before testing
+/// `window_set_immersive` restoration. Compiled ONLY in debug builds.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn debug_set_window_fullscreen(
+    window: tauri::WebviewWindow,
+    fullscreen: bool,
+) -> Result<bool, AppError> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        window.set_fullscreen(fullscreen).map_err(|err| {
+            AppError::new(
+                ErrorCode::Failed,
+                format!("Could not set window full screen: {err}"),
+            )
+        })?;
+        Ok(window.is_fullscreen().unwrap_or(fullscreen))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = window;
+        Ok(fullscreen)
+    }
+}
 
 /// Managed handle to the mobile barcode scanner plugin on Android.
 #[cfg(target_os = "android")]
@@ -481,6 +721,9 @@ pub struct MediaCheckSpec {
     /// Optional flag asking the page to also re-verify media decode after an iOS resume event.
     #[serde(default)]
     pub verify_resume: bool,
+    /// Optional flag asking the page to verify desktop window immersive full-screen transitions.
+    #[serde(default)]
+    pub verify_immersive: bool,
     /// Optional host path where [`media_check_report`] writes the JSON result. Never read from JS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out_file: Option<String>,
@@ -511,6 +754,9 @@ pub struct PublicMediaCheckSpec {
     /// Whether to also wait for an app resume and re-verify media loading.
     #[serde(default)]
     pub verify_resume: bool,
+    /// Whether to verify desktop window immersive full-screen transitions.
+    #[serde(default)]
+    pub verify_immersive: bool,
 }
 
 /// Decoded media verification report submitted by the web view after loading content URLs.
@@ -545,6 +791,9 @@ pub struct MediaCheckReport {
     /// Result of post-resume loopback media reload check when requested (iOS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_ok: Option<bool>,
+    /// Result of desktop window immersive full-screen transition check when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub immersive_check: Option<Value>,
     /// Failure description when `ok` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -609,6 +858,7 @@ pub fn media_check_spec(app: tauri::AppHandle) -> Result<Option<PublicMediaCheck
         html_path: spec.html_path,
         svg_path: spec.svg_path,
         verify_resume: spec.verify_resume,
+        verify_immersive: spec.verify_immersive,
     }))
 }
 
@@ -1069,5 +1319,27 @@ mod tests {
             .ok_or("expected label cap error")?;
         assert_eq!(err.code, ErrorCode::InvalidArgs);
         Ok(())
+    }
+
+    #[test]
+    fn desktop_immersive_state_restores_previous_fullscreen_state() {
+        let state = DesktopImmersiveState::default();
+        assert!(!state.is_active());
+        assert_eq!(state.leave(), None);
+
+        // Normal window -> enter immersive -> leave restores windowed (false).
+        assert!(state.enter(false));
+        assert!(state.is_active());
+        // Repeated enter while already active preserves original pre-immersive false.
+        assert!(state.enter(true));
+        assert_eq!(state.leave(), Some(false));
+        assert!(!state.is_active());
+        assert_eq!(state.leave(), None);
+
+        // Window already full screen -> enter immersive -> leave keeps full screen (true).
+        assert!(state.enter(true));
+        assert!(state.is_active());
+        assert_eq!(state.leave(), Some(true));
+        assert!(!state.is_active());
     }
 }

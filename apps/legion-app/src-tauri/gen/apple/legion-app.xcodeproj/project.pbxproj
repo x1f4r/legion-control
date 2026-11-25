@@ -16,6 +16,7 @@
 		A8D8F8F44B08FD72584FA24C /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 940B44E97834A92896E9CACA /* libapp.a */; };
 		ACCA748BCEC032E9EA366D89 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E7396AE922C706A88EC51BAC /* Metal.framework */; };
 		B59BAEE49EBDE9A498CEAD51 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = DAB3B96B6F1929AE4D8E2909 /* main.mm */; };
+		C4E8A1905F2D49B1A72B9310 /* ImmersiveBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4E8A1905F2D49B1A72B9311 /* ImmersiveBridge.swift */; };
 		D81CFC19DBDA2BD4F4365381 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8527E414051CEE07D68A3036 /* UIKit.framework */; };
 		E369286A721A12D042451211 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 02997A061EB4CEAB8BFAC771 /* assets */; };
 		F3E3F77BCF44298683FE8119 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5C4A949CBB9C67072A34C2CC /* MetalKit.framework */; };
@@ -38,6 +39,7 @@
 		A0DF25A90ACCE7D60E305C2E /* legion-app_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "legion-app_iOS.entitlements"; sourceTree = "<group>"; };
 		A7A240A00852CA08E2ABA631 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		B8E6533CB97FB5AF3724CC7B /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		C4E8A1905F2D49B1A72B9311 /* ImmersiveBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImmersiveBridge.swift; sourceTree = "<group>"; };
 		DAB3B96B6F1929AE4D8E2909 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
 		E2AF24FF1AA6A58A7B64CF03 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E7396AE922C706A88EC51BAC /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
@@ -150,6 +152,7 @@
 		FFF97ECDE3A21354F1DA35F9 /* legion-app */ = {
 			isa = PBXGroup;
 			children = (
+				C4E8A1905F2D49B1A72B9311 /* ImmersiveBridge.swift */,
 				DAB3B96B6F1929AE4D8E2909 /* main.mm */,
 				A90AF45C72F44ACAD71D6F40 /* bindings */,
 			);
@@ -251,6 +254,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C4E8A1905F2D49B1A72B9310 /* ImmersiveBridge.swift in Sources */,
 				B59BAEE49EBDE9A498CEAD51 /* main.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
