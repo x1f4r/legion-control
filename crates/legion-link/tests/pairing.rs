@@ -553,3 +553,227 @@ async fn real_sshd_pairing_with_legion_link_enrol_stream_and_revoke() {
 
     link.close().await;
 }
+
+#[tokio::test]
+async fn real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!(
+            "skipping real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly: built `legion` binary not found"
+        );
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        eprintln!("skipping: throwaway sshd unavailable");
+        return;
+    };
+
+    let node_toml = format!(
+        "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+        toml_literal(&auth_keys),
+        toml_literal(&sshd.host_key_pub),
+    );
+    fs::write(config_dir.join("node.toml"), node_toml).unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n\
+         [roles.operator]\n\
+         allow = [\"effect:read\", \"exec.run\"]\n\
+         deny = [\"audit.*\", \"fs.write\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+
+    // Scenario A: Client gives up waiting for confirmation while the node finishes enrolling
+    // (`enrol` timeout = 1ms). Either the immediate post-timeout device-key probe confirms
+    // enrolment or retrying the same invite once the node finishes commits recovers cleanly.
+    let invite_a_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=late-phone",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let invite_a_text = invite_a_res["invite"].as_str().unwrap();
+
+    let key_a = DeviceKey::generate().unwrap();
+    let short_opts = legion_link::LinkOptions {
+        ssh_timeouts: SshTimeouts {
+            enrol: Duration::from_millis(1),
+            ..SshTimeouts::default()
+        },
+        ..legion_link::LinkOptions::default()
+    };
+    let link_a = Link::with_options(
+        LinkConfig {
+            device_key: Some(key_a.to_openssh().unwrap()),
+            ..LinkConfig::default()
+        },
+        short_opts,
+    );
+
+    let first_attempt = link_a.pair(invite_a_text, "late-phone").await;
+    let enrolled_a = match first_attempt {
+        Ok(enrolled) => enrolled,
+        Err(err) => {
+            assert_eq!(
+                err.code,
+                ErrorCode::Timeout,
+                "unexpected first error: {err}"
+            );
+            assert!(
+                link_a.config().node("tower").is_none(),
+                "timed-out pair must not save half-paired node locally"
+            );
+            // Wait deterministically for the node's in-flight enrolment to finish committing
+            // authorized_keys (simulating the node finishing a couple seconds after client timeout).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if fs::read_to_string(&auth_keys)
+                    .unwrap_or_default()
+                    .contains("--device late-phone")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(
+                fs::read_to_string(&auth_keys)
+                    .unwrap_or_default()
+                    .contains("--device late-phone"),
+                "node did not finish committing late-phone enrolment"
+            );
+            // Retry with the exact same invite: temp key is already gone, so recovery probes
+            // `device_key` + `meta.whoami` and completes pairing cleanly.
+            link_a
+                .pair(invite_a_text, "late-phone")
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "retry after late enrolment failed: {e}\n--- sshd log ---\n{}",
+                        sshd.log()
+                    )
+                })
+        }
+    };
+    assert_eq!(enrolled_a.node, "tower");
+    assert_eq!(enrolled_a.principal, "device:late-phone");
+    assert_eq!(enrolled_a.role, "operator");
+    let whoami_a = link_a
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(whoami_a["principal"], json!("device:late-phone"));
+    assert_eq!(whoami_a["role"], json!("operator"));
+    link_a.close().await;
+
+    // Scenario B: Deterministic half-paired retry — the node has already consumed the single-use
+    // invite and installed `key_b`, while the client only persisted `key_b` (no node entry yet).
+    let invite_b_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=retry-phone",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let invite_b_text = invite_b_res["invite"].as_str().unwrap();
+    let invite_b = Invite::parse(invite_b_text).unwrap();
+
+    let key_b = DeviceKey::generate().unwrap();
+    let direct = enrol(
+        &invite_b,
+        &key_b,
+        "retry-phone",
+        SshTimeouts::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct.principal, "device:retry-phone");
+
+    // Client has `key_b` persisted, but no `tower` node entry (simulating a dropped reply).
+    let link_b = Link::new(LinkConfig {
+        device_key: Some(key_b.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let recovered_b = link_b
+        .pair(invite_b_text, "retry-phone")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "half-paired retry failed: {e}\n--- sshd log ---\n{}",
+                sshd.log()
+            )
+        });
+    assert_eq!(recovered_b.node, "tower");
+    assert_eq!(recovered_b.principal, "device:retry-phone");
+    assert_eq!(recovered_b.role, "operator");
+    assert!(link_b.config().node("tower").is_some());
+
+    // Now that `tower` IS paired under `device:retry-phone`, replaying the spent invite on `link_b`
+    // must be rejected (never silently accepted a second time).
+    let replay_same = link_b.pair(invite_b_text, "retry-phone").await.unwrap_err();
+    assert_eq!(replay_same.code, ErrorCode::Denied, "{replay_same}");
+    assert_eq!(
+        replay_same.details.as_ref().unwrap()["reason"],
+        json!(REASON_AUTH_FAILED)
+    );
+
+    // And a different device key trying the consumed invite must still be rejected.
+    let stranger_key = DeviceKey::generate().unwrap();
+    let replay_stranger = enrol(
+        &invite_b,
+        &stranger_key,
+        "stranger",
+        SshTimeouts::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(replay_stranger.code, ErrorCode::Denied, "{replay_stranger}");
+    assert_eq!(
+        replay_stranger.details.as_ref().unwrap()["reason"],
+        json!(REASON_AUTH_FAILED)
+    );
+
+    let whoami_b = link_b
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(whoami_b["principal"], json!("device:retry-phone"));
+    link_b.close().await;
+}

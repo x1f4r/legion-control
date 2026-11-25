@@ -151,8 +151,8 @@ pub use content::{
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
 pub use invite::{
-    Enrolled, FleetPushOutcome, INVITE_PREFIX, INVITE_VERSION, Invite, MAX_INVITE_LEN, SshTarget,
-    SshTimeouts,
+    DEFAULT_ENROL_TIMEOUT, Enrolled, FleetPushOutcome, INVITE_PREFIX, INVITE_VERSION, Invite,
+    MAX_INVITE_LEN, SshTarget, SshTimeouts,
 };
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;

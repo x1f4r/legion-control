@@ -751,11 +751,33 @@ impl Link {
     /// configuration is left unchanged.
     #[cfg(feature = "ssh")]
     pub async fn pair(&self, invite_text: &str, device_name: &str) -> Result<Enrolled, ErrorBody> {
+        self.pair_cancellable(invite_text, device_name, CancellationToken::new())
+            .await
+    }
+
+    /// Like [`Link::pair`], but stops waiting and leaves [`LinkConfig`] untouched when `cancel`
+    /// is triggered.
+    #[cfg(feature = "ssh")]
+    pub async fn pair_cancellable(
+        &self,
+        invite_text: &str,
+        device_name: &str,
+        cancel: CancellationToken,
+    ) -> Result<Enrolled, ErrorBody> {
         self.pair_with(
             invite_text,
             device_name,
-            |invite, key, name, timeouts, cancel| async move {
-                crate::invite::enrol(&invite, &key, &name, timeouts, cancel).await
+            cancel,
+            |invite, key, name, timeouts, allow_auth_failed_recovery, cancel| async move {
+                crate::invite::enrol_with_recovery(
+                    &invite,
+                    &key,
+                    &name,
+                    timeouts,
+                    cancel,
+                    allow_auth_failed_recovery,
+                )
+                .await
             },
         )
         .await
@@ -766,6 +788,7 @@ impl Link {
         &self,
         invite_text: &str,
         device_name: &str,
+        cancel: CancellationToken,
         enrol_fn: F,
     ) -> Result<Enrolled, ErrorBody>
     where
@@ -774,6 +797,7 @@ impl Link {
             crate::key::DeviceKey,
             String,
             SshTimeouts,
+            bool,
             CancellationToken,
         ) -> Fut,
         Fut: Future<Output = Result<Enrolled, ErrorBody>>,
@@ -787,16 +811,39 @@ impl Link {
             )
             .with_hint("Pass a short label such as `phone` or `tablet`."));
         }
+        if cancel.is_cancelled() {
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Enrolment with {} was cancelled.", invite.node),
+            )
+            .with_machine(&invite.node));
+        }
 
-        let _mutation_guard = self.inner.mutation_lock.lock().await;
+        let _mutation_guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    format!("Enrolment with {} was cancelled.", invite.node),
+                )
+                .with_machine(&invite.node));
+            }
+            guard = self.inner.mutation_lock.lock() => guard,
+        };
 
-        let existing_key = self
-            .inner
-            .config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .device_key
-            .clone();
+        let (existing_key, already_paired_same_principal) = {
+            let cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let already = cfg.nodes.iter().any(|n| {
+                n.node == invite.node
+                    && n.origin == NodeOrigin::Paired
+                    && n.principal.as_deref() == Some(invite.principal.as_str())
+            });
+            (cfg.device_key.clone(), already)
+        };
         let (device_key, generated_pem) = match existing_key {
             Some(pem) => (crate::key::DeviceKey::from_openssh(&pem)?, None),
             None => {
@@ -806,14 +853,24 @@ impl Link {
             }
         };
 
+        let node_name = invite.node.clone();
         let enrolled = enrol_fn(
             invite,
             device_key,
             name.to_owned(),
             self.inner.options.ssh_timeouts,
-            CancellationToken::new(),
+            !already_paired_same_principal,
+            cancel.clone(),
         )
         .await?;
+
+        if cancel.is_cancelled() {
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Enrolment with {node_name} was cancelled."),
+            )
+            .with_machine(&node_name));
+        }
 
         let entry = NodeLink::from(enrolled.clone());
         {
@@ -4246,6 +4303,7 @@ mod tests {
                           key: DeviceKey,
                           name: String,
                           timeouts: SshTimeouts,
+                          _allow_auth_failed_recovery: bool,
                           cancel: CancellationToken| async move {
             let public_key = key.public_key_line(&name)?;
             let (client, server) = tokio::io::duplex(64 * 1024);
@@ -4285,7 +4343,7 @@ mod tests {
                 &invite,
                 &public_key,
                 &name,
-                timeouts.handshake,
+                timeouts.enrol,
                 cancel,
             )
             .await
@@ -4307,12 +4365,32 @@ mod tests {
         let link = Link::with_opener(LinkConfig::default(), LinkOptions::default(), opener);
         assert!(link.config().device_key.is_none());
 
+        // A cancelled first pairing must leave LinkConfig untouched.
+        let cancel_now = CancellationToken::new();
+        cancel_now.cancel();
+        let cancel_err = link
+            .pair_with(
+                &make_invite("tower", "inv-cancel"),
+                "phone",
+                cancel_now,
+                |_, _, _, _, _, _| async {
+                    panic!("enrol_fn must not run when cancelled beforehand")
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(cancel_err.code, ErrorCode::Cancelled);
+        assert_eq!(link.config(), LinkConfig::default());
+
         // A failed first pairing must leave LinkConfig untouched.
         let fail_err = link
             .pair_with(
                 &make_invite("tower", "inv-bad"),
                 "phone",
-                |_, _, _, _, _| async { Err(ErrorBody::new(ErrorCode::Denied, "Invite expired.")) },
+                CancellationToken::new(),
+                |_, _, _, _, _, _| async {
+                    Err(ErrorBody::new(ErrorCode::Denied, "Invite expired."))
+                },
             )
             .await
             .unwrap_err();
@@ -4321,7 +4399,12 @@ mod tests {
 
         // First successful pairing generates a fresh device key and adds `tower`.
         let enrolled_tower = link
-            .pair_with(&make_invite("tower", "inv-1"), "phone", mock_enrol)
+            .pair_with(
+                &make_invite("tower", "inv-1"),
+                "phone",
+                CancellationToken::new(),
+                mock_enrol,
+            )
             .await
             .unwrap();
         assert_eq!(enrolled_tower.node, "tower");
@@ -4344,7 +4427,12 @@ mod tests {
 
         // Pairing a second node must reuse the exact same device key (never replace it).
         let enrolled_pi = link
-            .pair_with(&make_invite("pi", "inv-2"), "phone", mock_enrol)
+            .pair_with(
+                &make_invite("pi", "inv-2"),
+                "phone",
+                CancellationToken::new(),
+                mock_enrol,
+            )
             .await
             .unwrap();
         assert_eq!(enrolled_pi.node, "pi");
@@ -4375,7 +4463,12 @@ mod tests {
         };
         let broken_link = Link::new(broken_cfg.clone());
         let bad_key_err = broken_link
-            .pair_with(&make_invite("pi", "inv-3"), "phone", mock_enrol)
+            .pair_with(
+                &make_invite("pi", "inv-3"),
+                "phone",
+                CancellationToken::new(),
+                mock_enrol,
+            )
             .await
             .unwrap_err();
         assert_eq!(bad_key_err.code, ErrorCode::InvalidArgs);
