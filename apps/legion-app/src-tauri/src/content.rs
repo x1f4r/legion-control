@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE,
+    ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE,
     CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderName, HeaderValue, RANGE, REFERRER_POLICY,
     VARY, X_CONTENT_TYPE_OPTIONS,
 };
@@ -69,8 +69,12 @@ const CUSTOM_SCHEME_BUDGET_UNIT_BYTES: usize = 64 * 1024;
 /// Maximum simultaneous TCP connections accepted by the loopback content listener.
 pub const MAX_LOOPBACK_CONNECTIONS: usize = 32;
 
-/// Maximum time a loopback client may take to send HTTP request headers (5 seconds).
+/// Maximum time an authenticated loopback client may take to send HTTP request headers (5 seconds).
 pub const LOOPBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time an unauthenticated loopback connection (one that has not yet presented a valid
+/// ticket) may take to send complete HTTP request headers before being closed (2 seconds).
+pub const LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Initial exponential backoff delay after a transient `accept()` error.
 const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(25);
@@ -216,6 +220,87 @@ struct ActivityState {
     last_activity: Instant,
 }
 
+struct LoopbackConnSlot {
+    id: u64,
+    authenticated: Arc<AtomicBool>,
+    evict: CancellationToken,
+}
+
+/// Bounded registry of active loopback TCP connections.
+///
+/// Tracks whether each connection has presented a valid content ticket so that when the connection
+/// cap is reached, the oldest unauthenticated connection is evicted before refusing a new one.
+struct LoopbackConnTable {
+    max_connections: usize,
+    next_id: u64,
+    active: VecDeque<LoopbackConnSlot>,
+}
+
+impl LoopbackConnTable {
+    fn new(max_connections: usize) -> Self {
+        let cap = max_connections.max(1);
+        Self {
+            max_connections: cap,
+            next_id: 1,
+            active: VecDeque::with_capacity(cap),
+        }
+    }
+
+    fn admit(
+        table: &Arc<Mutex<Self>>,
+    ) -> Option<(LoopbackConnGuard, Arc<AtomicBool>, CancellationToken)> {
+        let mut guard = table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.active.len() >= guard.max_connections {
+            let evict_idx = guard
+                .active
+                .iter()
+                .position(|slot| !slot.authenticated.load(Ordering::Acquire))?;
+            if let Some(evicted) = guard.active.remove(evict_idx) {
+                evicted.evict.cancel();
+            }
+        }
+        let id = guard.next_id;
+        guard.next_id = guard.next_id.wrapping_add(1);
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let evict = CancellationToken::new();
+        guard.active.push_back(LoopbackConnSlot {
+            id,
+            authenticated: Arc::clone(&authenticated),
+            evict: evict.clone(),
+        });
+        Some((
+            LoopbackConnGuard {
+                table: Arc::clone(table),
+                id,
+            },
+            authenticated,
+            evict,
+        ))
+    }
+
+    fn release(&mut self, id: u64) {
+        if let Some(idx) = self.active.iter().position(|slot| slot.id == id) {
+            self.active.remove(idx);
+        }
+    }
+}
+
+struct LoopbackConnGuard {
+    table: Arc<Mutex<LoopbackConnTable>>,
+    id: u64,
+}
+
+impl Drop for LoopbackConnGuard {
+    fn drop(&mut self) {
+        self.table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release(self.id);
+    }
+}
+
 struct ActiveStreamGuard {
     active_streams: Arc<AtomicUsize>,
     activity: Arc<Mutex<ActivityState>>,
@@ -316,7 +401,7 @@ pub struct AppContentServer {
     allowed_origins: Vec<String>,
     idle_shutdown: Duration,
     header_read_timeout: Duration,
-    loopback_conn_limit: Arc<Semaphore>,
+    loopback_conns: Arc<Mutex<LoopbackConnTable>>,
     custom_scheme_max_full_bytes: u64,
     custom_scheme_memory_budget: Arc<Semaphore>,
     custom_scheme_buffered_bytes: Arc<AtomicUsize>,
@@ -393,7 +478,7 @@ impl AppContentServer {
             allowed_origins,
             idle_shutdown,
             header_read_timeout,
-            loopback_conn_limit: Arc::new(Semaphore::new(conn_cap)),
+            loopback_conns: Arc::new(Mutex::new(LoopbackConnTable::new(conn_cap))),
             custom_scheme_max_full_bytes,
             custom_scheme_memory_budget: Arc::new(Semaphore::new(budget_units)),
             custom_scheme_buffered_bytes: Arc::new(AtomicUsize::new(0)),
@@ -750,7 +835,7 @@ impl AppContentServer {
         };
 
         let response = self
-            .handle_checked_request(&guard, &method, &uri, &headers, options)
+            .handle_checked_request(&guard, &method, &uri, &headers, options, None)
             .await;
         let ticket_key_hash = parse_content_path(uri.path()).map(|(id, _)| ticket_hash(id));
         let initial_status = response.status();
@@ -932,8 +1017,10 @@ impl AppContentServer {
                     continue;
                 }
             };
-            let Ok(conn_permit) = Arc::clone(&self.loopback_conn_limit).try_acquire_owned() else {
-                // Drop excess connections immediately instead of spawning unbounded tasks.
+            let Some((conn_guard_slot, conn_authenticated, conn_evict)) =
+                LoopbackConnTable::admit(&self.loopback_conns)
+            else {
+                // Every active slot is held by an authenticated connection; drop excess immediately.
                 drop(stream);
                 continue;
             };
@@ -941,18 +1028,28 @@ impl AppContentServer {
             let server = Arc::clone(&self);
             let conn_guard = Arc::clone(&guard);
             let conn_shutdown = shutdown.clone();
+            let unauth_timeout = header_read_timeout.min(LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT);
             tokio::spawn(async move {
-                let _permit = conn_permit;
+                let _slot_guard = conn_guard_slot;
                 let io = TokioIo::new(stream);
+                let service_auth = Arc::clone(&conn_authenticated);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let server = Arc::clone(&server);
                     let guard = Arc::clone(&conn_guard);
+                    let auth_flag = Arc::clone(&service_auth);
                     async move {
                         let method = req.method().clone();
                         let uri = req.uri().clone();
                         let headers = req.headers().clone();
                         let resp = server
-                            .handle_checked_request(&guard, &method, &uri, &headers, options)
+                            .handle_checked_request(
+                                &guard,
+                                &method,
+                                &uri,
+                                &headers,
+                                options,
+                                Some(&auth_flag),
+                            )
                             .await;
                         Ok::<Response<ContentBody>, Infallible>(resp)
                     }
@@ -963,12 +1060,30 @@ impl AppContentServer {
                     .header_read_timeout(header_read_timeout)
                     .serve_connection(io, service);
                 tokio::pin!(conn);
-                tokio::select! {
-                    biased;
-                    () = conn_shutdown.cancelled() => {
-                        conn.as_mut().graceful_shutdown();
+                let unauth_deadline = tokio::time::sleep(unauth_timeout);
+                tokio::pin!(unauth_deadline);
+                let mut check_unauth = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = conn_shutdown.cancelled() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                            break;
+                        }
+                        () = conn_evict.cancelled() => {
+                            // Immediately drop an evicted unauthenticated socket without waiting
+                            // for its peer to finish headers.
+                            break;
+                        }
+                        () = &mut unauth_deadline, if check_unauth => {
+                            check_unauth = false;
+                            if !conn_authenticated.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                        _ = &mut conn => break,
                     }
-                    _ = &mut conn => {}
                 }
             });
         }
@@ -1022,6 +1137,7 @@ impl AppContentServer {
         uri: &Uri,
         headers: &HeaderMap,
         options: ServeOptions,
+        conn_authenticated: Option<&AtomicBool>,
     ) -> Response<ContentBody> {
         self.touch_activity();
 
@@ -1040,10 +1156,16 @@ impl AppContentServer {
             return not_found_response(options.corp, cors_origin);
         };
 
-        // Only track status and stream-failure state for requests that present a real, live ticket.
-        // Requests with unknown, expired, or invalid tickets must never allocate status slots and
-        // evict the viewer's diagnosis for an active media URL.
+        // Only track status, stream-failure state, and connection authentication for requests that
+        // present a real, live ticket. Requests with unknown, expired, or invalid tickets must
+        // never allocate status slots or keep a loopback socket alive past the unauthenticated
+        // header timeout.
         let valid_ticket = self.tickets.lookup(ticket_id);
+        if valid_ticket.is_some()
+            && let Some(auth) = conn_authenticated
+        {
+            auth.store(true, Ordering::Release);
+        }
         let key_hash = valid_ticket.as_ref().map(|t| t.key_hash);
         let stream_failed = key_hash.map(|h| self.ensure_ticket_stream_flag(h));
 
@@ -1071,6 +1193,12 @@ impl AppContentServer {
             hooks,
         )
         .await;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            response
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("close"));
+        }
 
         if let Some(origin) = cors_origin {
             apply_cors_headers(response.headers_mut(), origin);
@@ -1276,6 +1404,9 @@ fn guard_error_response(rejection: GuardRejection, corp: CorpPolicy) -> Response
         .headers_mut()
         .insert(CONTENT_LENGTH, HeaderValue::from(len));
     response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 fn not_found_response(corp: CorpPolicy, cors_origin: Option<HeaderValue>) -> Response<ContentBody> {
@@ -1294,6 +1425,9 @@ fn not_found_response(corp: CorpPolicy, cors_origin: Option<HeaderValue>) -> Res
     response
         .headers_mut()
         .insert(CONTENT_LENGTH, HeaderValue::from(len));
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
     if let Some(origin) = cors_origin {
         apply_cors_headers(response.headers_mut(), origin);
     }
@@ -2137,7 +2271,7 @@ mod tests {
             Duration::from_secs(30),
             vec!["tauri://localhost".to_owned()],
             2,
-            Duration::from_millis(200),
+            Duration::from_millis(400),
             CUSTOM_SCHEME_MAX_FULL_BYTES,
             CUSTOM_SCHEME_TOTAL_MEMORY_BUDGET_BYTES,
         ));
@@ -2152,35 +2286,52 @@ mod tests {
             .strip_prefix(&format!("http://127.0.0.1:{port}"))
             .unwrap();
 
-        // Slowloris header-read timeout: send incomplete HTTP headers and verify server closes
-        // promptly after 200ms rather than holding the slot open forever.
-        let mut slow1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        slow1.write_all(b"GET /v1/content/").await.unwrap();
-        let mut slow2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        slow2.write_all(b"GET /v1/content/").await.unwrap();
-        // Give accept loop a moment to register both permits.
-        tokio::time::sleep(Duration::from_millis(40)).await;
-
-        // Third simultaneous connection exceeds the cap of 2 and is closed immediately.
-        let mut overflow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let mut byte = [0u8; 1];
-        let overflow_read =
-            tokio::time::timeout(Duration::from_millis(120), overflow.read(&mut byte)).await;
-        assert!(
-            matches!(overflow_read, Ok(Ok(0)) | Ok(Err(_))),
-            "excess connection above cap should be dropped immediately, got {overflow_read:?}"
-        );
-
-        // After the 200ms header read timeout expires, slowloris sockets close and normal
-        // requests succeed again.
+        // 1) Slowloris header-read timeout: send incomplete HTTP headers and verify server closes
+        // promptly after the configured timeout rather than holding the slot open forever.
+        let mut slow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        slow.write_all(b"GET /v1/content/").await.unwrap();
         let mut sink = Vec::new();
         let slow_closed =
-            tokio::time::timeout(Duration::from_secs(2), slow1.read_to_end(&mut sink)).await;
+            tokio::time::timeout(Duration::from_secs(2), slow.read_to_end(&mut sink)).await;
         assert!(
             slow_closed.is_ok(),
             "slowloris socket must time out and close"
         );
-        drop(slow2);
+
+        // 2) Authenticated connection cap: when both slots are held by authenticated keep-alive
+        // sockets, a third simultaneous connection exceeds the cap of 2 and is dropped immediately.
+        let keep_alive_req = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+        );
+        let mut auth1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        auth1.write_all(keep_alive_req.as_bytes()).await.unwrap();
+        let mut auth2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        auth2.write_all(keep_alive_req.as_bytes()).await.unwrap();
+        // Wait for both responses to finish so both slots are marked authenticated and idle on keep-alive.
+        let mut buf1 = [0u8; 1024];
+        let mut buf2 = [0u8; 1024];
+        let n1 = tokio::time::timeout(Duration::from_millis(300), auth1.read(&mut buf1))
+            .await
+            .unwrap()
+            .unwrap();
+        let n2 = tokio::time::timeout(Duration::from_millis(300), auth2.read(&mut buf2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf1[..n1]).contains("200 OK"));
+        assert!(String::from_utf8_lossy(&buf2[..n2]).contains("200 OK"));
+
+        let mut overflow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut byte = [0u8; 1];
+        let overflow_read =
+            tokio::time::timeout(Duration::from_millis(150), overflow.read(&mut byte)).await;
+        assert!(
+            matches!(overflow_read, Ok(Ok(0)) | Ok(Err(_))),
+            "excess connection above authenticated cap should be dropped immediately, got {overflow_read:?}"
+        );
+        drop(auth1);
+        drop(auth2);
+        tokio::time::sleep(Duration::from_millis(30)).await;
 
         let (status, _, body) = raw_http(
             port,
@@ -2571,6 +2722,7 @@ mod tests {
                     max_full_bytes: Some(8),
                     ..ServeOptions::default()
                 },
+                None,
             )
             .await;
         assert_eq!(resp413.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -3724,6 +3876,132 @@ mod tests {
             server.content_status_for_url(&sample_junk_url),
             ContentUrlStatus::default(),
             "unknown tickets must never populate content_status"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_serves_viewer_while_32_partial_header_sockets_are_held() {
+        let payload: Vec<u8> = (0..(64 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/track.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let valid = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let valid_path = valid
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        // 1) Guard rejections (403, 421) and 404 responses emit `Connection: close` and actually
+        // close the TCP connection even when the client asks for `Connection: keep-alive`.
+        for (expected_status, req) in [
+            (
+                404u16,
+                format!(
+                    "GET /v1/content/nonexistent/track.flac HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+            (
+                404u16,
+                format!(
+                    "GET /other/path HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+            (
+                403u16,
+                format!(
+                    "GET {valid_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+            (
+                421u16,
+                format!(
+                    "GET {valid_path} HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: keep-alive\r\n\r\n"
+                ),
+            ),
+        ] {
+            let (st, head, _) = tokio::time::timeout(Duration::from_secs(2), raw_http(port, &req))
+                .await
+                .expect("server must close 404/guard-rejected keep-alive connections immediately");
+            assert_eq!(st, expected_status, "{head}");
+            assert!(
+                head.to_ascii_lowercase().contains("connection: close"),
+                "expected Connection: close on {expected_status}, got:\n{head}"
+            );
+        }
+
+        // 2) Hold MAX_LOOPBACK_CONNECTIONS (32) partial-header sockets simultaneously open, then
+        // issue a real viewer GET. The listener must evict the oldest unauthenticated socket and
+        // serve the viewer's valid request immediately.
+        let mut holders = Vec::with_capacity(MAX_LOOPBACK_CONNECTIONS);
+        for _ in 0..MAX_LOOPBACK_CONNECTIONS {
+            let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            sock.write_all(b"GET /v1/content/").await.unwrap();
+            holders.push(sock);
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let (viewer_status, viewer_head, viewer_body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            raw_http(
+                port,
+                &format!(
+                    "GET {valid_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            ),
+        )
+        .await
+        .expect("viewer GET must succeed immediately even while 32 partial-header sockets are held");
+        assert_eq!(viewer_status, 200, "{viewer_head}");
+        assert_eq!(viewer_body, payload);
+
+        // The oldest unauthenticated socket (holders[0]) was evicted and must see EOF immediately.
+        let mut evicted_buf = [0u8; 16];
+        let evicted_read = tokio::time::timeout(
+            Duration::from_millis(300),
+            holders[0].read(&mut evicted_buf),
+        )
+        .await;
+        assert!(
+            matches!(evicted_read, Ok(Ok(0)) | Ok(Err(_))),
+            "oldest unauthenticated socket should be evicted, got {evicted_read:?}"
+        );
+        drop(holders);
+
+        // 3) Under default limits, an unauthenticated partial-header socket closes after the short
+        // ~2s unauthenticated header timeout (well below the 5s authenticated timeout).
+        let started = Instant::now();
+        let mut idle_unauth = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        idle_unauth.write_all(b"GET /v1/content/").await.unwrap();
+        let mut sink = Vec::new();
+        let closed = tokio::time::timeout(
+            Duration::from_millis(3500),
+            idle_unauth.read_to_end(&mut sink),
+        )
+        .await;
+        assert!(
+            closed.is_ok(),
+            "unauthenticated partial-header socket must time out within ~2s (elapsed={:?})",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "unauthenticated timeout fired unexpectedly early: {:?}",
+            started.elapsed()
         );
 
         server.shutdown();
