@@ -373,11 +373,21 @@ fn is_transfer_job_authorized_once(paths: &Paths, id: &str) -> bool {
 /// having removed a right (which can happen transiently during an editor's in-place save), re-reads
 /// twice after [`AUTH_RECHECK_RETRY_DELAY`] and returns `false` only if every read agrees.
 pub fn is_transfer_job_authorized(paths: &Paths, id: &str) -> bool {
+    is_transfer_job_authorized_with_pause(paths, id, std::thread::sleep)
+}
+
+/// Like [`is_transfer_job_authorized`], but invokes `pause` instead of sleeping so tests can
+/// drive transient policy-save retries deterministically without wall-clock sleeps.
+pub fn is_transfer_job_authorized_with_pause(
+    paths: &Paths,
+    id: &str,
+    mut pause: impl FnMut(Duration),
+) -> bool {
     if is_transfer_job_authorized_once(paths, id) {
         return true;
     }
     for _ in 0..AUTH_RECHECK_RETRIES {
-        std::thread::sleep(AUTH_RECHECK_RETRY_DELAY);
+        pause(AUTH_RECHECK_RETRY_DELAY);
         if is_transfer_job_authorized_once(paths, id) {
             return true;
         }
