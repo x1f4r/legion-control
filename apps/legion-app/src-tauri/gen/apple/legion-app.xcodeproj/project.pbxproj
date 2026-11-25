@@ -242,7 +242,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "cargo tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
+			shellScript = "if [ -f \"${SRCROOT}/.build-env\" ]; then\n  while IFS='=' read -r _k _v || [ -n \"$_k\" ]; do\n    case \"$_k\" in\n      LEGION_BUILD_SEQUENCE) export LEGION_BUILD_SEQUENCE=\"$_v\" ;;\n      LEGION_BUILD_REV) export LEGION_BUILD_REV=\"$_v\" ;;\n      LEGION_PREVIEW_UPDATE_KEY) export LEGION_PREVIEW_UPDATE_KEY=\"$_v\" ;;\n    esac\n  done < \"${SRCROOT}/.build-env\"\nfi\ncargo tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

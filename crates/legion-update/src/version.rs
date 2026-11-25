@@ -33,15 +33,17 @@ pub const fn compiled_sequence() -> u64 {
     parse_const_u64(env!("LEGION_UPDATE_SEQUENCE"))
 }
 
+static SEQUENCE_MARKER_BYTES: &[u8] = concat!(
+    "LEGION_UPDATE_SEQUENCE=",
+    env!("LEGION_UPDATE_SEQUENCE"),
+    "\0"
+)
+.as_bytes();
+
 /// NUL-terminated static marker compiled into binaries so packaging tools can verify the binary's
 /// embedded update sequence without executing it.
-pub const fn compiled_sequence_marker() -> &'static [u8] {
-    concat!(
-        "LEGION_UPDATE_SEQUENCE=",
-        env!("LEGION_UPDATE_SEQUENCE"),
-        "\0"
-    )
-    .as_bytes()
+pub fn compiled_sequence_marker() -> &'static [u8] {
+    SEQUENCE_MARKER_BYTES
 }
 
 /// Parses a sequence number as either a small synthetic test sequence (`Ok(None)`) or a valid UTC

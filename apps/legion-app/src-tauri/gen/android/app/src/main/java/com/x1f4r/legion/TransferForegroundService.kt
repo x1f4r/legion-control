@@ -114,9 +114,10 @@ class TransferForegroundService : Service() {
   internal fun applySummary(summary: JSONObject, ensureForegroundFirst: Boolean = false) {
     val activeCount = summary.optInt("activeCount", 0)
     val pausedCount = summary.optInt("pausedCount", 0)
+    val cancellingCount = summary.optInt("cancellingCount", 0)
     val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
 
-    if (activeCount > 0) {
+    if (activeCount > 0 || cancellingCount > 0) {
       nm?.cancel(PAUSED_NOTIFICATION_ID)
       val notification = buildOngoingNotification(this, summary, isActive = true)
       if (!inForeground.get() || ensureForegroundFirst) {
@@ -264,9 +265,10 @@ class TransferForegroundService : Service() {
       latestSummary = summary
       val activeCount = summary.optInt("activeCount", 0)
       val pausedCount = summary.optInt("pausedCount", 0)
+      val cancellingCount = summary.optInt("cancellingCount", 0)
       val canPause = summary.optBoolean("canPause", false)
       val canResume = summary.optBoolean("canResume", false)
-      val shape = "active=$activeCount paused=$pausedCount canPause=$canPause canResume=$canResume"
+      val shape = "active=$activeCount paused=$pausedCount cancelling=$cancellingCount canPause=$canPause canResume=$canResume"
       if (shape != lastLoggedShape) {
         lastLoggedShape = shape
         if (BuildConfig.DEBUG) {
@@ -278,7 +280,7 @@ class TransferForegroundService : Service() {
       val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
       val instance = runningInstance
 
-      if (activeCount > 0) {
+      if (activeCount > 0 || cancellingCount > 0) {
         nm?.cancel(PAUSED_NOTIFICATION_ID)
         if (instance != null) {
           instance.applySummary(summary, ensureForegroundFirst = false)
@@ -438,6 +440,8 @@ class TransferForegroundService : Service() {
         builder.setProgress(1000, pct, false)
       }
 
+      val activeCount = summary.optInt("activeCount", 0)
+      val pausedCount = summary.optInt("pausedCount", 0)
       if (canPause) {
         builder.addAction(
           0,
@@ -451,11 +455,13 @@ class TransferForegroundService : Service() {
           actionPendingIntent(context, TransferActionReceiver.ACTION_RESUME, primaryId, 2),
         )
       }
-      builder.addAction(
-        0,
-        "Cancel",
-        actionPendingIntent(context, TransferActionReceiver.ACTION_CANCEL, primaryId, 3),
-      )
+      if (activeCount > 0 || pausedCount > 0) {
+        builder.addAction(
+          0,
+          "Cancel",
+          actionPendingIntent(context, TransferActionReceiver.ACTION_CANCEL, primaryId, 3),
+        )
+      }
 
       return builder.build()
     }

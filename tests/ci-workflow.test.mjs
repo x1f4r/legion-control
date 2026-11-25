@@ -130,8 +130,148 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
 
   // Every platform build job in legion-app.yml and legion-release.yml must stamp LEGION_BUILD_SEQUENCE.
   for (const id of ['android', 'linux-desktop', 'ios', 'macos-desktop', 'windows-desktop']) {
-    assert.match(appJobs.get(id).join('\n'), /LEGION_BUILD_SEQUENCE/, `legion-app.yml:${id} does not stamp LEGION_BUILD_SEQUENCE`);
+    const body = appJobs.get(id).join('\n');
+    assert.match(body, /LEGION_BUILD_SEQUENCE/, `legion-app.yml:${id} does not stamp LEGION_BUILD_SEQUENCE`);
+    assert.match(
+      body,
+      /make-update-set\.mjs check-artifact[\s\S]*--forbid-preview-key/,
+      `legion-app.yml:${id} must verify shipped artifacts with check-artifact --forbid-preview-key`,
+    );
   }
+
+  // Every packaging build in legion-app.yml must clear its bundle output directory first, and
+  // artifact uploads must reference exact paths from build outputs rather than installer globs.
+  assert.match(appJobs.get('android').join('\n'), /rm -rf src-tauri\/gen\/android\/app\/build\/outputs\/apk/);
+  assert.match(appJobs.get('linux-desktop').join('\n'), /rm -rf src-tauri\/target\/release\/bundle/);
+  assert.match(appJobs.get('ios').join('\n'), /rm -rf src-tauri\/gen\/apple\/build/);
+  assert.match(appJobs.get('macos-desktop').join('\n'), /rm -rf src-tauri\/target\/release\/bundle/);
+  assert.match(
+    appJobs.get('windows-desktop').join('\n'),
+    /Remove-Item -LiteralPath 'src-tauri\\target\\release\\bundle' -Recurse -Force/,
+  );
+  assert.doesNotMatch(
+    appWorkflow,
+    /path:[^\n]*bundle\/(?:deb\/\*\.deb|appimage\/\*\.AppImage|dmg\/\*\.dmg|nsis\/\*\.exe)/,
+    'legion-app.yml must upload exact built bundle paths rather than wildcard globs',
+  );
+  // Desktop preview self-update steps must clean bundle/ on exit so cached target/ never retains
+  // preview-keyed installers across runs.
+  for (const id of ['linux-desktop', 'macos-desktop']) {
+    const body = appJobs.get(id).join('\n');
+    const diagStart = body.indexOf('dump_diag()');
+    assert.ok(diagStart !== -1, `legion-app.yml:${id} missing dump_diag cleanup trap`);
+    assert.match(
+      body.slice(diagStart, diagStart + 1400),
+      /rm -rf apps\/legion-app\/src-tauri\/target\/release\/bundle/,
+      `legion-app.yml:${id} must clean bundle/ inside self-update cleanup trap`,
+    );
+    assert.match(
+      body.slice(diagStart, diagStart + 1400),
+      /new-start\.log/,
+      `legion-app.yml:${id} must include new-start.log in self-update diagnostics`,
+    );
+    assert.match(
+      body.slice(diagStart, diagStart + 1600),
+      /rollback-ps\.txt/,
+      `legion-app.yml:${id} must include rollback-ps.txt in self-update diagnostics`,
+    );
+    assert.match(
+      body.slice(diagStart, diagStart + 1600),
+      /update\.lock/,
+      `legion-app.yml:${id} must include update.lock in self-update diagnostics`,
+    );
+    assert.match(
+      body.slice(diagStart, diagStart + 1600),
+      /deferred-\*\.json/,
+      `legion-app.yml:${id} must include deferred-*.json in self-update diagnostics`,
+    );
+    assert.match(
+      body,
+      /Phase 2: concurrent second start/,
+      `legion-app.yml:${id} must verify a concurrent second start during an update`,
+    );
+    assert.match(
+      body,
+      /verify_updated\(\)[\s\S]*&& \[ ! -e "\$APP_DATA\/update\.lock" \]/,
+      `legion-app.yml:${id} must wait for update.lock release inside verify_updated`,
+    );
+    assert.match(
+      body,
+      /verify_updated\(\)[\s\S]*count_app_instances[\s\S]*rollback-\*\.json/,
+      `legion-app.yml:${id} must verify single running instance and rollback absence inside verify_updated`,
+    );
+    assert.match(
+      body,
+      /FAIL \((?:Linux|macOS) self-update\):/,
+      `legion-app.yml:${id} must print a named single-line failure reason before diagnostics`,
+    );
+  }
+  {
+    const winBody = appJobs.get('windows-desktop').join('\n');
+    assert.match(
+      winBody,
+      /cargo test --manifest-path apps\/legion-app\/src-tauri\/Cargo\.toml --locked/,
+      'legion-app.yml:windows-desktop must run Rust unit tests on Windows',
+    );
+    const finallyStart = winBody.lastIndexOf('} finally {');
+    assert.ok(finallyStart !== -1, 'legion-app.yml:windows-desktop missing self-update finally block');
+    assert.match(
+      winBody.slice(finallyStart),
+      /Remove-Item -LiteralPath 'apps\\legion-app\\src-tauri\\target\\release\\bundle' -Recurse -Force/,
+      'legion-app.yml:windows-desktop must clean bundle/ in self-update finally block',
+    );
+    assert.match(
+      winBody,
+      /new-start\.log/,
+      'legion-app.yml:windows-desktop must include new-start.log in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /rollback-ps\.txt/,
+      'legion-app.yml:windows-desktop must include rollback-ps.txt in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /update\.lock/,
+      'legion-app.yml:windows-desktop must include update.lock in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /deferred-\*\.json/,
+      'legion-app.yml:windows-desktop must include deferred-*.json in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /Phase 2: concurrent second start/,
+      'legion-app.yml:windows-desktop must verify a concurrent second start during an update',
+    );
+    assert.match(
+      winBody,
+      /function Verify-Updated[\s\S]*-not \(Test-Path -LiteralPath \$updateLock\)/,
+      'legion-app.yml:windows-desktop must wait for update.lock release inside Verify-Updated',
+    );
+    assert.match(
+      winBody,
+      /function Verify-Updated[\s\S]*Get-AppInstances[\s\S]*rollback-\*\.json/,
+      'legion-app.yml:windows-desktop must verify single running instance and rollback absence inside Verify-Updated',
+    );
+    assert.match(
+      winBody,
+      /Write-Host "FAIL \(Windows self-update\):/,
+      'legion-app.yml:windows-desktop must print a named single-line failure reason before diagnostics',
+    );
+  }
+
   const releaseWorkflow = read('.github/workflows/legion-release.yml');
   assert.match(releaseWorkflow, /LEGION_BUILD_SEQUENCE:/);
+  assert.match(
+    releaseWorkflow,
+    /make-update-set\.mjs check-artifact[\s\S]*--kind binary[\s\S]*--forbid-preview-key/,
+    'legion-release.yml must verify staged release binaries with check-artifact --forbid-preview-key',
+  );
+  assert.match(
+    releaseWorkflow,
+    /make-update-set\.mjs check-artifact[\s\S]*--kind deb[\s\S]*--forbid-preview-key/,
+    'legion-release.yml must verify staged release .deb packages with check-artifact --forbid-preview-key',
+  );
 });

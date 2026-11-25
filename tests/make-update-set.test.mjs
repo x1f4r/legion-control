@@ -7,6 +7,7 @@ import zlib from 'node:zlib';
 
 import {
   androidVersionCode,
+  checkShippedArtifact,
   createPreviewKey,
   currentSequence,
   desktopBundleVersion,
@@ -172,8 +173,12 @@ function buildDeb(members) {
   return Buffer.concat(parts);
 }
 
-/** Build a tiny valid SquashFS 4.0 image (gzip) with a root `.desktop` file behind an ELF64 prefix. */
-function buildMiniAppImage(desktopText, elfSize = 128) {
+/**
+ * Build a tiny valid SquashFS 4.0 image (gzip) behind an ELF64 prefix containing:
+ * - optional root `legion-app.desktop`
+ * - optional `usr/bin/legion-app` compiled binary bytes
+ */
+function buildMiniAppImage({ desktopText = null, binBytes = null, elfSize = 128 } = {}) {
   const elfStub = Buffer.alloc(Math.max(128, elfSize), 0);
   Buffer.from('\x7fELF', 'ascii').copy(elfStub, 0);
   elfStub[4] = 2; // ELF64
@@ -185,70 +190,156 @@ function buildMiniAppImage(desktopText, elfSize = 128) {
   elfStub.writeUInt16LE(shentsize, 58);
   elfStub.writeUInt16LE(shnum, 60);
 
-  const fileBytes = Buffer.from(desktopText, 'utf8');
-  const compFileBlock = zlib.deflateSync(fileBytes);
+  const dataBlocks = [];
+  let dataCursor = 96; // immediately after 96-byte superblock
+  const addFileData = (raw) => {
+    const start = dataCursor;
+    const comp = zlib.deflateSync(raw);
+    dataBlocks.push(comp);
+    dataCursor += comp.length;
+    return { start, rawLen: raw.length, compLen: comp.length };
+  };
 
-  // Data block starts right after the 96-byte superblock.
-  const dataStart = 96;
-  const inodeTableStart = dataStart + compFileBlock.length;
+  const makeFileInode = (info) => {
+    const buf = Buffer.alloc(36);
+    buf.writeUInt16LE(2, 0); // basic regular file
+    buf.writeUInt32LE(info.start, 16); // blocks_start
+    buf.writeUInt32LE(0xffffffff, 20); // no fragment
+    buf.writeUInt32LE(0, 24);
+    buf.writeUInt32LE(info.rawLen, 28);
+    buf.writeUInt32LE(info.compLen, 32);
+    return buf;
+  };
 
-  // Inode 0 (offset 0): basic regular file (type 2), 32 + 4 = 36 bytes.
-  const fileInode = Buffer.alloc(36);
-  fileInode.writeUInt16LE(2, 0); // basic regular file
-  fileInode.writeUInt32LE(dataStart, 16); // blocks_start
-  fileInode.writeUInt32LE(0xffffffff, 20); // no fragment
-  fileInode.writeUInt32LE(0, 24);
-  fileInode.writeUInt32LE(fileBytes.length, 28); // file_size
-  fileInode.writeUInt32LE(compFileBlock.length, 32); // block_size[0] (compressed)
+  const dirStreamParts = [];
+  let dirStreamLen = 0;
+  const addDirTable = (entries) => {
+    const startOff = dirStreamLen;
+    const parts = [];
+    const hdr = Buffer.alloc(12);
+    hdr.writeUInt32LE(entries.length - 1, 0); // count - 1
+    hdr.writeUInt32LE(0, 4); // start_block = 0
+    hdr.writeUInt32LE(1, 8); // inode_number
+    parts.push(hdr);
+    for (const e of entries) {
+      const nameBuf = Buffer.from(e.name, 'utf8');
+      const ent = Buffer.alloc(8 + nameBuf.length);
+      ent.writeUInt16LE(e.inodeOff, 0);
+      ent.writeInt16LE(0, 2);
+      ent.writeUInt16LE(e.type, 4);
+      ent.writeUInt16LE(nameBuf.length - 1, 6);
+      nameBuf.copy(ent, 8);
+      parts.push(ent);
+    }
+    const raw = Buffer.concat(parts);
+    dirStreamParts.push(raw);
+    dirStreamLen += raw.length;
+    return { offset: startOff, size: raw.length };
+  };
 
-  // Directory entry stream for root: 12-byte header + 8-byte entry + name "legion-app.desktop"
-  const nameBuf = Buffer.from('legion-app.desktop', 'utf8');
-  const dirData = Buffer.alloc(12 + 8 + nameBuf.length);
-  dirData.writeUInt32LE(0, 0); // count - 1 = 0 (1 entry)
-  dirData.writeUInt32LE(0, 4); // start_block = 0
-  dirData.writeUInt32LE(1, 8); // inode_number
-  dirData.writeUInt16LE(0, 12); // offset inside inode metadata block = 0
-  dirData.writeInt16LE(0, 14); // inode_offset
-  dirData.writeUInt16LE(2, 16); // type = regular file
-  dirData.writeUInt16LE(nameBuf.length - 1, 18); // name_size - 1
-  nameBuf.copy(dirData, 20);
+  const makeDirInode = (dirMeta) => {
+    const buf = Buffer.alloc(32);
+    buf.writeUInt16LE(1, 0); // basic dir
+    buf.writeUInt32LE(0, 16); // block_index = 0
+    buf.writeUInt32LE(2, 20); // link_count
+    buf.writeUInt16LE(dirMeta.size + 3, 24); // file_size (+3 for . and ..)
+    buf.writeUInt16LE(dirMeta.offset, 26); // block_offset
+    return buf;
+  };
 
-  // Inode 1 (offset 36): basic directory (type 1), 32 bytes.
-  const rootInode = Buffer.alloc(32);
-  rootInode.writeUInt16LE(1, 0); // basic dir
-  rootInode.writeUInt32LE(0, 16); // block_index
-  rootInode.writeUInt32LE(2, 20); // link_count
-  rootInode.writeUInt16LE(dirData.length + 3, 24); // file_size (+3 for . and ..)
-  rootInode.writeUInt16LE(0, 26); // block_offset
+  const inodes = [];
+  let inodeOff = 0;
+  const pushInode = (buf) => {
+    const off = inodeOff;
+    inodes.push(buf);
+    inodeOff += buf.length;
+    return off;
+  };
 
-  const inodeBlockRaw = Buffer.concat([fileInode, rootInode]);
-  const inodeBlockComp = zlib.deflateSync(inodeBlockRaw);
+  const rootEntries = [];
+  if (desktopText !== null) {
+    const deskOff = pushInode(makeFileInode(addFileData(Buffer.from(desktopText, 'utf8'))));
+    rootEntries.push({ name: 'legion-app.desktop', inodeOff: deskOff, type: 2 });
+  }
+  const extraBins = Array.isArray(binBytes)
+    ? binBytes
+    : binBytes !== null
+      ? [{ name: 'legion-app', data: binBytes }]
+      : [];
+  if (extraBins.length > 0) {
+    const binEntries = extraBins.map((entry) => {
+      const off = pushInode(
+        makeFileInode(addFileData(Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data))),
+      );
+      return { name: entry.name, inodeOff: off, type: 2 };
+    });
+    const binDirMeta = addDirTable(binEntries);
+    const binDirOff = pushInode(makeDirInode(binDirMeta));
+    const usrDirMeta = addDirTable([{ name: 'bin', inodeOff: binDirOff, type: 1 }]);
+    const usrDirOff = pushInode(makeDirInode(usrDirMeta));
+    rootEntries.push({ name: 'usr', inodeOff: usrDirOff, type: 1 });
+  }
+  const rootDirMeta = addDirTable(rootEntries);
+  const rootInodeOff = pushInode(makeDirInode(rootDirMeta));
+
+  const inodeTableStart = dataCursor;
+  const inodeBlockComp = zlib.deflateSync(Buffer.concat(inodes));
   const inodeMetaHdr = Buffer.alloc(2);
   inodeMetaHdr.writeUInt16LE(inodeBlockComp.length, 0);
 
   const dirTableStart = inodeTableStart + 2 + inodeBlockComp.length;
-  const dirBlockComp = zlib.deflateSync(dirData);
+  const dirBlockComp = zlib.deflateSync(Buffer.concat(dirStreamParts));
   const dirMetaHdr = Buffer.alloc(2);
   dirMetaHdr.writeUInt16LE(dirBlockComp.length, 0);
 
   const totalSqLen = dirTableStart + 2 + dirBlockComp.length;
   const sb = Buffer.alloc(96, 0);
   Buffer.from('hsqs', 'ascii').copy(sb, 0);
-  sb.writeUInt32LE(2, 4); // inodes
+  sb.writeUInt32LE(inodes.length, 4); // inodes
   sb.writeUInt32LE(131072, 12); // block_size
   sb.writeUInt32LE(0, 16); // fragments
   sb.writeUInt16LE(1, 20); // gzip
   sb.writeUInt16LE(17, 22); // block_log
   sb.writeUInt16LE(4, 28); // s_major
   sb.writeUInt16LE(0, 30); // s_minor
-  sb.writeBigUInt64LE(BigInt(fileInode.length), 32); // root_inode_ref (block 0, off 36)
+  sb.writeBigUInt64LE(BigInt(rootInodeOff), 32); // root_inode_ref
   sb.writeBigUInt64LE(BigInt(totalSqLen), 40); // bytes_used
   sb.writeBigUInt64LE(0xffffffffffffffffn, 56);
   sb.writeBigUInt64LE(BigInt(inodeTableStart), 64);
   sb.writeBigUInt64LE(BigInt(dirTableStart), 72);
   sb.writeBigUInt64LE(0xffffffffffffffffn, 80);
 
-  return Buffer.concat([elfStub, sb, compFileBlock, inodeMetaHdr, inodeBlockComp, dirMetaHdr, dirBlockComp]);
+  return Buffer.concat([elfStub, sb, ...dataBlocks, inodeMetaHdr, inodeBlockComp, dirMetaHdr, dirBlockComp]);
+}
+
+/** Build a synthetic Windows NSIS installer with PE UTF-16LE version string and zlib NSIS datablock. */
+function buildMiniNsis({ peSeq, payloadBytes }) {
+  const peHeader = Buffer.concat([
+    Buffer.from('MZ..'),
+    peSeq !== null ? Buffer.from(`0.2.0+seq${peSeq}\0`, 'utf16le') : Buffer.alloc(0),
+  ]);
+  // Align NSIS FirstHeader to 512 bytes.
+  const padLen = (512 - (peHeader.length % 512)) % 512;
+  const stub = Buffer.concat([peHeader, Buffer.alloc(padLen, 0)]);
+  const deflated = zlib.deflateRawSync(payloadBytes);
+  const blockHdr = Buffer.alloc(4);
+  blockHdr.writeUInt32LE((0x80000000 | deflated.length) >>> 0, 0);
+  const archiveLen = 28 + blockHdr.length + deflated.length;
+  const firstHeader = Buffer.alloc(28, 0);
+  Buffer.from([
+    0xef, 0xbe, 0xad, 0xde, 0x4e, 0x75, 0x6c, 0x6c, 0x73, 0x6f, 0x66, 0x74, 0x49, 0x6e, 0x73, 0x74,
+  ]).copy(firstHeader, 4);
+  firstHeader.writeUInt32LE(payloadBytes.length, 20);
+  firstHeader.writeUInt32LE(archiveLen, 24);
+  return Buffer.concat([stub, firstHeader, blockHdr, deflated]);
+}
+
+function compiledPayload(seq, previewValue = 'none') {
+  return Buffer.concat([
+    Buffer.from('\x7fELF...'),
+    Buffer.from(`LEGION_UPDATE_SEQUENCE=${seq}\0`),
+    Buffer.from(`LEGION_UPDATE_PREVIEW_KEY=${previewValue}\0`),
+  ]);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────────────────
@@ -316,55 +407,293 @@ test('createPreviewKey writes mode 600 outside the repo and refuses overwrite or
   }
 });
 
-test('verifyArtifactSequence inspects every artifact format without executing it and refuses mismatches', () => {
+test('verifyArtifactSequence inspects compiled binaries in every format and refuses mismatches or conflicting markers', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-update-seq-verify-'));
   try {
     const seq = 202611250137;
     const wrongSeq = 202611250136;
 
-    // 1. Android APK (ZIP + binary AXML)
+    // 1. Android APK (ZIP + binary AXML + compiled lib/*/liblegion_app_lib.so)
     const apk = path.join(tmp, 'Legion-0.2.0-universal.apk');
-    fs.writeFileSync(apk, buildZip([{ name: 'AndroidManifest.xml', data: buildMinimalAxml(androidVersionCode(seq)) }]));
+    fs.writeFileSync(
+      apk,
+      buildZip([
+        { name: 'AndroidManifest.xml', data: buildMinimalAxml(androidVersionCode(seq)) },
+        { name: 'lib/arm64-v8a/liblegion_app_lib.so', data: compiledPayload(seq) },
+        { name: 'lib/x86_64/liblegion_app_lib.so', data: compiledPayload(seq) },
+      ]),
+    );
     verifyArtifactSequence(apk, { name: path.basename(apk), kind: 'apk' }, seq);
     assert.throws(() => verifyArtifactSequence(apk, { name: path.basename(apk), kind: 'apk' }, wrongSeq), /versionCode/);
 
+    // APK with matching versionCode but seq-0 compiled native library MUST be refused!
+    const apkSeq0 = path.join(tmp, 'Legion-seq0.apk');
+    fs.writeFileSync(
+      apkSeq0,
+      buildZip([
+        { name: 'AndroidManifest.xml', data: buildMinimalAxml(androidVersionCode(seq)) },
+        { name: 'lib/arm64-v8a/liblegion_app_lib.so', data: compiledPayload(0) },
+      ]),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(apkSeq0, { name: path.basename(apkSeq0), kind: 'apk' }, seq),
+      /compiled LEGION_UPDATE_SEQUENCE=0/,
+    );
+
+    // APK with one matching ABI and one mismatched ABI MUST be refused!
+    const apkMixedAbi = path.join(tmp, 'Legion-mixed.apk');
+    fs.writeFileSync(
+      apkMixedAbi,
+      buildZip([
+        { name: 'AndroidManifest.xml', data: buildMinimalAxml(androidVersionCode(seq)) },
+        { name: 'lib/arm64-v8a/liblegion_app_lib.so', data: compiledPayload(seq) },
+        { name: 'lib/x86_64/liblegion_app_lib.so', data: compiledPayload(wrongSeq) },
+      ]),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(apkMixedAbi, { name: path.basename(apkMixedAbi), kind: 'apk' }, seq),
+      /compiled LEGION_UPDATE_SEQUENCE=/,
+    );
+
     // 2. Node standalone binary (compiled sequence marker)
     const bin = path.join(tmp, 'legion-0.2.0-x86_64-unknown-linux-musl');
-    fs.writeFileSync(bin, Buffer.concat([Buffer.from('\x7fELF...'), Buffer.from(`LEGION_UPDATE_SEQUENCE=${seq}\0`)]));
+    fs.writeFileSync(bin, compiledPayload(seq));
     verifyArtifactSequence(bin, { name: path.basename(bin), kind: 'binary' }, seq);
-    assert.throws(() => verifyArtifactSequence(bin, { name: path.basename(bin), kind: 'binary' }, wrongSeq), /does not match sequence/);
+    assert.throws(() => verifyArtifactSequence(bin, { name: path.basename(bin), kind: 'binary' }, wrongSeq), /compiled LEGION_UPDATE_SEQUENCE=/);
 
-    // 3. Debian .deb (ar + control.tar.gz)
+    // Binary holding TWO conflicting markers (one matching, one different) MUST be refused!
+    const dualBin = path.join(tmp, 'legion-dual');
+    fs.writeFileSync(
+      dualBin,
+      Buffer.concat([
+        Buffer.from(`LEGION_UPDATE_SEQUENCE=${seq}\0`),
+        Buffer.from(`LEGION_UPDATE_SEQUENCE=${wrongSeq}\0`),
+      ]),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(dualBin, { name: path.basename(dualBin), kind: 'binary' }, seq),
+      /conflicting compiled LEGION_UPDATE_SEQUENCE markers/,
+    );
+
+    // Duplicate identical markers fail `checkShippedArtifact(..., { requireExactlyOne: true })`.
+    const dupBin = path.join(tmp, 'legion-dup');
+    fs.writeFileSync(
+      dupBin,
+      Buffer.concat([
+        Buffer.from(`LEGION_UPDATE_SEQUENCE=${seq}\0`),
+        Buffer.from(`LEGION_UPDATE_SEQUENCE=${seq}\0`),
+        Buffer.from('LEGION_UPDATE_PREVIEW_KEY=none\0'),
+      ]),
+    );
+    assert.throws(
+      () => checkShippedArtifact({ filePath: dupBin, kind: 'binary', sequence: seq, requireExactlyOne: true }),
+      /expected exactly 1/,
+    );
+
+    // 3. Debian .deb (ar + control.tar.gz + data.tar.gz with compiled usr/bin/legion-app)
     const deb = path.join(tmp, 'legion-app_0.2.0_amd64.deb');
     const controlTarGz = zlib.gzipSync(buildTar([{
       name: './control',
       data: Buffer.from(`Package: legion-app\nVersion: 0.2.0+${seq}\nArchitecture: amd64\n`),
     }]));
-    fs.writeFileSync(deb, buildDeb([{ name: 'control.tar.gz', data: controlTarGz }]));
+    const dataTarGz = zlib.gzipSync(buildTar([{
+      name: './usr/bin/legion-app',
+      data: compiledPayload(seq),
+    }]));
+    fs.writeFileSync(deb, buildDeb([
+      { name: 'control.tar.gz', data: controlTarGz },
+      { name: 'data.tar.gz', data: dataTarGz },
+    ]));
     verifyArtifactSequence(deb, { name: path.basename(deb), kind: 'deb' }, seq);
     assert.throws(() => verifyArtifactSequence(deb, { name: path.basename(deb), kind: 'deb' }, wrongSeq), /Debian Version/);
 
-    // 4. macOS app-tar (.tar.gz + Info.plist)
+    // .deb with matching control Version but seq-0 compiled binary MUST be refused!
+    const debBadBin = path.join(tmp, 'legion-app-badbin.deb');
+    const badDataTarGz = zlib.gzipSync(buildTar([{
+      name: './usr/bin/legion-app',
+      data: compiledPayload(0),
+    }]));
+    fs.writeFileSync(debBadBin, buildDeb([
+      { name: 'control.tar.gz', data: controlTarGz },
+      { name: 'data.tar.gz', data: badDataTarGz },
+    ]));
+    assert.throws(
+      () => verifyArtifactSequence(debBadBin, { name: path.basename(debBadBin), kind: 'deb' }, seq),
+      /compiled LEGION_UPDATE_SEQUENCE=0/,
+    );
+
+    // 4. macOS app-tar (.tar.gz + Info.plist + Contents/MacOS/legion-app)
     const appTar = path.join(tmp, 'Legion-macos-aarch64.app.tar.gz');
-    const plist = `<?xml version="1.0"?><plist><dict><key>CFBundleVersion</key><string>${seq}</string></dict></plist>`;
-    fs.writeFileSync(appTar, zlib.gzipSync(buildTar([{ name: 'Legion.app/Contents/Info.plist', data: Buffer.from(plist) }])));
+    const plist = `<?xml version="1.0"?><plist><dict><key>CFBundleExecutable</key><string>legion-app</string><key>CFBundleVersion</key><string>${seq}</string></dict></plist>`;
+    fs.writeFileSync(
+      appTar,
+      zlib.gzipSync(buildTar([
+        { name: 'Legion.app/Contents/Info.plist', data: Buffer.from(plist) },
+        { name: 'Legion.app/Contents/MacOS/legion-app', data: compiledPayload(seq) },
+      ])),
+    );
     verifyArtifactSequence(appTar, { name: path.basename(appTar), kind: 'app-tar' }, seq);
     assert.throws(() => verifyArtifactSequence(appTar, { name: path.basename(appTar), kind: 'app-tar' }, wrongSeq), /CFBundleVersion/);
 
-    // 5. Windows NSIS (.exe with UTF-16LE VS_VERSION_INFO FileVersion)
-    const nsis = path.join(tmp, 'Legion-windows-x86_64-setup.exe');
-    fs.writeFileSync(nsis, Buffer.concat([Buffer.from('MZ..'), Buffer.from(`0.2.0+seq${seq}\0`, 'utf16le')]));
-    verifyArtifactSequence(nsis, { name: path.basename(nsis), kind: 'nsis' }, seq);
-    assert.throws(() => verifyArtifactSequence(nsis, { name: path.basename(nsis), kind: 'nsis' }, wrongSeq), /does not match sequence/);
+    // macOS app-tar with matching Info.plist but seq-0 binary MUST be refused!
+    const appTarBadBin = path.join(tmp, 'Legion-badbin.app.tar.gz');
+    fs.writeFileSync(
+      appTarBadBin,
+      zlib.gzipSync(buildTar([
+        { name: 'Legion.app/Contents/Info.plist', data: Buffer.from(plist) },
+        { name: 'Legion.app/Contents/MacOS/legion-app', data: compiledPayload(0) },
+      ])),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(appTarBadBin, { name: path.basename(appTarBadBin), kind: 'app-tar' }, seq),
+      /compiled LEGION_UPDATE_SEQUENCE=0/,
+    );
 
-    // 6. Linux AppImage (SquashFS 4.0 containing .desktop with X-AppImage-Version behind a >900 KiB ELF64 runtime)
+    // 5. Windows NSIS (.exe with PE UTF-16LE +seq<N> AND compressed NSIS payload containing compiled marker)
+    const nsis = path.join(tmp, 'Legion-windows-x86_64-setup.exe');
+    fs.writeFileSync(nsis, buildMiniNsis({ peSeq: seq, payloadBytes: compiledPayload(seq) }));
+    verifyArtifactSequence(nsis, { name: path.basename(nsis), kind: 'nsis' }, seq);
+    assert.throws(() => verifyArtifactSequence(nsis, { name: path.basename(nsis), kind: 'nsis' }, wrongSeq), /PE version string/);
+
+    // NSIS with matching PE +seq<N> but seq-0 compiled payload MUST be refused!
+    const nsisBadPayload = path.join(tmp, 'Legion-badpayload-setup.exe');
+    fs.writeFileSync(nsisBadPayload, buildMiniNsis({ peSeq: seq, payloadBytes: compiledPayload(0) }));
+    assert.throws(
+      () => verifyArtifactSequence(nsisBadPayload, { name: path.basename(nsisBadPayload), kind: 'nsis' }, seq),
+      /compiled LEGION_UPDATE_SEQUENCE=0/,
+    );
+
+    // NSIS with PE metadata only and no NSIS payload MUST be refused!
+    const nsisNoPayload = path.join(tmp, 'Legion-nopayload-setup.exe');
+    fs.writeFileSync(nsisNoPayload, Buffer.concat([Buffer.from('MZ..'), Buffer.from(`0.2.0+seq${seq}\0`, 'utf16le')]));
+    assert.throws(
+      () => verifyArtifactSequence(nsisNoPayload, { name: path.basename(nsisNoPayload), kind: 'nsis' }, seq),
+      /NSIS payload/,
+    );
+
+    // 6. Linux AppImage (SquashFS 4.0 containing BOTH .desktop AND compiled usr/bin/legion-app behind >900 KiB ELF64)
     const appImage = path.join(tmp, 'Legion-0.2.0-x86_64.AppImage');
     fs.writeFileSync(
       appImage,
-      buildMiniAppImage(`[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`, 1024 * 1024),
+      buildMiniAppImage({
+        desktopText: `[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`,
+        binBytes: compiledPayload(seq),
+        elfSize: 1024 * 1024,
+      }),
     );
     verifyArtifactSequence(appImage, { name: path.basename(appImage), kind: 'appimage' }, seq);
-    assert.throws(() => verifyArtifactSequence(appImage, { name: path.basename(appImage), kind: 'appimage' }, wrongSeq), /does not match sequence/);
+    assert.throws(() => verifyArtifactSequence(appImage, { name: path.basename(appImage), kind: 'appimage' }, wrongSeq), /X-AppImage-Version/);
+
+    // AppImage with matching .desktop metadata ALONE (no usr/bin/legion-app) MUST be refused!
+    const appImageDesktopOnly = path.join(tmp, 'Legion-desktop-only.AppImage');
+    fs.writeFileSync(
+      appImageDesktopOnly,
+      buildMiniAppImage({
+        desktopText: `[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`,
+        binBytes: null,
+      }),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(appImageDesktopOnly, { name: path.basename(appImageDesktopOnly), kind: 'appimage' }, seq),
+      /desktop metadata alone is not accepted/,
+    );
+
+    // AppImage with matching .desktop but seq-0 compiled usr/bin/legion-app MUST be refused!
+    const appImageBadBin = path.join(tmp, 'Legion-badbin.AppImage');
+    fs.writeFileSync(
+      appImageBadBin,
+      buildMiniAppImage({
+        desktopText: `[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`,
+        binBytes: compiledPayload(0),
+      }),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(appImageBadBin, { name: path.basename(appImageBadBin), kind: 'appimage' }, seq),
+      /compiled LEGION_UPDATE_SEQUENCE=0/,
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('checkShippedArtifact enforces no compiled-in preview key across formats and build logs', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-update-preview-check-'));
+  try {
+    const seq = 202611250137;
+    const cleanLog = path.join(tmp, 'clean.log');
+    const previewLog = path.join(tmp, 'preview.log');
+    fs.writeFileSync(cleanLog, 'warning: legion-update@0.1.0: legion-update: release update key only (no preview key)\n');
+    fs.writeFileSync(previewLog, 'warning: legion-update@0.1.0: legion-update: preview update key compiled in (SHA256:abc123)\n');
+
+    // Clean NSIS passes `--forbid-preview-key`.
+    const cleanNsis = path.join(tmp, 'Legion-clean-setup.exe');
+    fs.writeFileSync(cleanNsis, buildMiniNsis({ peSeq: seq, payloadBytes: compiledPayload(seq, 'none') }));
+    checkShippedArtifact({
+      filePath: cleanNsis,
+      kind: 'nsis',
+      sequence: seq,
+      requireExactlyOne: true,
+      forbidPreviewKey: true,
+      buildLogPath: cleanLog,
+    });
+
+    // Stale preview-keyed NSIS fails `--forbid-preview-key` even with a clean log!
+    const previewNsis = path.join(tmp, 'Legion-preview-setup.exe');
+    fs.writeFileSync(previewNsis, buildMiniNsis({ peSeq: seq, payloadBytes: compiledPayload(seq, 'SHA256:throwawayPreviewFp') }));
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: previewNsis,
+        kind: 'nsis',
+        sequence: seq,
+        requireExactlyOne: true,
+        forbidPreviewKey: true,
+        buildLogPath: cleanLog,
+      }),
+      /trusts a compiled-in preview update key/,
+    );
+
+    // Build log reporting preview key compiled in fails even if binary was replaced!
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: cleanNsis,
+        kind: 'nsis',
+        sequence: seq,
+        requireExactlyOne: true,
+        forbidPreviewKey: true,
+        buildLogPath: previewLog,
+      }),
+      /build log .* preview update key/,
+    );
+
+    // Clean macOS app-bundle directory passes; preview-keyed app-bundle fails.
+    const appDir = path.join(tmp, 'Legion.app');
+    fs.mkdirSync(path.join(appDir, 'Contents', 'MacOS'), { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, 'Contents', 'Info.plist'),
+      `<plist><dict><key>CFBundleExecutable</key><string>legion-app</string><key>CFBundleVersion</key><string>${seq}</string></dict></plist>`,
+    );
+    fs.writeFileSync(path.join(appDir, 'Contents', 'MacOS', 'legion-app'), compiledPayload(seq, 'none'));
+    checkShippedArtifact({
+      filePath: appDir,
+      kind: 'app-bundle',
+      sequence: seq,
+      requireExactlyOne: true,
+      forbidPreviewKey: true,
+    });
+    fs.writeFileSync(
+      path.join(appDir, 'Contents', 'MacOS', 'legion-app'),
+      compiledPayload(seq, 'SHA256:badPreviewKey'),
+    );
+    assert.throws(
+      () => checkShippedArtifact({
+        filePath: appDir,
+        kind: 'app-bundle',
+        sequence: seq,
+        requireExactlyOne: true,
+        forbidPreviewKey: true,
+      }),
+      /trusts a compiled-in preview update key/,
+    );
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -384,8 +713,20 @@ test('makeUpdateSet verifies embedded sequences, records artifact sizes, signs, 
     const now = new Date('2026-11-25T01:37:00Z');
     const apk = path.join(tmp, 'Legion-0.2.0-universal.apk');
     const appimage = path.join(tmp, 'Legion-0.2.0-x86_64.AppImage');
-    fs.writeFileSync(apk, buildZip([{ name: 'AndroidManifest.xml', data: buildMinimalAxml(androidVersionCode(seq)) }]));
-    fs.writeFileSync(appimage, buildMiniAppImage(`[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`));
+    fs.writeFileSync(
+      apk,
+      buildZip([
+        { name: 'AndroidManifest.xml', data: buildMinimalAxml(androidVersionCode(seq)) },
+        { name: 'lib/arm64-v8a/liblegion_app_lib.so', data: compiledPayload(seq) },
+      ]),
+    );
+    fs.writeFileSync(
+      appimage,
+      buildMiniAppImage({
+        desktopText: `[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`,
+        binBytes: compiledPayload(seq),
+      }),
+    );
 
     // Mismatched sequence is refused before writing an update set.
     assert.throws(
@@ -449,4 +790,119 @@ test('parseArtifactSpec rejects invalid filenames and mismatched combinations', 
     () => parseArtifactSpec('/tmp/a.apk:program=app,os=android,arch=aarch64,kind=apk,name=../evil.apk'),
     /not a valid bare filename/,
   );
+});
+
+test('main executable must itself carry markers even when a helper has them, and stable create forbids preview keys', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-update-main-bin-'));
+  try {
+    const seq = 202611250140;
+    const now = new Date('2026-11-25T01:40:00Z');
+    const priv = path.join(tmp, 'release.key');
+    const pub = path.join(tmp, 'release.pub.pem');
+    createPreviewKey({ privateKeyPath: priv, publicKeyPath: pub });
+
+    // 1. .deb whose usr/bin/legion has NO markers MUST fail even if usr/bin/legion-helper has them.
+    const debUnmarkedMain = path.join(tmp, 'legion_0.2.0_amd64.deb');
+    fs.writeFileSync(
+      debUnmarkedMain,
+      buildDeb([
+        {
+          name: 'control.tar.gz',
+          data: zlib.gzipSync(buildTar([{
+            name: './control',
+            data: Buffer.from(`Package: legion\nVersion: 0.2.0+${seq}\nArchitecture: amd64\n`),
+          }])),
+        },
+        {
+          name: 'data.tar.gz',
+          data: zlib.gzipSync(buildTar([
+            { name: './usr/bin/legion', data: Buffer.from('\x7fELF unmarked main binary') },
+            { name: './usr/bin/legion-helper', data: compiledPayload(seq) },
+          ])),
+        },
+      ]),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(debUnmarkedMain, { name: path.basename(debUnmarkedMain), kind: 'deb' }, seq),
+      /\[usr\/bin\/legion\].*no compiled LEGION_UPDATE_SEQUENCE marker/,
+    );
+
+    // 2. AppImage whose usr/bin/legion-app has NO markers MUST fail even if usr/bin/helper has them.
+    const appImageUnmarkedMain = path.join(tmp, 'Legion-unmarked-main.AppImage');
+    fs.writeFileSync(
+      appImageUnmarkedMain,
+      buildMiniAppImage({
+        desktopText: `[Desktop Entry]\nName=Legion\nExec=legion-app\nX-AppImage-Version=0.2.0+${seq}\n`,
+        binBytes: [
+          { name: 'legion-app', data: Buffer.from('\x7fELF unmarked main binary') },
+          { name: 'helper', data: compiledPayload(seq) },
+        ],
+      }),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(appImageUnmarkedMain, { name: path.basename(appImageUnmarkedMain), kind: 'appimage' }, seq),
+      /\[usr\/bin\/legion-app\].*no compiled LEGION_UPDATE_SEQUENCE marker/,
+    );
+
+    // 3. macOS app-tar whose CFBundleExecutable has NO markers MUST fail even if a helper has them.
+    const appTarUnmarkedMain = path.join(tmp, 'Legion-unmarked-main.app.tar.gz');
+    const plist = `<?xml version="1.0"?><plist><dict><key>CFBundleExecutable</key><string>legion-app</string><key>CFBundleVersion</key><string>${seq}</string></dict></plist>`;
+    fs.writeFileSync(
+      appTarUnmarkedMain,
+      zlib.gzipSync(buildTar([
+        { name: 'Legion.app/Contents/Info.plist', data: Buffer.from(plist) },
+        { name: 'Legion.app/Contents/MacOS/legion-app', data: Buffer.from('\xcf\xfa\xed\xfe unmarked main') },
+        { name: 'Legion.app/Contents/MacOS/helper', data: compiledPayload(seq) },
+      ])),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(appTarUnmarkedMain, { name: path.basename(appTarUnmarkedMain), kind: 'app-tar' }, seq),
+      /\[Legion\.app\/Contents\/MacOS\/legion-app\].*no compiled LEGION_UPDATE_SEQUENCE marker/,
+    );
+
+    // 4. `makeUpdateSet({ channel: 'stable' })` automatically enforces forbidPreviewKey!
+    const previewBin = path.join(tmp, 'legion-0.2.0-x86_64-unknown-linux-musl');
+    fs.writeFileSync(previewBin, compiledPayload(seq, 'SHA256:throwawayPreviewKey'));
+    assert.throws(
+      () =>
+        makeUpdateSet({
+          outDir: path.join(tmp, 'stable-bad'),
+          channel: 'stable',
+          version: '0.2.0',
+          build: 'abc123def456',
+          sequence: seq,
+          privateKeyPath: priv,
+          artifacts: [`${previewBin}:program=node,os=linux,arch=x86_64,kind=binary`],
+          now,
+        }),
+      /trusts a compiled-in preview update key/,
+    );
+
+    // The same artifact succeeds on preview channel, while a clean (`none`) artifact succeeds on stable.
+    makeUpdateSet({
+      outDir: path.join(tmp, 'preview-ok'),
+      channel: 'preview',
+      version: '0.2.0',
+      build: 'abc123def456',
+      sequence: seq,
+      privateKeyPath: priv,
+      artifacts: [`${previewBin}:program=node,os=linux,arch=x86_64,kind=binary`],
+      now,
+    });
+
+    const cleanBin = path.join(tmp, 'legion-clean-x86_64-unknown-linux-musl');
+    fs.writeFileSync(cleanBin, compiledPayload(seq, 'none'));
+    makeUpdateSet({
+      outDir: path.join(tmp, 'stable-ok'),
+      channel: 'stable',
+      version: '0.2.0',
+      build: 'abc123def456',
+      sequence: seq,
+      privateKeyPath: priv,
+      artifacts: [`${cleanBin}:program=node,os=linux,arch=x86_64,kind=binary`],
+      now,
+    });
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

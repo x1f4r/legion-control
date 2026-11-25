@@ -64,6 +64,7 @@ tauri-plugin-single-instance = "=2.5.5"
 
 [dev-dependencies]
 ed25519-dalek = "3.0.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

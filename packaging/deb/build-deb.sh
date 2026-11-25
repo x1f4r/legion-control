@@ -163,4 +163,13 @@ chmod 0644 "${STAGE}/DEBIAN/md5sums"
 
 OUT_FILE="${OUT_DIR_ABS}/${PKG_NAME}_${DEB_VERSION}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "$STAGE" "$OUT_FILE" >/dev/null
+if [[ -n "${LEGION_BUILD_SEQUENCE:-}" && "${LEGION_BUILD_SEQUENCE}" != "0" ]] \
+  && command -v node >/dev/null 2>&1 \
+  && [[ -f "${REPO_ROOT}/scripts/make-update-set.mjs" ]]; then
+  CHECK_ARGS=(check-artifact --file "$OUT_FILE" --kind deb --sequence "$LEGION_BUILD_SEQUENCE")
+  if [[ -z "${LEGION_PREVIEW_UPDATE_KEY:-}" ]]; then
+    CHECK_ARGS+=(--forbid-preview-key)
+  fi
+  node "${REPO_ROOT}/scripts/make-update-set.mjs" "${CHECK_ARGS[@]}" >&2
+fi
 printf '%s\n' "$OUT_FILE"

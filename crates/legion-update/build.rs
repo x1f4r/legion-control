@@ -51,13 +51,15 @@ fn main() {
                 .join(", ");
             format!(
                 "/// Optional Ed25519 preview update public key compiled in via `LEGION_PREVIEW_UPDATE_KEY`.\n\
-                 pub const PREVIEW_PUBLIC_KEY: Option<[u8; 32]> = Some([{formatted}]);\n"
+                 pub const PREVIEW_PUBLIC_KEY: Option<[u8; 32]> = Some([{formatted}]);\n\
+                 const PREVIEW_KEY_MARKER_STR: &str = \"LEGION_UPDATE_PREVIEW_KEY={fp}\\0\";\n"
             )
         }
         None => {
             println!("cargo:warning=legion-update: release update key only (no preview key)");
             "/// Optional Ed25519 preview update public key compiled in via `LEGION_PREVIEW_UPDATE_KEY`.\n\
-             pub const PREVIEW_PUBLIC_KEY: Option<[u8; 32]> = None;\n"
+             pub const PREVIEW_PUBLIC_KEY: Option<[u8; 32]> = None;\n\
+             const PREVIEW_KEY_MARKER_STR: &str = \"LEGION_UPDATE_PREVIEW_KEY=none\\0\";\n"
                 .to_owned()
         }
     };
