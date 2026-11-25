@@ -4002,22 +4002,21 @@ fn finalize_independent_conflict_version<S: IndexStore>(
 ) -> Result<()> {
     let mut meta = load_meta_required(store)?;
 
-    if let Some(existing) = store.get_record(&loser_record.path)? {
-        if !existing.deleted && existing.content_equal(loser_record) {
-            loser_record.version = existing.version;
-            return Ok(());
-        }
-        if existing.deleted {
-            let mut version = existing.version;
-            meta.bump_version(&mut version);
-            loser_record.version = version;
-            let batch = StoreBatch {
-                folder_meta: Some(meta),
-                ..StoreBatch::default()
-            };
-            store.apply_batch(batch)?;
-            return Ok(());
-        }
+    if let Some(existing) = store.get_record(&loser_record.path)?
+        && (existing.deleted || existing.content_equal(loser_record))
+    {
+        // Bump the existing record's version even when the same conflict copy is still live
+        // locally: a new conflict re-asserting this path must causally outrank any unseen or
+        // held-back deletion of an earlier copy (e.g. after a peer ran `KeepConflict`).
+        let mut version = existing.version;
+        meta.bump_version(&mut version);
+        loser_record.version = version;
+        let batch = StoreBatch {
+            folder_meta: Some(meta),
+            ..StoreBatch::default()
+        };
+        store.apply_batch(batch)?;
+        return Ok(());
     }
 
     let vkey = meta.version_key();
