@@ -16,8 +16,8 @@ use serde_json::json;
 
 pub use doctor::{
     FleetPingEntry, check_executable_on_path, check_installation, check_linux_lingering,
-    check_policy_exec_roles, check_ssh_on_path, extract_login_path, fleet_ping_checks,
-    parse_linger_output,
+    check_policy_exec_roles, check_self_in_fleet, check_ssh_on_path, extract_login_path,
+    fleet_ping_checks, parse_linger_output,
 };
 pub use init::{InitResult, render_node_toml, render_policy_toml};
 
@@ -38,7 +38,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, and each machine in fleet.toml is checked (unless quick=true; unreachable machines are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. Passing acknowledge=\"devices-rollback\" (owner role only) clears a recorded configuration rollback failure in the state directory and audits who acknowledged it; otherwise it writes nothing but a probe file in the state directory, which it removes.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, this node's own name appears in fleet.toml when fleet.toml lists machines, and each machine in fleet.toml is checked (unless quick=true; unreachable machines and node name mismatches are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. Passing acknowledge=\"devices-rollback\" (owner role only) clears a recorded configuration rollback failure in the state directory and audits who acknowledged it; otherwise it writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
     init::register(registry);
@@ -61,6 +61,10 @@ pub struct Version {
     pub protocol: u32,
     /// The node's name.
     pub node: String,
+    /// Whether `node` was set explicitly in `node.toml` (`Some(true)`), derived from the host name
+    /// (`Some(false)`), or unknown because `node.toml` failed to parse (`None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_explicit: Option<bool>,
     /// The operating system.
     pub os: &'static str,
     /// The CPU architecture.
@@ -76,6 +80,7 @@ async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
         install: crate::package::install_method(exe.as_deref()),
         protocol: PROTOCOL,
         node: ctx.node_name().to_owned(),
+        node_explicit: ctx.node_name_explicit(),
         os: ctx.os(),
         arch: ctx.arch(),
     })

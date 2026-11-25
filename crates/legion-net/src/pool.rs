@@ -25,7 +25,8 @@ use tokio::task::JoinSet;
 use crate::config::{FleetFile, MachineEntry, RemoteOs, ResolvedSystem, Transport};
 use crate::connector::{Pipe, Subcommand};
 use crate::session::{self, CallError, OpenError, Session};
-use crate::state::StateStore;
+use crate::state::{ReportedNode, StateStore};
+use serde::{Deserialize, Serialize};
 
 /// Maximum number of new remote connections opened concurrently during a fan-out or ping.
 const MAX_CONCURRENT_CONNECTS: usize = 8;
@@ -90,6 +91,18 @@ const MULTI_SYSTEM_TIMEOUT: Duration = Duration::from_secs(4);
 /// its sibling systems in parallel, avoiding redundant SSH spawns in the common case.
 const REMEMBERED_SYSTEM_HEAD_START: Duration = Duration::from_millis(250);
 
+/// Reported on a machine entry when the peer answered under a different node name than its fleet
+/// name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameMismatch {
+    /// Node name reported by the answering machine.
+    pub reported: String,
+    /// Whether that name was set explicitly in `node.toml` (`Some(true)`), derived from the host
+    /// name (`Some(false)`), or unreported by an older node (`None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<bool>,
+}
+
 /// Outcome of probing one machine with [`Fleet::ping`].
 #[derive(Clone, Debug)]
 pub struct PingOutcome {
@@ -99,6 +112,11 @@ pub struct PingOutcome {
     pub reachable: bool,
     /// Node name reported by `hello`, when reachable.
     pub node: Option<String>,
+    /// Whether the reported `node` name is explicit in `node.toml` (`Some(true)`), host-derived
+    /// (`Some(false)`), or unreported by an older node (`None`).
+    pub node_explicit: Option<bool>,
+    /// Present when the machine answered under a different node name than `machine`.
+    pub name_mismatch: Option<NameMismatch>,
     /// System name that answered, when the machine defines named `[[systems]]`.
     pub system: Option<String>,
     /// Legion version reported by `hello`, when reachable.
@@ -1106,6 +1124,11 @@ impl Fleet {
                 machine: machine.to_owned(),
                 reachable: true,
                 node: Some(here.to_owned()),
+                node_explicit: config
+                    .get::<legion_core::config::NodeFile>()
+                    .ok()
+                    .map(|f| f.name.is_some()),
+                name_mismatch: None,
                 system: None,
                 version: Some(VERSION.to_owned()),
                 os: Some(std::env::consts::OS.to_owned()),
@@ -1156,22 +1179,39 @@ impl Fleet {
                 EventSink::discard(),
             );
             return match tokio::time::timeout(timeout, fut).await {
-                Ok(Ok(value)) => PingOutcome {
-                    machine: machine.to_owned(),
-                    reachable: true,
-                    node: value.get("node").and_then(Value::as_str).map(str::to_owned),
-                    system: None,
-                    version: value
-                        .get("version")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    os: value.get("os").and_then(Value::as_str).map(str::to_owned),
-                    arch: value.get("arch").and_then(Value::as_str).map(str::to_owned),
-                    latency_ms: Some(
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    ),
-                    error: None,
-                },
+                Ok(Ok(value)) => {
+                    let reported = value.get("node").and_then(Value::as_str).map(str::to_owned);
+                    let explicit = value.get("node_explicit").and_then(Value::as_bool);
+                    if let Some(ref rep) = reported {
+                        self.inner.state.record_node(machine, rep, explicit);
+                    }
+                    let name_mismatch =
+                        reported
+                            .as_deref()
+                            .filter(|rep| *rep != machine)
+                            .map(|rep| NameMismatch {
+                                reported: rep.to_owned(),
+                                explicit,
+                            });
+                    PingOutcome {
+                        machine: machine.to_owned(),
+                        reachable: true,
+                        node: reported,
+                        node_explicit: explicit,
+                        name_mismatch,
+                        system: None,
+                        version: value
+                            .get("version")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        os: value.get("os").and_then(Value::as_str).map(str::to_owned),
+                        arch: value.get("arch").and_then(Value::as_str).map(str::to_owned),
+                        latency_ms: Some(
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        ),
+                        error: None,
+                    }
+                }
                 Ok(Err(err)) => ping_failed(machine, ensure_machine(err, machine)),
                 Err(_) => ping_failed(
                     machine,
@@ -1206,6 +1246,9 @@ impl Fleet {
         if let Some(live) = existing {
             match live.session.hello(timeout, cancel.clone()).await {
                 Ok(hello) => {
+                    self.inner
+                        .state
+                        .record_node(machine, &hello.node, hello.node_explicit);
                     return ping_ok(machine, hello, live.session.info().system.clone(), started);
                 }
                 Err(CallError::Remote(err)) => {
@@ -1238,10 +1281,158 @@ impl Fleet {
         {
             Ok(live) => {
                 let info = live.session.info();
+                self.inner
+                    .state
+                    .record_node(machine, &info.hello.node, info.hello.node_explicit);
                 ping_ok(machine, info.hello.clone(), info.system.clone(), started)
             }
             Err(err) => ping_failed(machine, ensure_machine(err, machine)),
         }
+    }
+
+    /// Last observed node name and explicitness for `machine`, checking persisted state and live
+    /// pooled sessions without making any network connections.
+    pub(crate) fn last_reported_node(&self, machine: &str) -> Option<ReportedNode> {
+        if let Some(cached) = self.inner.state.last_node(machine) {
+            return Some(cached);
+        }
+        let slot = {
+            self.inner
+                .slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(machine)
+                .cloned()
+        };
+        slot.and_then(|slot| {
+            let guard = slot
+                .current
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.as_ref().map(|live| {
+                let hello = &live.session.info().hello;
+                ReportedNode {
+                    node: hello.node.clone(),
+                    explicit: hello.node_explicit,
+                }
+            })
+        })
+    }
+
+    /// Records the latest known node name and explicitness for `machine` in the fleet state cache.
+    pub(crate) fn record_reported_node(&self, machine: &str, node: &str, explicit: Option<bool>) {
+        self.inner.state.record_node(machine, node, explicit);
+    }
+
+    /// Removes any cached reported node name for `machine` (for example after `fleet.add` or
+    /// `fleet.remove`).
+    pub(crate) fn clear_cached_node(&self, machine: &str) {
+        self.inner.state.clear_node(machine);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_session(
+        &self,
+        machine: &str,
+        entry: &MachineEntry,
+        session: Session,
+    ) {
+        let systems = entry.resolved_systems();
+        let active_system = systems[0].clone();
+        let slot = self.slot(machine);
+        *slot
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(LiveEntry {
+            session: Arc::new(session),
+            systems_fingerprint: systems,
+            active_system,
+            active_os: None,
+        });
+    }
+
+    /// Probes the live node name and explicitness of `machine` (via `hello` for direct peers or
+    /// `meta.version` for relayed peers) and updates the fleet state cache.
+    pub(crate) async fn probe_identity(
+        &self,
+        ctx: &Ctx,
+        machine: &str,
+    ) -> Result<ReportedNode, ErrorBody> {
+        let here = ctx.node_name();
+        let fleet_file = ctx
+            .config()
+            .get::<FleetFile>()
+            .map_err(|err| ensure_machine(err, here))?;
+        let (direct_machine, direct_entry, relayed) = resolve_route(&fleet_file, machine, here)?;
+        if relayed {
+            let value = self
+                .call_remote(
+                    ctx,
+                    machine,
+                    "meta.version",
+                    json!({}),
+                    EventSink::discard(),
+                )
+                .await?;
+            let node = value
+                .get("node")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("Remote meta.version on {machine} did not report a node name."),
+                    )
+                    .with_machine(machine)
+                })?
+                .to_owned();
+            let explicit = value.get("node_explicit").and_then(Value::as_bool);
+            self.inner.state.record_node(machine, &node, explicit);
+            return Ok(ReportedNode { node, explicit });
+        }
+
+        let cancel = ctx.cancel_token().clone();
+        let slot = self.slot(direct_machine);
+        let had_existing = {
+            let systems = direct_entry.resolved_systems();
+            let guard = slot
+                .current
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard
+                .as_ref()
+                .is_some_and(|live| live.session.is_alive() && live.systems_fingerprint == systems)
+        };
+        let live = self
+            .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+            .await
+            .map_err(|err| ensure_machine(err, machine))?;
+        let hello = if had_existing {
+            match live
+                .session
+                .hello(SINGLE_SYSTEM_TIMEOUT, cancel.clone())
+                .await
+            {
+                Ok(hello) => hello,
+                Err(CallError::NotWritten(_) | CallError::LostInFlight(_)) => {
+                    self.invalidate_if_same(&slot, &live.session);
+                    let fresh = self
+                        .get_or_open(direct_machine, direct_entry, None, cancel)
+                        .await
+                        .map_err(|err| ensure_machine(err, machine))?;
+                    fresh.session.info().hello.clone()
+                }
+                Err(CallError::Remote(err)) => return Err(ensure_machine(err, machine)),
+            }
+        } else {
+            live.session.info().hello.clone()
+        };
+        self.inner
+            .state
+            .record_node(machine, &hello.node, hello.node_explicit);
+        Ok(ReportedNode {
+            node: hello.node,
+            explicit: hello.node_explicit,
+        })
     }
 
     /// Closes and removes any cached session and idle stream pipes for `machine`, e.g. after
@@ -1450,18 +1641,51 @@ impl Fleet {
                 err.with_machine(target_machine)
             }
         };
+        let tool = params.tool.clone();
         let slot = self.slot(direct_machine);
-        let live = self
+        let mut live = self
             .get_or_open(direct_machine, direct_entry, None, cancel.clone())
             .await
             .map_err(&label_error)?;
 
-        match live
+        // `device.invite` writes a temporary key to `authorized_keys` and bakes the node's own
+        // name into the invite string. Check the live name before forwarding on direct hops so a
+        // misnamed node is refused without mutating its `authorized_keys`.
+        if !relayed && tool == "device.invite" {
+            let hello = match live
+                .session
+                .hello(SINGLE_SYSTEM_TIMEOUT, cancel.clone())
+                .await
+            {
+                Ok(hello) => hello,
+                Err(CallError::NotWritten(_)) => {
+                    self.invalidate_if_same(&slot, &live.session);
+                    live = self
+                        .get_or_open(direct_machine, direct_entry, None, cancel.clone())
+                        .await
+                        .map_err(&label_error)?;
+                    live.session.info().hello.clone()
+                }
+                Err(CallError::LostInFlight(err)) => {
+                    self.invalidate_if_same(&slot, &live.session);
+                    return Err(label_error(err));
+                }
+                Err(CallError::Remote(err)) => return Err(label_error(err)),
+            };
+            self.inner
+                .state
+                .record_node(target_machine, &hello.node, hello.node_explicit);
+            if hello.node != target_machine {
+                return Err(name_mismatch_error(target_machine, &hello.node));
+            }
+        }
+
+        let (used_live, value) = match live
             .session
             .call(params.clone(), cancel.clone(), events.clone())
             .await
         {
-            Ok(value) => Ok(value),
+            Ok(value) => (live, value),
             Err(CallError::NotWritten(_)) => {
                 // Request was never written to the dead session: reopen once and retry.
                 self.invalidate_if_same(&slot, &live.session);
@@ -1470,20 +1694,58 @@ impl Fleet {
                     .await
                     .map_err(&label_error)?;
                 match fresh.session.call(params, cancel, events).await {
-                    Ok(value) => Ok(value),
+                    Ok(value) => (fresh, value),
                     Err(CallError::LostInFlight(err) | CallError::NotWritten(err)) => {
                         self.invalidate_if_same(&slot, &fresh.session);
-                        Err(label_error(err))
+                        return Err(label_error(err));
                     }
-                    Err(CallError::Remote(err)) => Err(label_error(err)),
+                    Err(CallError::Remote(err)) => return Err(label_error(err)),
                 }
             }
             Err(CallError::LostInFlight(err)) => {
                 self.invalidate_if_same(&slot, &live.session);
-                Err(label_error(err))
+                return Err(label_error(err));
             }
-            Err(CallError::Remote(err)) => Err(label_error(err)),
+            Err(CallError::Remote(err)) => return Err(label_error(err)),
+        };
+
+        self.validate_forwarded_answer(target_machine, relayed, &used_live, &tool, &value)?;
+        Ok(value)
+    }
+
+    fn validate_forwarded_answer(
+        &self,
+        target_machine: &str,
+        relayed: bool,
+        live: &LiveEntry,
+        tool: &str,
+        value: &Value,
+    ) -> Result<(), ErrorBody> {
+        if !matches!(tool, "device.endpoint" | "device.invite") {
+            return Ok(());
         }
+        if let Some(reported) = value.get("node").and_then(Value::as_str) {
+            if reported != target_machine {
+                let explicit = (!relayed && live.session.info().hello.node == reported)
+                    .then_some(live.session.info().hello.node_explicit)
+                    .flatten();
+                self.inner
+                    .state
+                    .record_node(target_machine, reported, explicit);
+                return Err(name_mismatch_error(target_machine, reported));
+            }
+            return Ok(());
+        }
+        if !relayed {
+            let hello = &live.session.info().hello;
+            if hello.node != target_machine {
+                self.inner
+                    .state
+                    .record_node(target_machine, &hello.node, hello.node_explicit);
+                return Err(name_mismatch_error(target_machine, &hello.node));
+            }
+        }
+        Ok(())
     }
 
     async fn get_or_open(
@@ -1591,6 +1853,10 @@ impl Fleet {
             let timeout = timeout_override.unwrap_or(SINGLE_SYSTEM_TIMEOUT);
             return match self.open_one_system(machine, &sys, timeout, cancel).await {
                 Ok((session, worked_os)) => {
+                    let hello = &session.info().hello;
+                    self.inner
+                        .state
+                        .record_node(machine, &hello.node, hello.node_explicit);
                     if sys.explicit {
                         self.inner.state.record_system(machine, &sys.name);
                     }
@@ -1640,6 +1906,10 @@ impl Fleet {
             {
                 match res {
                     Ok((session, worked_os)) => {
+                        let hello = &session.info().hello;
+                        self.inner
+                            .state
+                            .record_node(machine, &hello.node, hello.node_explicit);
                         if sys.explicit {
                             self.inner.state.record_system(machine, &sys.name);
                         }
@@ -1680,6 +1950,10 @@ impl Fleet {
             match res {
                 Ok((session, worked_os)) => {
                     probe_cancel.cancel();
+                    let hello = &session.info().hello;
+                    self.inner
+                        .state
+                        .record_node(machine, &hello.node, hello.node_explicit);
                     if sys.explicit {
                         self.inner.state.record_system(machine, &sys.name);
                     }
@@ -3326,16 +3600,39 @@ fn ensure_machine(err: ErrorBody, machine: &str) -> ErrorBody {
     }
 }
 
+/// Builds the standard `name_mismatch` error when a machine answers under a different node name
+/// than its fleet name.
+pub(crate) fn name_mismatch_error(expected: &str, reported: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::NameMismatch,
+        format!("{expected} calls itself {reported}."),
+    )
+    .with_hint(format!(
+        "Run `legion fleet.sync direction=push machines='[\"{expected}\"]'` to set its name, or set `name = \"{expected}\"` in its node.toml."
+    ))
+    .with_machine(expected)
+    .with_details(json!({
+        "expected": expected,
+        "reported": reported,
+    }))
+}
+
 fn ping_ok(
     machine: &str,
     hello: legion_proto::HelloResult,
     system: Option<String>,
     started: Instant,
 ) -> PingOutcome {
+    let name_mismatch = (hello.node != machine).then(|| NameMismatch {
+        reported: hello.node.clone(),
+        explicit: hello.node_explicit,
+    });
     PingOutcome {
         machine: machine.to_owned(),
         reachable: true,
         node: Some(hello.node),
+        node_explicit: hello.node_explicit,
+        name_mismatch,
         system,
         version: Some(hello.version),
         os: Some(hello.os),
@@ -3350,6 +3647,8 @@ fn ping_failed(machine: &str, error: ErrorBody) -> PingOutcome {
         machine: machine.to_owned(),
         reachable: false,
         node: None,
+        node_explicit: None,
+        name_mismatch: None,
         system: None,
         version: None,
         os: None,
@@ -3442,6 +3741,7 @@ mod tests {
                 Some(Id::Number(1)),
                 serde_json::to_value(HelloResult {
                     node: "pi".to_owned(),
+                    node_explicit: Some(true),
                     version: "0.1.0".to_owned(),
                     build: None,
                     protocol: PROTOCOL,
@@ -3734,6 +4034,7 @@ mod tests {
             Some(Id::Number(1)),
             serde_json::to_value(HelloResult {
                 node: "dual".to_owned(),
+                node_explicit: Some(true),
                 version: "0.1.0".to_owned(),
                 build: None,
                 protocol: PROTOCOL,
