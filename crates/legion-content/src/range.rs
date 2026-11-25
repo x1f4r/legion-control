@@ -21,9 +21,17 @@ impl ContentTime {
     }
 }
 
-/// Builds a strong `ETag` from a file's `size` and modification time.
-pub fn etag(size: u64, mtime: ContentTime) -> HeaderValue {
-    let tag = format!("\"{size:x}-{:x}-{:x}\"", mtime.secs as u64, mtime.nanos);
+/// Builds a strong `ETag` from a file's `size`, modification time, and optional file identity
+/// (such as a hash of `(dev, ino)` on Unix) so atomic replacement with the same size and
+/// timestamp still changes the tag.
+pub fn etag(size: u64, mtime: ContentTime, file_id: Option<u64>) -> HeaderValue {
+    let tag = match file_id {
+        Some(id) => format!(
+            "\"{size:x}-{:x}-{:x}-{id:x}\"",
+            mtime.secs as u64, mtime.nanos
+        ),
+        None => format!("\"{size:x}-{:x}-{:x}\"", mtime.secs as u64, mtime.nanos),
+    };
     HeaderValue::from_str(&tag).unwrap_or_else(|_| HeaderValue::from_static("\"0-0-0\""))
 }
 
@@ -45,8 +53,9 @@ pub fn if_range_matches(if_range: &str, current_etag: &str) -> bool {
 pub enum ParsedRange {
     /// No `Range` header was present.
     None,
-    /// The `Range` header uses an unknown unit or requests multiple ranges; per RFC 9110 §14.2 a
-    /// single-range server ignores it and returns the full representation (`200 OK`).
+    /// The `Range` header uses an unknown unit, requests multiple ranges, or carries a range
+    /// bound beyond `u64::MAX` that cannot be represented; per RFC 9110 §14.2 a single-range
+    /// server ignores it and returns the full representation (`200 OK`).
     Ignore,
     /// The `Range` header uses `bytes=` with an invalid or unsatisfiable specification (for
     /// example `bytes=10-5`, `bytes=-0`, or non-numeric bounds).
@@ -85,6 +94,12 @@ pub enum RangeDecision {
 }
 
 /// Parses a single HTTP `Range` header value.
+///
+/// Purely numeric bounds that exceed `u64::MAX` are handled gracefully:
+/// - `bytes=-<huge>` clamps to `u64::MAX` (resolving to the whole file on non-empty files).
+/// - `bytes=<start>-<huge>` clamps to an open-ended range from `start` through EOF.
+/// - `bytes=<huge>-...` (valid syntax with an unrepresentable start) falls back to `Ignore`
+///   (`200 OK`) rather than misreporting syntax invalidity.
 pub fn parse_range(raw: &str) -> ParsedRange {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -116,20 +131,23 @@ pub fn parse_range(raw: &str) -> ParsedRange {
         if end_str.is_empty() || !end_str.bytes().all(|b| b.is_ascii_digit()) {
             return ParsedRange::Invalid;
         }
-        let Ok(suffix) = end_str.parse::<u64>() else {
-            return ParsedRange::Invalid;
-        };
-        if suffix == 0 {
+        if end_str.bytes().all(|b| b == b'0') {
             return ParsedRange::Invalid;
         }
+        let suffix = end_str.parse::<u64>().unwrap_or(u64::MAX);
         return ParsedRange::Suffix(suffix);
     }
 
     if !start_str.bytes().all(|b| b.is_ascii_digit()) {
         return ParsedRange::Invalid;
     }
-    let Ok(start) = start_str.parse::<u64>() else {
+    if !end_str.is_empty() && !end_str.bytes().all(|b| b.is_ascii_digit()) {
         return ParsedRange::Invalid;
+    }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        // Syntactically valid byte range whose start exceeds `u64::MAX`: ignore and serve 200 OK.
+        return ParsedRange::Ignore;
     };
 
     if end_str.is_empty() {
@@ -137,18 +155,18 @@ pub fn parse_range(raw: &str) -> ParsedRange {
         return ParsedRange::FromStart { start, end: None };
     }
 
-    if !end_str.bytes().all(|b| b.is_ascii_digit()) {
-        return ParsedRange::Invalid;
-    }
-    let Ok(end) = end_str.parse::<u64>() else {
-        return ParsedRange::Invalid;
-    };
-    if start > end {
-        return ParsedRange::Invalid;
-    }
-    ParsedRange::FromStart {
-        start,
-        end: Some(end),
+    match end_str.parse::<u64>() {
+        Ok(end) => {
+            if start > end {
+                return ParsedRange::Invalid;
+            }
+            ParsedRange::FromStart {
+                start,
+                end: Some(end),
+            }
+        }
+        // `end` is all digits and exceeds `u64::MAX`, so `end >= start` and clamps to EOF.
+        Err(_) => ParsedRange::FromStart { start, end: None },
     }
 }
 
@@ -244,14 +262,46 @@ mod tests {
                 length: 100,
             })
         );
+        // Overflowing suffix clamps to whole file
+        assert_eq!(
+            resolve_range(parse_range("bytes=-999999999999999999999999999999"), 100),
+            RangeDecision::Partial(ResolvedRange {
+                start: 0,
+                end: 99,
+                length: 100,
+            })
+        );
+        // Overflowing end clamps to EOF
+        assert_eq!(
+            resolve_range(parse_range("bytes=50-999999999999999999999999999999"), 100),
+            RangeDecision::Partial(ResolvedRange {
+                start: 50,
+                end: 99,
+                length: 50,
+            })
+        );
+        // Overflowing start falls back to full 200 OK instead of 416
+        assert_eq!(
+            resolve_range(parse_range("bytes=999999999999999999999999999999-"), 100),
+            RangeDecision::Full
+        );
+        assert_eq!(
+            resolve_range(
+                parse_range("bytes=999999999999999999999999999999-9999999999999999999999999999999"),
+                100
+            ),
+            RangeDecision::Full
+        );
         // Unsatisfiable cases
         for raw in [
             "bytes=100-100",
             "bytes=100-",
             "bytes=500-600",
             "bytes=-0",
+            "bytes=-00000000000000000000000000000",
             "bytes=10-5",
             "bytes=abc-def",
+            "bytes=999999999999999999999999999999-abc",
             "bytes=-",
         ] {
             assert_eq!(
@@ -281,8 +331,10 @@ mod tests {
     }
 
     #[test]
-    fn etag_and_if_range_require_strong_match() {
-        let tag = etag(4096, ContentTime::new(1_700_000_000, 123_456_789));
+    fn etag_includes_file_id_and_if_range_requires_strong_match() {
+        let tag = etag(4096, ContentTime::new(1_700_000_000, 123_456_789), Some(42));
+        let tag_other_inode = etag(4096, ContentTime::new(1_700_000_000, 123_456_789), Some(43));
+        assert_ne!(tag, tag_other_inode);
         let tag_str = tag.to_str().unwrap();
         assert!(if_range_matches(tag_str, tag_str));
         assert!(if_range_matches(&format!(" {tag_str} "), tag_str));

@@ -1,23 +1,39 @@
-//! Streaming HTTP body with bounded chunk buffering and backpressure.
+//! Streaming HTTP body with bounded chunk buffering, periodic liveness checks, and backpressure.
 
+use std::any::Any;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
 
-/// Chunk size read per poll so arbitrarily large files stream in constant memory.
+/// Chunk size buffered per read so arbitrarily large files stream in constant memory without
+/// zero-filling a fresh scratch buffer on every poll.
 const CHUNK_SIZE: usize = 64 * 1024;
+
+/// Default byte interval between in-flight revocation and TTL checks (2 MiB).
+pub const LIVENESS_CHECK_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Default wall-time interval between in-flight revocation and TTL checks (2 seconds).
+pub const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Type-erased async reader yielded by a [`ContentSource`](crate::ContentSource).
 pub type BoxAsyncRead = Box<dyn AsyncRead + Send + Unpin>;
 
+/// Periodic liveness callback checked while streaming a [`ContentBody`].
+pub(crate) type LiveCheck = Arc<dyn Fn() -> Result<(), io::Error> + Send + Sync>;
+
 /// HTTP response body produced by [`handle_request`](crate::handle_request).
 ///
-/// Streaming bodies read at most 64 KiB per frame poll, propagate backpressure from the HTTP
-/// transport to the underlying reader, and drop the reader immediately if the client disconnects.
+/// Streaming bodies read at most 64 KiB per frame poll through a [`BufReader`] (avoiding per-poll
+/// zero-fill), propagate backpressure from the HTTP transport to the underlying reader, re-check
+/// ticket and policy liveness periodically while streaming, and drop the reader and any RAII
+/// permits immediately if the client disconnects.
 pub struct ContentBody {
     kind: BodyKind,
 }
@@ -26,9 +42,15 @@ enum BodyKind {
     Empty,
     Fixed(Option<Bytes>),
     Stream {
-        reader: BoxAsyncRead,
+        reader: BufReader<BoxAsyncRead>,
         remaining: u64,
-        buf: BytesMut,
+        live_check: Option<LiveCheck>,
+        check_bytes_interval: u64,
+        check_time_interval: Duration,
+        bytes_since_check: u64,
+        last_check: Instant,
+        bytes_served: Option<Arc<AtomicU64>>,
+        _guards: Vec<Box<dyn Any + Send + Sync>>,
     },
 }
 
@@ -58,17 +80,43 @@ impl ContentBody {
     /// file shrank mid-stream), polling yields an [`io::ErrorKind::UnexpectedEof`] error so the
     /// HTTP server aborts the response rather than delivering a truncated payload as complete.
     pub fn stream(reader: BoxAsyncRead, length: u64) -> Self {
+        Self::stream_with_controls(
+            reader,
+            length,
+            None,
+            LIVENESS_CHECK_BYTES,
+            LIVENESS_CHECK_INTERVAL,
+            None,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn stream_with_controls(
+        reader: BoxAsyncRead,
+        length: u64,
+        live_check: Option<LiveCheck>,
+        check_bytes_interval: u64,
+        check_time_interval: Duration,
+        bytes_served: Option<Arc<AtomicU64>>,
+        guards: Vec<Box<dyn Any + Send + Sync>>,
+    ) -> Self {
         if length == 0 {
             return Self::empty();
         }
-        let initial_cap = usize::try_from(length)
+        let cap = usize::try_from(length)
             .unwrap_or(CHUNK_SIZE)
             .min(CHUNK_SIZE);
         Self {
             kind: BodyKind::Stream {
-                reader,
+                reader: BufReader::with_capacity(cap, reader),
                 remaining: length,
-                buf: BytesMut::with_capacity(initial_cap),
+                live_check,
+                check_bytes_interval: check_bytes_interval.max(1),
+                check_time_interval,
+                bytes_since_check: 0,
+                last_check: Instant::now(),
+                bytes_served,
+                _guards: guards,
             },
         }
     }
@@ -88,29 +136,41 @@ impl Body for ContentBody {
             BodyKind::Stream {
                 reader,
                 remaining,
-                buf,
+                live_check,
+                check_bytes_interval,
+                check_time_interval,
+                bytes_since_check,
+                last_check,
+                bytes_served,
+                ..
             } => {
                 if *remaining == 0 {
                     return Poll::Ready(None);
                 }
+
+                if let Some(check) = live_check.as_ref()
+                    && (*bytes_since_check >= *check_bytes_interval
+                        || last_check.elapsed() >= *check_time_interval)
+                {
+                    if let Err(err) = check() {
+                        *remaining = 0;
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    *bytes_since_check = 0;
+                    *last_check = Instant::now();
+                }
+
                 let want = usize::try_from(*remaining)
                     .unwrap_or(CHUNK_SIZE)
                     .min(CHUNK_SIZE);
-                buf.clear();
-                if buf.capacity() < want {
-                    buf.reserve(want);
-                }
-                buf.resize(want, 0);
-                let mut read_buf = ReadBuf::new(&mut buf[..want]);
-                match Pin::new(reader.as_mut()).poll_read(cx, &mut read_buf) {
+                match Pin::new(&mut *reader).poll_fill_buf(cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(Err(err)) => {
                         *remaining = 0;
                         Poll::Ready(Some(Err(err)))
                     }
-                    Poll::Ready(Ok(())) => {
-                        let n = read_buf.filled().len();
-                        if n == 0 {
+                    Poll::Ready(Ok(avail)) => {
+                        if avail.is_empty() {
                             let missing = *remaining;
                             *remaining = 0;
                             return Poll::Ready(Some(Err(io::Error::new(
@@ -118,8 +178,14 @@ impl Body for ContentBody {
                                 format!("content stream ended with {missing} bytes remaining"),
                             ))));
                         }
-                        *remaining -= n as u64;
-                        let chunk = buf.split_to(n).freeze();
+                        let take = avail.len().min(want);
+                        let chunk = Bytes::copy_from_slice(&avail[..take]);
+                        Pin::new(&mut *reader).consume(take);
+                        *remaining -= take as u64;
+                        *bytes_since_check = bytes_since_check.saturating_add(take as u64);
+                        if let Some(counter) = bytes_served {
+                            counter.fetch_add(take as u64, Ordering::Relaxed);
+                        }
                         Poll::Ready(Some(Ok(Frame::data(chunk))))
                     }
                 }

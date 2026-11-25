@@ -2,16 +2,19 @@
 //!
 //! File types are chosen strictly from the file name's extension (case-insensitive); file bytes
 //! are never inspected to guess a media type. Every text file — including HTML, XHTML, XML, and
-//! JavaScript — is served as `text/plain; charset=utf-8`. Anything outside the allow-list is
-//! served as `application/octet-stream` with `Content-Disposition: attachment`.
+//! JavaScript — is served as `text/plain; charset=utf-8` (except WebVTT `.vtt`, which is served
+//! as `text/vtt; charset=utf-8` for `<track>` subtitles). Anything outside the allow-list —
+//! including PDF — is served as `application/octet-stream` with `Content-Disposition: attachment`.
 
 use http::HeaderValue;
 
-/// Sandbox CSP attached to every content reply except inline PDF documents.
+/// Sandbox CSP attached unconditionally to every content reply.
 ///
-/// `sandbox` without `allow-scripts` or `allow-same-origin` places the document in a unique opaque
-/// origin with script execution disabled; `default-src 'none'` further blocks all subresources.
-pub const CONTENT_SANDBOX_CSP: &str = "sandbox; default-src 'none'";
+/// `sandbox` without `allow-scripts` or `allow-same-origin` places any rendered document in a
+/// unique opaque origin with script execution disabled; `default-src 'none'` blocks all
+/// subresources; `frame-ancestors 'none'` stops any page (even on the same origin or a third-party
+/// origin holding a leaked ticket) from framing a content URL.
+pub const CONTENT_SANDBOX_CSP: &str = "sandbox; default-src 'none'; frame-ancestors 'none'";
 
 /// How a file name should be presented over HTTP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,9 +23,6 @@ pub struct ContentPolicy {
     pub content_type: &'static str,
     /// Whether `Content-Disposition: attachment` is forced even without `?download=1`.
     pub attachment: bool,
-    /// Whether [`CONTENT_SANDBOX_CSP`] must be emitted when served inline (true for everything
-    /// except PDF).
-    pub sandbox_csp: bool,
 }
 
 /// Maps `file_name` to its [`ContentPolicy`] using only its ASCII extension (case-insensitive).
@@ -36,14 +36,12 @@ pub fn classify_filename(file_name: &str) -> ContentPolicy {
         return ContentPolicy {
             content_type: "application/octet-stream",
             attachment: true,
-            sandbox_csp: true,
         };
     };
 
     let inline = |content_type: &'static str| ContentPolicy {
         content_type,
         attachment: false,
-        sandbox_csp: true,
     };
 
     match ext.as_str() {
@@ -59,7 +57,7 @@ pub fn classify_filename(file_name: &str) -> ContentPolicy {
         "heic" => inline("image/heic"),
         "heif" => inline("image/heif"),
 
-        // SVG (inline, always carries `Content-Security-Policy: sandbox; default-src 'none'`)
+        // SVG (inline, always carries `CONTENT_SANDBOX_CSP`)
         "svg" => inline("image/svg+xml"),
 
         // Video
@@ -80,12 +78,8 @@ pub fn classify_filename(file_name: &str) -> ContentPolicy {
         "wav" => inline("audio/wav"),
         "weba" => inline("audio/webm"),
 
-        // PDF: the sole inline type served without `sandbox` CSP so browser PDF viewers work.
-        "pdf" => ContentPolicy {
-            content_type: "application/pdf",
-            attachment: false,
-            sandbox_csp: false,
-        },
+        // WebVTT subtitles for `<track>` elements (browsers require `text/vtt`).
+        "vtt" => inline("text/vtt; charset=utf-8"),
 
         // Text and source files (including HTML/XHTML/XML/JS): always plain text, never active.
         "txt" | "md" | "markdown" | "log" | "csv" | "tsv" | "json" | "jsonl" | "ndjson"
@@ -95,15 +89,14 @@ pub fn classify_filename(file_name: &str) -> ContentPolicy {
         | "hpp" | "hxx" | "cs" | "swift" | "m" | "mm" | "php" | "pl" | "sh" | "bash" | "zsh"
         | "fish" | "ps1" | "bat" | "cmd" | "sql" | "graphql" | "gql" | "proto" | "nix" | "lua"
         | "zig" | "ex" | "exs" | "erl" | "hs" | "ml" | "mli" | "r" | "scala" | "dart" | "vue"
-        | "svelte" | "astro" | "diff" | "patch" | "rst" | "tex" | "rtf" | "srt" | "vtt" | "ics" => {
+        | "svelte" | "astro" | "diff" | "patch" | "rst" | "tex" | "rtf" | "srt" | "ics" => {
             inline("text/plain; charset=utf-8")
         }
 
-        // Everything else forces download as octet-stream.
+        // Everything else (including PDF) forces download as octet-stream.
         _ => ContentPolicy {
             content_type: "application/octet-stream",
             attachment: true,
-            sandbox_csp: true,
         },
     }
 }
@@ -181,7 +174,6 @@ mod tests {
             ContentPolicy {
                 content_type: "image/jpeg",
                 attachment: false,
-                sandbox_csp: true,
             }
         );
         assert_eq!(
@@ -189,7 +181,6 @@ mod tests {
             ContentPolicy {
                 content_type: "image/svg+xml",
                 attachment: false,
-                sandbox_csp: true,
             }
         );
         assert_eq!(
@@ -197,7 +188,6 @@ mod tests {
             ContentPolicy {
                 content_type: "video/mp4",
                 attachment: false,
-                sandbox_csp: true,
             }
         );
         assert_eq!(
@@ -205,15 +195,13 @@ mod tests {
             ContentPolicy {
                 content_type: "audio/flac",
                 attachment: false,
-                sandbox_csp: true,
             }
         );
         assert_eq!(
-            classify_filename("manual.pdf"),
+            classify_filename("captions.vtt"),
             ContentPolicy {
-                content_type: "application/pdf",
+                content_type: "text/vtt; charset=utf-8",
                 attachment: false,
-                sandbox_csp: false,
             }
         );
         for text_name in ["index.html", "page.HTM", "doc.xhtml", "app.js", "notes.txt"] {
@@ -222,18 +210,25 @@ mod tests {
                 ContentPolicy {
                     content_type: "text/plain; charset=utf-8",
                     attachment: false,
-                    sandbox_csp: true,
                 },
                 "{text_name}"
             );
         }
-        for other in ["archive.zip", "program.exe", "README", ".bashrc", "a.wasm"] {
+        for other in [
+            "manual.pdf",
+            "MANUAL.PDF",
+            "archive.zip",
+            "program.exe",
+            "README",
+            ".bashrc",
+            "a.wasm",
+            "trailing.",
+        ] {
             assert_eq!(
                 classify_filename(other),
                 ContentPolicy {
                     content_type: "application/octet-stream",
                     attachment: true,
-                    sandbox_csp: true,
                 },
                 "{other}"
             );
