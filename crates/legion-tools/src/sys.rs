@@ -1000,7 +1000,7 @@ async fn kill_targets(
                         status: TargetStatus::StillRunning,
                         code: None,
                         message: Some(
-                            "This program has no window or console to ask to close; force stop it instead."
+                            "This program has no window to ask to close; force stop it instead."
                                 .to_owned(),
                         ),
                     }));

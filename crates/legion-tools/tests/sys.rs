@@ -528,13 +528,20 @@ async fn kill_targets_reports_per_target_outcomes() {
     assert_eq!(results[0]["status"], json!("stopped"), "{res:#}");
     #[cfg(windows)]
     {
-        // Windowless helper outside its own console group cannot be asked gracefully on Windows:
-        // reports `still_running` immediately with a sentence saying it must be forced.
+        // Windowless console helper cannot be asked to close on Windows: reports `still_running`
+        // right away with a sentence saying it must be forced, and survives until `force: true`.
         assert_eq!(results[0]["status"], json!("still_running"), "{res:#}");
-        assert!(results[0]["message"].is_string(), "{res:#}");
+        assert!(
+            results[0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("force"),
+            "{res:#}"
+        );
         assert!(
             alive(normal.id()),
-            "normal child must not be terminated without force"
+            "windowless child must not be terminated without force"
         );
         let forced_normal = fixture
             .call(
@@ -551,6 +558,55 @@ async fn kill_targets_reports_per_target_outcomes() {
             json!("stopped"),
             "{forced_normal:#}"
         );
+
+        // When the runner can create a top-level Win32 window, verify `force: false` closes it
+        // cleanly via `WM_CLOSE`.
+        let ready_file = fixture.dir.path().join("wm-close-ready.txt");
+        let ps_script = concat!(
+            "Add-Type -AssemblyName System.Windows.Forms; ",
+            "$f = New-Object System.Windows.Forms.Form; ",
+            "$f.Text = 'legion-wm-close-test'; ",
+            "$t = New-Object System.Windows.Forms.Timer; ",
+            "$t.Interval = 30000; ",
+            "$t.Add_Tick({ $f.Close() }); ",
+            "$f.Add_Shown({ $t.Start(); Set-Content -Path $env:LEGION_WIN_READY -Value 'ready' }); ",
+            "[System.Windows.Forms.Application]::Run($f)"
+        );
+        if let Ok(mut win_child) = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
+            .env("LEGION_WIN_READY", &ready_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            let shown = wait_for(Duration::from_secs(15), || {
+                ready_file.exists().then_some(())
+            })
+            .await;
+            if shown.is_some() && alive(win_child.id()) {
+                let win_start = start_time_of(&fixture, win_child.id()).await;
+                let closed = fixture
+                    .call(
+                        "sys.kill",
+                        json!({
+                            "targets": [{"pid": win_child.id(), "start_time": win_start}],
+                            "force": false
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    closed["results"][0]["status"],
+                    json!("stopped"),
+                    "windowed process must close gracefully on WM_CLOSE: {closed:#}"
+                );
+                assert!(gone(win_child.id()).await);
+            } else {
+                let _ = win_child.kill();
+            }
+            let _ = win_child.wait();
+        }
     }
     assert_eq!(results[1]["status"], json!("gone"), "{res:#}");
     assert_eq!(results[2]["status"], json!("reused"), "{res:#}");

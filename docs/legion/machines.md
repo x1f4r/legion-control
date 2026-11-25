@@ -52,10 +52,9 @@ side by side, so `sys.info` stays as fast as its slowest single probe.
 - Without `force` the tool asks the processes to exit and waits up to five seconds. What is left
   is `still_running`, and the caller decides whether to call again with `force`.
   - On Linux and macOS, asking sends `SIGTERM` and `force` sends `SIGKILL`.
-  - On Windows, asking posts `WM_CLOSE` to the process's top-level windows and sends
-    `CTRL_BREAK_EVENT` where its console process group allows it; if neither applies (a
-    windowless process outside an accessible console group), it reports `still_running` right away
-    with a sentence saying it must be forced. `TerminateProcess` is used only with `force`.
+  - On Windows, asking posts `WM_CLOSE` to the process's top-level windows, nothing else; a
+    process with no windows reports `still_running` right away with a sentence saying it must be
+    forced. `TerminateProcess` is used only with `force`.
 - Refused always: process id 0 and 1, the node's own process and its ancestors, and non-leader
   thread ids on Linux. A process of another user is whatever the operating system answers,
   reported per target.

@@ -316,13 +316,13 @@ pub enum SignalOutcome {
     /// A different process now holds the PID (start time did not match); nothing was signaled.
     IdentityMismatch,
     /// No graceful stop mechanism applies to this process on this platform (for example, a
-    /// windowless process outside an accessible console group on Windows); caller should report
-    /// `still_running` immediately and require `force`.
+    /// process with no top-level windows on Windows); caller should report `still_running`
+    /// immediately and require `force`.
     CannotAskGracefully,
 }
 
-/// Deliver one stop request (`SIGTERM` when `!force`, `SIGKILL` when `force` on Unix; `WM_CLOSE` /
-/// `CTRL_BREAK_EVENT` when `!force`, `TerminateProcess` when `force` on Windows) to a single
+/// Deliver one stop request (`SIGTERM` when `!force`, `SIGKILL` when `force` on Unix; `WM_CLOSE`
+/// to top-level windows when `!force`, `TerminateProcess` when `force` on Windows) to a single
 /// verified process without waiting for it to exit or escalating.
 pub async fn signal_process(identity: &ProcessId, force: bool) -> Result<SignalOutcome> {
     if identity.pid == 0 {

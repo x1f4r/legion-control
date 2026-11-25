@@ -36,7 +36,6 @@ use windows::Win32::System::Com::{
     CoSetProxyBlanket, CoUninitialize, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
     RPC_C_IMP_LEVEL_IMPERSONATE,
 };
-use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -124,14 +123,13 @@ pub(crate) enum TerminateOutcome {
     AccessDenied,
 }
 
-/// Outcome of an atomic open-verify-graceful-stop attempt (`WM_CLOSE` / `CTRL_BREAK_EVENT`)
-/// against one [`ProcessId`].
+/// Outcome of an atomic open-verify-graceful-stop attempt (`WM_CLOSE`) against one [`ProcessId`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GracefulStopOutcome {
-    /// A close request (`WM_CLOSE`) or console break (`CTRL_BREAK_EVENT`) was delivered.
+    /// A `WM_CLOSE` request was posted to at least one top-level window owned by the target PID.
     Requested,
-    /// Neither a top-level window nor an accessible console process group applied; caller must
-    /// report `still_running` and require `force`.
+    /// The process owns no top-level windows to ask to close; caller must report `still_running`
+    /// and require `force`.
     CannotAskGracefully,
     /// The process no longer exists or has already exited.
     AlreadyGone,
@@ -2099,9 +2097,6 @@ fn snapshot_exe_name(target_pid: u32) -> Option<String> {
     None
 }
 
-/// Open `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verify its
-/// exact 100-ns `FILETIME` creation time while the held handle pins the PID against reuse, and
-/// call `TerminateProcess` through that handle.
 struct CloseWindowsCtx {
     target_pid: u32,
     posted: usize,
@@ -2117,10 +2112,10 @@ unsafe extern "system" fn enum_windows_close_proc(hwnd: HWND, lparam: LPARAM) ->
     let mut win_pid = 0u32;
     // SAFETY: `hwnd` is a top-level window handle passed by `EnumWindows`, and `win_pid` is a
     // valid stack `u32`.
-    let _ = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut win_pid)) };
-    if win_pid == ctx.target_pid {
-        // Post `WM_CLOSE` to visible or unowned top-level windows asynchronously so a hung window
-        // never blocks the caller.
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut win_pid)) };
+    if tid != 0 && win_pid != 0 && win_pid == ctx.target_pid {
+        // Post `WM_CLOSE` only to visible or unowned top-level windows owned by the exact verified
+        // target PID, asynchronously so a hung window never blocks the caller.
         // SAFETY: `hwnd` is a valid window handle from `EnumWindows`.
         let is_visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
         // SAFETY: `hwnd` is a valid window handle from `EnumWindows`.
@@ -2134,9 +2129,8 @@ unsafe extern "system" fn enum_windows_close_proc(hwnd: HWND, lparam: LPARAM) ->
     BOOL(1)
 }
 
-/// Pin `identity.pid` with an open handle, verify its exact creation time, and ask it to exit
-/// gracefully without terminating it: post `WM_CLOSE` to its top-level windows and send
-/// `CTRL_BREAK_EVENT` when its console process group allows it.
+/// Pin `identity.pid` with an open handle, verify its exact creation time on that handle, and ask
+/// it to exit gracefully by posting `WM_CLOSE` to its top-level windows (and nothing else).
 pub(crate) fn open_verify_request_close(identity: &ProcessId) -> Result<GracefulStopOutcome> {
     let desired = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
     // SAFETY: `OpenProcess` takes plain integer arguments and the returned handle is immediately
@@ -2177,16 +2171,7 @@ pub(crate) fn open_verify_request_close(identity: &ProcessId) -> Result<Graceful
         )
     };
 
-    // Never pass process group 0 (which broadcasts to every process sharing the console,
-    // including this process) or our own PID.
-    let console_sent = if identity.pid != 0 && identity.pid != std::process::id() {
-        // SAFETY: `identity.pid` is a verified live non-zero process pinned by `handle`.
-        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, identity.pid) }.is_ok()
-    } else {
-        false
-    };
-
-    if ctx.posted > 0 || console_sent {
+    if ctx.posted > 0 {
         return Ok(GracefulStopOutcome::Requested);
     }
 
@@ -2199,6 +2184,9 @@ pub(crate) fn open_verify_request_close(identity: &ProcessId) -> Result<Graceful
     }
 }
 
+/// Open `identity.pid` with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verify its
+/// exact 100-ns `FILETIME` creation time while the held handle pins the PID against reuse, and
+/// call `TerminateProcess` through that handle.
 pub(crate) fn open_verify_terminate(identity: &ProcessId) -> Result<TerminateOutcome> {
     let desired = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
     // SAFETY: `OpenProcess` takes plain integer arguments and the returned handle is immediately
