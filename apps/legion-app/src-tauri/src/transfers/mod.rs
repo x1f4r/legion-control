@@ -3598,6 +3598,7 @@ impl TransferManager {
 
         let mut retry_started: Option<Instant> = None;
         let mut attempt: u32 = 0;
+        let mut sent_any_bytes = false;
 
         loop {
             if cancel.is_cancelled() {
@@ -3605,6 +3606,27 @@ impl TransferManager {
             }
             if self.should_wifi_pause(total_size) {
                 return Err(WorkerStop::WifiOnlyPause);
+            }
+
+            if sent_any_bytes
+                && self
+                    .verify_uploaded_destination(
+                        &initial.transfer.machine,
+                        &remote_path,
+                        total_size,
+                        &local_hash,
+                        cancel,
+                    )
+                    .await?
+            {
+                self.update_progress(id, total_size, total_size, None);
+                self.maybe_broadcast_progress();
+                return Ok(WorkerOutcome {
+                    bytes_total: total_size,
+                    hash: local_hash,
+                    local_path: None,
+                    finalized_in_cache: false,
+                });
             }
 
             let target: ContentTarget = self
@@ -3644,6 +3666,7 @@ impl TransferManager {
                         )
                     {
                         remote_path = next_path;
+                        sent_any_bytes = false;
                         self.lock_resolved_upload_path(id, &remote_path, &next_name);
                         self.update_progress(id, 0, total_size, None);
                         retry_started = None;
@@ -3662,6 +3685,9 @@ impl TransferManager {
             };
 
             let resume_offset = put.offset();
+            if resume_offset > 0 || total_size == 0 {
+                sent_any_bytes = true;
+            }
             self.update_progress(id, resume_offset, total_size, None);
             self.maybe_broadcast_progress();
 
@@ -3759,6 +3785,7 @@ impl TransferManager {
                         }
                     }
                 };
+                sent_any_bytes = true;
                 if let Err(err) = write_res {
                     if cancel.is_cancelled() {
                         return Err(WorkerStop::Interrupted);
@@ -3787,6 +3814,25 @@ impl TransferManager {
             if let Some(err) = write_err {
                 put.cancel();
                 if self
+                    .verify_uploaded_destination(
+                        &initial.transfer.machine,
+                        &remote_path,
+                        total_size,
+                        &local_hash,
+                        cancel,
+                    )
+                    .await?
+                {
+                    self.update_progress(id, total_size, total_size, None);
+                    self.maybe_broadcast_progress();
+                    return Ok(WorkerOutcome {
+                        bytes_total: total_size,
+                        hash: local_hash,
+                        local_path: None,
+                        finalized_in_cache: false,
+                    });
+                }
+                if self
                     .should_retry(&err, &mut retry_started, &mut attempt, cancel)
                     .await?
                 {
@@ -3805,6 +3851,9 @@ impl TransferManager {
                     });
                 }
                 Err(err) => {
+                    if cancel.is_cancelled() {
+                        return Err(WorkerStop::Interrupted);
+                    }
                     if use_no_replace
                         && err.code == legion_link::proto::ErrorCode::Exists
                         && let Some((next_path, next_name)) = advance_upload_candidate(
@@ -3816,11 +3865,31 @@ impl TransferManager {
                         )
                     {
                         remote_path = next_path;
+                        sent_any_bytes = false;
                         self.lock_resolved_upload_path(id, &remote_path, &next_name);
                         self.update_progress(id, 0, total_size, None);
                         retry_started = None;
                         attempt = 0;
                         continue;
+                    }
+                    if self
+                        .verify_uploaded_destination(
+                            &initial.transfer.machine,
+                            &remote_path,
+                            total_size,
+                            &local_hash,
+                            cancel,
+                        )
+                        .await?
+                    {
+                        self.update_progress(id, total_size, total_size, None);
+                        self.maybe_broadcast_progress();
+                        return Ok(WorkerOutcome {
+                            bytes_total: total_size,
+                            hash: local_hash,
+                            local_path: None,
+                            finalized_in_cache: false,
+                        });
                     }
                     let app_err = AppError::from(err);
                     if self
@@ -3833,6 +3902,55 @@ impl TransferManager {
                 }
             }
         }
+    }
+
+    /// Checks whether `remote_path` already exists on `machine` with the exact `expected_size`
+    /// and BLAKE3 `expected_hash` that were uploaded.
+    ///
+    /// Called whenever an upload ends without its final `ok` reply (on any route, direct or
+    /// relayed) so a transfer whose bytes were already verified and renamed on the target is
+    /// reported `Done` instead of `Failed` or duplicated.
+    async fn verify_uploaded_destination(
+        &self,
+        machine: &str,
+        remote_path: &str,
+        expected_size: u64,
+        expected_hash: &str,
+        cancel: &CancellationToken,
+    ) -> Result<bool, WorkerStop> {
+        if cancel.is_cancelled() {
+            return Err(WorkerStop::Interrupted);
+        }
+        let Ok(target) = self.backend.content_target(machine) else {
+            return Ok(false);
+        };
+        let call_fut = target.link.call_machine(
+            &target.link_node,
+            "fs.hash",
+            json!({ "path": remote_path }),
+            |_| {},
+        );
+        let res = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(WorkerStop::Interrupted),
+            timed = tokio::time::timeout(self.stall_timeout, call_fut) => {
+                match timed {
+                    Ok(res) => res,
+                    Err(_) => return Ok(false),
+                }
+            }
+        };
+        let Ok(routed) = res else {
+            return Ok(false);
+        };
+        let size_matches = routed.value.get("size").and_then(Value::as_u64) == Some(expected_size);
+        let hash_matches = routed
+            .value
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            == Some(expected_hash);
+        Ok(size_matches && hash_matches)
     }
 
     async fn hash_upload_source(
@@ -4057,7 +4175,7 @@ enum WorkerStop {
 fn is_transient_error(err: &AppError) -> bool {
     matches!(
         err.code,
-        ErrorCode::Unreachable | ErrorCode::Timeout | ErrorCode::Busy
+        ErrorCode::Unreachable | ErrorCode::Timeout | ErrorCode::Busy | ErrorCode::Cancelled
     )
 }
 
@@ -4533,6 +4651,8 @@ mod tests {
         advertise_cap_no_replace: bool,
         reply_no_replace: bool,
         race_create_on_put_finish: std::collections::HashSet<String>,
+        cancel_after_put_commit: bool,
+        cancel_mid_put_once: bool,
         stat_calls: AtomicUsize,
         put_requests: Mutex<Vec<Value>>,
         active_streams: AtomicUsize,
@@ -4778,6 +4898,10 @@ mod tests {
                         }
                         let mut buf = vec![0u8; 16 * 1024];
                         let mut got = existing;
+                        let cancel_mid_once = {
+                            let mut st = remote.lock().unwrap();
+                            std::mem::take(&mut st.cancel_mid_put_once)
+                        };
                         while got.len() < size {
                             tokio::select! {
                                 biased;
@@ -4787,7 +4911,24 @@ mod tests {
                                 }
                                 res = reader.read(&mut buf) => match res {
                                     Ok(0) => break,
-                                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                                    Ok(n) => {
+                                        got.extend_from_slice(&buf[..n]);
+                                        if cancel_mid_once && got.len() < size {
+                                            remote.lock().unwrap().partial_uploads.insert(path, got);
+                                            let err = json!({
+                                                "error": ErrorBody::new(
+                                                    ProtoCode::Cancelled,
+                                                    "The stream stopped because the node is shutting down.",
+                                                )
+                                                .with_machine("tower")
+                                            });
+                                            let _ = server_out
+                                                .write_all(format!("{err}\n").as_bytes())
+                                                .await;
+                                            let _ = server_out.shutdown().await;
+                                            return;
+                                        }
+                                    }
                                     Err(_) => return,
                                 }
                             }
@@ -4831,6 +4972,19 @@ mod tests {
                         if raced_exists {
                             let err = json!({
                                 "error": ErrorBody::new(ProtoCode::Exists, "destination created concurrently")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            let _ = server_out.shutdown().await;
+                            return;
+                        }
+                        let cancel_after_commit = remote.lock().unwrap().cancel_after_put_commit;
+                        if cancel_after_commit {
+                            let err = json!({
+                                "error": ErrorBody::new(
+                                    ProtoCode::Cancelled,
+                                    "The stream stopped because the node is shutting down.",
+                                )
+                                .with_machine("tower")
                             });
                             let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
                             let _ = server_out.shutdown().await;
@@ -4932,7 +5086,9 @@ mod tests {
                                         req.id,
                                         json!({ "path": path, "size": 0, "hash": forced }),
                                     )
-                                } else if let Some(data) = st.files.get(path) {
+                                } else if let Some(data) =
+                                    st.files.get(path).or_else(|| st.uploaded.get(path))
+                                {
                                     let h = format!("blake3:{}", blake3::hash(data).to_hex());
                                     ProtoResp::ok(
                                         req.id,
@@ -8358,6 +8514,556 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.code, ErrorCode::Denied, "expected Denied for {refused}");
         }
+
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn direct_upload_checks_destination_when_final_ok_lost_and_retries_unsolicited_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Arc::new(Mutex::new(MockRemoteState {
+            advertise_cap_no_replace: true,
+            reply_no_replace: true,
+            cancel_after_put_commit: true,
+            ..MockRemoteState::default()
+        }));
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(4),
+        );
+
+        // Case A: All bytes are committed and renamed on `tower`, then the stream ends with
+        // `cancelled` before the final `ok` reply. Destination verification (`fs.hash` size +
+        // hash match) marks the upload `Done`, never `Failed` or duplicated.
+        let payload_a: Vec<u8> = (0..180_000).map(|i| (i % 251) as u8).collect();
+        let src_a = dir.path().join("committed.bin");
+        fs::write(&src_a, &payload_a).unwrap();
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: src_a.to_string_lossy().into_owned(),
+                name: "committed.bin".into(),
+                size: payload_a.len() as u64,
+                mime: None,
+            });
+        let id_a = mgr
+            .enqueue_upload("tower".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let done_a = wait_for_state(&mgr, &id_a, |s| s.is_terminal()).await;
+        assert_eq!(
+            done_a.state,
+            TransferState::Done,
+            "committed upload without final ok must verify and finish Done, got: {:?}",
+            done_a.error
+        );
+        assert_eq!(done_a.bytes_done, payload_a.len() as u64);
+        assert_eq!(
+            remote
+                .lock()
+                .unwrap()
+                .uploaded
+                .get("/home/me/Uploads/committed.bin")
+                .map(Vec::as_slice),
+            Some(payload_a.as_slice())
+        );
+        assert_eq!(
+            remote.lock().unwrap().put_requests.lock().unwrap().len(),
+            1,
+            "must not re-upload after destination hash matched"
+        );
+
+        // Case B: Stream returns an unsolicited `cancelled` mid-upload before commit ->
+        // destination check sees missing file, treats unsolicited `cancelled` as retryable,
+        // resumes from partial bytes, and finishes `Done`.
+        {
+            let mut st = remote.lock().unwrap();
+            st.cancel_after_put_commit = false;
+            st.cancel_mid_put_once = true;
+        }
+        let payload_b: Vec<u8> = (0..220_000).map(|i| ((i * 7) % 251) as u8).collect();
+        let src_b = dir.path().join("resumed.bin");
+        fs::write(&src_b, &payload_b).unwrap();
+        {
+            let mut picked = platform.picked_files.lock().unwrap();
+            picked.clear();
+            picked.push(PickedUploadFile {
+                local_path: src_b.to_string_lossy().into_owned(),
+                name: "resumed.bin".into(),
+                size: payload_b.len() as u64,
+                mime: None,
+            });
+        }
+        let id_b = mgr
+            .enqueue_upload("tower".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let done_b = wait_for_state(&mgr, &id_b, |s| s.is_terminal()).await;
+        assert_eq!(
+            done_b.state,
+            TransferState::Done,
+            "unsolicited cancelled mid-upload must retry/resume and finish Done, got: {:?}",
+            done_b.error
+        );
+        assert_eq!(
+            remote
+                .lock()
+                .unwrap()
+                .uploaded
+                .get("/home/me/Uploads/resumed.bin")
+                .map(Vec::as_slice),
+            Some(payload_b.as_slice())
+        );
+
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relayed_upload_checks_destination_when_relay_dies_before_final_ok_and_retries_unsolicited_cancel()
+     {
+        use legion_link::proto::{
+            ErrorBody, ErrorCode as ProtoCode, HelloResult, PROTOCOL, Response as ProtoResp,
+            VERSION,
+        };
+        use legion_link::{
+            CAP_STREAM_RELAY, Link, LinkConfig, LinkOptions, NodeLink, Session, SessionOpener,
+            SshTarget,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tower_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITowerKeyUploadCheck000000000000000000000000";
+        let studio_uploaded: Arc<Mutex<HashMap<String, Vec<u8>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let studio_partials: Arc<Mutex<HashMap<String, Vec<u8>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let cancel_after_commit = Arc::new(AtomicBool::new(true));
+        let cancel_mid_once = Arc::new(AtomicBool::new(false));
+        let relay_puts = Arc::new(AtomicUsize::new(0));
+
+        struct RelayUploadFaultOpener {
+            uploaded: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            partials: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            cancel_after_commit: Arc<AtomicBool>,
+            cancel_mid_once: Arc<AtomicBool>,
+            relay_puts: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for RelayUploadFaultOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send>>
+            {
+                let uploaded = Arc::clone(&self.uploaded);
+                let partials = Arc::clone(&self.partials);
+                let cancel_after_commit = Arc::clone(&self.cancel_after_commit);
+                let cancel_mid_once = Arc::clone(&self.cancel_mid_once);
+                let relay_puts = Arc::clone(&self.relay_puts);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let stream_cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let greeting = json!({
+                            "protocol": 1,
+                            "capabilities": [CAP_STREAM_RELAY, CAP_PUT_NO_REPLACE],
+                        });
+                        let _ = server_out
+                            .write_all(format!("{greeting}\n").as_bytes())
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let outer: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(outer["op"], json!("relay"));
+                        assert_eq!(outer["on"], json!("studio"));
+                        let req = outer["request"].clone();
+                        assert_eq!(req["op"], json!("put"));
+                        relay_puts.fetch_add(1, Ordering::SeqCst);
+
+                        let path = req["path"].as_str().unwrap().to_owned();
+                        let size = req["size"].as_u64().unwrap() as usize;
+                        let mut got = partials
+                            .lock()
+                            .unwrap()
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or_default();
+                        let offset = got.len();
+                        let ready = json!({ "offset": offset, "no_replace": true });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+
+                        let abort_mid = cancel_mid_once.swap(false, Ordering::SeqCst);
+                        let mut buf = vec![0u8; 16 * 1024];
+                        while got.len() < size {
+                            match reader.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    got.extend_from_slice(&buf[..n]);
+                                    if abort_mid && got.len() < size {
+                                        partials.lock().unwrap().insert(path, got);
+                                        let err = json!({
+                                            "error": ErrorBody::new(
+                                                ProtoCode::Cancelled,
+                                                "The stream stopped because the node is shutting down.",
+                                            )
+                                            .with_machine("tower")
+                                        });
+                                        let _ = server_out
+                                            .write_all(format!("{err}\n").as_bytes())
+                                            .await;
+                                        let _ = server_out.shutdown().await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        if got.len() != size {
+                            partials.lock().unwrap().insert(path, got);
+                            let _ = server_out.shutdown().await;
+                            return;
+                        }
+                        partials.lock().unwrap().remove(&path);
+                        let hash = format!("blake3:{}", blake3::hash(&got).to_hex());
+                        uploaded.lock().unwrap().insert(path, got);
+
+                        if cancel_after_commit.load(Ordering::SeqCst) {
+                            // Exact reviewer reproduction: all bytes committed and renamed on
+                            // `studio`, then relay `tower` terminated before the final `ok`.
+                            let err = json!({
+                                "error": ErrorBody::new(
+                                    ProtoCode::Cancelled,
+                                    "The stream stopped because the node is shutting down.",
+                                )
+                                .with_machine("tower")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                        } else {
+                            let done = json!({ "ok": true, "size": size, "hash": hash });
+                            let _ = server_out.write_all(format!("{done}\n").as_bytes()).await;
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: stream_cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct RelayedOnlyBackend {
+            link: Link,
+        }
+
+        impl Backend for RelayedOnlyBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                })
+            }
+            fn is_pairing_holder_live(&self, _: &str) -> bool {
+                true
+            }
+        }
+
+        let opener: SessionOpener = {
+            let uploaded = Arc::clone(&studio_uploaded);
+            let partials = Arc::clone(&studio_partials);
+            let cancel_after_commit = Arc::clone(&cancel_after_commit);
+            let cancel_mid_once = Arc::clone(&cancel_mid_once);
+            let relay_puts = Arc::clone(&relay_puts);
+            Arc::new(move |entry, _, cancel| {
+                let uploaded = Arc::clone(&uploaded);
+                let partials = Arc::clone(&partials);
+                let cancel_after_commit = Arc::clone(&cancel_after_commit);
+                let cancel_mid_once = Arc::clone(&cancel_mid_once);
+                let relay_puts = Arc::clone(&relay_puts);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let uploaded_rpc = Arc::clone(&uploaded);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = if req.method == "hello" {
+                                ProtoResp::ok(
+                                    req.id,
+                                    serde_json::to_value(HelloResult {
+                                        node: "tower".to_owned(),
+                                        version: VERSION.to_owned(),
+                                        build: None,
+                                        protocol: PROTOCOL,
+                                        os: "linux".to_owned(),
+                                        arch: "x86_64".to_owned(),
+                                        systems: vec![],
+                                        system: None,
+                                        boot_id: None,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else if req.method == "call" {
+                                let tool =
+                                    req.params.get("tool").and_then(Value::as_str).unwrap_or("");
+                                let path = req
+                                    .params
+                                    .pointer("/args/path")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let data = uploaded_rpc.lock().unwrap().get(path).cloned();
+                                if tool == "fs.stat" {
+                                    if let Some(d) = data {
+                                        ProtoResp::ok(
+                                            req.id,
+                                            json!({ "kind": "file", "size": d.len() }),
+                                        )
+                                    } else {
+                                        ProtoResp::error(
+                                            req.id,
+                                            legion_link::proto::RpcError::new(
+                                                -32000,
+                                                ErrorBody::new(ProtoCode::NotFound, "not found")
+                                                    .with_machine("studio"),
+                                            ),
+                                        )
+                                    }
+                                } else if tool == "fs.hash" {
+                                    if let Some(d) = data {
+                                        let h = format!("blake3:{}", blake3::hash(&d).to_hex());
+                                        ProtoResp::ok(
+                                            req.id,
+                                            json!({ "path": path, "size": d.len(), "hash": h }),
+                                        )
+                                    } else {
+                                        ProtoResp::error(
+                                            req.id,
+                                            legion_link::proto::RpcError::new(
+                                                -32000,
+                                                ErrorBody::new(ProtoCode::NotFound, "not found")
+                                                    .with_machine("studio"),
+                                            ),
+                                        )
+                                    }
+                                } else {
+                                    ProtoResp::ok(req.id, json!({}))
+                                }
+                            } else {
+                                ProtoResp::ok(req.id, json!({}))
+                            };
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let stream_opener = Arc::new(RelayUploadFaultOpener {
+                        uploaded,
+                        partials,
+                        cancel_after_commit,
+                        cancel_mid_once,
+                        relay_puts,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![tower_key.to_owned()],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            opener,
+        );
+        let backend: Arc<dyn Backend> = Arc::new(RelayedOnlyBackend { link });
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(4),
+        );
+
+        // Case A: Relayed put commits & renames on `studio`, then relay `tower` terminates with
+        // `cancelled` before final `ok` -> transfer checks destination on `studio` and reports Done.
+        let payload_a: Vec<u8> = (0..180_000).map(|i| ((i * 3) % 251) as u8).collect();
+        let src_a = dir.path().join("relayed-committed.bin");
+        fs::write(&src_a, &payload_a).unwrap();
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: src_a.to_string_lossy().into_owned(),
+                name: "relayed-committed.bin".into(),
+                size: payload_a.len() as u64,
+                mime: None,
+            });
+        let id_a = mgr
+            .enqueue_upload("studio".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let done_a = wait_for_state(&mgr, &id_a, |s| s.is_terminal()).await;
+        assert_eq!(
+            done_a.state,
+            TransferState::Done,
+            "committed relayed upload without final ok must verify and finish Done, got: {:?}",
+            done_a.error
+        );
+        assert_eq!(relay_puts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            studio_uploaded
+                .lock()
+                .unwrap()
+                .get("/home/me/Uploads/relayed-committed.bin")
+                .map(Vec::as_slice),
+            Some(payload_a.as_slice())
+        );
+
+        // Case B: Relay shuts down mid-upload before commit (unsolicited `cancelled`) ->
+        // destination check sees missing file, worker retries, resumes over relay, and finishes Done.
+        cancel_after_commit.store(false, Ordering::SeqCst);
+        cancel_mid_once.store(true, Ordering::SeqCst);
+        let payload_b: Vec<u8> = (0..220_000).map(|i| ((i * 11) % 251) as u8).collect();
+        let src_b = dir.path().join("relayed-resumed.bin");
+        fs::write(&src_b, &payload_b).unwrap();
+        {
+            let mut picked = platform.picked_files.lock().unwrap();
+            picked.clear();
+            picked.push(PickedUploadFile {
+                local_path: src_b.to_string_lossy().into_owned(),
+                name: "relayed-resumed.bin".into(),
+                size: payload_b.len() as u64,
+                mime: None,
+            });
+        }
+        let id_b = mgr
+            .enqueue_upload("studio".into(), "/home/me/Uploads".into(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let done_b = wait_for_state(&mgr, &id_b, |s| s.is_terminal()).await;
+        assert_eq!(
+            done_b.state,
+            TransferState::Done,
+            "relayed upload interrupted by unsolicited relay cancel must resume and finish Done, got: {:?}",
+            done_b.error
+        );
+        assert_eq!(relay_puts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            studio_uploaded
+                .lock()
+                .unwrap()
+                .get("/home/me/Uploads/relayed-resumed.bin")
+                .map(Vec::as_slice),
+            Some(payload_b.as_slice())
+        );
 
         mgr.shutdown();
     }

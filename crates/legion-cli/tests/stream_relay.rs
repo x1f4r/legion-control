@@ -67,6 +67,10 @@ fn main() -> ExitCode {
             "stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets",
             stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets,
         ),
+        (
+            "relay_shutdown_is_labelled_with_relay_machine",
+            relay_shutdown_is_labelled_with_relay_machine,
+        ),
     ];
 
     let mut passed = 0usize;
@@ -1115,6 +1119,11 @@ fn hops_limit_chained_via_and_old_relay_refusal() {
         drop(stdin);
         let reply = read_json_line(&mut stdout);
         assert_eq!(reply["error"]["code"], json!("failed"));
+        assert_eq!(
+            reply["error"]["machine"],
+            json!("tower"),
+            "hop-cap error must name relay: {reply}"
+        );
         assert!(
             reply["error"]["message"]
                 .as_str()
@@ -1765,5 +1774,74 @@ fn stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets() 
         stdout.read_exact(&mut got).unwrap();
         assert!(got.iter().all(|&b| b == 0x42));
         assert!(child.wait().unwrap().success());
+    }
+}
+
+fn relay_shutdown_is_labelled_with_relay_machine() {
+    #[cfg(not(unix))]
+    {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let tower = node("tower");
+        let pid_file = tower.home().join("shutdown-target.pid");
+        let seen_file = tower.home().join("shutdown-seen.txt");
+        tower.write_config(
+            "fleet.toml",
+            &fleet_entry_for_helper(
+                "studio",
+                "stalling-stat",
+                &[&pid_file.to_string_lossy(), &seen_file.to_string_lossy()],
+            ),
+        );
+        write_device_policy(&tower, "allow = [\"fs.read\"]\n");
+
+        let mut child = spawn_stream_with_timeout(&tower, Some("device"), Some(60_000));
+        let relay_pid = child.id();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": { "protocol": 1, "op": "stat", "path": "~/big.iso", "checksum": true }
+            }),
+        );
+        drop(stdin);
+
+        let _ = wait_for_file(&seen_file, Duration::from_secs(3));
+        let target_pid: u32 = wait_for_file(&pid_file, Duration::from_secs(3))
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Terminate the relay (`tower`) while waiting on `studio`.
+        send_signal(relay_pid, "-TERM");
+
+        let reply = read_json_line(&mut stdout);
+        assert_eq!(reply["error"]["code"], json!("cancelled"), "reply={reply}");
+        assert_eq!(
+            reply["error"]["machine"],
+            json!("tower"),
+            "relay shutdown must be labelled with relay's name, not target's: {reply}"
+        );
+        let status = wait_child_exit(&mut child, Duration::from_secs(3)).expect("relay exit");
+        assert!(!status.success());
+
+        let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+        if remaining_target > 0 {
+            let _ = Command::new("kill")
+                .args(["-KILL", &target_pid.to_string()])
+                .status();
+        }
+        assert_eq!(
+            remaining_target, 0,
+            "target process lingered after relay shutdown"
+        );
     }
 }

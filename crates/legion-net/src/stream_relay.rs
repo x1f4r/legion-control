@@ -82,6 +82,14 @@ fn client_gone_error(relay: &str) -> ErrorBody {
     .with_machine(relay)
 }
 
+fn relay_shutdown_error(relay: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Cancelled,
+        "The stream stopped because the node is shutting down.",
+    )
+    .with_machine(relay)
+}
+
 async fn wait_downstream<F, T>(
     fut: F,
     timeout: Duration,
@@ -390,7 +398,7 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
         .with_hint(
             "Check fleet.toml and node.toml on the machines along the path so they do not forward to each other in a cycle.",
         )
-        .with_machine(&on);
+        .with_machine(host.name());
         let _ = reply_error(&mut output, &error);
         record_for_target(
             host,
@@ -659,7 +667,7 @@ pub(crate) fn serve_relay_remote_scoped<R: BufRead, W: Write>(
         .with_hint(
             "Check fleet.toml and node.toml on the machines along the path so they do not forward to each other in a cycle.",
         )
-        .with_machine(&on);
+        .with_machine(host.name());
         let _ = reply_error(&mut output, &error);
         record_for_target(
             host,
@@ -851,11 +859,7 @@ async fn open_and_greet_downstream(
             }
         } => {
             pipe_cancel.cancel();
-            return Err(ErrorBody::new(
-                ErrorCode::Cancelled,
-                format!("Relaying stream to {target} was cancelled."),
-            )
-            .with_machine(target));
+            return Err(relay_shutdown_error(host.name()));
         }
         () = async {
             match options.client_gone.as_ref() {
@@ -889,11 +893,7 @@ async fn open_and_greet_downstream(
     .await
     {
         DownstreamWait::Ready(inner) => inner,
-        DownstreamWait::Shutdown => Err(ErrorBody::new(
-            ErrorCode::Cancelled,
-            format!("Relaying stream to {target} was cancelled."),
-        )
-        .with_machine(target)),
+        DownstreamWait::Shutdown => Err(relay_shutdown_error(host.name())),
         DownstreamWait::ClientGone => Err(client_gone_error(host.name())),
         DownstreamWait::TimedOut => {
             let mut err = ErrorBody::new(
@@ -1054,11 +1054,7 @@ async fn read_downstream_reply_forwarding_busy<W: Write>(
         {
             DownstreamWait::Ready(res) => res,
             DownstreamWait::Shutdown => {
-                return Err(ErrorBody::new(
-                    ErrorCode::Cancelled,
-                    "The stream stopped because the node is shutting down.",
-                )
-                .with_machine(target));
+                return Err(relay_shutdown_error(host.name()));
             }
             DownstreamWait::ClientGone => {
                 return Err(client_gone_error(host.name()));
@@ -1098,7 +1094,7 @@ async fn read_downstream_reply_forwarding_busy<W: Write>(
             output
                 .write_all(&buf)
                 .and_then(|()| output.flush())
-                .map_err(|err| gone(&err))?;
+                .map_err(|err| machine_or(gone(&err), host.name()))?;
             continue;
         }
         if let Some(err_val) = fields.get("error") {
@@ -1216,13 +1212,7 @@ async fn relay_read_or_control<W: Write>(
             )
             .with_machine(&next_hop),
         ),
-        DownstreamWait::Shutdown => Some(
-            ErrorBody::new(
-                ErrorCode::Cancelled,
-                "The stream stopped because the node is shutting down.",
-            )
-            .with_machine(target),
-        ),
+        DownstreamWait::Shutdown => Some(relay_shutdown_error(host.name())),
         DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
         DownstreamWait::TimedOut => Some(downstream_timeout_error(
             target,
@@ -1428,11 +1418,7 @@ async fn pump_manifest_lines<W: Write>(
         {
             DownstreamWait::Ready(res) => res,
             DownstreamWait::Shutdown => {
-                let err = ErrorBody::new(
-                    ErrorCode::Cancelled,
-                    "The stream stopped because the node is shutting down.",
-                )
-                .with_machine(target);
+                let err = relay_shutdown_error(host.name());
                 let _ = reply_error(output, &err);
                 return Err(err);
             }
@@ -1469,7 +1455,7 @@ async fn pump_manifest_lines<W: Write>(
         output
             .write_all(&buf)
             .and_then(|()| output.flush())
-            .map_err(|err| gone(&err))?;
+            .map_err(|err| machine_or(gone(&err), host.name()))?;
         if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&buf) {
             if fields.get("done") == Some(&Value::Bool(true)) {
                 return Ok(());
@@ -1610,11 +1596,7 @@ async fn pump_bytes_to_eof<W: Write>(
         {
             DownstreamWait::Ready(res) => res,
             DownstreamWait::Shutdown => {
-                return Err(ErrorBody::new(
-                    ErrorCode::Cancelled,
-                    "The stream stopped because the node is shutting down.",
-                )
-                .with_machine(target));
+                return Err(relay_shutdown_error(host.name()));
             }
             DownstreamWait::ClientGone => {
                 return Err(client_gone_error(host.name()));
@@ -1639,7 +1621,7 @@ async fn pump_bytes_to_eof<W: Write>(
         output
             .write_all(&buf[..n])
             .and_then(|()| output.flush())
-            .map_err(|err| gone(&err))?;
+            .map_err(|err| machine_or(gone(&err), host.name()))?;
     }
 }
 
@@ -1825,7 +1807,7 @@ async fn relay_keep_open_gets<W: Write>(
                                 "Relaying stream.get to {target} exceeded the maximum of {MAX_HOPS} hops (possible routing loop)."
                             ),
                         )
-                        .with_machine(target);
+                        .with_machine(host.name());
                         if reply_error(output, &err).is_err() {
                             break Err(err);
                         }
@@ -2289,13 +2271,7 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
             )
             .with_machine(&next_hop),
         ),
-        DownstreamWait::Shutdown => Some(
-            ErrorBody::new(
-                ErrorCode::Cancelled,
-                "The stream stopped because the node is shutting down.",
-            )
-            .with_machine(target),
-        ),
+        DownstreamWait::Shutdown => Some(relay_shutdown_error(host.name())),
         DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
         DownstreamWait::TimedOut => Some(downstream_timeout_error(
             target,
@@ -2674,13 +2650,7 @@ async fn relay_write_scoped<R: BufRead, W: Write>(
             )
             .with_machine(&next_hop),
         ),
-        DownstreamWait::Shutdown => Some(
-            ErrorBody::new(
-                ErrorCode::Cancelled,
-                "The stream stopped because the node is shutting down.",
-            )
-            .with_machine(target),
-        ),
+        DownstreamWait::Shutdown => Some(relay_shutdown_error(host.name())),
         DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
         DownstreamWait::TimedOut => Some(downstream_timeout_error(
             target,
@@ -2855,13 +2825,7 @@ async fn relay_write_scoped<R: BufRead, W: Write>(
                     }
                     DownstreamWait::Ready(Err(_)) => break,
                     DownstreamWait::Shutdown => {
-                        body_abort = Some(
-                            ErrorBody::new(
-                                ErrorCode::Cancelled,
-                                "The stream stopped because the node is shutting down.",
-                            )
-                            .with_machine(target),
-                        );
+                        body_abort = Some(relay_shutdown_error(host.name()));
                         break;
                     }
                     DownstreamWait::ClientGone => {
