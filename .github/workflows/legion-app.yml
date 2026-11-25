@@ -323,12 +323,16 @@ jobs:
 
           PID1=""
           PID2=""
+          XVFB_PID=""
+          DBUS_SESSION_BUS_PID=""
           dump_diag() {
             local rc=$?
             set +e
             [ -n "$PID1" ] && kill "$PID1" 2>/dev/null || true
             [ -n "$PID2" ] && kill "$PID2" 2>/dev/null || true
             pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
+            [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
+            [ -n "$DBUS_SESSION_BUS_PID" ] && kill "$DBUS_SESSION_BUS_PID" 2>/dev/null || true
             {
               echo "=== Linux self-update diagnostics (exit=$rc) ==="
               echo "--- ps aux ---"
@@ -411,14 +415,20 @@ jobs:
           LEGION_HOME="$WORK/node" "$WORK/bin/legion" update.publish "from=$WORK/set-2" --json
           LEGION_HOME="$WORK/node" "$WORK/bin/legion" update.list --json > "$DIAG/node-update-list.json"
 
-          # Launch 1: start seq1 under Xvfb and wait for verified download of seq2.
+          # Keep Xvfb and D-Bus alive across seq1 exit and seq2 relaunch by the swap supervisor.
+          Xvfb :99 -screen 0 1280x800x24 >"$DIAG/xvfb.log" 2>&1 &
+          XVFB_PID=$!
+          export DISPLAY=":99"
+          eval "$(dbus-launch --sh-syntax)"
+          sleep 1
+
+          # Launch 1: start seq1 under persistent Xvfb and wait for verified download of seq2.
           PATH="$WORK/bin:$PATH" \
           LEGION_HOME="$WORK/node" \
           APPIMAGE_EXTRACT_AND_RUN=1 \
           WEBKIT_DISABLE_DMABUF_RENDERER=1 \
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" \
-              "$WORK/run/Legion.AppImage" >"$DIAG/run1.log" 2>&1 &
+            "$WORK/run/Legion.AppImage" >"$DIAG/run1.log" 2>&1 &
           PID1=$!
 
           DL_FILE="$APP_DATA/downloads/preview-$SEQ2/Legion-linux-x86_64.AppImage"
@@ -441,6 +451,7 @@ jobs:
           kill "$PID1" 2>/dev/null || true
           wait "$PID1" 2>/dev/null || true
           PID1=""
+          sleep 1
           [ "$DOWNLOADED" -eq 1 ]
 
           # Launch 2: next-start auto-install replaces Legion.AppImage atomically and relaunches seq2.
@@ -449,8 +460,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN=1 \
           WEBKIT_DISABLE_DMABUF_RENDERER=1 \
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-            dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" \
-              "$WORK/run/Legion.AppImage" >"$DIAG/run2.log" 2>&1 &
+            "$WORK/run/Legion.AppImage" >"$DIAG/run2.log" 2>&1 &
           PID2=$!
 
           UPDATED=0

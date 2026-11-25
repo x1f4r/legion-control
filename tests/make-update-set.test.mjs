@@ -172,10 +172,18 @@ function buildDeb(members) {
   return Buffer.concat(parts);
 }
 
-/** Build a tiny valid SquashFS 4.0 image (gzip) with a root `.desktop` file behind an ELF prefix. */
-function buildMiniAppImage(desktopText) {
-  const elfStub = Buffer.alloc(128, 0);
+/** Build a tiny valid SquashFS 4.0 image (gzip) with a root `.desktop` file behind an ELF64 prefix. */
+function buildMiniAppImage(desktopText, elfSize = 128) {
+  const elfStub = Buffer.alloc(Math.max(128, elfSize), 0);
   Buffer.from('\x7fELF', 'ascii').copy(elfStub, 0);
+  elfStub[4] = 2; // ELF64
+  elfStub[5] = 1; // little-endian
+  const shentsize = 64;
+  const shnum = 1;
+  const shoff = elfStub.length - shentsize * shnum;
+  elfStub.writeBigUInt64LE(BigInt(shoff), 40);
+  elfStub.writeUInt16LE(shentsize, 58);
+  elfStub.writeUInt16LE(shnum, 60);
 
   const fileBytes = Buffer.from(desktopText, 'utf8');
   const compFileBlock = zlib.deflateSync(fileBytes);
@@ -349,9 +357,12 @@ test('verifyArtifactSequence inspects every artifact format without executing it
     verifyArtifactSequence(nsis, { name: path.basename(nsis), kind: 'nsis' }, seq);
     assert.throws(() => verifyArtifactSequence(nsis, { name: path.basename(nsis), kind: 'nsis' }, wrongSeq), /does not match sequence/);
 
-    // 6. Linux AppImage (SquashFS 4.0 containing .desktop with X-AppImage-Version)
+    // 6. Linux AppImage (SquashFS 4.0 containing .desktop with X-AppImage-Version behind a >900 KiB ELF64 runtime)
     const appImage = path.join(tmp, 'Legion-0.2.0-x86_64.AppImage');
-    fs.writeFileSync(appImage, buildMiniAppImage(`[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`));
+    fs.writeFileSync(
+      appImage,
+      buildMiniAppImage(`[Desktop Entry]\nName=Legion\nX-AppImage-Version=0.2.0+${seq}\n`, 1024 * 1024),
+    );
     verifyArtifactSequence(appImage, { name: path.basename(appImage), kind: 'appimage' }, seq);
     assert.throws(() => verifyArtifactSequence(appImage, { name: path.basename(appImage), kind: 'appimage' }, wrongSeq), /does not match sequence/);
   } finally {

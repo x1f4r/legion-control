@@ -741,26 +741,69 @@ function inspectAppImageSquashfs(filePath, expectedSeqStr) {
     return out.subarray(0, n);
   };
   try {
-    // Locate SquashFS 4.0 superblock magic `hsqs` (0x73717368) at ELF end or scanning chunks.
+    // Locate SquashFS 4.0 superblock magic `hsqs` (0x73717368): check the exact ELF section-table
+    // end first (the AppImage Type 2 spec offset; modern static runtimes exceed 900 KiB), then
+    // fall back to scanning up to 4 MiB from the start of the file.
+    const isValidSqAt = (offset) => {
+      if (offset < 0 || offset + 96 > fileSize) return false;
+      const cand = readAt(offset, 96);
+      if (cand.length < 96) return false;
+      if (cand.subarray(0, 4).toString('ascii') !== 'hsqs') return false;
+      const major = cand.readUInt16LE(28);
+      const minor = cand.readUInt16LE(30);
+      const bSize = cand.readUInt32LE(12);
+      const cId = cand.readUInt16LE(20);
+      return major === 4 && minor === 0 && bSize >= 4096 && bSize <= 1048576 && cId >= 1 && cId <= 6;
+    };
+
     let sqOff = -1;
-    const probeSize = Math.min(fileSize, 512 * 1024);
-    const head = readAt(0, probeSize);
-    const magic = Buffer.from('hsqs', 'ascii');
-    let searchFrom = 0;
-    while (true) {
-      const idx = head.indexOf(magic, searchFrom);
-      if (idx === -1) break;
-      if (idx + 96 <= head.length) {
-        const major = head.readUInt16LE(idx + 28);
-        const minor = head.readUInt16LE(idx + 30);
-        const blockSize = head.readUInt32LE(idx + 12);
-        const compId = head.readUInt16LE(idx + 20);
-        if (major === 4 && minor === 0 && blockSize >= 4096 && blockSize <= 1048576 && compId >= 1 && compId <= 6) {
-          sqOff = idx;
-          break;
+    if (fileSize >= 64) {
+      const elf = readAt(0, 64);
+      if (elf[0] === 0x7f && elf[1] === 0x45 && elf[2] === 0x4c && elf[3] === 0x46) {
+        let elfEnd = -1;
+        if (elf[4] === 2) {
+          // ELF64 little-endian: e_shoff (40), e_shentsize (58), e_shnum (60).
+          const shoff = Number(elf.readBigUInt64LE(40));
+          const shentsize = elf.readUInt16LE(58);
+          const shnum = elf.readUInt16LE(60);
+          if (shoff > 0 && shentsize > 0 && shnum > 0) {
+            elfEnd = shoff + shentsize * shnum;
+          }
+        } else if (elf[4] === 1) {
+          // ELF32 little-endian: e_shoff (32), e_shentsize (46), e_shnum (48).
+          const shoff = elf.readUInt32LE(32);
+          const shentsize = elf.readUInt16LE(46);
+          const shnum = elf.readUInt16LE(48);
+          if (shoff > 0 && shentsize > 0 && shnum > 0) {
+            elfEnd = shoff + shentsize * shnum;
+          }
+        }
+        if (isValidSqAt(elfEnd)) {
+          sqOff = elfEnd;
         }
       }
-      searchFrom = idx + 4;
+    }
+
+    if (sqOff === -1) {
+      const probeSize = Math.min(fileSize, 4 * 1024 * 1024);
+      const head = readAt(0, probeSize);
+      const magic = Buffer.from('hsqs', 'ascii');
+      let searchFrom = 0;
+      while (true) {
+        const idx = head.indexOf(magic, searchFrom);
+        if (idx === -1) break;
+        if (idx + 96 <= head.length) {
+          const major = head.readUInt16LE(idx + 28);
+          const minor = head.readUInt16LE(idx + 30);
+          const blockSize = head.readUInt32LE(idx + 12);
+          const compId = head.readUInt16LE(idx + 20);
+          if (major === 4 && minor === 0 && blockSize >= 4096 && blockSize <= 1048576 && compId >= 1 && compId <= 6) {
+            sqOff = idx;
+            break;
+          }
+        }
+        searchFrom = idx + 4;
+      }
     }
     if (sqOff === -1) {
       return null;
