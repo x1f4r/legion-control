@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+getrandom.workspace = true
 jiff.workspace = true
 legion-core.workspace = true
 legion-link = { workspace = true, features = ["schemars"] }
@@ -17,11 +18,13 @@ legion-proto.workspace = true
 # Also the power tools' actuator and Wake-on-LAN, which power.wol, power.wake and power.switch
 # share with the local power tools.
 legion-tools.workspace = true
+legion-update = { workspace = true, features = ["schemars"] }
 legion-xfer.workspace = true
 same-file.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["io-util"] }
 toml.workspace = true
@@ -32,7 +35,13 @@ unicode-normalization.workspace = true
 ed25519-dalek.workspace = true
 legion-tools = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+
+# Re-executes itself as a JSON-RPC peer over the command connector to verify node-to-node
+# `update.publish` propagation, per-node signature verification, and tampered-peer refusal.
+[[test]]
+name = "updates"
+harness = false
 
 [lints]
 workspace = true

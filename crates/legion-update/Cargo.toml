@@ -1,0 +1,27 @@
+[package]
+name = "legion-update"
+description = "Signed Legion update sets: verification rules, trusted keys, sequence ordering, and artifact selection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Optional JSON Schema derives for node tool arguments and results.
+schemars = ["dep:schemars"]
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+jiff.workspace = true
+legion-proto.workspace = true
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

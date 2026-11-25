@@ -25,6 +25,11 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "appimage", "dmg", "nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
     },

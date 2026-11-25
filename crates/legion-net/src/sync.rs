@@ -1625,7 +1625,17 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                     device_push_ref,
                 )
                 .await;
-                results.insert(machine, per_doc);
+                let any_ok = per_doc.values().any(|o| o.status != SyncStatus::Error);
+                results.insert(machine.clone(), per_doc);
+                if explicit_docs.is_none() && !args.dry_run && any_ok {
+                    crate::updates::pull_missing_sets_from_peer(
+                        fleet,
+                        ctx,
+                        &machine,
+                        per_machine_timeout,
+                    )
+                    .await;
+                }
             }
         }
         SyncDirection::Status | SyncDirection::Push => {
@@ -1652,7 +1662,20 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                     }) as BoxFuture<'_, _>
                 })
                 .collect();
-            for (machine, per_doc) in join_all_concurrent(futs).await {
+            let synced_peers = join_all_concurrent(futs).await;
+            let reachable_for_updates: Vec<String> = if args.direction == SyncDirection::Push
+                && explicit_docs.is_none()
+                && !args.dry_run
+            {
+                synced_peers
+                    .iter()
+                    .filter(|(_, per_doc)| per_doc.values().any(|o| o.status != SyncStatus::Error))
+                    .map(|(machine, _)| machine.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for (machine, per_doc) in synced_peers {
                 results.insert(machine, per_doc);
             }
             if ctx.is_cancelled() {
@@ -1660,6 +1683,20 @@ async fn fleet_sync(fleet: &Fleet, ctx: &Ctx, args: SyncArgs) -> Result<SyncResu
                     ErrorCode::Cancelled,
                     "The call to fleet.sync was cancelled.",
                 ));
+            }
+            if !reachable_for_updates.is_empty() {
+                let update_futs: Vec<BoxFuture<'_, ()>> = reachable_for_updates
+                    .iter()
+                    .map(|machine| {
+                        Box::pin(crate::updates::propagate_stored_sets_to_peer(
+                            fleet,
+                            ctx,
+                            machine,
+                            per_machine_timeout,
+                        )) as BoxFuture<'_, ()>
+                    })
+                    .collect();
+                let _ = join_all_concurrent(update_futs).await;
             }
         }
     }

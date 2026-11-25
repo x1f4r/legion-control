@@ -127,4 +127,11 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
     assert.doesNotMatch(lines.join('\n'), /secrets\./, `legion-app.yml:${id} reads a secret`);
   }
   assert.match(appWorkflow, /cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \|\| \(github\.event_name == 'push' && github\.ref != 'refs\/heads\/main'\) \}\}/);
+
+  // Every platform build job in legion-app.yml and legion-release.yml must stamp LEGION_BUILD_SEQUENCE.
+  for (const id of ['android', 'linux-desktop', 'ios', 'macos-desktop', 'windows-desktop']) {
+    assert.match(appJobs.get(id).join('\n'), /LEGION_BUILD_SEQUENCE/, `legion-app.yml:${id} does not stamp LEGION_BUILD_SEQUENCE`);
+  }
+  const releaseWorkflow = read('.github/workflows/legion-release.yml');
+  assert.match(releaseWorkflow, /LEGION_BUILD_SEQUENCE:/);
 });
