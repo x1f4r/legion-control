@@ -2182,3 +2182,92 @@ async fn non_regular_files_are_refused_before_opening() {
     .unwrap();
     assert_eq!(dir_grep["matches"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn list_find_and_stat_report_category_and_mime_for_regular_files_only() {
+    let f = Fixture::new();
+    let subdir = f.work.join("folder.jpg");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let photo = f.work.join("holiday.JPG");
+    let clip = f.work.join("clip.mp4");
+    let unknown = f.work.join("mystery.unknownext");
+    std::fs::write(&photo, "not opened").unwrap();
+    std::fs::write(&clip, "not opened").unwrap();
+    std::fs::write(&unknown, "not opened").unwrap();
+
+    // `fs.stat` classifies regular files by extension and omits category/mime for directories.
+    let st_photo = f
+        .call("fs.stat", json!({"path": f.p(&photo)}))
+        .await
+        .unwrap();
+    assert_eq!(st_photo["kind"], json!("file"));
+    assert_eq!(st_photo["category"], json!("image"));
+    assert_eq!(st_photo["mime"], json!("image/jpeg"));
+
+    let st_unknown = f
+        .call("fs.stat", json!({"path": f.p(&unknown)}))
+        .await
+        .unwrap();
+    assert_eq!(st_unknown["kind"], json!("file"));
+    assert_eq!(st_unknown["category"], json!("other"));
+    assert_eq!(st_unknown["mime"], json!("application/octet-stream"));
+
+    let st_dir = f
+        .call("fs.stat", json!({"path": f.p(&subdir)}))
+        .await
+        .unwrap();
+    assert_eq!(st_dir["kind"], json!("dir"));
+    assert!(st_dir.get("category").is_none());
+    assert!(st_dir.get("mime").is_none());
+
+    // `fs.list` reports category/mime on files and omits them on directories.
+    let listed = f
+        .call("fs.list", json!({"path": f.p(&f.work)}))
+        .await
+        .unwrap();
+    let entries = listed["entries"].as_array().unwrap();
+    let dir_entry = entries
+        .iter()
+        .find(|e| e["name"] == json!("folder.jpg"))
+        .unwrap();
+    assert_eq!(dir_entry["kind"], json!("dir"));
+    assert!(dir_entry.get("category").is_none());
+    assert!(dir_entry.get("mime").is_none());
+    let clip_entry = entries
+        .iter()
+        .find(|e| e["name"] == json!("clip.mp4"))
+        .unwrap();
+    assert_eq!(clip_entry["kind"], json!("file"));
+    assert_eq!(clip_entry["category"], json!("video"));
+    assert_eq!(clip_entry["mime"], json!("video/mp4"));
+
+    // `fs.find` reports category/mime on files and omits them on directories.
+    let found = f
+        .call("fs.find", json!({"path": f.p(&f.work)}))
+        .await
+        .unwrap();
+    let matches = found["matches"].as_array().unwrap();
+    let found_dir = matches.iter().find(|m| m["kind"] == json!("dir")).unwrap();
+    assert!(found_dir.get("category").is_none());
+    assert!(found_dir.get("mime").is_none());
+    let found_photo = matches
+        .iter()
+        .find(|m| m["path"].as_str().unwrap().ends_with("holiday.JPG"))
+        .unwrap();
+    assert_eq!(found_photo["category"], json!("image"));
+    assert_eq!(found_photo["mime"], json!("image/jpeg"));
+
+    // On Unix, symlinks keep `kind: "symlink"` and omit category/mime.
+    #[cfg(unix)]
+    {
+        let link = f.work.join("link.png");
+        std::os::unix::fs::symlink(&photo, &link).unwrap();
+        let st_link = f
+            .call("fs.stat", json!({"path": f.p(&link)}))
+            .await
+            .unwrap();
+        assert_eq!(st_link["kind"], json!("symlink"));
+        assert!(st_link.get("category").is_none());
+        assert!(st_link.get("mime").is_none());
+    }
+}

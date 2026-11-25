@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
+use legion_core::media::{Category, classify_path};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
 use regex::RegexBuilder;
@@ -175,6 +176,10 @@ struct FindMatch {
     kind: EntryKind,
     size: u64,
     mtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<Category>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
 }
 
 /// Result of `fs.find`.
@@ -281,11 +286,19 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             let Ok(entry_meta) = fs::symlink_metadata(entry_path) else {
                 continue;
             };
+            let (category, mime) = if kind == EntryKind::File {
+                let info = classify_path(entry_path);
+                (Some(info.category), Some(info.mime.to_owned()))
+            } else {
+                (None, None)
+            };
             let found = FindMatch {
                 path: path_to_string(entry_path),
                 kind,
                 size: entry_meta.len(),
                 mtime: format_mtime(&entry_meta),
+                category,
+                mime,
             };
             let item_bytes = serde_json::to_vec(&found).map_or(0, |v| v.len())
                 + usize::from(!matches.is_empty());

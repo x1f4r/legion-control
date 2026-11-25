@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use legion_core::media::{Category, classify_path};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
 use schemars::JsonSchema;
@@ -94,6 +95,10 @@ struct ListEntry {
     mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<Category>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
 }
 
 /// Result of `fs.list`.
@@ -248,6 +253,12 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         } else {
             None
         };
+        let (category, mime) = if kind == EntryKind::File {
+            let info = classify_path(&child_path);
+            (Some(info.category), Some(info.mime.to_owned()))
+        } else {
+            (None, None)
+        };
         let entry = ListEntry {
             name,
             path: path_to_string(&child_path),
@@ -256,6 +267,8 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
             mtime: format_mtime(&meta),
             mode: platform::unix_mode(&meta),
             target,
+            category,
+            mime,
         };
         let entry_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len())
             + usize::from(!walk.entries.is_empty());
@@ -300,6 +313,10 @@ struct StatResult {
     readonly: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<Category>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
 }
 
 async fn stat(ctx: &Ctx, args: StatArgs) -> Result<StatResult, ToolError> {
@@ -313,6 +330,12 @@ async fn stat(ctx: &Ctx, args: StatArgs) -> Result<StatResult, ToolError> {
         } else {
             None
         };
+        let (category, mime) = if kind == EntryKind::File {
+            let info = classify_path(&path);
+            (Some(info.category), Some(info.mime.to_owned()))
+        } else {
+            (None, None)
+        };
         Ok(StatResult {
             path: path_to_string(&path),
             kind,
@@ -321,6 +344,8 @@ async fn stat(ctx: &Ctx, args: StatArgs) -> Result<StatResult, ToolError> {
             mode: platform::unix_mode(&meta),
             readonly: meta.permissions().readonly(),
             target,
+            category,
+            mime,
         })
     })
     .await

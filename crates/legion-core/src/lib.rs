@@ -10,6 +10,7 @@ pub mod config;
 mod ctx;
 pub mod exe;
 mod glob;
+pub mod media;
 mod node;
 pub mod paths;
 pub mod policy;
