@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use crate::content::{BoxStreamRead, BoxStreamWrite, ContentTime, RawStream};
+use crate::content::{BoxStreamRead, BoxStreamWrite, ContentTime, GreetedStream, RawStream};
+use crate::link::Route;
 use crate::stderr::StderrTail;
 
 /// Stream protocol version spoken by `legion stream`.
@@ -33,7 +34,7 @@ const MAX_NOISE_LINES: usize = 64;
 /// Maximum cumulative bytes of noise skipped before giving up.
 const MAX_NOISE_BYTES: usize = 64 * 1024;
 /// Read buffer capacity wrapping the underlying stream for JSON reply lines.
-const STREAM_BUF_BYTES: usize = 16 * 1024;
+pub(crate) const PUT_STREAM_BUF_BYTES: usize = 16 * 1024;
 /// Minimum idle reply timeout while waiting for `put` verification heartbeats (`legion stream`
 /// emits `{"busy": true}` every 10 seconds while hashing large files).
 const MIN_PUT_FINISH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -118,6 +119,7 @@ pub struct PutStream {
     remaining: u64,
     no_replace_confirmed: bool,
     stream_capabilities: Vec<String>,
+    route: Route,
     timeout: Duration,
     cancel: CancellationToken,
     channel_cancel: CancellationToken,
@@ -151,6 +153,11 @@ impl PutStream {
     /// Stream capabilities advertised by the remote machine on this stream channel.
     pub fn stream_capabilities(&self) -> &[String] {
         &self.stream_capabilities
+    }
+
+    /// Route taken to reach the target machine (`Direct` or `Relay { via }`).
+    pub fn route(&self) -> &Route {
+        &self.route
     }
 
     /// Cancels this upload stream and closes its underlying SSH channel or child process
@@ -353,7 +360,8 @@ struct PutDoneReply {
     hash: String,
 }
 
-/// Runs the `legion stream` `put` handshake on `stream` and returns a positioned [`PutStream`].
+/// Runs the `legion stream` `put` handshake on a direct `stream` and returns a positioned
+/// [`PutStream`].
 pub(crate) async fn handshake_put(
     stream: RawStream,
     machine: &str,
@@ -363,16 +371,83 @@ pub(crate) async fn handshake_put(
     cancel: CancellationToken,
     on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<PutStream, ErrorBody> {
-    let RawStream {
-        reader,
-        mut writer,
-        stderr,
-        cancel: channel_cancel,
-        park: _,
-        guard,
-    } = stream;
+    handshake_put_from_source(
+        PutStreamStart::Raw(stream),
+        machine,
+        None,
+        request,
+        as_principal,
+        timeout,
+        cancel,
+        on_greeting_capabilities,
+    )
+    .await
+}
 
-    let mut header = json!({
+/// Runs the `legion stream` `put` handshake wrapped in `op: "relay"` on an already-greeted stream
+/// opened to `relay_via`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handshake_put_relayed(
+    stream: GreetedStream,
+    machine: &str,
+    relay_via: &str,
+    request: &PutRequest,
+    as_principal: Option<&str>,
+    timeout: Duration,
+    cancel: CancellationToken,
+) -> Result<PutStream, ErrorBody> {
+    handshake_put_from_source(
+        PutStreamStart::Greeted(stream),
+        machine,
+        Some(relay_via),
+        request,
+        as_principal,
+        timeout,
+        cancel,
+        None,
+    )
+    .await
+}
+
+enum PutStreamStart {
+    Raw(RawStream),
+    Greeted(GreetedStream),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handshake_put_from_source(
+    stream: PutStreamStart,
+    machine: &str,
+    relay_via: Option<&str>,
+    request: &PutRequest,
+    as_principal: Option<&str>,
+    timeout: Duration,
+    cancel: CancellationToken,
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
+) -> Result<PutStream, ErrorBody> {
+    let (mut buf_reader, mut writer, stderr, channel_cancel, guard, already_greeted, greeted_caps) =
+        match stream {
+            PutStreamStart::Raw(raw) => (
+                BufReader::with_capacity(PUT_STREAM_BUF_BYTES, raw.reader),
+                raw.writer,
+                raw.stderr,
+                raw.cancel,
+                raw.guard,
+                false,
+                Vec::new(),
+            ),
+            PutStreamStart::Greeted(greeted) => (
+                greeted.reader,
+                greeted.writer,
+                greeted.stderr,
+                greeted.cancel,
+                greeted.guard,
+                true,
+                greeted.capabilities,
+            ),
+        };
+
+    let mut inner = json!({
         "protocol": STREAM_PROTOCOL,
         "op": "put",
         "path": request.path,
@@ -380,31 +455,56 @@ pub(crate) async fn handshake_put(
         "hash": request.hash,
     });
     if let Some(mode) = request.mode {
-        header["mode"] = json!(mode);
+        inner["mode"] = json!(mode);
     }
     if let Some(mtime) = request.mtime {
-        header["mtime"] = json!({ "secs": mtime.secs, "nanos": mtime.nanos });
+        inner["mtime"] = json!({ "secs": mtime.secs, "nanos": mtime.nanos });
     }
     if request.no_replace {
-        header["no_replace"] = json!(true);
+        inner["no_replace"] = json!(true);
     }
-    if let Some(principal) = as_principal {
-        header["as"] = json!(principal);
-    }
+    let header = match relay_via {
+        Some(_) => {
+            let mut envelope = json!({
+                "protocol": STREAM_PROTOCOL,
+                "op": "relay",
+                "on": machine,
+                "request": inner,
+            });
+            if let Some(principal) = as_principal {
+                envelope["as"] = json!(principal);
+            }
+            envelope
+        }
+        None => {
+            if let Some(principal) = as_principal {
+                inner["as"] = json!(principal);
+            }
+            inner
+        }
+    };
     let mut header_bytes = header.to_string().into_bytes();
     header_bytes.push(b'\n');
 
-    let mut buf_reader = BufReader::with_capacity(STREAM_BUF_BYTES, reader);
+    let io_peer = relay_via.unwrap_or(machine);
     let handshake = async {
         writer
             .write_all(&header_bytes)
             .await
-            .map_err(|err| put_io_error(machine, "writing stream put header", &err, &stderr))?;
+            .map_err(|err| put_io_error(io_peer, "writing stream put header", &err, &stderr))?;
         writer
             .flush()
             .await
-            .map_err(|err| put_io_error(machine, "flushing stream put header", &err, &stderr))?;
-        read_put_ready(&mut buf_reader, machine, &stderr, on_greeting_capabilities).await
+            .map_err(|err| put_io_error(io_peer, "flushing stream put header", &err, &stderr))?;
+        read_put_ready(
+            &mut buf_reader,
+            machine,
+            already_greeted,
+            greeted_caps,
+            &stderr,
+            on_greeting_capabilities,
+        )
+        .await
     };
 
     let (ready, mut stream_capabilities) = tokio::select! {
@@ -456,13 +556,24 @@ pub(crate) async fn handshake_put(
         .with_machine(machine));
     }
 
+    // On a relayed put, the greeting came from the relay rather than the final target, so only
+    // an explicit `ready.no_replace == Some(true)` from the target confirms atomic no-replace.
     let no_replace_confirmed = ready.no_replace == Some(true)
-        || (request.no_replace && stream_capabilities.iter().any(|c| c == CAP_PUT_NO_REPLACE));
+        || (request.no_replace
+            && relay_via.is_none()
+            && stream_capabilities.iter().any(|c| c == CAP_PUT_NO_REPLACE));
     if ready.no_replace == Some(true)
         && !stream_capabilities.iter().any(|c| c == CAP_PUT_NO_REPLACE)
     {
         stream_capabilities.push(CAP_PUT_NO_REPLACE.to_owned());
     }
+
+    let route = match relay_via {
+        Some(via) => Route::Relay {
+            via: via.to_owned(),
+        },
+        None => Route::Direct,
+    };
 
     let stream_cancel = cancel.child_token();
     let active_cancel = channel_cancel.clone();
@@ -486,6 +597,7 @@ pub(crate) async fn handshake_put(
         remaining: request.size - ready.offset,
         no_replace_confirmed,
         stream_capabilities,
+        route,
         timeout,
         cancel: stream_cancel,
         channel_cancel,
@@ -497,11 +609,13 @@ pub(crate) async fn handshake_put(
 async fn read_put_ready<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     machine: &str,
+    already_greeted: bool,
+    initial_caps: Vec<String>,
     stderr: &Option<Arc<StderrTail>>,
     on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<(PutReadyReply, Vec<String>), ErrorBody> {
-    let mut greeted = false;
-    let mut greeting_caps = Vec::new();
+    let mut greeted = already_greeted;
+    let mut greeting_caps = initial_caps;
     let mut noise_lines = 0usize;
     let mut noise_bytes = 0usize;
     let mut busy_heartbeats = 0usize;
@@ -561,10 +675,8 @@ async fn read_put_ready<R: AsyncRead + Unpin>(
                 }
                 continue;
             } else {
-                if let Some(error_val) = fields.get("error")
-                    && let Ok(body) = serde_json::from_value::<ErrorBody>(error_val.clone())
-                {
-                    return Err(crate::strip_remote_sent(body).with_machine(machine));
+                if let Some(error_val) = fields.get("error") {
+                    return Err(crate::decode_remote_error(error_val, machine));
                 }
                 if let Ok(ready) = serde_json::from_value::<PutReadyReply>(Value::Object(fields)) {
                     return Ok((ready, greeting_caps));
@@ -745,10 +857,8 @@ async fn read_put_done_with_limits<R: AsyncRead + Unpin>(
             }
             continue;
         }
-        if let Some(error_val) = fields.get("error")
-            && let Ok(body) = serde_json::from_value::<ErrorBody>(error_val.clone())
-        {
-            return Err(crate::strip_remote_sent(body).with_machine(machine));
+        if let Some(error_val) = fields.get("error") {
+            return Err(crate::decode_remote_error(error_val, machine));
         }
         if let Ok(done) = serde_json::from_value::<PutDoneReply>(Value::Object(fields)) {
             return Ok(done);
@@ -886,6 +996,8 @@ mod tests {
                 let watch_cancel = stream_cancel.clone();
 
                 tokio::spawn(async move {
+                    let _ = server_out.write_all(b"Welcome banner\n").await;
+                    let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
                     let mut reader = BufReader::new(server_in);
                     let mut line = String::new();
                     if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
@@ -895,9 +1007,6 @@ mod tests {
                     assert_eq!(req["op"], "put");
                     let size = req["size"].as_u64().unwrap();
                     let hash = req["hash"].as_str().unwrap().to_owned();
-
-                    let _ = server_out.write_all(b"Welcome banner\n").await;
-                    let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
                     match mode {
                         PutServerMode::Deny => {
                             let err = json!({
@@ -1107,6 +1216,8 @@ mod tests {
             .unwrap();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
 
+        // Machine with no direct entry tries tower as a relay; old tower omits `stream.relay`
+        // so the upload is refused before sending any header.
         let err = link
             .open_put(
                 "pi",
@@ -1122,7 +1233,12 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+        assert_eq!(
+            err.message,
+            "tower needs an update before it can pass files along from pi."
+        );
 
         let mut put = link
             .open_put(

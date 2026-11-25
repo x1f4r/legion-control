@@ -24,11 +24,12 @@ use std::time::{Duration, Instant};
 
 use legion_link::proto::ErrorCode;
 use legion_link::{
-    Link, LinkConfig, LinkOptions, MachineRouteStatus, NodeOrigin,
+    Link, LinkConfig, LinkOptions, MachineRouteStatus, NodeOrigin, PutRequest,
     REASON_DEVICE_REMOVED_OR_UNKNOWN, Route,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -755,5 +756,339 @@ async fn real_node_endpoint_superset_host_keys_does_not_flag_identity_changed() 
             .identity_changed
             .is_none()
     );
+    link.close().await;
+}
+
+fn write_node_wrapper(
+    path: &Path,
+    legion_bin: &Path,
+    target_legion_home: &Path,
+    target_home: &Path,
+) {
+    // Passes all arguments (`rpc` or `stream`, swapped by `legion-net`'s command connector) straight
+    // through to the target node's `legion` binary.
+    let script = format!(
+        "#!/bin/sh\nexport LEGION_HOME='{}'\nexport HOME='{}'\nunset XDG_CONFIG_HOME XDG_STATE_HOME\nexec '{}' \"$@\"\n",
+        target_legion_home.display(),
+        target_home.display(),
+        legion_bin.display(),
+    );
+    fs::write(path, script).unwrap();
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn blake3_via_legion_stream(
+    legion_bin: &Path,
+    legion_home: &Path,
+    user_home: &Path,
+    path_in_home: &str,
+) -> String {
+    use std::io::Write;
+    let mut child = Command::new(legion_bin)
+        .arg("stream")
+        .env("LEGION_HOME", legion_home)
+        .env("HOME", user_home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({
+                "protocol": 1,
+                "op": "stat",
+                "path": path_in_home,
+                "checksum": true,
+            })
+        )
+        .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reply_line = stdout
+        .lines()
+        .nth(1)
+        .expect("expected greeting + stat reply");
+    let reply: Value = serde_json::from_str(reply_line).unwrap();
+    reply["hash"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!("skipping two-sshd relayed stream test: sshd/ssh-keygen unavailable");
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        panic!(
+            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
+        );
+    };
+
+    let root = strict_tempdir();
+    let user_a = root.path().join("home-a");
+    let user_b = root.path().join("home-b");
+    let home_a = root.path().join("legion-a");
+    let home_b = root.path().join("legion-b");
+    let auth_a = user_a.join(".ssh").join("authorized_keys");
+    let auth_b = user_b.join(".ssh").join("authorized_keys");
+
+    for dir in [
+        home_a.join("config"),
+        home_b.join("config"),
+        user_a.join(".ssh"),
+        user_b.join(".ssh"),
+        user_b.join("media"),
+        user_b.join("uploads"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+    }
+    #[cfg(unix)]
+    for dir in [&user_a, &user_b, &user_a.join(".ssh"), &user_b.join(".ssh")] {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd_a) = ManagedSshd::new(&root.path().join("sshd-a"), &auth_a, &user_a) else {
+        return;
+    };
+    let Some(sshd_b) = ManagedSshd::new(&root.path().join("sshd-b"), &auth_b, &user_b) else {
+        return;
+    };
+
+    fs::write(
+        home_a.join("config/node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            sshd_a.port,
+            sshd_a.user,
+            toml_literal(&auth_a),
+            toml_literal(&sshd_a.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home_b.join("config/node.toml"),
+        format!(
+            "name = \"pi\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            sshd_b.port,
+            sshd_b.user,
+            toml_literal(&auth_b),
+            toml_literal(&sshd_b.host_key_pub),
+        ),
+    )
+    .unwrap();
+    let policy = "default = \"owner\"\n";
+    fs::write(home_a.join("config/policy.toml"), policy).unwrap();
+    fs::write(home_b.join("config/policy.toml"), policy).unwrap();
+
+    // Wire A <-> B using wrappers that accept `"rpc"` OR `"stream"` as their trailing arg.
+    let node_b_exec = root.path().join("node-b.sh");
+    let node_a_exec = root.path().join("node-a.sh");
+    write_node_wrapper(&node_b_exec, &legion_bin, &home_b, &user_b);
+    write_node_wrapper(&node_a_exec, &legion_bin, &home_a, &user_a);
+
+    fs::write(
+        home_a.join("config/fleet.toml"),
+        format!(
+            "[machines.tower]\nssh = \"127.0.0.1\"\n\n[machines.pi]\ncommand = [{}, \"rpc\"]\n",
+            toml_literal(&node_b_exec),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home_b.join("config/fleet.toml"),
+        format!(
+            "[machines.pi]\nssh = \"127.0.0.1\"\n\n[machines.tower]\ncommand = [{}, \"rpc\"]\n",
+            toml_literal(&node_a_exec),
+        ),
+    )
+    .unwrap();
+
+    // Seed a sample file on `pi` and a second payload to upload.
+    let sample_media: Vec<u8> = (0..180_000usize)
+        .map(|i| ((i * 11 + 5) % 251) as u8)
+        .collect();
+    fs::write(user_b.join("media/clip.bin"), &sample_media).unwrap();
+    let upload_payload: Vec<u8> = (0..128 * 1024usize)
+        .map(|i| ((i * 5 + 3) % 251) as u8)
+        .collect();
+    fs::write(user_a.join("seed-upload.bin"), &upload_payload).unwrap();
+    let upload_hash = blake3_via_legion_stream(&legion_bin, &home_a, &user_a, "~/seed-upload.bin");
+
+    // 1. Pair with `tower` ONLY (do NOT call `learn()` yet — device has NO direct entry for `pi`).
+    let invite_out = run_legion(
+        &legion_bin,
+        &home_a,
+        &user_a,
+        &[
+            "device.invite",
+            "name=pixel",
+            "role=owner",
+            "allow_owner=true",
+        ],
+    );
+    let invite_text = invite_out["invite"].as_str().unwrap();
+    let link = Link::with_options(
+        LinkConfig::default(),
+        LinkOptions {
+            allow_loopback_endpoints: true,
+            ..LinkOptions::default()
+        },
+    );
+    link.pair(invite_text, "pixel").await.unwrap();
+    assert!(link.config().node("pi").is_none());
+
+    // 2. Relayed ranged `open_content` on `pi` through `tower`.
+    let mut relayed_get = link
+        .open_content("pi", "~/media/clip.bin", 12_345, Some(40_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        relayed_get.route(),
+        &Route::Relay {
+            via: "tower".to_owned()
+        }
+    );
+    let mut got = Vec::new();
+    relayed_get.read_to_end(&mut got).await.unwrap();
+    assert_eq!(got, &sample_media[12_345..52_345]);
+    assert_eq!(
+        link.route_status().get("pi"),
+        Some(&MachineRouteStatus::Relay {
+            via: "tower".to_owned()
+        })
+    );
+
+    // 3. Relayed `open_put` with mid-upload cancel, partial check, and resumed completion.
+    {
+        let mut partial_put = link
+            .open_put(
+                "pi",
+                PutRequest {
+                    path: "~/uploads/relayed.bin".to_owned(),
+                    size: upload_payload.len() as u64,
+                    hash: upload_hash.clone(),
+                    mode: None,
+                    mtime: None,
+                    no_replace: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            partial_put.route(),
+            &Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        partial_put
+            .write_all(&upload_payload[..48 * 1024])
+            .await
+            .unwrap();
+        partial_put.flush().await.unwrap();
+        // Wait until the bytes have crossed sshd -> tower -> pi onto disk before cancelling.
+        let part_file = user_b.join("uploads/relayed.bin.legion-part");
+        let part_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < part_deadline {
+            if fs::metadata(&part_file).is_ok_and(|m| m.len() >= 48 * 1024) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        partial_put.cancel();
+    }
+    // Wait briefly for target to flush partial file on cancel, then resume over relay.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    {
+        let mut resumed_put = link
+            .open_put(
+                "pi",
+                PutRequest {
+                    path: "~/uploads/relayed.bin".to_owned(),
+                    size: upload_payload.len() as u64,
+                    hash: upload_hash.clone(),
+                    mode: None,
+                    mtime: None,
+                    no_replace: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed_put.route(),
+            &Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        let resume_at = resumed_put.offset() as usize;
+        assert!(
+            resume_at > 0 && resume_at <= 48 * 1024,
+            "expected partial resume offset after cancel, got {resume_at}"
+        );
+        resumed_put
+            .write_all(&upload_payload[resume_at..])
+            .await
+            .unwrap();
+        let done = resumed_put.finish().await.unwrap();
+        assert_eq!(done.size, upload_payload.len() as u64);
+        assert_eq!(done.hash, upload_hash);
+    }
+    assert_eq!(
+        fs::read(user_b.join("uploads/relayed.bin")).unwrap(),
+        upload_payload
+    );
+
+    // 4. Learn `pi` directly -> next `open_content` and `open_put` switch cleanly to `Route::Direct`.
+    let learned = link.learn().await.unwrap();
+    assert_eq!(learned.added, vec!["pi".to_owned()]);
+
+    let mut direct_get = link
+        .open_content("pi", "~/media/clip.bin", 0, Some(16_384))
+        .await
+        .unwrap();
+    assert_eq!(direct_get.route(), &Route::Direct);
+    let mut got_direct = Vec::new();
+    direct_get.read_to_end(&mut got_direct).await.unwrap();
+    assert_eq!(got_direct, &sample_media[..16_384]);
+    assert_eq!(
+        link.route_status().get("pi"),
+        Some(&MachineRouteStatus::Direct)
+    );
+
+    let mut direct_put = link
+        .open_put(
+            "pi",
+            PutRequest {
+                path: "~/uploads/direct.bin".to_owned(),
+                size: upload_payload.len() as u64,
+                hash: upload_hash.clone(),
+                mode: None,
+                mtime: None,
+                no_replace: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_put.route(), &Route::Direct);
+    direct_put.write_all(&upload_payload).await.unwrap();
+    let done_direct = direct_put.finish().await.unwrap();
+    assert_eq!(done_direct.size, upload_payload.len() as u64);
+    assert_eq!(
+        fs::read(user_b.join("uploads/direct.bin")).unwrap(),
+        upload_payload
+    );
+
+    drop(sshd_a);
+    drop(sshd_b);
     link.close().await;
 }
