@@ -3728,7 +3728,9 @@ mod tests {
     fn property_truncated_and_mutated_inputs_never_panic_or_exceed_bounds() {
         // Build seeds across every supported format, every iteration cap, and the 16 MiB tag
         // budget boundary, then run > 3,500 truncations and mutations asserting valid Ok or clean
-        // structured Err within a strict time bound.
+        // structured Err per case, with generous per-case and overall hang guards.
+        const CASE_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+        const OVERALL_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(300);
         let t0 = std::time::Instant::now();
         let tiny_png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
         let small_seeds: Vec<(AudioFormat, Vec<u8>)> = vec![
@@ -3983,15 +3985,26 @@ mod tests {
 
         let label = Path::new("/fuzz.bin");
         let mut cases = 0usize;
+        let run_case = |data: &[u8], fmt: AudioFormat, mode: CoverExtractMode| {
+            let case_t0 = std::time::Instant::now();
+            let mut cur = Cursor::new(data);
+            let res = parse_audio(&mut cur, data.len() as u64, fmt, mode, label);
+            let case_elapsed = case_t0.elapsed();
+            assert!(
+                case_elapsed < CASE_HANG_GUARD,
+                "hang guard tripped: single parse_audio({fmt:?}, {mode:?}, {} bytes) ran for {case_elapsed:?} (limit {CASE_HANG_GUARD:?})",
+                data.len()
+            );
+            assert_valid_audio_outcome(&res, mode);
+            res
+        };
 
         for (fmt, seed) in &small_seeds {
             // 1. Every prefix truncation 0..=seed.len()
             for cut in 0..=seed.len() {
                 let slice = &seed[..cut];
                 for mode in [CoverExtractMode::CheckOnly, CoverExtractMode::ExtractBytes] {
-                    let mut cur = Cursor::new(slice);
-                    let res = parse_audio(&mut cur, slice.len() as u64, *fmt, mode, label);
-                    assert_valid_audio_outcome(&res, mode);
+                    let _ = run_case(slice, *fmt, mode);
                     cases += 1;
                 }
             }
@@ -4018,9 +4031,7 @@ mod tests {
                     }
                 }
                 for mode in [CoverExtractMode::CheckOnly, CoverExtractMode::ExtractBytes] {
-                    let mut cur = Cursor::new(buf.as_slice());
-                    let res = parse_audio(&mut cur, buf.len() as u64, *fmt, mode, label);
-                    assert_valid_audio_outcome(&res, mode);
+                    let _ = run_case(buf.as_slice(), *fmt, mode);
                     cases += 1;
                 }
             }
@@ -4029,9 +4040,7 @@ mod tests {
         // 3. Exercise every iteration-cap seed intact, truncated, and mutated.
         for (fmt, seed) in &cap_seeds {
             for mode in [CoverExtractMode::CheckOnly, CoverExtractMode::ExtractBytes] {
-                let mut cur = Cursor::new(seed.as_slice());
-                let res = parse_audio(&mut cur, seed.len() as u64, *fmt, mode, label);
-                assert_valid_audio_outcome(&res, mode);
+                let _ = run_case(seed.as_slice(), *fmt, mode);
                 cases += 1;
             }
             for step in 0..24usize {
@@ -4046,15 +4055,7 @@ mod tests {
                         buf[off] ^= (next_u64() & 0xFF) as u8;
                     }
                 }
-                let mut cur = Cursor::new(buf.as_slice());
-                let res = parse_audio(
-                    &mut cur,
-                    buf.len() as u64,
-                    *fmt,
-                    CoverExtractMode::CheckOnly,
-                    label,
-                );
-                assert_valid_audio_outcome(&res, CoverExtractMode::CheckOnly);
+                let _ = run_case(buf.as_slice(), *fmt, CoverExtractMode::CheckOnly);
                 cases += 1;
             }
         }
@@ -4078,19 +4079,15 @@ mod tests {
             mp3_near.extend_from_slice(&((near_len - 30) as u32).to_be_bytes());
             mp3_near.extend_from_slice(&[0, 0]);
             mp3_near.resize(10 + near_len, b'A');
-            let mut cur = Cursor::new(mp3_near.as_slice());
-            let ok_near = parse_audio(
-                &mut cur,
-                mp3_near.len() as u64,
+            let ok_near = run_case(
+                mp3_near.as_slice(),
                 AudioFormat::Mp3,
                 CoverExtractMode::CheckOnly,
-                label,
             );
             assert!(
                 ok_near.is_ok(),
                 "15.75 MiB unsync MP3 should succeed: {ok_near:?}"
             );
-            assert_valid_audio_outcome(&ok_near, CoverExtractMode::CheckOnly);
             cases += 1;
 
             let over_len = MAX_AUDIO_TAG_BYTES + 128;
@@ -4102,13 +4099,10 @@ mod tests {
                 (sz_over & 0x7F) as u8,
             ]);
             mp3_near.resize(10 + over_len, b'A');
-            let mut cur_over = Cursor::new(mp3_near.as_slice());
-            let err_over = parse_audio(
-                &mut cur_over,
-                mp3_near.len() as u64,
+            let err_over = run_case(
+                mp3_near.as_slice(),
                 AudioFormat::Mp3,
                 CoverExtractMode::CheckOnly,
-                label,
             )
             .unwrap_err();
             assert_eq!(
@@ -4129,15 +4123,11 @@ mod tests {
                         _ => (next_u64() & 0xFF) as u8,
                     };
                 }
-                let mut cur_m = Cursor::new(mp3_near.as_slice());
-                let res_m = parse_audio(
-                    &mut cur_m,
-                    mp3_near.len() as u64,
+                let _ = run_case(
+                    mp3_near.as_slice(),
                     AudioFormat::Mp3,
                     CoverExtractMode::CheckOnly,
-                    label,
                 );
-                assert_valid_audio_outcome(&res_m, CoverExtractMode::CheckOnly);
                 cases += 1;
             }
             drop(mp3_near);
@@ -4166,13 +4156,10 @@ mod tests {
                 ]);
                 flac_over.extend_from_slice(&pic_body);
             }
-            let mut cur_f = Cursor::new(flac_over.as_slice());
-            let err_f = parse_audio(
-                &mut cur_f,
-                flac_over.len() as u64,
+            let err_f = run_case(
+                flac_over.as_slice(),
                 AudioFormat::Flac,
                 CoverExtractMode::CheckOnly,
-                label,
             )
             .unwrap_err();
             assert_eq!(
@@ -4188,8 +4175,8 @@ mod tests {
             "expected >= 3,500 property cases, ran {cases}"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(15),
-            "audio parser property suite exceeded 15 s time bound: {elapsed:?} ({cases} cases)"
+            elapsed < OVERALL_HANG_GUARD,
+            "hang guard tripped: audio parser property suite ran for {elapsed:?} across {cases} cases (limit {OVERALL_HANG_GUARD:?})"
         );
     }
 

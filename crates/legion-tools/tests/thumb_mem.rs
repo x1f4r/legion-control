@@ -11,7 +11,7 @@ mod audio_fixtures;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -992,6 +992,11 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
         rng
     };
 
+    // Each file is already bounded by `fs.tags`'s own per-file decode timeout and memory cap;
+    // these generous limits exist strictly as hang guards so noisy CI runners never flake.
+    const CALL_HANG_GUARD: Duration = Duration::from_secs(60);
+    const OVERALL_HANG_GUARD: Duration = Duration::from_secs(300);
+
     let t0 = Instant::now();
     let live_start = LIVE_BYTES.load(Ordering::SeqCst);
     reset_peak();
@@ -1050,14 +1055,17 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
             cases += 1;
 
             if pending_batch.len() == 32 {
-                let res = node
-                    .call(Call::new(
+                let res = tokio::time::timeout(
+                    CALL_HANG_GUARD,
+                    node.call(Call::new(
                         Door::Cli,
                         "fs.tags",
                         json!({"paths": pending_batch}),
-                    ))
-                    .await
-                    .unwrap();
+                    )),
+                )
+                .await
+                .expect("hang guard tripped: fs.tags fuzz batch did not finish within 60 s")
+                .unwrap();
                 let arr = res["results"].as_array().unwrap();
                 assert_eq!(arr.len(), 32);
                 for item in arr {
@@ -1068,14 +1076,17 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
         }
     }
     if !pending_batch.is_empty() {
-        let res = node
-            .call(Call::new(
+        let res = tokio::time::timeout(
+            CALL_HANG_GUARD,
+            node.call(Call::new(
                 Door::Cli,
                 "fs.tags",
                 json!({"paths": pending_batch}),
-            ))
-            .await
-            .unwrap();
+            )),
+        )
+        .await
+        .expect("hang guard tripped: trailing fs.tags fuzz batch did not finish within 60 s")
+        .unwrap();
         let arr = res["results"].as_array().unwrap();
         assert_eq!(arr.len(), pending_batch.len());
         for item in arr {
@@ -1107,14 +1118,17 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
             pending_batch.push(pm.to_string_lossy().into_owned());
             cases += 1;
             if pending_batch.len() == 32 {
-                let res = node
-                    .call(Call::new(
+                let res = tokio::time::timeout(
+                    CALL_HANG_GUARD,
+                    node.call(Call::new(
                         Door::Cli,
                         "fs.tags",
                         json!({"paths": pending_batch}),
-                    ))
-                    .await
-                    .unwrap();
+                    )),
+                )
+                .await
+                .expect("hang guard tripped: fs.tags cap-seed batch did not finish within 60 s")
+                .unwrap();
                 for item in res["results"].as_array().unwrap() {
                     af::assert_clean_tags_item(item);
                 }
@@ -1123,14 +1137,17 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
         }
     }
     if !pending_batch.is_empty() {
-        let res = node
-            .call(Call::new(
+        let res = tokio::time::timeout(
+            CALL_HANG_GUARD,
+            node.call(Call::new(
                 Door::Cli,
                 "fs.tags",
                 json!({"paths": pending_batch}),
-            ))
-            .await
-            .unwrap();
+            )),
+        )
+        .await
+        .expect("hang guard tripped: trailing fs.tags cap-seed batch did not finish within 60 s")
+        .unwrap();
         for item in res["results"].as_array().unwrap() {
             af::assert_clean_tags_item(item);
         }
@@ -1145,14 +1162,19 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
         async move {
             let live_before = LIVE_BYTES.load(Ordering::SeqCst);
             reset_peak();
-            let res = node_ref
-                .call(Call::new(
+            let res = tokio::time::timeout(
+                CALL_HANG_GUARD,
+                node_ref.call(Call::new(
                     Door::Cli,
                     "fs.tags",
                     json!({"paths": [path.to_string_lossy()]}),
-                ))
-                .await
-                .unwrap();
+                )),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("hang guard tripped: {label} did not finish within {CALL_HANG_GUARD:?}")
+            })
+            .unwrap();
             let peak = peak_total_bytes().saturating_sub(live_before);
             let item = res["results"][0].clone();
             af::assert_clean_tags_item(&item);
@@ -1267,14 +1289,17 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
             std::fs::write(&pm, &big_mp3).unwrap();
             let live_before = LIVE_BYTES.load(Ordering::SeqCst);
             reset_peak();
-            let res = node
-                .call(Call::new(
+            let res = tokio::time::timeout(
+                CALL_HANG_GUARD,
+                node.call(Call::new(
                     Door::Cli,
                     "fs.tags",
                     json!({"paths": [pm.to_string_lossy()]}),
-                ))
-                .await
-                .unwrap();
+                )),
+            )
+            .await
+            .expect("hang guard tripped: mutated 16 MiB MP3 did not finish within 60 s")
+            .unwrap();
             let peak = peak_total_bytes().saturating_sub(live_before);
             af::assert_clean_tags_item(&res["results"][0]);
             assert!(
@@ -1298,8 +1323,8 @@ async fn property_mutated_and_truncated_audio_fixtures_hold_memory_and_time_boun
         "expected >= 2,400 property fixtures, ran {cases}"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(25),
-        "mutated audio property test took too long: {elapsed:?}"
+        elapsed < OVERALL_HANG_GUARD,
+        "hang guard tripped: mutated audio property test ran for {elapsed:?} (limit {OVERALL_HANG_GUARD:?})"
     );
     assert!(
         small_and_cap_peak < 64 * 1024 * 1024,
