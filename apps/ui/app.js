@@ -610,42 +610,18 @@ function App() {
       const prevStates = prevTransferStatesRef.current;
       const nextStates = new Map(list.map((t) => [t.id, t.state]));
       const newlyFailed = [];
-      const newlyCompletedUploads = [];
       if (prevStates !== null) {
         for (const item of list) {
           const prev = prevStates.get(item.id);
           if (item.state === 'failed' && prev !== 'failed') {
             newlyFailed.push(item);
           }
-          if (item.direction === 'upload' && item.state === 'done' && prev !== 'done') {
-            newlyCompletedUploads.push(item);
-          }
         }
+        folderChanges.observeDeviceTransfers(list, prevStates);
       }
       prevTransferStatesRef.current = nextStates;
       deviceTransfersRef.current = list;
       setDeviceTransfers(list);
-
-      if (newlyCompletedUploads.length > 0) {
-        const stillRunningDirs = new Set();
-        for (const t of list) {
-          if (t.direction === 'upload' && (t.state === 'running' || t.state === 'queued')) {
-            const dir = parentFilePath(t.path) || '~';
-            stillRunningDirs.add(`${t.machine}\0${folderChanges.canonicalize(t.machine, dir)}`);
-          }
-        }
-        const announced = new Set();
-        for (const item of newlyCompletedUploads) {
-          const dir = parentFilePath(item.path) || '~';
-          const key = `${item.machine}\0${folderChanges.canonicalize(item.machine, dir)}`;
-          if (announced.has(key)) continue;
-          announced.add(key);
-          folderChanges.changed(item.machine, dir, {
-            throttle: stillRunningDirs.has(key),
-            reason: 'upload',
-          });
-        }
-      }
 
       const currentToast = toastRef.current;
       if (

@@ -254,6 +254,70 @@ test('observeTransferJobs announces destination progress and final destination +
   store.dispose();
 });
 
+test('observeDeviceTransfers and observeTransferJobs announce nothing on cancelling/cancelled and announce on done', () => {
+  const clock = createFakeClock();
+  const store = createFolderChangesStore({
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  });
+  const events = [];
+  store.subscribe('tower', '/home/me/Documents', (ev) => events.push(ev));
+
+  // Device upload: queued -> running -> cancelling -> cancelled announces nothing.
+  let prev = new Map();
+  const stepTransfers = (list) => {
+    store.observeDeviceTransfers(list, prev);
+    prev = new Map(list.map((t) => [t.id, t.state]));
+  };
+  const baseUp = {
+    id: 'up-cancel',
+    direction: 'upload',
+    machine: 'tower',
+    path: '/home/me/Documents/partial.bin',
+  };
+  stepTransfers([{ ...baseUp, state: 'queued' }]);
+  stepTransfers([{ ...baseUp, state: 'running' }]);
+  stepTransfers([{ ...baseUp, state: 'cancelling' }]);
+  stepTransfers([{ ...baseUp, state: 'cancelled' }]);
+  assert.equal(events.length, 0, 'Cancelling and cancelled uploads must announce nothing');
+
+  // Background transfer job: running -> cancelling -> cancelled announces nothing.
+  const seenJobs = new Map();
+  const baseJob = {
+    id: 'j-cancel',
+    kind: 'transfer',
+    machine: 'tower',
+    from: '/home/me/Inbox/clip.mp4',
+    to: 'tower:/home/me/Documents/clip.mp4',
+    progress: { files_done: 0, files_total: 1 },
+  };
+  store.observeTransferJobs([{ ...baseJob, state: 'running' }], seenJobs);
+  store.observeTransferJobs([{ ...baseJob, state: 'cancelling' }], seenJobs);
+  store.observeTransferJobs([{ ...baseJob, state: 'cancelled' }], seenJobs);
+  assert.equal(events.length, 0, 'Cancelling and cancelled jobs must announce nothing');
+
+  // A finished upload DOES announce (unthrottled even when a sibling upload is cancelling).
+  const okUp = {
+    id: 'up-ok',
+    direction: 'upload',
+    machine: 'tower',
+    path: '/home/me/Documents/finished.txt',
+  };
+  stepTransfers([
+    { ...baseUp, state: 'cancelling' },
+    { ...okUp, state: 'running' },
+  ]);
+  assert.equal(events.length, 0);
+  stepTransfers([
+    { ...baseUp, state: 'cancelling' },
+    { ...okUp, state: 'done' },
+  ]);
+  assert.equal(events.length, 1, 'Finished upload must announce changed folder immediately');
+  assert.equal(events[0].reason, 'upload');
+  store.dispose();
+});
+
 test('createCoalescedRefetch never overlaps and coalesces multiple bursts into one follow-up', async () => {
   let active = 0;
   let maxConcurrent = 0;

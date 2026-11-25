@@ -378,7 +378,10 @@ export function ActivityGroups({
     const out = (jobs || []).map((j) => ({ _kind: 'job', ...j }));
     for (const t of deviceTransfers || []) {
       const mappedState =
-        t.state === 'running' || t.state === 'queued' || t.state === 'paused'
+        t.state === 'running' ||
+        t.state === 'queued' ||
+        t.state === 'paused' ||
+        t.state === 'cancelling'
           ? 'running'
           : t.state === 'done'
             ? 'succeeded'

@@ -517,13 +517,51 @@ test('live folder refresh updates open folders on upload, background copy, renam
       'Must not refetch on visibilitychange when data is fresher than 10 seconds',
     );
 
-    // Advance Date.now by 11 seconds and fire visibilitychange -> must refetch once and show the external file.
+    // 5b. An upload transitioning running -> cancelling -> cancelled must announce nothing
+    // (so the unannounced external file stays absent), whereas a finished upload DOES announce.
     await page.evaluate(() => {
+      window.__LEGION_MOCK__.simulateUploadTransition(
+        'tower',
+        '/home/me/Documents/LiveCreated',
+        'aborted-upload.txt',
+        ['running', 'cancelling', 'cancelled'],
+      );
+    });
+    await page.waitForTimeout(250);
+    assert.equal(
+      await page.locator('main .list .row .title', { hasText: 'from-keyboard.txt' }).count(),
+      0,
+      'Cancelling/cancelled upload must not trigger a folder refetch',
+    );
+    assert.equal(
+      await page.locator('main .list .row .title', { hasText: 'aborted-upload.txt' }).count(),
+      0,
+      'Cancelled upload must not appear in the folder',
+    );
+
+    // Now simulate a finished upload into the same open folder -> announces and refreshes immediately.
+    await page.evaluate(() => {
+      window.__LEGION_MOCK__.simulateUploadTransition(
+        'tower',
+        '/home/me/Documents/LiveCreated',
+        'completed-upload.txt',
+        ['running', 'done'],
+      );
+    });
+    await page.locator('main .list .row .title', { hasText: 'completed-upload.txt' }).waitFor({
+      state: 'visible',
+      timeout: 5000,
+    });
+    await page.waitForTimeout(200);
+
+    // Advance Date.now by 11 seconds with a second external file and fire visibilitychange -> must refetch once.
+    await page.evaluate(() => {
+      window.__LEGION_MOCK__.addExternalFile('tower', '/home/me/Documents/LiveCreated', 'from-keyboard-later.txt');
       const realNow = Date.now.bind(Date);
       Date.now = () => realNow() + 11_000;
       document.dispatchEvent(new Event('visibilitychange'));
     });
-    await page.locator('main .list .row .title', { hasText: 'from-keyboard.txt' }).waitFor({
+    await page.locator('main .list .row .title', { hasText: 'from-keyboard-later.txt' }).waitFor({
       state: 'visible',
       timeout: 5000,
     });

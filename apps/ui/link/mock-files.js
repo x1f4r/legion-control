@@ -1092,12 +1092,7 @@ export function createMockFilesState({
       for (const t of deviceTransfers) {
         if (t.state !== 'running') continue;
         // Keep the demo row moving gently so screenshots stay near ~25-45% while user-started ones progress clearly.
-        const step =
-          t.id === 'dt-live-1'
-            ? Math.max(1_500_000, Math.floor(t.bytes_total * 0.01))
-            : t.bytes_total < 256_000
-              ? Math.max(1, Math.ceil(t.bytes_total * 0.25))
-              : Math.max(256_000, Math.floor(t.bytes_total * 0.18));
+        const step = t.id === 'dt-live-1' ? Math.max(1_500_000, Math.floor(t.bytes_total * 0.01)) : Math.max(256_000, Math.floor(t.bytes_total * 0.18));
         t.bytes_done = Math.min(t.bytes_total, t.bytes_done + step);
         t.rate = step * 3;
         changed = true;
@@ -2044,6 +2039,7 @@ export function createMockFilesState({
               ensureTransferPump();
             }
           } else if (action === 'cancel') {
+            delete item._mockPendingUpload;
             item.state = 'cancelled';
             item.rate = 0;
             item.finished = new Date().toISOString();
@@ -2106,6 +2102,45 @@ export function createMockFilesState({
         };
         m.jobs.unshift(entry);
         return entry;
+      },
+      simulateUploadTransition(machineName, dirPath, name, states) {
+        const normDir = normalizePath(dirPath || '~');
+        const destPath = joinFilePath(normDir, name);
+        const id = `dt-sim-${transferSeq++}`;
+        const item = {
+          id,
+          direction: 'upload',
+          machine: machineName,
+          path: destPath,
+          name,
+          localPath: `Device/${name}`,
+          mime: mimeFromName(name),
+          state: 'queued',
+          bytes_done: 0,
+          bytes_total: 1024,
+          rate: 0,
+          error: null,
+          created: new Date().toISOString(),
+          finished: null,
+          hash: null,
+          canOpen: false,
+        };
+        deviceTransfers.unshift(item);
+        for (const st of states || []) {
+          item.state = st;
+          if (st === 'done') {
+            item.bytes_done = item.bytes_total;
+            item.finished = new Date().toISOString();
+            const list = trees[machineName]?.get(normDir);
+            if (list && !list.some((e) => e.path === destPath)) {
+              list.push(makeEntry(destPath, { size: item.bytes_total, mtime: item.finished }));
+            }
+          } else if (st === 'cancelled' || st === 'failed') {
+            item.finished = new Date().toISOString();
+          }
+          emitTransfers();
+        }
+        return id;
       },
     };
   }

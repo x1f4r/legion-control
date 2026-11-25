@@ -1439,8 +1439,9 @@ pub(crate) async fn handshake_get(
     as_principal: Option<&str>,
     timeout: Duration,
     cancel: CancellationToken,
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<ContentStream, ErrorBody> {
-    handshake_get_with_options(
+    handshake_get_inner(
         stream,
         opener,
         machine,
@@ -1451,10 +1452,12 @@ pub(crate) async fn handshake_get(
         timeout,
         cancel,
         ContentStreamOptions::default(),
+        on_greeting_capabilities,
     )
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handshake_get_with_options(
     stream: RawStream,
@@ -1467,6 +1470,36 @@ pub(crate) async fn handshake_get_with_options(
     timeout: Duration,
     cancel: CancellationToken,
     options: ContentStreamOptions,
+) -> Result<ContentStream, ErrorBody> {
+    handshake_get_inner(
+        stream,
+        opener,
+        machine,
+        path,
+        offset,
+        length,
+        as_principal,
+        timeout,
+        cancel,
+        options,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handshake_get_inner(
+    stream: RawStream,
+    opener: Option<Arc<dyn StreamOpener>>,
+    machine: &str,
+    path: &str,
+    offset: u64,
+    length: Option<u64>,
+    as_principal: Option<&str>,
+    timeout: Duration,
+    cancel: CancellationToken,
+    options: ContentStreamOptions,
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<ContentStream, ErrorBody> {
     let policy = opener
         .as_ref()
@@ -1489,6 +1522,7 @@ pub(crate) async fn handshake_get_with_options(
         timeout,
         options.max_busy_lines,
         cancel,
+        on_greeting_capabilities,
     )
     .await?;
 
@@ -1646,6 +1680,7 @@ async fn reopen_keep_open_channel(
         timeout,
         max_busy_lines,
         cancel,
+        None,
     )
     .await
     .map_err(|err| {
@@ -1730,6 +1765,7 @@ async fn open_continuation_chunk(
         timeout,
         DEFAULT_MAX_BUSY_LINES,
         cancel,
+        None,
     )
     .await
     .map_err(|err| io::Error::other(err.message))?;
@@ -1758,6 +1794,7 @@ async fn open_one_chunk(
     timeout: Duration,
     max_busy_lines: usize,
     cancel: CancellationToken,
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<(OpenedChannel, ValidatedGet), ErrorBody> {
     let RawStream {
         reader,
@@ -1780,7 +1817,14 @@ async fn open_one_chunk(
             .flush()
             .await
             .map_err(|err| stream_io_error(machine, "flushing stream header", &err, &stderr))?;
-        read_get_ready(&mut buf_reader, machine, &stderr, max_busy_lines).await
+        read_get_ready(
+            &mut buf_reader,
+            machine,
+            &stderr,
+            max_busy_lines,
+            on_greeting_capabilities,
+        )
+        .await
     };
 
     let ready = tokio::select! {
@@ -1845,6 +1889,7 @@ async fn read_get_ready<R: AsyncRead + Unpin>(
     machine: &str,
     stderr: &Option<Arc<StderrTail>>,
     max_busy_lines: usize,
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<GetReadyReply, ErrorBody> {
     let mut greeted = false;
     let mut noise_lines = 0usize;
@@ -1884,6 +1929,9 @@ async fn read_get_ready<R: AsyncRead + Unpin>(
                         )
                         .with_hint("Update legion so both sides speak the same stream protocol.")
                         .with_machine(machine));
+                    }
+                    if let Some(cb) = on_greeting_capabilities {
+                        cb(crate::put::parse_greeting_capabilities(&fields));
                     }
                     greeted = true;
                     continue;

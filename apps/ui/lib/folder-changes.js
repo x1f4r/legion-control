@@ -374,6 +374,44 @@ export function createFolderChangesStore({
   }
 
   /**
+   * Observes device transfer queue snapshots (from `link.transfers` / `link.onTransferEvent`)
+   * and announces destination folders ONLY when an upload transitions into `done`.
+   * Transfers that are `queued`, `running`, `paused`, `cancelling`, `cancelled`, or `failed`
+   * announce nothing.
+   */
+  function observeDeviceTransfers(list, prevStates) {
+    if (!Array.isArray(list)) return;
+    if (!(prevStates instanceof Map)) return;
+    const newlyCompletedUploads = [];
+    for (const item of list) {
+      if (!item || item.direction !== 'upload' || !item.id) continue;
+      if (item.state === 'done' && prevStates.get(item.id) !== 'done') {
+        newlyCompletedUploads.push(item);
+      }
+    }
+    if (newlyCompletedUploads.length === 0) return;
+
+    const stillRunningDirs = new Set();
+    for (const t of list) {
+      if (t?.direction === 'upload' && (t.state === 'running' || t.state === 'queued')) {
+        const dir = parentFilePath(t.path) || '~';
+        stillRunningDirs.add(`${t.machine}\0${canonicalize(t.machine, dir)}`);
+      }
+    }
+    const announced = new Set();
+    for (const item of newlyCompletedUploads) {
+      const dir = parentFilePath(item.path) || '~';
+      const key = `${item.machine}\0${canonicalize(item.machine, dir)}`;
+      if (announced.has(key)) continue;
+      announced.add(key);
+      changed(item.machine, dir, {
+        throttle: stillRunningDirs.has(key),
+        reason: 'upload',
+      });
+    }
+  }
+
+  /**
    * Observes transfer jobs (from `job.list`, `job.status`, or fleet snapshots) and announces
    * destination (and source for move) folder changes on progress and completion.
    */
@@ -437,6 +475,7 @@ export function createFolderChangesStore({
     setCached,
     deleteCached,
     clearCache,
+    observeDeviceTransfers,
     observeTransferJobs,
     dispose,
   };
