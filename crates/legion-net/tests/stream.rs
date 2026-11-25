@@ -136,7 +136,7 @@ fn after_protocol(output: &[u8]) -> &[u8] {
     assert_eq!(opening["protocol"], json!(STREAM_PROTOCOL), "{opening}");
     assert_eq!(
         opening["capabilities"],
-        json!(["if_exists", "lock", "move", "probe", "rename"]),
+        json!(legion_net::stream::STREAM_CAPABILITIES),
         "{opening}"
     );
     &output[end + 1..]
@@ -1222,27 +1222,210 @@ allow = ["effect:read", "effect:write", "effect:destroy"]
     assert!(node.home().join("projects/a.txt").exists());
     assert!(!node.home().join("projects/b.txt").exists());
 
-    // 3. `probe_write remove` never unlinks a non-empty file even if named like a probe marker.
-    let fake_probe = node.home().join("projects/.legion-move-probe-fake.tmp");
-    fs::write(&fake_probe, b"non-empty-user-data").unwrap();
+    // 3. `probe_write remove` never unlinks non-empty or unowned empty files even if named like a
+    //    probe marker, and DOES unlink markers it created with a matching ownership record.
+    #[cfg(feature = "move-between-places")]
+    {
+        let fake_probe = node.home().join("projects/.legion-move-probe-fake.tmp");
+        fs::write(&fake_probe, b"non-empty-user-data").unwrap();
+        node.run(
+            None,
+            &json!({
+                "op": "probe_write",
+                "action": "remove",
+                "dir": "~/projects",
+                "marker": ".legion-move-probe-fake.tmp"
+            }),
+            b"",
+        )
+        .ok();
+        assert_eq!(
+            fs::read(&fake_probe).unwrap(),
+            b"non-empty-user-data",
+            "probe_write remove must never delete non-empty files"
+        );
+
+        let unowned_empty = node.home().join("projects/.legion-move-probe-unowned.tmp");
+        fs::write(&unowned_empty, b"").unwrap();
+        node.run(
+            None,
+            &json!({
+                "op": "probe_write",
+                "action": "remove",
+                "dir": "~/projects",
+                "marker": ".legion-move-probe-unowned.tmp"
+            }),
+            b"",
+        )
+        .ok();
+        assert!(
+            unowned_empty.exists(),
+            "probe_write remove must never delete an unowned 0-byte file by name"
+        );
+
+        let created = node
+            .run(
+                None,
+                &json!({
+                    "op": "probe_write",
+                    "action": "create",
+                    "dir": "~/projects"
+                }),
+                b"",
+            )
+            .ok()
+            .first()
+            .0;
+        let marker_name = created["marker"].as_str().unwrap();
+        assert!(node.home().join("projects").join(marker_name).exists());
+        node.run(
+            None,
+            &json!({
+                "op": "probe_write",
+                "action": "remove",
+                "dir": "~/projects",
+                "marker": marker_name
+            }),
+            b"",
+        )
+        .ok();
+        assert!(
+            !node.home().join("projects").join(marker_name).exists(),
+            "probe_write remove should unlink its own recorded probe marker"
+        );
+    }
+}
+
+#[cfg(not(feature = "move-between-places"))]
+#[test]
+fn move_only_stream_ops_are_refused_and_capabilities_omitted() {
+    let node = Node::new();
+    fs::write(node.home().join("projects/keep.txt"), b"keep").unwrap();
+
+    // Greeting advertises `if_exists` and `rename`, and omits `lock`, `move`, and `probe`.
+    let stat_ran = node.run(
+        None,
+        &json!({"op": "stat", "path": "~/projects/keep.txt"}),
+        b"",
+    );
+    stat_ran.ok();
+    let nl = stat_ran.output.iter().position(|&b| b == b'\n').unwrap();
+    let greeting: Value = serde_json::from_slice(&stat_ran.output[..nl]).unwrap();
+    let caps = greeting["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&json!("if_exists")), "{greeting}");
+    assert!(caps.contains(&json!("rename")), "{greeting}");
+    assert!(!caps.contains(&json!("lock")), "{greeting}");
+    assert!(!caps.contains(&json!("move")), "{greeting}");
+    assert!(!caps.contains(&json!("probe")), "{greeting}");
+
+    // Move-only operations and move-only `delete` fields are all refused with `unsupported`.
+    let keep_hash = hash(b"keep");
+    for header in [
+        json!({"op": "lock", "paths": ["~/projects/keep.txt"]}),
+        json!({"op": "probe_write", "action": "create", "dir": "~/projects"}),
+        json!({"op": "probe_write", "action": "behavior", "dir": "~/projects"}),
+        json!({"op": "probe_read", "dir": "~/projects", "marker": ".legion-move-probe-x.tmp"}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "remove_root": true}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "dry_run": true}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "expect_root_hash": keep_hash}),
+        json!({"op": "delete", "root": "~/projects", "names": ["keep.txt"], "expect_hashes": {"keep.txt": keep_hash}}),
+        json!({"op": "delete", "root": "~/projects/keep.txt", "names": [], "forbid_file_id": [1, 2]}),
+        json!({"op": "delete", "root": "~/projects", "names": ["keep.txt"], "lock_id": "0123456789abcdef0123456789abcdef"}),
+    ] {
+        node.run(None, &header, b"").refused(ErrorCode::Unsupported);
+    }
+    assert_eq!(
+        fs::read(node.home().join("projects/keep.txt")).unwrap(),
+        b"keep",
+        "refused move-only delete must never touch files"
+    );
+
+    // Plain `delete` (syncing extra entries in a destination tree) still works.
+    let done = node
+        .run(
+            None,
+            &json!({"op": "delete", "root": "~/projects", "names": ["keep.txt"]}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(done["removed"], json!(1), "{done}");
+    assert!(!node.home().join("projects/keep.txt").exists());
+}
+
+#[test]
+fn stat_and_manifest_never_mutate_pending_renames() {
+    let node = Node::new();
+    let dir = node.home().join("projects/rec");
+    fs::create_dir_all(&dir).unwrap();
+    let temp_name = "legion-renaming-42-1-Draft.txt";
+    fs::write(dir.join(temp_name), b"payload").unwrap();
+    let renames_dir = node
+        .dir
+        .path()
+        .join("legion")
+        .join("state")
+        .join("xfer")
+        .join("renames");
+    fs::create_dir_all(&renames_dir).unwrap();
+    let intent_path = renames_dir.join("pending.json");
+    fs::write(
+        &intent_path,
+        serde_json::to_vec(&json!({
+            "parent": dir.to_string_lossy(),
+            "from_name": "Draft.txt",
+            "temp_name": temp_name,
+            "to_name": "draft.txt",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // `stat` and `manifest` are reads and must touch nothing.
+    let st = node
+        .run(
+            None,
+            &json!({"op": "stat", "path": "~/projects/rec/draft.txt"}),
+            b"",
+        )
+        .ok()
+        .first()
+        .0;
+    assert_eq!(st["kind"], json!("missing"), "{st}");
+    assert!(dir.join(temp_name).exists());
+    assert!(!dir.join("draft.txt").exists());
+    assert!(intent_path.exists());
+
     node.run(
         None,
-        &json!({
-            "op": "probe_write",
-            "action": "remove",
-            "dir": "~/projects",
-            "marker": ".legion-move-probe-fake.tmp"
-        }),
+        &json!({"op": "manifest", "root": "~/projects/rec"}),
         b"",
     )
     .ok();
-    assert_eq!(
-        fs::read(&fake_probe).unwrap(),
-        b"non-empty-user-data",
-        "probe_write remove must never delete non-empty files"
-    );
+    assert!(dir.join(temp_name).exists());
+    assert!(!dir.join("draft.txt").exists());
+    assert!(intent_path.exists());
+
+    // A write operation (`put`) in the same folder DOES recover the pending rename.
+    let body = b"other";
+    node.run(
+        None,
+        &json!({
+            "op": "put",
+            "path": "~/projects/rec/other.txt",
+            "size": body.len(),
+            "hash": hash(body),
+        }),
+        body,
+    )
+    .ok();
+    assert_eq!(fs::read(dir.join("draft.txt")).unwrap(), b"payload");
+    assert!(!dir.join(temp_name).exists());
+    assert!(!intent_path.exists());
 }
 
+#[cfg(feature = "move-between-places")]
 #[test]
 fn stream_lock_is_exclusive_and_returns_conflict_while_held() {
     use std::sync::mpsc;
@@ -1334,6 +1517,7 @@ fn stream_lock_is_exclusive_and_returns_conflict_while_held() {
     assert_eq!(after["locked"], true, "{after}");
 }
 
+#[cfg(feature = "move-between-places")]
 #[test]
 fn stream_lock_lease_expiry_quota_cleanup_metadata_privacy_and_holder_visibility() {
     use std::sync::mpsc;

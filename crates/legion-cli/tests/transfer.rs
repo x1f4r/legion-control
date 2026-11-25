@@ -110,9 +110,15 @@ fn main() -> ExitCode {
             "if_exists_modes_and_concurrent_rename_race",
             if_exists_modes_and_concurrent_rename_race,
         ),
+        #[cfg(feature = "move-between-places")]
         (
             "move_refusals_dry_run_and_kill_at_every_stage",
             move_refusals_dry_run_and_kill_at_every_stage,
+        ),
+        #[cfg(not(feature = "move-between-places"))]
+        (
+            "move_between_places_is_refused_and_unadvertised",
+            move_between_places_is_refused_and_unadvertised,
         ),
         (
             "background_transfer_outlives_caller_progress_owner_cancel_resume_and_paths",
@@ -122,6 +128,7 @@ fn main() -> ExitCode {
             "favourites_two_node_convergence_auto_push_and_hostile_peer",
             favourites_two_node_convergence_auto_push_and_hostile_peer,
         ),
+        #[cfg(feature = "move-between-places")]
         (
             "move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename",
             move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename,
@@ -138,10 +145,12 @@ fn main() -> ExitCode {
             "stale_partial_restart_reports_honest_per_attempt_progress",
             stale_partial_restart_reports_honest_per_attempt_progress,
         ),
+        #[cfg(feature = "move-between-places")]
         (
             "move_tree_shared_subfolder_and_inconclusive_probe_keep_source",
             move_tree_shared_subfolder_and_inconclusive_probe_keep_source,
         ),
+        #[cfg(feature = "move-between-places")]
         (
             "crossing_moves_same_node_and_two_nodes_never_lose_data",
             crossing_moves_same_node_and_two_nodes_never_lose_data,
@@ -150,6 +159,7 @@ fn main() -> ExitCode {
             "stream_rename_privilege_and_visible_interrupted_recovery",
             stream_rename_privilege_and_visible_interrupted_recovery,
         ),
+        #[cfg(feature = "move-between-places")]
         (
             "move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop",
             move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop,
@@ -930,7 +940,7 @@ fn first_reply(stdout: &[u8]) -> Value {
     assert_eq!(opening["protocol"], json!(1));
     assert_eq!(
         opening["capabilities"],
-        json!(["if_exists", "lock", "move", "probe", "rename"])
+        json!(legion_net::stream::STREAM_CAPABILITIES)
     );
     serde_json::from_slice(lines.next().unwrap()).unwrap()
 }
@@ -2789,6 +2799,7 @@ fn if_exists_modes_and_concurrent_rename_race() {
     assert_eq!(fs::read(pi.home().join("race.bin")).unwrap(), b"initial");
 }
 
+#[cfg(feature = "move-between-places")]
 fn move_refusals_dry_run_and_kill_at_every_stage() {
     let laptop = node("laptop");
     let pi = node("pi");
@@ -3564,6 +3575,7 @@ fn favourites_two_node_convergence_auto_push_and_hostile_peer() {
     );
 }
 
+#[cfg(feature = "move-between-places")]
 fn move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename() {
     let laptop = node("laptop");
     // Register `twin` in `fleet.toml` pointing at `laptop`'s OWN home & config (same-machine alias).
@@ -4106,25 +4118,28 @@ fn older_v1_peer_copies_work_and_new_features_are_refused() {
 
     // 3. `move: true` is refused in BOTH directions with `unsupported`, naming `old_pi`, and leaves
     //    both source and destination untouched.
-    let err_push_move = refused(&transfer(
-        &laptop,
-        json!({"from": "~/updated.txt", "to": "old_pi:~/moved_to_old.txt", "move": true}),
-        &[],
-    ));
-    assert_eq!(err_push_move["code"], "unsupported", "{err_push_move}");
-    assert_eq!(err_push_move["machine"], "old_pi", "{err_push_move}");
-    assert!(laptop.home().join("updated.txt").exists());
-    assert!(!old_pi.home().join("moved_to_old.txt").exists());
+    #[cfg(feature = "move-between-places")]
+    {
+        let err_push_move = refused(&transfer(
+            &laptop,
+            json!({"from": "~/updated.txt", "to": "old_pi:~/moved_to_old.txt", "move": true}),
+            &[],
+        ));
+        assert_eq!(err_push_move["code"], "unsupported", "{err_push_move}");
+        assert_eq!(err_push_move["machine"], "old_pi", "{err_push_move}");
+        assert!(laptop.home().join("updated.txt").exists());
+        assert!(!old_pi.home().join("moved_to_old.txt").exists());
 
-    let err_pull_move = refused(&transfer(
-        &laptop,
-        json!({"from": "old_pi:~/from_old.txt", "to": "~/moved_from_old.txt", "move": true}),
-        &[],
-    ));
-    assert_eq!(err_pull_move["code"], "unsupported", "{err_pull_move}");
-    assert_eq!(err_pull_move["machine"], "old_pi", "{err_pull_move}");
-    assert!(old_pi.home().join("from_old.txt").exists());
-    assert!(!laptop.home().join("moved_from_old.txt").exists());
+        let err_pull_move = refused(&transfer(
+            &laptop,
+            json!({"from": "old_pi:~/from_old.txt", "to": "~/moved_from_old.txt", "move": true}),
+            &[],
+        ));
+        assert_eq!(err_pull_move["code"], "unsupported", "{err_pull_move}");
+        assert_eq!(err_pull_move["machine"], "old_pi", "{err_pull_move}");
+        assert!(old_pi.home().join("from_old.txt").exists());
+        assert!(!laptop.home().join("moved_from_old.txt").exists());
+    }
 }
 
 fn revoking_device_or_policy_stops_running_transfer_and_live_stream() {
@@ -4160,19 +4175,22 @@ allow = ["effect:read"]
     pi.write_config("policy.toml", device_policy);
 
     // 1. Background `move: true` requires `effect:destroy` up front (not merely `effect:write`).
-    fs::write(laptop.home().join("no_destroy.bin"), b"keep-me").unwrap();
-    let err_destroy = refused(&transfer(
-        &laptop,
-        json!({
-            "from": "~/no_destroy.bin",
-            "to": "pi:~/no_destroy.bin",
-            "move": true,
-            "background": true
-        }),
-        &["--as", "write_only"],
-    ));
-    assert_eq!(err_destroy["code"], "denied", "{err_destroy}");
-    assert!(laptop.home().join("no_destroy.bin").exists());
+    #[cfg(feature = "move-between-places")]
+    {
+        fs::write(laptop.home().join("no_destroy.bin"), b"keep-me").unwrap();
+        let err_destroy = refused(&transfer(
+            &laptop,
+            json!({
+                "from": "~/no_destroy.bin",
+                "to": "pi:~/no_destroy.bin",
+                "move": true,
+                "background": true
+            }),
+            &["--as", "write_only"],
+        ));
+        assert_eq!(err_destroy["code"], "denied", "{err_destroy}");
+        assert!(laptop.home().join("no_destroy.bin").exists());
+    }
 
     // 2. Removing a paired device via `device.remove` cancels its running background transfer job!
     let auth_keys_path = laptop.home().join(".ssh/authorized_keys");
@@ -4646,6 +4664,7 @@ fn stale_partial_restart_reports_honest_per_attempt_progress() {
     assert_eq!(fs::read(pi.home().join("restart.bin")).unwrap(), body);
 }
 
+#[cfg(feature = "move-between-places")]
 fn move_tree_shared_subfolder_and_inconclusive_probe_keep_source() {
     let laptop = node("laptop");
 
@@ -4964,6 +4983,7 @@ fn move_tree_shared_subfolder_and_inconclusive_probe_keep_source() {
     }
 }
 
+#[cfg(feature = "move-between-places")]
 fn crossing_moves_same_node_and_two_nodes_never_lose_data() {
     let payload = b"identical-crossing-move-payload-must-survive";
 
@@ -5118,12 +5138,14 @@ allow = ["effect:read", "effect:write", "effect:destroy"]
     assert!(!laptop.home().join("other.txt").exists());
 
     // 2. Simulated interrupted two-step rename: visible `legion-renaming-*` file + state-dir
-    //    intent JSON. A subsequent `stream` `manifest` recovers it cleanly to `target.txt` and
-    //    clears the intent record!
+    //    intent JSON. Read operations (`stat`, `manifest`, copying *from* `rec`) must touch
+    //    nothing, while a write operation into `rec` (`fs.transfer` writing to `rec`) recovers it
+    //    cleanly to `target.txt` and clears the intent record!
     let rec_dir = laptop.home().join("rec");
     fs::create_dir_all(&rec_dir).unwrap();
     let temp_name = "legion-renaming-999-1-Target.txt";
     fs::write(rec_dir.join(temp_name), b"recovered-body").unwrap();
+    fs::write(rec_dir.join("seed.txt"), b"seed-data").unwrap();
     let renames_dir = laptop.state().join("xfer").join("renames");
     fs::create_dir_all(&renames_dir).unwrap();
     let intent_path = renames_dir.join("test-intent.json");
@@ -5139,9 +5161,35 @@ allow = ["effect:read", "effect:write", "effect:destroy"]
     )
     .unwrap();
 
-    // Running `stat` on `rec/target.txt` triggers recovery automatically.
+    // `stat` and `manifest` are reads and must NOT recover or modify `rec`.
     let st = stream_request(&laptop, json!({"op": "stat", "path": "~/rec/target.txt"}));
-    assert_eq!(st["kind"], "file", "{st}");
+    assert_eq!(st["kind"], "missing", "{st}");
+    assert!(rec_dir.join(temp_name).exists());
+    assert!(!rec_dir.join("target.txt").exists());
+    assert!(intent_path.exists());
+
+    let _ = stream_request(&laptop, json!({"op": "manifest", "root": "~/rec"}));
+    assert!(rec_dir.join(temp_name).exists());
+    assert!(!rec_dir.join("target.txt").exists());
+    assert!(intent_path.exists());
+
+    // Copying *from* `~/rec` (source side) must NOT mutate `~/rec`.
+    ok(&transfer(
+        &laptop,
+        json!({"from": "~/rec", "to": "~/rec_copy"}),
+        &[],
+    ));
+    assert!(rec_dir.join(temp_name).exists());
+    assert!(!rec_dir.join("target.txt").exists());
+    assert!(intent_path.exists());
+
+    // Writing *into* `~/rec` (`fs.transfer` writing a file there) DOES recover `target.txt`!
+    fs::write(laptop.home().join("incoming.txt"), b"hello").unwrap();
+    ok(&transfer(
+        &laptop,
+        json!({"from": "~/incoming.txt", "to": "~/rec/incoming.txt"}),
+        &[],
+    ));
     assert_eq!(
         fs::read(rec_dir.join("target.txt")).unwrap(),
         b"recovered-body"
@@ -5150,6 +5198,106 @@ allow = ["effect:read", "effect:write", "effect:destroy"]
     assert!(!intent_path.exists());
 }
 
+#[cfg(not(feature = "move-between-places"))]
+fn move_between_places_is_refused_and_unadvertised() {
+    let laptop = node("laptop");
+    let pi = node("pi");
+    fleet(&laptop, &[("pi", &pi, "node", vec![])]);
+    fs::write(laptop.home().join("note.txt"), b"keep-original").unwrap();
+
+    let expected_msg =
+        "Moving is not available yet. Copy it, check the copy, then delete the original.";
+
+    // 1. Foreground, dry-run, and background `fs.transfer` with `move: true` are all refused
+    //    before copying anything or spawning a job.
+    for extra in [
+        json!({}),
+        json!({"dry_run": true}),
+        json!({"background": true}),
+    ] {
+        let mut args = json!({
+            "from": "~/note.txt",
+            "to": "pi:~/note.txt",
+            "move": true,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        let err = refused(&transfer(&laptop, args, &[]));
+        assert_eq!(err["code"], "unsupported", "{err}");
+        assert_eq!(err["message"], expected_msg, "{err}");
+    }
+    assert_eq!(
+        fs::read(laptop.home().join("note.txt")).unwrap(),
+        b"keep-original"
+    );
+    assert!(!pi.home().join("note.txt").exists());
+    let jobs = ok(&call_tool(&laptop, "job.list", json!({}), &[]));
+    assert!(
+        jobs["jobs"].as_array().unwrap().is_empty(),
+        "refused background move must not create any job: {jobs}"
+    );
+
+    // 2. Tool catalog omits `move` from `fs.transfer`'s schema properties.
+    let tools_out = laptop.run(&["tools", "--json"]);
+    assert_eq!(
+        tools_out.code, 0,
+        "tools --json failed: stdout={} stderr={}",
+        tools_out.stdout, tools_out.stderr
+    );
+    let tools: Value = serde_json::from_str(&tools_out.stdout).unwrap();
+    let transfer_spec = tools
+        .as_array()
+        .or_else(|| tools.get("tools").and_then(Value::as_array))
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "fs.transfer")
+        .unwrap();
+    let props = transfer_spec["input_schema"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(
+        !props.contains_key("move"),
+        "default build must not advertise move in fs.transfer schema: {props:?}"
+    );
+
+    // 3. Direct `legion stream` refuses move-only ops and conditional move `delete` fields.
+    for mut header in [
+        json!({"op": "lock", "paths": ["~/note.txt"]}),
+        json!({"op": "probe_write", "action": "create", "dir": "~"}),
+        json!({"op": "probe_read", "dir": "~", "marker": ".legion-move-probe-x.tmp"}),
+        json!({"op": "delete", "root": "~/note.txt", "names": [], "remove_root": true}),
+        json!({"op": "delete", "root": "~/note.txt", "names": [], "expect_root_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000"}),
+    ] {
+        header["protocol"] = json!(1);
+        let mut child = Command::new(LEGION_BIN)
+            .arg("stream")
+            .env("LEGION_HOME", legion_home_of(&laptop))
+            .env("HOME", laptop.home())
+            .env("USERPROFILE", laptop.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            writeln!(stdin, "{header}").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            !out.status.success(),
+            "expected stream refusal for {header}"
+        );
+        let reply = first_reply(&out.stdout);
+        assert_eq!(reply["error"]["code"], "unsupported", "{reply}");
+    }
+    assert!(laptop.home().join("note.txt").exists());
+}
+
+#[cfg(feature = "move-between-places")]
 fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
     let run_transfer_env = |who: &Home, args_val: Value, envs: &[(&str, &str)]| -> Run {
         let args_text = args_val.to_string();

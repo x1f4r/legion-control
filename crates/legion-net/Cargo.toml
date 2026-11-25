@@ -7,6 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Enables moving files and trees between places (`fs.transfer` with `move: true` and the stream
+# `lock`, `probe_write`, `probe_read`, and conditional `delete` operations that serve it). Off by
+# default while moving between places is reworked.
+move-between-places = []
+
 [dependencies]
 base64.workspace = true
 getrandom.workspace = true

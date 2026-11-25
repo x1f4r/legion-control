@@ -97,8 +97,12 @@ pub const CAP_PROBE: &str = "probe";
 pub const CAP_RENAME: &str = "rename";
 
 /// Capabilities advertised in this node's stream greeting line.
+#[cfg(feature = "move-between-places")]
 pub const STREAM_CAPABILITIES: [&str; 5] =
     [CAP_IF_EXISTS, CAP_LOCK, CAP_MOVE, CAP_PROBE, CAP_RENAME];
+/// Capabilities advertised in this node's stream greeting line.
+#[cfg(not(feature = "move-between-places"))]
+pub const STREAM_CAPABILITIES: [&str; 2] = [CAP_IF_EXISTS, CAP_RENAME];
 
 /// How often an operation at work on something long says so, where a reply line is awaited.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
@@ -117,6 +121,7 @@ const RECHECK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 static STREAM_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The operations this node knows, as `unsupported` names them.
+#[cfg(feature = "move-between-places")]
 const OPS: [&str; 11] = [
     "manifest",
     "stat",
@@ -129,6 +134,11 @@ const OPS: [&str; 11] = [
     "probe_read",
     "rename",
     "lock",
+];
+/// The operations this node knows, as `unsupported` names them.
+#[cfg(not(feature = "move-between-places"))]
+const OPS: [&str; 8] = [
+    "manifest", "stat", "get", "put", "pack", "unpack", "delete", "rename",
 ];
 
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
@@ -1276,6 +1286,28 @@ fn parse_header_bytes(line: &[u8]) -> Result<(Header, Value), ErrorBody> {
         )
         .with_hint("op is one of manifest, stat, get, put, pack, unpack and delete.")
     })?;
+    #[cfg(not(feature = "move-between-places"))]
+    if let Op::Delete {
+        dry_run,
+        remove_root,
+        expect_hashes,
+        expect_root_hash,
+        forbid_file_id,
+        lock_id,
+        ..
+    } = &header.op
+        && (*dry_run
+            || *remove_root
+            || !expect_hashes.is_empty()
+            || expect_root_hash.is_some()
+            || forbid_file_id.is_some()
+            || lock_id.is_some())
+    {
+        return Err(unsupported(
+            "Moving between places is not enabled on this node; move-only delete options are unsupported."
+                .to_owned(),
+        ));
+    }
     let mut recorded = value;
     if let Value::Object(map) = &mut recorded {
         map.remove("as");
@@ -1815,17 +1847,6 @@ fn gone(error: &io::Error) -> ErrorBody {
     )
 }
 
-fn write_grant_for(host: &Host, principal: &str) -> Option<Grant> {
-    ConfigStore::new(host.paths.config_dir())
-        .get::<Policy>()
-        .ok()
-        .and_then(|policy| {
-            policy
-                .authorize_name(principal, "fs.write", Some(Effect::Write), &host.paths)
-                .ok()
-        })
-}
-
 fn can_write_rename_intent(grant: &Grant, parent: &Path, intent: &PendingRenameIntent) -> bool {
     grant.check_path(parent, Access::Write).is_ok()
         && legion_tools::fs::check_not_protected_tree(grant, parent).is_ok()
@@ -1851,14 +1872,6 @@ fn list<W: Write>(
     output: &mut W,
 ) -> Result<(), Failure> {
     let root = resolve_root(grant, root, Access::Read)?;
-    let state_dir = host.paths.state_dir();
-    if let Some(wg) = write_grant_for(host, grant.principal()) {
-        recover_pending_renames_checked(
-            state_dir,
-            Some(RenameRecoveryScope::WithinDir(&root)),
-            |parent, intent| can_write_rename_intent(&wg, parent, intent),
-        );
-    }
     let options = ManifestOptions { checksum, exclude };
     let listing = busy(output, || manifest(grant, &host.paths, &root, &options))??;
     write_listing(output, listing.entries, listing.skipped)
@@ -1913,20 +1926,6 @@ fn stat<W: Write>(
     // source size and hash. Sidecar metadata/locks live in the node's state directory.
     let given = grant.check_path(path, Access::Read)?;
     let state_dir = host.paths.state_dir();
-    if let Some(wg) = write_grant_for(host, grant.principal()) {
-        if let Some(parent) = given.parent() {
-            recover_pending_renames_checked(
-                state_dir,
-                Some(RenameRecoveryScope::ExactDir(parent)),
-                |p, intent| can_write_rename_intent(&wg, p, intent),
-            );
-        }
-        if wg.check_path(&given, Access::Write).is_ok()
-            && legion_tools::fs::check_not_protected_tree(&wg, &given).is_ok()
-        {
-            legion_xfer::reclaim_stale_claim(state_dir, &given);
-        }
-    }
     let is_symlink = fs::symlink_metadata(&given).is_ok_and(|meta| meta.file_type().is_symlink());
     let expected_hash = if_hash.and_then(|s| s.parse::<Hash>().ok());
     let partial = || {
@@ -3012,7 +3011,6 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
                             _ => None,
                         };
                         if hold {
-                            let marker_id = symlink_file_identity(&marker_path).ok();
                             let owned =
                                 legion_xfer::register_owned_temp(state_dir, &marker_path, &file);
                             drop(file);
@@ -3043,23 +3041,11 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
                                     confirm_requested = true;
                                 }
                             }
-                            let still_held = match (
-                                marker_id,
-                                fs::symlink_metadata(&marker_path),
-                                symlink_file_identity(&marker_path),
-                            ) {
-                                (Some(orig), Ok(meta), Ok(now)) => {
-                                    meta.file_type().is_file()
-                                        && meta.len() == 0
-                                        && orig.same_file(&now)
-                                }
-                                _ => false,
-                            };
-                            if let Ok(meta) = fs::symlink_metadata(&marker_path)
-                                && meta.file_type().is_file()
-                                && meta.len() == 0
-                            {
-                                let _ = fs::remove_file(&marker_path);
+                            let still_held = owned
+                                .as_ref()
+                                .is_some_and(legion_xfer::OwnedTempGuard::matches_unmodified_probe);
+                            if let Some(ref guard) = owned {
+                                guard.remove_matching_probe();
                             }
                             drop(owned);
                             if res.is_ok() && confirm_requested {
@@ -3106,13 +3092,7 @@ fn probe_write<R: Read + Send + 'static, W: Write>(
             let checked_dir = grant.check_path(dir, Access::Write)?;
             let marker_path = checked_dir.join(marker);
             grant.check_path(&marker_path, Access::Write)?;
-            if let Ok(meta) = fs::symlink_metadata(&marker_path)
-                && meta.file_type().is_file()
-                && meta.len() == 0
-            {
-                let _ = fs::remove_file(&marker_path);
-            }
-            legion_xfer::forget_probe_marker(state_dir, &marker_path);
+            let _ = legion_xfer::remove_owned_probe_marker(state_dir, &marker_path);
             reply(
                 output,
                 &ProbeReply {

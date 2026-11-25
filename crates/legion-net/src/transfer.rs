@@ -121,14 +121,34 @@ const MOST_LISTING_BYTES: usize = 512 * 1024 * 1024;
 /// How many paths a result lists in each of its lists; the counts are always whole.
 const MOST_LISTED: usize = 100;
 
+/// Message returned when `fs.transfer` is called with `move: true` while moving between places is
+/// disabled.
+#[cfg(not(feature = "move-between-places"))]
+const MOVE_BETWEEN_PLACES_UNSUPPORTED: &str =
+    "Moving is not available yet. Copy it, check the copy, then delete the original.";
+
+fn transfer_input_schema() -> Value {
+    #[allow(unused_mut)]
+    let mut schema = input_schema::<TransferArgs>();
+    #[cfg(not(feature = "move-between-places"))]
+    if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        props.remove("move");
+    }
+    schema
+}
+
 /// Adds `fs.transfer`, which holds the fleet's session pool to reach the other ends.
 pub fn register(registry: &mut Registry, fleet: Fleet) {
+    #[cfg(feature = "move-between-places")]
+    let description = "Copy or move a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); move removes each source file only after its destination copy is verified by hash (refused up front unless the caller may fs.remove the source); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent, deleted and removed without changing anything.".to_owned();
+    #[cfg(not(feature = "move-between-places"))]
+    let description = "Copy a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent and deleted without changing anything.".to_owned();
     registry.add(TransferTool {
         spec: ToolSpec {
             name: "fs.transfer".to_owned(),
-            description: "Copy or move a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); move removes each source file only after its destination copy is verified by hash (refused up front unless the caller may fs.remove the source); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent, deleted and removed without changing anything.".to_owned(),
+            description,
             effect: Effect::Write,
-            input_schema: input_schema::<TransferArgs>(),
+            input_schema: transfer_input_schema(),
         },
         fleet,
     });
@@ -147,6 +167,13 @@ impl Tool for TransferTool {
     fn call<'a>(&'a self, ctx: &'a Ctx, args: Value) -> BoxFuture<'a, Result<Value, ToolError>> {
         Box::pin(async move {
             let args = parse_args::<TransferArgs>(&self.spec.name, args)?;
+            #[cfg(not(feature = "move-between-places"))]
+            if args.move_source {
+                return Err(ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    MOVE_BETWEEN_PLACES_UNSUPPORTED,
+                ));
+            }
             if args.background {
                 return start_background(ctx, args).await;
             }
