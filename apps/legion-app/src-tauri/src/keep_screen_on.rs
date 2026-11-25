@@ -78,7 +78,8 @@ impl DesktopKeepScreenOn {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if on {
-                let hold = guard.get_or_insert_with(legion_os::display_awake::DisplayAwakeHold::new);
+                let hold =
+                    guard.get_or_insert_with(legion_os::display_awake::DisplayAwakeHold::new);
                 hold.set(true);
             } else if let Some(mut hold) = guard.take() {
                 hold.set(false);
@@ -257,10 +258,13 @@ mod tests {
             "ScreenSaver fallback must not be called when Desktop Portal succeeds"
         );
 
-        let fallback = select_linux_inhibit(|flags| {
-            assert_eq!(flags, PORTAL_INHIBIT_IDLE);
-            None
-        }, || Some(77));
+        let fallback = select_linux_inhibit(
+            |flags| {
+                assert_eq!(flags, PORTAL_INHIBIT_IDLE);
+                None
+            },
+            || Some(77),
+        );
         assert_eq!(fallback, Some(SelectedLinuxInhibit::ScreenSaver(77)));
 
         let neither = select_linux_inhibit(|_| None, || None);

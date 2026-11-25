@@ -289,7 +289,8 @@ pub fn run() {
                     let _ = close_updater.try_spawn_desktop_close_install();
                 }
                 tauri::WindowEvent::Resized(_) => {
-                    if let Some(immersive) = resize_app.try_state::<commands::DesktopImmersiveState>()
+                    if let Some(immersive) =
+                        resize_app.try_state::<commands::DesktopImmersiveState>()
                         && immersive.is_active()
                         && let Some(win) = resize_app.get_webview_window(&resize_label)
                         && !win.is_fullscreen().unwrap_or(true)

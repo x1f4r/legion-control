@@ -150,7 +150,11 @@ mod tests {
         }
 
         let log = events.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(log.len(), 4, "expected [true, false, true, false], got {log:?}");
+        assert_eq!(
+            log.len(),
+            4,
+            "expected [true, false, true, false], got {log:?}"
+        );
         assert_eq!(
             log.iter().map(|(_, on)| *on).collect::<Vec<_>>(),
             vec![true, false, true, false]
