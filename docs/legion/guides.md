@@ -1351,16 +1351,17 @@ requiring `effect:admin`, built on `config.list`, `config.read`, and `config.wri
   on a cloned machine. For an unambiguous machine that reports a `node_id` and a different
   host-derived name (no explicit `name` in `node.toml`), `direction=push` writes
   `name = "<fleet name>"` one machine at a time via `config.set_name` (keeping all other bytes in
-  `node.toml` verbatim, preserving any UTF-8 BOM and CRLF line endings, backing up both files
-  before writing, migrating matching `[projects.<name>.on]` entries in `projects.toml` before
-  writing `node.toml` without overwriting existing entries or moving keys whose old name is listed
-  as another machine in the node's own `fleet.toml`, and recording audit entries for each write)
-  and records the update in `node_names`. If `node.toml` —
-  or `projects.toml` when it has keys to move — is a symbolic link, `config.set_name` refuses
-  without writing through links (`conflict`, `details.kind = "linked_config"`) and `fleet.sync`
-  reports `status: "manual"` with a hint to edit by hand. When a machine has a different explicit
-  `name` in `node.toml` — or reports no `node_id` (an older node or an unwritable state directory)
-  — `fleet.sync` leaves `node.toml` untouched and reports `name_mismatch` in `node_names`.
+  `node.toml` verbatim, preserving any UTF-8 BOM and CRLF line endings, backing up all changed files
+  before writing, migrating matching `[projects.<name>.on]` entries in `projects.toml` and matching
+  entries in `favorites.toml` before writing `node.toml` without overwriting existing entries or
+  moving entries whose old name is listed as another machine in the node's own `fleet.toml`, and
+  recording audit entries for each write) and records the update in `node_names`. If `node.toml` —
+  or `projects.toml` / `favorites.toml` when it has entries to move — is a symbolic link,
+  `config.set_name` refuses without writing through links (`conflict`, `details.kind = "linked_config"`)
+  and `fleet.sync` reports `status: "manual"` with a hint to edit by hand. When a machine has a
+  different explicit `name` in `node.toml` — or reports no `node_id` (an older node or an unwritable
+  state directory) — `fleet.sync` leaves `node.toml` untouched and reports `name_mismatch` in
+  `node_names`.
   `fleet.list`, `fleet.ping`, and `meta.doctor` also flag name mismatches (including when a node's
   own name is absent from a non-empty `fleet.toml`), and forwarded `device.endpoint` and
   `device.invite` calls refuse mismatched nodes with `conflict` (`details.kind = "name_mismatch"`).

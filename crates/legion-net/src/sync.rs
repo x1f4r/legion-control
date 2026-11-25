@@ -42,9 +42,10 @@ use legion_tools::device::sessions::{
 };
 use legion_tools::ext::def::parse_toml as parse_extension_toml;
 use legion_tools::fav::{
-    FavoritesFile, MAX_FAVORITES_BYTES, apply_favorites_merge_blocking, compact_favorites,
-    favorites_size_limit_error, merge_favorites, parse_favorites_bytes,
-    sanitize_received_favorites,
+    FavoriteRecord, FavoriteTombstone, FavoritesFile, MAX_FAVORITES_BYTES,
+    apply_favorites_merge_blocking, build_time_floor, compact_favorites, effective_stamp,
+    favorite_id, favorites_size_limit_error, format_timestamp, merge_favorites,
+    parse_favorites_bytes, sanitize_received_favorites,
 };
 use legion_tools::proj::ProjectsFile;
 use legion_xfer::hash::{Hash, hash_bytes};
@@ -105,14 +106,14 @@ pub(crate) fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(SyncTool::<ConfigSetNameArgs, ConfigSetNameResult, _>::new(
         "config.set_name",
         Effect::Admin,
-        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and line endings). When `node.toml` already sets `<name>`, changes nothing. Never writes through symbolic links (refuses with `conflict`, `details.kind = \"linked_config\"`), never overwrites a different explicit `name` (`conflict`, `details.kind = \"name_mismatch\"`), refuses `caller` equal to `name` (`conflict`), and refuses before writing anything if `fleet.toml` exists but cannot be read or parsed. Validates, prepares, and backs up both `projects.toml` and `node.toml` before writing (`projects.toml` first with its own audit entry, `node.toml` last) under lock, moving matching `[projects.<name>.on]` entries to the new name without overwriting existing entries or moving keys whose old name is listed as another machine in this node's own `fleet.toml` (reporting moved entries and conflicts). Atomic replacement requires write permission on the config directory rather than on `node.toml` or `projects.toml` itself, so a read-only regular file in a writable config directory is replaced.",
+        "Set `name = \"<name>\"` in this node's `node.toml` when `node.toml` does not exist or omits `name`, keeping every other byte in the file unchanged (preserving a UTF-8 BOM and line endings). When `node.toml` already sets `<name>`, changes nothing. Never writes through symbolic links (refuses with `conflict`, `details.kind = \"linked_config\"`), never overwrites a different explicit `name` (`conflict`, `details.kind = \"name_mismatch\"`), refuses `caller` equal to `name` (`conflict`), and refuses before writing anything if `fleet.toml` exists but cannot be read or parsed. Validates, prepares, and backs up `projects.toml`, `favorites.toml`, and `node.toml` before writing (`projects.toml` and `favorites.toml` first with their own audit entries, `node.toml` last) under lock, moving matching `[projects.<name>.on]` entries and `favorites.toml` entries to the new name without overwriting existing entries or moving entries whose old name is listed as another machine in this node's own `fleet.toml` (reporting moved entries and conflicts). Atomic replacement requires write permission on the config directory rather than on `node.toml`, `projects.toml`, or `favorites.toml` itself, so a read-only regular file in a writable config directory is replaced.",
         fleet.clone(),
         |fleet, ctx, args| Box::pin(config_set_name(fleet, ctx, args)),
     ));
     registry.add(SyncTool::<SyncArgs, SyncResult, _>::new(
         "fleet.sync",
         Effect::Admin,
-        "Compare, push, or pull shared configuration documents (devices.toml, favorites.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts, and check each machine's reported node name against its fleet name. Naming is decided only after every target machine has answered so two fleet entries pointing at the same node never race to rename it: when two or more entries report the same `node_id`, none of them renames the node and each reports `ambiguous`. A node that reports no `node_id` (older Legion or an unwritable state directory) is never renamed and reports `name_mismatch`. For unambiguous machines with a `node_id` whose name differs and is host-derived (no explicit `name` in node.toml), `direction=push` sets `name = \"<fleet name>\"` one machine at a time via `config.set_name` (keeping all other bytes unchanged and migrating matching `projects.toml` entries) and reports `set` in `node_names`, or `manual` when `node.toml` or `projects.toml` is a symbolic link; when the machine has a different explicit `name`, `fleet.sync` reports `name_mismatch` and leaves `node.toml` untouched. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the receiving node and merges paired devices commutatively with tombstones winning so a revoked device is not revived. Pushing or pulling favorites.toml merges entries commutatively in both directions with per-field timestamps and 90-day tombstones without owner-only rules. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs whole node.toml or tokens.toml files.",
+        "Compare, push, or pull shared configuration documents (devices.toml, favorites.toml, fleet.toml, policy.toml, projects.toml, and tools.d/*.toml) across machines in fleet.toml using per-peer BLAKE3 sync sidecars to detect conflicts, and check each machine's reported node name against its fleet name. Naming is decided only after every target machine has answered so two fleet entries pointing at the same node never race to rename it: when two or more entries report the same `node_id`, none of them renames the node and each reports `ambiguous`. A node that reports no `node_id` (older Legion or an unwritable state directory) is never renamed and reports `name_mismatch`. For unambiguous machines with a `node_id` whose name differs and is host-derived (no explicit `name` in node.toml), `direction=push` sets `name = \"<fleet name>\"` one machine at a time via `config.set_name` (keeping all other bytes unchanged and migrating matching `projects.toml` and `favorites.toml` entries) and reports `set` in `node_names`, or `manual` when `node.toml`, `projects.toml`, or `favorites.toml` is a symbolic link; when the machine has a different explicit `name`, `fleet.sync` reports `name_mismatch` and leaves `node.toml` untouched. In status mode, reports same, changed_here, changed_there, both, only_here, or only_there without importing anything. Pushing or pulling devices.toml requires the owner role on the node doing the writing (for non-owner callers, fleet.sync syncs the other documents and reports devices.toml as skipped with the reason; propagation after local device tools runs node to node with the node's own authority). Paired devices (devices.toml) obey a strict one-way trust rule for live entries: push sends local entries to peers and imports ONLY tombstones back — never a peer's live devices. New or changed live devices from a peer are accepted only via an explicit `fleet.sync direction=pull from=<peer>` run by an owner, or when that peer pushes to this node with owner authority. Tombstones always win and may flow in every direction. Favourites (favorites.toml) merge commutatively in both directions with per-field timestamps and 90-day tombstones without owner-only rules. Removal of a tools.d file is never propagated: push never deletes remote files, pull never deletes local files, and status reports files present on only one side as only_here or only_there. Syncing policy.toml is powerful because it changes who may do what on the receiving machine; every replacement is strictly validated by the receiver before installing, backed up, and recorded in the audit log with its hash before and after. Never syncs whole node.toml or tokens.toml files.",
         fleet,
         |fleet, ctx, args| Box::pin(fleet_sync(fleet, ctx, args)),
     ));
@@ -1435,11 +1436,15 @@ struct ConfigSetNameArgs {
     caller: Option<String>,
 }
 
-/// A project entry in `projects.toml` that already had a path under the target node name, so the
-/// old node name's entry was kept untouched and reported instead of overwriting it.
+/// A project or favourite entry that could not be migrated during `config.set_name` (because a
+/// target entry already existed or `fleet.toml` lists the old name as another machine), so the old
+/// entry was kept untouched and reported instead of overwriting it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProjectRenameConflict {
-    pub(crate) project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) favorite_id: Option<String>,
     pub(crate) old_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) new_path: Option<String>,
@@ -1612,7 +1617,8 @@ fn plan_projects_migration(
                     .and_then(|p| p.on.get(new_name))
                     .cloned();
                 conflicts.push(ProjectRenameConflict {
-                    project: proj_name.clone(),
+                    project: Some(proj_name.clone()),
+                    favorite_id: None,
                     old_path,
                     new_path,
                     reason: Some(format!(
@@ -1634,7 +1640,8 @@ fn plan_projects_migration(
                     .and_then(|p| p.on.get(new_name))
                     .cloned();
                 conflicts.push(ProjectRenameConflict {
-                    project: proj_name,
+                    project: Some(proj_name),
+                    favorite_id: None,
                     old_path,
                     new_path,
                     reason: None,
@@ -1666,6 +1673,168 @@ fn plan_projects_migration(
 
     Ok(Some(PlannedProjectsMigration {
         path: projects_path.to_path_buf(),
+        original_bytes: bytes,
+        updated_bytes,
+        moved,
+        conflicts,
+    }))
+}
+
+struct PlannedFavoritesMigration {
+    path: PathBuf,
+    original_bytes: Vec<u8>,
+    updated_bytes: Option<Vec<u8>>,
+    moved: Vec<String>,
+    conflicts: Vec<ProjectRenameConflict>,
+}
+
+/// Reads, validates, and computes any `favorites.toml` machine-name migration completely in memory
+/// without writing anything. Refuses before any write if `favorites.toml` is invalid, unreadable,
+/// or a symlink that needs entries moved (or is dangling). Never moves entries under `old_name`
+/// when `old_name_in_fleet` is true and never overwrites an existing favourite under `new_name`.
+fn plan_favorites_migration(
+    favorites_path: &Path,
+    node_path: &Path,
+    old_name: &str,
+    new_name: &str,
+    old_name_in_fleet: bool,
+) -> Result<Option<PlannedFavoritesMigration>, ErrorBody> {
+    if old_name == new_name {
+        return Ok(None);
+    }
+    let meta = match std::fs::symlink_metadata(favorites_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be inspected: {error}.", favorites_path.display()),
+            ));
+        }
+    };
+    let is_symlink = meta.file_type().is_symlink();
+
+    let Some(bytes) = read_regular_file(favorites_path)? else {
+        if is_symlink {
+            return Err(linked_config_error("favorites.toml", new_name, node_path));
+        }
+        return Ok(None);
+    };
+
+    let mut file = parse_favorites_bytes(favorites_path, &bytes)?;
+    let matching_ids: Vec<String> = file
+        .entries
+        .iter()
+        .filter(|(_, rec)| rec.machine == old_name)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if matching_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let now = Timestamp::now();
+    let floor = build_time_floor();
+    let mut moved = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for old_id in matching_ids {
+        let Some(old_rec) = file.entries.get(&old_id).cloned() else {
+            continue;
+        };
+        if old_name_in_fleet {
+            conflicts.push(ProjectRenameConflict {
+                project: None,
+                favorite_id: Some(old_id.clone()),
+                old_path: old_rec.path.clone(),
+                new_path: None,
+                reason: Some(format!(
+                    "Left favourite {old_id} ({old_name}:{}) untouched because fleet.toml lists {old_name} as another machine.",
+                    old_rec.path
+                )),
+            });
+            continue;
+        }
+        let new_id = favorite_id(new_name, &old_rec.path);
+        let existing_target = file.entries.get(&new_id).or_else(|| {
+            file.entries
+                .values()
+                .find(|rec| rec.machine == new_name && rec.path == old_rec.path)
+        });
+        if let Some(existing) = existing_target {
+            conflicts.push(ProjectRenameConflict {
+                project: None,
+                favorite_id: Some(old_id.clone()),
+                old_path: old_rec.path.clone(),
+                new_path: Some(existing.path.clone()),
+                reason: Some(format!(
+                    "Left favourite {old_id} ({old_name}:{}) untouched because a favourite for {} on {new_name} already exists.",
+                    old_rec.path, existing.path
+                )),
+            });
+            continue;
+        }
+
+        // Advance past both the old entry's updated_at and any prior tombstone at `new_id` so the
+        // tombstone for `old_id` and the new live incarnation at `new_id` win cleanly across CRDT
+        // merges.
+        let mut stamp_ts = effective_stamp(now, Some(&old_rec.updated_at), floor);
+        if let Some(prev_tomb) = file.removed.remove(&new_id) {
+            stamp_ts = effective_stamp(stamp_ts, Some(&prev_tomb.removed_at), floor);
+        }
+        let stamp = format_timestamp(stamp_ts);
+
+        file.entries.remove(&old_id);
+        file.removed.insert(
+            old_id.clone(),
+            FavoriteTombstone {
+                removed_at: stamp.clone(),
+                removed_on: new_name.to_owned(),
+            },
+        );
+        let migrated = FavoriteRecord {
+            machine: new_name.to_owned(),
+            path: old_rec.path.clone(),
+            kind: old_rec.kind,
+            label: old_rec.label.clone(),
+            pinned: old_rec.pinned,
+            added_at: stamp.clone(),
+            added_by: old_rec.added_by.clone(),
+            updated_at: stamp.clone(),
+            updated_on: new_name.to_owned(),
+            label_updated_at: stamp.clone(),
+            label_updated_on: new_name.to_owned(),
+            pinned_updated_at: stamp,
+            pinned_updated_on: new_name.to_owned(),
+        };
+        file.entries.insert(new_id.clone(), migrated);
+        moved.push(format!(
+            "favorites.{old_id} -> {new_id} ({old_name} -> {new_name}: {})",
+            old_rec.path
+        ));
+    }
+
+    if !moved.is_empty() && is_symlink {
+        return Err(linked_config_error("favorites.toml", new_name, node_path));
+    }
+
+    let updated_bytes = if moved.is_empty() {
+        None
+    } else {
+        legion_core::Document::validate(&file).map_err(|reason| {
+            ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Migrated favorites.toml is invalid: {reason}."),
+            )
+        })?;
+        let canonical = file.to_toml_string();
+        if canonical.len() > MAX_FAVORITES_BYTES {
+            return Err(favorites_size_limit_error(canonical.len()));
+        }
+        Some(canonical.into_bytes())
+    };
+
+    Ok(Some(PlannedFavoritesMigration {
+        path: favorites_path.to_path_buf(),
         original_bytes: bytes,
         updated_bytes,
         moved,
@@ -1733,6 +1902,7 @@ fn set_local_node_name_with_writer(
 
     let node_path = config_dir.join("node.toml");
     let projects_path = config_dir.join("projects.toml");
+    let favorites_path = config_dir.join(<FavoritesFile as legion_core::Document>::FILE);
     let _proj_held = match std::fs::symlink_metadata(&projects_path) {
         Ok(_) => Some(acquire_lock(
             &state_dir.join("projects.lock"),
@@ -1746,8 +1916,21 @@ fn set_local_node_name_with_writer(
             ));
         }
     };
+    let _fav_held = match std::fs::symlink_metadata(&favorites_path) {
+        Ok(_) => Some(acquire_lock(
+            &state_dir.join("sync").join("favorites.lock"),
+            "favorites.toml",
+        )?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{} cannot be inspected: {error}.", favorites_path.display()),
+            ));
+        }
+    };
 
-    // Phase 1: Inspect, read, validate, and compute both new file contents completely in memory
+    // Phase 1: Inspect, read, validate, and compute all new file contents completely in memory
     // before taking backups or writing anything.
     match std::fs::symlink_metadata(&node_path) {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -1800,8 +1983,10 @@ fn set_local_node_name_with_writer(
         InsertNodeName::Write(updated) => updated,
     };
 
-    // Never move `projects.toml` keys whose old name is listed in this node's own `fleet.toml` as
-    // another machine.
+    // Never move `projects.toml` or `favorites.toml` entries whose old name is listed in this
+    // node's own `fleet.toml` as another machine. If `fleet.toml` exists but cannot be read or
+    // parsed, refuse before writing anything so we never guess whether entries belong to another
+    // machine.
     let fleet_path = config_dir.join(<FleetFile as legion_core::Document>::FILE);
     let old_name_in_fleet = if previous_node != target.as_str() {
         match read_regular_file(&fleet_path)? {
@@ -1832,6 +2017,13 @@ fn set_local_node_name_with_writer(
         target.as_str(),
         old_name_in_fleet,
     )?;
+    let planned_favorites = plan_favorites_migration(
+        &favorites_path,
+        &node_path,
+        previous_node,
+        target.as_str(),
+        old_name_in_fleet,
+    )?;
 
     // Phase 2: Take all backups BEFORE the first write so a failing backup refuses before anything
     // changes.
@@ -1843,14 +2035,24 @@ fn set_local_node_name_with_writer(
         )?),
         _ => None,
     };
+    let favorites_backup = match planned_favorites.as_ref() {
+        Some(plan) if plan.updated_bytes.is_some() => Some(write_sync_backup(
+            state_dir,
+            "favorites.toml.bak",
+            &plan.original_bytes,
+        )?),
+        _ => None,
+    };
     let node_backup = match existing_node.as_deref() {
         Some(old_bytes) => Some(write_sync_backup(state_dir, "node.toml.bak", old_bytes)?),
         None => None,
     };
 
-    // Phase 3: Write `projects.toml` first and record its audit entry immediately before touching
-    // `node.toml`.
-    let (moved, conflicts) = if let Some(plan) = planned_projects {
+    // Phase 3: Write `projects.toml` and `favorites.toml` first and record an audit entry
+    // immediately after each replacement, before touching `node.toml`.
+    let mut moved = Vec::new();
+    let mut conflicts = Vec::new();
+    if let Some(plan) = planned_projects {
         if let Some(updated_proj_bytes) = plan.updated_bytes {
             write_atomically(&plan.path, &updated_proj_bytes).map_err(|error| {
                 ErrorBody::new(
@@ -1877,10 +2079,39 @@ fn set_local_node_name_with_writer(
                 &Ok(json!({})),
             );
         }
-        (plan.moved, plan.conflicts)
-    } else {
-        (Vec::new(), Vec::new())
-    };
+        moved.extend(plan.moved);
+        conflicts.extend(plan.conflicts);
+    }
+    if let Some(plan) = planned_favorites {
+        if let Some(updated_fav_bytes) = plan.updated_bytes {
+            write_atomically(&plan.path, &updated_fav_bytes).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("{} cannot be written: {error}.", plan.path.display()),
+                )
+            })?;
+            let fav_audit_args = json!({
+                "document": "favorites.toml",
+                "previous": previous_node,
+                "node": target.as_str(),
+                "backup": favorites_backup,
+                "moved": plan.moved,
+                "conflicts": plan.conflicts,
+            });
+            audit.node.record_audit_blocking(
+                previous_node.to_owned(),
+                Some(audit.principal.clone()),
+                audit.door,
+                audit.device.clone(),
+                "config.set_name.favorites_migrated".to_owned(),
+                &fav_audit_args,
+                audit.started,
+                &Ok(json!({})),
+            );
+        }
+        moved.extend(plan.moved);
+        conflicts.extend(plan.conflicts);
+    }
 
     // Phase 4: Write `node.toml` last and record `config.set_name.applied` immediately.
     std::fs::create_dir_all(config_dir).map_err(|error| {
@@ -3425,6 +3656,8 @@ fn skipped_devices_outcome() -> DocSyncOutcome {
         ),
         warnings: Vec::new(),
         error: None,
+    }
+}
 
 async fn sync_favorites_document(
     fleet: &Fleet,
@@ -8082,8 +8315,8 @@ removed_on = \"box-a\"
             );
         }
 
-        // 5. An unparseable `fleet.toml` refuses `config.set_name` before writing `node.toml`
-        //    or `projects.toml`.
+        // 5. Item 4: An unparseable `fleet.toml` refuses `config.set_name` before writing
+        //    `node.toml`, `projects.toml`, or `favorites.toml`.
         {
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths::under(dir.path());
@@ -8093,8 +8326,30 @@ removed_on = \"box-a\"
             let orig_node = "[svc]\nsudo = false\n";
             let orig_proj =
                 format!("[projects.app]\n[projects.app.on]\n{host_name} = \"/work/app\"\n");
+            let mut favs = FavoritesFile::default();
+            let old_fav_id = favorite_id(&host_name, "/work/photos");
+            favs.entries.insert(
+                old_fav_id.clone(),
+                FavoriteRecord {
+                    machine: host_name.clone(),
+                    path: "/work/photos".to_owned(),
+                    kind: legion_tools::fav::FavoriteKind::Dir,
+                    label: Some("Photos".to_owned()),
+                    pinned: true,
+                    added_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    added_by: "owner".to_owned(),
+                    updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    updated_on: host_name.clone(),
+                    label_updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    label_updated_on: host_name.clone(),
+                    pinned_updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    pinned_updated_on: host_name.clone(),
+                },
+            );
+            let orig_fav = favs.to_toml_string();
             std::fs::write(paths.config_file("node.toml"), orig_node).unwrap();
             std::fs::write(paths.config_file("projects.toml"), &orig_proj).unwrap();
+            std::fs::write(paths.config_file("favorites.toml"), &orig_fav).unwrap();
 
             let fleet = Fleet::new(&paths);
             let mut reg = Registry::new();
@@ -8121,6 +8376,212 @@ removed_on = \"box-a\"
             assert_eq!(
                 std::fs::read_to_string(paths.config_file("projects.toml")).unwrap(),
                 orig_proj
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("favorites.toml")).unwrap(),
+                orig_fav
+            );
+        }
+
+        // 6. Item 2: `favorites.toml` entries keyed by the node's old name are migrated under lock
+        //    with tombstones for old ids, never overwrite existing entries on the target name,
+        //    leave entries owned by another `fleet.toml` machine untouched, and audit
+        //    `config.set_name.favorites_migrated` before `config.set_name.applied`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+            let old_move_id = favorite_id(&host_name, "/work/photos");
+            let new_move_id = favorite_id(target_name, "/work/photos");
+            let old_dup_id = favorite_id(&host_name, "/work/docs");
+            let new_dup_id = favorite_id(target_name, "/work/docs");
+            let other_id = favorite_id("tower", "/srv/data");
+            let make_rec =
+                |machine: &str, path: &str, label: Option<&str>, pinned: bool| FavoriteRecord {
+                    machine: machine.to_owned(),
+                    path: path.to_owned(),
+                    kind: legion_tools::fav::FavoriteKind::Dir,
+                    label: label.map(str::to_owned),
+                    pinned,
+                    added_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    added_by: "owner".to_owned(),
+                    updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    updated_on: machine.to_owned(),
+                    label_updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    label_updated_on: machine.to_owned(),
+                    pinned_updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    pinned_updated_on: machine.to_owned(),
+                };
+            let mut favs = FavoritesFile::default();
+            favs.entries.insert(
+                old_move_id.clone(),
+                make_rec(&host_name, "/work/photos", Some("Photos"), true),
+            );
+            favs.entries.insert(
+                old_dup_id.clone(),
+                make_rec(&host_name, "/work/docs", Some("Old Docs"), false),
+            );
+            favs.entries.insert(
+                new_dup_id.clone(),
+                make_rec(target_name, "/work/docs", Some("Keep Docs"), true),
+            );
+            favs.entries.insert(
+                other_id.clone(),
+                make_rec("tower", "/srv/data", None, false),
+            );
+            std::fs::write(paths.config_file("favorites.toml"), favs.to_toml_string()).unwrap();
+
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            register(&mut reg, fleet);
+            let node = Node::new(paths.clone(), reg);
+
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res["changed"], json!(true), "{res}");
+            assert_eq!(
+                res["moved"],
+                json!([format!(
+                    "favorites.{old_move_id} -> {new_move_id} ({host_name} -> {target_name}: /work/photos)"
+                )]),
+                "{res}"
+            );
+            assert_eq!(
+                res["conflicts"][0]["favorite_id"],
+                json!(old_dup_id),
+                "{res}"
+            );
+            assert_eq!(
+                res["conflicts"][0]["old_path"],
+                json!("/work/docs"),
+                "{res}"
+            );
+            assert_eq!(
+                res["conflicts"][0]["new_path"],
+                json!("/work/docs"),
+                "{res}"
+            );
+
+            let after = parse_favorites_bytes(
+                &paths.config_file("favorites.toml"),
+                &std::fs::read(paths.config_file("favorites.toml")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !after.entries.contains_key(&old_move_id)
+                    && after.removed.contains_key(&old_move_id),
+                "moved favourite must leave a tombstone for its old id: {after:?}"
+            );
+            let moved_rec = after
+                .entries
+                .get(&new_move_id)
+                .expect("new favourite entry");
+            assert_eq!(moved_rec.machine, target_name);
+            assert_eq!(moved_rec.path, "/work/photos");
+            assert_eq!(moved_rec.label.as_deref(), Some("Photos"));
+            assert!(moved_rec.pinned);
+            assert_eq!(
+                after
+                    .entries
+                    .get(&new_dup_id)
+                    .and_then(|r| r.label.as_deref()),
+                Some("Keep Docs"),
+                "existing favourite on target name must not be overwritten"
+            );
+            assert!(
+                after.entries.contains_key(&old_dup_id),
+                "conflicting old favourite must stay untouched"
+            );
+            assert!(after.entries.contains_key(&other_id));
+
+            let audit_entries: Vec<Value> = std::fs::read_to_string(paths.audit_log())
+                .unwrap()
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            let fav_idx = audit_entries
+                .iter()
+                .position(|e| e["tool"] == json!("config.set_name.favorites_migrated"))
+                .unwrap_or_else(|| panic!("expected favorites_migrated audit: {audit_entries:?}"));
+            let applied_idx = audit_entries
+                .iter()
+                .position(|e| e["tool"] == json!("config.set_name.applied"))
+                .unwrap();
+            assert!(fav_idx < applied_idx, "{audit_entries:?}");
+        }
+
+        // 7. Item 2: `favorites.toml` entries under a name `fleet.toml` gives to another machine
+        //    are left untouched and reported in `conflicts`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::create_dir_all(paths.state_dir()).unwrap();
+            std::fs::write(
+                paths.config_file("fleet.toml"),
+                format!("[machines.{host_name}]\nssh = \"other.example\"\n"),
+            )
+            .unwrap();
+            let old_fav_id = favorite_id(&host_name, "/srv/other");
+            let mut favs = FavoritesFile::default();
+            favs.entries.insert(
+                old_fav_id.clone(),
+                FavoriteRecord {
+                    machine: host_name.clone(),
+                    path: "/srv/other".to_owned(),
+                    kind: legion_tools::fav::FavoriteKind::Dir,
+                    label: None,
+                    pinned: false,
+                    added_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    added_by: "owner".to_owned(),
+                    updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    updated_on: host_name.clone(),
+                    label_updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    label_updated_on: host_name.clone(),
+                    pinned_updated_at: "2026-11-24T10:00:00.000Z".to_owned(),
+                    pinned_updated_on: host_name.clone(),
+                },
+            );
+            let orig_fav = favs.to_toml_string();
+            std::fs::write(paths.config_file("favorites.toml"), &orig_fav).unwrap();
+
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            register(&mut reg, fleet);
+            let node = Node::new(paths.clone(), reg);
+
+            let res = node
+                .call(Call::new(
+                    Door::Cli,
+                    "config.set_name",
+                    json!({"name": target_name}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res["changed"], json!(true), "{res}");
+            assert!(res.get("moved").is_none(), "{res}");
+            assert_eq!(
+                res["conflicts"][0]["favorite_id"],
+                json!(old_fav_id),
+                "{res}"
+            );
+            assert!(
+                res["conflicts"][0]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("fleet.toml") && r.contains(&host_name)),
+                "{res}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file("favorites.toml")).unwrap(),
+                orig_fav
             );
         }
     }

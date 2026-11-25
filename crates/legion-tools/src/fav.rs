@@ -1992,7 +1992,8 @@ fn parse_favorites_push_outcomes(sync_result: &Value) -> BTreeMap<String, FleetP
     out
 }
 
-fn format_timestamp(ts: Timestamp) -> String {
+/// Formats a `favorites.toml` RFC 3339 UTC timestamp to millisecond precision.
+pub fn format_timestamp(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
