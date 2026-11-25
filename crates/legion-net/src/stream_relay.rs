@@ -9,6 +9,7 @@
 //! bounded buffers and backpressure.
 
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use legion_proto::{Effect, ErrorBody, ErrorCode};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::mpsc as async_mpsc;
+use tokio::sync::{Notify, mpsc as async_mpsc};
 
 use crate::config::validate_machine_name;
 use crate::connector::{PipeHandle, StderrTail};
@@ -40,10 +41,95 @@ const MAX_NOISE_BYTES: usize = 64 * 1024;
 const MAX_REPLY_LINE: usize = 1024 * 1024;
 /// Maximum `{"done": true}` trailer line length on a `keep_open` `get`.
 const MAX_DONE_LINE: usize = 1024;
-/// Bounded grace period when tearing down a downstream stream process.
+/// Bounded grace period when tearing down a downstream stream process after normal completion.
 const DOWNSTREAM_CLOSE_GRACE: Duration = Duration::from_millis(500);
-/// Poll slice used to notice `shutdown` while awaiting downstream I/O.
+/// Short grace period when tearing down a timed-out, cancelled, or abandoned downstream process.
+const DOWNSTREAM_ABORT_GRACE: Duration = Duration::from_millis(200);
+/// Poll slice used to notice `shutdown` or `client_gone` while awaiting downstream I/O.
 const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(50);
+
+enum DownstreamWait<T> {
+    Ready(T),
+    Shutdown,
+    ClientGone,
+    TimedOut,
+}
+
+fn format_timeout(duration: Duration) -> String {
+    if duration.as_secs() > 0 && duration.subsec_millis() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis().max(1))
+    }
+}
+
+fn downstream_timeout_error(target: &str, timeout: Duration) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Timeout,
+        format!(
+            "{target} stopped responding on the relayed stream for {}.",
+            format_timeout(timeout)
+        ),
+    )
+    .with_machine(target)
+}
+
+fn client_gone_error(relay: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Cancelled,
+        "The client closed the relayed stream.",
+    )
+    .with_machine(relay)
+}
+
+async fn wait_downstream<F, T>(
+    fut: F,
+    timeout: Duration,
+    shutdown: Option<&CancellationToken>,
+    client_gone: Option<&CancellationToken>,
+    progress: Option<&Notify>,
+    external_timeout: Option<&CancellationToken>,
+) -> DownstreamWait<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            () = async {
+                match shutdown {
+                    Some(tok) => tok.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => return DownstreamWait::Shutdown,
+            () = async {
+                match client_gone {
+                    Some(tok) => tok.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => return DownstreamWait::ClientGone,
+            () = async {
+                match external_timeout {
+                    Some(tok) => tok.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => return DownstreamWait::TimedOut,
+            res = &mut fut => return DownstreamWait::Ready(res),
+            () = async {
+                match progress {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
+            }
+            () = &mut sleep => return DownstreamWait::TimedOut,
+        }
+    }
+}
 
 /// Validates the target machine name and inner `request` of a `relay` header.
 ///
@@ -403,6 +489,10 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
                             .shutdown
                             .as_ref()
                             .is_some_and(CancellationToken::is_cancelled)
+                            || options
+                                .client_gone
+                                .as_ref()
+                                .is_some_and(CancellationToken::is_cancelled)
                         {
                             return NextHeader::IdleExit;
                         }
@@ -427,7 +517,7 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
                             })
                             .unwrap_or(until_idle);
                         let mut wait = until_idle.min(until_flush);
-                        if options.shutdown.is_some() {
+                        if options.shutdown.is_some() || options.client_gone.is_some() {
                             wait = wait.min(SHUTDOWN_POLL_SLICE);
                         }
                         match rx.recv_timeout(wait) {
@@ -749,49 +839,76 @@ async fn open_and_greet_downstream(
     config: &ConfigStore,
     host: &Host,
     target: &str,
-    shutdown: Option<&CancellationToken>,
+    options: &StreamServeOptions,
 ) -> Result<OpenedDownstream, ErrorBody> {
-    let cancel = shutdown.cloned().unwrap_or_default();
+    let pipe_cancel = CancellationToken::new();
+    let opened_pipe = tokio::select! {
+        biased;
+        () = async {
+            match options.shutdown.as_ref() {
+                Some(tok) => tok.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            pipe_cancel.cancel();
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Relaying stream to {target} was cancelled."),
+            )
+            .with_machine(target));
+        }
+        () = async {
+            match options.client_gone.as_ref() {
+                Some(tok) => tok.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            pipe_cancel.cancel();
+            return Err(client_gone_error(host.name()));
+        }
+        res = fleet.open_relay_stream_pipe(config, host.name(), target, pipe_cancel.clone()) => res?,
+    };
     let RelayPipe {
         pipe,
         next_hop,
         chained,
-    } = fleet
-        .open_relay_stream_pipe(config, host.name(), target, cancel.clone())
-        .await?;
+    } = opened_pipe;
     let stderr = pipe.stderr_tail().clone();
     let (stdin, stdout, handle) = pipe.into_parts();
     let mut stdout = AsyncBufReader::with_capacity(OUTPUT_BUFFER, stdout);
 
-    let greet_res = tokio::select! {
-        biased;
-        () = cancel.cancelled() => {
-            Err(ErrorBody::new(
-                ErrorCode::Cancelled,
-                format!("Relaying stream to {target} was cancelled."),
+    let greet_timeout = DOWNSTREAM_GREETING_TIMEOUT.min(options.downstream_read_timeout);
+    let greet_res = match wait_downstream(
+        read_downstream_greeting(&mut stdout, &next_hop, target, chained, &stderr),
+        greet_timeout,
+        options.shutdown.as_ref(),
+        options.client_gone.as_ref(),
+        None,
+        None,
+    )
+    .await
+    {
+        DownstreamWait::Ready(inner) => inner,
+        DownstreamWait::Shutdown => Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!("Relaying stream to {target} was cancelled."),
+        )
+        .with_machine(target)),
+        DownstreamWait::ClientGone => Err(client_gone_error(host.name())),
+        DownstreamWait::TimedOut => {
+            let mut err = ErrorBody::new(
+                ErrorCode::Timeout,
+                format!(
+                    "Timed out waiting for {next_hop} to start legion stream after {}.",
+                    format_timeout(greet_timeout)
+                ),
             )
-            .with_machine(target))
-        }
-        res = tokio::time::timeout(
-            DOWNSTREAM_GREETING_TIMEOUT,
-            read_downstream_greeting(&mut stdout, &next_hop, target, chained, &stderr),
-        ) => match res {
-            Ok(inner) => inner,
-            Err(_) => {
-                let mut err = ErrorBody::new(
-                    ErrorCode::Timeout,
-                    format!(
-                        "Timed out waiting for {next_hop} to start legion stream after {}s.",
-                        DOWNSTREAM_GREETING_TIMEOUT.as_secs()
-                    ),
-                )
-                .with_machine(&next_hop);
-                let text = stderr.text();
-                if !text.is_empty() {
-                    err = err.with_hint(format!("Remote stderr: {text}"));
-                }
-                Err(err)
+            .with_machine(&next_hop);
+            let text = stderr.text();
+            if !text.is_empty() {
+                err = err.with_hint(format!("Remote stderr: {text}"));
             }
+            Err(err)
         }
     };
 
@@ -807,7 +924,7 @@ async fn open_and_greet_downstream(
         Err(err) => {
             drop(stdin);
             drop(stdout);
-            handle.close(DOWNSTREAM_CLOSE_GRACE).await;
+            handle.close(DOWNSTREAM_ABORT_GRACE).await;
             Err(err)
         }
     }
@@ -915,26 +1032,43 @@ enum ReplyLine {
 /// until the first non-busy reply line, remote error, or EOF arrives.
 async fn read_downstream_reply_forwarding_busy<W: Write>(
     stdout: &mut AsyncBufReader<ChildStdout>,
+    host: &Host,
     target: &str,
-    shutdown: Option<&CancellationToken>,
+    options: &StreamServeOptions,
+    progress: Option<&Notify>,
+    external_timeout: Option<&CancellationToken>,
     output: &mut BufWriter<W>,
 ) -> Result<ReplyLine, ErrorBody> {
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let read_res = match shutdown {
-            Some(token) => tokio::select! {
-                biased;
-                () = token.cancelled() => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Cancelled,
-                        "The stream stopped because the node is shutting down.",
-                    )
-                    .with_machine(target));
-                }
-                res = read_bounded_async_line(stdout, &mut buf, MAX_REPLY_LINE) => res,
-            },
-            None => read_bounded_async_line(stdout, &mut buf, MAX_REPLY_LINE).await,
+        let read_res = match wait_downstream(
+            read_bounded_async_line(stdout, &mut buf, MAX_REPLY_LINE),
+            options.downstream_read_timeout,
+            options.shutdown.as_ref(),
+            options.client_gone.as_ref(),
+            progress,
+            external_timeout,
+        )
+        .await
+        {
+            DownstreamWait::Ready(res) => res,
+            DownstreamWait::Shutdown => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "The stream stopped because the node is shutting down.",
+                )
+                .with_machine(target));
+            }
+            DownstreamWait::ClientGone => {
+                return Err(client_gone_error(host.name()));
+            }
+            DownstreamWait::TimedOut => {
+                return Err(downstream_timeout_error(
+                    target,
+                    options.downstream_read_timeout,
+                ));
+            }
         };
         let n = read_res.map_err(|err| {
             ErrorBody::new(
@@ -1028,28 +1162,25 @@ async fn relay_read_or_control<W: Write>(
 ) -> Result<(), ErrorBody> {
     let audit_tool = format!("stream.{}", inner_op.name());
     let (tool_name, tool_effect) = inner_op.authorised_as();
-    let opened =
-        match open_and_greet_downstream(fleet, config, host, target, options.shutdown.as_ref())
-            .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                let error = machine_or(error, host.name());
-                let _ = reply_error(output, &error);
-                record_for_target(
-                    host,
-                    target,
-                    Some(principal),
-                    door,
-                    device,
-                    &audit_tool,
-                    recorded,
-                    started,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let opened = match open_and_greet_downstream(fleet, config, host, target, options).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                &audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
 
     let OpenedDownstream {
         mut stdin,
@@ -1061,22 +1192,46 @@ async fn relay_read_or_control<W: Write>(
     } = opened;
 
     let header_bytes = build_downstream_header(&inner_map, &principal, target, chained, next_hops);
-    let write_res = async {
-        stdin.write_all(&header_bytes).await?;
-        stdin.flush().await
-    }
+    let write_wait = wait_downstream(
+        async {
+            stdin.write_all(&header_bytes).await?;
+            stdin.flush().await
+        },
+        options.downstream_read_timeout,
+        options.shutdown.as_ref(),
+        options.client_gone.as_ref(),
+        None,
+        None,
+    )
     .await;
     // Read/control operations carry no request body; half-close downstream stdin immediately.
     drop(stdin);
 
-    if let Err(err) = write_res {
+    let write_err = match write_wait {
+        DownstreamWait::Ready(Ok(())) => None,
+        DownstreamWait::Ready(Err(err)) => Some(
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Could not send stream request to {next_hop}: {err}."),
+            )
+            .with_machine(&next_hop),
+        ),
+        DownstreamWait::Shutdown => Some(
+            ErrorBody::new(
+                ErrorCode::Cancelled,
+                "The stream stopped because the node is shutting down.",
+            )
+            .with_machine(target),
+        ),
+        DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
+        DownstreamWait::TimedOut => Some(downstream_timeout_error(
+            target,
+            options.downstream_read_timeout,
+        )),
+    };
+    if let Some(error) = write_err {
         drop(stdout);
-        handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-        let error = ErrorBody::new(
-            ErrorCode::Unreachable,
-            format!("Could not send stream request to {next_hop}: {err}."),
-        )
-        .with_machine(&next_hop);
+        handle.close(DOWNSTREAM_ABORT_GRACE).await;
         let _ = reply_error(output, &error);
         record_for_target(
             host,
@@ -1094,8 +1249,11 @@ async fn relay_read_or_control<W: Write>(
 
     let first_reply = read_downstream_reply_forwarding_busy(
         &mut stdout,
+        host,
         target,
-        options.shutdown.as_ref(),
+        options,
+        None,
+        None,
         output,
     )
     .await;
@@ -1121,7 +1279,7 @@ async fn relay_read_or_control<W: Write>(
         }
         Ok(ReplyLine::Eof) => {
             drop(stdout);
-            handle.close(DOWNSTREAM_CLOSE_GRACE).await;
+            handle.close(DOWNSTREAM_ABORT_GRACE).await;
             let mut error = ErrorBody::new(
                 ErrorCode::Unreachable,
                 format!("The stream to {target} closed before answering."),
@@ -1147,7 +1305,7 @@ async fn relay_read_or_control<W: Write>(
         }
         Err(error) => {
             drop(stdout);
-            handle.close(DOWNSTREAM_CLOSE_GRACE).await;
+            handle.close(DOWNSTREAM_ABORT_GRACE).await;
             let error = machine_or(error, host.name());
             let _ = reply_error(output, &error);
             record_for_target(
@@ -1179,7 +1337,7 @@ async fn relay_read_or_control<W: Write>(
             if res.is_err() || first_done {
                 res
             } else {
-                pump_manifest_lines(&mut stdout, target, options.shutdown.as_ref(), output).await
+                pump_manifest_lines(&mut stdout, host, target, options, output).await
             }
         }
         Op::Get { .. } => {
@@ -1220,14 +1378,19 @@ async fn relay_read_or_control<W: Write>(
             if let Err(err) = output.write_all(&first_raw).and_then(|()| output.flush()) {
                 Err(machine_or(gone(&err), host.name()))
             } else {
-                pump_bytes_to_eof(&mut stdout, target, options.shutdown.as_ref(), output).await
+                pump_bytes_to_eof(&mut stdout, host, target, options, output).await
             }
         }
         Op::Put { .. } | Op::Unpack { .. } | Op::Relay { .. } => unreachable!(),
     };
 
     drop(stdout);
-    handle.close(DOWNSTREAM_CLOSE_GRACE).await;
+    let close_grace = if outcome.is_ok() {
+        DOWNSTREAM_CLOSE_GRACE
+    } else {
+        DOWNSTREAM_ABORT_GRACE
+    };
+    handle.close(close_grace).await;
 
     record_for_target(
         host,
@@ -1245,40 +1408,63 @@ async fn relay_read_or_control<W: Write>(
 
 async fn pump_manifest_lines<W: Write>(
     stdout: &mut AsyncBufReader<ChildStdout>,
+    host: &Host,
     target: &str,
-    shutdown: Option<&CancellationToken>,
+    options: &StreamServeOptions,
     output: &mut BufWriter<W>,
 ) -> Result<(), ErrorBody> {
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let read_res = match shutdown {
-            Some(token) => tokio::select! {
-                biased;
-                () = token.cancelled() => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Cancelled,
-                        "The stream stopped because the node is shutting down.",
-                    )
-                    .with_machine(target));
-                }
-                res = read_bounded_async_line(stdout, &mut buf, MAX_REPLY_LINE) => res,
-            },
-            None => read_bounded_async_line(stdout, &mut buf, MAX_REPLY_LINE).await,
+        let read_res = match wait_downstream(
+            read_bounded_async_line(stdout, &mut buf, MAX_REPLY_LINE),
+            options.downstream_read_timeout,
+            options.shutdown.as_ref(),
+            options.client_gone.as_ref(),
+            None,
+            None,
+        )
+        .await
+        {
+            DownstreamWait::Ready(res) => res,
+            DownstreamWait::Shutdown => {
+                let err = ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "The stream stopped because the node is shutting down.",
+                )
+                .with_machine(target);
+                let _ = reply_error(output, &err);
+                return Err(err);
+            }
+            DownstreamWait::ClientGone => {
+                return Err(client_gone_error(host.name()));
+            }
+            DownstreamWait::TimedOut => {
+                let err = downstream_timeout_error(target, options.downstream_read_timeout);
+                let _ = reply_error(output, &err);
+                return Err(err);
+            }
         };
-        let n = read_res.map_err(|err| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!("Reading manifest stream from {target} failed: {err}."),
-            )
-            .with_machine(target)
-        })?;
+        let n = match read_res {
+            Ok(n) => n,
+            Err(err) => {
+                let error = ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Reading manifest stream from {target} failed: {err}."),
+                )
+                .with_machine(target);
+                let _ = reply_error(output, &error);
+                return Err(error);
+            }
+        };
         if n == 0 {
-            return Err(ErrorBody::new(
+            let error = ErrorBody::new(
                 ErrorCode::Failed,
                 format!("The manifest stream from {target} ended before finishing."),
             )
-            .with_machine(target));
+            .with_machine(target);
+            let _ = reply_error(output, &error);
+            return Err(error);
         }
         output
             .write_all(&buf)
@@ -1331,22 +1517,43 @@ async fn pump_exact_bytes<W: Write>(
             )
             .with_machine(host.name()));
         }
+        if options
+            .client_gone
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(client_gone_error(host.name()));
+        }
         let want = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
             .min(buf.len());
-        let read_res = match options.shutdown.as_ref() {
-            Some(token) => tokio::select! {
-                biased;
-                () = token.cancelled() => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Cancelled,
-                        "The stream stopped because the node is shutting down.",
-                    )
-                    .with_machine(host.name()));
-                }
-                res = stdout.read(&mut buf[..want]) => res,
-            },
-            None => stdout.read(&mut buf[..want]).await,
+        let read_res = match wait_downstream(
+            stdout.read(&mut buf[..want]),
+            options.downstream_read_timeout,
+            options.shutdown.as_ref(),
+            options.client_gone.as_ref(),
+            None,
+            None,
+        )
+        .await
+        {
+            DownstreamWait::Ready(res) => res,
+            DownstreamWait::Shutdown => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "The stream stopped because the node is shutting down.",
+                )
+                .with_machine(host.name()));
+            }
+            DownstreamWait::ClientGone => {
+                return Err(client_gone_error(host.name()));
+            }
+            DownstreamWait::TimedOut => {
+                return Err(downstream_timeout_error(
+                    target,
+                    options.downstream_read_timeout,
+                ));
+            }
         };
         let n = read_res.map_err(|err| {
             ErrorBody::new(
@@ -1384,25 +1591,40 @@ async fn pump_exact_bytes<W: Write>(
 
 async fn pump_bytes_to_eof<W: Write>(
     stdout: &mut AsyncBufReader<ChildStdout>,
+    host: &Host,
     target: &str,
-    shutdown: Option<&CancellationToken>,
+    options: &StreamServeOptions,
     output: &mut BufWriter<W>,
 ) -> Result<(), ErrorBody> {
     let mut buf = vec![0u8; OUTPUT_BUFFER];
     loop {
-        let read_res = match shutdown {
-            Some(token) => tokio::select! {
-                biased;
-                () = token.cancelled() => {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Cancelled,
-                        "The stream stopped because the node is shutting down.",
-                    )
-                    .with_machine(target));
-                }
-                res = stdout.read(&mut buf) => res,
-            },
-            None => stdout.read(&mut buf).await,
+        let read_res = match wait_downstream(
+            stdout.read(&mut buf),
+            options.downstream_read_timeout,
+            options.shutdown.as_ref(),
+            options.client_gone.as_ref(),
+            None,
+            None,
+        )
+        .await
+        {
+            DownstreamWait::Ready(res) => res,
+            DownstreamWait::Shutdown => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "The stream stopped because the node is shutting down.",
+                )
+                .with_machine(target));
+            }
+            DownstreamWait::ClientGone => {
+                return Err(client_gone_error(host.name()));
+            }
+            DownstreamWait::TimedOut => {
+                return Err(downstream_timeout_error(
+                    target,
+                    options.downstream_read_timeout,
+                ));
+            }
         };
         let n = read_res.map_err(|err| {
             ErrorBody::new(
@@ -1441,28 +1663,25 @@ async fn relay_keep_open_gets<W: Write>(
     output: &mut BufWriter<W>,
     mut next_header: impl FnMut(&mut Option<GetAuditBucket>) -> NextHeader,
 ) -> Result<(), ErrorBody> {
-    let opened =
-        match open_and_greet_downstream(fleet, config, host, target, options.shutdown.as_ref())
-            .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                let error = machine_or(error, host.name());
-                let _ = reply_error(output, &error);
-                record_for_target(
-                    host,
-                    target,
-                    Some(first_principal),
-                    door,
-                    device,
-                    "stream.get",
-                    first_recorded,
-                    first_started,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let opened = match open_and_greet_downstream(fleet, config, host, target, options).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(first_principal),
+                door,
+                device,
+                "stream.get",
+                first_recorded,
+                first_started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
 
     let OpenedDownstream {
         mut stdin,
@@ -1678,17 +1897,41 @@ async fn relay_keep_open_gets<W: Write>(
             chained,
             req.next_hops,
         );
-        if let Err(err) = async {
-            stdin.write_all(&header_bytes).await?;
-            stdin.flush().await
-        }
+        let write_err = match wait_downstream(
+            async {
+                stdin.write_all(&header_bytes).await?;
+                stdin.flush().await
+            },
+            options.downstream_read_timeout,
+            options.shutdown.as_ref(),
+            options.client_gone.as_ref(),
+            None,
+            None,
+        )
         .await
         {
-            let error = ErrorBody::new(
-                ErrorCode::Unreachable,
-                format!("Could not send stream get to {next_hop}: {err}."),
-            )
-            .with_machine(&next_hop);
+            DownstreamWait::Ready(Ok(())) => None,
+            DownstreamWait::Ready(Err(err)) => Some(
+                ErrorBody::new(
+                    ErrorCode::Unreachable,
+                    format!("Could not send stream get to {next_hop}: {err}."),
+                )
+                .with_machine(&next_hop),
+            ),
+            DownstreamWait::Shutdown => Some(
+                ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "The stream stopped because the node is shutting down.",
+                )
+                .with_machine(host.name()),
+            ),
+            DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
+            DownstreamWait::TimedOut => Some(downstream_timeout_error(
+                target,
+                options.downstream_read_timeout,
+            )),
+        };
+        if let Some(error) = write_err {
             let _ = reply_error(output, &error);
             record_for_target(
                 host,
@@ -1706,8 +1949,11 @@ async fn relay_keep_open_gets<W: Write>(
 
         let reply = read_downstream_reply_forwarding_busy(
             &mut stdout,
+            host,
             target,
-            options.shutdown.as_ref(),
+            options,
+            None,
+            None,
             output,
         )
         .await;
@@ -1849,29 +2095,50 @@ async fn relay_keep_open_gets<W: Write>(
         let target_keep_open = ready.keep_open == Some(true);
         if target_keep_open {
             let mut trailer = Vec::with_capacity(32);
-            let trailer_res = match options.shutdown.as_ref() {
-                Some(token) => tokio::select! {
-                    biased;
-                    () = token.cancelled() => {
-                        Err(io::Error::new(io::ErrorKind::Interrupted, "shutting down"))
-                    }
-                    res = read_bounded_async_line(&mut stdout, &mut trailer, MAX_DONE_LINE) => res,
-                },
-                None => read_bounded_async_line(&mut stdout, &mut trailer, MAX_DONE_LINE).await,
+            let trailer_wait = wait_downstream(
+                read_bounded_async_line(&mut stdout, &mut trailer, MAX_DONE_LINE),
+                options.downstream_read_timeout,
+                options.shutdown.as_ref(),
+                options.client_gone.as_ref(),
+                None,
+                None,
+            )
+            .await;
+            let trailer_err = match trailer_wait {
+                DownstreamWait::Ready(Ok(n))
+                    if n > 0
+                        && serde_json::from_slice::<Value>(&trailer)
+                            .ok()
+                            .and_then(|v| v.as_object().cloned())
+                            .is_some_and(|m| {
+                                m.len() == 1 && m.get("done") == Some(&Value::Bool(true))
+                            }) =>
+                {
+                    None
+                }
+                DownstreamWait::Shutdown => Some(
+                    ErrorBody::new(
+                        ErrorCode::Cancelled,
+                        "The stream stopped because the node is shutting down.",
+                    )
+                    .with_machine(host.name()),
+                ),
+                DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
+                DownstreamWait::TimedOut => Some(downstream_timeout_error(
+                    target,
+                    options.downstream_read_timeout,
+                )),
+                DownstreamWait::Ready(_) => Some(
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!(
+                            "The relayed keep_open stream from {target} ended without its frame terminator."
+                        ),
+                    )
+                    .with_machine(target),
+                ),
             };
-            let ok_done = matches!(trailer_res, Ok(n) if n > 0)
-                && serde_json::from_slice::<Value>(&trailer)
-                    .ok()
-                    .and_then(|v| v.as_object().cloned())
-                    .is_some_and(|m| m.len() == 1 && m.get("done") == Some(&Value::Bool(true)));
-            if !ok_done {
-                let error = ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!(
-                        "The relayed keep_open stream from {target} ended without its frame terminator."
-                    ),
-                )
-                .with_machine(target);
+            if let Some(error) = trailer_err {
                 record_for_target(
                     host,
                     target,
@@ -1940,7 +2207,12 @@ async fn relay_keep_open_gets<W: Write>(
     let _ = output.flush();
     drop(stdin);
     drop(stdout);
-    handle.close(DOWNSTREAM_CLOSE_GRACE).await;
+    let close_grace = if res.is_ok() {
+        DOWNSTREAM_CLOSE_GRACE
+    } else {
+        DOWNSTREAM_ABORT_GRACE
+    };
+    handle.close(close_grace).await;
     res
 }
 
@@ -1966,28 +2238,25 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
     mut input: BufReader<R>,
     output: &mut BufWriter<W>,
 ) -> Result<(), ErrorBody> {
-    let opened =
-        match open_and_greet_downstream(fleet, config, host, target, options.shutdown.as_ref())
-            .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                let error = machine_or(error, host.name());
-                let _ = reply_error(output, &error);
-                record_for_target(
-                    host,
-                    target,
-                    Some(principal),
-                    door,
-                    device,
-                    audit_tool,
-                    recorded,
-                    started,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let opened = match open_and_greet_downstream(fleet, config, host, target, options).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
 
     let OpenedDownstream {
         mut stdin,
@@ -1999,20 +2268,44 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
     } = opened;
 
     let header_bytes = build_downstream_header(&inner_map, &principal, target, chained, next_hops);
-    if let Err(err) = async {
-        stdin.write_all(&header_bytes).await?;
-        stdin.flush().await
-    }
+    let header_err = match wait_downstream(
+        async {
+            stdin.write_all(&header_bytes).await?;
+            stdin.flush().await
+        },
+        options.downstream_read_timeout,
+        options.shutdown.as_ref(),
+        options.client_gone.as_ref(),
+        None,
+        None,
+    )
     .await
     {
+        DownstreamWait::Ready(Ok(())) => None,
+        DownstreamWait::Ready(Err(err)) => Some(
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Could not send stream request to {next_hop}: {err}."),
+            )
+            .with_machine(&next_hop),
+        ),
+        DownstreamWait::Shutdown => Some(
+            ErrorBody::new(
+                ErrorCode::Cancelled,
+                "The stream stopped because the node is shutting down.",
+            )
+            .with_machine(target),
+        ),
+        DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
+        DownstreamWait::TimedOut => Some(downstream_timeout_error(
+            target,
+            options.downstream_read_timeout,
+        )),
+    };
+    if let Some(error) = header_err {
         drop(stdin);
         drop(stdout);
-        handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-        let error = ErrorBody::new(
-            ErrorCode::Unreachable,
-            format!("Could not send stream request to {next_hop}: {err}."),
-        )
-        .with_machine(&next_hop);
+        handle.close(DOWNSTREAM_ABORT_GRACE).await;
         let _ = reply_error(output, &error);
         record_for_target(
             host,
@@ -2030,8 +2323,11 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
 
     let first_reply = read_downstream_reply_forwarding_busy(
         &mut stdout,
+        host,
         target,
-        options.shutdown.as_ref(),
+        options,
+        None,
+        None,
         output,
     )
     .await;
@@ -2159,6 +2455,12 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
     let stop_writing = CancellationToken::new();
     let writer_stop = stop_writing.clone();
     let writer_shutdown = options.shutdown.clone();
+    let writer_client_gone = options.client_gone.clone();
+    let write_timeout = options.downstream_read_timeout;
+    let write_progress = Arc::new(Notify::new());
+    let writer_progress = Arc::clone(&write_progress);
+    let write_timed_out = CancellationToken::new();
+    let writer_timed_out = write_timed_out.clone();
 
     // Dedicated OS thread feeds bounded chunks from client stdin so returning early when the
     // target dies mid-put never blocks on an unread client stdin.
@@ -2190,16 +2492,44 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
                         None => std::future::pending().await,
                     }
                 } => None,
+                () = async {
+                    match writer_client_gone.as_ref() {
+                        Some(tok) => tok.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
                 chunk = chunk_rx.recv() => chunk,
             };
             match next {
                 Some(bytes) => {
-                    if stdin.write_all(&bytes).await.is_err() {
-                        break;
+                    match wait_downstream(
+                        stdin.write_all(&bytes),
+                        write_timeout,
+                        writer_shutdown.as_ref(),
+                        writer_client_gone.as_ref(),
+                        None,
+                        Some(&writer_stop),
+                    )
+                    .await
+                    {
+                        DownstreamWait::Ready(Ok(())) => {
+                            writer_progress.notify_one();
+                        }
+                        DownstreamWait::TimedOut => {
+                            if !writer_stop.is_cancelled() {
+                                writer_timed_out.cancel();
+                            }
+                            break;
+                        }
+                        DownstreamWait::Ready(Err(_))
+                        | DownstreamWait::Shutdown
+                        | DownstreamWait::ClientGone => {
+                            break;
+                        }
                     }
                 }
                 None => {
-                    let _ = stdin.flush().await;
+                    let _ = tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, stdin.flush()).await;
                     break;
                 }
             }
@@ -2211,14 +2541,17 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
 
     let final_reply = read_downstream_reply_forwarding_busy(
         &mut stdout,
+        host,
         target,
-        options.shutdown.as_ref(),
+        options,
+        Some(write_progress.as_ref()),
+        Some(&write_timed_out),
         output,
     )
     .await;
 
     stop_writing.cancel();
-    let _ = tokio::time::timeout(DOWNSTREAM_CLOSE_GRACE, writer_task).await;
+    let _ = tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, writer_task).await;
 
     let outcome = match final_reply {
         Ok(ReplyLine::Json(raw, _fields)) => output
@@ -2250,7 +2583,12 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
     };
 
     drop(stdout);
-    handle.close(DOWNSTREAM_CLOSE_GRACE).await;
+    let close_grace = if outcome.is_ok() {
+        DOWNSTREAM_CLOSE_GRACE
+    } else {
+        DOWNSTREAM_ABORT_GRACE
+    };
+    handle.close(close_grace).await;
     record_for_target(
         host,
         target,
@@ -2285,28 +2623,25 @@ async fn relay_write_scoped<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut BufWriter<W>,
 ) -> Result<(), ErrorBody> {
-    let opened =
-        match open_and_greet_downstream(fleet, config, host, target, options.shutdown.as_ref())
-            .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                let error = machine_or(error, host.name());
-                let _ = reply_error(output, &error);
-                record_for_target(
-                    host,
-                    target,
-                    Some(principal),
-                    door,
-                    device,
-                    audit_tool,
-                    recorded,
-                    started,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let opened = match open_and_greet_downstream(fleet, config, host, target, options).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
 
     let OpenedDownstream {
         mut stdin,
@@ -2318,20 +2653,44 @@ async fn relay_write_scoped<R: BufRead, W: Write>(
     } = opened;
 
     let header_bytes = build_downstream_header(&inner_map, &principal, target, chained, next_hops);
-    if let Err(err) = async {
-        stdin.write_all(&header_bytes).await?;
-        stdin.flush().await
-    }
+    let header_err = match wait_downstream(
+        async {
+            stdin.write_all(&header_bytes).await?;
+            stdin.flush().await
+        },
+        options.downstream_read_timeout,
+        options.shutdown.as_ref(),
+        options.client_gone.as_ref(),
+        None,
+        None,
+    )
     .await
     {
+        DownstreamWait::Ready(Ok(())) => None,
+        DownstreamWait::Ready(Err(err)) => Some(
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Could not send stream request to {next_hop}: {err}."),
+            )
+            .with_machine(&next_hop),
+        ),
+        DownstreamWait::Shutdown => Some(
+            ErrorBody::new(
+                ErrorCode::Cancelled,
+                "The stream stopped because the node is shutting down.",
+            )
+            .with_machine(target),
+        ),
+        DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
+        DownstreamWait::TimedOut => Some(downstream_timeout_error(
+            target,
+            options.downstream_read_timeout,
+        )),
+    };
+    if let Some(error) = header_err {
         drop(stdin);
         drop(stdout);
-        handle.close(DOWNSTREAM_CLOSE_GRACE).await;
-        let error = ErrorBody::new(
-            ErrorCode::Unreachable,
-            format!("Could not send stream request to {next_hop}: {err}."),
-        )
-        .with_machine(&next_hop);
+        handle.close(DOWNSTREAM_ABORT_GRACE).await;
         let _ = reply_error(output, &error);
         record_for_target(
             host,
@@ -2349,8 +2708,11 @@ async fn relay_write_scoped<R: BufRead, W: Write>(
 
     let first_reply = read_downstream_reply_forwarding_busy(
         &mut stdout,
+        host,
         target,
-        options.shutdown.as_ref(),
+        options,
+        None,
+        None,
         output,
     )
     .await;
@@ -2472,28 +2834,71 @@ async fn relay_write_scoped<R: BufRead, W: Write>(
 
     let mut left = body_limit.unwrap_or(u64::MAX);
     let mut buf = vec![0u8; OUTPUT_BUFFER];
+    let mut body_abort: Option<ErrorBody> = None;
     while left > 0 {
         let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
         match input.read(&mut buf[..want]) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if stdin.write_all(&buf[..n]).await.is_err() {
-                    break;
+                match wait_downstream(
+                    stdin.write_all(&buf[..n]),
+                    options.downstream_read_timeout,
+                    options.shutdown.as_ref(),
+                    options.client_gone.as_ref(),
+                    None,
+                    None,
+                )
+                .await
+                {
+                    DownstreamWait::Ready(Ok(())) => {
+                        left -= n as u64;
+                    }
+                    DownstreamWait::Ready(Err(_)) => break,
+                    DownstreamWait::Shutdown => {
+                        body_abort = Some(
+                            ErrorBody::new(
+                                ErrorCode::Cancelled,
+                                "The stream stopped because the node is shutting down.",
+                            )
+                            .with_machine(target),
+                        );
+                        break;
+                    }
+                    DownstreamWait::ClientGone => {
+                        body_abort = Some(client_gone_error(host.name()));
+                        break;
+                    }
+                    DownstreamWait::TimedOut => {
+                        body_abort = Some(downstream_timeout_error(
+                            target,
+                            options.downstream_read_timeout,
+                        ));
+                        break;
+                    }
                 }
-                left -= n as u64;
             }
         }
     }
-    let _ = stdin.flush().await;
+    if body_abort.is_none() {
+        let _ = tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, stdin.flush()).await;
+    }
     drop(stdin);
 
-    let final_reply = read_downstream_reply_forwarding_busy(
-        &mut stdout,
-        target,
-        options.shutdown.as_ref(),
-        output,
-    )
-    .await;
+    let final_reply = match body_abort {
+        Some(err) => Err(err),
+        None => {
+            read_downstream_reply_forwarding_busy(
+                &mut stdout,
+                host,
+                target,
+                options,
+                None,
+                None,
+                output,
+            )
+            .await
+        }
+    };
 
     let outcome = match final_reply {
         Ok(ReplyLine::Json(raw, _)) => output
@@ -2525,7 +2930,12 @@ async fn relay_write_scoped<R: BufRead, W: Write>(
     };
 
     drop(stdout);
-    handle.close(DOWNSTREAM_CLOSE_GRACE).await;
+    let close_grace = if outcome.is_ok() {
+        DOWNSTREAM_CLOSE_GRACE
+    } else {
+        DOWNSTREAM_ABORT_GRACE
+    };
+    handle.close(close_grace).await;
     record_for_target(
         host,
         target,

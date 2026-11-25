@@ -74,6 +74,9 @@ pub const STREAM_CAPABILITIES: [&str; 1] = [CAP_STREAM_RELAY];
 /// How often an operation at work on something long says so, where a reply line is awaited.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// Maximum time a relayed stream waits between messages or data chunks from its downstream target.
+pub const DEFAULT_RELAY_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The operations this node knows, as `unsupported` names them.
 const OPS: [&str; 8] = [
     "manifest", "stat", "get", "put", "pack", "unpack", "delete", "relay",
@@ -378,6 +381,12 @@ pub struct StreamServeOptions {
     /// Optional shutdown signal (such as SIGTERM/SIGINT) that flushes pending audit records and
     /// ends a `keep_open` session cleanly.
     pub shutdown: Option<CancellationToken>,
+    /// Optional signal cancelled when the upstream client closes its read side before the stream
+    /// ends, allowing relayed streams blocked on a stuck target to tear down promptly.
+    pub client_gone: Option<CancellationToken>,
+    /// Maximum time a relayed stream waits between messages or data chunks from its downstream
+    /// target before failing both sides with `timeout`.
+    pub downstream_read_timeout: Duration,
     /// Optional fleet session pool reused when serving `op: "relay"` requests. When absent,
     /// relayed requests construct a short-lived fleet handle over `host.paths()`.
     pub fleet: Option<crate::Fleet>,
@@ -393,6 +402,8 @@ impl Default for StreamServeOptions {
             recheck_bytes: GET_RECHECK_BYTES,
             recheck_interval: GET_RECHECK_INTERVAL,
             shutdown: None,
+            client_gone: None,
+            downstream_read_timeout: DEFAULT_RELAY_READ_TIMEOUT,
             fleet: None,
             runtime: None,
         }

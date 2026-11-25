@@ -59,6 +59,14 @@ fn main() -> ExitCode {
             "heartbeats_pass_through_and_both_ends_dying_close_in_bounded_time",
             heartbeats_pass_through_and_both_ends_dying_close_in_bounded_time,
         ),
+        (
+            "stuck_target_50mb_get_sigstop_client_gone_and_timeout",
+            stuck_target_50mb_get_sigstop_client_gone_and_timeout,
+        ),
+        (
+            "stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets",
+            stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets,
+        ),
     ];
 
     let mut passed = 0usize;
@@ -99,16 +107,129 @@ fn helper(args: &[String]) -> ExitCode {
             let legion_home = &args[1];
             let user_home = &args[2];
             let sub = &args[3];
-            let status = Command::new(LEGION_BIN)
-                .arg(sub)
+            let mut cmd = Command::new(LEGION_BIN);
+            cmd.arg(sub)
                 .env("LEGION_HOME", legion_home)
                 .env("HOME", user_home)
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .expect("spawn legion node");
-            ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8)
+                .stderr(Stdio::inherit());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = cmd.exec();
+                panic!("exec legion node failed: {err}");
+            }
+            #[cfg(not(unix))]
+            {
+                let status = cmd.status().expect("spawn legion node");
+                ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8)
+            }
+        }
+        Some("node-pid") => {
+            // Args: node-pid <pid_file> <legion_home> <user_home> <subcommand>
+            let pid_file = PathBuf::from(&args[1]);
+            let legion_home = &args[2];
+            let user_home = &args[3];
+            let sub = &args[4];
+            fs::write(&pid_file, std::process::id().to_string()).unwrap();
+            let mut cmd = Command::new(LEGION_BIN);
+            cmd.arg(sub)
+                .env("LEGION_HOME", legion_home)
+                .env("HOME", user_home)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = cmd.exec();
+                panic!("exec legion node-pid failed: {err}");
+            }
+            #[cfg(not(unix))]
+            {
+                let status = cmd.status().expect("spawn legion node-pid");
+                ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8)
+            }
+        }
+        Some("stalling-stat") => {
+            // Args: stalling-stat <pid_file> <seen_file> <subcommand>
+            let pid_file = PathBuf::from(&args[1]);
+            let seen_file = PathBuf::from(&args[2]);
+            fs::write(&pid_file, std::process::id().to_string()).unwrap();
+            let mut out = std::io::stdout().lock();
+            writeln!(
+                out,
+                "{}",
+                json!({ "protocol": 1, "capabilities": ["stream.relay"] })
+            )
+            .unwrap();
+            out.flush().unwrap();
+            let mut line = String::new();
+            let mut stdin = BufReader::new(std::io::stdin());
+            if stdin.read_line(&mut line).unwrap_or(0) > 0 {
+                fs::write(&seen_file, &line).unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Some("paced-heartbeat-stat") => {
+            let mut out = std::io::stdout().lock();
+            writeln!(
+                out,
+                "{}",
+                json!({ "protocol": 1, "capabilities": ["stream.relay"] })
+            )
+            .unwrap();
+            out.flush().unwrap();
+            let mut line = String::new();
+            let mut stdin = BufReader::new(std::io::stdin());
+            let _ = stdin.read_line(&mut line);
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(200));
+                writeln!(out, "{}", json!({ "busy": true })).unwrap();
+                out.flush().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            writeln!(out, "{}", json!({ "kind": "file", "size": 456 })).unwrap();
+            out.flush().unwrap();
+            ExitCode::SUCCESS
+        }
+        Some("paced-get") => {
+            let mut out = std::io::stdout().lock();
+            writeln!(
+                out,
+                "{}",
+                json!({ "protocol": 1, "capabilities": ["stream.relay"] })
+            )
+            .unwrap();
+            out.flush().unwrap();
+            let mut line = String::new();
+            let mut stdin = BufReader::new(std::io::stdin());
+            let _ = stdin.read_line(&mut line);
+            let chunk = vec![0x42u8; 16 * 1024];
+            let total = (chunk.len() * 3) as u64;
+            writeln!(
+                out,
+                "{}",
+                json!({
+                    "size": total,
+                    "offset": 0,
+                    "length": total,
+                    "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 }
+                })
+            )
+            .unwrap();
+            out.flush().unwrap();
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(200));
+                if out.write_all(&chunk).is_err() || out.flush().is_err() {
+                    return ExitCode::from(1);
+                }
+            }
+            ExitCode::SUCCESS
         }
         Some("old-relay") => {
             // Simulates an older `legion stream` that emits `{"protocol": 1}` without
@@ -285,18 +406,39 @@ fn fleet_entry_for_helper(alias: &str, mode: &str, extra: &[&str]) -> String {
 }
 
 fn spawn_stream(node_home: &Home, pinned: Option<&str>) -> Child {
+    spawn_stream_with_timeout(node_home, pinned, None)
+}
+
+fn spawn_stream_with_timeout(
+    node_home: &Home,
+    pinned: Option<&str>,
+    relay_timeout_ms: Option<u64>,
+) -> Child {
     let mut cmd = Command::new(LEGION_BIN);
     cmd.arg("stream");
     if let Some(p) = pinned {
         cmd.arg("--as").arg(p);
     }
     cmd.env("LEGION_HOME", legion_home_of(node_home))
-        .env("HOME", node_home.home())
-        .stdin(Stdio::piped())
+        .env("HOME", node_home.home());
+    if let Some(ms) = relay_timeout_ms {
+        cmd.env("LEGION_TEST_RELAY_TIMEOUT_MS", ms.to_string());
+    }
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn legion stream")
+}
+
+fn fleet_entry_for_node_with_pid(alias: &str, pid_file: &std::path::Path, target: &Home) -> String {
+    let exe = toml_string(&self_exe());
+    let flag = toml_string(HELPER_FLAG);
+    let mode = toml_string("node-pid");
+    let pf = toml_string(&pid_file.to_string_lossy());
+    let lh = toml_string(&legion_home_of(target).to_string_lossy());
+    let uh = toml_string(&target.home().to_string_lossy());
+    format!("[machines.{alias}]\ncommand = [{exe}, {flag}, {mode}, {pf}, {lh}, {uh}, \"rpc\"]\n")
 }
 
 fn read_json_line<R: BufRead>(reader: &mut R) -> Value {
@@ -1175,5 +1317,453 @@ fn heartbeats_pass_through_and_both_ends_dying_close_in_bounded_time() {
         );
         drop(stdin);
         let _ = child.wait().unwrap();
+    }
+}
+
+fn wait_for_file(path: &std::path::Path, limit: Duration) -> String {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Ok(text) = fs::read_to_string(path)
+            && !text.trim().is_empty()
+        {
+            return text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_child_exit(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, sig: &str) {
+    let status = Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {sig} {pid} failed");
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let proc_stat = PathBuf::from(format!("/proc/{pid}/stat"));
+    if let Ok(stat) = fs::read_to_string(&proc_stat)
+        && let Some(rparen) = stat.rfind(')')
+        && let Some(state) = stat[rparen + 1..].trim_start().chars().next()
+    {
+        return state != 'Z';
+    }
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(unix)]
+fn count_alive_pids(pids: &[u32]) -> usize {
+    pids.iter()
+        .copied()
+        .filter(|&pid| pid_is_alive(pid))
+        .count()
+}
+
+#[cfg(unix)]
+fn wait_pids_gone(pids: &[u32], limit: Duration) -> usize {
+    let deadline = Instant::now() + limit;
+    loop {
+        let alive = count_alive_pids(pids);
+        if alive == 0 || Instant::now() >= deadline {
+            return alive;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn stuck_target_50mb_get_sigstop_client_gone_and_timeout() {
+    #[cfg(not(unix))]
+    {
+        // SIGSTOP and stdout peer hangup detection are Unix-only.
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let tower = node("tower");
+        let studio = node("studio");
+        let target_pid_file = tower.home().join("studio-get.pid");
+        tower.write_config(
+            "fleet.toml",
+            &fleet_entry_for_node_with_pid("studio", &target_pid_file, &studio),
+        );
+        write_device_policy(&tower, "allow = [\"fs.read\"]\n");
+        write_device_policy(&studio, "allow = [\"fs.read\"]\n");
+
+        // Create a real 50 MiB file on `studio` (sparse-friendly on ext4/btrfs/tmpfs via set_len
+        // + end byte so reads return 50 MiB cleanly without slowing the test down).
+        let huge_path = studio.home().join("huge50.bin");
+        let total: u64 = 50 * 1024 * 1024;
+        {
+            let mut file = fs::File::create(&huge_path).unwrap();
+            file.set_len(total).unwrap();
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(total - 4)).unwrap();
+            file.write_all(b"END!").unwrap();
+        }
+
+        // Scenario 1A: 50 MiB relayed `get`, target's `legion stream` SIGSTOPped after 1 MiB,
+        // client killed while timeout is long (60s) -> relay notices client gone and tears down
+        // both relay and target within a few seconds without SIGCONT.
+        {
+            let _ = fs::remove_file(&target_pid_file);
+            let mut child = spawn_stream_with_timeout(&tower, Some("device"), Some(60_000));
+            let relay_pid = child.id();
+            let mut stdin = child.stdin.take().unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let _ = read_greeting(&mut stdout);
+            write_json_line(
+                &mut stdin,
+                &json!({
+                    "protocol": 1,
+                    "op": "relay",
+                    "on": "studio",
+                    "request": { "protocol": 1, "op": "get", "path": "~/huge50.bin" }
+                }),
+            );
+            drop(stdin);
+
+            let ready = read_json_line(&mut stdout);
+            assert_eq!(ready["length"], json!(total));
+            let mut first_mb = vec![0u8; 1024 * 1024];
+            stdout.read_exact(&mut first_mb).unwrap();
+
+            let target_pid: u32 = wait_for_file(&target_pid_file, Duration::from_secs(3))
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(count_alive_pids(&[relay_pid]), 1);
+            assert_eq!(count_alive_pids(&[target_pid]), 1);
+
+            send_signal(target_pid, "-STOP");
+
+            // Kill the client side by dropping its stdout reader.
+            let started = Instant::now();
+            drop(stdout);
+
+            let status = wait_child_exit(&mut child, Duration::from_secs(4));
+            assert!(
+                status.is_some(),
+                "relay stayed stuck instead of noticing client gone on SIGSTOPped target"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "client-gone teardown took too long: {:?}",
+                started.elapsed()
+            );
+            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
+            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+            if remaining_target > 0 {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &target_pid.to_string()])
+                    .status();
+            }
+            assert_eq!(
+                remaining_relay, 0,
+                "relay process lingered after client gone"
+            );
+            assert_eq!(
+                remaining_target, 0,
+                "SIGSTOPped target process lingered after client gone"
+            );
+        }
+
+        // Scenario 1B: 50 MiB relayed `get`, target's `legion stream` SIGSTOPped after 1 MiB,
+        // client stays alive -> shortened between-messages timeout (500ms) ends both sides with
+        // `timeout` labelled with `studio` and leaves 0 processes on relay and target.
+        {
+            let _ = fs::remove_file(&target_pid_file);
+            let mut child = spawn_stream_with_timeout(&tower, Some("device"), Some(500));
+            let relay_pid = child.id();
+            let mut stdin = child.stdin.take().unwrap();
+            let mut stdout = BufReader::new(child.stdout.take().unwrap());
+            let mut stderr = child.stderr.take().unwrap();
+            let _ = read_greeting(&mut stdout);
+            write_json_line(
+                &mut stdin,
+                &json!({
+                    "protocol": 1,
+                    "op": "relay",
+                    "on": "studio",
+                    "request": { "protocol": 1, "op": "get", "path": "~/huge50.bin" }
+                }),
+            );
+            drop(stdin);
+
+            let ready = read_json_line(&mut stdout);
+            assert_eq!(ready["length"], json!(total));
+            let mut first_mb = vec![0u8; 1024 * 1024];
+            stdout.read_exact(&mut first_mb).unwrap();
+
+            let target_pid: u32 = wait_for_file(&target_pid_file, Duration::from_secs(3))
+                .trim()
+                .parse()
+                .unwrap();
+            send_signal(target_pid, "-STOP");
+
+            // Client keeps reading; relay must time out and close stdout instead of hanging.
+            let started = Instant::now();
+            let mut rest = Vec::new();
+            let _ = stdout.read_to_end(&mut rest);
+            assert!(
+                started.elapsed() < Duration::from_secs(4),
+                "timeout took too long on SIGSTOPped get: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                (first_mb.len() + rest.len()) < total as usize,
+                "stream should terminate short on timeout"
+            );
+            let status = wait_child_exit(&mut child, Duration::from_secs(3)).expect("relay exit");
+            assert!(!status.success());
+            let mut err_text = String::new();
+            let _ = stderr.read_to_string(&mut err_text);
+            assert!(
+                err_text.contains("studio") && err_text.contains("stopped responding"),
+                "expected timeout stderr naming studio, got: {err_text:?}"
+            );
+
+            let audits = audit_entries(&tower);
+            let last = audits.last().expect("relay audit entry");
+            assert_eq!(last["target"], json!("studio"));
+            assert_eq!(last["outcome"], json!("timeout"));
+
+            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
+            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+            if remaining_target > 0 {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &target_pid.to_string()])
+                    .status();
+            }
+            assert_eq!(remaining_relay, 0, "relay process lingered after timeout");
+            assert_eq!(
+                remaining_target, 0,
+                "SIGSTOPped target process lingered after timeout"
+            );
+        }
+    }
+}
+
+fn stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets() {
+    let tower = node("tower");
+    let pid_file = tower.home().join("stat-target.pid");
+    let seen_file = tower.home().join("stat-seen.txt");
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "{}{}{}",
+            fleet_entry_for_helper(
+                "studio",
+                "stalling-stat",
+                &[&pid_file.to_string_lossy(), &seen_file.to_string_lossy()],
+            ),
+            fleet_entry_for_helper("busy_stat", "paced-heartbeat-stat", &[]),
+            fleet_entry_for_helper("paced_get", "paced-get", &[]),
+        ),
+    );
+    write_device_policy(&tower, "allow = [\"fs.read\"]\n");
+
+    // Scenario 2A: checksum `stat` stopped before first reply -> shortened 500ms timeout replies
+    // with `timeout` labelled with `studio` and leaves 0 processes on relay and target.
+    {
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&seen_file);
+        let mut child = spawn_stream_with_timeout(&tower, Some("device"), Some(500));
+        #[cfg(unix)]
+        let relay_pid = child.id();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": { "protocol": 1, "op": "stat", "path": "~/big.iso", "checksum": true }
+            }),
+        );
+        drop(stdin);
+
+        let _ = wait_for_file(&seen_file, Duration::from_secs(3));
+        let target_pid: u32 = wait_for_file(&pid_file, Duration::from_secs(3))
+            .trim()
+            .parse()
+            .unwrap();
+        #[cfg(unix)]
+        send_signal(target_pid, "-STOP");
+
+        let started = Instant::now();
+        let reply = read_json_line(&mut stdout);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "checksum stat timeout took too long: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(reply["error"]["code"], json!("timeout"), "reply={reply}");
+        assert_eq!(reply["error"]["machine"], json!("studio"), "reply={reply}");
+        let status = wait_child_exit(&mut child, Duration::from_secs(3)).expect("relay exit");
+        assert!(!status.success());
+
+        #[cfg(unix)]
+        {
+            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
+            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+            if remaining_target > 0 {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &target_pid.to_string()])
+                    .status();
+            }
+            assert_eq!(
+                remaining_relay, 0,
+                "relay process lingered after stat timeout"
+            );
+            assert_eq!(
+                remaining_target, 0,
+                "target process lingered after stat timeout"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = target_pid;
+    }
+
+    // Scenario 2B (Unix): checksum `stat` SIGSTOPped before first reply with a 60s timeout, client
+    // killed -> relay notices client gone and tears down both sides within a few seconds.
+    #[cfg(unix)]
+    {
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(&seen_file);
+        let mut child = spawn_stream_with_timeout(&tower, Some("device"), Some(60_000));
+        let relay_pid = child.id();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": { "protocol": 1, "op": "stat", "path": "~/big.iso", "checksum": true }
+            }),
+        );
+        drop(stdin);
+
+        let _ = wait_for_file(&seen_file, Duration::from_secs(3));
+        let target_pid: u32 = wait_for_file(&pid_file, Duration::from_secs(3))
+            .trim()
+            .parse()
+            .unwrap();
+        send_signal(target_pid, "-STOP");
+
+        let started = Instant::now();
+        drop(stdout);
+
+        let status = wait_child_exit(&mut child, Duration::from_secs(4));
+        assert!(
+            status.is_some(),
+            "relay stayed stuck on SIGSTOPped checksum stat after client disappeared"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "client-gone teardown on stat took too long: {:?}",
+            started.elapsed()
+        );
+        let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
+        let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+        if remaining_target > 0 {
+            let _ = Command::new("kill")
+                .args(["-KILL", &target_pid.to_string()])
+                .status();
+        }
+        assert_eq!(
+            remaining_relay, 0,
+            "relay process lingered after stat client gone"
+        );
+        assert_eq!(
+            remaining_target, 0,
+            "SIGSTOPped target lingered after stat client gone"
+        );
+    }
+
+    // Scenario 2C: heartbeats reset the between-messages deadline (3 heartbeats spaced 200ms apart
+    // = 800ms total > 450ms timeout).
+    {
+        let mut child = spawn_stream_with_timeout(&tower, Some("device"), Some(450));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "busy_stat",
+                "request": { "protocol": 1, "op": "stat", "path": "~/big.iso", "checksum": true }
+            }),
+        );
+        drop(stdin);
+        for _ in 0..3 {
+            assert_eq!(read_json_line(&mut stdout), json!({ "busy": true }));
+        }
+        let reply = read_json_line(&mut stdout);
+        assert_eq!(reply["kind"], json!("file"));
+        assert_eq!(reply["size"], json!(456));
+        assert!(child.wait().unwrap().success());
+    }
+
+    // Scenario 2D: data chunks reset the between-messages deadline (3 chunks spaced 200ms apart =
+    // 600ms total > 450ms timeout).
+    {
+        let mut child = spawn_stream_with_timeout(&tower, Some("device"), Some(450));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "paced_get",
+                "request": { "protocol": 1, "op": "get", "path": "~/paced.bin" }
+            }),
+        );
+        drop(stdin);
+        let ready = read_json_line(&mut stdout);
+        let expected_len = 3 * 16 * 1024;
+        assert_eq!(ready["length"], json!(expected_len));
+        let mut got = vec![0u8; expected_len];
+        stdout.read_exact(&mut got).unwrap();
+        assert!(got.iter().all(|&b| b == 0x42));
+        assert!(child.wait().unwrap().success());
     }
 }

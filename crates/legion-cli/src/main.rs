@@ -303,12 +303,48 @@ async fn serve_stream(
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
-    let stream_options = legion_net::stream::StreamServeOptions {
+    let client_gone = CancellationToken::new();
+    let watch_stop = CancellationToken::new();
+    let client_watcher = if legion_os::pipe::stdout_is_peer_stream() {
+        let gone_tok = client_gone.clone();
+        let stop_tok = watch_stop.clone();
+        let shut_tok = shutdown.clone();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = stop_tok.cancelled() => break,
+                    () = shut_tok.cancelled() => break,
+                    _ = interval.tick() => {
+                        if legion_os::pipe::stdout_peer_closed() {
+                            gone_tok.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let mut stream_options = legion_net::stream::StreamServeOptions {
         shutdown: Some(shutdown.clone()),
+        client_gone: Some(client_gone),
         fleet: Some(fleet),
         runtime: Some(tokio::runtime::Handle::current()),
         ..legion_net::stream::StreamServeOptions::default()
     };
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("LEGION_TEST_RELAY_TIMEOUT_MS")
+        && let Ok(ms) = raw.trim().parse::<u64>()
+        && ms > 0
+    {
+        stream_options.downstream_read_timeout = Duration::from_millis(ms);
+    }
+
     let mut served = tokio::task::spawn_blocking(move || {
         legion_net::stream::serve_with_options(
             &host,
@@ -323,13 +359,17 @@ async fn serve_stream(
     let outcome = tokio::select! {
         result = &mut served => Some(result),
         () = shutdown.cancelled() => {
-            // Give an operation that is already finishing a short window to audit cleanly
-            // without hanging if stdin stays open.
-            tokio::time::timeout(Duration::from_millis(500), served)
+            // Give an operation that is already finishing a short window to tear down downstream
+            // processes and audit cleanly without hanging if stdin stays open.
+            tokio::time::timeout(Duration::from_millis(750), served)
                 .await
                 .ok()
         }
     };
+    watch_stop.cancel();
+    if let Some(watcher) = client_watcher {
+        watcher.abort();
+    }
     match outcome {
         Some(Ok(Ok(()))) => ExitCode::SUCCESS,
         Some(Ok(Err(error))) => {
