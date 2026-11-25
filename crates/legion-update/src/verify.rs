@@ -142,6 +142,11 @@ pub fn verify_set_directory(
         meta.sums.verify_file(name, &dir.join(name))?;
     }
 
+    // Also verify every declared artifact matches its signed byte size in update.json.
+    for artifact in &meta.manifest.artifacts {
+        verify_exact_file_size(&dir.join(&artifact.name), &artifact.name, artifact.size)?;
+    }
+
     Ok(meta)
 }
 
@@ -159,14 +164,57 @@ pub fn select_verified_artifact<'a>(
     Ok(artifact)
 }
 
-/// Verifies a downloaded artifact file on disk against the signed `SHA256SUMS` inside `meta`.
+/// Verifies a downloaded artifact file on disk against the signed `SHA256SUMS` and declared byte
+/// size inside `meta`.
 pub fn verify_artifact_file(
     meta: &VerifiedSetMeta,
     artifact_name: &str,
     file_path: &Path,
 ) -> Result<String, ErrorBody> {
     validate_entry_name(artifact_name)?;
+    if let Some(artifact) = meta
+        .manifest
+        .artifacts
+        .iter()
+        .find(|entry| entry.name == artifact_name)
+    {
+        verify_exact_file_size(file_path, artifact_name, artifact.size)?;
+    }
     meta.sums.verify_file(artifact_name, file_path)
+}
+
+fn verify_exact_file_size(path: &Path, label: &str, expected_size: u64) -> Result<(), ErrorBody> {
+    let fs_meta = fs::symlink_metadata(path).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::NotFound,
+            format!(
+                "Expected file {label} at {} could not be read: {err}.",
+                path.display()
+            ),
+        )
+    })?;
+    if !fs_meta.file_type().is_file() {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Expected {label} at {} to be a regular file (symlinks and directories are refused).",
+                path.display()
+            ),
+        ));
+    }
+    if fs_meta.len() != expected_size {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Size mismatch for {label}: expected {expected_size} bytes, got {} bytes.",
+                fs_meta.len()
+            ),
+        )
+        .with_hint(
+            "The downloaded file may be truncated, padded, or tampered with; nothing was accepted.",
+        ));
+    }
+    Ok(())
 }
 
 fn read_small_regular_file(

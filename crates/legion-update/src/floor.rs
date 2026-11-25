@@ -13,6 +13,8 @@ use legion_proto::{ErrorBody, ErrorCode};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
+use crate::version::check_sequence_plausibility;
+
 /// Maximum accepted size of a sequence-floor JSON file.
 const MAX_FLOOR_BYTES: u64 = 64 * 1024;
 
@@ -84,19 +86,30 @@ pub fn read_sequence_floor(path: &Path) -> SequenceFloorState {
     SequenceFloorState::Recorded(record.sequence)
 }
 
-/// Enforces rule 3: `candidate` must be strictly greater than `running_sequence` and strictly
-/// greater than any recorded sequence floor. Fails closed if the floor file is corrupt.
+/// Enforces rule 3: `running_sequence` must be non-zero, `candidate` must be plausible and
+/// strictly greater than both `running_sequence` and any recorded sequence floor. Fails closed if
+/// the floor file is corrupt.
 pub fn check_sequence_upgrade(
     candidate: u64,
     running_sequence: u64,
     floor_path: &Path,
 ) -> Result<(), ErrorBody> {
+    if running_sequence == 0 {
+        return Err(ErrorBody::new(
+            ErrorCode::Unsupported,
+            "This build has sequence 0 and cannot self-update.",
+        )
+        .with_hint(
+            "Install a stamped build (built with LEGION_BUILD_SEQUENCE) to enable self-updates.",
+        ));
+    }
     if candidate == 0 {
         return Err(ErrorBody::new(
             ErrorCode::InvalidArgs,
             "Refusing update set: sequence must be greater than 0.",
         ));
     }
+    check_sequence_plausibility(candidate, running_sequence)?;
 
     match read_sequence_floor(floor_path) {
         SequenceFloorState::Missing => {}
@@ -157,6 +170,59 @@ pub fn commit_sequence_floor(floor_path: &Path, sequence: u64) -> Result<(), Err
         SequenceFloorState::Missing | SequenceFloorState::Recorded(_) => {}
     }
 
+    write_sequence_floor_file(floor_path, sequence)
+}
+
+/// Ensures the sequence floor file is readable and at least `running_sequence`.
+///
+/// If the file is damaged, malformed, oversized, or a symlink, it is atomically rebuilt at
+/// `running_sequence` (which is compiled into the running binary and can never lower protection
+/// below the running build) and the original corruption detail is returned so callers can surface
+/// it truthfully instead of silently claiming everything is fine.
+///
+/// Refuses to act on sequence-0 builds or if `floor_path` is a directory.
+pub fn recover_sequence_floor(
+    floor_path: &Path,
+    running_sequence: u64,
+) -> Result<(u64, Option<String>), ErrorBody> {
+    if running_sequence == 0 {
+        return Err(ErrorBody::new(
+            ErrorCode::Unsupported,
+            "This build has sequence 0 and cannot maintain a sequence floor.",
+        ));
+    }
+    match read_sequence_floor(floor_path) {
+        SequenceFloorState::Missing => {
+            write_sequence_floor_file(floor_path, running_sequence)?;
+            Ok((running_sequence, None))
+        }
+        SequenceFloorState::Recorded(existing) => {
+            if running_sequence > existing {
+                write_sequence_floor_file(floor_path, running_sequence)?;
+                Ok((running_sequence, None))
+            } else {
+                Ok((existing, None))
+            }
+        }
+        SequenceFloorState::Invalid(detail) => {
+            if let Ok(meta) = fs::symlink_metadata(floor_path)
+                && meta.file_type().is_dir()
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Sequence floor path {} is a directory and cannot be rebuilt automatically.",
+                        floor_path.display()
+                    ),
+                ));
+            }
+            write_sequence_floor_file(floor_path, running_sequence)?;
+            Ok((running_sequence, Some(detail)))
+        }
+    }
+}
+
+fn write_sequence_floor_file(floor_path: &Path, sequence: u64) -> Result<(), ErrorBody> {
     let parent = floor_path.parent().ok_or_else(|| {
         ErrorBody::new(
             ErrorCode::Internal,
