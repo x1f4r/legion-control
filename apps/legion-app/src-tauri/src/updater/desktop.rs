@@ -2690,20 +2690,99 @@ pub fn write_windows_supervisor_script(updates_dir: &Path, pid: u32) -> Result<P
 /// Written to an owner-only `.ps1` file in the updates directory and invoked via System32
 /// `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <path>` so the command
 /// line stays short (well under Windows's 32,767-character `CreateProcessW` limit). Receives all
-/// paths strictly through environment variables, uses `-LiteralPath` on every filesystem cmdlet,
-/// invokes the NSIS installer directly via `ProcessStartInfo` (`UseShellExecute = $false`) with
-/// `/S /UPDATE /D=<install_dir>` (`/D=` last and unquoted), writes progress lines to stdout
-/// (redirected by the parent to `supervisor.log`), and restores the previous copy transactionally
-/// on any installer or startup failure.
+/// paths strictly through environment variables, performs all filesystem and path work via .NET
+/// (`[System.IO.File]`, `[System.IO.Directory]`, `[System.IO.Path]`) to avoid Windows PowerShell
+/// 5.1 parameter-set and wildcard-path quirks, invokes the NSIS installer directly via
+/// `ProcessStartInfo` (`UseShellExecute = $false`) with `/S /UPDATE /D=<install_dir>` (`/D=` last
+/// and unquoted), writes progress lines to stdout (redirected by the parent to `supervisor.log`),
+/// and restores the previous copy transactionally on any installer or startup failure.
 pub const WINDOWS_NSIS_SUPERVISOR_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $script:supLockStream = $null
+
 function Write-Log([string]$msg) {
   try {
-    $line = "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffZ') $msg"
-    [Console]::Out.WriteLine($line)
+    $ts = [System.DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    [Console]::Out.WriteLine("$ts $msg")
     [Console]::Out.Flush()
   } catch {}
+}
+
+function Format-ErrorRecord($err) {
+  $msg = if ($err -and $err.Exception) { $err.Exception.Message } else { [string]$err }
+  $inv = if ($err) { $err.InvocationInfo } else { $null }
+  if ($inv) {
+    $lineNum = $inv.ScriptLineNumber
+    $lineText = if ($inv.Line) { $inv.Line.Trim() } else { '' }
+    $posMsg = if ($inv.PositionMessage) { ($inv.PositionMessage -replace '\r?\n', ' | ').Trim() } else { '' }
+    return "$msg [line $($lineNum): $lineText] ($posMsg)"
+  }
+  return $msg
+}
+
+function Remove-FileQuiet([string]$filePath) {
+  if (-not $filePath) { return }
+  try {
+    if ([System.IO.File]::Exists($filePath)) {
+      try { [System.IO.File]::SetAttributes($filePath, [System.IO.FileAttributes]::Normal) } catch {}
+      [System.IO.File]::Delete($filePath)
+    }
+  } catch {}
+}
+
+function Remove-DirQuiet([string]$dirPath) {
+  if (-not $dirPath) { return }
+  try {
+    if ([System.IO.Directory]::Exists($dirPath)) {
+      foreach ($f in [System.IO.Directory]::GetFiles($dirPath, '*', [System.IO.SearchOption]::AllDirectories)) {
+        try { [System.IO.File]::SetAttributes($f, [System.IO.FileAttributes]::Normal) } catch {}
+      }
+      [System.IO.Directory]::Delete($dirPath, $true)
+    }
+  } catch {}
+}
+
+function Move-FileSafe([string]$src, [string]$dst) {
+  $parent = [System.IO.Path]::GetDirectoryName($dst)
+  if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+  }
+  if ([System.IO.File]::Exists($dst)) {
+    try { [System.IO.File]::SetAttributes($dst, [System.IO.FileAttributes]::Normal) } catch {}
+    [System.IO.File]::Delete($dst)
+  }
+  $srcRoot = [System.IO.Path]::GetPathRoot($src)
+  $dstRoot = [System.IO.Path]::GetPathRoot($dst)
+  if ($srcRoot -and $dstRoot -and $srcRoot.Equals($dstRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    [System.IO.File]::Move($src, $dst)
+  } else {
+    [System.IO.File]::Copy($src, $dst, $true)
+    try { [System.IO.File]::SetAttributes($src, [System.IO.FileAttributes]::Normal) } catch {}
+    [System.IO.File]::Delete($src)
+  }
+}
+
+function Copy-FileSafe([string]$src, [string]$dst) {
+  $parent = [System.IO.Path]::GetDirectoryName($dst)
+  if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+  }
+  if ([System.IO.File]::Exists($dst)) {
+    try { [System.IO.File]::SetAttributes($dst, [System.IO.FileAttributes]::Normal) } catch {}
+  }
+  [System.IO.File]::Copy($src, $dst, $true)
+}
+
+function Write-Utf8NoBom([string]$filePath, [string]$text) {
+  $parent = [System.IO.Path]::GetDirectoryName($filePath)
+  if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+  }
+  [System.IO.File]::WriteAllText($filePath, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Clear-EnvVar([string]$name) {
+  [System.Environment]::SetEnvironmentVariable($name, $null)
 }
 
 function Release-UpdateLocks {
@@ -2711,12 +2790,8 @@ function Release-UpdateLocks {
     try { $script:supLockStream.Dispose() } catch {}
     $script:supLockStream = $null
   }
-  if ($env:LEGION_SUPERVISOR_LOCK -and (Test-Path -LiteralPath $env:LEGION_SUPERVISOR_LOCK)) {
-    Remove-Item -LiteralPath $env:LEGION_SUPERVISOR_LOCK -Force -ErrorAction SilentlyContinue
-  }
-  if ($env:LEGION_UPDATE_LOCK -and (Test-Path -LiteralPath $env:LEGION_UPDATE_LOCK)) {
-    Remove-Item -LiteralPath $env:LEGION_UPDATE_LOCK -Force -ErrorAction SilentlyContinue
-  }
+  Remove-FileQuiet $env:LEGION_SUPERVISOR_LOCK
+  Remove-FileQuiet $env:LEGION_UPDATE_LOCK
 }
 
 if ($env:LEGION_SUPERVISOR_LOCK) {
@@ -2728,7 +2803,7 @@ if ($env:LEGION_SUPERVISOR_LOCK) {
       [System.IO.FileShare]::None
     )
   } catch {
-    Write-Log "failed to hold supervisor lock $($env:LEGION_SUPERVISOR_LOCK): $($_.Exception.Message)"
+    Write-Log "failed to hold supervisor lock $($env:LEGION_SUPERVISOR_LOCK): $(Format-ErrorRecord $_)"
   }
 }
 
@@ -2743,7 +2818,7 @@ function Start-Direct([string]$filePath, [string]$arguments, [bool]$noWindow) {
 
 function Get-InstallDirProcesses([string]$installDir) {
   if (-not $installDir) { return @() }
-  $prefix = $installDir.TrimEnd('\') + '\'
+  $prefix = [System.IO.Path]::GetFullPath($installDir).TrimEnd('\') + '\'
   $found = New-Object System.Collections.Generic.List[object]
   foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
     if ($p.Id -eq $PID) { continue }
@@ -2779,9 +2854,9 @@ function Capture-RollbackPs {
       try { $pPath = $p.Path } catch {}
       $lines.Add("pid=$($p.Id) name=$($p.ProcessName) path=$pPath")
     }
-    Set-Content -LiteralPath $env:LEGION_ROLLBACK_PS_FILE -Value ($lines -join "`n") -Encoding UTF8
+    Write-Utf8NoBom $env:LEGION_ROLLBACK_PS_FILE ($lines -join "`n")
   } catch {
-    Write-Log "failed to write rollback process list: $($_.Exception.Message)"
+    Write-Log "failed to write rollback process list: $(Format-ErrorRecord $_)"
   }
 }
 
@@ -2790,9 +2865,11 @@ function Save-CappedNewStartLog([string]$outLog, [string]$errLog) {
   try {
     $chunks = New-Object System.Collections.Generic.List[string]
     foreach ($src in @($outLog, $errLog)) {
-      if ($src -and (Test-Path -LiteralPath $src)) {
-        $raw = Get-Content -LiteralPath $src -Raw -ErrorAction SilentlyContinue
-        if ($raw) { $chunks.Add($raw) }
+      if ($src -and [System.IO.File]::Exists($src)) {
+        try {
+          $raw = [System.IO.File]::ReadAllText($src)
+          if ($raw) { $chunks.Add($raw) }
+        } catch {}
       }
     }
     $combined = ($chunks -join "`n")
@@ -2800,19 +2877,17 @@ function Save-CappedNewStartLog([string]$outLog, [string]$errLog) {
     if ($bytes.Length -gt 32768) {
       $combined = [System.Text.Encoding]::UTF8.GetString($bytes, $bytes.Length - 32768, 32768)
     }
-    Set-Content -LiteralPath $env:LEGION_NEW_LOG -Value $combined -Encoding UTF8
+    Write-Utf8NoBom $env:LEGION_NEW_LOG $combined
   } catch {
-    Write-Log "failed to save capped startup log: $($_.Exception.Message)"
+    Write-Log "failed to save capped startup log: $(Format-ErrorRecord $_)"
   }
   foreach ($src in @($outLog, $errLog)) {
-    if ($src -and (Test-Path -LiteralPath $src)) {
-      Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue
-    }
+    Remove-FileQuiet $src
   }
 }
 
 function Test-FileUnlocked([string]$filePath) {
-  if (-not (Test-Path -LiteralPath $filePath)) { return $true }
+  if (-not $filePath -or -not [System.IO.File]::Exists($filePath)) { return $true }
   $stream = $null
   try {
     $stream = [System.IO.File]::Open(
@@ -2846,9 +2921,9 @@ function Write-RollbackNotice([string]$installState, [string]$extraDetail) {
     $payload = $obj | ConvertTo-Json -Compress
   } catch {}
   try {
-    [System.IO.File]::WriteAllText($env:LEGION_ROLLBACK_FILE, $payload, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Utf8NoBom $env:LEGION_ROLLBACK_FILE $payload
   } catch {
-    Write-Log "failed to write rollback notice: $($_.Exception.Message)"
+    Write-Log "failed to write rollback notice: $(Format-ErrorRecord $_)"
   }
 }
 
@@ -2865,166 +2940,193 @@ function Restore-Previous([string]$why) {
   $script:restoreAttempted = $true
   Write-Log "restoring previous install: $why"
 
-  $hasBackup = $false
+  $stageNew = $null
+  $moved = New-Object System.Collections.Generic.List[object]
+  $copied = New-Object System.Collections.Generic.List[string]
+  $restoredDone = $false
+  $noticeWritten = $false
+
   try {
-    $hasBackup = [bool]($env:LEGION_BACKUP_DIR -and (Test-Path -LiteralPath $env:LEGION_BACKUP_DIR))
-  } catch {
-    Write-Log "failed to inspect backup dir: $($_.Exception.Message)"
-  }
+    $hasBackup = $false
+    try {
+      $hasBackup = [bool]($env:LEGION_BACKUP_DIR -and [System.IO.Directory]::Exists($env:LEGION_BACKUP_DIR))
+    } catch {
+      Write-Log "failed to inspect backup dir: $(Format-ErrorRecord $_)"
+    }
 
-  if (-not $hasBackup) {
-    Write-Log "backup dir missing: $($env:LEGION_BACKUP_DIR); keeping new install intact"
-    Write-RollbackNotice 'new_kept_backup_missing' "Backup folder missing; kept new install in place."
-    return
-  }
+    if (-not $hasBackup) {
+      Write-Log "backup dir missing: $($env:LEGION_BACKUP_DIR); keeping new install intact"
+      Write-RollbackNotice 'new_kept_backup_missing' "Backup folder missing; kept new install in place."
+      $noticeWritten = $true
+      return
+    }
 
-  $backupRoot = (Get-Item -LiteralPath $env:LEGION_BACKUP_DIR).FullName.TrimEnd('\')
-  $backupFiles = @()
-  try {
-    $backupFiles = @(Get-ChildItem -LiteralPath $backupRoot -Recurse -File -Force)
-  } catch {
-    Write-Log "failed to list backup dir: $($_.Exception.Message)"
-    Write-RollbackNotice 'new_kept_files_in_use' "Could not enumerate backup folder: $($_.Exception.Message)"
-    return
-  }
+    $backupRoot = [System.IO.Path]::GetFullPath($env:LEGION_BACKUP_DIR).TrimEnd('\')
+    $installRoot = [System.IO.Path]::GetFullPath($env:LEGION_INSTALL_DIR).TrimEnd('\')
+    $backupFiles = @()
+    try {
+      $backupFiles = @([System.IO.Directory]::GetFiles($backupRoot, '*', [System.IO.SearchOption]::AllDirectories))
+    } catch {
+      $listErr = Format-ErrorRecord $_
+      Write-Log "failed to list backup dir: $listErr"
+      Write-RollbackNotice 'new_kept_files_in_use' "Could not enumerate backup folder: $listErr"
+      $noticeWritten = $true
+      return
+    }
 
-  # Phase 1: Bounded retry waiting until no install-dir process is running and EVERY file that
-  # would be overwritten can be opened exclusively. Never touch a single file while another process
-  # holds any target file open so the install directory can never end up half-copied.
-  $canRestore = $false
-  $busyReason = ''
-  for ($r = 0; $r -lt $rollbackRetries; $r++) {
+    # Phase 1: Bounded retry waiting until no install-dir process is running and EVERY file that
+    # would be overwritten can be opened exclusively. Never touch a single file while another process
+    # holds any target file open so the install directory can never end up half-copied.
+    $canRestore = $false
     $busyReason = ''
-    $dirProcs = @(Get-InstallDirProcesses $env:LEGION_INSTALL_DIR)
-    if ($dirProcs.Count -gt 0) {
-      $busyReason = "install-dir process pid=$($dirProcs[0].Id) ($($dirProcs[0].ProcessName)) still running"
-    } else {
-      foreach ($bf in $backupFiles) {
-        $rel = $bf.FullName.Substring($backupRoot.Length).TrimStart('\')
-        $dst = Join-Path $env:LEGION_INSTALL_DIR $rel
-        if (-not (Test-FileUnlocked $dst)) {
-          $busyReason = "file '$rel' is in use by another process"
+    for ($r = 0; $r -lt $rollbackRetries; $r++) {
+      $busyReason = ''
+      $dirProcs = @(Get-InstallDirProcesses $installRoot)
+      if ($dirProcs.Count -gt 0) {
+        $busyReason = "install-dir process pid=$($dirProcs[0].Id) ($($dirProcs[0].ProcessName)) still running"
+      } else {
+        foreach ($bf in $backupFiles) {
+          $rel = $bf.Substring($backupRoot.Length).TrimStart('\')
+          $dst = [System.IO.Path]::Combine($installRoot, $rel)
+          if (-not (Test-FileUnlocked $dst)) {
+            $busyReason = "file '$rel' is in use by another process"
+            break
+          }
+        }
+      }
+      if (-not $busyReason) {
+        $canRestore = $true
+        break
+      }
+      Start-Sleep -Milliseconds 250
+    }
+
+    if (-not $canRestore) {
+      Write-Log "rollback could not acquire exclusive access after $rollbackRetries attempts ($busyReason); keeping new install intact"
+      Write-RollbackNotice 'new_kept_files_in_use' "Could not restore previous install because $busyReason; kept new install intact."
+      $noticeWritten = $true
+      return
+    }
+
+    Remove-FileQuiet $env:LEGION_INSTALLER
+
+    # Phase 2: Transactional swap with undo — move all existing target files into a staging snapshot
+    # first, then copy backup files in. If any step fails mid-way, remove newly created files and
+    # restore all staged new files back so the install directory is never left half-copied.
+    $stageNew = "$backupRoot.new-snap"
+    Remove-DirQuiet $stageNew
+    $swapFailed = $false
+    $swapError = ''
+
+    foreach ($bf in $backupFiles) {
+      $rel = $bf.Substring($backupRoot.Length).TrimStart('\')
+      $dst = [System.IO.Path]::Combine($installRoot, $rel)
+      if ([System.IO.File]::Exists($dst)) {
+        $stagedDst = [System.IO.Path]::Combine($stageNew, $rel)
+        try {
+          Move-FileSafe $dst $stagedDst
+          $moved.Add(@{ Src = $dst; Staged = $stagedDst })
+        } catch {
+          $swapFailed = $true
+          $swapError = "could not move '$rel' aside: $(Format-ErrorRecord $_)"
           break
         }
       }
     }
-    if (-not $busyReason) {
-      $canRestore = $true
-      break
-    }
-    Start-Sleep -Milliseconds 250
-  }
 
-  if (-not $canRestore) {
-    Write-Log "rollback could not acquire exclusive access after $rollbackRetries attempts ($busyReason); keeping new install intact"
-    Write-RollbackNotice 'new_kept_files_in_use' "Could not restore previous install because $busyReason; kept new install intact."
-    return
-  }
-
-  if ($env:LEGION_INSTALLER -and (Test-Path -LiteralPath $env:LEGION_INSTALLER)) {
-    Remove-Item -LiteralPath $env:LEGION_INSTALLER -Force -ErrorAction SilentlyContinue
-  }
-
-  # Phase 2: Transactional swap with undo — move all existing target files into a staging snapshot
-  # first, then copy backup files in. If any step fails mid-way, remove newly created files and
-  # restore all staged new files back so the install directory is never left half-copied.
-  $stageNew = "$backupRoot.new-snap"
-  if (Test-Path -LiteralPath $stageNew) {
-    Remove-Item -LiteralPath $stageNew -Recurse -Force -ErrorAction SilentlyContinue
-  }
-  $moved = New-Object System.Collections.Generic.List[object]
-  $copied = New-Object System.Collections.Generic.List[string]
-  $swapFailed = $false
-  $swapError = ''
-
-  foreach ($bf in $backupFiles) {
-    $rel = $bf.FullName.Substring($backupRoot.Length).TrimStart('\')
-    $dst = Join-Path $env:LEGION_INSTALL_DIR $rel
-    if (Test-Path -LiteralPath $dst) {
-      $stagedDst = Join-Path $stageNew $rel
-      $stagedParent = Split-Path -LiteralPath $stagedDst -Parent
-      try {
-        if ($stagedParent -and -not (Test-Path -LiteralPath $stagedParent)) {
-          [System.IO.Directory]::CreateDirectory($stagedParent) | Out-Null
+    if (-not $swapFailed) {
+      foreach ($bf in $backupFiles) {
+        $rel = $bf.Substring($backupRoot.Length).TrimStart('\')
+        $dst = [System.IO.Path]::Combine($installRoot, $rel)
+        try {
+          Copy-FileSafe $bf $dst
+          $copied.Add($dst)
+        } catch {
+          $swapFailed = $true
+          $swapError = "could not restore '$rel': $(Format-ErrorRecord $_)"
+          break
         }
-        Move-Item -LiteralPath $dst -Destination $stagedDst -Force
-        $moved.Add(@{ Src = $dst; Staged = $stagedDst })
-      } catch {
-        $swapFailed = $true
-        $swapError = "could not move '$rel' aside: $($_.Exception.Message)"
-        break
       }
     }
-  }
 
-  if (-not $swapFailed) {
-    foreach ($bf in $backupFiles) {
-      $rel = $bf.FullName.Substring($backupRoot.Length).TrimStart('\')
-      $dst = Join-Path $env:LEGION_INSTALL_DIR $rel
-      $dstParent = Split-Path -LiteralPath $dst -Parent
-      try {
-        if ($dstParent -and -not (Test-Path -LiteralPath $dstParent)) {
-          [System.IO.Directory]::CreateDirectory($dstParent) | Out-Null
+    if ($swapFailed) {
+      Write-Log "transactional rollback aborted ($swapError); undoing partial changes so new install stays intact"
+      $undoFailed = $false
+      foreach ($c in $copied) {
+        Remove-FileQuiet $c
+      }
+      foreach ($m in $moved) {
+        try {
+          if ([System.IO.File]::Exists($m.Staged)) {
+            Move-FileSafe $m.Staged $m.Src
+          }
+        } catch {
+          $undoFailed = $true
+          Write-Log "failed to undo staged file $($m.Src): $(Format-ErrorRecord $_)"
         }
-        Copy-Item -LiteralPath $bf.FullName -Destination $dst -Force
-        $copied.Add($dst)
-      } catch {
-        $swapFailed = $true
-        $swapError = "could not restore '$rel': $($_.Exception.Message)"
-        break
       }
+      Remove-DirQuiet $stageNew
+      $abortState = if ($undoFailed) { 'restore_incomplete' } else { 'new_kept_files_in_use' }
+      Write-RollbackNotice $abortState "Rollback could not replace install files ($swapError); kept new install intact."
+      $noticeWritten = $true
+      return
     }
-  }
 
-  if ($swapFailed) {
-    Write-Log "transactional rollback aborted ($swapError); undoing partial changes so new install stays intact"
-    foreach ($c in $copied) {
-      if (Test-Path -LiteralPath $c) {
-        Remove-Item -LiteralPath $c -Force -ErrorAction SilentlyContinue
-      }
+    Remove-DirQuiet $stageNew
+    $restoredDone = $true
+    Write-Log "restored previous install cleanly ($($backupFiles.Count) files)"
+    Write-RollbackNotice 'restored_previous' ''
+    $noticeWritten = $true
+
+    $reopenNeeded = $false
+    if ($verifyOnly -and $env:LEGION_REOPEN_FILE -and [System.IO.File]::Exists($env:LEGION_REOPEN_FILE)) {
+      Remove-FileQuiet $env:LEGION_REOPEN_FILE
+      $reopenNeeded = $true
     }
-    foreach ($m in $moved) {
+    Release-UpdateLocks
+
+    if (-not $verifyOnly -or $reopenNeeded) {
       try {
-        if (Test-Path -LiteralPath $m.Staged) {
-          Move-Item -LiteralPath $m.Staged -Destination $m.Src -Force
+        if ($env:LEGION_EXE -and [System.IO.File]::Exists($env:LEGION_EXE)) {
+          Clear-EnvVar 'LEGION_UPDATE_VERIFY_ONLY'
+          Clear-EnvVar 'LEGION_UPDATE_SUPERVISED_LAUNCH'
+          if ($env:LEGION_RELAUNCH_PATH) { $env:PATH = $env:LEGION_RELAUNCH_PATH }
+          Write-Log "relaunching restored executable after rollback: $($env:LEGION_EXE)"
+          Start-Direct $env:LEGION_EXE '' $false | Out-Null
+        } else {
+          Write-Log "cannot relaunch after rollback: executable missing at $($env:LEGION_EXE)"
         }
       } catch {
-        Write-Log "failed to undo staged file $($m.Src): $($_.Exception.Message)"
+        Write-Log "failed to relaunch executable after rollback: $(Format-ErrorRecord $_)"
       }
     }
-    if (Test-Path -LiteralPath $stageNew) {
-      Remove-Item -LiteralPath $stageNew -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    Write-RollbackNotice 'new_kept_files_in_use' "Rollback could not replace install files ($swapError); kept new install intact."
-    return
-  }
-
-  if (Test-Path -LiteralPath $stageNew) {
-    Remove-Item -LiteralPath $stageNew -Recurse -Force -ErrorAction SilentlyContinue
-  }
-  Write-Log "restored previous install cleanly ($($backupFiles.Count) files)"
-  Write-RollbackNotice 'restored_previous' ''
-
-  $reopenNeeded = $false
-  if ($verifyOnly -and $env:LEGION_REOPEN_FILE -and (Test-Path -LiteralPath $env:LEGION_REOPEN_FILE)) {
-    Remove-Item -LiteralPath $env:LEGION_REOPEN_FILE -Force -ErrorAction SilentlyContinue
-    $reopenNeeded = $true
-  }
-  Release-UpdateLocks
-
-  if (-not $verifyOnly -or $reopenNeeded) {
-    try {
-      if (Test-Path -LiteralPath $env:LEGION_EXE) {
-        Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
-        Remove-Item Env:LEGION_UPDATE_SUPERVISED_LAUNCH -ErrorAction SilentlyContinue
-        if ($env:LEGION_RELAUNCH_PATH) { $env:PATH = $env:LEGION_RELAUNCH_PATH }
-        Write-Log "relaunching restored executable after rollback: $($env:LEGION_EXE)"
-        Start-Direct $env:LEGION_EXE '' $false | Out-Null
-      } else {
-        Write-Log "cannot relaunch after rollback: executable missing at $($env:LEGION_EXE)"
+  } catch {
+    $errInfo = Format-ErrorRecord $_
+    Write-Log "restore exception: $errInfo"
+    if (-not $restoredDone) {
+      $undoFailed = $false
+      foreach ($c in $copied) {
+        Remove-FileQuiet $c
       }
-    } catch {
-      Write-Log "failed to relaunch executable after rollback: $($_.Exception.Message)"
+      foreach ($m in $moved) {
+        try {
+          if ([System.IO.File]::Exists($m.Staged)) {
+            Move-FileSafe $m.Staged $m.Src
+          }
+        } catch {
+          $undoFailed = $true
+          Write-Log "failed to undo staged file $($m.Src): $(Format-ErrorRecord $_)"
+        }
+      }
+      if ($stageNew) { Remove-DirQuiet $stageNew }
+      if (-not $noticeWritten) {
+        $fallbackState = if ($undoFailed) { 'restore_incomplete' } else { 'new_kept_files_in_use' }
+        Write-RollbackNotice $fallbackState "Restore failed: $errInfo"
+        $noticeWritten = $true
+      }
+    } elseif (-not $noticeWritten) {
+      Write-RollbackNotice 'restored_previous' ''
+      $noticeWritten = $true
     }
   }
 }
@@ -3053,26 +3155,18 @@ try {
     $dirProcs = @(Get-InstallDirProcesses $env:LEGION_INSTALL_DIR)
     $wvProcs = @(Get-LegionWebViewProcesses)
     Write-Log "install still in use after ${preWaitSecs}s (oldAlive=$oldAlive, dirProcs=$($dirProcs.Count), webviewProcs=$($wvProcs.Count)); deferring update cleanly without changing install"
-    if ($env:LEGION_INSTALLER -and (Test-Path -LiteralPath $env:LEGION_INSTALLER)) {
-      Remove-Item -LiteralPath $env:LEGION_INSTALLER -Force -ErrorAction SilentlyContinue
-    }
-    if ($env:LEGION_BACKUP_DIR -and (Test-Path -LiteralPath $env:LEGION_BACKUP_DIR)) {
-      Remove-Item -LiteralPath $env:LEGION_BACKUP_DIR -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    Remove-FileQuiet $env:LEGION_INSTALLER
+    Remove-DirQuiet $env:LEGION_BACKUP_DIR
     if ($env:LEGION_DEFERRED_FILE -and $env:LEGION_DEFERRED_JSON) {
-      [System.IO.File]::WriteAllText($env:LEGION_DEFERRED_FILE, $env:LEGION_DEFERRED_JSON, (New-Object System.Text.UTF8Encoding($false)))
+      Write-Utf8NoBom $env:LEGION_DEFERRED_FILE $env:LEGION_DEFERRED_JSON
     }
     exit 0
   }
   Write-Log "old instance and helpers exited cleanly"
   Start-Sleep -Milliseconds 250
 
-  if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
-    Remove-Item -LiteralPath $env:LEGION_READY_MARKER -Force -ErrorAction SilentlyContinue
-  }
-  if ($env:LEGION_ROLLBACK_PS_FILE -and (Test-Path -LiteralPath $env:LEGION_ROLLBACK_PS_FILE)) {
-    Remove-Item -LiteralPath $env:LEGION_ROLLBACK_PS_FILE -Force -ErrorAction SilentlyContinue
-  }
+  Remove-FileQuiet $env:LEGION_READY_MARKER
+  Remove-FileQuiet $env:LEGION_ROLLBACK_PS_FILE
 
   $nsisArgs = "/S /UPDATE /D=" + $env:LEGION_INSTALL_DIR
   Write-Log "running NSIS installer with args: $nsisArgs"
@@ -3090,7 +3184,7 @@ try {
   if ($verifyOnly) {
     $env:LEGION_UPDATE_VERIFY_ONLY = '1'
   } else {
-    Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
+    Clear-EnvVar 'LEGION_UPDATE_VERIFY_ONLY'
   }
   $env:LEGION_UPDATE_SUPERVISED_LAUNCH = if ($env:LEGION_TARGET_SEQUENCE) { $env:LEGION_TARGET_SEQUENCE } else { '1' }
 
@@ -3100,9 +3194,7 @@ try {
     $outLog = "$($env:LEGION_NEW_LOG).stdout"
     $errLog = "$($env:LEGION_NEW_LOG).stderr"
     foreach ($f in @($env:LEGION_NEW_LOG, $outLog, $errLog)) {
-      if (Test-Path -LiteralPath $f) {
-        Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
-      }
+      Remove-FileQuiet $f
     }
   }
   Write-Log "launching updated app: $($env:LEGION_EXE)"
@@ -3121,7 +3213,7 @@ try {
   $started = $false
   $exitedLogged = $false
   for ($j = 0; $j -lt $maxTicks; $j++) {
-    if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
+    if ($env:LEGION_READY_MARKER -and [System.IO.File]::Exists($env:LEGION_READY_MARKER)) {
       $started = $true
       break
     }
@@ -3139,29 +3231,23 @@ try {
     }
     Start-Sleep -Milliseconds 250
   }
-  if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
+  if ($env:LEGION_READY_MARKER -and [System.IO.File]::Exists($env:LEGION_READY_MARKER)) {
     $started = $true
   }
   if ($started) {
     Write-Log "ready marker observed at $($env:LEGION_READY_MARKER); cleaning up backup"
-    if (Test-Path -LiteralPath $env:LEGION_BACKUP_DIR) {
-      Remove-Item -LiteralPath $env:LEGION_BACKUP_DIR -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath $env:LEGION_INSTALLER) {
-      Remove-Item -LiteralPath $env:LEGION_INSTALLER -Force -ErrorAction SilentlyContinue
-    }
-    if ($env:LEGION_ROLLBACK_PS_FILE -and (Test-Path -LiteralPath $env:LEGION_ROLLBACK_PS_FILE)) {
-      Remove-Item -LiteralPath $env:LEGION_ROLLBACK_PS_FILE -Force -ErrorAction SilentlyContinue
-    }
+    Remove-DirQuiet $env:LEGION_BACKUP_DIR
+    Remove-FileQuiet $env:LEGION_INSTALLER
+    Remove-FileQuiet $env:LEGION_ROLLBACK_PS_FILE
     $reopenNeeded = $false
-    if ($verifyOnly -and $env:LEGION_REOPEN_FILE -and (Test-Path -LiteralPath $env:LEGION_REOPEN_FILE)) {
-      Remove-Item -LiteralPath $env:LEGION_REOPEN_FILE -Force -ErrorAction SilentlyContinue
+    if ($verifyOnly -and $env:LEGION_REOPEN_FILE -and [System.IO.File]::Exists($env:LEGION_REOPEN_FILE)) {
+      Remove-FileQuiet $env:LEGION_REOPEN_FILE
       $reopenNeeded = $true
     }
     Release-UpdateLocks
-    if ($reopenNeeded -and (Test-Path -LiteralPath $env:LEGION_EXE)) {
-      Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
-      Remove-Item Env:LEGION_UPDATE_SUPERVISED_LAUNCH -ErrorAction SilentlyContinue
+    if ($reopenNeeded -and $env:LEGION_EXE -and [System.IO.File]::Exists($env:LEGION_EXE)) {
+      Clear-EnvVar 'LEGION_UPDATE_VERIFY_ONLY'
+      Clear-EnvVar 'LEGION_UPDATE_SUPERVISED_LAUNCH'
       Write-Log "user reopened app during close update; launching updated copy interactively"
       Start-Direct $env:LEGION_EXE '' $false | Out-Null
     }
@@ -3170,21 +3256,20 @@ try {
   Capture-RollbackPs
   if (-not $proc.HasExited) {
     Write-Log "ready marker not observed after $j ticks; stopping pid=$($proc.Id)"
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    try { $proc.Kill() } catch {}
   }
   Start-Sleep -Milliseconds 500
   Save-CappedNewStartLog $outLog $errLog
   Restore-Previous "ready marker not observed"
   exit 1
 } catch {
-  Write-Log "supervisor exception: $($_.Exception.Message)"
-  Restore-Previous $_.Exception.Message
+  $errInfo = Format-ErrorRecord $_
+  Write-Log "supervisor exception: $errInfo"
+  Restore-Previous $errInfo
   exit 1
 } finally {
   Release-UpdateLocks
-  if ($env:LEGION_SUPERVISOR_SCRIPT -and (Test-Path -LiteralPath $env:LEGION_SUPERVISOR_SCRIPT)) {
-    Remove-Item -LiteralPath $env:LEGION_SUPERVISOR_SCRIPT -Force -ErrorAction SilentlyContinue
-  }
+  Remove-FileQuiet $env:LEGION_SUPERVISOR_SCRIPT
 }
 "#;
 
@@ -3646,37 +3731,55 @@ mod tests {
             "Windows NSIS supervisor must pass /S /UPDATE /D= unquoted and last"
         );
 
-        // Every Test-Path, Remove-Item, Set-Content, Get-ChildItem, Copy-Item, Move-Item, and
-        // Split-Path in the script must use -LiteralPath (never wildcard-expanding -Path or bare
-        // positional path).
+        // All filesystem and path operations in the Windows supervisor must use .NET
+        // ([System.IO.File], [System.IO.Directory], [System.IO.Path]) rather than PowerShell
+        // filesystem cmdlets so Windows PowerShell 5.1 parameter-set differences (such as
+        // `Split-Path -LiteralPath ... -Parent`) and wildcard interpretation can never occur.
+        let forbidden_cmdlets = [
+            "Test-Path",
+            "Remove-Item",
+            "Set-Content",
+            "Get-Content",
+            "Get-Item",
+            "Get-ChildItem",
+            "Copy-Item",
+            "Move-Item",
+            "Split-Path",
+            "Join-Path",
+        ];
         for line in WINDOWS_NSIS_SUPERVISOR_SCRIPT.lines() {
             let trimmed = line.trim();
-            if trimmed.contains("Test-Path ") {
-                assert!(trimmed.contains("Test-Path -LiteralPath "), "{trimmed}");
+            if trimmed.starts_with('#') {
+                continue;
             }
-            if trimmed.contains("Remove-Item ") && !trimmed.contains("Env:") {
-                assert!(trimmed.contains("Remove-Item -LiteralPath "), "{trimmed}");
-            }
-            if trimmed.contains("Set-Content ") {
-                assert!(trimmed.contains("Set-Content -LiteralPath "), "{trimmed}");
-            }
-            if trimmed.contains("Get-ChildItem ") {
-                assert!(trimmed.contains("Get-ChildItem -LiteralPath "), "{trimmed}");
-            }
-            if trimmed.contains("Copy-Item ") {
-                assert!(trimmed.contains("Copy-Item -LiteralPath "), "{trimmed}");
-            }
-            if trimmed.contains("Move-Item ") {
-                assert!(trimmed.contains("Move-Item -LiteralPath "), "{trimmed}");
-            }
-            if trimmed.contains("Split-Path ") {
-                assert!(trimmed.contains("Split-Path -LiteralPath "), "{trimmed}");
+            for cmdlet in forbidden_cmdlets {
+                assert!(
+                    !trimmed.contains(cmdlet),
+                    "Windows supervisor must use .NET instead of {cmdlet} (PS 5.1 safety): {trimmed}"
+                );
             }
         }
+        for required_dotnet in [
+            "[System.IO.Path]::GetDirectoryName",
+            "[System.IO.Path]::Combine",
+            "[System.IO.Path]::GetFullPath",
+            "[System.IO.Directory]::GetFiles",
+            "[System.IO.File]::Copy",
+            "[System.IO.File]::Move",
+            "[System.IO.File]::Delete",
+            "ScriptLineNumber",
+            "PositionMessage",
+        ] {
+            assert!(
+                WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains(required_dotnet),
+                "Windows supervisor missing expected .NET / diagnostic call: {required_dotnet}"
+            );
+        }
 
-        // Restore-Previous must guard every step individually, probe file locks before touching
-        // any file, undo any mid-way move/copy failure so the install directory can never end up
-        // half-copied, and prevent double-execution from the outer catch block.
+        // Restore-Previous must wrap its body in try/catch, log failing line/position on error,
+        // probe file locks before touching any file, undo any mid-way move/copy failure so the
+        // install directory can never end up half-copied, and prevent double-execution from the
+        // outer catch block.
         let restore_start = WINDOWS_NSIS_SUPERVISOR_SCRIPT
             .find("function Restore-Previous")
             .unwrap();
@@ -3692,15 +3795,17 @@ mod tests {
         assert!(
             restore_body.contains("Test-FileUnlocked")
                 && restore_body.contains("new_kept_files_in_use")
-                && restore_body.contains("restored_previous"),
-            "Restore-Previous must retry file locks and record exact install_state:\n{restore_body}"
+                && restore_body.contains("restored_previous")
+                && restore_body.contains("restore_incomplete")
+                && restore_body.contains("restore exception:"),
+            "Restore-Previous must retry file locks, catch unexpected errors with diagnostics, and record exact install_state:\n{restore_body}"
         );
         assert!(
-            restore_body.matches("try {").count() >= 4,
-            "Restore-Previous must isolate list, transactional swap, notice write, and relaunch in separate try/catch guards:\n{restore_body}"
+            restore_body.matches("try {").count() >= 5,
+            "Restore-Previous must isolate outer restore, list, transactional swap, undo, and relaunch in try/catch guards:\n{restore_body}"
         );
         assert!(
-            restore_body.matches("} catch {").count() >= 4,
+            restore_body.matches("} catch {").count() >= 5,
             "Restore-Previous must catch failures per step:\n{restore_body}"
         );
         assert!(
@@ -5259,38 +5364,51 @@ mod tests {
         drop(held_exe);
 
         let log1 = String::from_utf8_lossy(&out1.stdout);
+        let err1 = String::from_utf8_lossy(&out1.stderr);
         assert!(
-            !log1.contains("supervisor exception:"),
-            "rollback must not throw an unhandled exception when exe is locked:\n{log1}\nstderr:\n{}",
-            String::from_utf8_lossy(&out1.stderr)
+            !log1.contains("supervisor exception:") && !log1.contains("restore exception:"),
+            "rollback must not throw an unhandled exception when exe is locked:\n{log1}\nstderr:\n{err1}"
         );
         assert_eq!(
             fs::read(&exe_path).unwrap(),
             b"new-v2-exe",
-            "locked exe must stay intact at v2"
+            "locked exe must stay intact at v2:\n{log1}\nstderr:\n{err1}"
         );
         assert_eq!(
             fs::read(&dll_path).unwrap(),
             b"new-v2-dll",
-            "sibling helper.dll must NOT be overwritten when exe is locked (zero half-copy!)"
+            "sibling helper.dll must NOT be overwritten when exe is locked (zero half-copy!):\n{log1}\nstderr:\n{err1}"
         );
-        let rb1_text = fs::read_to_string(&rollback_marker).unwrap();
+        let rb1_text = fs::read_to_string(&rollback_marker).unwrap_or_else(|e| {
+            panic!("missing rollback marker after locked restore ({e}):\n{log1}\nstderr:\n{err1}")
+        });
         assert!(
             rb1_text.contains("new_kept_files_in_use"),
-            "rollback notice must record new_kept_files_in_use: {rb1_text}"
+            "rollback notice must record new_kept_files_in_use: {rb1_text}\nlog:\n{log1}\nstderr:\n{err1}"
         );
-        assert!(!update_lock.exists(), "update.lock must be released");
+        assert!(
+            !update_lock.exists(),
+            "update.lock must be released:\n{log1}"
+        );
         assert!(
             !sup_lock.exists(),
-            "update-supervisor.lock must be released"
+            "update-supervisor.lock must be released:\n{log1}"
         );
         assert!(
             !script1.exists(),
-            "supervisor .ps1 script must be cleaned up"
+            "supervisor .ps1 script must be cleaned up:\n{log1}"
         );
 
-        // Part 2: With the file lock released, rollback cleanly restores ALL files to v1 and
+        // Part 2: With the file lock released, rollback cleanly restores ALL files (including
+        // nested subdirectories and paths containing wildcard characters like `[1]`) to v1 and
         // records `restored_previous`.
+        let nested_sub = install_dir.join("res[1]");
+        let backup_nested = backup_dir.join("res[1]");
+        fs::create_dir_all(&nested_sub).unwrap();
+        fs::create_dir_all(&backup_nested).unwrap();
+        fs::write(nested_sub.join("asset.dat"), b"new-v2-asset").unwrap();
+        fs::write(backup_nested.join("asset.dat"), b"old-v1-asset").unwrap();
+
         fs::copy(sys_root.join("System32").join("where.exe"), &fake_installer).unwrap();
         let _ = fs::remove_file(&rollback_marker);
         let script2 = write_windows_supervisor_script(&updates_dir, 1002).unwrap();
@@ -5335,34 +5453,44 @@ mod tests {
             .unwrap();
 
         let log2 = String::from_utf8_lossy(&out2.stdout);
+        let err2 = String::from_utf8_lossy(&out2.stderr);
         assert!(
-            !log2.contains("supervisor exception:"),
-            "clean rollback must not throw:\n{log2}\nstderr:\n{}",
-            String::from_utf8_lossy(&out2.stderr)
+            !log2.contains("supervisor exception:") && !log2.contains("restore exception:"),
+            "clean rollback must not throw:\n{log2}\nstderr:\n{err2}"
         );
         assert_eq!(
             fs::read(&exe_path).unwrap(),
             b"old-v1-exe",
-            "unlocked exe must be restored to v1"
+            "unlocked exe must be restored to v1:\n{log2}\nstderr:\n{err2}"
         );
         assert_eq!(
             fs::read(&dll_path).unwrap(),
             b"old-v1-dll",
-            "sibling helper.dll must be restored to v1"
+            "sibling helper.dll must be restored to v1:\n{log2}\nstderr:\n{err2}"
         );
-        let rb2_text = fs::read_to_string(&rollback_marker).unwrap();
+        assert_eq!(
+            fs::read(nested_sub.join("asset.dat")).unwrap(),
+            b"old-v1-asset",
+            "nested wildcard-named subdir file must be restored to v1:\n{log2}\nstderr:\n{err2}"
+        );
+        let rb2_text = fs::read_to_string(&rollback_marker).unwrap_or_else(|e| {
+            panic!("missing rollback marker after clean restore ({e}):\n{log2}\nstderr:\n{err2}")
+        });
         assert!(
             rb2_text.contains("restored_previous"),
-            "rollback notice must record restored_previous: {rb2_text}"
+            "rollback notice must record restored_previous: {rb2_text}\nlog:\n{log2}\nstderr:\n{err2}"
         );
-        assert!(!update_lock.exists(), "update.lock must be released");
+        assert!(
+            !update_lock.exists(),
+            "update.lock must be released:\n{log2}"
+        );
         assert!(
             !sup_lock.exists(),
-            "update-supervisor.lock must be released"
+            "update-supervisor.lock must be released:\n{log2}"
         );
         assert!(
             !script2.exists(),
-            "supervisor .ps1 script must be cleaned up"
+            "supervisor .ps1 script must be cleaned up:\n{log2}"
         );
     }
 }

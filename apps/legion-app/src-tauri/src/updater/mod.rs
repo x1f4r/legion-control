@@ -1223,10 +1223,19 @@ impl UpdateManager {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let rb = {
                 let captured = desktop::read_captured_startup_detail(&self.updates_dir);
-                let state_note = if rb.install_state.as_deref() == Some("new_kept_files_in_use") {
-                    Some("Previous copy could not be restored because install files were in use; kept new copy intact.".to_owned())
-                } else {
-                    None
+                let state_note = match rb.install_state.as_deref() {
+                    Some("new_kept_files_in_use") => Some(
+                        "Previous copy could not be restored because install files were in use; kept new copy intact."
+                            .to_owned(),
+                    ),
+                    Some("new_kept_backup_missing") => Some(
+                        "Previous copy backup was missing; kept new copy in place.".to_owned(),
+                    ),
+                    Some("restore_incomplete") => Some(
+                        "Previous copy could not be fully restored after a rollback error."
+                            .to_owned(),
+                    ),
+                    _ => None,
                 };
                 let detail = match (rb.detail.or(state_note), captured) {
                     (Some(a), Some(b)) if !a.contains(&b) => Some(format!("{a}\n{b}")),
