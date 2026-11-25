@@ -1597,6 +1597,31 @@ export function MusicPlayer({
     }
   }, [playing, duration, playbackRate, currentTime]);
 
+  // Clear MediaSession metadata, playbackState, and handlers completely when the music player closes.
+  useEffect(() => {
+    return () => {
+      const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;
+      if (!ms) return;
+      for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'seekto', 'seekbackward', 'seekforward']) {
+        try {
+          ms.setActionHandler(action, null);
+        } catch {
+          // Ignore unsupported action names.
+        }
+      }
+      try {
+        ms.metadata = null;
+      } catch {
+        // Ignore browsers that reject null metadata.
+      }
+      try {
+        ms.playbackState = 'none';
+      } catch {
+        // Ignore playbackState errors.
+      }
+    };
+  }, []);
+
   // Keyboard shortcuts (desktop & browser).
   useEffect(() => {
     function onKeyDown(e) {

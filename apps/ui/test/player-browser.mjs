@@ -799,10 +799,24 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     assert.equal(afterAutoNext.revokedPrev, true, 'Auto-advancing to next song must revoke previous content URL');
     assert.notEqual(afterAutoNext.nextUrl, firstSongUrl);
 
-    // Close and open untagged song (last song in folder): title is filename without extension, no subtitle,
-    // no "Unknown artist", plain bg, muted tile (NOT green), Next absent while Play stays in exact same slot!
+    // Play song -> MediaSession reflects "playing"; closing the music player clears metadata to null and playbackState to "none".
+    await page.locator('.music-play-btn').click();
+    await page.waitForFunction(
+      () => navigator.mediaSession?.playbackState === 'playing',
+      null,
+      { timeout: 5000 },
+    );
     await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const clearedSession = await page.evaluate(() => ({
+      metadata: navigator.mediaSession?.metadata ?? null,
+      playbackState: navigator.mediaSession?.playbackState || '',
+    }));
+    assert.equal(clearedSession.metadata, null);
+    assert.equal(clearedSession.playbackState, 'none');
+
+    // Open untagged song (last song in folder): title is filename without extension, no subtitle,
+    // no "Unknown artist", plain bg, muted tile (NOT green), Next absent while Play stays in exact same slot!
     await page.locator('.list a.row', { hasText: 'field_recording_untagged.wav' }).click();
     await page.locator('.music-title', { hasText: 'field_recording_untagged' }).waitFor();
     assert.equal(await page.locator('.music-subtitle').count(), 0);
