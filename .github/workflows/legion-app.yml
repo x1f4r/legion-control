@@ -321,10 +321,20 @@ jobs:
           set -euo pipefail
           READY_FILE="$RUNNER_TEMP/legion-linux-ready.txt"
           rm -f "$READY_FILE"
+          APP_PID=""
+          cleanup_smoke() {
+            if [ -n "$APP_PID" ]; then
+              kill -TERM -- "-$APP_PID" 2>/dev/null || kill "$APP_PID" 2>/dev/null || true
+              sleep 1
+              kill -KILL -- "-$APP_PID" 2>/dev/null || kill -9 "$APP_PID" 2>/dev/null || true
+              wait "$APP_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_smoke EXIT
           LEGION_APP_READY_FILE="$READY_FILE" \
           WEBKIT_DISABLE_DMABUF_RENDERER=1 \
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-          dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" \
+          setsid dbus-run-session -- xvfb-run -a -s "-screen 0 1280x800x24" \
             apps/legion-app/src-tauri/target/release/legion-app \
             >"$RUNNER_TEMP/legion-linux.log" 2>&1 &
           APP_PID=$!
@@ -337,8 +347,8 @@ jobs:
             fi
             sleep 1
           done
-          kill "$APP_PID" 2>/dev/null || true
-          wait "$APP_PID" 2>/dev/null || true
+          cleanup_smoke
+          APP_PID=""
           cat "$RUNNER_TEMP/legion-linux.log" || true
           [ "$FOUND" -eq 1 ]
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -374,7 +384,7 @@ jobs:
               echo "--- $WORK/run tree ---"
               ls -la "$WORK/run" 2>/dev/null || true
             } > "$DIAG/summary.txt"
-            for f in prefs.json floor.json current-build.json last-state.json supervisor.log supervisor-script.sh.txt; do
+            for f in prefs.json floor.json current-build.json last-state.json supervisor.log supervisor-script.sh.txt new-start.log rollback-ps.txt; do
               [ -f "$APP_DATA/$f" ] && cp "$APP_DATA/$f" "$DIAG/$f"
             done
             for f in "$APP_DATA"/rollback-*.json "$APP_DATA"/started-*.ok; do
@@ -454,20 +464,46 @@ jobs:
           set -euo pipefail
           PID1=""
           PID2=""
+          kill_pg() {
+            local pg="$1"
+            [ -n "$pg" ] || return 0
+            kill -TERM -- "-$pg" 2>/dev/null || kill "$pg" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              if ! kill -0 -- "-$pg" 2>/dev/null; then
+                break
+              fi
+              sleep 0.25
+            done
+            kill -KILL -- "-$pg" 2>/dev/null || kill -9 "$pg" 2>/dev/null || true
+            wait "$pg" 2>/dev/null || true
+          }
+          wait_dbus_free() {
+            if ! command -v dbus-send >/dev/null 2>&1 || [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+              return 0
+            fi
+            for _ in $(seq 1 20); do
+              local reply
+              reply="$(dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
+                /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:com.x1f4r.legion.SingleInstance 2>/dev/null || true)"
+              case "$reply" in
+                *"boolean true"*) sleep 0.25 ;;
+                *) return 0 ;;
+              esac
+            done
+          }
           cleanup_inner() {
-            [ -n "$PID1" ] && kill "$PID1" 2>/dev/null || true
-            [ -n "$PID2" ] && kill "$PID2" 2>/dev/null || true
-            pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
+            kill_pg "$PID1"
+            kill_pg "$PID2"
           }
           trap cleanup_inner EXIT
 
-          # Launch 1: start seq1 and wait for verified download of seq2.
+          # Launch 1: start seq1 in its own process group and wait for verified download + persisted prefs.
           PATH="$WORK/bin:$PATH" \
           LEGION_HOME="$WORK/node" \
           APPIMAGE_EXTRACT_AND_RUN=1 \
           WEBKIT_DISABLE_DMABUF_RENDERER=1 \
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-            "$WORK/run/Legion.AppImage" >"$DIAG/run1.log" 2>&1 &
+            setsid "$WORK/run/Legion.AppImage" >"$DIAG/run1.log" 2>&1 &
           PID1=$!
 
           DL_FILE="$APP_DATA/downloads/preview-$SEQ2/Legion-linux-x86_64.AppImage"
@@ -480,17 +516,16 @@ jobs:
               } >> "$DIAG/poll-trace.log"
             fi
             if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
-               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ]; then
+               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
+               && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
               DOWNLOADED=1
               break
             fi
             sleep 1
           done
-          pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
-          kill "$PID1" 2>/dev/null || true
-          wait "$PID1" 2>/dev/null || true
+          kill_pg "$PID1"
           PID1=""
-          sleep 1
+          wait_dbus_free
           [ "$DOWNLOADED" -eq 1 ]
 
           # Launch 2: next-start auto-install replaces Legion.AppImage atomically and relaunches seq2.
@@ -499,7 +534,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN=1 \
           WEBKIT_DISABLE_DMABUF_RENDERER=1 \
           WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-            "$WORK/run/Legion.AppImage" >"$DIAG/run2.log" 2>&1 &
+            setsid "$WORK/run/Legion.AppImage" >"$DIAG/run2.log" 2>&1 &
           PID2=$!
 
           UPDATED=0
@@ -509,6 +544,7 @@ jobs:
                 echo "=== run2 t=${i}s ==="
                 cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
                 cat "$APP_DATA/supervisor.log" 2>/dev/null || echo "(no supervisor.log)"
+                [ -f "$APP_DATA/new-start.log" ] && cat "$APP_DATA/new-start.log" || true
               } >> "$DIAG/poll-trace.log"
             fi
             if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
@@ -520,8 +556,7 @@ jobs:
             fi
             sleep 1
           done
-          pkill -f "$WORK/run/Legion.AppImage" 2>/dev/null || true
-          kill "$PID2" 2>/dev/null || true
+          kill_pg "$PID2"
           PID2=""
           cat "$APP_DATA/current-build.json" || true
           [ "$UPDATED" -eq 1 ]
@@ -935,7 +970,7 @@ jobs:
               echo "--- $WORK/run tree ---"
               ls -la "$WORK/run" 2>/dev/null || true
             } > "$DIAG/summary.txt"
-            for f in prefs.json floor.json current-build.json last-state.json supervisor.log supervisor-script.sh.txt; do
+            for f in prefs.json floor.json current-build.json last-state.json supervisor.log supervisor-script.sh.txt new-start.log rollback-ps.txt; do
               [ -f "$APP_DATA/$f" ] && cp "$APP_DATA/$f" "$DIAG/$f"
             done
             for f in "$APP_DATA"/rollback-*.json "$APP_DATA"/started-*.ok; do
@@ -1022,7 +1057,8 @@ jobs:
               } >> "$DIAG/poll-trace.log"
             fi
             if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
-               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ]; then
+               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ] \
+               && [ -f "$APP_DATA/prefs.json" ] && grep -q "\"sequence\": $SEQ2" "$APP_DATA/prefs.json"; then
               DOWNLOADED=1
               break
             fi
@@ -1044,6 +1080,7 @@ jobs:
                 echo "=== run2 t=${i}s ==="
                 cat "$APP_DATA/last-state.json" 2>/dev/null || echo "(no last-state.json)"
                 cat "$APP_DATA/supervisor.log" 2>/dev/null || echo "(no supervisor.log)"
+                [ -f "$APP_DATA/new-start.log" ] && cat "$APP_DATA/new-start.log" || true
               } >> "$DIAG/poll-trace.log"
             fi
             if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
@@ -1256,7 +1293,7 @@ jobs:
             }
             Set-Content -LiteralPath (Join-Path $diag 'summary.txt') -Value ($summaryLines -join "`n") -Encoding UTF8
 
-            foreach ($name in @('prefs.json', 'floor.json', 'current-build.json', 'last-state.json', 'supervisor.log', 'supervisor-script.ps1.txt')) {
+            foreach ($name in @('prefs.json', 'floor.json', 'current-build.json', 'last-state.json', 'supervisor.log', 'supervisor-script.ps1.txt', 'new-start.log', 'rollback-ps.txt')) {
               $src = Join-Path $appUpdates $name
               if (Test-Path -LiteralPath $src) {
                 Copy-Item -LiteralPath $src -Destination (Join-Path $diag $name) -Force -ErrorAction SilentlyContinue
@@ -1349,8 +1386,10 @@ jobs:
             $env:PATH = "$(Join-Path $work 'bin');$env:PATH"
             $proc1 = Start-Process -FilePath $exe.FullName -RedirectStandardOutput (Join-Path $diag 'run1-stdout.log') -RedirectStandardError (Join-Path $diag 'run1-stderr.log') -PassThru
             $currentJson = Join-Path $appUpdates 'current-build.json'
+            $prefsJson = Join-Path $appUpdates 'prefs.json'
             $lastStateJson = Join-Path $appUpdates 'last-state.json'
             $supLog = Join-Path $appUpdates 'supervisor.log'
+            $newStartLog = Join-Path $appUpdates 'new-start.log'
             $dlFile = Join-Path $appUpdates "downloads\preview-$seq2\Legion-windows-x86_64-setup.exe"
             $downloaded = $false
             for ($i = 1; $i -le 60; $i++) {
@@ -1360,13 +1399,17 @@ jobs:
                   Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $lastStateJson -Raw)
                 }
               }
-              if ((Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq1") -and (Test-Path -LiteralPath $dlFile) -and -not (Test-Path -LiteralPath "$dlFile.part")) {
+              if ((Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq1") -and (Test-Path -LiteralPath $dlFile) -and -not (Test-Path -LiteralPath "$dlFile.part") -and (Test-Path -LiteralPath $prefsJson) -and ((Get-Content -LiteralPath $prefsJson -Raw) -match "`"sequence`":\s*$seq2")) {
                 $downloaded = $true
                 break
               }
               Start-Sleep -Seconds 1
             }
-            if (-not $proc1.HasExited) { Stop-Process -Id $proc1.Id -Force -ErrorAction SilentlyContinue }
+            if (-not $proc1.HasExited) {
+              Stop-Process -Id $proc1.Id -Force -ErrorAction SilentlyContinue
+              try { $proc1.WaitForExit(5000) | Out-Null } catch {}
+            }
+            Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Milliseconds 500
             if (-not $downloaded) { throw 'Timed out waiting for Windows seq1 to download verified seq2.' }
 
@@ -1383,6 +1426,9 @@ jobs:
                 }
                 if (Test-Path -LiteralPath $supLog) {
                   Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $supLog -Raw)
+                }
+                if (Test-Path -LiteralPath $newStartLog) {
+                  Add-Content -LiteralPath $pollTrace -Value (Get-Content -LiteralPath $newStartLog -Raw)
                 }
               }
               if ((Test-Path -LiteralPath $startedMarker) -and (Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq2") -and -not (Test-Path -LiteralPath $backupDir)) {

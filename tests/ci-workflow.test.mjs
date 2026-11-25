@@ -165,6 +165,16 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
       /rm -rf apps\/legion-app\/src-tauri\/target\/release\/bundle/,
       `legion-app.yml:${id} must clean bundle/ inside self-update cleanup trap`,
     );
+    assert.match(
+      body.slice(diagStart, diagStart + 1400),
+      /new-start\.log/,
+      `legion-app.yml:${id} must include new-start.log in self-update diagnostics`,
+    );
+    assert.match(
+      body.slice(diagStart, diagStart + 1400),
+      /rollback-ps\.txt/,
+      `legion-app.yml:${id} must include rollback-ps.txt in self-update diagnostics`,
+    );
   }
   {
     const winBody = appJobs.get('windows-desktop').join('\n');
@@ -174,6 +184,16 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
       winBody.slice(finallyStart),
       /Remove-Item -LiteralPath 'apps\\legion-app\\src-tauri\\target\\release\\bundle' -Recurse -Force/,
       'legion-app.yml:windows-desktop must clean bundle/ in self-update finally block',
+    );
+    assert.match(
+      winBody,
+      /new-start\.log/,
+      'legion-app.yml:windows-desktop must include new-start.log in self-update diagnostics',
+    );
+    assert.match(
+      winBody,
+      /rollback-ps\.txt/,
+      'legion-app.yml:windows-desktop must include rollback-ps.txt in self-update diagnostics',
     );
   }
 
