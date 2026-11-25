@@ -2525,30 +2525,78 @@ impl Link {
                 }
                 Err(err) => {
                     if is_device_removed_or_unknown(&err) {
-                        self.clear_unsynced(machine);
-                        return Err(err);
-                    }
-                    if direct_err.is_none() {
+                        learned_auth_err = Some(err);
+                    } else if direct_err.is_none() {
                         direct_err = Some(err);
                     }
                 }
             }
         }
 
-        if let Some(auth_err) = relay_auth_err.or(learned_auth_err) {
-            self.clear_unsynced(machine);
-            return Err(auth_err);
+        Err(self.resolve_stream_fallback_error(
+            machine,
+            entry_learned_from,
+            in_unsynced_backoff,
+            learned_auth_err,
+            direct_err,
+            relay_auth_err,
+            old_relay_err,
+            last_relay_err,
+            unknown_machine_err,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_stream_fallback_error(
+        &self,
+        machine: &str,
+        entry_learned_from: Option<String>,
+        in_unsynced_backoff: bool,
+        learned_auth_err: Option<ErrorBody>,
+        direct_err: Option<ErrorBody>,
+        relay_auth_err: Option<ErrorBody>,
+        old_relay_err: Option<ErrorBody>,
+        last_relay_err: Option<ErrorBody>,
+        unknown_machine_err: Option<ErrorBody>,
+    ) -> ErrorBody {
+        if let Some(auth_err) = relay_auth_err {
+            if learned_auth_err.is_none() && !in_unsynced_backoff {
+                self.clear_unsynced(machine);
+            }
+            return auth_err;
         }
         if let Some(old_err) = old_relay_err {
-            return Err(old_err);
+            if in_unsynced_backoff || learned_auth_err.is_some() {
+                self.mark_unsynced(machine);
+                self.record_route(
+                    machine,
+                    MachineRouteStatus::NotSyncedYet {
+                        introducer: entry_learned_from,
+                        via: None,
+                    },
+                );
+            } else if direct_err.is_some()
+                && let Some(relay_name) = old_err
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.get("relay"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| old_err.machine.clone())
+            {
+                self.record_route(machine, MachineRouteStatus::Relay { via: relay_name });
+            }
+            return attach_direct_error(old_err, learned_auth_err.as_ref().or(direct_err.as_ref()));
+        }
+        if let Some(auth_err) = learned_auth_err {
+            self.clear_unsynced(machine);
+            return auth_err;
         }
         if let Some(err) = direct_err.or(last_relay_err) {
-            return Err(err);
+            return err;
         }
-        if unknown_machine_err.is_some() {
-            return Err(unknown_machine_error(machine));
-        }
-        Err(unknown_machine_error(machine))
+        let _ = unknown_machine_err;
+        unknown_machine_error(machine)
     }
 
     async fn open_content_direct(
@@ -2846,30 +2894,25 @@ impl Link {
                 }
                 Err(err) => {
                     if is_device_removed_or_unknown(&err) {
-                        self.clear_unsynced(machine);
-                        return Err(err);
-                    }
-                    if direct_err.is_none() {
+                        learned_auth_err = Some(err);
+                    } else if direct_err.is_none() {
                         direct_err = Some(err);
                     }
                 }
             }
         }
 
-        if let Some(auth_err) = relay_auth_err.or(learned_auth_err) {
-            self.clear_unsynced(machine);
-            return Err(auth_err);
-        }
-        if let Some(old_err) = old_relay_err {
-            return Err(old_err);
-        }
-        if let Some(err) = direct_err.or(last_relay_err) {
-            return Err(err);
-        }
-        if unknown_machine_err.is_some() {
-            return Err(unknown_machine_error(machine));
-        }
-        Err(unknown_machine_error(machine))
+        Err(self.resolve_stream_fallback_error(
+            machine,
+            entry_learned_from,
+            in_unsynced_backoff,
+            learned_auth_err,
+            direct_err,
+            relay_auth_err,
+            old_relay_err,
+            last_relay_err,
+            unknown_machine_err,
+        ))
     }
 
     async fn open_put_direct(
@@ -3773,6 +3816,24 @@ fn is_unknown_machine(err: &ErrorBody) -> bool {
             .and_then(|d| d.get("reason"))
             .and_then(Value::as_str)
             == Some(crate::REASON_UNKNOWN_MACHINE)
+}
+
+fn attach_direct_error(mut err: ErrorBody, direct: Option<&ErrorBody>) -> ErrorBody {
+    if let Some(direct_err) = direct
+        && let Ok(direct_val) = serde_json::to_value(direct_err)
+    {
+        let mut details = err.details.take().unwrap_or_else(|| json!({}));
+        if let Some(obj) = details.as_object_mut() {
+            obj.insert("direct_error".to_owned(), direct_val);
+        } else {
+            details = json!({
+                "detail": details,
+                "direct_error": direct_val,
+            });
+        }
+        err.details = Some(details);
+    }
+    err
 }
 
 fn relay_too_old_error(relay: &str, target: &str) -> ErrorBody {
@@ -8305,5 +8366,296 @@ mod tests {
         assert_eq!(done_direct.size, 2048);
 
         link.close().await;
+    }
+
+    #[tokio::test]
+    async fn learned_direct_refusal_with_old_relay_prefers_relay_too_old_and_keeps_truthful_route()
+    {
+        use crate::content::{RawStream, StreamOpenError, StreamOpener};
+        use crate::session::TransportHandle;
+        use legion_proto::{HelloResult, PROTOCOL, VERSION};
+
+        #[derive(Clone, Copy)]
+        enum StudioFailure {
+            AuthRefused,
+            Unreachable,
+        }
+
+        struct OldRelayStreamOpener;
+
+        impl StreamOpener for OldRelayStreamOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send>>
+            {
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(4 * 1024);
+                    let (_server_in, client_out) = tokio::io::duplex(4 * 1024);
+                    let stream_cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        // Older relay omits `capabilities: ["stream.relay"]`.
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: stream_cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct OldRelayTransport;
+
+        impl TransportHandle for OldRelayTransport {
+            fn collect_exit_info(
+                &mut self,
+                _wait_limit: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                Box::pin(async { (Some(0), String::new()) })
+            }
+
+            fn close(
+                self: Box<Self>,
+                _grace: Duration,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+
+            fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+                Some(Arc::new(OldRelayStreamOpener))
+            }
+        }
+
+        let failure_mode = Arc::new(Mutex::new(StudioFailure::AuthRefused));
+        let opener: SessionOpener = {
+            let failure_mode = Arc::clone(&failure_mode);
+            Arc::new(move |entry, _, cancel| {
+                let failure_mode = Arc::clone(&failure_mode);
+                Box::pin(async move {
+                    if entry.node == "studio" {
+                        return match *failure_mode.lock().unwrap() {
+                            StudioFailure::AuthRefused => Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                "The device key was rejected by studio.",
+                            )
+                            .with_machine("studio")
+                            .with_details(json!({
+                                "reason": crate::REASON_DEVICE_REMOVED_OR_UNKNOWN,
+                            }))),
+                            StudioFailure::Unreachable => Err(ErrorBody::new(
+                                ErrorCode::Unreachable,
+                                "studio could not be reached directly.",
+                            )
+                            .with_machine("studio")
+                            .with_details(json!({
+                                "reason": crate::REASON_UNREACHABLE,
+                            }))),
+                        };
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(8 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: Request = serde_json::from_str(&line).unwrap();
+                            let reply = if req.method == "hello" {
+                                Response::ok(
+                                    req.id,
+                                    serde_json::to_value(HelloResult {
+                                        node: "tower".to_owned(),
+                                        version: VERSION.to_owned(),
+                                        build: None,
+                                        protocol: PROTOCOL,
+                                        os: "linux".to_owned(),
+                                        arch: "x86_64".to_owned(),
+                                        systems: Vec::new(),
+                                        system: None,
+                                        boot_id: None,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                Response::ok(req.id, json!({}))
+                            };
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(OldRelayTransport),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let make_link = || {
+            let mut studio = NodeLink::ssh(
+                "studio",
+                SshTarget {
+                    hosts: vec!["studio.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![test_host_key(202)],
+                },
+                Some("device:pixel".to_owned()),
+            );
+            studio.origin = NodeOrigin::Learned;
+            studio.learned_from = Some("tower".to_owned());
+            Link::with_opener(
+                LinkConfig {
+                    device_key: Some("dummy".to_owned()),
+                    nodes: vec![
+                        NodeLink::ssh(
+                            "tower",
+                            SshTarget {
+                                hosts: vec!["tower.example.net".to_owned()],
+                                port: 22,
+                                user: "me".to_owned(),
+                                host_keys: vec![test_host_key(201)],
+                            },
+                            Some("device:pixel".to_owned()),
+                        ),
+                        studio,
+                    ],
+                    forgotten_nodes: Vec::new(),
+                },
+                LinkOptions::default(),
+                Arc::clone(&opener),
+            )
+        };
+
+        let put_req = || PutRequest {
+            path: "~/uploads/photo.jpg".to_owned(),
+            size: 16,
+            hash: format!("blake3:{}", "a".repeat(64)),
+            mode: None,
+            mtime: None,
+            no_replace: false,
+        };
+
+        // 1. Learned direct refuses device key + old relay -> both `open_content` and `open_put`
+        //    return `relay_too_old` with the direct refusal in `details.direct_error` and record
+        //    `NotSyncedYet` (never `Direct`), both on first attempt and during unsynced backoff.
+        {
+            *failure_mode.lock().unwrap() = StudioFailure::AuthRefused;
+            let link = make_link();
+
+            for attempt in 1..=2 {
+                let err = link
+                    .open_content("studio", "~/file.txt", 0, None)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    err.code,
+                    ErrorCode::Unsupported,
+                    "attempt {attempt}: {err:?}"
+                );
+                assert_eq!(
+                    err.message,
+                    "tower needs an update before it can pass files along from studio."
+                );
+                let details = err.details.as_ref().expect("relay_too_old details");
+                assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+                assert_eq!(details["direct_error"]["code"], json!("denied"));
+                assert_eq!(
+                    details["direct_error"]["details"]["reason"],
+                    json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+                );
+                assert_eq!(
+                    link.route_status().get("studio"),
+                    Some(&MachineRouteStatus::NotSyncedYet {
+                        introducer: Some("tower".to_owned()),
+                        via: None,
+                    }),
+                    "attempt {attempt}: route_status must not report Direct"
+                );
+            }
+            link.close().await;
+
+            let link_put = make_link();
+            for attempt in 1..=2 {
+                let err = link_put.open_put("studio", put_req()).await.err().unwrap();
+                assert_eq!(
+                    err.code,
+                    ErrorCode::Unsupported,
+                    "put attempt {attempt}: {err:?}"
+                );
+                assert_eq!(
+                    err.message,
+                    "tower needs an update before it can pass files along from studio."
+                );
+                let details = err.details.as_ref().expect("relay_too_old details");
+                assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+                assert_eq!(details["direct_error"]["code"], json!("denied"));
+                assert_eq!(
+                    details["direct_error"]["details"]["reason"],
+                    json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+                );
+                assert_eq!(
+                    link_put.route_status().get("studio"),
+                    Some(&MachineRouteStatus::NotSyncedYet {
+                        introducer: Some("tower".to_owned()),
+                        via: None,
+                    }),
+                    "put attempt {attempt}: route_status must not report Direct"
+                );
+            }
+            link_put.close().await;
+        }
+
+        // 2. Learned direct unreachable + old relay -> both `open_content` and `open_put` return
+        //    `relay_too_old` with `details.direct_error.code == "unreachable"` and non-Direct
+        //    route status.
+        {
+            *failure_mode.lock().unwrap() = StudioFailure::Unreachable;
+            let link = make_link();
+            let err = link
+                .open_content("studio", "~/file.txt", 0, None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err.code, ErrorCode::Unsupported);
+            let details = err.details.as_ref().unwrap();
+            assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+            assert_eq!(details["direct_error"]["code"], json!("unreachable"));
+            assert_ne!(
+                link.route_status().get("studio"),
+                Some(&MachineRouteStatus::Direct)
+            );
+            link.close().await;
+
+            let link_put = make_link();
+            let err = link_put.open_put("studio", put_req()).await.err().unwrap();
+            assert_eq!(err.code, ErrorCode::Unsupported);
+            let details = err.details.as_ref().unwrap();
+            assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+            assert_eq!(details["direct_error"]["code"], json!("unreachable"));
+            assert_ne!(
+                link_put.route_status().get("studio"),
+                Some(&MachineRouteStatus::Direct)
+            );
+            link_put.close().await;
+        }
     }
 }
