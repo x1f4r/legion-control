@@ -895,7 +895,8 @@ impl Link {
                 ErrorCode::Cancelled,
                 format!("Enrolment with {} was cancelled.", invite.node),
             )
-            .with_machine(&invite.node));
+            .with_machine(&invite.node)
+            .with_details(json!({ crate::DETAIL_SENT: false })));
         }
 
         // Hold `mutation_lock` only while reading local config before the network exchange so
@@ -908,7 +909,8 @@ impl Link {
                         ErrorCode::Cancelled,
                         format!("Enrolment with {} was cancelled.", invite.node),
                     )
-                    .with_machine(&invite.node));
+                    .with_machine(&invite.node)
+                    .with_details(json!({ crate::DETAIL_SENT: false })));
                 }
                 guard = self.inner.mutation_lock.lock() => guard,
             };

@@ -37,6 +37,7 @@ import {
   migrateLocalMachineStorage,
   PENDING_LOCAL_MACHINE_NAME,
 } from './lib/local-machine.js';
+import { createPairingController } from './lib/pairing.js';
 import { createForegroundResumeController } from './lib/resume.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
@@ -577,6 +578,7 @@ function App() {
         message,
         actionLabel: opts.actionLabel || null,
         actionHref,
+        onAction: typeof opts.onAction === 'function' ? opts.onAction : null,
         tone: opts.tone || null,
         suppressOnActivity,
         transferIds,
@@ -584,7 +586,14 @@ function App() {
       };
       toastRef.current = nextToast;
       setToast(nextToast);
-      const ttlMs = tracksTransfer ? 8000 : opts.tone === 'error' ? 6000 : 4500;
+      const ttlMs =
+        typeof opts.ttlMs === 'number'
+          ? opts.ttlMs
+          : tracksTransfer || nextToast.onAction
+            ? 8000
+            : opts.tone === 'error'
+              ? 6000
+              : 4500;
       toastTimerRef.current = window.setTimeout(() => {
         toastTimerRef.current = null;
         if (toastRef.current?.seq === seq) {
@@ -1360,6 +1369,84 @@ function App() {
     },
     [link, capsStore, sessionCache, persistentCache, applyLocalNodeMigration, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
+
+  const pairingOpenRef = useRef(pairingOpen);
+  pairingOpenRef.current = pairingOpen;
+  const linkReadyRef = useRef(Boolean(linkState?.ready));
+  linkReadyRef.current = Boolean(linkState?.ready);
+  const hydrateRef = useRef(hydrate);
+  hydrateRef.current = hydrate;
+  const showToastRef = useRef(showToast);
+  showToastRef.current = showToast;
+  const deviceNounRef = useRef(deviceNoun);
+  deviceNounRef.current = deviceNoun;
+
+  const pairingController = useMemo(() => {
+    const ctrl = createPairingController({
+      link,
+      isOnPairingScreen: () => {
+        if (!linkReadyRef.current || pairingOpenRef.current) return true;
+        const r = routeRef.current;
+        return r?.section === 'settings' && r?.page === 'connections' && r?.sub === 'pair';
+      },
+      onPaired: ({ next, node, startedScreen, onPairingScreen }) => {
+        setPairingOpen(false);
+        setFleetError(null);
+        capsStore.invalidate();
+        folderChanges.clearCache();
+        if (onPairingScreen) {
+          if (startedScreen === 'settings') {
+            window.location.hash = '#/settings/connections';
+          } else {
+            window.location.hash = '#/machines';
+          }
+          setPairNotice(
+            next?.last_paired
+              ? {
+                  summary: next.last_paired,
+                  screen: startedScreen === 'settings' ? 'connections' : 'machines',
+                }
+              : null,
+          );
+        }
+        hydrateRef.current(next);
+        showToastRef.current(node ? `Paired with ${node}` : 'Paired');
+      },
+      onBackgroundOutcome: ({ kind, message, error, retryable }) => {
+        if (kind === 'uncertain') {
+          showToastRef.current(message, {
+            tone: 'error',
+            actionLabel: retryable ? 'Try again' : null,
+            onAction: retryable ? () => ctrl.retryPair() : null,
+            ttlMs: 12000,
+          });
+          return;
+        }
+        if (kind === 'not_enrolled') {
+          showToastRef.current(message, { ttlMs: 8000 });
+          return;
+        }
+        const summary = plainErrorMessage(error, 'Pairing failed.', {
+          technical: Boolean(settingsRef.current?.technical),
+          deviceNoun: deviceNounRef.current,
+        });
+        showToastRef.current(summary, {
+          tone: 'error',
+          actionLabel: retryable ? 'Try again' : null,
+          onAction: retryable ? () => ctrl.retryPair() : null,
+          ttlMs: 10000,
+        });
+      },
+    });
+    return ctrl;
+  }, [link, capsStore, folderChanges]);
+
+  const [pairingState, setPairingState] = useState(() => pairingController.getState());
+
+  useEffect(() => {
+    setPairingState(pairingController.getState());
+    return pairingController.subscribe(setPairingState);
+  }, [pairingController]);
 
   // Feed fleet version/build/reachability into the per-machine capabilities store so build
   // upgrades and reconnects invalidate cached tool schemas automatically.
@@ -2757,6 +2844,8 @@ function App() {
               <${StartView}
                 link=${link}
                 linkState=${linkState}
+                pairingController=${pairingController}
+                pairingState=${pairingState}
                 onCancel=${linkState?.ready ? () => setPairingOpen(false) : null}
                 onConnected=${(next) => {
                   setPairingOpen(false);
@@ -2779,17 +2868,31 @@ function App() {
                         role=${visibleToast.tone === 'error' ? 'alert' : 'status'}
                       >
                         <span>${visibleToast.message}</span>
-                        ${visibleToast.actionLabel && visibleToast.actionHref
+                        ${visibleToast.actionLabel && visibleToast.onAction
                           ? html`
-                              <a
+                              <button
+                                type="button"
                                 class="btn small primary"
-                                href=${visibleToast.actionHref}
-                                onClick=${clearToast}
+                                onClick=${() => {
+                                  const fn = visibleToast.onAction;
+                                  clearToast();
+                                  fn();
+                                }}
                               >
                                 ${visibleToast.actionLabel}
-                              </a>
+                              </button>
                             `
-                          : null}
+                          : visibleToast.actionLabel && visibleToast.actionHref
+                            ? html`
+                                <a
+                                  class="btn small primary"
+                                  href=${visibleToast.actionHref}
+                                  onClick=${clearToast}
+                                >
+                                  ${visibleToast.actionLabel}
+                                </a>
+                              `
+                            : null}
                         <button
                           type="button"
                           class="btn small quiet"
@@ -2944,6 +3047,8 @@ function App() {
                                 capsStore=${capsStore}
                                 onRegisterRefresh=${registerScreenRefresh}
                                 linkState=${linkState}
+                                pairingController=${pairingController}
+                                pairingState=${pairingState}
                                 nodeInfo=${nodeInfo}
                                 tools=${tools}
                                 allowedSet=${allowedSet}

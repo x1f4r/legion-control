@@ -532,6 +532,19 @@ mod enrol_client {
         ExchangeErr { err: ErrorBody, request_sent: bool },
     }
 
+    /// Outcome of probing a node with the permanent device key after an ambiguous or
+    /// post-send-cancelled enrolment attempt.
+    pub(crate) enum ProbeOutcome {
+        /// The node authenticated `device_key` and confirmed `invite.node` + `invite.principal`.
+        Confirmed(Enrolled),
+        /// The node answered and definitively showed this device is not enrolled under
+        /// `invite.principal`.
+        NotEnrolled,
+        /// The node could not be reached or did not answer definitively; pairing may still have
+        /// completed on the node.
+        Unreachable,
+    }
+
     fn is_auth_failed(err: &ErrorBody) -> bool {
         err.details
             .as_ref()
@@ -540,18 +553,51 @@ mod enrol_client {
             == Some(crate::ssh::REASON_AUTH_FAILED)
     }
 
+    fn is_device_removed_or_unknown(err: &ErrorBody) -> bool {
+        err.details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+    }
+
     fn is_device_principal(principal: &str) -> bool {
         principal
             .strip_prefix("device:")
             .is_some_and(|suffix| !suffix.is_empty())
     }
 
-    fn cancelled_error(node: &str) -> ErrorBody {
+    fn cancelled_unsent_error(node: &str) -> ErrorBody {
         ErrorBody::new(
             ErrorCode::Cancelled,
             format!("Enrolment with {node} was cancelled."),
         )
         .with_machine(node)
+        .with_details(json!({ crate::DETAIL_SENT: false }))
+    }
+
+    fn cancelled_not_enrolled_error(node: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!("Pairing with {node} was stopped. Nothing was saved."),
+        )
+        .with_machine(node)
+        .with_details(json!({
+            crate::DETAIL_SENT: true,
+            "outcome": "not_enrolled",
+        }))
+    }
+
+    fn cancelled_uncertain_error(node: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!("Pairing may have finished on {node}. Try again to check."),
+        )
+        .with_machine(node)
+        .with_details(json!({
+            crate::DETAIL_SENT: true,
+            "outcome": "uncertain",
+        }))
     }
 
     /// Enrols `device_key` on the node described by `invite` under `device_name`.
@@ -592,7 +638,7 @@ mod enrol_client {
             .with_hint("Pass a short label such as `phone` or `tablet`."));
         }
         if cancel.is_cancelled() {
-            return Err(cancelled_error(&invite.node));
+            return Err(cancelled_unsent_error(&invite.node));
         }
         let seed = invite.key_seed()?;
         let temp_key = DeviceKey::from_seed(*seed);
@@ -637,7 +683,9 @@ mod enrol_client {
                     Err(err) => EnrolAttemptOutcome::ExchangeErr { err, request_sent },
                 }
             },
-            || probe_enrolled_with_device_key(invite, device_key, name, timeouts, cancel.clone()),
+            // Probe uses a fresh token (bounded by `timeouts.connect` and `timeouts.handshake`) so
+            // stopping the enrolment wait after the request left still checks the machine once.
+            || probe_enrolled_with_device_key(invite, device_key, name, timeouts),
         )
         .await
     }
@@ -653,26 +701,24 @@ mod enrol_client {
         A: FnOnce() -> AFut,
         AFut: Future<Output = EnrolAttemptOutcome>,
         P: FnOnce() -> PFut,
-        PFut: Future<Output = Option<Enrolled>>,
+        PFut: Future<Output = ProbeOutcome>,
     {
         if cancel.is_cancelled() {
-            return Err(cancelled_error(&invite.node));
+            return Err(cancelled_unsent_error(&invite.node));
         }
         match attempt().await {
             EnrolAttemptOutcome::Ok(enrolled) => {
-                if cancel.is_cancelled() {
-                    return Err(cancelled_error(&invite.node));
-                }
+                // Never discard a confirmation that has already arrived.
                 Ok(enrolled)
             }
             EnrolAttemptOutcome::ConnectErr(err) => {
                 if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
-                    return Err(cancelled_error(&invite.node));
+                    return Err(cancelled_unsent_error(&invite.node));
                 }
                 if is_auth_failed(&err) {
                     if allow_auth_failed_recovery
                         && is_device_principal(&invite.principal)
-                        && let Some(enrolled) = probe().await
+                        && let ProbeOutcome::Confirmed(enrolled) = probe().await
                     {
                         return Ok(enrolled);
                     }
@@ -684,16 +730,28 @@ mod enrol_client {
                 Err(err)
             }
             EnrolAttemptOutcome::ExchangeErr { err, request_sent } => {
-                if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
-                    return Err(cancelled_error(&invite.node));
+                if !request_sent {
+                    if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
+                        return Err(cancelled_unsent_error(&invite.node));
+                    }
+                    return Err(err);
                 }
-                if request_sent
-                    && matches!(
-                        err.code,
-                        ErrorCode::Timeout | ErrorCode::Unreachable | ErrorCode::NotFound
-                    )
-                {
-                    if let Some(enrolled) = probe().await {
+                if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
+                    // Once the request left the device, Cancel means "stop waiting", not "undo":
+                    // ask the machine once with the pinned key whether enrolment finished.
+                    return match probe().await {
+                        ProbeOutcome::Confirmed(enrolled) => Ok(enrolled),
+                        ProbeOutcome::NotEnrolled => {
+                            Err(cancelled_not_enrolled_error(&invite.node))
+                        }
+                        ProbeOutcome::Unreachable => Err(cancelled_uncertain_error(&invite.node)),
+                    };
+                }
+                if matches!(
+                    err.code,
+                    ErrorCode::Timeout | ErrorCode::Unreachable | ErrorCode::NotFound
+                ) {
+                    if let ProbeOutcome::Confirmed(enrolled) = probe().await {
                         return Ok(enrolled);
                     }
                     if err.hint.is_none() {
@@ -708,29 +766,33 @@ mod enrol_client {
     }
 
     /// Verifies whether `device_key` is already accepted on `invite.node` under `invite.principal`
-    /// using the invite's pinned host keys, recovering cleanly if enrolment completed late after
-    /// the client stopped waiting.
+    /// using the invite's pinned host keys, distinguishing definitive refusal from unreachability.
     async fn probe_enrolled_with_device_key(
         invite: &Invite,
         device_key: &DeviceKey,
         device_name: &str,
         timeouts: SshTimeouts,
-        cancel: CancellationToken,
-    ) -> Option<Enrolled> {
-        if cancel.is_cancelled() {
-            return None;
-        }
+    ) -> ProbeOutcome {
+        let probe_cancel = CancellationToken::new();
         let target = invite.target();
-        let session = crate::ssh::open(
+        let session = match crate::ssh::open(
             &invite.node,
             &target,
             device_key,
             Subcommand::Rpc,
             timeouts,
-            cancel.clone(),
+            probe_cancel.clone(),
         )
         .await
-        .ok()?;
+        {
+            Ok(session) => session,
+            Err(err) => {
+                if is_auth_failed(&err) || is_device_removed_or_unknown(&err) {
+                    return ProbeOutcome::NotEnrolled;
+                }
+                return ProbeOutcome::Unreachable;
+            }
+        };
 
         let whoami_res = tokio::time::timeout(
             timeouts.handshake,
@@ -742,19 +804,27 @@ mod enrol_client {
                     on: None,
                     hops: 0,
                 },
-                cancel,
+                probe_cancel,
                 EventSink::discard(),
             ),
         )
         .await;
         session.close().await;
 
-        let whoami = whoami_res.ok()?.ok()?;
-        let node = whoami.get("node").and_then(Value::as_str)?;
-        let principal = whoami.get("principal").and_then(Value::as_str)?;
-        let role = whoami.get("role").and_then(Value::as_str)?;
+        let Ok(Ok(whoami)) = whoami_res else {
+            return ProbeOutcome::Unreachable;
+        };
+        let Some(node) = whoami.get("node").and_then(Value::as_str) else {
+            return ProbeOutcome::Unreachable;
+        };
+        let Some(principal) = whoami.get("principal").and_then(Value::as_str) else {
+            return ProbeOutcome::Unreachable;
+        };
+        let Some(role) = whoami.get("role").and_then(Value::as_str) else {
+            return ProbeOutcome::Unreachable;
+        };
         if node != invite.node || principal != invite.principal || role.is_empty() {
-            return None;
+            return ProbeOutcome::NotEnrolled;
         }
         let device = invite
             .principal
@@ -762,7 +832,7 @@ mod enrol_client {
             .filter(|s| !s.is_empty())
             .unwrap_or(device_name.trim())
             .to_owned();
-        Some(Enrolled {
+        ProbeOutcome::Confirmed(Enrolled {
             node: node.to_owned(),
             target,
             principal: principal.to_owned(),
@@ -930,9 +1000,10 @@ mod enrol_client {
             }
         };
 
+        // Prefer an already-ready confirmation over a simultaneous cancel so a reply that has
+        // already arrived is never thrown away.
         let result = tokio::select! {
             biased;
-            () = cancel.cancelled() => Err(cancelled_error(&invite.node)),
             res = tokio::time::timeout(timeout, exchange) => match res {
                 Ok(outcome) => outcome,
                 Err(_) => {
@@ -950,7 +1021,8 @@ mod enrol_client {
                     }
                     Err(err)
                 }
-            }
+            },
+            () = cancel.cancelled() => Err(cancelled_unsent_error(&invite.node)),
         };
         (result, sent.load(Ordering::Acquire))
     }
@@ -1532,7 +1604,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     probes_c.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
+                    enrol_client::ProbeOutcome::Confirmed(expected)
                 }
             },
         )
@@ -1541,9 +1613,9 @@ mod tests {
         assert_eq!(recovered.node, "tower");
         assert_eq!(probes.load(Ordering::SeqCst), 1);
 
-        // 2. Timeout after request was sent while node has NOT finished yet -> probe returns None
-        //    -> Timeout error carries retry hint, and subsequent retry seeing REASON_AUTH_FAILED
-        //    (after node finished late) recovers cleanly via device-key probe.
+        // 2. Timeout after request was sent while node has NOT finished yet -> probe says
+        //    NotEnrolled -> Timeout error carries retry hint, and subsequent retry seeing
+        //    REASON_AUTH_FAILED (after node finished late) recovers cleanly via device-key probe.
         let timeout_err = enrol_client::enrol_flow(
             &invite,
             CancellationToken::new(),
@@ -1555,7 +1627,7 @@ mod tests {
                     request_sent: true,
                 }
             },
-            || async { None },
+            || async { enrol_client::ProbeOutcome::NotEnrolled },
         )
         .await
         .unwrap_err();
@@ -1595,7 +1667,7 @@ mod tests {
             },
             || {
                 let expected = sample_device_enrolled();
-                async move { Some(expected) }
+                async move { enrol_client::ProbeOutcome::Confirmed(expected) }
             },
         )
         .await
@@ -1621,7 +1693,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     shared_probes_c.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
+                    enrol_client::ProbeOutcome::Confirmed(expected)
                 }
             },
         )
@@ -1656,7 +1728,7 @@ mod tests {
                 let expected = sample_device_enrolled();
                 async move {
                     blocked_probes_c.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
+                    enrol_client::ProbeOutcome::Confirmed(expected)
                 }
             },
         )
@@ -1671,8 +1743,8 @@ mod tests {
                 .is_some_and(|h| h.contains("single-use"))
         );
 
-        // 4. Genuine auth failure on a `device:` invite (probe returns None) returns Denied with
-        //    expiry hint.
+        // 4. Genuine auth failure on a `device:` invite (probe returns NotEnrolled) returns
+        //    Denied with expiry hint.
         let genuine_err = enrol_client::enrol_flow(
             &device_invite,
             CancellationToken::new(),
@@ -1684,7 +1756,7 @@ mod tests {
                         .with_details(json!({ "reason": crate::ssh::REASON_AUTH_FAILED })),
                 )
             },
-            || async { None },
+            || async { enrol_client::ProbeOutcome::NotEnrolled },
         )
         .await
         .unwrap_err();
@@ -1696,17 +1768,72 @@ mod tests {
                 .is_some_and(|h| h.contains(&device_invite.expires))
         );
 
-        // 5. Explicit user cancellation never runs the recovery probe.
-        let cancel_probes = Arc::new(AtomicUsize::new(0));
-        let cancel_probes_c = Arc::clone(&cancel_probes);
-        let cancel = CancellationToken::new();
-        let cancel_for_attempt = cancel.clone();
-        let cancel_err = enrol_client::enrol_flow(
+        // 5a. Cancel before request left the device (`ConnectErr` or `request_sent = false`)
+        //     stops immediately without probing and marks `sent: false`.
+        let pre_send_probes = Arc::new(AtomicUsize::new(0));
+        let pre_send_probes_c = Arc::clone(&pre_send_probes);
+        let cancel_before = CancellationToken::new();
+        let cancel_before_attempt = cancel_before.clone();
+        let pre_send_err = enrol_client::enrol_flow(
             &invite,
-            cancel,
+            cancel_before,
             true,
             || async move {
-                cancel_for_attempt.cancel();
+                cancel_before_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::ConnectErr(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "Cancelled.",
+                ))
+            },
+            || {
+                let expected = sample_enrolled();
+                async move {
+                    pre_send_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(expected)
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(pre_send_err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            pre_send_err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(false)
+        );
+        assert_eq!(pre_send_probes.load(Ordering::SeqCst), 0);
+
+        // 5b. Cancel after confirmation already arrived MUST NEVER discard the confirmation.
+        let cancel_after_ok = CancellationToken::new();
+        let cancel_after_ok_attempt = cancel_after_ok.clone();
+        let mut direct_enrolled = sample_enrolled();
+        direct_enrolled.recovered = false;
+        let kept_ok = enrol_client::enrol_flow(
+            &invite,
+            cancel_after_ok,
+            true,
+            || async move {
+                cancel_after_ok_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::Ok(direct_enrolled)
+            },
+            || async { panic!("probe must not run when confirmation already arrived") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept_ok.node, "tower");
+        assert!(!kept_ok.recovered);
+
+        // 5c. Cancel after request left (`request_sent = true`) probes once; if the machine
+        //     confirmed late, returns Ok(enrolled) instead of leaving the device half-paired.
+        let late_cancel_probes = Arc::new(AtomicUsize::new(0));
+        let late_cancel_probes_c = Arc::clone(&late_cancel_probes);
+        let cancel_late = CancellationToken::new();
+        let cancel_late_attempt = cancel_late.clone();
+        let late_confirmed = enrol_client::enrol_flow(
+            &invite,
+            cancel_late,
+            true,
+            || async move {
+                cancel_late_attempt.cancel();
                 enrol_client::EnrolAttemptOutcome::ExchangeErr {
                     err: ErrorBody::new(ErrorCode::Cancelled, "Cancelled."),
                     request_sent: true,
@@ -1715,15 +1842,78 @@ mod tests {
             || {
                 let expected = sample_enrolled();
                 async move {
-                    cancel_probes_c.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
+                    late_cancel_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(expected)
                 }
             },
         )
         .await
+        .unwrap();
+        assert_eq!(late_confirmed.node, "tower");
+        assert!(late_confirmed.recovered);
+        assert_eq!(late_cancel_probes.load(Ordering::SeqCst), 1);
+
+        // 5d. Cancel after request left when machine definitively says no (`NotEnrolled`):
+        //     returns Cancelled with `sent: true, outcome: "not_enrolled"`.
+        let cancel_denied = CancellationToken::new();
+        let cancel_denied_attempt = cancel_denied.clone();
+        let denied_err = enrol_client::enrol_flow(
+            &invite,
+            cancel_denied,
+            true,
+            || async move {
+                cancel_denied_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Cancelled, "Cancelled."),
+                    request_sent: true,
+                }
+            },
+            || async { enrol_client::ProbeOutcome::NotEnrolled },
+        )
+        .await
         .unwrap_err();
-        assert_eq!(cancel_err.code, ErrorCode::Cancelled);
-        assert_eq!(cancel_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(denied_err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            denied_err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(true)
+        );
+        assert_eq!(
+            denied_err.details.as_ref().unwrap()["outcome"],
+            json!("not_enrolled")
+        );
+
+        // 5e. Cancel after request left when machine is unreachable (`Unreachable`):
+        //     returns Cancelled with `sent: true, outcome: "uncertain"` and the exact retry message.
+        let cancel_unreach = CancellationToken::new();
+        let cancel_unreach_attempt = cancel_unreach.clone();
+        let unreach_err = enrol_client::enrol_flow(
+            &invite,
+            cancel_unreach,
+            true,
+            || async move {
+                cancel_unreach_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Cancelled, "Cancelled."),
+                    request_sent: true,
+                }
+            },
+            || async { enrol_client::ProbeOutcome::Unreachable },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unreach_err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            unreach_err.message,
+            "Pairing may have finished on tower. Try again to check."
+        );
+        assert_eq!(
+            unreach_err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(true)
+        );
+        assert_eq!(
+            unreach_err.details.as_ref().unwrap()["outcome"],
+            json!("uncertain")
+        );
 
         // 6. Failure before request left the client (`request_sent = false`) does not probe.
         let unsent_probes = Arc::new(AtomicUsize::new(0));
@@ -1742,7 +1932,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     unsent_probes_c.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
+                    enrol_client::ProbeOutcome::Confirmed(expected)
                 }
             },
         )
@@ -1774,7 +1964,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     not_found_probes_c.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
+                    enrol_client::ProbeOutcome::Confirmed(expected)
                 }
             },
         )
@@ -1800,7 +1990,7 @@ mod tests {
                 let expected = sample_enrolled();
                 async move {
                     unsent_nf_probes_c.fetch_add(1, Ordering::SeqCst);
-                    Some(expected)
+                    enrol_client::ProbeOutcome::Confirmed(expected)
                 }
             },
         )

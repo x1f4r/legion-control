@@ -946,3 +946,128 @@ async fn real_sshd_refused_single_use_key_recovers_only_for_device_principals() 
     );
     link_y.close().await;
 }
+
+#[tokio::test]
+async fn real_sshd_cancel_before_and_after_send_behaves_honestly() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_cancel_before_and_after_send_behaves_honestly: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!(
+            "skipping real_sshd_cancel_before_and_after_send_behaves_honestly: built `legion` binary not found"
+        );
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        eprintln!("skipping: throwaway sshd unavailable");
+        return;
+    };
+
+    let node_toml = format!(
+        "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+        toml_literal(&auth_keys),
+        toml_literal(&sshd.host_key_pub),
+    );
+    fs::write(config_dir.join("node.toml"), node_toml).unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n[roles.operator]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+
+    let inv_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=cancel-phone",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv_text = inv_res["invite"].as_str().unwrap();
+
+    let key = DeviceKey::generate().unwrap();
+    let link = Link::new(LinkConfig {
+        device_key: Some(key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+
+    // 1. Cancel BEFORE sending: nothing happens on machine or device, `sent: false`, invite still usable.
+    let pre_cancel = CancellationToken::new();
+    pre_cancel.cancel();
+    let pre_err = link
+        .pair_cancellable(inv_text, "cancel-phone", pre_cancel)
+        .await
+        .unwrap_err();
+    assert_eq!(pre_err.code, ErrorCode::Cancelled);
+    assert_eq!(pre_err.details.as_ref().unwrap()[DETAIL_SENT], json!(false));
+    assert!(link.config().node("tower").is_none());
+    assert!(!fs::read_to_string(&auth_keys).unwrap().contains("--device cancel-phone"));
+
+    // 2. Cancel RIGHT AFTER the machine commits `authorized_keys` (reproducing the race where
+    //    cancel fires after the request left): pairing MUST succeed and save `tower` instead of
+    //    leaving the device half-paired.
+    let post_cancel = CancellationToken::new();
+    let cancel_trigger = post_cancel.clone();
+    let ak_path = auth_keys.clone();
+    let watcher = tokio::spawn(async move {
+        let before = fs::read_to_string(&ak_path).unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let now = fs::read_to_string(&ak_path).unwrap_or_default();
+            if now != before && now.contains("--device cancel-phone") {
+                cancel_trigger.cancel();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+
+    let enrolled = link
+        .pair_cancellable(inv_text, "cancel-phone", post_cancel)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "cancel after send must save completed pairing instead of failing: {e}\n--- sshd log ---\n{}",
+                sshd.log()
+            )
+        });
+    let _ = watcher.await;
+    assert_eq!(enrolled.node, "tower");
+    assert_eq!(enrolled.principal, "device:cancel-phone");
+    assert!(
+        link.config().node("tower").is_some(),
+        "completed pairing must be saved in LinkConfig even when cancel fired late"
+    );
+    let whoami = link
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(whoami["principal"], json!("device:cancel-phone"));
+    link.close().await;
+}

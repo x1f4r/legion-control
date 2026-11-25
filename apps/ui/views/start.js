@@ -1,41 +1,58 @@
 // First-start screen: bearer token entry for HTTP, or device pairing for the native app.
 
-import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
+import { createPairingController } from '../lib/pairing.js';
 import { CopyButton, Notice } from './common.js';
 
-function inviteTargetNode(text) {
-  const trimmed = String(text || '').trim();
-  if (!trimmed.startsWith('legion-invite-1.')) return '';
-  try {
-    const b64 = trimmed.slice('legion-invite-1.'.length).replace(/-/g, '+').replace(/_/g, '/');
-    const pad = (4 - (b64.length % 4)) % 4;
-    const parsed = JSON.parse(atob(b64 + '='.repeat(pad)));
-    return typeof parsed?.node === 'string' && parsed.node.trim() ? parsed.node.trim() : '';
-  } catch {
-    return '';
-  }
-}
-
-export function StartView({ link, linkState, onConnected, onCancel }) {
+export function StartView({
+  link,
+  linkState,
+  onConnected,
+  onCancel,
+  pairingController = null,
+  pairingState = null,
+}) {
   const [token, setToken] = useState('');
-  const [invite, setInvite] = useState('');
-  const [deviceName, setDeviceName] = useState('');
   const [pasteOpen, setPasteOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [pairing, setPairing] = useState(false);
-  const [pairingNode, setPairingNode] = useState('');
-  const [error, setError] = useState(linkState?.error || null);
+  const [localError, setLocalError] = useState(linkState?.error || null);
   const [archivedInfo, setArchivedInfo] = useState(null);
   const inviteInputRef = useRef(null);
-  const pairAbortRef = useRef(null);
 
-  useEffect(() => () => {
-    pairAbortRef.current?.abort();
-  }, []);
+  const fallbackController = useMemo(
+    () =>
+      pairingController
+        ? null
+        : createPairingController({
+            link,
+            onPaired: ({ next }) => {
+              window.location.hash = '#/machines';
+              onConnected?.(next);
+            },
+          }),
+    [pairingController, link, onConnected],
+  );
+  const ctrl = pairingController || fallbackController;
+  const [fallbackState, setFallbackState] = useState(() => ctrl.getState());
+  useEffect(() => {
+    if (pairingController) return undefined;
+    setFallbackState(ctrl.getState());
+    return ctrl.subscribe(setFallbackState);
+  }, [pairingController, ctrl]);
+
+  const pState = pairingState || fallbackState;
+  const invite = pState.invite;
+  const deviceName = pState.deviceName;
+  const pairing = pState.inFlight;
+  const cancelling = pState.cancelling;
+  const pairingNode = pState.node;
+  const pairNotice = pState.notice;
+  const error = pState.error || localError;
+  const controlsDisabled = busy || pairing;
 
   function cancelPairing() {
-    pairAbortRef.current?.abort();
+    ctrl.cancelPair();
   }
 
   useEffect(() => {
@@ -55,19 +72,19 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
     link
       .deviceName()
       .then((name) => {
-        if (alive && name) {
-          setDeviceName((prev) => (prev ? prev : name));
+        if (alive && name && !ctrl.getState().deviceName) {
+          ctrl.setDeviceName(name);
         }
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [link, needsPairing]);
+  }, [link, needsPairing, ctrl]);
 
   async function submitToken(e) {
     e.preventDefault();
-    setError(null);
+    setLocalError(null);
     setBusy(true);
     try {
       const next = await link.setToken(token);
@@ -75,48 +92,30 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
       window.location.hash = '#/machines';
       onConnected(next);
     } catch (err) {
-      setError(err);
+      setLocalError(err);
     } finally {
       setBusy(false);
     }
   }
 
-  async function runPair(inviteText, { clearInput = false } = {}) {
-    const controller = new AbortController();
-    pairAbortRef.current = controller;
-    setPairingNode(inviteTargetNode(inviteText));
-    setPairing(true);
-    try {
-      const next = await link.pair(inviteText, deviceName.trim() || undefined, {
-        signal: controller.signal,
-      });
-      if (clearInput) setInvite('');
-      window.location.hash = '#/machines';
-      onConnected(next);
-    } catch (err) {
-      if (err?.code !== 'cancelled') {
-        setError(err);
-      }
-    } finally {
-      if (pairAbortRef.current === controller) {
-        pairAbortRef.current = null;
-      }
-      setPairing(false);
-      setPairingNode('');
-    }
-  }
-
   async function onScan() {
-    setError(null);
+    setLocalError(null);
+    ctrl.clearOutcome();
     setBusy(true);
     try {
       const scanned = await link.scanInvite();
       if (scanned) {
-        await runPair(scanned);
+        setBusy(false);
+        await ctrl.startPair({
+          invite: scanned,
+          deviceName: ctrl.getState().deviceName,
+          source: 'scan',
+          screen: 'start',
+        });
       }
     } catch (err) {
       if (err?.code !== 'cancelled') {
-        setError(err);
+        setLocalError(err);
       }
     } finally {
       setBusy(false);
@@ -125,17 +124,19 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
 
   async function submitInvite(e) {
     e.preventDefault();
-    setError(null);
-    setBusy(true);
-    try {
-      await runPair(invite.trim(), { clearInput: true });
-    } finally {
-      setBusy(false);
-    }
+    setLocalError(null);
+    const trimmed = invite.trim();
+    if (!trimmed) return;
+    await ctrl.startPair({
+      invite: trimmed,
+      deviceName: ctrl.getState().deviceName,
+      source: 'paste',
+      screen: 'start',
+    });
   }
 
   async function onRepairStore() {
-    setError(null);
+    setLocalError(null);
     setBusy(true);
     try {
       const res = await link.repairStore();
@@ -148,7 +149,7 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
         onConnected(res.state);
       }
     } catch (err) {
-      setError(err);
+      setLocalError(err);
     } finally {
       setBusy(false);
     }
@@ -281,27 +282,74 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
               <input
                 type="text"
                 value=${deviceName}
-                onInput=${(e) => setDeviceName(e.target.value)}
+                onInput=${(e) => ctrl.setDeviceName(e.target.value)}
                 placeholder=${canScan ? 'phone' : 'computer'}
-                disabled=${busy}
+                disabled=${controlsDisabled}
               />
             </label>
             ${pairing
               ? html`
                   <div class="notice" role="status" aria-live="polite">
-                    <strong>${pairingNode ? `Pairing with ${pairingNode}…` : 'Pairing…'}</strong>
+                    <strong>
+                      ${cancelling
+                        ? pairingNode
+                          ? `Checking ${pairingNode}…`
+                          : 'Checking…'
+                        : pairingNode
+                          ? `Pairing with ${pairingNode}…`
+                          : 'Pairing…'}
+                    </strong>
                     <span>
-                      Waiting for ${pairingNode || 'the machine'} to confirm. This can take up to
-                      45 seconds on a slow connection.
+                      ${cancelling
+                        ? `Checking whether ${pairingNode || 'the machine'} finished pairing before stopping.`
+                        : `Waiting for ${pairingNode || 'the machine'} to confirm. This can take up to 45 seconds on a slow connection.`}
                     </span>
                   </div>
                 `
               : null}
+            ${pairNotice
+              ? html`
+                  <div
+                    class=${pairNotice.kind === 'neutral' ? 'notice neutral' : 'notice'}
+                    role="status"
+                  >
+                    <strong>${pairNotice.title}</strong>
+                    ${pairNotice.retryable && invite
+                      ? html`
+                          <div class="actions">
+                            <button
+                              type="button"
+                              class="btn small primary"
+                              disabled=${controlsDisabled}
+                              onClick=${() => ctrl.retryPair()}
+                            >
+                              Try again
+                            </button>
+                          </div>
+                        `
+                      : null}
+                  </div>
+                `
+              : null}
             ${error ? html`<${Notice} error=${error} />` : null}
+            ${error && pState.source === 'scan' && invite && !pairing
+              ? html`
+                  <div class="actions">
+                    <button
+                      type="button"
+                      class="btn primary"
+                      disabled=${controlsDisabled}
+                      onClick=${() => ctrl.retryPair()}
+                    >
+                      Try again
+                    </button>
+                  </div>
+                `
+              : null}
             <div class="actions">
               ${canScan
                 ? html`
-                    <button type="button" class="btn primary" disabled=${busy} onClick=${onScan}>
+                    <button type="button" class="btn primary" disabled=${controlsDisabled} onClick=${onScan}>
                       ${pairing && !pasteOpen ? 'Pairing…' : 'Scan the code'}
                     </button>
                   `
@@ -309,14 +357,16 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
               <button
                 type="button"
                 class=${canScan ? 'btn' : 'btn primary'}
-                disabled=${busy}
+                disabled=${controlsDisabled}
                 onClick=${() => setPasteOpen((v) => !v)}
               >
                 Paste invite
               </button>
               ${pairing && !pasteOpen
                 ? html`
-                    <button type="button" class="btn" onClick=${cancelPairing}>Cancel</button>
+                    <button type="button" class="btn" disabled=${cancelling} onClick=${cancelPairing}>
+                      ${cancelling ? 'Stopping…' : 'Cancel'}
+                    </button>
                   `
                 : null}
             </div>
@@ -328,20 +378,20 @@ export function StartView({ link, linkState, onConnected, onCancel }) {
                       <textarea
                         ref=${inviteInputRef}
                         value=${invite}
-                        onInput=${(e) => setInvite(e.target.value)}
+                        onInput=${(e) => ctrl.setInvite(e.target.value)}
                         placeholder="Paste the invite line from legion pair"
-                        disabled=${busy}
+                        disabled=${controlsDisabled}
                         required
                       ></textarea>
                     </label>
                     <div class="actions">
-                      <button type="submit" class="btn primary" disabled=${busy}>
-                        ${busy ? 'Pairing…' : 'Pair device'}
+                      <button type="submit" class="btn primary" disabled=${controlsDisabled}>
+                        ${pairing ? 'Pairing…' : 'Pair device'}
                       </button>
                       ${pairing
                         ? html`
-                            <button type="button" class="btn" onClick=${cancelPairing}>
-                              Cancel
+                            <button type="button" class="btn" disabled=${cancelling} onClick=${cancelPairing}>
+                              ${cancelling ? 'Stopping…' : 'Cancel'}
                             </button>
                           `
                         : null}

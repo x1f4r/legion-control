@@ -1328,7 +1328,7 @@ export function createAppLink() {
       message: 'Pairing was cancelled.',
       hint: null,
       machine: null,
-      details: null,
+      details: { sent: false },
     });
     if (signal?.aborted) {
       throw cancelledError();
