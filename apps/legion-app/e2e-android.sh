@@ -262,7 +262,7 @@ printf 'sample note\n' > "$FILES_A_DIR/notes.md"
 printf 'nested file\n' > "$FILES_A_DIR/subdir/item.txt"
 printf 'hello from pi\n' > "$FILES_B_DIR/pi.txt"
 printf 'nested on pi\n' > "$FILES_B_DIR/subdir/item.txt"
-# Seed a valid 1x1 PNG picture and a 128 KiB PCM WAV sample on pi for relayed & direct file e2e.
+# Seed a valid 4x4 PNG picture and a 128 KiB PCM WAV sample on pi for relayed & direct file e2e.
 node -e '
 const fs = require("node:fs");
 const path = require("node:path");
@@ -299,9 +299,27 @@ ssh-keygen -q -t ed25519 -N '' -C 'legion-e2e-fleet' -f "$FLEET_KEY"
 chmod 600 "$AUTH_KEYS_A" "$AUTH_KEYS_B"
 
 FLEET_PUB="$(cat "$FLEET_KEY.pub")"
-printf 'command="env LEGION_HOME=%s %s gate",restrict %s\n' "$NODE_A_HOME" "$LEGION_BIN" "$FLEET_PUB" > "$FLEET_AUTH_KEYS_A"
-printf 'command="env LEGION_HOME=%s %s gate",restrict %s\n' "$NODE_B_HOME" "$LEGION_BIN" "$FLEET_PUB" > "$FLEET_AUTH_KEYS_B"
-chmod 600 "$FLEET_AUTH_KEYS_A" "$FLEET_AUTH_KEYS_B"
+write_fleet_auth_key() {
+	local out="$1"
+	local node_home="$2"
+	local dispatch
+	dispatch="$RUN_DIR/fleet-dispatch-$(basename "$node_home").sh"
+	cat > "$dispatch" <<EOF
+#!/usr/bin/env sh
+set -eu
+export LEGION_HOME="$node_home"
+case "\${SSH_ORIGINAL_COMMAND:-}" in
+	"legion rpc") exec "$LEGION_BIN" rpc ;;
+	"legion stream") exec "$LEGION_BIN" stream ;;
+	*) printf 'unexpected fleet command: %s\n' "\${SSH_ORIGINAL_COMMAND:-}" >&2; exit 2 ;;
+esac
+EOF
+	chmod 700 "$dispatch"
+	printf 'command="%s",restrict %s\n' "$dispatch" "$FLEET_PUB" > "$out"
+	chmod 600 "$out"
+}
+write_fleet_auth_key "$FLEET_AUTH_KEYS_A" "$NODE_A_HOME"
+write_fleet_auth_key "$FLEET_AUTH_KEYS_B" "$NODE_B_HOME"
 
 read -r PORT_A PORT_B <<< "$(node -e '
 const net = require("node:net");
@@ -529,8 +547,10 @@ run_on_avd() {
 	# Enable the debug-only loopback endpoint switch so the two-node loopback harness
 	# (127.0.0.1 + 10.0.2.2) can learn peer endpoints. Release builds ignore this marker.
 	adb -s "$serial" shell "run-as '$APP_ID' touch allow-loopback-endpoints"
-	# Android 17 (API 37) Local Network Protection gates 10.0.2.2 behind ACCESS_LOCAL_NETWORK.
+	# Android 17 (API 37) Local Network Protection gates 10.0.2.2 behind ACCESS_LOCAL_NETWORK,
+	# and transfer downloads request POST_NOTIFICATIONS before starting on Android 13+.
 	adb -s "$serial" shell pm grant "$APP_ID" android.permission.ACCESS_LOCAL_NETWORK >/dev/null 2>&1 || true
+	adb -s "$serial" shell pm grant "$APP_ID" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
 	"$HERE/emulator.sh" --avd "$avd" launch
 
 	E2E_ADB_SERIAL="$serial" \

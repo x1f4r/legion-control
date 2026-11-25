@@ -429,7 +429,7 @@ async function waitForMachineWithStats(page, machineName, timeoutMs = 30000) {
   const text = await stats.innerText();
   assert.match(text, /Processor[\s\S]*\d+%/, `Unexpected stats text for ${machineName}: ${text}`);
   assert.match(text, /Memory[\s\S]*\d+%/, `Unexpected stats text for ${machineName}: ${text}`);
-  assert.match(text, /Disk[\s\S]*\d+%/, `Unexpected stats text for ${machineName}: ${text}`);
+  assert.match(text, /(?:Disk|Storage)[\s\S]*\d+%/, `Unexpected stats text for ${machineName}: ${text}`);
   return card;
 }
 
@@ -509,6 +509,23 @@ function enrolSecondDeviceFromHost(inviteText, name) {
   return JSON.parse(out);
 }
 
+async function waitForTransferDone(page, id, label, timeoutMs = 25000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const list = await page.evaluate(() => window.__TAURI__.core.invoke('transfers'));
+    const item = (list || []).find((t) => t.id === id);
+    if (item && item.state === 'failed') {
+      throw new Error(`${label} failed: ${JSON.stringify(item.error)}`);
+    }
+    if (item && item.state === 'done') {
+      return item;
+    }
+    await sleep(200);
+  }
+  const list = await page.evaluate(() => window.__TAURI__.core.invoke('transfers'));
+  throw new Error(`Timed out waiting for ${label} (${id}); transfers=${JSON.stringify(list)}`);
+}
+
 async function runPhoneSuite() {
   let conn = await connectWebView();
   let page = conn.page;
@@ -529,7 +546,7 @@ async function runPhoneSuite() {
   await waitForMachineWithStats(page, 'tower');
   await waitForMachineWithStats(page, 'pi');
   await page.getByText('Paired with tower and shared with pi.').waitFor({ state: 'visible', timeout: 15000 });
-  assert.equal(await page.locator('nav.nav a').count(), 3, 'Expected 3 root bottom nav items');
+  assert.equal(await page.locator('nav.nav a').count(), 4, 'Expected 4 root bottom nav items');
   await takeShot(page, '02-paired-fleet.png');
 
   // 2b. Second machine reached only through the fleet:
@@ -538,15 +555,20 @@ async function runPhoneSuite() {
   //     picture, perform a ranged media read, download, and upload on pi strictly through relay
   //     tower (zero direct auth on pi's sshd).
   log('Step 2b: verifying picture, ranged media read, download, and upload on pi strictly through relay tower');
-  await page.waitForFunction(
-    async () => {
-      const st = await window.__TAURI__.core.invoke('state');
-      return Array.isArray(st.learn_rejections) && st.learn_rejections.some((r) => r.machine === 'pi');
-    },
-    null,
-    { timeout: 20000 },
-  );
-  const relayedState = await page.evaluate(() => window.__TAURI__.core.invoke('state'));
+  let relayedState = null;
+  {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      relayedState = await page.evaluate(() => window.__TAURI__.core.invoke('state'));
+      if (
+        Array.isArray(relayedState?.learn_rejections) &&
+        relayedState.learn_rejections.some((r) => r.machine === 'pi')
+      ) {
+        break;
+      }
+      await sleep(200);
+    }
+  }
   assert.equal(
     relayedState.nodes.some((n) => n.node === 'pi'),
     false,
@@ -620,7 +642,13 @@ async function runPhoneSuite() {
       };
       audio.onseeked = () => {
         clearTimeout(timer);
-        const out = { duration: audio.duration, currentTime: audio.currentTime, url: minted.url };
+        const seekableEnd = audio.seekable && audio.seekable.length > 0 ? audio.seekable.end(0) : 0;
+        const out = {
+          duration: audio.duration,
+          currentTime: audio.currentTime,
+          seekableEnd,
+          url: minted.url,
+        };
         audio.src = '';
         resolve(out);
       };
@@ -628,12 +656,16 @@ async function runPhoneSuite() {
     });
   }, path.join(FILES_B_DIR, 'clip.wav'));
   assert.ok(audioRelayed.duration > 3.5, `Expected ~4s WAV duration, got ${audioRelayed.duration}`);
+  assert.ok(
+    audioRelayed.seekableEnd > 3.5,
+    `Expected ranged seekable media (>3.5s via HTTP 206), got ${audioRelayed.seekableEnd}`,
+  );
   assert.ok(audioRelayed.currentTime >= 1.9, `Expected seek to ~2.0s, got ${audioRelayed.currentTime}`);
-  const relayedContentLog = adb(['logcat', '-d', '-s', 'legion-content:I']);
+  const relayedContentLog = adb(['logcat', '-d', '-s', 'legion-app:I']);
   assert.match(
     relayedContentLog,
     /legion-content: GET clip\.wav range=bytes=\d+-.* -> 206/,
-    `Expected HTTP 206 ranged media read in Android legion-content logcat:\n${relayedContentLog}`,
+    `Expected HTTP 206 ranged media read in Android legion-app logcat:\n${relayedContentLog}`,
   );
 
   // Download photo.png from pi via relay tower.
@@ -645,18 +677,7 @@ async function runPhoneSuite() {
     });
     return res.id;
   }, path.join(FILES_B_DIR, 'photo.png'));
-  await page.waitForFunction(
-    async (id) => {
-      const list = await window.__TAURI__.core.invoke('transfer_list');
-      const item = (list || []).find((t) => t.id === id);
-      if (item && item.state === 'failed') {
-        throw new Error(`Relayed download failed: ${JSON.stringify(item.error)}`);
-      }
-      return item && item.state === 'done';
-    },
-    dlId,
-    { timeout: 25000 },
-  );
+  await waitForTransferDone(page, dlId, 'Relayed download');
 
   // Upload a 64 KiB file from the Android app's sandbox cache to pi via relay tower.
   const uploadPayload = Buffer.alloc(64 * 1024);
@@ -687,23 +708,13 @@ async function runPhoneSuite() {
   );
   assert.ok(uploadResult?.ids?.length === 1, `Unexpected upload enqueue result: ${JSON.stringify(uploadResult)}`);
   const upId = uploadResult.ids[0];
-  await page.waitForFunction(
-    async (id) => {
-      const list = await window.__TAURI__.core.invoke('transfer_list');
-      const item = (list || []).find((t) => t.id === id);
-      if (item && item.state === 'failed') {
-        throw new Error(`Relayed upload failed: ${JSON.stringify(item.error)}`);
-      }
-      return item && item.state === 'done';
-    },
-    upId,
-    { timeout: 25000 },
-  );
+  await waitForTransferDone(page, upId, 'Relayed upload');
   const landed = fs.readFileSync(path.join(FILES_B_DIR, 'relayed-upload.bin'));
   assert.deepEqual(landed, uploadPayload, 'Uploaded bytes on pi must match original payload');
 
   // Confirm pi's sshd has NOT seen any direct authentication from pixel-e2e yet: every single
-  // file view, ranged media read, download, and upload above traversed the tower relay!
+  // file view, ranged media read, download, and upload above traversed the tower relay, and both
+  // relay (tower) and target (pi) wrote stream audit entries for device:pixel-e2e on target pi.
   const pixelFp = getDeviceFingerprint('pi', 'pixel-e2e');
   assert.ok(pixelFp, 'Expected pixel-e2e to be present on pi after pairing with tower');
   const sshdBBeforeLearn = fs.readFileSync(NODES.pi.sshdLog, 'utf8');
@@ -711,19 +722,51 @@ async function runPhoneSuite() {
     !sshdBBeforeLearn.includes(pixelFp),
     `Expected zero direct SSH auth on pi before learning direct route, but found ${pixelFp}`,
   );
+  for (const nodeName of ['tower', 'pi']) {
+    const auditPath = path.join(NODES[nodeName].home, 'state/audit.jsonl');
+    const lines = fs
+      .readFileSync(auditPath, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.ok(
+      lines.some(
+        (e) =>
+          e.tool === 'stream.put' &&
+          e.target === 'pi' &&
+          e.principal === 'device:pixel-e2e' &&
+          e.outcome === 'ok',
+      ),
+      `Expected ok stream.put audit entry for device:pixel-e2e targeting pi on ${nodeName}`,
+    );
+  }
   log('Confirmed picture, ranged media read, download, and upload on pi all ran strictly through relay tower');
 
-  // 2c. Publish pi's direct loopback endpoint, run learn(), and verify streams switch to direct!
-  log('Step 2c: enabling pi direct endpoint, running learn(), and confirming streams switch to direct');
+  // 2c. Publish pi's direct loopback endpoint, trigger pull-to-refresh so the UI runs learn() and
+  //     refreshes linkState, and verify streams switch seamlessly to direct!
+  log('Step 2c: enabling pi direct endpoint, running learn() via UI refresh, and confirming streams switch to direct');
   fs.writeFileSync(
     path.join(NODES.pi.home, 'config/node.toml'),
     `name = "pi"\n\n[devices]\nhosts = ["127.0.0.1", "10.0.2.2"]\nport = ${NODES.pi.port}\nuser = "${CURRENT_USER}"\nauthorized_keys = "${AUTH_KEYS_B}"\nhost_keys = ["${HOST_KEY_B_PUB}"]\n`,
   );
-  const learnedAfter = await page.evaluate(() => window.__TAURI__.core.invoke('learn'));
-  assert.ok(
-    Array.isArray(learnedAfter?.report?.added) && learnedAfter.report.added.includes('pi'),
-    `Expected learn() to add direct route for pi: ${JSON.stringify(learnedAfter)}`,
-  );
+  await page.evaluate(() => {
+    window.location.hash = '#/machines';
+  });
+  await page.locator('header.top h1', { hasText: 'Machines' }).waitFor({ state: 'visible', timeout: 15000 });
+  await triggerPullRefresh(page);
+  {
+    const deadline = Date.now() + 20000;
+    let learnedPi = false;
+    while (Date.now() < deadline) {
+      const st = await page.evaluate(() => window.__TAURI__.core.invoke('state'));
+      if (Array.isArray(st?.nodes) && st.nodes.some((n) => n.node === 'pi')) {
+        learnedPi = true;
+        break;
+      }
+      await sleep(250);
+    }
+    assert.ok(learnedPi, 'Expected pull-to-refresh learn() to add direct route for pi');
+  }
   const audioDirect = await page.evaluate(async (clipPath) => {
     const minted = await window.__TAURI__.core.invoke('content_url', {
       machine: 'pi',
