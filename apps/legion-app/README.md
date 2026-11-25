@@ -125,23 +125,31 @@ fixed log line.
   endpoints, and adds `form-action 'none'; base-uri 'none'; frame-ancestors 'none'`. `lib.rs`
   attaches `on_navigation` to allow only the bundled app origin and denies all `on_new_window`
   requests.
-- **Content addresses (`content_url`) and status (`content_status`):**
+- **Content addresses (`content_url`), status (`content_status`), and revocation (`content_revoke`):**
   - All platforms (Linux, macOS, Windows, iOS/iPadOS, and Android) mount `legion-content` lazily on
-    `http://127.0.0.1:<ephemeral-port>` (capped at 32 simultaneous connections, 5-second
-    header-read timeout, exponential accept-error backoff, mobile resume recovery, and stopping 60
-    seconds after no live tickets or active streams remain), validate `Host` and `Origin` through
-    `HostOriginGuard` (`tauri://localhost` on Linux/macOS/iOS; `http://tauri.localhost` and
-    `https://tauri.localhost` on Windows and Android; never `null`), and set
-    `Cross-Origin-Resource-Policy: cross-origin`.
+    `http://127.0.0.1:<ephemeral-port>` (deciding liveness from Legion's own accept-task state and
+    always binding a fresh OS-chosen port on recovery; capped at 32 simultaneous connections with a
+    5-second header-read timeout, a 2-second header timeout for unauthenticated connections,
+    `Connection: close` on `404` and guard rejections, eviction of the oldest unauthenticated
+    connection before refusing a new one at the cap, exponential accept-error backoff, mobile
+    resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
+    validate `Host` and `Origin` through `HostOriginGuard` (`tauri://localhost` on Linux/macOS/iOS;
+    `http://tauri.localhost` and `https://tauri.localhost` on Windows and Android; never `null`),
+    and set `Cross-Origin-Resource-Policy: cross-origin`.
   - On Android, `res/xml/network_security_config.xml` denies cleartext traffic globally
     (`cleartextTrafficPermitted="false"`) and permits cleartext strictly for `127.0.0.1`, so
     WebView streams and seeks arbitrarily large media with flat memory while keeping cleartext
-    blocked for every other host.
+    blocked for every other host. Because any Android app can connect to `127.0.0.1` and send any
+    `Host` and `Origin`, `HostOriginGuard` protects against browsers only; against other apps the
+    ticket is the only barrier, which is why it is 256 bits, hashed at rest, scoped to one holder,
+    machine and path, and revoked via `content_revoke(url)` as soon as the viewer closes, switches
+    files, or tears down a media element.
   - `content_status(url)` exposes redacted per-ticket HTTP status, response `Content-Type`,
-    mid-stream failure state, and ticket liveness so the viewer distinguishes transport, server,
-    and permission errors from genuine codec failures.
-  - Tickets expire after 15 minutes idle / 6 hours max, and are revoked immediately on `unpair`,
-    `repair_store`, `accept_identity_change`, and app exit.
+    mid-stream failure state, and ticket liveness (recorded strictly after ticket lookup succeeds)
+    so the viewer distinguishes transport, server, and permission errors from genuine codec
+    failures.
+  - Tickets also expire after 15 minutes idle / 6 hours max, and are revoked immediately on
+    `unpair`, `repair_store`, `accept_identity_change`, and app exit.
 - **Background transfer queue (`transfers/*`) and what survives what:**
   - Shared Rust queue (`concurrency = 2`, 64 KiB streaming buffers, serialized monotonic
     persistence in `<app_data_dir>/transfers/queue.json`, partial resume by byte offset, progress

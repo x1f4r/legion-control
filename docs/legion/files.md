@@ -328,18 +328,26 @@ mount it:
   machine, separate from transfer and RPC pipes (which never share permits with content), with
   per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
-  download})` and `content_status({url})`, reading through `Link::open_content`. Every platform
-  (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts it lazily on a streaming HTTP/1.1
-  listener bound strictly to `127.0.0.1` on a system-chosen port (capped at 32 simultaneous
-  connections with a 5-second header-read timeout, exponential backoff on accept errors, mobile
-  resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
-  protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page origins,
-  never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. On Android,
-  `res/xml/network_security_config.xml` denies cleartext traffic globally while exempting only the
-  loopback literal `127.0.0.1`, allowing WebView to stream and seek arbitrarily large media with
-  flat memory without permitting cleartext to any other host. Tickets are read-only, short-lived,
-  exist only for files opened in the app, and die immediately when their pairing is removed or
-  replaced or when the app quits.
+  download})`, `content_status({url})`, and `content_revoke({url})`, reading through
+  `Link::open_content`. Every platform (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts it
+  lazily on a streaming HTTP/1.1 listener bound strictly to `127.0.0.1:0` on a system-chosen port
+  (deciding liveness strictly from Legion's own accept-task state and always binding a fresh
+  OS-chosen port on recovery; capped at 32 simultaneous connections with a 5-second header-read
+  timeout, a 2-second header timeout for connections that have not yet presented a valid ticket,
+  `Connection: close` on `404` and guard rejections, eviction of the oldest unauthenticated
+  connection before refusing a new one at the cap, status tracking strictly after ticket lookup
+  succeeds, exponential backoff on accept errors, mobile resume recovery, and stopping 60 seconds
+  after no live tickets or active streams remain), protected by `HostOriginGuard` (loopback
+  host+port and only that platform's bundled page origins, never `null`) and
+  `Cross-Origin-Resource-Policy: cross-origin`. On Android, `res/xml/network_security_config.xml`
+  denies cleartext traffic globally while exempting only the loopback literal `127.0.0.1`, allowing
+  WebView to stream and seek arbitrarily large media with flat memory without permitting cleartext
+  to any other host. On Android, any app on the phone can connect to `127.0.0.1` and send any
+  `Host` and `Origin`, so the host and origin guard protects against browsers only; against other
+  apps the ticket is the only barrier, which is why it is 256 bits, hashed at rest, scoped to one
+  holder, machine and path, and revoked when the viewer closes, moves to another file, or tears
+  down a media element (as well as immediately when its pairing is removed or replaced or when the
+  app quits).
 
 The interface's content security policy grows by exactly what this needs: `img-src` and
 `media-src` for `http://127.0.0.1:*`.
