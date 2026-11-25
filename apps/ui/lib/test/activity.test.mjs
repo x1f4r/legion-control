@@ -7,14 +7,20 @@ import {
   formatActivityDuration,
   formatActivitySubtitle,
   formatCommandMeta,
+  formatDeviceTransferSubtitle,
+  formatDeviceTransferTitle,
   formatInviteValidity,
   formatMachineDetailSubtitle,
   formatMachineStatusPhrase,
   formatMachinesHeaderSubtitle,
+  formatTransferEta,
+  formatTransferJobSubtitle,
+  friendlyDeviceTransferState,
   friendlyJobName,
   friendlyJobState,
   groupActivity,
   plainRefusalParts,
+  transferProgressPct,
 } from '../activity.js';
 
 test('friendlyJobName hides raw commands and preserves meaningful names', () => {
@@ -198,4 +204,48 @@ test('wakePending phrases, dry-run summaries, refusal splitting, and invite copy
   assert.equal(formatInviteValidity(15), '15 minutes');
   assert.equal(formatInviteValidity(60), '1 hour');
   assert.equal(formatInviteValidity(1440), '1 day');
+});
+
+test('transfer job and device transfer formatting uses plain words by default and paths in technical mode', () => {
+  assert.equal(transferProgressPct({ bytes_done: 498_000_000, bytes_total: 1_200_000_000 }), 42);
+  assert.equal(formatTransferEta(498_000_000, 1_200_000_000, 12_000_000), 'about 1 minute left');
+
+  const runningTransfer = {
+    kind: 'transfer',
+    title: 'Copying Arrival.mp4 to pi',
+    machine: 'tower',
+    state: 'running',
+    progress: { bytes_done: 498_000_000, bytes_total: 1_200_000_000, rate: 12_000_000 },
+  };
+  assert.equal(friendlyJobName(runningTransfer), 'Copying Arrival.mp4 to pi');
+  assert.match(formatTransferJobSubtitle(runningTransfer, { technical: false }), /tower .* 1\.2 GB .* about 1 minute left/);
+
+  const doneDl = {
+    id: 'dt-1',
+    direction: 'download',
+    machine: 'tower',
+    path: '/home/me/Tickets.pdf',
+    localPath: 'Downloads/Legion/Tickets.pdf',
+    name: 'Tickets.pdf',
+    state: 'done',
+    bytes_done: 310_000,
+    bytes_total: 310_000,
+    hash: 'blake3:88f12c09aa7b34e2c51d0e89',
+    canOpen: true,
+  };
+  assert.equal(formatDeviceTransferTitle(doneDl, false), 'Downloaded Tickets.pdf');
+  assert.equal(formatDeviceTransferSubtitle(doneDl, { deviceNoun: 'phone', technical: false }), 'To this phone · tap to open');
+  assert.deepEqual(friendlyDeviceTransferState(doneDl, false), { label: 'Finished', cls: 'done' });
+  assert.match(formatDeviceTransferTitle(doneDl, true), /tower:\/home\/me\/Tickets\.pdf/);
+  assert.match(formatDeviceTransferSubtitle(doneDl, { technical: true }), /310000 B/);
+
+  const runningDl = {
+    direction: 'download',
+    name: 'Beach.mp4',
+    state: 'running',
+    bytes_done: 210_000_000,
+    bytes_total: 840_000_000,
+  };
+  assert.equal(formatDeviceTransferTitle(runningDl, false), 'Downloading Beach.mp4');
+  assert.deepEqual(friendlyDeviceTransferState(runningDl, false), { label: '25%', cls: 'running' });
 });
