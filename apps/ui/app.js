@@ -29,6 +29,14 @@ import {
 import { readSortPreference, writeSortPreference } from './lib/files-store.js';
 import { createFolderChangesStore } from './lib/folder-changes.js';
 import { formatBytes, formatRelativeTime } from './lib/format.js';
+import {
+  isLocalConnectionName,
+  isPendingLocalName,
+  isRealMachineName,
+  LOCAL_PIPE_CONNECTION,
+  migrateLocalMachineStorage,
+  PENDING_LOCAL_MACHINE_NAME,
+} from './lib/local-machine.js';
 import { createForegroundResumeController } from './lib/resume.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
@@ -89,6 +97,14 @@ function createPersistentCache() {
 function safeLocalStorage() {
   try {
     return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function safeSessionStorage() {
+  try {
+    return window.sessionStorage;
   } catch {
     return null;
   }
@@ -1055,6 +1071,109 @@ function App() {
     }
   }, [link]);
 
+  const applyLocalNodeMigration = useCallback(
+    (realName) => {
+      if (!isRealMachineName(realName)) return;
+      migrateLocalMachineStorage(realName, {
+        localStorage: safeLocalStorage(),
+        sessionStorage: safeSessionStorage(),
+      });
+      capsStore.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      capsStore.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+      folderChanges.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      folderChanges.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+      thumbCache.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      thumbCache.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+
+      const cur = routeRef.current;
+      if (cur) {
+        let changed = false;
+        const nextRoute = { ...cur };
+        if (isLocalConnectionName(cur.machine) || isPendingLocalName(cur.machine)) {
+          nextRoute.machine = realName;
+          changed = true;
+        }
+        if (
+          cur.viewer &&
+          (isLocalConnectionName(cur.viewer.machine) || isPendingLocalName(cur.viewer.machine))
+        ) {
+          nextRoute.viewer = { ...cur.viewer, machine: realName };
+          changed = true;
+        }
+        if (
+          cur.section === 'settings' &&
+          cur.page === 'connections' &&
+          cur.sub === 'node' &&
+          (isLocalConnectionName(cur.item) || isPendingLocalName(cur.item))
+        ) {
+          nextRoute.item = realName;
+          changed = true;
+        }
+        if (changed) {
+          const nextHref = routeHref(nextRoute);
+          if (nextHref && nextHref !== window.location.hash) {
+            window.history.replaceState(window.history.state, '', nextHref);
+            lastHashRef.current = nextHref;
+          }
+          setRoute(nextRoute);
+        }
+      }
+    },
+    [capsStore, folderChanges, thumbCache],
+  );
+
+  const handleLocalNodeResolved = useCallback(
+    (realName) => {
+      if (!isRealMachineName(realName)) return;
+      if (typeof link.setLocalMachineName === 'function') {
+        link.setLocalMachineName(realName);
+      }
+      applyLocalNodeMigration(realName);
+      setLinkState((prev) => {
+        if (!prev || !Array.isArray(prev.nodes)) return prev;
+        const seen = new Set();
+        const nextNodes = [];
+        for (const n of prev.nodes) {
+          if (!n) continue;
+          const isLocalEntry =
+            n.isLocalComputer ||
+            n.nodeNamePending ||
+            isLocalConnectionName(n.node) ||
+            isPendingLocalName(n.node);
+          const nodeName = isLocalEntry ? realName : n.node;
+          if (!nodeName || seen.has(nodeName)) continue;
+          seen.add(nodeName);
+          if (isLocalEntry) {
+            nextNodes.push({
+              ...n,
+              node: realName,
+              isLocalComputer: true,
+              nodeNamePending: false,
+              reachable: true,
+              whoami: n.whoami ? { ...n.whoami, node: realName } : n.whoami,
+            });
+          } else {
+            nextNodes.push(n);
+          }
+        }
+        const nextState = { ...prev, nodes: nextNodes };
+        nodeInfoRef.current = nextNodes[0] || null;
+        return nextState;
+      });
+      capsStore
+        .ensure(realName)
+        .then((entry) => {
+          const toolList = entry?.tools;
+          if (Array.isArray(toolList) && toolList.length > 0 && nodeInfoRef.current?.node === realName) {
+            setTools(toolList);
+            sessionCache.set(`tools:${realName}`, toolList);
+          }
+        })
+        .catch(() => {});
+    },
+    [link, applyLocalNodeMigration, capsStore, sessionCache],
+  );
+
   const refreshFleet = useCallback(
     async (activeNodeInfo, options = {}) => {
       const targetNode = activeNodeInfo || nodeInfoRef.current;
@@ -1076,11 +1195,14 @@ function App() {
         await refreshFleetProgressive({
           link,
           localNode: targetNode.node,
+          isLocalComputer: Boolean(targetNode.isLocalComputer),
+          nodeNamePending: Boolean(targetNode.nodeNamePending),
           initialMachines: baseSnap?.machines || [],
           cachedAt: baseSnap?.cachedAt ?? null,
           forceOffline: Boolean(options.forceOffline),
           checkOffline: settingsRef.current.checkOffline !== false,
           signal: ctrl.signal,
+          onLocalNodeResolved: handleLocalNodeResolved,
           onUpdate(next) {
             if (ctrl.signal.aborted) return;
             setSnapshot(next);
@@ -1089,7 +1211,9 @@ function App() {
             if (ctrl.signal.aborted) return;
             if (link.kind !== 'mock') {
               const activeName = nodeInfoRef.current?.node || targetNode.node;
-              persistentCache.set('fleet', serializeFleetCache(activeName, finalSnap.machines));
+              if (isRealMachineName(activeName)) {
+                persistentCache.set('fleet', serializeFleetCache(activeName, finalSnap.machines));
+              }
             }
           },
         });
@@ -1103,7 +1227,7 @@ function App() {
         }
       }
     },
-    [link, persistentCache],
+    [link, persistentCache, handleLocalNodeResolved],
   );
 
   const handleAcceptIdentityChange = useCallback(
@@ -1139,6 +1263,9 @@ function App() {
         return;
       }
       const primary = nextState.nodes[0];
+      if (isRealMachineName(primary.node)) {
+        applyLocalNodeMigration(primary.node);
+      }
       let cachedSnap = null;
       if (typeof link.initialFleetCache === 'function') {
         cachedSnap = hydrateFleetCache(link.initialFleetCache(), primary.node);
@@ -1177,7 +1304,7 @@ function App() {
         checkUpdatesQuietly();
       }
     },
-    [link, capsStore, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
+    [link, capsStore, sessionCache, persistentCache, applyLocalNodeMigration, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
 
   // Feed fleet version/build/reachability into the per-machine capabilities store so build
@@ -1850,9 +1977,17 @@ function App() {
     inMachinePhone && route.tab === 'files' && Boolean(selectedMachine?.reachable);
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
+  const isWideSplitHost =
+    wide &&
+    (route.section === 'machines' ||
+      route.section === 'files' ||
+      route.section === 'activity' ||
+      route.section === 'settings' ||
+      (route.section === 'actions' && Boolean(route.allTools)));
+  const isWideSplitScreen = isWideSplitHost && !filesSelecting;
   const hasFilesDock =
     (route.section === 'files' &&
-      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch))) ||
+      (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)))) ||
     isPhoneMachineFiles;
   const hasDock = isActionsRoot || isPhoneCommand || hasFilesDock;
 
@@ -2109,6 +2244,10 @@ function App() {
   }
 
   function renderHeader() {
+    if (isWideSplitScreen) {
+      return null;
+    }
+
     // Files headers: selection mode, folder, search, sync, favourites, recent, and root.
     if (route.section === 'files') {
       if (filesSelecting) {
@@ -2542,6 +2681,7 @@ function App() {
     'app',
     !showBottomNav ? 'standalone' : '',
     hasDock ? 'docked' : '',
+    isWideSplitScreen ? 'split-screen' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -2610,9 +2750,9 @@ function App() {
                 <${ScrollContainer}
                   as="main"
                   containerRef=${mainRef}
-                  className=${isPhoneCommand ? 'main command-stream' : 'main'}
-                  onRefresh=${handlePullRefresh}
-                  disabled=${pullDisabled}
+                  className=${isPhoneCommand ? 'main command-stream' : isWideSplitHost ? 'main split-host' : 'main'}
+                  onRefresh=${isWideSplitHost ? null : handlePullRefresh}
+                  disabled=${pullDisabled || isWideSplitHost}
                   onTouchStart=${onMainTouchStart}
                   onTouchEnd=${onMainTouchEnd}
                   onTouchCancel=${onMainTouchCancel}

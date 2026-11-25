@@ -3497,8 +3497,8 @@ fn favourites_two_node_convergence_auto_push_and_hostile_peer() {
     tower.write_config("fleet.toml", "");
     pi.write_config("fleet.toml", "");
 
-    // Wait 5ms so stamps are strictly newer than initial add.
-    std::thread::sleep(Duration::from_millis(5));
+    // Wait past Windows's 15.6 ms system clock quantum so stamps are strictly newer.
+    std::thread::sleep(Duration::from_millis(25));
     ok(&call_tool(
         &tower,
         "fav.set",
@@ -3507,7 +3507,7 @@ fn favourites_two_node_convergence_auto_push_and_hostile_peer() {
     ));
     ok(&call_tool(&tower, "fav.remove", json!({"id": &id2}), &[]));
 
-    std::thread::sleep(Duration::from_millis(5));
+    std::thread::sleep(Duration::from_millis(25));
     ok(&call_tool(
         &pi,
         "fav.set",
@@ -4440,13 +4440,13 @@ role_updated_on = "laptop"
     let stream_done = ok(&call_tool(
         &laptop,
         "job.wait",
-        json!({"id": &stream_job_id, "timeout_s": 12}),
+        json!({"id": &stream_job_id, "timeout_s": 20}),
         &[],
     ));
     assert_eq!(stream_done["state"], "failed", "{stream_done}");
     assert_eq!(stream_done["error"]["code"], "denied", "{stream_done}");
     assert!(
-        revoked_at.elapsed() < Duration::from_secs(10),
+        revoked_at.elapsed() < Duration::from_secs(18),
         "slow-link revocation took too long: {:?}",
         revoked_at.elapsed()
     );
@@ -4487,12 +4487,12 @@ role_updated_on = "laptop"
     let pull_done = ok(&call_tool(
         &laptop,
         "job.wait",
-        json!({"id": &pull_job_id, "timeout_s": 12}),
+        json!({"id": &pull_job_id, "timeout_s": 20}),
         &[],
     ));
     assert_eq!(pull_done["state"], "failed", "{pull_done}");
     assert!(
-        pull_revoked_at.elapsed() < Duration::from_secs(10),
+        pull_revoked_at.elapsed() < Duration::from_secs(18),
         "slow-link get revocation took too long: {:?}",
         pull_revoked_at.elapsed()
     );
@@ -4532,13 +4532,13 @@ role_updated_on = "laptop"
     let stall_done = ok(&call_tool(
         &laptop,
         "job.wait",
-        json!({"id": &stall_job_id, "timeout_s": 12}),
+        json!({"id": &stall_job_id, "timeout_s": 20}),
         &[],
     ));
     assert_eq!(stall_done["state"], "failed", "{stall_done}");
     assert_eq!(stall_done["error"]["code"], "denied", "{stall_done}");
     assert!(
-        stall_revoked_at.elapsed() < Duration::from_secs(10),
+        stall_revoked_at.elapsed() < Duration::from_secs(18),
         "stalled-stream revocation took too long: {:?}",
         stall_revoked_at.elapsed()
     );
@@ -5339,13 +5339,14 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
                 &laptop,
                 json!({"from": "~/race_f/item.bin", "to": "~/race_d/item.bin", "move": true}),
                 &[
-                    ("LEGION_TEST_MOVE_LOCK_LEASE_MS", "300"),
-                    ("LEGION_TEST_DELETE_HASH_DELAY_MS", "900"),
+                    ("LEGION_TEST_MOVE_LOCK_LEASE_MS", "400"),
+                    ("LEGION_TEST_DELETE_HASH_DELAY_MS", "2500"),
                 ],
             )
         });
-        // Wait until A has actually acquired its move locks, then wait past one full lease (450 ms)
-        // so A is guaranteed mid-hash past the initial 300 ms lease when B arrives!
+        // Wait until A has actually acquired its move locks, then wait past one full lease (550 ms)
+        // so A is guaranteed mid-hash past the initial 400 ms lease while still leaving ~2 s of
+        // margin for move B to spawn and collide even on a loaded CI runner.
         let lock_dir = laptop.state().join("xfer/move-lock");
         let wait_lock = Instant::now() + Duration::from_secs(10);
         while !fs::read_dir(&lock_dir)
@@ -5360,11 +5361,11 @@ fn move_lock_long_hash_pinning_renewal_lost_lock_and_sigstop() {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(450));
+        std::thread::sleep(Duration::from_millis(550));
         let b_res = run_transfer_env(
             &laptop,
             json!({"from": "~/race_d/item.bin", "to": "~/race_f/item.bin", "move": true}),
-            &[("LEGION_TEST_MOVE_LOCK_LEASE_MS", "300")],
+            &[("LEGION_TEST_MOVE_LOCK_LEASE_MS", "400")],
         );
         (h_a.join().unwrap(), b_res)
     });

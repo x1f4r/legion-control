@@ -94,5 +94,38 @@ export function createThumbCache({ maxEntries = 180, maxBytes = 4 * 1024 * 1024,
       entries.clear();
       totalBytes = 0;
     },
+
+    renameMachine(fromName, toName) {
+      if (!fromName || !toName || fromName === toName) return false;
+      const fromPrefix = `${fromName}\0`;
+      const toPrefix = `${toName}\0`;
+      let moved = false;
+      const snapshot = Array.from(entries.entries());
+      for (const [key, val] of snapshot) {
+        if (!key.startsWith(fromPrefix)) continue;
+        const nextKey = toPrefix + key.slice(fromPrefix.length);
+        entries.delete(key);
+        totalBytes = Math.max(0, totalBytes - estimateBytes(val));
+        if (!entries.has(nextKey)) {
+          entries.set(nextKey, val);
+          totalBytes += estimateBytes(val);
+        }
+        if (storage && typeof storage.removeItem === 'function') {
+          try {
+            if (typeof storage.getItem === 'function' && storage.getItem(STORAGE_PREFIX + nextKey) == null) {
+              const raw = storage.getItem(STORAGE_PREFIX + key);
+              if (raw != null && typeof storage.setItem === 'function') {
+                storage.setItem(STORAGE_PREFIX + nextKey, raw);
+              }
+            }
+            storage.removeItem(STORAGE_PREFIX + key);
+          } catch {
+            // Ignore storage migration errors.
+          }
+        }
+        moved = true;
+      }
+      return moved;
+    },
   };
 }
