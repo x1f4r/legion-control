@@ -91,6 +91,11 @@ pub struct ContentRequest {
     pub principal: String,
     /// Door through which the request arrived, recorded in the audit log.
     pub door: Door,
+    /// Whether `open_content` should write an immediate `content.read` audit line.
+    ///
+    /// Doors that coalesce audit entries per ticket (such as `legion serve`) set this to `false`
+    /// and record their own coalesced `content.ticket` / `content.read` entries.
+    pub audit: bool,
     /// Cancelled when the caller disconnects or the server shuts down.
     pub cancel: CancellationToken,
 }
@@ -107,6 +112,10 @@ pub struct OpenedContent {
     pub mtime_secs: i64,
     /// File modification time: sub-second nanoseconds (`0..1_000_000_000`).
     pub mtime_nanos: u32,
+    /// Opaque file identity (a hash of `(dev, ino)` on Unix, `None` elsewhere) folded into strong
+    /// `ETag` values so replacing a file with identical size and timestamp invalidates cached
+    /// ranges.
+    pub file_id: Option<u64>,
     /// Async byte reader yielding `length` bytes with backpressure.
     pub reader: Box<dyn AsyncRead + Send + Unpin>,
 }
@@ -206,27 +215,29 @@ pub async fn open_local_content(
         "length": req.length,
     });
     let outcome = open_local_content_inner(node, &here, req).await;
-    let audit_result = match &outcome {
-        Ok(_) => Ok(Value::Null),
-        Err(ContentError::OutOfRange { size }) => Err(ErrorBody::new(
-            ErrorCode::Conflict,
-            format!(
-                "{} cannot be read at byte {}: there are {size} bytes.",
-                req.path, req.offset
-            ),
-        )),
-        Err(ContentError::Error(err)) => Err(err.clone()),
-    };
-    node.record_audit(
-        here,
-        Some(req.principal.clone()),
-        req.door,
-        "content.read".to_owned(),
-        &args,
-        started,
-        &audit_result,
-    )
-    .await;
+    if req.audit {
+        let audit_result = match &outcome {
+            Ok(_) => Ok(Value::Null),
+            Err(ContentError::OutOfRange { size }) => Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                format!(
+                    "{} cannot be read at byte {}: there are {size} bytes.",
+                    req.path, req.offset
+                ),
+            )),
+            Err(ContentError::Error(err)) => Err(err.clone()),
+        };
+        node.record_audit(
+            here,
+            Some(req.principal.clone()),
+            req.door,
+            "content.read".to_owned(),
+            &args,
+            started,
+            &audit_result,
+        )
+        .await;
+    }
     outcome
 }
 
@@ -263,18 +274,15 @@ async fn open_local_content_inner(
                 _ => ErrorCode::Failed,
             };
             ContentError::Error(
-                ErrorBody::new(
-                    code,
-                    format!("Could not open {}: {err}.", resolved.display()),
-                )
-                .with_machine(&here_owned),
+                ErrorBody::new(code, format!("Could not open the requested file: {err}."))
+                    .with_machine(&here_owned),
             )
         })?;
         let meta = file.metadata().map_err(|err| {
             ContentError::Error(
                 ErrorBody::new(
                     ErrorCode::Failed,
-                    format!("Could not inspect {}: {err}.", resolved.display()),
+                    format!("Could not inspect the requested file: {err}."),
                 )
                 .with_machine(&here_owned),
             )
@@ -283,7 +291,7 @@ async fn open_local_content_inner(
             return Err(ContentError::Error(
                 ErrorBody::new(
                     ErrorCode::Conflict,
-                    format!("{} is not a regular file.", resolved.display()),
+                    "The requested path is not a regular file.",
                 )
                 .with_hint("Name a regular file rather than a directory or special file.")
                 .with_machine(&here_owned),
@@ -300,7 +308,7 @@ async fn open_local_content_inner(
                 ContentError::Error(
                     ErrorBody::new(
                         ErrorCode::Failed,
-                        format!("Could not seek {}: {err}.", resolved.display()),
+                        format!("Could not seek the requested file: {err}."),
                     )
                     .with_machine(&here_owned),
                 )
@@ -310,7 +318,8 @@ async fn open_local_content_inner(
             .modified()
             .ok()
             .map_or((0, 0), system_time_to_unix_pair);
-        Ok((file, size, actual_length, mtime_secs, mtime_nanos))
+        let file_id = metadata_file_id(&meta);
+        Ok((file, size, actual_length, mtime_secs, mtime_nanos, file_id))
     })
     .await
     .map_err(|err| {
@@ -323,7 +332,7 @@ async fn open_local_content_inner(
         )
     })??;
 
-    let (file, size, actual_length, mtime_secs, mtime_nanos) = opened;
+    let (file, size, actual_length, mtime_secs, mtime_nanos, file_id) = opened;
     let reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(LocalFileReader {
         file: tokio::fs::File::from_std(file),
         remaining: actual_length,
@@ -335,8 +344,26 @@ async fn open_local_content_inner(
         length: actual_length,
         mtime_secs,
         mtime_nanos,
+        file_id,
         reader,
     })
+}
+
+#[cfg(unix)]
+fn metadata_file_id(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut input = [0u8; 16];
+    input[..8].copy_from_slice(&meta.dev().to_le_bytes());
+    input[8..].copy_from_slice(&meta.ino().to_le_bytes());
+    let digest = blake3::hash(&input);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest.as_bytes()[..8]);
+    Some(u64::from_le_bytes(out))
+}
+
+#[cfg(not(unix))]
+fn metadata_file_id(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
 }
 
 fn system_time_to_unix_pair(time: SystemTime) -> (i64, u32) {

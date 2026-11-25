@@ -30,6 +30,18 @@ use crate::state::StateStore;
 /// Maximum number of new remote connections opened concurrently during a fan-out or ping.
 const MAX_CONCURRENT_CONNECTS: usize = 8;
 
+/// Maximum concurrent `legion stream` channels (active + idle) per target machine.
+///
+/// Kept strictly below OpenSSH's default `MaxSessions` of 10 so multiplexed connections always
+/// keep room for the persistent `legion rpc` session and never trip `MaxSessions`.
+const MAX_STREAMS_PER_TARGET: usize = 8;
+
+/// Maximum idle `keep_open` `legion stream` pipes kept warm per target machine.
+const MAX_IDLE_CONTENT_PIPES: usize = 4;
+
+/// How long an idle `keep_open` `legion stream` pipe stays warm before being dropped.
+const IDLE_CONTENT_PIPE_TTL: Duration = Duration::from_secs(60);
+
 /// Default connect timeout for a single-system machine.
 const SINGLE_SYSTEM_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -76,6 +88,7 @@ struct PoolInner {
     slots: Mutex<HashMap<String, Arc<MachineSlot>>>,
     connect_permits: Arc<Semaphore>,
     state: StateStore,
+    mux: ControlMux,
     /// Bumped on [`Fleet::close`] so an in-flight connect started before shutdown never installs a
     /// session afterwards.
     generation: AtomicU64,
@@ -85,6 +98,147 @@ struct MachineSlot {
     /// Serializes opening a new session for this machine so concurrent first calls share one.
     open_lock: tokio::sync::Mutex<()>,
     current: Mutex<Option<LiveEntry>>,
+    /// Caps concurrent `legion stream` pipes (both active and idle) to this machine below
+    /// OpenSSH's default `MaxSessions` of 10.
+    stream_permits: Arc<Semaphore>,
+    /// Warm `keep_open` `legion stream` pipes ready for immediate reuse by content range reads.
+    idle_streams: Mutex<Vec<IdleContentPipe>>,
+}
+
+struct IdleContentPipe {
+    stdin: tokio::process::ChildStdin,
+    reader: tokio::io::BufReader<tokio::process::ChildStdout>,
+    handle: crate::connector::PipeHandle,
+    stderr: Arc<crate::connector::StderrTail>,
+    systems_fingerprint: Vec<ResolvedSystem>,
+    last_used: Instant,
+}
+
+#[cfg(unix)]
+struct ControlMux {
+    dir: Mutex<Option<std::path::PathBuf>>,
+    sockets: Mutex<HashMap<String, Vec<(String, std::path::PathBuf)>>>,
+}
+
+#[cfg(not(unix))]
+struct ControlMux;
+
+#[cfg(unix)]
+impl ControlMux {
+    fn new() -> Self {
+        Self {
+            dir: Mutex::new(None),
+            sockets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn control_path(&self, machine: &str, target: &str) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
+
+        let dir = {
+            let mut guard = self.dir.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = guard.as_ref() {
+                existing.clone()
+            } else {
+                let base = {
+                    let tmp = std::env::temp_dir();
+                    if tmp.to_string_lossy().len() <= 40 {
+                        tmp
+                    } else {
+                        std::path::PathBuf::from("/tmp")
+                    }
+                };
+                let seq = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+                let path = base.join(format!("lgn-{}-{seq}", std::process::id()));
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                if builder.create(&path).is_err() && !path.is_dir() {
+                    return None;
+                }
+                *guard = Some(path.clone());
+                path
+            }
+        };
+
+        let hash = fnv1a64(target.as_bytes());
+        let sock = dir.join(format!("{hash:016x}.ctl"));
+        if sock.to_string_lossy().len() >= 96 {
+            return None;
+        }
+        let mut sockets = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+        let list = sockets.entry(machine.to_owned()).or_default();
+        if !list.iter().any(|(_, existing)| existing == &sock) {
+            list.push((target.to_owned(), sock.clone()));
+        }
+        Some(sock)
+    }
+
+    async fn close_machine(&self, machine: &str) {
+        let removed = self
+            .sockets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(machine)
+            .unwrap_or_default();
+        for (target, sock) in removed {
+            crate::connector::close_ssh_control_master(&target, &sock).await;
+        }
+    }
+
+    async fn close_all(&self) {
+        let all: Vec<(String, std::path::PathBuf)> = {
+            let mut guard = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+            guard.drain().flat_map(|(_, v)| v).collect()
+        };
+        for (target, sock) in all {
+            crate::connector::close_ssh_control_master(&target, &sock).await;
+        }
+        if let Some(dir) = self.dir.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ControlMux {
+    fn drop(&mut self) {
+        let all: Vec<(String, std::path::PathBuf)> = {
+            let mut guard = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+            guard.drain().flat_map(|(_, v)| v).collect()
+        };
+        for (target, sock) in all {
+            crate::connector::close_ssh_control_master_sync(&target, &sock);
+        }
+        if let Some(dir) = self.dir.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(not(unix))]
+impl ControlMux {
+    fn new() -> Self {
+        Self
+    }
+
+    fn control_path(&self, _machine: &str, _target: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    async fn close_machine(&self, _machine: &str) {}
+
+    async fn close_all(&self) {}
 }
 
 #[derive(Clone)]
@@ -105,6 +259,7 @@ impl Fleet {
                 slots: Mutex::new(HashMap::new()),
                 connect_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS)),
                 state: StateStore::new(paths.state_dir()),
+                mux: ControlMux::new(),
                 generation: AtomicU64::new(0),
             }),
         }
@@ -441,6 +596,28 @@ impl Fleet {
             (live.active_system, live.active_os)
         };
 
+        // If this is a stream pipe and all per-target permits are occupied, evict one idle
+        // content pipe first so idle keep-alive streams never starve a new stream or fs.transfer.
+        let stream_permit = if subcommand == Subcommand::Stream {
+            if slot.stream_permits.available_permits() == 0 {
+                let evicted = {
+                    let mut idle = slot
+                        .idle_streams
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if idle.is_empty() {
+                        None
+                    } else {
+                        Some(idle.remove(0))
+                    }
+                };
+                drop(evicted);
+            }
+            Some(acquire_stream_permit(&slot.stream_permits, machine, &cancel).await?)
+        } else {
+            None
+        };
+
         let _permit = acquire_connect_permit(&self.inner.connect_permits, machine, &cancel).await?;
         let pipe = match &system.transport {
             Transport::Command { argv } => Pipe::spawn_command(argv, subcommand),
@@ -448,17 +625,23 @@ impl Fleet {
                 target, program, ..
             } => {
                 let os = resolved_os.unwrap_or(RemoteOs::Unix);
-                Pipe::spawn_ssh(
+                let control = self.inner.mux.control_path(machine, target);
+                Pipe::spawn_ssh_with_control(
                     target,
                     os,
                     subcommand,
                     program.as_deref(),
                     SINGLE_SYSTEM_TIMEOUT,
+                    control.as_deref(),
                 )
             }
         }
         .map_err(|err| err.with_machine(machine))?;
 
+        let pipe = match stream_permit {
+            Some(permit) => pipe.with_permit(permit),
+            None => pipe,
+        };
         Ok(pipe)
     }
 
@@ -719,7 +902,8 @@ impl Fleet {
         }
     }
 
-    /// Closes and removes any cached session for `machine`, e.g. after editing `fleet.toml`.
+    /// Closes and removes any cached session and idle stream pipes for `machine`, e.g. after
+    /// editing `fleet.toml`.
     pub async fn evict(&self, machine: &str) {
         let removed = {
             let mut slots = self
@@ -730,6 +914,18 @@ impl Fleet {
             slots.remove(machine)
         };
         if let Some(slot) = removed {
+            let idle: Vec<IdleContentPipe> = {
+                let mut guard = slot
+                    .idle_streams
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            for pipe in idle {
+                drop(pipe.stdin);
+                drop(pipe.reader);
+                pipe.handle.close(Duration::from_secs(1)).await;
+            }
             let session = slot
                 .current
                 .lock()
@@ -739,9 +935,11 @@ impl Fleet {
                 live.session.close().await;
             }
         }
+        self.inner.mux.close_machine(machine).await;
     }
 
-    /// Closes every open session cleanly (EOF on stdin, short wait, then kill).
+    /// Closes every open session, idle stream pipe, and SSH control master cleanly (EOF on stdin,
+    /// short wait, then kill).
     pub async fn close(&self) {
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
         let slots: Vec<Arc<MachineSlot>> = {
@@ -754,6 +952,20 @@ impl Fleet {
         };
         let mut closing = JoinSet::new();
         for slot in slots {
+            let idle: Vec<IdleContentPipe> = {
+                let mut guard = slot
+                    .idle_streams
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            for pipe in idle {
+                closing.spawn(async move {
+                    drop(pipe.stdin);
+                    drop(pipe.reader);
+                    pipe.handle.close(Duration::from_secs(1)).await;
+                });
+            }
             let live = slot
                 .current
                 .lock()
@@ -766,6 +978,7 @@ impl Fleet {
             }
         }
         while closing.join_next().await.is_some() {}
+        self.inner.mux.close_all().await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1234,12 +1447,14 @@ impl Fleet {
                 };
                 let mut last_err = None;
                 for (index, candidate_os) in attempts.iter().copied().enumerate() {
-                    let pipe = Pipe::spawn_ssh(
+                    let control = self.inner.mux.control_path(machine, target);
+                    let pipe = Pipe::spawn_ssh_with_control(
                         target,
                         candidate_os,
                         Subcommand::Rpc,
                         program.as_deref(),
                         timeout,
+                        control.as_deref(),
                     )
                     .map_err(|err| OpenError::Unreachable {
                         error: err.with_machine(machine),
@@ -1319,6 +1534,8 @@ impl Fleet {
             Arc::new(MachineSlot {
                 open_lock: tokio::sync::Mutex::new(()),
                 current: Mutex::new(None),
+                stream_permits: Arc::new(Semaphore::new(MAX_STREAMS_PER_TARGET)),
+                idle_streams: Mutex::new(Vec::new()),
             })
         }))
     }
@@ -1618,6 +1835,13 @@ impl Drop for PoolInner {
             .map(|(_, slot)| slot)
             .collect();
         for slot in slots {
+            let idle = std::mem::take(
+                &mut *slot
+                    .idle_streams
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            drop(idle);
             let live = slot
                 .current
                 .lock()
@@ -1750,27 +1974,29 @@ impl Router for Fleet {
                         "length": req.length,
                     });
                     let outcome = self.open_remote_content(node, &here, machine, &req).await;
-                    let audit_result = match &outcome {
-                        Ok(_) => Ok(Value::Null),
-                        Err(ContentError::OutOfRange { size }) => Err(ErrorBody::new(
-                            ErrorCode::Conflict,
-                            format!(
-                                "{} on {machine} cannot be read at byte {}: there are {size} bytes.",
-                                req.path, req.offset
-                            ),
-                        )),
-                        Err(ContentError::Error(err)) => Err(err.clone()),
-                    };
-                    node.record_audit(
-                        machine.to_owned(),
-                        Some(req.principal.clone()),
-                        req.door,
-                        "content.read".to_owned(),
-                        &args,
-                        started,
-                        &audit_result,
-                    )
-                    .await;
+                    if req.audit {
+                        let audit_result = match &outcome {
+                            Ok(_) => Ok(Value::Null),
+                            Err(ContentError::OutOfRange { size }) => Err(ErrorBody::new(
+                                ErrorCode::Conflict,
+                                format!(
+                                    "{} on {machine} cannot be read at byte {}: there are {size} bytes.",
+                                    req.path, req.offset
+                                ),
+                            )),
+                            Err(ContentError::Error(err)) => Err(err.clone()),
+                        };
+                        node.record_audit(
+                            machine.to_owned(),
+                            Some(req.principal.clone()),
+                            req.door,
+                            "content.read".to_owned(),
+                            &args,
+                            started,
+                            &audit_result,
+                        )
+                        .await;
+                    }
                     outcome
                 }
             }
@@ -1786,60 +2012,213 @@ impl Fleet {
         machine: &str,
         req: &ContentRequest,
     ) -> Result<OpenedContent, ContentError> {
-        use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
+        use tokio::io::{
+            AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf,
+        };
 
         const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
         const MAX_REPLY_LINE: usize = 1024 * 1024;
+        const MAX_DONE_LINE: usize = 256;
         const MAX_NOISE_LINES: usize = 64;
         const MAX_NOISE_BYTES: usize = 64 * 1024;
         const STREAM_BUF: usize = 64 * 1024;
 
-        struct RemoteContentReader {
+        enum ReaderPhase {
+            Data { remaining: u64 },
+            DoneTrailer { line: Vec<u8> },
+            CheckEof,
+            Finished,
+        }
+
+        struct RemotePipeParts {
+            stdin: tokio::process::ChildStdin,
             reader: BufReader<tokio::process::ChildStdout>,
-            _stdin: tokio::process::ChildStdin,
-            _handle: crate::connector::PipeHandle,
-            remaining: u64,
+            handle: crate::connector::PipeHandle,
+            stderr: Arc<crate::connector::StderrTail>,
+            systems_fingerprint: Vec<ResolvedSystem>,
+        }
+
+        struct RemoteContentReader {
+            parts: Option<RemotePipeParts>,
+            slot: Arc<MachineSlot>,
+            keep_open: bool,
+            phase: ReaderPhase,
             cancel: CancellationToken,
+        }
+
+        impl RemoteContentReader {
+            fn recycle(&mut self) {
+                if let Some(parts) = self.parts.take() {
+                    return_idle_pipe(
+                        &self.slot,
+                        IdleContentPipe {
+                            stdin: parts.stdin,
+                            reader: parts.reader,
+                            handle: parts.handle,
+                            stderr: parts.stderr,
+                            systems_fingerprint: parts.systems_fingerprint,
+                            last_used: Instant::now(),
+                        },
+                    );
+                }
+            }
         }
 
         impl AsyncRead for RemoteContentReader {
             fn poll_read(
-                mut self: std::pin::Pin<&mut Self>,
+                self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
                 buf: &mut ReadBuf<'_>,
             ) -> std::task::Poll<std::io::Result<()>> {
-                if self.cancel.is_cancelled() {
+                let this = self.get_mut();
+                if this.cancel.is_cancelled() {
+                    this.parts = None;
+                    this.phase = ReaderPhase::Finished;
                     return std::task::Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "content stream was cancelled",
                     )));
                 }
-                if self.remaining == 0 || buf.remaining() == 0 {
-                    return std::task::Poll::Ready(Ok(()));
-                }
-                let max_read = usize::try_from(self.remaining)
-                    .unwrap_or(usize::MAX)
-                    .min(buf.remaining());
-                let slice = buf.initialize_unfilled_to(max_read);
-                let mut sub = ReadBuf::new(slice);
-                match std::pin::Pin::new(&mut self.reader).poll_read(cx, &mut sub) {
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                    std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
-                    std::task::Poll::Ready(Ok(())) => {
-                        let n = sub.filled().len();
-                        buf.advance(n);
-                        if n == 0 {
-                            let missing = self.remaining;
-                            self.remaining = 0;
-                            return std::task::Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                format!(
-                                    "remote content stream ended with {missing} bytes remaining"
-                                ),
-                            )));
+                loop {
+                    match &mut this.phase {
+                        ReaderPhase::Finished => return std::task::Poll::Ready(Ok(())),
+                        ReaderPhase::Data { remaining } => {
+                            if *remaining == 0 {
+                                this.phase = if this.keep_open {
+                                    ReaderPhase::DoneTrailer {
+                                        line: Vec::with_capacity(32),
+                                    }
+                                } else {
+                                    ReaderPhase::CheckEof
+                                };
+                                continue;
+                            }
+                            if buf.remaining() == 0 {
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            let Some(parts) = this.parts.as_mut() else {
+                                this.phase = ReaderPhase::Finished;
+                                return std::task::Poll::Ready(Ok(()));
+                            };
+                            let max_read = usize::try_from(*remaining)
+                                .unwrap_or(usize::MAX)
+                                .min(buf.remaining());
+                            match std::pin::Pin::new(&mut parts.reader).poll_fill_buf(cx) {
+                                std::task::Poll::Pending => return std::task::Poll::Pending,
+                                std::task::Poll::Ready(Err(err)) => {
+                                    this.parts = None;
+                                    this.phase = ReaderPhase::Finished;
+                                    return std::task::Poll::Ready(Err(err));
+                                }
+                                std::task::Poll::Ready(Ok(avail)) => {
+                                    if avail.is_empty() {
+                                        let missing = *remaining;
+                                        this.parts = None;
+                                        this.phase = ReaderPhase::Finished;
+                                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            format!(
+                                                "remote content stream ended with {missing} bytes remaining"
+                                            ),
+                                        )));
+                                    }
+                                    let take = avail.len().min(max_read);
+                                    buf.put_slice(&avail[..take]);
+                                    std::pin::Pin::new(&mut parts.reader).consume(take);
+                                    *remaining -= take as u64;
+                                    return std::task::Poll::Ready(Ok(()));
+                                }
+                            }
                         }
-                        self.remaining -= n as u64;
-                        std::task::Poll::Ready(Ok(()))
+                        ReaderPhase::DoneTrailer { line } => {
+                            let Some(parts) = this.parts.as_mut() else {
+                                this.phase = ReaderPhase::Finished;
+                                return std::task::Poll::Ready(Ok(()));
+                            };
+                            match std::pin::Pin::new(&mut parts.reader).poll_fill_buf(cx) {
+                                std::task::Poll::Pending => return std::task::Poll::Pending,
+                                std::task::Poll::Ready(Err(err)) => {
+                                    this.parts = None;
+                                    this.phase = ReaderPhase::Finished;
+                                    return std::task::Poll::Ready(Err(err));
+                                }
+                                std::task::Poll::Ready(Ok(avail)) => {
+                                    if avail.is_empty() {
+                                        this.parts = None;
+                                        this.phase = ReaderPhase::Finished;
+                                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::UnexpectedEof,
+                                            "remote content stream closed before done frame",
+                                        )));
+                                    }
+                                    if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                                        let take = pos + 1;
+                                        if line.len() + take > MAX_DONE_LINE {
+                                            this.parts = None;
+                                            this.phase = ReaderPhase::Finished;
+                                            return std::task::Poll::Ready(Err(
+                                                std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    "remote content stream sent extra data instead of done frame",
+                                                ),
+                                            ));
+                                        }
+                                        line.extend_from_slice(&avail[..take]);
+                                        std::pin::Pin::new(&mut parts.reader).consume(take);
+                                        if !is_done_frame(line) {
+                                            this.parts = None;
+                                            this.phase = ReaderPhase::Finished;
+                                            return std::task::Poll::Ready(Err(
+                                                std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    "remote content stream sent an invalid done frame",
+                                                ),
+                                            ));
+                                        }
+                                        this.recycle();
+                                        this.phase = ReaderPhase::Finished;
+                                        return std::task::Poll::Ready(Ok(()));
+                                    }
+                                    let n = avail.len();
+                                    if line.len() + n > MAX_DONE_LINE {
+                                        this.parts = None;
+                                        this.phase = ReaderPhase::Finished;
+                                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "remote content stream sent extra bytes past declared length",
+                                        )));
+                                    }
+                                    line.extend_from_slice(avail);
+                                    std::pin::Pin::new(&mut parts.reader).consume(n);
+                                }
+                            }
+                        }
+                        ReaderPhase::CheckEof => {
+                            let Some(parts) = this.parts.as_mut() else {
+                                this.phase = ReaderPhase::Finished;
+                                return std::task::Poll::Ready(Ok(()));
+                            };
+                            match std::pin::Pin::new(&mut parts.reader).poll_fill_buf(cx) {
+                                std::task::Poll::Pending => return std::task::Poll::Pending,
+                                std::task::Poll::Ready(Err(err)) => {
+                                    this.parts = None;
+                                    this.phase = ReaderPhase::Finished;
+                                    return std::task::Poll::Ready(Err(err));
+                                }
+                                std::task::Poll::Ready(Ok(avail)) => {
+                                    let extra = !avail.is_empty();
+                                    this.parts = None;
+                                    this.phase = ReaderPhase::Finished;
+                                    if extra {
+                                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "remote content stream sent extra bytes past declared length",
+                                        )));
+                                    }
+                                    return std::task::Poll::Ready(Ok(()));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1854,18 +2233,13 @@ impl Fleet {
             .authorize_name(&req.principal, "fs.read", Some(Effect::Read), node.paths())
             .map_err(|err| ContentError::Error(err.with_machine(here)))?;
 
-        let pipe = self
-            .open_pipe_for(
-                node.config(),
-                here,
-                machine,
-                Subcommand::Stream,
-                req.cancel.clone(),
-            )
-            .await
-            .map_err(ContentError::Error)?;
-        let stderr = pipe.stderr_tail().clone();
-        let (mut stdin, stdout, handle) = pipe.into_parts();
+        let fleet_file = node
+            .config()
+            .get::<FleetFile>()
+            .map_err(|err| ContentError::Error(ensure_machine(err, here)))?;
+        let entry = lookup_machine(&fleet_file, machine, here).map_err(ContentError::Error)?;
+        let systems_fingerprint = entry.resolved_systems();
+        let slot = self.slot(machine);
 
         let mut header = json!({
             "protocol": crate::stream::STREAM_PROTOCOL,
@@ -1873,6 +2247,7 @@ impl Fleet {
             "path": req.path,
             "offset": req.offset,
             "as": req.principal,
+            "keep_open": true,
         });
         if let Some(len) = req.length {
             header["length"] = json!(len);
@@ -1880,235 +2255,524 @@ impl Fleet {
         let mut line = header.to_string().into_bytes();
         line.push(b'\n');
 
-        let mut reader = BufReader::with_capacity(STREAM_BUF, stdout);
-        let handshake = async {
-            stdin.write_all(&line).await.map_err(|err| {
-                ContentError::Error(
-                    ErrorBody::new(
-                        ErrorCode::Unreachable,
-                        format!("Could not send stream get header to {machine}: {err}."),
-                    )
-                    .with_machine(machine),
-                )
-            })?;
-            stdin.flush().await.map_err(|err| {
-                ContentError::Error(
-                    ErrorBody::new(
-                        ErrorCode::Unreachable,
-                        format!("Could not flush stream get header to {machine}: {err}."),
-                    )
-                    .with_machine(machine),
-                )
-            })?;
-
-            let mut greeted = false;
-            let mut noise_lines = 0usize;
-            let mut noise_bytes = 0usize;
-            let mut reply_buf = Vec::new();
-            loop {
-                reply_buf.clear();
-                let mut total = 0usize;
-                loop {
-                    let available = reader.fill_buf().await.map_err(|err| {
-                        ContentError::Error(
-                            ErrorBody::new(
-                                ErrorCode::Unreachable,
-                                format!("Reading stream reply from {machine} failed: {err}."),
-                            )
-                            .with_machine(machine),
+        let mut tried_fresh = false;
+        loop {
+            let (mut stdin, mut reader, handle, stderr, reused) =
+                if let Some(idle) = pop_idle_pipe(&slot, &systems_fingerprint) {
+                    (idle.stdin, idle.reader, idle.handle, idle.stderr, true)
+                } else {
+                    tried_fresh = true;
+                    let pipe = self
+                        .open_pipe_for(
+                            node.config(),
+                            here,
+                            machine,
+                            Subcommand::Stream,
+                            req.cancel.clone(),
                         )
-                    })?;
-                    if available.is_empty() {
-                        break;
-                    }
-                    if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-                        let take = pos + 1;
-                        if total + take > MAX_REPLY_LINE {
-                            return Err(ContentError::Error(
+                        .await
+                        .map_err(ContentError::Error)?;
+                    let stderr = pipe.stderr_tail().clone();
+                    let (stdin, stdout, handle) = pipe.into_parts();
+                    (
+                        stdin,
+                        BufReader::with_capacity(STREAM_BUF, stdout),
+                        handle,
+                        stderr,
+                        false,
+                    )
+                };
+
+            enum HandshakeFailure {
+                BrokenPipe(ContentError),
+                ProtocolError(ContentError),
+            }
+
+            let handshake = async {
+                stdin.write_all(&line).await.map_err(|err| {
+                    HandshakeFailure::BrokenPipe(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("Could not send stream get header to {machine}: {err}."),
+                        )
+                        .with_machine(machine),
+                    ))
+                })?;
+                stdin.flush().await.map_err(|err| {
+                    HandshakeFailure::BrokenPipe(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("Could not flush stream get header to {machine}: {err}."),
+                        )
+                        .with_machine(machine),
+                    ))
+                })?;
+
+                let mut greeted = reused;
+                let mut noise_lines = 0usize;
+                let mut noise_bytes = 0usize;
+                let mut reply_buf = Vec::new();
+                loop {
+                    reply_buf.clear();
+                    let mut total = 0usize;
+                    loop {
+                        let available = reader.fill_buf().await.map_err(|err| {
+                            HandshakeFailure::BrokenPipe(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Unreachable,
+                                    format!("Reading stream reply from {machine} failed: {err}."),
+                                )
+                                .with_machine(machine),
+                            ))
+                        })?;
+                        if available.is_empty() {
+                            break;
+                        }
+                        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                            let take = pos + 1;
+                            if total + take > MAX_REPLY_LINE {
+                                return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                                    ErrorBody::new(
+                                        ErrorCode::Failed,
+                                        format!("{machine} sent an oversized stream reply line."),
+                                    )
+                                    .with_machine(machine),
+                                )));
+                            }
+                            reply_buf.extend_from_slice(&available[..take]);
+                            reader.consume(take);
+                            total += take;
+                            break;
+                        }
+                        let n = available.len();
+                        if total + n > MAX_REPLY_LINE {
+                            return Err(HandshakeFailure::ProtocolError(ContentError::Error(
                                 ErrorBody::new(
                                     ErrorCode::Failed,
                                     format!("{machine} sent an oversized stream reply line."),
                                 )
                                 .with_machine(machine),
-                            ));
+                            )));
                         }
-                        reply_buf.extend_from_slice(&available[..take]);
-                        reader.consume(take);
-                        total += take;
-                        break;
+                        reply_buf.extend_from_slice(available);
+                        reader.consume(n);
+                        total += n;
                     }
-                    let n = available.len();
-                    if total + n > MAX_REPLY_LINE {
-                        return Err(ContentError::Error(
+                    if total == 0 {
+                        let mut err = ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("The stream to {machine} closed before answering."),
+                        )
+                        .with_machine(machine);
+                        let text = stderr.text();
+                        if !text.is_empty() {
+                            err = err.with_hint(format!("Remote stderr: {text}"));
+                        }
+                        return Err(HandshakeFailure::BrokenPipe(ContentError::Error(err)));
+                    }
+
+                    if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&reply_buf) {
+                        if !greeted {
+                            if let Some(spoken) = fields.get("protocol") {
+                                if spoken.as_u64()
+                                    != Some(u64::from(crate::stream::STREAM_PROTOCOL))
+                                {
+                                    return Err(HandshakeFailure::ProtocolError(
+                                        ContentError::Error(
+                                            ErrorBody::new(
+                                                ErrorCode::Unsupported,
+                                                format!(
+                                                    "{machine} speaks stream protocol {spoken}, and this node speaks stream protocol {}.",
+                                                    crate::stream::STREAM_PROTOCOL
+                                                ),
+                                            )
+                                            .with_hint("Update legion on whichever machine is older.")
+                                            .with_machine(machine),
+                                        ),
+                                    ));
+                                }
+                                greeted = true;
+                                continue;
+                            }
+                        } else if fields.len() == 1
+                            && fields.get("busy") == Some(&Value::Bool(true))
+                        {
+                            continue;
+                        } else {
+                            if let Some(err_val) = fields.get("error")
+                                && let Ok(body) =
+                                    serde_json::from_value::<ErrorBody>(err_val.clone())
+                            {
+                                if body.code == ErrorCode::Conflict
+                                    && let Some(actual) = body
+                                        .details
+                                        .as_ref()
+                                        .and_then(|d| d.get("actual"))
+                                        .and_then(Value::as_u64)
+                                    && body
+                                        .details
+                                        .as_ref()
+                                        .and_then(|d| d.get("requested"))
+                                        .is_some()
+                                {
+                                    return Err(HandshakeFailure::ProtocolError(
+                                        ContentError::OutOfRange { size: actual },
+                                    ));
+                                }
+                                return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                                    body.with_machine(machine),
+                                )));
+                            }
+                            if let Ok(ready) = serde_json::from_value::<crate::stream::GetReady>(
+                                Value::Object(fields),
+                            ) {
+                                return Ok(ready);
+                            }
+                            return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Failed,
+                                    format!(
+                                        "{machine} answered stream get with an unexpected line."
+                                    ),
+                                )
+                                .with_machine(machine),
+                            )));
+                        }
+                    }
+                    if greeted {
+                        return Err(HandshakeFailure::ProtocolError(ContentError::Error(
                             ErrorBody::new(
                                 ErrorCode::Failed,
-                                format!("{machine} sent an oversized stream reply line."),
+                                format!("{machine} answered stream get with non-JSON output."),
                             )
                             .with_machine(machine),
-                        ));
+                        )));
                     }
-                    reply_buf.extend_from_slice(available);
-                    reader.consume(n);
-                    total += n;
-                }
-                if total == 0 {
-                    let mut err = ErrorBody::new(
-                        ErrorCode::Unreachable,
-                        format!("The stream to {machine} closed before answering."),
-                    )
-                    .with_machine(machine);
-                    let text = stderr.text();
-                    if !text.is_empty() {
-                        err = err.with_hint(format!("Remote stderr: {text}"));
+                    noise_lines += 1;
+                    noise_bytes += reply_buf.len();
+                    if noise_lines > MAX_NOISE_LINES || noise_bytes > MAX_NOISE_BYTES {
+                        return Err(HandshakeFailure::ProtocolError(ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Unreachable,
+                                format!(
+                                    "{machine} sent too much non-protocol output before starting legion stream."
+                                ),
+                            )
+                            .with_machine(machine),
+                        )));
                     }
-                    return Err(ContentError::Error(err));
                 }
+            };
 
-                if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&reply_buf) {
-                    if !greeted {
-                        if let Some(spoken) = fields.get("protocol") {
-                            if spoken.as_u64() != Some(u64::from(crate::stream::STREAM_PROTOCOL)) {
-                                return Err(ContentError::Error(
-                                    ErrorBody::new(
-                                        ErrorCode::Unsupported,
-                                        format!(
-                                            "{machine} speaks stream protocol {spoken}, and this node speaks stream protocol {}.",
-                                            crate::stream::STREAM_PROTOCOL
-                                        ),
-                                    )
-                                    .with_hint("Update legion on whichever machine is older.")
-                                    .with_machine(machine),
-                                ));
-                            }
-                            greeted = true;
+            let ready = tokio::select! {
+                biased;
+                () = req.cancel.cancelled() => {
+                    drop(stdin);
+                    drop(reader);
+                    handle.close(Duration::from_secs(1)).await;
+                    return Err(ContentError::Error(
+                        ErrorBody::new(
+                            ErrorCode::Cancelled,
+                            format!("Opening content on {machine} was cancelled."),
+                        )
+                        .with_machine(machine),
+                    ));
+                }
+                res = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake) => match res {
+                    Ok(Ok(ready)) => ready,
+                    Ok(Err(HandshakeFailure::BrokenPipe(err))) => {
+                        drop(stdin);
+                        drop(reader);
+                        handle.close(Duration::from_secs(1)).await;
+                        if reused && !tried_fresh {
                             continue;
                         }
-                    } else if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
-                        continue;
-                    } else {
-                        if let Some(err_val) = fields.get("error")
-                            && let Ok(body) = serde_json::from_value::<ErrorBody>(err_val.clone())
-                        {
-                            if body.code == ErrorCode::Conflict
-                                && let Some(actual) = body
-                                    .details
-                                    .as_ref()
-                                    .and_then(|d| d.get("actual"))
-                                    .and_then(Value::as_u64)
-                                && body
-                                    .details
-                                    .as_ref()
-                                    .and_then(|d| d.get("requested"))
-                                    .is_some()
-                            {
-                                return Err(ContentError::OutOfRange { size: actual });
-                            }
-                            return Err(ContentError::Error(body.with_machine(machine)));
+                        return Err(err);
+                    }
+                    Ok(Err(HandshakeFailure::ProtocolError(err))) => {
+                        if reused && matches!(err, ContentError::OutOfRange { .. }) {
+                            // Keep-open pipe stays healthy after a pre-body range error.
+                            return_idle_pipe(
+                                &slot,
+                                IdleContentPipe {
+                                    stdin,
+                                    reader,
+                                    handle,
+                                    stderr,
+                                    systems_fingerprint,
+                                    last_used: Instant::now(),
+                                },
+                            );
+                        } else {
+                            drop(stdin);
+                            drop(reader);
+                            handle.close(Duration::from_secs(1)).await;
                         }
-                        if let Ok(ready) =
-                            serde_json::from_value::<crate::stream::GetReady>(Value::Object(fields))
-                        {
-                            return Ok(ready);
-                        }
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        drop(stdin);
+                        drop(reader);
+                        handle.close(Duration::from_secs(1)).await;
                         return Err(ContentError::Error(
                             ErrorBody::new(
-                                ErrorCode::Failed,
-                                format!("{machine} answered stream get with an unexpected line."),
+                                ErrorCode::Timeout,
+                                format!("Timed out waiting for {machine} to answer stream get."),
                             )
                             .with_machine(machine),
                         ));
                     }
                 }
-                if greeted {
-                    return Err(ContentError::Error(
-                        ErrorBody::new(
-                            ErrorCode::Failed,
-                            format!("{machine} answered stream get with non-JSON output."),
-                        )
-                        .with_machine(machine),
-                    ));
-                }
-                noise_lines += 1;
-                noise_bytes += reply_buf.len();
-                if noise_lines > MAX_NOISE_LINES || noise_bytes > MAX_NOISE_BYTES {
-                    return Err(ContentError::Error(
-                        ErrorBody::new(
-                            ErrorCode::Unreachable,
-                            format!(
-                                "{machine} sent too much non-protocol output before starting legion stream."
-                            ),
-                        )
-                        .with_machine(machine),
-                    ));
-                }
-            }
-        };
+            };
 
-        let ready = tokio::select! {
-            biased;
-            () = req.cancel.cancelled() => {
+            let Some(mtime) = ready.mtime else {
                 drop(stdin);
                 drop(reader);
                 handle.close(Duration::from_secs(1)).await;
                 return Err(ContentError::Error(
                     ErrorBody::new(
-                        ErrorCode::Cancelled,
-                        format!("Opening content on {machine} was cancelled."),
+                        ErrorCode::Unsupported,
+                        format!(
+                            "{machine} answered stream get without modification time (older legion version)."
+                        ),
+                    )
+                    .with_hint(
+                        "Update legion on that machine so it supports random-access content reads.",
                     )
                     .with_machine(machine),
                 ));
+            };
+
+            if let Err(err) = validate_remote_get_ready(machine, req, &ready) {
+                drop(stdin);
+                drop(reader);
+                handle.close(Duration::from_secs(1)).await;
+                return Err(ContentError::Error(err));
             }
-            res = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake) => match res {
-                Ok(Ok(ready)) => ready,
-                Ok(Err(err)) => {
+
+            let keep_open = ready.keep_open == Some(true);
+
+            // Zero-length probe (HEAD, If-Range, POST /v1/content, or empty file): validate the
+            // trailer/EOF immediately so the warm keep_open pipe returns to the pool right away.
+            if ready.length == 0 {
+                if keep_open {
+                    let mut trailer = Vec::with_capacity(32);
+                    let mut bad = false;
+                    loop {
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.fill_buf()).await {
+                            Ok(Ok([])) | Ok(Err(_)) | Err(_) => {
+                                bad = true;
+                                break;
+                            }
+                            Ok(Ok(avail)) => {
+                                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                                    let take = pos + 1;
+                                    if trailer.len() + take > MAX_DONE_LINE {
+                                        bad = true;
+                                    } else {
+                                        trailer.extend_from_slice(&avail[..take]);
+                                        reader.consume(take);
+                                        if !is_done_frame(&trailer) {
+                                            bad = true;
+                                        }
+                                    }
+                                    break;
+                                }
+                                let n = avail.len();
+                                if trailer.len() + n > MAX_DONE_LINE {
+                                    bad = true;
+                                    break;
+                                }
+                                trailer.extend_from_slice(avail);
+                                reader.consume(n);
+                            }
+                        }
+                    }
+                    if bad {
+                        drop(stdin);
+                        drop(reader);
+                        handle.close(Duration::from_secs(1)).await;
+                        return Err(ContentError::Error(
+                            ErrorBody::new(
+                                ErrorCode::Failed,
+                                format!("{machine} sent an invalid stream done frame."),
+                            )
+                            .with_machine(machine),
+                        ));
+                    }
+                    return_idle_pipe(
+                        &slot,
+                        IdleContentPipe {
+                            stdin,
+                            reader,
+                            handle,
+                            stderr,
+                            systems_fingerprint,
+                            last_used: Instant::now(),
+                        },
+                    );
+                } else {
+                    match tokio::time::timeout(Duration::from_secs(5), reader.fill_buf()).await {
+                        Ok(Ok([])) => {}
+                        Ok(Ok(_)) => {
+                            drop(stdin);
+                            drop(reader);
+                            handle.close(Duration::from_secs(1)).await;
+                            return Err(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Failed,
+                                    format!(
+                                        "{machine} sent extra bytes after a zero-length stream get."
+                                    ),
+                                )
+                                .with_machine(machine),
+                            ));
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            drop(stdin);
+                            drop(reader);
+                            handle.close(Duration::from_secs(1)).await;
+                            return Err(ContentError::Error(
+                                ErrorBody::new(
+                                    ErrorCode::Failed,
+                                    format!(
+                                        "{machine} failed to finish a zero-length stream get cleanly."
+                                    ),
+                                )
+                                .with_machine(machine),
+                            ));
+                        }
+                    }
                     drop(stdin);
                     drop(reader);
                     handle.close(Duration::from_secs(1)).await;
-                    return Err(err);
                 }
-                Err(_) => {
-                    drop(stdin);
-                    drop(reader);
-                    handle.close(Duration::from_secs(1)).await;
-                    return Err(ContentError::Error(
-                        ErrorBody::new(
-                            ErrorCode::Timeout,
-                            format!("Timed out waiting for {machine} to answer stream get."),
-                        )
-                        .with_machine(machine),
-                    ));
-                }
+                return Ok(OpenedContent {
+                    size: ready.size,
+                    offset: ready.offset,
+                    length: 0,
+                    mtime_secs: mtime.secs,
+                    mtime_nanos: mtime.nanos,
+                    file_id: ready.file_id,
+                    reader: Box::new(tokio::io::empty()),
+                });
             }
-        };
 
-        let Some(mtime) = ready.mtime else {
-            drop(stdin);
-            drop(reader);
-            handle.close(Duration::from_secs(1)).await;
-            return Err(ContentError::Error(
-                ErrorBody::new(
-                    ErrorCode::Unsupported,
-                    format!("{machine} answered stream get without modification time (older legion version)."),
-                )
-                .with_hint("Update legion on that machine so it supports random-access content reads.")
-                .with_machine(machine),
-            ));
-        };
+            return Ok(OpenedContent {
+                size: ready.size,
+                offset: ready.offset,
+                length: ready.length,
+                mtime_secs: mtime.secs,
+                mtime_nanos: mtime.nanos,
+                file_id: ready.file_id,
+                reader: Box::new(RemoteContentReader {
+                    parts: Some(RemotePipeParts {
+                        stdin,
+                        reader,
+                        handle,
+                        stderr,
+                        systems_fingerprint,
+                    }),
+                    slot,
+                    keep_open,
+                    phase: ReaderPhase::Data {
+                        remaining: ready.length,
+                    },
+                    cancel: req.cancel.clone(),
+                }),
+            });
+        }
+    }
+}
 
-        Ok(OpenedContent {
-            size: ready.size,
-            offset: ready.offset,
-            length: ready.length,
-            mtime_secs: mtime.secs,
-            mtime_nanos: mtime.nanos,
-            reader: Box::new(RemoteContentReader {
-                reader,
-                _stdin: stdin,
-                _handle: handle,
-                remaining: ready.length,
-                cancel: req.cancel.clone(),
-            }),
-        })
+fn validate_remote_get_ready(
+    machine: &str,
+    req: &ContentRequest,
+    ready: &crate::stream::GetReady,
+) -> Result<(), ErrorBody> {
+    if ready.offset != req.offset || ready.offset > ready.size {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{machine} answered stream get with an invalid offset."),
+        )
+        .with_machine(machine));
+    }
+    let available = ready.size - ready.offset;
+    let expected_len = req.length.map_or(available, |n| n.min(available));
+    if ready.length != expected_len {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{machine} answered stream get with an unexpected byte length."),
+        )
+        .with_machine(machine));
+    }
+    if ready.length > 0 {
+        let valid_end = ready
+            .offset
+            .checked_add(ready.length)
+            .and_then(|s| s.checked_sub(1))
+            .is_some_and(|end| end < ready.size);
+        if !valid_end {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{machine} answered stream get with an overflowing byte range."),
+            )
+            .with_machine(machine));
+        }
+    }
+    Ok(())
+}
+
+fn is_done_frame(line: &[u8]) -> bool {
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+    map.len() == 1 && map.get("done") == Some(&Value::Bool(true))
+}
+
+fn pop_idle_pipe(slot: &MachineSlot, fingerprint: &[ResolvedSystem]) -> Option<IdleContentPipe> {
+    let mut idle = slot
+        .idle_streams
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    // Drop expired or config-stale idle pipes.
+    idle.retain(|pipe| {
+        now.saturating_duration_since(pipe.last_used) < IDLE_CONTENT_PIPE_TTL
+            && pipe.systems_fingerprint == fingerprint
+    });
+    idle.pop()
+}
+
+fn return_idle_pipe(slot: &MachineSlot, pipe: IdleContentPipe) {
+    let mut idle = slot
+        .idle_streams
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    idle.retain(|p| now.saturating_duration_since(p.last_used) < IDLE_CONTENT_PIPE_TTL);
+    if idle.len() >= MAX_IDLE_CONTENT_PIPES {
+        idle.remove(0);
+    }
+    idle.push(pipe);
+}
+
+async fn acquire_stream_permit(
+    permits: &Arc<Semaphore>,
+    machine: &str,
+    cancel: &CancellationToken,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ErrorBody> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!("Opening a stream to {machine} was cancelled."),
+        )
+        .with_machine(machine)),
+        permit = Arc::clone(permits).acquire_owned() => permit.map_err(|_| {
+            ErrorBody::new(ErrorCode::Internal, "Stream concurrency limiter closed.")
+                .with_machine(machine)
+        }),
     }
 }
 
@@ -2898,6 +3562,195 @@ device = \"{pad_id}\"
             err_tomb.code,
             ErrorCode::Denied,
             "tombstone-only devices.toml must pass expiring-credential forward guard: {err_tomb:?}"
+        );
+
+        fleet.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_content_rejects_lying_peer_and_queues_concurrent_streams_under_cap() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+
+        // 1. Misbehaving remote script that responds to `stream` with invalid length, wrong
+        //    offset, or extra bytes past declared length depending on requested path.
+        let lying_script = dir.path().join("lying-stream.sh");
+        std::fs::write(
+            &lying_script,
+            r#"#!/bin/sh
+if [ "$1" != "stream" ]; then
+  exit 1
+fi
+printf '{"protocol":1}\n'
+IFS= read -r req || exit 0
+case "$req" in
+  *wrong_offset*)
+    printf '{"size":100,"offset":5,"length":10,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    printf '0123456789'
+    ;;
+  *wrong_length*)
+    printf '{"size":100,"offset":0,"length":50,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    printf '0123456789'
+    ;;
+  *overflow*)
+    printf '{"size":18446744073709551615,"offset":10,"length":18446744073709551615,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    ;;
+  *extra_bytes*)
+    printf '{"size":10,"offset":0,"length":5,"mtime":{"secs":1700000000,"nanos":0},"keep_open":false}\n'
+    printf 'helloEXTRA_UNEXPECTED'
+    ;;
+  *bad_done*)
+    printf '{"size":10,"offset":0,"length":5,"mtime":{"secs":1700000000,"nanos":0},"keep_open":true}\n'
+    printf 'helloEXTRA_NOT_DONE\n'
+    ;;
+  *short_eof*)
+    printf '{"size":10,"offset":0,"length":10,"mtime":{"secs":1700000000,"nanos":0},"keep_open":true}\n'
+    printf '12345'
+    ;;
+  *)
+    printf '{"size":10,"offset":0,"length":10,"mtime":{"secs":1700000000,"nanos":0},"keep_open":true}\n'
+    printf '0123456789{"done":true}\n'
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        // 2. Slow-open remote script that records max concurrent active processes in a counter
+        //    file so we can prove 12 concurrent opens queue cleanly under MAX_STREAMS_PER_TARGET (8).
+        let active_dir = dir.path().join("active-streams");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        let max_file = dir.path().join("max-concurrent.txt");
+        let capped_script = dir.path().join("capped-stream.sh");
+        std::fs::write(
+            &capped_script,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" != "stream" ]; then
+  exit 1
+fi
+marker="{active}/$$"
+: > "$marker"
+count=$(ls -1 "{active}" | wc -l)
+printf '%s\n' "$count" >> "{max}"
+printf '{{"protocol":1}}\n'
+IFS= read -r _req || true
+sleep 0.15
+printf '{{"size":4,"offset":0,"length":4,"mtime":{{"secs":1700000000,"nanos":0}},"keep_open":false}}\n'
+printf 'OKAY'
+rm -f "$marker"
+"#,
+                active = active_dir.display(),
+                max = max_file.display(),
+            ),
+        )
+        .unwrap();
+
+        let fleet_toml = format!(
+            "[machines.liar]\ncommand = [\"/bin/sh\", {}, \"rpc\"]\n\
+             [machines.capped]\ncommand = [\"/bin/sh\", {}, \"rpc\"]\n",
+            serde_json::to_string(&lying_script.to_string_lossy().into_owned()).unwrap(),
+            serde_json::to_string(&capped_script.to_string_lossy().into_owned()).unwrap(),
+        );
+        std::fs::write(paths.config_file("fleet.toml"), fleet_toml).unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let fleet = Fleet::new(&paths);
+
+        let make_req =
+            |machine: &str, path: &str, offset: u64, length: Option<u64>| ContentRequest {
+                machine: Some(machine.to_owned()),
+                path: path.to_owned(),
+                offset,
+                length,
+                principal: "owner".to_owned(),
+                door: Door::Http,
+                audit: false,
+                cancel: CancellationToken::new(),
+            };
+
+        // Wrong offset / wrong length / overflow rejected before any bytes are delivered.
+        for (path, offset, len) in [
+            ("/wrong_offset", 0u64, Some(10u64)),
+            ("/wrong_length", 0, Some(10)),
+            ("/overflow", 10, None),
+        ] {
+            let err = fleet
+                .open_content(&node, make_req("liar", path, offset, len))
+                .await
+                .err()
+                .expect("must fail");
+            match err {
+                ContentError::Error(body) => assert_eq!(body.code, ErrorCode::Failed, "{path}"),
+                other => panic!("unexpected {other:?} for {path}"),
+            }
+        }
+
+        // Extra bytes past declared length (one-shot and keep_open) fail with InvalidData and
+        // never forward any extra bytes beyond the declared 5 bytes.
+        for path in ["/extra_bytes", "/bad_done"] {
+            let mut opened = fleet
+                .open_content(&node, make_req("liar", path, 0, Some(5)))
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let err = opened.reader.read_to_end(&mut buf).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{path}: {err}");
+            assert_eq!(buf, b"hello", "{path}: must never forward extra bytes");
+        }
+
+        // Short EOF fails with UnexpectedEof.
+        let mut short = fleet
+            .open_content(&node, make_req("liar", "/short_eof", 0, Some(10)))
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let err = short.reader.read_to_end(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // 12 concurrent streams to `capped` all succeed by queueing under MAX_STREAMS_PER_TARGET (8).
+        let mut join = JoinSet::new();
+        for _ in 0..12 {
+            let fleet = fleet.clone();
+            let node = node.clone();
+            join.spawn(async move {
+                let mut opened = fleet
+                    .open_content(
+                        &node,
+                        ContentRequest {
+                            machine: Some("capped".to_owned()),
+                            path: "/ok".to_owned(),
+                            offset: 0,
+                            length: Some(4),
+                            principal: "owner".to_owned(),
+                            door: Door::Http,
+                            audit: false,
+                            cancel: CancellationToken::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                opened.reader.read_to_end(&mut out).await.unwrap();
+                assert_eq!(out, b"OKAY");
+            });
+        }
+        while let Some(res) = join.join_next().await {
+            res.unwrap();
+        }
+        let max_seen = std::fs::read_to_string(&max_file)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.trim().parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_seen > 0 && max_seen <= MAX_STREAMS_PER_TARGET,
+            "expected peak concurrency in 1..={MAX_STREAMS_PER_TARGET}, got {max_seen}"
         );
 
         fleet.close().await;

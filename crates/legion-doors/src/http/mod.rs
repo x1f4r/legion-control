@@ -34,7 +34,10 @@ mod ui;
 use std::future::Future;
 use std::io::{self, Write as _};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -49,7 +52,7 @@ use axum::middleware::{self, Next};
 use axum::routing::{any, get, post};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use legion_content::TicketTable;
+use legion_content::{ConcurrencyLimits, ContentLimiter, TicketTable};
 use legion_core::config::NodeFile;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
@@ -58,11 +61,14 @@ use rmcp::model::ClientJsonRpcMessage;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::session::{SessionId, SessionManager};
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use self::content::ContentAuditCoalescer;
 use self::gate::Refusal;
 use self::sessions::{Abandonable, SessionRef, Sessions};
 use crate::Authenticated;
@@ -141,12 +147,42 @@ pub fn listen_address(text: &str) -> Result<SocketAddr, ErrorBody> {
     Ok(address)
 }
 
+/// Concurrency and slow-reader protection limits for `/v1/content/{ticket}/{name}` streams.
+#[derive(Clone, Copy, Debug)]
+pub struct ContentStreamLimits {
+    /// Per-ticket, per-holder, and global concurrent stream caps.
+    pub concurrency: ConcurrencyLimits,
+    /// Maximum duration a content stream write may stall without draining any bytes.
+    pub write_idle_timeout: Duration,
+    /// Window over which minimum sustained write progress is checked while streaming.
+    pub min_rate_window: Duration,
+    /// Minimum bytes written during [`Self::min_rate_window`] (default 40 KiB / 10s = 4 KiB/s).
+    pub min_rate_bytes: u64,
+}
+
+impl Default for ContentStreamLimits {
+    fn default() -> Self {
+        Self {
+            concurrency: ConcurrencyLimits::default(),
+            write_idle_timeout: Duration::from_secs(15),
+            min_rate_window: Duration::from_secs(10),
+            min_rate_bytes: 40 * 1024,
+        }
+    }
+}
+
+/// Request extension injected per TCP connection so streaming content bodies can enable write
+/// stall and minimum-rate enforcement on their underlying socket.
+#[derive(Clone)]
+pub(crate) struct ConnectionStreamFlag(pub(crate) Arc<AtomicUsize>);
+
 /// The HTTP door over one node.
 pub struct HttpDoor {
     node: Node,
     router: Arc<dyn Router>,
     full: Arc<crate::mcp::catalog::CatalogCache>,
     compact: Arc<crate::mcp::catalog::CatalogCache>,
+    content_limits: ContentStreamLimits,
 }
 
 impl HttpDoor {
@@ -159,7 +195,14 @@ impl HttpDoor {
             compact: McpDoor::catalog(&node, true)?,
             node,
             router,
+            content_limits: ContentStreamLimits::default(),
         })
+    }
+
+    /// Overrides the default content stream concurrency and slow-reader timeouts (useful in tests).
+    pub fn with_content_limits(mut self, limits: ContentStreamLimits) -> Self {
+        self.content_limits = limits;
+        self
     }
 
     /// Serves connections from `listener` until `shutdown` completes, then stops accepting,
@@ -220,12 +263,15 @@ impl HttpDoor {
         };
         let (mcp_full, managers_full) = mcp(false, Arc::clone(&self.full));
         let (mcp_compact, managers_compact) = mcp(true, Arc::clone(&self.compact));
+        let content_limits = self.content_limits;
         let shared = Arc::new(Shared {
             mcp_full,
             mcp_compact,
             managers: [managers_full, managers_compact],
             sessions: Sessions::default(),
-            content_tickets: TicketTable::new(),
+            content_tickets: Arc::new(TicketTable::new()),
+            content_limiter: ContentLimiter::with_limits(content_limits.concurrency),
+            content_audit: ContentAuditCoalescer::default(),
             node: self.node.clone(),
             router: Arc::clone(&self.router),
             port: local.port(),
@@ -276,7 +322,18 @@ impl HttpDoor {
                     }
                 },
             };
-            let service = TowerToHyperService::new(app.clone());
+            let active_streams = Arc::new(AtomicUsize::new(0));
+            let monitored = MonitoredTcpStream::new(
+                stream,
+                Arc::clone(&active_streams),
+                content_limits.write_idle_timeout,
+                content_limits.min_rate_window,
+                content_limits.min_rate_bytes,
+            );
+            let service = InjectConnectionFlag {
+                inner: TowerToHyperService::new(app.clone()),
+                flag: ConnectionStreamFlag(active_streams),
+            };
             let closing = closing.clone();
             connections.spawn(async move {
                 let _slot = slot;
@@ -284,7 +341,7 @@ impl HttpDoor {
                 builder
                     .timer(TokioTimer::new())
                     .header_read_timeout(HEADER_TIMEOUT);
-                let connection = builder.serve_connection(TokioIo::new(stream), service);
+                let connection = builder.serve_connection(TokioIo::new(monitored), service);
                 tokio::pin!(connection);
                 tokio::select! {
                     _ = connection.as_mut() => {}
@@ -303,6 +360,7 @@ impl HttpDoor {
         let _ = tokio::time::timeout(DRAIN, connections.wait()).await;
         shared.calls.close();
         let _ = tokio::time::timeout(DRAIN, shared.calls.wait()).await;
+        shared.content_audit.flush_all(&shared.node).await;
         self.router.shutdown().await;
         Ok(())
     }
@@ -324,7 +382,11 @@ pub(crate) struct Shared {
     /// Which token opened each session.
     sessions: Sessions,
     /// Active content tickets bound to bearer tokens.
-    content_tickets: TicketTable,
+    content_tickets: Arc<TicketTable>,
+    /// Per-ticket, per-holder, and global concurrent stream limiter.
+    content_limiter: ContentLimiter,
+    /// Coalesced per-ticket `content.read` audit tracker.
+    content_audit: ContentAuditCoalescer,
 }
 
 impl Shared {
@@ -340,14 +402,176 @@ impl Shared {
     }
 
     /// Ends the sessions and content tickets of tokens that were removed, replaced or have
-    /// expired, and sweeps idle ones.
+    /// expired, flushes coalesced content audit entries, and sweeps idle ones.
     async fn end_stale_sessions(&self) {
         let tokens = self.node.config().get::<Tokens>().ok();
         let now = jiff::Timestamp::now();
-        self.content_tickets
-            .retain_holders(|holder| content::holder_is_live(holder, None, tokens.as_deref(), now));
+        let removed = self
+            .content_tickets
+            .sweep_holders(|holder| content::holder_is_live(holder, None, tokens.as_deref(), now));
+        self.content_audit.flush_removed(&self.node, &removed).await;
+        self.content_audit.flush_due(&self.node).await;
         let ended = self.sessions.stale(tokens.as_deref());
         self.close(ended).await;
+    }
+}
+
+/// Hyper service adapter that injects [`ConnectionStreamFlag`] into every request on a TCP
+/// connection so streaming content responses can activate socket-level stall and rate limits.
+struct InjectConnectionFlag {
+    inner: TowerToHyperService<axum::Router>,
+    flag: ConnectionStreamFlag,
+}
+
+impl hyper::service::Service<axum::http::Request<hyper::body::Incoming>> for InjectConnectionFlag {
+    type Response = <TowerToHyperService<axum::Router> as hyper::service::Service<
+        axum::http::Request<hyper::body::Incoming>,
+    >>::Response;
+    type Error = <TowerToHyperService<axum::Router> as hyper::service::Service<
+        axum::http::Request<hyper::body::Incoming>,
+    >>::Error;
+    type Future = <TowerToHyperService<axum::Router> as hyper::service::Service<
+        axum::http::Request<hyper::body::Incoming>,
+    >>::Future;
+
+    fn call(&self, mut req: axum::http::Request<hyper::body::Incoming>) -> Self::Future {
+        req.extensions_mut().insert(self.flag.clone());
+        self.inner.call(req)
+    }
+}
+
+/// Wraps a [`TcpStream`] to enforce a write/idle timeout and minimum sustained progress rate while
+/// a content response is actively streaming on the connection.
+struct MonitoredTcpStream {
+    inner: TcpStream,
+    active: Arc<AtomicUsize>,
+    write_idle_timeout: Duration,
+    min_rate_window: Duration,
+    min_rate_bytes: u64,
+    stall_sleep: Option<Pin<Box<Sleep>>>,
+    rate_window_start: Option<Instant>,
+    rate_window_bytes: u64,
+    rate_sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl MonitoredTcpStream {
+    fn new(
+        inner: TcpStream,
+        active: Arc<AtomicUsize>,
+        write_idle_timeout: Duration,
+        min_rate_window: Duration,
+        min_rate_bytes: u64,
+    ) -> Self {
+        Self {
+            inner,
+            active,
+            write_idle_timeout,
+            min_rate_window,
+            min_rate_bytes,
+            stall_sleep: None,
+            rate_window_start: None,
+            rate_window_bytes: 0,
+            rate_sleep: None,
+        }
+    }
+
+    fn reset_monitoring(&mut self) {
+        self.stall_sleep = None;
+        self.rate_window_start = None;
+        self.rate_window_bytes = 0;
+        self.rate_sleep = None;
+    }
+}
+
+impl AsyncRead for MonitoredTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for MonitoredTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.active.load(Ordering::Acquire) == 0 {
+            self.reset_monitoring();
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        }
+
+        let now = Instant::now();
+        if self.rate_window_start.is_none() {
+            self.rate_window_start = Some(now);
+            self.rate_window_bytes = 0;
+            self.rate_sleep = Some(Box::pin(tokio::time::sleep(self.min_rate_window)));
+        }
+
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    self.stall_sleep = None;
+                    self.rate_window_bytes = self.rate_window_bytes.saturating_add(n as u64);
+                }
+                if let Some(start) = self.rate_window_start
+                    && now.saturating_duration_since(start) >= self.min_rate_window
+                {
+                    if self.rate_window_bytes < self.min_rate_bytes {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "content stream transfer rate fell below minimum threshold",
+                        )));
+                    }
+                    self.rate_window_start = Some(now);
+                    self.rate_window_bytes = 0;
+                    self.rate_sleep = Some(Box::pin(tokio::time::sleep(self.min_rate_window)));
+                }
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => {
+                let write_idle_timeout = self.write_idle_timeout;
+                let stall = self
+                    .stall_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(write_idle_timeout)));
+                if stall.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "content stream stalled waiting for client to read",
+                    )));
+                }
+                if let Some(rate_sleep) = self.rate_sleep.as_mut()
+                    && rate_sleep.as_mut().poll(cx).is_ready()
+                {
+                    if self.rate_window_bytes < self.min_rate_bytes {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "content stream transfer rate fell below minimum threshold",
+                        )));
+                    }
+                    self.rate_window_start = Some(now);
+                    self.rate_window_bytes = 0;
+                    let next = Box::pin(tokio::time::sleep(self.min_rate_window));
+                    self.rate_sleep = Some(next);
+                    if let Some(next_sleep) = self.rate_sleep.as_mut() {
+                        let _ = next_sleep.as_mut().poll(cx);
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -405,7 +629,7 @@ async fn gate(
             // no `Origin`. Host and Origin guards above have already run; `legion-content`
             // authenticates the 256-bit ticket, re-verifies the token and `fs.read` policy, and
             // sets its own fixed headers (`nosniff`, `CORP`, `no-referrer`, `no-store`, and
-            // `sandbox` CSP for everything except inline PDF).
+            // unconditional `sandbox` CSP with `frame-ancestors 'none'`).
             served_content = true;
             next.run(request).await
         } else if config.ui
@@ -679,21 +903,27 @@ fn wants_compact(request: &Request) -> bool {
 /// A request's body, refused with 413 when it is larger than [`MAX_BODY`] and with 408 when the
 /// client takes longer than [`BODY_TIMEOUT`] to send it.
 pub(crate) async fn read_body(body: Body) -> Result<Bytes, Box<Response<Body>>> {
+    read_body_limited(body, MAX_BODY).await
+}
+
+/// Like [`read_body`] with a caller-specified maximum byte size `limit`.
+pub(crate) async fn read_body_limited(
+    body: Body,
+    limit: usize,
+) -> Result<Bytes, Box<Response<Body>>> {
     let too_large = || {
         Box::new(reply::refusal(
             StatusCode::PAYLOAD_TOO_LARGE,
             ErrorCode::InvalidArgs,
-            &format!(
-                "The request body is larger than {MAX_BODY} bytes, or ended before its length."
-            ),
+            &format!("The request body is larger than {limit} bytes, or ended before its length."),
         ))
     };
     // A body whose declared length is already too large is refused before a byte of it is read.
     let declared = http_body::Body::size_hint(&body).lower();
-    if usize::try_from(declared).map_or(true, |declared| declared > MAX_BODY) {
+    if usize::try_from(declared).map_or(true, |declared| declared > limit) {
         return Err(too_large());
     }
-    match tokio::time::timeout(BODY_TIMEOUT, axum::body::to_bytes(body, MAX_BODY)).await {
+    match tokio::time::timeout(BODY_TIMEOUT, axum::body::to_bytes(body, limit)).await {
         Ok(Ok(bytes)) => Ok(bytes),
         Ok(Err(_)) => Err(too_large()),
         Err(_) => Err(Box::new(reply::refusal(
@@ -747,5 +977,144 @@ mod tests {
             listen_address("tower:x").unwrap_err().code,
             ErrorCode::InvalidArgs
         );
+    }
+
+    #[tokio::test]
+    async fn slow_content_reader_is_dropped_by_write_idle_timeout_while_api_stays_responsive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("legion");
+        let user_home = dir.path().join("user");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+
+        // Create a 16 MiB file so the kernel TCP send buffer fills when the client stops reading.
+        let big_file = user_home.join("big.bin");
+        std::fs::write(&big_file, vec![b'Z'; 16 * 1024 * 1024]).unwrap();
+
+        let paths = legion_core::Paths::under(&home);
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "[principals.phone]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+        )
+        .unwrap();
+
+        let node = Node::new(paths, legion_tools::registry());
+        let minted = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "phone", "principal": "phone" }),
+            ))
+            .await
+            .unwrap();
+        let raw_token = minted["token"].as_str().unwrap().to_owned();
+        let door = HttpDoor::new(node, Arc::new(legion_core::Local))
+            .unwrap()
+            .with_content_limits(ContentStreamLimits {
+                concurrency: ConcurrencyLimits {
+                    max_per_ticket: 2,
+                    max_per_holder: 4,
+                    max_global: 8,
+                    retry_after_secs: 3,
+                },
+                write_idle_timeout: Duration::from_millis(350),
+                min_rate_window: Duration::from_secs(5),
+                min_rate_bytes: 40 * 1024,
+            });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = door.serve(listener, stop.cancelled()).await;
+        });
+
+        // 1. Mint a ticket via POST /v1/content.
+        let body = serde_json::json!({ "path": big_file.to_string_lossy() }).to_string();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!(
+            "POST /v1/content HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {raw_token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut resp_bytes = Vec::new();
+        s.read_to_end(&mut resp_bytes).await.unwrap();
+        let resp_text = String::from_utf8(resp_bytes).unwrap();
+        let (_, json_body) = resp_text.split_once("\r\n\r\n").unwrap();
+        let created: serde_json::Value = serde_json::from_str(json_body).unwrap();
+        let content_url = created["url"].as_str().unwrap().to_owned();
+
+        // 2. Open 2 stalled readers (filling max_per_ticket = 2) that send GET and never read.
+        let mut stalled = Vec::new();
+        for _ in 0..2 {
+            let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let get = format!(
+                "GET {content_url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            );
+            conn.write_all(get.as_bytes()).await.unwrap();
+            stalled.push(conn);
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // 3. A 3rd concurrent request gets 429 Too Many Requests + Retry-After + Connection: close.
+        {
+            let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let get = format!(
+                "GET {content_url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            );
+            conn.write_all(get.as_bytes()).await.unwrap();
+            let mut reply = Vec::new();
+            conn.read_to_end(&mut reply).await.unwrap();
+            let reply = String::from_utf8_lossy(&reply);
+            assert!(reply.starts_with("HTTP/1.1 429 "), "{reply}");
+            assert!(
+                reply.to_ascii_lowercase().contains("retry-after: 3"),
+                "{reply}"
+            );
+            assert!(
+                reply.to_ascii_lowercase().contains("connection: close"),
+                "{reply}"
+            );
+        }
+
+        // 4. Meanwhile, GET /v1/health stays fast and responsive.
+        {
+            let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!(
+                "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            );
+            conn.write_all(req.as_bytes()).await.unwrap();
+            let mut reply = Vec::new();
+            conn.read_to_end(&mut reply).await.unwrap();
+            let reply = String::from_utf8_lossy(&reply);
+            assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+        }
+
+        // 5. After write_idle_timeout (350ms), the server drops the stalled connections and frees
+        //    their permits so a fresh range read succeeds even while the stalled sockets remain open.
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        {
+            let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let get = format!(
+                "GET {content_url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-15\r\nConnection: close\r\n\r\n"
+            );
+            conn.write_all(get.as_bytes()).await.unwrap();
+            let mut reply = Vec::new();
+            conn.read_to_end(&mut reply).await.unwrap();
+            let reply = String::from_utf8_lossy(&reply);
+            assert!(
+                reply.starts_with("HTTP/1.1 206 "),
+                "expected stalled streams to time out and free slots: {reply}"
+            );
+        }
+
+        drop(stalled);
+        shutdown.cancel();
+        server_task.await.unwrap();
     }
 }

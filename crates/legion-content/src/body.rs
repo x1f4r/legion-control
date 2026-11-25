@@ -44,6 +44,7 @@ enum BodyKind {
     Stream {
         reader: BufReader<BoxAsyncRead>,
         remaining: u64,
+        eof_verified: bool,
         live_check: Option<LiveCheck>,
         check_bytes_interval: u64,
         check_time_interval: Duration,
@@ -110,6 +111,7 @@ impl ContentBody {
             kind: BodyKind::Stream {
                 reader: BufReader::with_capacity(cap, reader),
                 remaining: length,
+                eof_verified: false,
                 live_check,
                 check_bytes_interval: check_bytes_interval.max(1),
                 check_time_interval,
@@ -136,6 +138,7 @@ impl Body for ContentBody {
             BodyKind::Stream {
                 reader,
                 remaining,
+                eof_verified,
                 live_check,
                 check_bytes_interval,
                 check_time_interval,
@@ -145,7 +148,30 @@ impl Body for ContentBody {
                 ..
             } => {
                 if *remaining == 0 {
-                    return Poll::Ready(None);
+                    if *eof_verified {
+                        return Poll::Ready(None);
+                    }
+                    // Poll the underlying reader once more at EOF so remote framing trailers
+                    // (such as `{"done": true}\n`) are validated and unexpected extra bytes
+                    // past the declared length fail with `InvalidData` without being forwarded.
+                    return match Pin::new(&mut *reader).poll_fill_buf(cx) {
+                        Poll::Pending => Poll::Pending,
+                        Poll::Ready(Err(err)) => {
+                            *eof_verified = true;
+                            Poll::Ready(Some(Err(err)))
+                        }
+                        Poll::Ready(Ok(avail)) => {
+                            *eof_verified = true;
+                            if avail.is_empty() {
+                                Poll::Ready(None)
+                            } else {
+                                Poll::Ready(Some(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "content stream yielded extra bytes past declared length",
+                                ))))
+                            }
+                        }
+                    };
                 }
 
                 if let Some(check) = live_check.as_ref()
@@ -154,6 +180,7 @@ impl Body for ContentBody {
                 {
                     if let Err(err) = check() {
                         *remaining = 0;
+                        *eof_verified = true;
                         return Poll::Ready(Some(Err(err)));
                     }
                     *bytes_since_check = 0;
@@ -167,12 +194,14 @@ impl Body for ContentBody {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(Err(err)) => {
                         *remaining = 0;
+                        *eof_verified = true;
                         Poll::Ready(Some(Err(err)))
                     }
                     Poll::Ready(Ok(avail)) => {
                         if avail.is_empty() {
                             let missing = *remaining;
                             *remaining = 0;
+                            *eof_verified = true;
                             return Poll::Ready(Some(Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
                                 format!("content stream ended with {missing} bytes remaining"),
@@ -197,7 +226,11 @@ impl Body for ContentBody {
         match &self.kind {
             BodyKind::Empty => true,
             BodyKind::Fixed(slot) => slot.is_none(),
-            BodyKind::Stream { remaining, .. } => *remaining == 0,
+            BodyKind::Stream {
+                remaining,
+                eof_verified,
+                ..
+            } => *remaining == 0 && *eof_verified,
         }
     }
 

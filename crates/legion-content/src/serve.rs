@@ -850,7 +850,7 @@ mod tests {
                     length: actual,
                     mtime,
                     file_id: Some(1),
-                    reader: Box::new(file),
+                    reader: Box::new(tokio::io::AsyncReadExt::take(file, actual)),
                 })
             })
         }
