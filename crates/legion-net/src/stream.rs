@@ -2447,6 +2447,7 @@ fn probe_write<W: Write>(
                                 dir: Some(probe_dir.to_string_lossy().into_owned()),
                                 marker: Some(name),
                                 exists: true,
+                                network_fs: legion_os::fs_kind::detect_network_fs(&probe_dir),
                                 ..ProbeReply::default()
                             },
                         );
@@ -2537,6 +2538,7 @@ fn probe_read<W: Write>(
         output,
         &ProbeReply {
             exists,
+            network_fs: legion_os::fs_kind::detect_network_fs(&checked_dir),
             ..ProbeReply::default()
         },
     )

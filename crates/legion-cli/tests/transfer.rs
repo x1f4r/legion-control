@@ -410,6 +410,51 @@ fn helper(args: &[String]) -> ExitCode {
             });
             exit_of(child.wait().unwrap())
         }
+        // Makes `probe_write` (create) inject `network_fs: "nfs"` into the real stream reply so
+        // moves targeting a network share treat the directory pair as inconclusive (copy completes
+        // and source is kept with the network file system reason stated).
+        "network-fs-peer" if subcommand == "stream" => {
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let is_probe_create = header_val["op"].as_str() == Some("probe_write")
+                && header_val["action"].as_str() == Some("create");
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(if is_probe_create {
+                    Stdio::piped()
+                } else {
+                    Stdio::inherit()
+                })
+                .spawn()
+                .unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
+            if is_probe_create {
+                let mut child_out = BufReader::new(child.stdout.take().unwrap());
+                let mut stdout = std::io::stdout().lock();
+                let mut line = String::new();
+                let mut idx = 0usize;
+                while child_out.read_line(&mut line).unwrap() > 0 {
+                    if idx == 1
+                        && let Ok(mut reply) = serde_json::from_str::<Value>(&line)
+                    {
+                        reply["network_fs"] = json!("nfs");
+                        writeln!(stdout, "{reply}").unwrap();
+                    } else {
+                        stdout.write_all(line.as_bytes()).unwrap();
+                    }
+                    stdout.flush().unwrap();
+                    line.clear();
+                    idx += 1;
+                }
+            }
+            exit_of(child.wait().unwrap())
+        }
         // Makes `probe_write` return `{dir: null, marker: null, exists: false}` so directory
         // distinctness cannot be proven (proving move fails safe and keeps both copies).
         "inconclusive-probe" if subcommand == "stream" => {
@@ -4598,6 +4643,66 @@ fn move_tree_shared_subfolder_and_inconclusive_probe_keep_source() {
             reason.contains("inc_tree/sub") && reason.contains("could not be proven distinct")
         }),
         "skipped must name both folders that could not be told apart: {tree_inc}"
+    );
+
+    // 2b. Network file system peer (`network_fs: "nfs"`): even when the probe marker is not seen
+    //     on the source (e.g. cached NFS listing on a shared mount), BOTH a normal copy-move AND
+    //     an identical-content move treat the pair as inconclusive, keeping the source and stating
+    //     the network file system reason.
+    let pi_nfs = node("pi_nfs");
+    fleet(&laptop, &[("pi_nfs", &pi_nfs, "network-fs-peer", vec![])]);
+
+    fs::write(laptop.home().join("nfs_copy.txt"), b"nfs-payload").unwrap();
+    let nfs_moved = ok(&transfer(
+        &laptop,
+        json!({"from": "~/nfs_copy.txt", "to": "pi_nfs:~/nfs_copy.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(nfs_moved["files_sent"], 1, "{nfs_moved}");
+    assert_eq!(
+        nfs_moved["source_removed"].as_u64().unwrap_or(0),
+        0,
+        "network fs move must keep source: {nfs_moved}"
+    );
+    assert_eq!(
+        fs::read(laptop.home().join("nfs_copy.txt")).unwrap(),
+        b"nfs-payload"
+    );
+    assert_eq!(
+        fs::read(pi_nfs.home().join("nfs_copy.txt")).unwrap(),
+        b"nfs-payload"
+    );
+    assert!(
+        nfs_moved["skipped"].as_array().unwrap().iter().any(|e| {
+            let r = e["reason"].as_str().unwrap_or("");
+            r.contains("network file system") && r.contains("nfs")
+        }),
+        "expected network file system reason in skipped: {nfs_moved}"
+    );
+
+    // Identical-content branch (file already exists on destination with exact same bytes):
+    // must STILL keep source instead of deleting the only copy on a shared mount!
+    let nfs_same = ok(&transfer(
+        &laptop,
+        json!({"from": "~/nfs_copy.txt", "to": "pi_nfs:~/nfs_copy.txt", "move": true}),
+        &[],
+    ));
+    assert_eq!(nfs_same["files_unchanged"], 1, "{nfs_same}");
+    assert_eq!(
+        nfs_same["source_removed"].as_u64().unwrap_or(0),
+        0,
+        "identical-content move on network fs must keep source: {nfs_same}"
+    );
+    assert_eq!(
+        fs::read(laptop.home().join("nfs_copy.txt")).unwrap(),
+        b"nfs-payload"
+    );
+    assert!(
+        nfs_same["skipped"].as_array().unwrap().iter().any(|e| {
+            let r = e["reason"].as_str().unwrap_or("");
+            r.contains("network file system") && r.contains("nfs")
+        }),
+        "expected network file system reason on identical-content move: {nfs_same}"
     );
 
     // 3. Real OS read-only destination subfolder (Unix): `already_verified` matches the file in

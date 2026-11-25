@@ -1469,10 +1469,21 @@ impl Transfer<'_> {
                 &[CAP_PROBE],
             )
             .await;
+        let to_network_fs = created.network_fs;
         match check_res {
             Ok(reply) => {
                 let proof = if reply.exists {
                     DirPairProof::SameDirectory
+                } else if let Some(fs_kind) = to_network_fs {
+                    DirPairProof::Inconclusive(format!(
+                        "{to_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
+                        to.machine
+                    ))
+                } else if let Some(fs_kind) = reply.network_fs {
+                    DirPairProof::Inconclusive(format!(
+                        "{from_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
+                        from.machine
+                    ))
                 } else {
                     DirPairProof::ProvenDistinct
                 };
@@ -1542,13 +1553,24 @@ impl Transfer<'_> {
                 &[CAP_PROBE],
             )
             .await;
+        let to_network_fs = created.network_fs;
         match check_res {
             Ok(reply) => {
                 if !reply.exists && to_exists {
-                    cache.insert(
-                        (from_dir.to_owned(), to_dir.to_owned()),
-                        DirPairProof::ProvenDistinct,
-                    );
+                    let cached = if let Some(fs_kind) = to_network_fs {
+                        DirPairProof::Inconclusive(format!(
+                            "{to_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
+                            to.machine
+                        ))
+                    } else if let Some(fs_kind) = reply.network_fs {
+                        DirPairProof::Inconclusive(format!(
+                            "{from_dir} on {} is on a network file system ({fs_kind}), so source and destination could not be proven distinct",
+                            from.machine
+                        ))
+                    } else {
+                        DirPairProof::ProvenDistinct
+                    };
+                    cache.insert((from_dir.to_owned(), to_dir.to_owned()), cached);
                 }
                 Ok(reply.exists)
             }
