@@ -21,6 +21,7 @@ pub mod stream;
 pub mod sync;
 pub mod tools;
 pub mod transfer;
+pub mod updates;
 
 pub use config::{
     FleetFile, MachineEntry, RemoteOs, ResolvedSystem, SystemEntry, Transport, validate_mac,

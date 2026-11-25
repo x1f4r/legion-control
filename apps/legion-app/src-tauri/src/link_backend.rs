@@ -850,6 +850,27 @@ impl Backend for LinkBackend {
             Ok(state)
         })
     }
+
+    fn update_sources(&self) -> Result<Option<(Link, Vec<String>)>, AppError> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(err) = &guard.store_error {
+            return Err(err.clone());
+        }
+        let mut nodes: Vec<String> = Vec::new();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some() && guard.data.link.node(LOCAL_NODE_ID).is_none() {
+            nodes.push(LOCAL_NODE_ID.to_owned());
+        }
+        for entry in &guard.data.link.nodes {
+            if entry.origin == NodeOrigin::Paired && entry.identity_changed.is_none() {
+                nodes.push(entry.node.clone());
+            }
+        }
+        Ok(Some((guard.link.clone(), nodes)))
+    }
 }
 
 fn build_pair_summary(enrolled: &legion_link::Enrolled) -> PairSummary {
@@ -1166,35 +1187,150 @@ fn discover_local_legion_from(
     path_var: Option<&std::ffi::OsStr>,
     conventional: &[std::path::PathBuf],
 ) -> Option<String> {
-    use std::path::Path;
+    let appdir = std::env::var_os("APPDIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    discover_local_legion_with_env(path_var, conventional, appdir.as_deref())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn discover_local_legion_with_env(
+    path_var: Option<&std::ffi::OsStr>,
+    conventional: &[std::path::PathBuf],
+    appdir: Option<&std::path::Path>,
+) -> Option<String> {
+    use std::path::{Path, PathBuf};
 
     #[cfg(windows)]
     const BIN_NAME: &str = "legion.exe";
     #[cfg(not(windows))]
     const BIN_NAME: &str = "legion";
 
-    fn is_executable_file(path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        if !meta.is_file() {
-            return false;
+    let mut forbidden_roots: Vec<PathBuf> = Vec::new();
+    let sys_tmp = std::env::temp_dir();
+    forbidden_roots.push(sys_tmp.clone());
+    if let Ok(canon_tmp) = std::fs::canonicalize(&sys_tmp) {
+        forbidden_roots.push(canon_tmp);
+    }
+    #[cfg(unix)]
+    for raw in [
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/private/tmp",
+        "/private/var/tmp",
+    ] {
+        let p = PathBuf::from(raw);
+        forbidden_roots.push(p.clone());
+        if let Ok(c) = std::fs::canonicalize(&p) {
+            forbidden_roots.push(c);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            meta.permissions().mode() & 0o111 != 0
-        }
-        #[cfg(not(unix))]
-        {
-            true
+    }
+    if let Some(dir) = appdir {
+        forbidden_roots.push(dir.to_path_buf());
+        if let Ok(c) = std::fs::canonicalize(dir) {
+            forbidden_roots.push(c);
         }
     }
 
-    fn resolve_candidate(candidate: &Path) -> Option<String> {
-        let canonical = std::fs::canonicalize(candidate).ok()?;
-        if !is_executable_file(&canonical) {
+    let is_in_forbidden_root = |path: &Path| -> bool {
+        #[cfg(windows)]
+        {
+            let norm = |p: &Path| -> String {
+                let s = p.to_string_lossy();
+                let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+                s.trim_end_matches(['\\', '/']).to_ascii_lowercase()
+            };
+            let target = norm(path);
+            forbidden_roots.iter().any(|root| {
+                let r = norm(root);
+                !r.is_empty()
+                    && (target == r
+                        || target.starts_with(&format!("{r}\\"))
+                        || target.starts_with(&format!("{r}/")))
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            forbidden_roots.iter().any(|root| path.starts_with(root))
+        }
+    };
+
+    #[cfg(unix)]
+    let is_safe_unix_path = |raw_candidate: &Path, canonical: &Path| -> bool {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if is_in_forbidden_root(raw_candidate) || is_in_forbidden_root(canonical) {
+            return false;
+        }
+        let euid = rustix::process::geteuid().as_raw();
+
+        // Check every ancestor directory of both the raw candidate parent and the canonical binary:
+        // refuse any world-writable directory (including sticky temp dirs like 0o1777).
+        for check_start in [raw_candidate.parent(), canonical.parent()] {
+            let Some(mut cur) = check_start else {
+                return false;
+            };
+            loop {
+                let Ok(meta) = std::fs::symlink_metadata(cur) else {
+                    return false;
+                };
+                if meta.permissions().mode() & 0o002 != 0 {
+                    return false;
+                }
+                match cur.parent() {
+                    Some(parent) if parent != cur => cur = parent,
+                    _ => break,
+                }
+            }
+        }
+
+        let Ok(file_meta) = std::fs::symlink_metadata(canonical) else {
+            return false;
+        };
+        if !file_meta.file_type().is_file() {
+            return false;
+        }
+        let file_mode = file_meta.permissions().mode();
+        if file_mode & 0o111 == 0 || file_mode & 0o002 != 0 {
+            return false;
+        }
+        let file_uid = file_meta.uid();
+        if file_uid != euid && !(file_uid == 0 && file_mode & 0o022 == 0) {
+            return false;
+        }
+
+        // Immediate parent directory of the canonical binary must also be owned by the current
+        // user or root (never another local user).
+        let Some(parent) = canonical.parent() else {
+            return false;
+        };
+        let Ok(parent_meta) = std::fs::metadata(parent) else {
+            return false;
+        };
+        let parent_uid = parent_meta.uid();
+        let parent_mode = parent_meta.permissions().mode();
+        parent_uid == euid || (parent_uid == 0 && parent_mode & 0o002 == 0)
+    };
+
+    let resolve_candidate = |candidate: &Path| -> Option<String> {
+        if is_in_forbidden_root(candidate) {
             return None;
+        }
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        if is_in_forbidden_root(&canonical) {
+            return None;
+        }
+        #[cfg(unix)]
+        if !is_safe_unix_path(candidate, &canonical) {
+            return None;
+        }
+        #[cfg(not(unix))]
+        {
+            let meta = std::fs::metadata(&canonical).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
         }
         let raw = canonical.to_string_lossy();
         #[cfg(windows)]
@@ -1204,7 +1340,7 @@ fn discover_local_legion_from(
             return Some(stripped.to_owned());
         }
         Some(raw.into_owned())
-    }
+    };
 
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
@@ -1943,7 +2079,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let dir = tempfile::tempdir()?;
+        // Place the valid test fixture inside the user-owned target directory (not /tmp, which
+        // discover_local_legion intentionally refuses as a world-writable temp location).
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-discover");
+        std::fs::create_dir_all(&base)?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
+        let dir = tempfile::tempdir_in(&base)?;
         let real_dir = dir.path().join("real");
         let link_dir = dir.path().join("bin");
         std::fs::create_dir_all(&real_dir)?;
@@ -1966,6 +2107,73 @@ mod tests {
         let found = discover_local_legion_from(Some(&mixed_path), &[])
             .ok_or("expected canonical legion binary")?;
         assert_eq!(found, std::fs::canonicalize(&real_bin)?.to_string_lossy());
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    #[test]
+    fn discover_local_legion_refuses_tmp_appdir_and_world_writable_dirs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. A binary placed inside /tmp (system temp dir) must be refused.
+        let tmp_dir = tempfile::tempdir()?;
+        let tmp_bin = tmp_dir.path().join("legion");
+        std::fs::write(&tmp_bin, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&tmp_bin, std::fs::Permissions::from_mode(0o755))?;
+        let tmp_path = std::env::join_paths([tmp_dir.path()])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&tmp_path), &[], None),
+            None,
+            "legion binary in /tmp must be refused"
+        );
+
+        // 2. A binary inside a world-writable directory (or world-writable binary) outside /tmp
+        //    must be refused.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-discover");
+        std::fs::create_dir_all(&base)?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
+        let safe_root = tempfile::tempdir_in(&base)?;
+
+        let ww_dir = safe_root.path().join("world-writable");
+        std::fs::create_dir_all(&ww_dir)?;
+        std::fs::set_permissions(&ww_dir, std::fs::Permissions::from_mode(0o777))?;
+        let ww_bin = ww_dir.join("legion");
+        std::fs::write(&ww_bin, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&ww_bin, std::fs::Permissions::from_mode(0o755))?;
+        let ww_path = std::env::join_paths([&ww_dir])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&ww_path), &[], None),
+            None,
+            "legion binary inside world-writable directory must be refused"
+        );
+
+        let ww_file_dir = safe_root.path().join("ww-file");
+        std::fs::create_dir_all(&ww_file_dir)?;
+        std::fs::set_permissions(&ww_file_dir, std::fs::Permissions::from_mode(0o700))?;
+        let ww_file_bin = ww_file_dir.join("legion");
+        std::fs::write(&ww_file_bin, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&ww_file_bin, std::fs::Permissions::from_mode(0o777))?;
+        let ww_file_path = std::env::join_paths([&ww_file_dir])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&ww_file_path), &[], None),
+            None,
+            "world-writable legion binary must be refused"
+        );
+
+        // 3. A binary inside $APPDIR must be refused even when permissions are 0700.
+        let fake_appdir = safe_root.path().join("appdir");
+        let fake_appdir_bin = fake_appdir.join("usr/bin");
+        std::fs::create_dir_all(&fake_appdir_bin)?;
+        let appdir_legion = fake_appdir_bin.join("legion");
+        std::fs::write(&appdir_legion, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&appdir_legion, std::fs::Permissions::from_mode(0o755))?;
+        let appdir_path = std::env::join_paths([&fake_appdir_bin])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&appdir_path), &[], Some(&fake_appdir)),
+            None,
+            "legion binary inside $APPDIR must be refused"
+        );
         Ok(())
     }
 

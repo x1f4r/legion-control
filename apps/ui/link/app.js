@@ -411,6 +411,75 @@ export function createAppLink() {
     }
   }
 
+  async function updateState() {
+    try {
+      return await invoke('update_state');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  function watchUpdates(onState) {
+    const core = tauriCore();
+    if (!core || typeof core.Channel !== 'function' || typeof onState !== 'function') {
+      return () => {};
+    }
+    let active = true;
+    const channel = new core.Channel();
+    channel.onmessage = (st) => {
+      if (!active) return;
+      try {
+        onState(st);
+      } catch {
+        // Ignore view callback errors.
+      }
+    };
+    invoke('update_watch', { onState: channel }).catch(() => {});
+    return () => {
+      active = false;
+    };
+  }
+
+  async function checkUpdates() {
+    try {
+      return await invoke('update_check');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function installUpdate() {
+    try {
+      return await invoke('update_install');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function setAutoUpdate(enabled) {
+    try {
+      return await invoke('update_set_auto', { enabled: Boolean(enabled) });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function dismissUpdateNotice() {
+    try {
+      return await invoke('update_dismiss_notice');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function maybeAutoInstall(trigger = 'startup') {
+    try {
+      return await invoke('update_maybe_auto_install', { trigger });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
   // Optional native file & transfer queue hooks (see `apps/ui/link/files-contract.js`):
   // `contentUrl`, `download`, `upload`, `openExternally`, `transfers`, `transferControl`,
   // `openTransfer`, and `onTransferEvent` will be wired to Tauri commands when the native
@@ -431,5 +500,12 @@ export function createAppLink() {
     repairStore,
     invalidateSessions,
     scanInvite,
+    updateState,
+    watchUpdates,
+    checkUpdates,
+    installUpdate,
+    setAutoUpdate,
+    dismissUpdateNotice,
+    maybeAutoInstall,
   };
 }

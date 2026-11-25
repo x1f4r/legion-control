@@ -1267,9 +1267,74 @@ never signs releases; the offline Ed25519 signature is created locally before pu
 
    The script downloads `SHA256SUMS` and every release asset, re-hashes them locally, checks that
    the signing key matches `contract/release-public-key.pem`, writes and verifies `SHA256SUMS.sig`,
-   uploads it to the draft release, and prints the publish command.
+   uploads it to the draft release, and prints the publish command. Node GitHub releases intentionally
+   omit `update.json` so a raw node release `SHA256SUMS` cannot be replayed as a fleet update set.
 5. Review the listed artifacts and digests, then publish the draft release:
 
    ```sh
    gh release edit legion-vX.Y.Z --draft=false --latest=false
    ```
+
+### Making and publishing a preview update
+
+Preview builds let your own devices update directly from your fleet before a tagged release. They
+use the exact same signed update-set rule as stable releases, with a separate preview Ed25519 key
+that never enters the repository:
+
+1. Generate a preview signing keypair once outside the checkout (private key mode `600`, never
+   printed):
+
+   ```sh
+   node scripts/make-update-set.mjs keygen
+   ```
+
+   By default this creates `~/.legion-control/preview-update.key` and
+   `~/.legion-control/preview-update.pub.pem`. Back them up alongside your Android release
+   keystore.
+
+2. Pick a strictly growing UTC sequence number (`YYYYMMDDHHMM`) and build the node and app with the
+   preview public key compiled in:
+
+   ```sh
+   SEQ="$(node scripts/make-update-set.mjs sequence)"
+   export LEGION_PREVIEW_UPDATE_KEY="$HOME/.legion-control/preview-update.pub.pem"
+   export LEGION_BUILD_SEQUENCE="$SEQ"
+
+   # Rebuild any fleet node that should store and propagate preview sets:
+   cargo build --release --locked --bin legion
+
+   # Build the Android APK with versionCode derived from $SEQ:
+   ./apps/legion-app/build-android.sh --sequence "$SEQ"
+   ```
+
+   Official release builds leave `LEGION_PREVIEW_UPDATE_KEY` unset and never trust preview sets.
+
+3. Assemble and sign the update set directory (`update.json`, artifacts, `SHA256SUMS`,
+   `SHA256SUMS.sig`). The script inspects each artifact's embedded sequence metadata without
+   executing it, records exact artifact byte sizes in `update.json`, and refuses sequences more than
+   24 hours ahead of UTC now:
+
+   ```sh
+   REV="$(git rev-parse --short=12 HEAD)"
+   node scripts/make-update-set.mjs create \
+     --out "$HOME/.cache/legion-preview-$SEQ" \
+     --channel preview \
+     --version 0.1.0 \
+     --build "$REV" \
+     --sequence "$SEQ" \
+     --notes "Faster refresh and bug fixes." \
+     --key "$HOME/.legion-control/preview-update.key" \
+     --artifact "apps/legion-app/src-tauri/gen/android/app/build/outputs/apk/universal/release/legion-release-arm64.apk:program=app,os=android,arch=aarch64,kind=apk"
+   ```
+
+4. Publish the signed set to any machine in the fleet:
+
+   ```sh
+   legion update.publish from="$HOME/.cache/legion-preview-$SEQ"
+   ```
+
+   The node verifies the signature and every artifact hash against its compiled-in trusted keys,
+   stores the set under `state/updates/preview/<sequence>/` (keeping the newest two per channel),
+   and notifies every reachable fleet peer with node authority so each peer pulls, verifies for
+   itself, and stores the set. Release-only peers without `LEGION_PREVIEW_UPDATE_KEY` refuse the
+   preview set cleanly and store nothing. Check what a node holds with `legion update.list`.

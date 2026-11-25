@@ -40,6 +40,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     crate::install::register(registry, fleet.clone());
     crate::power::register(registry, fleet.clone());
     crate::sync::register(registry, fleet.clone());
+    crate::updates::register(registry, fleet.clone());
 
     registry.add(FleetTool::<NoArgs, ListResult, _>::new(
         "fleet.list",

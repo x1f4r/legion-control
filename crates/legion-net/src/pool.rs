@@ -180,6 +180,38 @@ impl Fleet {
         result
     }
 
+    /// Runs a node-to-node tool call on `machine` with this node's own `owner` authority (used by
+    /// admin propagation such as `update.publish` so a peer can be notified and pull signed sets
+    /// under node authority while recording an audit entry on both nodes).
+    pub(crate) async fn call_remote_as_node(
+        &self,
+        ctx: &Ctx,
+        machine: &str,
+        tool: &str,
+        args: Value,
+        events: EventSink,
+    ) -> Result<Value, ErrorBody> {
+        let started = Instant::now();
+        let node = ctx.node();
+        let here = ctx.node_name();
+        let principal = legion_core::policy::OWNER.to_owned();
+        let result = self
+            .call_remote_checked(ctx, node, here, &principal, machine, tool, &args, events)
+            .await;
+        node.record_audit_with_device(
+            machine.to_owned(),
+            Some(principal),
+            ctx.door(),
+            ctx.device().map(str::to_owned),
+            tool.to_owned(),
+            &args,
+            started,
+            &result,
+        )
+        .await;
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn call_remote_checked(
         &self,
