@@ -1026,13 +1026,20 @@ async fn apply_local_write(
                 tombstones_changed,
                 mut live_error,
             }) => {
-                // Always end live sessions for any devices removed or newly quarantined by the
-                // tombstones that landed.
+                // Always end live sessions and cancel active transfer jobs for any devices removed
+                // or newly quarantined by the tombstones that landed.
                 for target in &outcome.removed_targets {
                     let _ = terminate_device_sessions_for_target(
                         &paths_for_sessions,
                         target,
                         DEFAULT_TERMINATE_GRACE,
+                    )
+                    .await;
+                    let _ = legion_tools::job::cancel_transfer_jobs_for_device(
+                        &paths_for_sessions,
+                        &target.device,
+                        target.pairing_id.as_deref(),
+                        None,
                     )
                     .await;
                 }
@@ -1094,8 +1101,9 @@ async fn apply_local_write(
                 return Err(live_error.with_details(Value::Object(details)));
             }
             Err(MergeApplyError::AfterSave { error, tombstoned }) => {
-                // Always end live sessions for every newly tombstoned device whenever devices.toml
-                // was saved, even if policy or authorized_keys reconciliation failed afterwards.
+                // Always end live sessions and cancel active transfer jobs for every newly
+                // tombstoned device whenever devices.toml was saved, even if policy or
+                // authorized_keys reconciliation failed afterwards.
                 for target in &tombstoned {
                     let _ = terminate_device_sessions_for_target(
                         &paths_for_sessions,
@@ -1103,12 +1111,20 @@ async fn apply_local_write(
                         DEFAULT_TERMINATE_GRACE,
                     )
                     .await;
+                    let _ = legion_tools::job::cancel_transfer_jobs_for_device(
+                        &paths_for_sessions,
+                        &target.device,
+                        target.pairing_id.as_deref(),
+                        None,
+                    )
+                    .await;
                 }
                 return Err(error);
             }
         };
 
-        // End live sessions and open SSH connections for any devices removed by the merge.
+        // End live sessions, open SSH connections, and active transfer jobs for any devices
+        // removed or downgraded by the merge.
         for target in &merge_outcome.removed_targets {
             let _ = terminate_device_sessions_for_target(
                 &paths_for_sessions,
@@ -1116,7 +1132,16 @@ async fn apply_local_write(
                 DEFAULT_TERMINATE_GRACE,
             )
             .await;
+            let _ = legion_tools::job::cancel_transfer_jobs_for_device(
+                &paths_for_sessions,
+                &target.device,
+                target.pairing_id.as_deref(),
+                None,
+            )
+            .await;
         }
+        let _ = legion_tools::job::cancel_revoked_transfer_jobs(&paths_for_sessions, None, None)
+            .await;
 
         let hash_before = merge_outcome
             .bytes_before
@@ -1270,6 +1295,7 @@ async fn apply_local_write(
         .into_iter()
         .map(|spec| spec.name)
         .collect();
+    let is_policy = doc == SharedDocument::Policy;
     let outcome = tokio::task::spawn_blocking(move || {
         let is_builtin = |name: &str| builtins.contains(name);
         let precondition = match (expect_hash.as_deref(), expect_absent) {
@@ -1293,6 +1319,10 @@ async fn apply_local_write(
             format!("Writing configuration stopped unexpectedly: {error}."),
         )
     })??;
+
+    if is_policy {
+        let _ = legion_tools::job::cancel_revoked_transfer_jobs(ctx.paths(), None, None).await;
+    }
 
     // Record hashes before and after in the audit log (Node::call redacts `content` and does not
     // record tool results, so policy and config replacements record their before/after hashes here).

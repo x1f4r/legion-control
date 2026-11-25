@@ -43,9 +43,10 @@ use store::{
     CANCEL_FILE, EXIT_FILE, ExitOutcome, ExitRecord, JobRecord, LOCK_FILE, LOG_FILE,
     LaunchingState, ProgressFile, command_summary, compare_newest_first, create_exit_reserve,
     default_job_name, derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir,
-    jobs_lock_path, load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record,
-    read_job_record, read_progress_file, remove_env_file, remove_exit_reserve, validate_job_id,
-    write_cancel_request, write_env_file, write_exit_record, write_job_record, write_progress_file,
+    jobs_lock_path, load_all_records, not_found_job, now_rfc3339, probe_lock, prune_retention,
+    read_exit_record, read_job_record, read_progress_file, remove_env_file, remove_exit_reserve,
+    validate_job_id, write_cancel_request, write_env_file, write_exit_record, write_job_record,
+    write_progress_file,
 };
 
 /// Default and maximum `limit` for `job.list`.
@@ -86,19 +87,19 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "job.list",
         Effect::Read,
-        "List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Any principal with the read effect sees every job's command and output on this node. Reading never modifies job files.",
+        "List background jobs recorded on this node, newest first, with their id, name, current derived state, timestamps, exit code, and command summary. Filter by `state` to find running, failed, or interrupted jobs. Any principal with the read effect sees its own jobs, and unconfined roles see every job's command and output on this node; path-confined roles see another principal's transfer job only when every path it names is inside their `paths`, and another principal's command job only when allowed `job.start` or `exec.run`. Reading never modifies job files.",
         list,
     );
     registry.add_fn(
         "job.status",
         Effect::Read,
-        "Inspect one background job's full record (without environment values), current derived state, exit code or signal, duration, output size, and failure or interruption detail without modifying anything on disk. Pass an `id` from `job.start` or `job.list`; use `job.logs` to read output or `job.wait` to wait until it finishes.",
+        "Inspect one background job's full record (without environment values), current derived state, exit code or signal, duration, output size, and failure or interruption detail without modifying anything on disk. Pass an `id` from `job.start` or `job.list`; use `job.logs` to read output or `job.wait` to wait until it finishes. Jobs hidden by path confinement report `not_found`.",
         status,
     );
     registry.add_fn(
         "job.logs",
         Effect::Read,
-        "Read captured stdout and stderr from a background job without loading the whole log into memory. Stdout and stderr are merged into one log: each stream stays in its own order and lines (up to 64 KiB) are written whole under one lock so the two streams never split a line mid-way, while relative order between stdout and stderr is unspecified. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation. Any principal with the read effect sees every job's command and output on this node.",
+        "Read captured stdout and stderr from a background job without loading the whole log into memory. Stdout and stderr are merged into one log: each stream stays in its own order and lines (up to 64 KiB) are written whole under one lock so the two streams never split a line mid-way, while relative order between stdout and stderr is unspecified. Pass `offset` (feeding back `next_offset` from each reply) to stream new output incrementally while the job runs, or omit `offset` to read the last `tail` lines (default 100, max 5000). Replies are capped at `limit` bytes (default 65536, max 1048576), never split a UTF-8 character, and replace invalid UTF-8 bytes. Large logs rotate once into `output.log.1` and are read across both segments transparently; `output_dropped` and `dropped_bytes` report when earlier output was discarded by rotation. Any principal with the read effect sees its own jobs, and unconfined roles see every job's command and output on this node; path-confined roles only see jobs within their scope.",
         read_logs,
     );
     registry.add_fn(
@@ -110,7 +111,7 @@ pub fn register(registry: &mut Registry) {
     registry.add(JobCancelTool {
         spec: ToolSpec {
             name: "job.cancel".to_owned(),
-            description: "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any job on this node. A caller without the exec effect may still cancel a transfer job they started themselves (matched by principal and `kind: \"transfer\"`), and nothing else. Cancelling a job that already finished is not an error and returns its final state.".to_owned(),
+            description: "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any visible job on this node. A caller without the exec effect may still cancel a transfer job they started themselves (matched by principal, pairing id when paired, and `kind: \"transfer\"`), and nothing else. Cancelling a job that already finished is not an error and returns its final state.".to_owned(),
             effect: Effect::Exec,
             input_schema: input_schema::<CancelArgs>(),
         },
@@ -130,6 +131,7 @@ impl Tool for JobCancelTool {
         &self,
         policy: &Policy,
         principal: &str,
+        pairing_id: Option<&str>,
         paths: &Paths,
         args: &Value,
     ) -> Result<Grant, ErrorBody> {
@@ -138,8 +140,8 @@ impl Tool for JobCancelTool {
             Err(denied) => {
                 // Only callers not explicitly denied `job.cancel` by name/glob may use the
                 // narrow owner exception, and only for a `kind: "transfer"` job whose recorded
-                // principal matches the caller. Anything else returns the original denial so no
-                // information leaks about other jobs or principals.
+                // principal and pairing_id match the caller. Anything else returns the original
+                // denial so no information leaks about other jobs or principals.
                 if !policy.is_denied_by_name(principal, &self.spec.name)
                     && let Some(id) = args.get("id").and_then(Value::as_str)
                     && validate_job_id(id).is_ok()
@@ -148,6 +150,7 @@ impl Tool for JobCancelTool {
                     if let Ok(record) = read_job_record(&dir, id)
                         && record.kind == JobKind::Transfer
                         && record.principal == principal
+                        && record.pairing_id.as_deref() == pairing_id
                     {
                         return Ok(policy.grant(principal, paths));
                     }
@@ -189,14 +192,238 @@ pub(crate) fn exclusive_running_jobs_in(
 }
 
 /// Returns the IDs of currently starting or running background jobs attributed to paired device
-/// `device` (or started without a device tag under `principal`). Pure read; never touches or stops
-/// any job.
+/// `device` (matched by `pairing_id` when known, or device name / principal for legacy records).
+/// Pure read; never touches or stops any job.
 pub(crate) fn running_job_ids_for_device(
     paths: &Paths,
     device: &str,
+    pairing_id: Option<&str>,
     principal: &str,
 ) -> Vec<String> {
-    store::running_job_ids_for_device_in(paths.state_dir(), device, principal)
+    store::running_job_ids_for_device_in(paths.state_dir(), device, pairing_id, principal)
+}
+
+/// Checks whether a principal calling through `ctx` is allowed to see `record`.
+///
+/// - A principal always sees its own jobs (matching `pairing_id` when the caller is a paired
+///   device so a re-paired device with the same name never inherits its predecessor's jobs).
+/// - Unconfined roles (`roots().is_none()`) see all jobs on the node.
+/// - Path-confined roles see another principal's transfer job only when every path the job names
+///   lies inside the caller's `paths`, and see another principal's command job only when allowed
+///   `job.start` or `exec.run`.
+fn can_see_job(ctx: &Ctx, record: &JobRecord) -> bool {
+    let is_own = record.principal == ctx.principal()
+        && match ctx.pairing_id() {
+            Some(pid) => record.pairing_id.as_deref() == Some(pid),
+            None => true,
+        };
+    if is_own {
+        return true;
+    }
+    if ctx.grant().roots().is_none() {
+        return true;
+    }
+    match record.kind {
+        JobKind::Transfer => {
+            !record.transfer_paths.is_empty()
+                && record
+                    .transfer_paths
+                    .iter()
+                    .all(|path| ctx.grant().check_path(path, Access::Read).is_ok())
+        }
+        JobKind::Exec => {
+            let Ok(policy) = ctx.config().get::<Policy>() else {
+                return false;
+            };
+            policy
+                .authorize_name(ctx.principal(), "job.start", Some(Effect::Exec), ctx.paths())
+                .is_ok()
+                || policy
+                    .authorize_name(ctx.principal(), "exec.run", Some(Effect::Exec), ctx.paths())
+                    .is_ok()
+        }
+    }
+}
+
+/// Loads live `policy.toml` and `devices.toml` from `paths` and returns whether `record` (a
+/// transfer job) still holds its required device membership and policy permissions.
+fn transfer_record_still_authorized(
+    paths: &Paths,
+    policy: &Policy,
+    devices: Option<&crate::device::registry::DevicesFile>,
+    record: &JobRecord,
+) -> bool {
+    if let Some(pid) = record.pairing_id.as_deref()
+        && let Some(devices) = devices
+    {
+        if devices.removed.contains_key(pid) || !devices.devices.contains_key(pid) {
+            return false;
+        }
+        if crate::device::registry::quarantined_devices(devices).contains_key(pid) {
+            return false;
+        }
+    }
+    let Ok(grant) = policy.authorize_name(&record.principal, "fs.transfer", Some(Effect::Write), paths)
+    else {
+        return false;
+    };
+    if let Some(ref from_path) = record.transfer_local_from {
+        if grant.check_path(from_path, Access::Read).is_err() {
+            return false;
+        }
+        if record.transfer_move && grant.check_path(from_path, Access::Write).is_err() {
+            return false;
+        }
+    }
+    if let Some(ref to_path) = record.transfer_local_to
+        && grant.check_path(to_path, Access::Write).is_err()
+    {
+        return false;
+    }
+    if record.transfer_move
+        && policy
+            .authorize_name(&record.principal, "fs.remove", Some(Effect::Destroy), paths)
+            .is_err()
+    {
+        return false;
+    }
+    true
+}
+
+fn load_live_policy_and_devices(
+    paths: &Paths,
+) -> Option<(Policy, Option<crate::device::registry::DevicesFile>)> {
+    use legion_core::config::Document as _;
+    let policy_file = paths.config_file(Policy::FILE);
+    let policy = match std::fs::read(&policy_file) {
+        Ok(bytes) => legion_core::config::parse::<Policy>(&policy_file, &bytes).ok()?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Policy::default(),
+        Err(_) => return None,
+    };
+    let devices = crate::device::registry::load_devices_raw(paths).ok().flatten();
+    Some((policy, devices))
+}
+
+/// Checks live `policy.toml` and `devices.toml` for a running transfer job by id.
+///
+/// Used periodically by the detached transfer supervisor so direct edits to `policy.toml` or
+/// `devices.toml` revoke a running transfer promptly.
+pub fn is_transfer_job_authorized(paths: &Paths, id: &str) -> bool {
+    let dir = job_dir(paths.state_dir(), id);
+    let Ok(record) = read_job_record(&dir, id) else {
+        return true;
+    };
+    let Some((policy, devices)) = load_live_policy_and_devices(paths) else {
+        return true;
+    };
+    transfer_record_still_authorized(paths, &policy, devices.as_ref(), &record)
+}
+
+/// Cancels every active (`starting` or `running`) `kind: "transfer"` job belonging to the given
+/// paired device, returning the ids of jobs that were cancelled.
+pub async fn cancel_transfer_jobs_for_device(
+    paths: &Paths,
+    device: &str,
+    pairing_id: Option<&str>,
+    principal: Option<&str>,
+) -> Vec<String> {
+    let state_dir = paths.state_dir().to_path_buf();
+    let device_owned = device.to_owned();
+    let pairing_owned = pairing_id.map(str::to_owned);
+    let principal_owned = principal.map(str::to_owned);
+    let Ok((records, boot)) = blocking("job.cancel", move || {
+        let records = load_all_records(&state_dir)?;
+        let boot = procid::boot_id().ok();
+        Ok((records, boot))
+    })
+    .await
+    else {
+        return Vec::new();
+    };
+    let now = jiff::Timestamp::now();
+    let mut cancelled = Vec::new();
+    for (dir, record) in records {
+        if record.kind != JobKind::Transfer {
+            continue;
+        }
+        let matches_device = match (pairing_owned.as_deref(), record.pairing_id.as_deref()) {
+            (Some(pid), Some(rec_pid)) => rec_pid == pid,
+            (Some(_), None) => record.device.as_deref() == Some(device_owned.as_str()),
+            (None, _) => record.device.as_deref() == Some(device_owned.as_str()),
+        };
+        let matches_dedicated_principal = principal_owned.as_deref().is_some_and(|p| {
+            p.starts_with(crate::device::registry::DEVICE_PRINCIPAL_PREFIX)
+                && record.principal == p
+        });
+        if !matches_device && !matches_dedicated_principal {
+            continue;
+        }
+        let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
+        if !derived.state.is_active() {
+            continue;
+        }
+        if cancel_job_internal(paths.state_dir(), &record.id, false)
+            .await
+            .is_ok()
+        {
+            cancelled.push(record.id);
+        }
+    }
+    cancelled
+}
+
+/// Cancels every active (`starting` or `running`) `kind: "transfer"` job whose principal or paired
+/// device no longer satisfies live `policy.toml` and `devices.toml`.
+pub async fn cancel_revoked_transfer_jobs(
+    paths: &Paths,
+    principal_filter: Option<&str>,
+    pairing_id_filter: Option<&str>,
+) -> Vec<String> {
+    let paths_clone = paths.clone();
+    let Ok(Some((policy, devices))) =
+        tokio::task::spawn_blocking(move || load_live_policy_and_devices(&paths_clone)).await
+    else {
+        return Vec::new();
+    };
+    let state_dir = paths.state_dir().to_path_buf();
+    let Ok((records, boot)) = blocking("job.cancel", move || {
+        let records = load_all_records(&state_dir)?;
+        let boot = procid::boot_id().ok();
+        Ok((records, boot))
+    })
+    .await
+    else {
+        return Vec::new();
+    };
+    let now = jiff::Timestamp::now();
+    let mut cancelled = Vec::new();
+    for (dir, record) in records {
+        if record.kind != JobKind::Transfer {
+            continue;
+        }
+        if let Some(p) = principal_filter
+            && record.principal != p
+        {
+            continue;
+        }
+        if let Some(pid) = pairing_id_filter
+            && record.pairing_id.as_deref() != Some(pid)
+        {
+            continue;
+        }
+        let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
+        if !derived.state.is_active() {
+            continue;
+        }
+        if !transfer_record_still_authorized(paths, &policy, devices.as_ref(), &record)
+            && cancel_job_internal(paths.state_dir(), &record.id, false)
+                .await
+                .is_ok()
+        {
+            cancelled.push(record.id);
+        }
+    }
+    cancelled
 }
 
 /// Parameters for creating a `kind: "transfer"` job directory under `<state_dir>/jobs/<id>/`.
@@ -210,6 +437,16 @@ pub struct TransferJobSpec {
     pub principal: String,
     /// Paired device name, when started through a paired device gate.
     pub device: Option<String>,
+    /// Paired device pairing id, when started through a paired device gate.
+    pub pairing_id: Option<String>,
+    /// All paths named by the transfer (source and destination) for path-confined visibility.
+    pub transfer_paths: Vec<String>,
+    /// Local source path on this node (when `from` is local), for live revocation checks.
+    pub transfer_local_from: Option<String>,
+    /// Local destination path on this node (when `to` is local), for live revocation checks.
+    pub transfer_local_to: Option<String>,
+    /// Whether the transfer removes the source (`move: true`).
+    pub transfer_move: bool,
     /// Whether the job marks this machine busy while running.
     pub exclusive: bool,
 }
@@ -301,6 +538,11 @@ pub async fn create_transfer_job(
             env_names: Vec::new(),
             principal: spec.principal,
             device: spec.device,
+            pairing_id: spec.pairing_id,
+            transfer_paths: spec.transfer_paths,
+            transfer_local_from: spec.transfer_local_from,
+            transfer_local_to: spec.transfer_local_to,
+            transfer_move: spec.transfer_move,
             created: created.clone(),
             boot_id,
             exclusive: spec.exclusive,
@@ -785,6 +1027,7 @@ where
     let state_dir = ctx.paths().state_dir().to_path_buf();
     let principal = ctx.principal().to_owned();
     let device = ctx.device().map(str::to_owned);
+    let pairing_id = ctx.pairing_id().map(str::to_owned);
 
     // Ensure `<state dir>` exists before taking the node-wide jobs lock.
     let state_dir_for_prepare = state_dir.clone();
@@ -893,6 +1136,11 @@ where
             env_names,
             principal,
             device,
+            pairing_id,
+            transfer_paths: Vec::new(),
+            transfer_local_from: None,
+            transfer_local_to: None,
+            transfer_move: false,
             created: store::format_timestamp(now),
             boot_id,
             exclusive: args.exclusive,
@@ -1217,6 +1465,9 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<JobList, ToolError> {
     let mut jobs = Vec::new();
     let mut truncated = false;
     for (dir, record) in records {
+        if !can_see_job(ctx, &record) {
+            continue;
+        }
         let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
         if filter_state.is_some_and(|want| derived.state != want) {
             continue;
@@ -1249,12 +1500,11 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<JobList, ToolError> {
 
 async fn status(ctx: &Ctx, args: StatusArgs) -> Result<JobStatus, ToolError> {
     validate_job_id(&args.id)?;
-    let state_dir = ctx.paths().state_dir().to_path_buf();
-    load_status_async(&state_dir, &args.id).await
+    load_status_for_ctx(ctx, &args.id).await
 }
 
-async fn load_status_async(state_dir: &Path, id: &str) -> Result<JobStatus, ErrorBody> {
-    let dir = job_dir(state_dir, id);
+async fn load_status_for_ctx(ctx: &Ctx, id: &str) -> Result<JobStatus, ErrorBody> {
+    let dir = job_dir(ctx.paths().state_dir(), id);
     let dir_for_read = dir.clone();
     let id_for_read = id.to_owned();
     let (record, boot, progress_file) = blocking("job.status", move || {
@@ -1264,6 +1514,9 @@ async fn load_status_async(state_dir: &Path, id: &str) -> Result<JobStatus, Erro
         Ok((record, boot, progress))
     })
     .await?;
+    if !can_see_job(ctx, &record) {
+        return Err(not_found_job(id));
+    }
 
     let now = jiff::Timestamp::now();
     let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
@@ -1343,6 +1596,9 @@ async fn read_logs(ctx: &Ctx, args: LogsArgs) -> Result<JobLogs, ToolError> {
         Ok((record, boot))
     })
     .await?;
+    if !can_see_job(ctx, &record) {
+        return Err(not_found_job(&id));
+    }
 
     let derived = derive_status_async(&dir, &record, boot.as_deref(), jiff::Timestamp::now()).await;
     let actively_writing = derived.supervised == Some(true);
@@ -1369,7 +1625,6 @@ async fn read_logs(ctx: &Ctx, args: LogsArgs) -> Result<JobLogs, ToolError> {
 async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
     validate_job_id(&args.id)?;
     let timeout = wait_timeout_of(args.timeout_s)?;
-    let state_dir = ctx.paths().state_dir().to_path_buf();
     let id = args.id;
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1377,7 +1632,7 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
     let mut last_progress: Option<JobProgress> = None;
 
     loop {
-        let current = load_status_async(&state_dir, &id).await?;
+        let current = load_status_for_ctx(ctx, &id).await?;
         if let Some(ref progress) = current.progress
             && last_progress.as_ref() != Some(progress)
         {
@@ -1417,8 +1672,26 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
 async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> {
     validate_job_id(&args.id)?;
     let state_dir = ctx.paths().state_dir().to_path_buf();
-    let id = args.id;
-    let dir = job_dir(&state_dir, &id);
+    let dir = job_dir(&state_dir, &args.id);
+    let dir_for_check = dir.clone();
+    let id_for_check = args.id.clone();
+    let record = blocking("job.cancel", move || {
+        read_job_record(&dir_for_check, &id_for_check)
+    })
+    .await?;
+    if !can_see_job(ctx, &record) {
+        return Err(not_found_job(&args.id));
+    }
+    cancel_job_internal(&state_dir, &args.id, args.force).await
+}
+
+async fn cancel_job_internal(
+    state_dir: &Path,
+    id: &str,
+    force: bool,
+) -> Result<CancelledJob, ErrorBody> {
+    let id = id.to_owned();
+    let dir = job_dir(state_dir, &id);
 
     let dir_for_read = dir.clone();
     let id_for_read = id.clone();
@@ -1432,7 +1705,7 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
         .as_deref()
         .is_none_or(|cur| procid::same_boot(&initial_record.boot_id, cur));
 
-    let stop_grace = if args.force {
+    let stop_grace = if force {
         Duration::ZERO
     } else {
         Duration::from_secs(1)
@@ -1510,7 +1783,7 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
     let dir_for_cancel = dir.clone();
     blocking("job.cancel", move || write_cancel_request(&dir_for_cancel)).await?;
 
-    if !args.force {
+    if !force {
         let deadline = Instant::now() + CANCEL_GRACE;
         loop {
             let probe_dir = dir.clone();

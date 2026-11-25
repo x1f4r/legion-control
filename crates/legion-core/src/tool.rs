@@ -48,9 +48,11 @@ pub trait Tool: Send + Sync + 'static {
         &self,
         policy: &Policy,
         principal: &str,
+        pairing_id: Option<&str>,
         paths: &Paths,
         _args: &Value,
     ) -> Result<Grant, ErrorBody> {
+        let _ = pairing_id;
         policy.authorize(principal, self.spec(), paths)
     }
 

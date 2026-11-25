@@ -149,7 +149,8 @@ pub enum JobKind {
 /// Progress snapshot reported for a transfer job.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct JobProgress {
-    /// Bytes moved so far (monotonic within one run).
+    /// Bytes moved so far (monotonic within one attempt; resets if a stale partial restarts from
+    /// offset 0 on a new attempt).
     pub bytes_done: u64,
     /// Total bytes expected across the transfer, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +165,10 @@ pub struct JobProgress {
     pub current: Option<String>,
     /// Recent transfer rate in bytes per second.
     pub rate: u64,
+    /// 1-based attempt number, included when a file transfer restarted from offset 0 (such as
+    /// after a stale partial failed hash verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
 }
 
 /// On-disk progress snapshot stored in `<state dir>/jobs/<id>/progress.json`.
@@ -198,6 +203,16 @@ pub(super) struct JobRecord {
     pub principal: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transfer_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_local_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_local_to: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transfer_move: bool,
     pub created: String,
     pub boot_id: String,
     #[serde(default)]
@@ -405,18 +420,23 @@ pub(super) fn cut_chars(text: &str, max: usize) -> String {
     }
 }
 
+/// Returns the standard `not_found` error for a missing or hidden job id.
+pub(super) fn not_found_job(id: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::NotFound,
+        format!("There is no job with id {id:?} on this machine."),
+    )
+    .with_hint("Run `job.list` to see the jobs recorded on this node.")
+    .with_details(json!({"id": id}))
+}
+
 /// Reads `<job_dir>/job.json`, returning `not_found` with a hint to `job.list` when absent.
 pub(super) fn read_job_record(dir: &Path, id: &str) -> Result<JobRecord, ErrorBody> {
     let path = dir.join(JOB_FILE);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Err(ErrorBody::new(
-                ErrorCode::NotFound,
-                format!("There is no job with id {id:?} on this machine."),
-            )
-            .with_hint("Run `job.list` to see the jobs recorded on this node.")
-            .with_details(json!({"id": id})));
+            return Err(not_found_job(id));
         }
         Err(err) => {
             return Err(ErrorBody::new(
@@ -1214,12 +1234,14 @@ pub(super) fn exclusive_running_jobs_in(state_dir: &Path) -> Result<Vec<Exclusiv
 }
 
 /// Returns the IDs of active (`starting` or `running`) background jobs under `state_dir` that
-/// were started by paired device `device` (or without a device tag under `principal`).
+/// were started by paired device `device` / `pairing_id` (or without a device tag under
+/// `principal`).
 ///
 /// Pure read: never creates, modifies, or stops any job.
 pub(super) fn running_job_ids_for_device_in(
     state_dir: &Path,
     device: &str,
+    pairing_id: Option<&str>,
     principal: &str,
 ) -> Vec<String> {
     let Ok(records) = load_all_records(state_dir) else {
@@ -1229,11 +1251,7 @@ pub(super) fn running_job_ids_for_device_in(
     let now = jiff::Timestamp::now();
     let mut active: Vec<(String, String)> = Vec::new();
     for (dir, record) in records {
-        let matches = match record.device.as_deref() {
-            Some(recorded_device) => recorded_device == device,
-            None => record.principal == principal,
-        };
-        if !matches {
+        if !job_matches_device(&record, device, pairing_id, principal) {
             continue;
         }
         let status = derive_status(&dir, &record, current_boot.as_deref(), now);
@@ -1243,6 +1261,21 @@ pub(super) fn running_job_ids_for_device_in(
     }
     active.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     active.into_iter().map(|(_, id)| id).collect()
+}
+
+pub(super) fn job_matches_device(
+    record: &JobRecord,
+    device: &str,
+    pairing_id: Option<&str>,
+    principal: &str,
+) -> bool {
+    match (pairing_id, record.pairing_id.as_deref()) {
+        (Some(want), Some(got)) => want == got,
+        _ => match record.device.as_deref() {
+            Some(recorded_device) => recorded_device == device,
+            None => record.principal == principal,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1262,6 +1295,11 @@ mod tests {
             env_names: Vec::new(),
             principal: "owner".to_owned(),
             device: None,
+            pairing_id: None,
+            transfer_paths: Vec::new(),
+            transfer_local_from: None,
+            transfer_local_to: None,
+            transfer_move: false,
             created: created.to_owned(),
             boot_id: boot_id.to_owned(),
             exclusive: false,
