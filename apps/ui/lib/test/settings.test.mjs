@@ -17,6 +17,7 @@ import {
   findIncomingDevice,
   formatDeviceRemovedNotice,
   formatDisagreementNotice,
+  formatIncomingDeviceSubtitle,
   formatInvitedDeviceSyncNotice,
   formatLearnRejectionTechnical,
   formatPairSyncNotice,
@@ -700,4 +701,49 @@ test('describeConnectionRoute and buildRelayedConnections never show Through or 
     [['pi', 'studio']],
   );
   assert.equal(describeConnectionRoute(resolvedRelayed[0], false).label, 'through studio');
+});
+
+test('formatIncomingDeviceSubtitle highlights unconfirmed devices as Pairing not finished', () => {
+  assert.equal(
+    formatIncomingDeviceSubtitle(
+      {
+        id: '0123456789abcdef0123456789abcdef',
+        name: 'Pixel 10',
+        principal: 'device:pixel-10',
+        role: 'operator',
+        unconfirmed: true,
+      },
+      { technical: false, relativeTime: '2m ago' },
+    ),
+    'Pairing not finished · paired 2m ago',
+  );
+  assert.equal(
+    formatIncomingDeviceSubtitle(
+      {
+        id: '0123456789abcdef0123456789abcdef',
+        name: 'Pixel 10',
+        principal: 'device:pixel-10',
+        role: 'operator',
+        unconfirmed: true,
+      },
+      { technical: true, relativeTime: '2m ago' },
+    ),
+    'Pairing not finished · device:pixel-10 · operator · paired 2m ago',
+  );
+  // Confirmed devices (or entries from older machines omitting `unconfirmed`) keep normal wording.
+  assert.equal(
+    formatIncomingDeviceSubtitle(
+      {
+        name: 'Pixel 10',
+        principal: 'device:pixel-10',
+        role: 'operator',
+      },
+      {
+        roleDescriptions: { operator: 'view, edit, run commands and restart' },
+        technical: false,
+        relativeTime: '5m ago',
+      },
+    ),
+    'View, edit, run commands and restart · paired 5m ago',
+  );
 });

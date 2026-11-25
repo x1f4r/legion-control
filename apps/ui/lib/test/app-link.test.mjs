@@ -2004,3 +2004,296 @@ test('createAppLink keeps local desktop machine direct, rewrites local relay hop
     }
   }
 });
+
+test('createAppLink pair() forwards AbortSignal to cancel_pair and rejects when already aborted', async () => {
+  const prevWindow = globalThis.window;
+  const commands = [];
+  let rejectPair;
+
+  globalThis.window = {
+    __TAURI__: {
+      core: {
+        invoke(command) {
+          commands.push(command);
+          if (command === 'pair') {
+            return new Promise((_resolve, reject) => {
+              rejectPair = reject;
+            });
+          }
+          if (command === 'cancel_pair') {
+            rejectPair?.({ code: 'cancelled', message: 'Pairing with tower was cancelled.' });
+            return Promise.resolve({});
+          }
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+
+    // Already-aborted signal rejects before invoking `pair`.
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await assert.rejects(
+      () => link.pair('legion-invite-1.abc', 'phone', { signal: preAborted.signal }),
+      { code: 'cancelled' },
+    );
+    assert.deepEqual(commands, []);
+
+    // Aborting mid-flight invokes `cancel_pair` and surfaces `cancelled`.
+    const controller = new AbortController();
+    const pending = link.pair('legion-invite-1.abc', 'phone', { signal: controller.signal });
+    await Promise.resolve();
+    controller.abort();
+    await assert.rejects(() => pending, { code: 'cancelled' });
+    assert.deepEqual(commands, ['pair', 'cancel_pair']);
+  } finally {
+    if (prevWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = prevWindow;
+    }
+  }
+});
+
+test('debug media check reports separate pairing and media stages and tags pairing failures cleanly', async () => {
+  const prevWindow = globalThis.window;
+  const prevDocument = globalThis.document;
+  const prevImage = globalThis.Image;
+
+  const reports = [];
+  let pairDoneResolve;
+  const pairDone = new Promise((r) => {
+    pairDoneResolve = r;
+  });
+  let finalResolve;
+  const finalSeen = new Promise((r) => {
+    finalResolve = r;
+  });
+  let paired = false;
+
+  globalThis.Image = class FakeImage {
+    constructor() {
+      this.naturalWidth = 16;
+      this.naturalHeight = 16;
+      this.onload = null;
+    }
+    set src(_v) {
+      queueMicrotask(() => this.onload?.());
+    }
+    decode() {
+      return Promise.resolve();
+    }
+  };
+
+  globalThis.document = {
+    visibilityState: 'visible',
+    body: { appendChild() {} },
+    addEventListener() {},
+    removeEventListener() {},
+    createElement() {
+      const vListeners = new Map();
+      return {
+        style: {},
+        videoWidth: 64,
+        videoHeight: 64,
+        duration: 3,
+        currentTime: 0,
+        setAttribute() {},
+        removeAttribute() {},
+        pause() {},
+        load() {},
+        remove() {},
+        addEventListener(name, fn) {
+          if (!vListeners.has(name)) vListeners.set(name, new Set());
+          vListeners.get(name).add(fn);
+        },
+        removeEventListener(name, fn) {
+          vListeners.get(name)?.delete(fn);
+        },
+        set src(_v) {
+          queueMicrotask(() => {
+            for (const fn of [...(vListeners.get('loadeddata') || [])]) fn();
+          });
+        },
+      };
+    },
+  };
+
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    addEventListener() {},
+    removeEventListener() {},
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          if (command === 'state') {
+            return Promise.resolve(
+              paired
+                ? { ready: true, nodes: [{ node: 'tower' }] }
+                : { ready: false, nodes: [], needs: 'pairing' },
+            );
+          }
+          if (command === 'ready') return Promise.resolve();
+          if (command === 'media_check_spec') {
+            return Promise.resolve({
+              machine: 'tower',
+              invite: 'legion-invite-1.fake',
+              image_path: '/home/me/a.png',
+              video_path: '/home/me/b.mp4',
+              verify_resume: false,
+            });
+          }
+          if (command === 'pair') {
+            paired = true;
+            return Promise.resolve({ ready: true, nodes: [{ node: 'tower' }] });
+          }
+          if (command === 'call' && payload.tool === 'meta.whoami') {
+            return Promise.resolve({ node: 'tower', principal: 'device:ci-media', role: 'operator', tools: [] });
+          }
+          if (command === 'call' && payload.tool === 'meta.version') {
+            return Promise.resolve({ version: '0.1.0', protocol: 1 });
+          }
+          if (command === 'content_url') {
+            return Promise.resolve({
+              url: `http://127.0.0.1:49999/v1/content/tok/${payload.path.split('/').pop()}`,
+              expires_in: 900,
+            });
+          }
+          if (command === 'media_check_report') {
+            reports.push(payload.report);
+            if (payload.report.stage === 'media' && payload.report.pair_ok === true) {
+              pairDoneResolve(payload.report);
+            }
+            if (payload.report.stage === 'done' || payload.report.error) {
+              finalResolve(payload.report);
+            }
+            return Promise.resolve();
+          }
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    await link.state();
+    await pairDone;
+    const finalReport = await finalSeen;
+
+    assert.equal(reports.length, 3);
+    assert.equal(reports[0].stage, 'pairing');
+    assert.equal(reports[0].pair_ok, false);
+    assert.equal(reports[0].error, null);
+    assert.equal(reports[1].stage, 'media');
+    assert.equal(reports[1].pair_ok, true);
+    assert.equal(reports[1].ok, false);
+    assert.equal(finalReport.stage, 'done');
+    assert.equal(finalReport.pair_ok, true);
+    assert.equal(finalReport.ok, true);
+
+    // Pairing failure must report stage='pairing' and pair_ok=false.
+    const failReports = [];
+    let failResolve;
+    const failSeen = new Promise((r) => {
+      failResolve = r;
+    });
+    paired = false;
+    globalThis.window.__TAURI__.core.invoke = (command, payload) => {
+      if (command === 'state') return Promise.resolve({ ready: false, nodes: [], needs: 'pairing' });
+      if (command === 'ready') return Promise.resolve();
+      if (command === 'media_check_spec') {
+        return Promise.resolve({
+          machine: 'tower',
+          invite: 'legion-invite-1.fake',
+          image_path: '/home/me/a.png',
+          video_path: '/home/me/b.mp4',
+          verify_resume: false,
+        });
+      }
+      if (command === 'pair') {
+        return Promise.reject({
+          code: 'timeout',
+          message: 'Timed out waiting for tower to confirm enrolment after 45s.',
+        });
+      }
+      if (command === 'media_check_report') {
+        failReports.push(payload.report);
+        if (payload.report.error) failResolve(payload.report);
+        return Promise.resolve();
+      }
+      return Promise.resolve({});
+    };
+    const failLink = createAppLink();
+    await failLink.state();
+    const failReport = await failSeen;
+    assert.equal(failReport.stage, 'pairing');
+    assert.equal(failReport.pair_ok, false);
+    assert.equal(failReport.ok, false);
+    assert.match(failReport.error, /45s/);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevDocument === undefined) delete globalThis.document;
+    else globalThis.document = prevDocument;
+    if (prevImage === undefined) delete globalThis.Image;
+    else globalThis.Image = prevImage;
+  }
+});
+
+test('createAppLink restorePairing() invokes restore_pairing with existingPrincipal and refreshes state', async () => {
+  const prevWindow = globalThis.window;
+  const calls = [];
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'restore_pairing') {
+            return Promise.resolve({
+              ready: true,
+              nodes: [{ node: 'tower' }],
+              last_paired: { node: 'tower', device: 'phone', role: 'operator', synced: [], not_synced: [] },
+            });
+          }
+          if (command === 'state') {
+            return Promise.resolve({ ready: true, nodes: [{ node: 'tower', via: 'ssh' }] });
+          }
+          if (command === 'call' && payload?.tool === 'meta.whoami') {
+            return Promise.resolve({ node: 'tower', principal: 'device:phone', role: 'operator', tools: [] });
+          }
+          if (command === 'call' && payload?.tool === 'meta.version') {
+            return Promise.resolve({ version: '0.1.0', protocol: 1 });
+          }
+          return Promise.resolve({});
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    const res = await link.restorePairing('legion-invite-1.fake', 'device:phone', 'phone');
+    assert.equal(res.ready, true);
+    assert.equal(res.last_paired?.node, 'tower');
+    assert.deepEqual(calls[0], {
+      command: 'restore_pairing',
+      payload: {
+        invite: 'legion-invite-1.fake',
+        existingPrincipal: 'device:phone',
+        name: 'phone',
+      },
+    });
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+  }
+});

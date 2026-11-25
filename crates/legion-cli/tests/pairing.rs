@@ -179,8 +179,9 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         generate_ed25519_keypair(sshd.ssh_keygen_bin(), &device_key, "phone@controller").unwrap();
     let expected_fp = key_fingerprint(sshd.ssh_keygen_bin(), &device_pub_path).unwrap();
 
-    // 3a. Refusal checks over real ssh: enrolling the invite's own temporary key or an already-present
-    //     foreign key must fail cleanly and leave the invite usable.
+    // 3a. Refusal checks over real ssh: enrolling the invite's own temporary key returns `denied`
+    //     and leaves the invite usable; enrolling an already-present foreign key returns `conflict`
+    //     and immediately consumes the invite so it cannot be probed repeatedly for other keys.
     let temp_pub = ed25519_public_key_from_seed(&seed);
     for (bad_pub, expected_code) in [(&temp_pub, "denied"), (&foreign_pub, "conflict")] {
         let bad_line = json!({
@@ -212,9 +213,40 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         assert_eq!(reply["ok"], json!(false));
         assert_eq!(reply["error"]["code"], json!(expected_code));
     }
+    let after_conflict_list = home.run(&["device.list"]).json();
+    assert_eq!(
+        after_conflict_list["invites"].as_array().unwrap().len(),
+        0,
+        "conflict must consume the invite from state/devices.json: {after_conflict_list}"
+    );
+    let reuse_after_conflict = sshd
+        .ssh_command(&temp_key, &known_hosts)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        !reuse_after_conflict.status.success(),
+        "conflict-consumed invite key unexpectedly still authenticated"
+    );
 
-    // 3b. Connect over real ssh using the temporary key and pass an arbitrary remote command (`id`)
-    //    to confirm `legion gate --enrol` ignores SSH_ORIGINAL_COMMAND and completes enrolment.
+    // 3b. Mint a fresh invite, connect over real ssh using the temporary key and pass an arbitrary
+    //     remote command (`id`) to confirm `legion gate --enrol` ignores SSH_ORIGINAL_COMMAND and
+    //     completes enrolment.
+    let invite_run = home.run(&[
+        "device.invite",
+        "principal=phone",
+        "host=127.0.0.1",
+        &format!("port={}", sshd.port()),
+        &format!("user={}", sshd.user()),
+    ]);
+    assert_eq!(
+        invite_run.code, 0,
+        "second device.invite failed: stdout={} stderr={}",
+        invite_run.stdout, invite_run.stderr
+    );
+    let payload = InvitePayload::decode(invite_run.json()["invite"].as_str().unwrap()).unwrap();
+    let seed = payload.decode_seed().unwrap();
+    write_openssh_ed25519_private_key(&temp_key, &seed, "invite-2").unwrap();
     let enrol_line = json!({
         "enrol": 1,
         "id": payload.id,

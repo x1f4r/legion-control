@@ -7,14 +7,14 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use legion_core::CancellationToken;
 use legion_core::policy::expand_tilde;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 /// Timeout for one `ssh-keyscan` probe against local `sshd`.
 const KEYSCAN_TIMEOUT: Duration = Duration::from_secs(7);
@@ -257,6 +257,20 @@ pub fn fingerprint_key_b64(key_b64: &str) -> Option<String> {
     Some(fingerprint_blob(&blob))
 }
 
+/// Computes sorted, deduplicated `SHA256:...` fingerprints for a slice of OpenSSH public host keys
+/// (`"<type> <base64>[ comment]"`).
+pub fn host_key_fingerprints(host_keys: &[String]) -> Vec<String> {
+    let mut fps = BTreeSet::new();
+    for raw in host_keys {
+        if let Some(key_b64) = raw.split_whitespace().nth(1)
+            && let Some(fp) = fingerprint_key_b64(key_b64)
+        {
+            fps.insert(fp);
+        }
+    }
+    fps.into_iter().collect()
+}
+
 /// Strictly validated `ssh-ed25519` public key ready to be written to `authorized_keys`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidatedEd25519Key {
@@ -266,6 +280,8 @@ pub struct ValidatedEd25519Key {
     pub key_b64: String,
     /// Raw 51-byte OpenSSH wire blob (`u32(11) || "ssh-ed25519" || u32(32) || pk`).
     pub wire_blob: [u8; ED25519_WIRE_BLOB_LEN],
+    /// Raw 32-byte Ed25519 public key point.
+    pub public_key_bytes: [u8; 32],
     /// `SHA256:...` fingerprint matching `ssh-keygen -l`.
     pub fingerprint: String,
 }
@@ -377,8 +393,245 @@ pub fn validate_ed25519_public_key(raw: &str) -> Result<ValidatedEd25519Key, Err
         canonical: format!("ssh-ed25519 {canonical_b64}"),
         key_b64: canonical_b64,
         wire_blob,
+        public_key_bytes: pk_bytes,
         fingerprint: fingerprint_blob(&blob),
     })
+}
+
+/// OpenSSH `SSHSIG` namespace used for enrolment proof-of-possession signatures.
+pub const ENROL_PROOF_NAMESPACE: &str = "legion-enrol";
+
+/// Fixed prefix of the canonical enrolment proof message.
+pub const ENROL_PROOF_PREFIX: &str = "legion-enrol-proof-v1";
+
+/// Maximum accepted byte length of an OpenSSH `SSHSIG` PEM proof string.
+const MAX_ENROL_PROOF_LEN: usize = 1024;
+
+const SSHSIG_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+const SSHSIG_END: &str = "-----END SSH SIGNATURE-----";
+const SSHSIG_MAGIC: &[u8; 6] = b"SSHSIG";
+const SSHSIG_VERSION: u32 = 1;
+
+/// Builds the canonical enrolment proof-of-possession message binding the fixed prefix, invite id,
+/// canonical device public key (`"ssh-ed25519 <base64>"`), node name, and sorted deduplicated
+/// pinned host-key fingerprints.
+pub fn enrol_proof_message(
+    invite_id: &str,
+    canonical_public_key: &str,
+    node: &str,
+    host_key_fingerprints: &[String],
+) -> Vec<u8> {
+    let mut fps: BTreeSet<&str> = BTreeSet::new();
+    for fp in host_key_fingerprints {
+        let trimmed = fp.trim();
+        if !trimmed.is_empty() {
+            fps.insert(trimmed);
+        }
+    }
+    let joined: Vec<&str> = fps.into_iter().collect();
+    format!(
+        "{ENROL_PROOF_PREFIX}\nid={invite_id}\npublic_key={canonical_public_key}\nnode={node}\nhost_keys={}\n",
+        joined.join(",")
+    )
+    .into_bytes()
+}
+
+fn push_ssh_string(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_ssh_string<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
+    if input.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    *input = &input[4..];
+    if input.len() < len {
+        return None;
+    }
+    let (head, tail) = input.split_at(len);
+    *input = tail;
+    Some(head)
+}
+
+/// Strictly verifies an OpenSSH `SSHSIG` PEM proof of possession for `expected_key`, bound to
+/// `invite_id`, `node`, and `host_key_fingerprints` under namespace [`ENROL_PROOF_NAMESPACE`].
+///
+/// Any malformed armor, wrong namespace/version/key, mismatched invite or machine binding, or
+/// cryptographic verification failure returns `ErrorCode::Denied`.
+pub fn verify_enrol_proof(
+    proof_pem: &str,
+    invite_id: &str,
+    expected_key: &ValidatedEd25519Key,
+    node: &str,
+    host_key_fingerprints: &[String],
+) -> Result<(), ErrorBody> {
+    let denied = |reason: &str| {
+        ErrorBody::new(
+            ErrorCode::Denied,
+            format!("Enrolment proof of possession is invalid: {reason}."),
+        )
+        .with_hint(
+            "Sign the enrolment proof with the device's Ed25519 private key in OpenSSH SSHSIG format (namespace `legion-enrol`).",
+        )
+    };
+
+    if host_key_fingerprints.is_empty() {
+        return Err(denied(
+            "this invite does not record pinned host keys for proof verification",
+        ));
+    }
+    if proof_pem.is_empty() || proof_pem.len() > MAX_ENROL_PROOF_LEN {
+        return Err(denied("proof is empty or exceeds maximum length"));
+    }
+
+    let trimmed = proof_pem.trim();
+    let rest = trimmed
+        .strip_prefix(SSHSIG_BEGIN)
+        .ok_or_else(|| denied("missing SSHSIG BEGIN header"))?;
+    let body_raw = rest
+        .strip_suffix(SSHSIG_END)
+        .ok_or_else(|| denied("missing SSHSIG END footer"))?;
+    let body_b64: String = body_raw
+        .chars()
+        .filter(|c| !matches!(c, '\r' | '\n' | ' ' | '\t'))
+        .collect();
+    if body_b64.is_empty() {
+        return Err(denied("empty SSHSIG body"));
+    }
+    let blob = STANDARD
+        .decode(&body_b64)
+        .map_err(|_| denied("SSHSIG body is not valid base64"))?;
+    let mut cursor = blob.as_slice();
+
+    if cursor.len() < SSHSIG_MAGIC.len() + 4 {
+        return Err(denied("truncated SSHSIG header"));
+    }
+    if &cursor[..6] != SSHSIG_MAGIC {
+        return Err(denied("invalid SSHSIG magic preamble"));
+    }
+    cursor = &cursor[6..];
+    let version = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+    cursor = &cursor[4..];
+    if version != SSHSIG_VERSION {
+        return Err(denied("unsupported SSHSIG version"));
+    }
+
+    let pubkey_blob = read_ssh_string(&mut cursor).ok_or_else(|| denied("truncated public key"))?;
+    if pubkey_blob != expected_key.wire_blob.as_slice() {
+        return Err(denied(
+            "proof public key does not match the submitted device public key",
+        ));
+    }
+    let namespace = read_ssh_string(&mut cursor).ok_or_else(|| denied("truncated namespace"))?;
+    if namespace != ENROL_PROOF_NAMESPACE.as_bytes() {
+        return Err(denied("proof namespace must be `legion-enrol`"));
+    }
+    let reserved =
+        read_ssh_string(&mut cursor).ok_or_else(|| denied("truncated reserved field"))?;
+    if !reserved.is_empty() {
+        return Err(denied("unexpected non-empty reserved field"));
+    }
+    let hash_alg =
+        read_ssh_string(&mut cursor).ok_or_else(|| denied("truncated hash algorithm"))?;
+    let sig_blob = read_ssh_string(&mut cursor).ok_or_else(|| denied("truncated signature"))?;
+    if !cursor.is_empty() {
+        return Err(denied("unexpected trailing bytes in SSHSIG blob"));
+    }
+
+    let mut sig_cursor = sig_blob;
+    let sig_type =
+        read_ssh_string(&mut sig_cursor).ok_or_else(|| denied("truncated signature algorithm"))?;
+    if sig_type != b"ssh-ed25519" {
+        return Err(denied("only ssh-ed25519 proofs are accepted"));
+    }
+    let sig_bytes =
+        read_ssh_string(&mut sig_cursor).ok_or_else(|| denied("truncated signature bytes"))?;
+    if !sig_cursor.is_empty() || sig_bytes.len() != 64 {
+        return Err(denied("invalid Ed25519 signature length"));
+    }
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| denied("invalid Ed25519 signature length"))?;
+    let signature = Signature::from_bytes(&sig_array);
+
+    let msg = enrol_proof_message(
+        invite_id,
+        &expected_key.canonical,
+        node,
+        host_key_fingerprints,
+    );
+    let digest: Vec<u8> = match hash_alg {
+        b"sha512" => Sha512::digest(&msg).to_vec(),
+        b"sha256" => Sha256::digest(&msg).to_vec(),
+        _ => return Err(denied("unsupported SSHSIG hash algorithm")),
+    };
+
+    let mut signed_data = Vec::with_capacity(64 + digest.len());
+    signed_data.extend_from_slice(SSHSIG_MAGIC);
+    push_ssh_string(&mut signed_data, namespace);
+    push_ssh_string(&mut signed_data, reserved);
+    push_ssh_string(&mut signed_data, hash_alg);
+    push_ssh_string(&mut signed_data, &digest);
+
+    let verifying = VerifyingKey::from_bytes(&expected_key.public_key_bytes)
+        .map_err(|_| denied("invalid device Ed25519 public key"))?;
+    verifying
+        .verify_strict(&signed_data, &signature)
+        .map_err(|_| denied("signature verification failed"))
+}
+
+/// Produces an OpenSSH `SSHSIG` PEM enrolment proof signed by `seed` over `invite_id`, `node`,
+/// and `host_key_fingerprints` under namespace [`ENROL_PROOF_NAMESPACE`] with SHA-512.
+pub fn sign_enrol_proof(
+    seed: &[u8; 32],
+    invite_id: &str,
+    node: &str,
+    host_key_fingerprints: &[String],
+) -> String {
+    let signing = SigningKey::from_bytes(seed);
+    let pk_bytes = signing.verifying_key().to_bytes();
+    let wire_blob = encode_ed25519_wire_blob(&pk_bytes);
+    let canonical = format!("ssh-ed25519 {}", STANDARD.encode(wire_blob));
+    let msg = enrol_proof_message(invite_id, &canonical, node, host_key_fingerprints);
+    let digest = Sha512::digest(&msg);
+
+    let mut signed_data = Vec::new();
+    signed_data.extend_from_slice(SSHSIG_MAGIC);
+    push_ssh_string(&mut signed_data, ENROL_PROOF_NAMESPACE.as_bytes());
+    push_ssh_string(&mut signed_data, b"");
+    push_ssh_string(&mut signed_data, b"sha512");
+    push_ssh_string(&mut signed_data, &digest);
+    let signature = signing.sign(&signed_data);
+
+    let mut sig_blob = Vec::new();
+    push_ssh_string(&mut sig_blob, b"ssh-ed25519");
+    push_ssh_string(&mut sig_blob, &signature.to_bytes());
+
+    let mut sshsig = Vec::new();
+    sshsig.extend_from_slice(SSHSIG_MAGIC);
+    sshsig.extend_from_slice(&SSHSIG_VERSION.to_be_bytes());
+    push_ssh_string(&mut sshsig, &wire_blob);
+    push_ssh_string(&mut sshsig, ENROL_PROOF_NAMESPACE.as_bytes());
+    push_ssh_string(&mut sshsig, b"");
+    push_ssh_string(&mut sshsig, b"sha512");
+    push_ssh_string(&mut sshsig, &sig_blob);
+
+    let b64 = STANDARD.encode(&sshsig);
+    let mut pem = String::with_capacity(SSHSIG_BEGIN.len() + SSHSIG_END.len() + b64.len() + 16);
+    pem.push_str(SSHSIG_BEGIN);
+    pem.push('\n');
+    for chunk in b64.as_bytes().chunks(70) {
+        if let Ok(line) = std::str::from_utf8(chunk) {
+            pem.push_str(line);
+            pem.push('\n');
+        }
+    }
+    pem.push_str(SSHSIG_END);
+    pem.push('\n');
+    pem
 }
 
 fn looks_like_second_key_token(token: &str) -> bool {
@@ -1074,5 +1327,100 @@ mod tests {
         let t_expired = t0 + HOST_KEY_CACHE_TTL;
         assert!(cache.get_at(node_a, 22, t_expired).is_none());
         assert!(cache.get_at(node_b, 22, t_expired).is_none());
+    }
+
+    #[test]
+    fn enrol_proof_verifies_valid_signature_and_rejects_wrong_key_invite_machine_or_tampering() {
+        let seed_a = [0x11u8; 32];
+        let seed_b = [0x22u8; 32];
+        let pub_a = ed25519_public_key_from_seed(&seed_a);
+        let key_a = validate_ed25519_public_key(&pub_a).unwrap();
+
+        let hk1 = ed25519_public_key_from_seed(&[0xaa; 32]);
+        let hk2 = ed25519_public_key_from_seed(&[0xbb; 32]);
+        let hk3 = ed25519_public_key_from_seed(&[0xcc; 32]);
+        let fps_12 = host_key_fingerprints(&[hk1.clone(), hk2.clone()]);
+        let fps_21 = host_key_fingerprints(&[hk2, hk1, hk2_dup(&[0xaa; 32])]);
+        let fps_other = host_key_fingerprints(&[hk3]);
+        assert_eq!(fps_12, fps_21);
+
+        let proof = sign_enrol_proof(&seed_a, "inv-001", "tower", &fps_12);
+        assert!(proof.starts_with(SSHSIG_BEGIN));
+        assert!(proof.trim_end().ends_with(SSHSIG_END));
+
+        // 1. Valid proof verifies (regardless of input host-key order).
+        verify_enrol_proof(&proof, "inv-001", &key_a, "tower", &fps_21).unwrap();
+
+        // 2. Wrong signing key -> Denied.
+        let wrong_key_proof = sign_enrol_proof(&seed_b, "inv-001", "tower", &fps_12);
+        let err =
+            verify_enrol_proof(&wrong_key_proof, "inv-001", &key_a, "tower", &fps_12).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // 3. Different invite id -> Denied.
+        let err = verify_enrol_proof(&proof, "inv-002", &key_a, "tower", &fps_12).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // 4. Different node name -> Denied.
+        let err = verify_enrol_proof(&proof, "inv-001", &key_a, "pi", &fps_12).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // 5. Different pinned host keys -> Denied.
+        let err = verify_enrol_proof(&proof, "inv-001", &key_a, "tower", &fps_other).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // 6. Empty recorded host keys -> Denied.
+        let err = verify_enrol_proof(&proof, "inv-001", &key_a, "tower", &[]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // 7. Tampered signature byte -> Denied.
+        let mut tampered = proof.clone();
+        let idx = tampered.find('\n').unwrap() + 10;
+        let replacement = if tampered.as_bytes()[idx] == b'A' {
+            "B"
+        } else {
+            "A"
+        };
+        tampered.replace_range(idx..idx + 1, replacement);
+        let err = verify_enrol_proof(&tampered, "inv-001", &key_a, "tower", &fps_12).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+
+        // 8. Cross-verify with OpenSSH `ssh-keygen -Y verify` when available.
+        if std::process::Command::new("ssh-keygen")
+            .arg("-?")
+            .output()
+            .is_ok()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let allowed = dir.path().join("allowed_signers");
+            let sig_path = dir.path().join("proof.sig");
+            std::fs::write(&allowed, format!("device {}\n", key_a.canonical)).unwrap();
+            std::fs::write(&sig_path, &proof).unwrap();
+            let msg = enrol_proof_message("inv-001", &key_a.canonical, "tower", &fps_12);
+            let mut child = std::process::Command::new("ssh-keygen")
+                .args(["-Y", "verify", "-f"])
+                .arg(&allowed)
+                .args(["-I", "device", "-n", ENROL_PROOF_NAMESPACE, "-s"])
+                .arg(&sig_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(&msg).unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "ssh-keygen -Y verify rejected sign_enrol_proof output: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    fn hk2_dup(seed: &[u8; 32]) -> String {
+        ed25519_public_key_from_seed(seed)
     }
 }

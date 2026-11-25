@@ -6,6 +6,7 @@ on:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
       - 'rust-toolchain.toml'
   pull_request:
@@ -13,6 +14,7 @@ on:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
       - 'rust-toolchain.toml'
   workflow_dispatch:
@@ -995,211 +997,22 @@ jobs:
           echo "Selected iPhone: $IPHONE_NAME ($IPHONE_UDID)"
           echo "Selected iPad: $IPAD_NAME ($IPAD_UDID)"
 
-          # A simulator on a loaded runner can take well over half a minute to hand back a picture.
-          # Each attempt is bounded, and three failed attempts fail the job with a clear message.
-          shoot() {
-            local udid="$1" out="$2" attempt
-            for attempt in 1 2 3; do
-              if perl -e 'alarm 90; exec @ARGV' xcrun simctl io "$udid" screenshot "$out" && [ -s "$out" ]; then
-                return 0
-              fi
-              echo "screenshot attempt $attempt for $out did not finish in time; trying again" >&2
-              rm -f "$out"
-              sleep 5
-            done
-            echo "could not take $out after three attempts" >&2
-            return 1
-          }
-
-          run_simulator_once() {
-            local kind="$1"
-            local udid="$2"
-            local dev_name="$3"
-            local attempt="$4"
-
-            echo "=== Running on $kind ($dev_name / $udid) [attempt $attempt/2] ==="
-            xcrun simctl boot "$udid" || true
-            if ! perl -e 'alarm 480; exec @ARGV' xcrun simctl bootstatus "$udid" -b; then
-              echo "Simulator $kind ($udid) failed to boot on attempt $attempt" >&2
-              xcrun simctl shutdown "$udid" || true
-              return 2
-            fi
-            xcrun simctl install "$udid" "$SIM_APP" || return 1
-
-            local data_dir ready_file media_work media_spec media_out stdout_log stderr_log
-            data_dir="$(xcrun simctl get_app_container "$udid" com.x1f4r.legion data)" || return 1
-            mkdir -p "$data_dir/tmp" || return 1
-            ready_file="$data_dir/tmp/legion-ready.txt"
-            media_work="$RUNNER_TEMP/ios-media-${kind}"
-            media_spec="$data_dir/tmp/media-check.json"
-            media_out="$data_dir/tmp/media-result.json"
-            stdout_log="$RUNNER_TEMP/legion-${kind}-stdout.log"
-            stderr_log="$RUNNER_TEMP/legion-${kind}-stderr.log"
-            rm -rf "$media_work" "$ready_file" "$media_spec" "$media_out" "$stdout_log" "$stderr_log"
-
-            node scripts/ci-media-fixture.mjs ssh \
-              --work "$media_work" \
-              --legion "$LEGION_BIN" \
-              --host 127.0.0.1 \
-              --verify-resume \
-              --out "$media_out" >/dev/null || return 1
-            cp "$media_work/media-check.json" "$media_spec" || return 1
-
-            xcrun simctl ui "$udid" appearance dark || true
-            local launch_out app_pid
-            launch_out="$(SIMCTL_CHILD_LEGION_APP_READY_FILE="$ready_file" \
-              SIMCTL_CHILD_LEGION_APP_MEDIA_CHECK_FILE="$media_spec" \
-              SIMCTL_CHILD_LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS=1 \
-              xcrun simctl launch --stdout="$stdout_log" --stderr="$stderr_log" "$udid" com.x1f4r.legion)" || {
-              echo "Failed to launch Legion on $kind simulator (attempt $attempt)" >&2
-              if [ -f "$media_work/sshd.pid" ]; then kill "$(cat "$media_work/sshd.pid")" 2>/dev/null || true; fi
-              xcrun simctl shutdown "$udid" || true
-              return 2
-            }
-            echo "$launch_out"
-            app_pid="$(printf '%s\n' "$launch_out" | awk '{print $2}')"
-
-            local found=0
-            local media_ok=0
-            local media_failed=0
-            local resume_ok=0
-            local app_exited=0
-            for i in $(seq 1 90); do
-              if [ "$found" -eq 0 ]; then
-                if [ -f "$ready_file" ] && grep -q "legion-app: interface ready" "$ready_file"; then
-                  echo "$kind interface ready (file) after ${i}s: $(cat "$ready_file")"
-                  found=1
-                elif [ -f "$stdout_log" ] && grep -q "legion-app: interface ready" "$stdout_log"; then
-                  echo "$kind interface ready (stdout) after ${i}s"
-                  found=1
-                fi
-              fi
-              if [ "$media_ok" -eq 0 ] && [ -f "$media_out" ]; then
-                cat "$media_out"
-                if node -e 'const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.exit(r.ok && r.image_width > 0 && r.video_width > 0 && r.ipc_isolation_ok === true ? 0 : 1);' "$media_out"; then
-                  media_ok=1
-                else
-                  media_failed=1
-                  break
-                fi
-              fi
-              if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ]; then
-                break
-              fi
-              if [ -n "$app_pid" ] && ! kill -0 "$app_pid" 2>/dev/null; then
-                echo "$kind app process $app_pid exited after ${i}s"
-                app_exited=1
-                break
-              fi
-              sleep 1
-            done
-
-            if [ "$found" -eq 1 ] && [ "$media_ok" -eq 1 ]; then
-              if bash scripts/ios-sim-resume.sh \
-                --kind "$kind" \
-                --udid "$udid" \
-                --media-out "$media_out" \
-                --app-pid "$app_pid" \
-                --cycles 3 \
-                --wait-secs 30 \
-                --frontmost-timeout 20; then
-                resume_ok=1
-              else
-                media_failed=1
-              fi
-            fi
-
-            if [ -f "$media_work/sshd.pid" ]; then
-              kill "$(cat "$media_work/sshd.pid")" 2>/dev/null || true
-            fi
-            echo "--- $kind stdout ---"
-            cat "$stdout_log" || true
-            echo "--- $kind stderr ---"
-            cat "$stderr_log" || true
-            if [ "$found" -ne 1 ] || [ "$media_ok" -ne 1 ] || [ "$resume_ok" -ne 1 ]; then
-              local missing_stage="unknown"
-              if [ "$app_exited" -eq 1 ]; then
-                missing_stage="app process exited before initial check completed"
-              elif [ "$found" -ne 1 ]; then
-                missing_stage="interface ready"
-              elif [ "$media_ok" -ne 1 ]; then
-                missing_stage="initial media check"
-              else
-                missing_stage="post-resume check"
-              fi
-              echo "Failed $kind at stage: $missing_stage (ready=$found, media_check=$media_ok, resume=$resume_ok)"
-              if [ -f "$media_out" ]; then
-                echo "--- $kind media-result.json ---"
-                cat "$media_out" || true
-              fi
-              cat "$media_work/sshd.log" || true
-              ls -la "$data_dir/Library/Application Support" || true
-              xcrun simctl io "$udid" screenshot "ci-shots/ios/${kind}-timeout.png" || true
-              echo "--- DiagnosticReports ---"
-              ls -lt "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | head -n 20 || true
-              local latest_crash
-              latest_crash="$(ls -t "$HOME/Library/Logs/DiagnosticReports"/Legion* 2>/dev/null | head -n 1 || true)"
-              if [ -n "$latest_crash" ]; then
-                echo "=== Crash report: $latest_crash ==="
-                head -n 160 "$latest_crash" || true
-              fi
-              echo "--- CoreSimulator logs ---"
-              xcrun simctl spawn "$udid" log show --last 3m --style compact --predicate 'eventMessage CONTAINS "Legion" OR eventMessage CONTAINS "com.x1f4r.legion"' | tail -n 100 || true
-              xcrun simctl terminate "$udid" com.x1f4r.legion || true
-              xcrun simctl shutdown "$udid" || true
-              if [ "$found" -eq 0 ] && [ "$media_failed" -eq 0 ]; then
-                return 2
-              fi
-              return 1
-            fi
-
-            # Confirm the app data directory is excluded from iCloud/iTunes backups.
-            local app_data_dir="$data_dir/Library/Application Support/com.x1f4r.legion"
-            test -d "$app_data_dir" || return 1
-            swift - "$app_data_dir" << 'SWIFT' || return 1
-          import Foundation
-          let path = CommandLine.arguments[1]
-          let url = URL(fileURLWithPath: path)
-          let values = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
-          guard values.isExcludedFromBackup == true else {
-              fputs("Expected isExcludedFromBackup == true for \(path), got \(String(describing: values.isExcludedFromBackup))\n", stderr)
-              exit(1)
-          }
-          print("Verified isExcludedFromBackup == true for \(path)")
-          SWIFT
-
-            sleep 2
-            shoot "$udid" "ci-shots/ios/${kind}-dark.png" || return 1
-
-            xcrun simctl ui "$udid" appearance light || true
-            sleep 2
-            shoot "$udid" "ci-shots/ios/${kind}-light.png" || return 1
-
-            xcrun simctl terminate "$udid" com.x1f4r.legion || true
-            xcrun simctl shutdown "$udid" || true
-            return 0
-          }
-
-          run_simulator() {
-            local kind="$1"
-            local udid="$2"
-            local dev_name="$3"
-            local rc=0
-            run_simulator_once "$kind" "$udid" "$dev_name" 1 || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              return 0
-            fi
-            if [ "$rc" -eq 2 ]; then
-              echo "Retrying $kind simulator once after cold-boot/launch stall..." >&2
-              sleep 3
-              run_simulator_once "$kind" "$udid" "$dev_name" 2
-              return $?
-            fi
-            return "$rc"
-          }
-
-          run_simulator iphone "$IPHONE_UDID" "$IPHONE_NAME"
-          run_simulator ipad "$IPAD_UDID" "$IPAD_NAME"
+          bash scripts/ios-sim-check.sh \
+            --kind iphone \
+            --udid "$IPHONE_UDID" \
+            --dev-name "$IPHONE_NAME" \
+            --sim-app "$SIM_APP" \
+            --legion-bin "$LEGION_BIN" \
+            --runner-temp "$RUNNER_TEMP" \
+            --shots-dir ci-shots/ios
+          bash scripts/ios-sim-check.sh \
+            --kind ipad \
+            --udid "$IPAD_UDID" \
+            --dev-name "$IPAD_NAME" \
+            --sim-app "$SIM_APP" \
+            --legion-bin "$LEGION_BIN" \
+            --runner-temp "$RUNNER_TEMP" \
+            --shots-dir ci-shots/ios
           ls -lh ci-shots/ios/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

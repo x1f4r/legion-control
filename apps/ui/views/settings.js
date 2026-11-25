@@ -12,6 +12,7 @@ import {
   formatInviteValidity,
 } from '../lib/activity.js';
 import { formatRelativeTime } from '../lib/format.js';
+import { createPairingController } from '../lib/pairing.js';
 import { routeHref } from '../lib/route.js';
 import { describeRoleAccess } from '../lib/schema.js';
 import {
@@ -27,6 +28,7 @@ import {
   findIncomingDevice,
   formatDeviceRemovedNotice,
   formatDisagreementNotice,
+  formatIncomingDeviceSubtitle,
   formatInvitedDeviceSyncNotice,
   formatLearnRejectionTechnical,
   formatPairSyncNotice,
@@ -165,12 +167,47 @@ function ThisDevicePage({
 
 // ── Connections subpages ─────────────────────────────────────────────────────────────────────
 
-function PairMachineSubpage({ link, linkState, onConnected }) {
-  const [invite, setInvite] = useState('');
-  const [deviceName, setDeviceName] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
+function PairMachineSubpage({
+  link,
+  linkState,
+  onConnected,
+  pairingController = null,
+  pairingState = null,
+}) {
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState(null);
   const canScan = linkState?.can_scan !== false;
+
+  const fallbackController = useMemo(
+    () =>
+      pairingController
+        ? null
+        : createPairingController({
+            link,
+            onPaired: ({ next }) => {
+              window.location.hash = '#/settings/connections';
+              onConnected?.(next);
+            },
+          }),
+    [pairingController, link, onConnected],
+  );
+  const ctrl = pairingController || fallbackController;
+  const [fallbackState, setFallbackState] = useState(() => ctrl.getState());
+  useEffect(() => {
+    if (pairingController) return undefined;
+    setFallbackState(ctrl.getState());
+    return ctrl.subscribe(setFallbackState);
+  }, [pairingController, ctrl]);
+
+  const pState = pairingState || fallbackState;
+  const invite = pState.invite;
+  const deviceName = pState.deviceName;
+  const pairing = pState.inFlight;
+  const cancelling = pState.cancelling;
+  const pairingNode = pState.node;
+  const pairNotice = pState.notice;
+  const error = pState.error || scanError;
+  const busy = scanning || pairing;
 
   useEffect(() => {
     if (typeof link.deviceName !== 'function') return;
@@ -178,46 +215,54 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
     link
       .deviceName()
       .then((name) => {
-        if (alive && name) setDeviceName((prev) => prev || name);
+        if (alive && name && !ctrl.getState().deviceName) {
+          ctrl.setDeviceName(name);
+        }
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [link]);
+  }, [link, ctrl]);
+
+  function cancelPairing() {
+    ctrl.cancelPair();
+  }
 
   async function onScan() {
-    setError(null);
-    setBusy(true);
+    setScanError(null);
+    ctrl.clearOutcome();
+    setScanning(true);
     try {
       const scanned = await link.scanInvite();
       if (scanned) {
-        const next = await link.pair(scanned, deviceName.trim() || undefined);
-        window.location.hash = '#/settings/connections';
-        onConnected(next);
+        setScanning(false);
+        await ctrl.startPair({
+          invite: scanned,
+          deviceName: ctrl.getState().deviceName,
+          source: 'scan',
+          screen: 'settings',
+        });
       }
     } catch (err) {
-      setError(err);
+      if (err?.code !== 'cancelled') {
+        setScanError(err);
+      }
     } finally {
-      setBusy(false);
+      setScanning(false);
     }
   }
 
   async function onSubmit(e) {
     e.preventDefault();
     if (!invite.trim()) return;
-    setError(null);
-    setBusy(true);
-    try {
-      const next = await link.pair(invite.trim(), deviceName.trim() || undefined);
-      setInvite('');
-      window.location.hash = '#/settings/connections';
-      onConnected(next);
-    } catch (err) {
-      setError(err);
-    } finally {
-      setBusy(false);
-    }
+    setScanError(null);
+    await ctrl.startPair({
+      invite: invite.trim(),
+      deviceName: ctrl.getState().deviceName,
+      source: 'paste',
+      screen: 'settings',
+    });
   }
 
   return html`
@@ -231,11 +276,83 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
         <input
           type="text"
           value=${deviceName}
-          onInput=${(e) => setDeviceName(e.target.value)}
+          onInput=${(e) => ctrl.setDeviceName(e.target.value)}
           placeholder="phone"
+          disabled=${busy}
         />
       </label>
+      ${pairing
+        ? html`
+            <div class="notice" role="status" aria-live="polite">
+              <strong>
+                ${cancelling
+                  ? pairingNode
+                    ? `Checking ${pairingNode}…`
+                    : 'Checking…'
+                  : pairingNode
+                    ? `Pairing with ${pairingNode}…`
+                    : 'Pairing…'}
+              </strong>
+              <span>
+                ${cancelling
+                  ? `Checking whether ${pairingNode || 'the machine'} finished pairing before stopping.`
+                  : `Waiting for ${pairingNode || 'the machine'} to confirm. This can take up to 45 seconds on a slow connection.`}
+              </span>
+            </div>
+          `
+        : null}
+      ${pairNotice
+        ? html`
+            <div
+              class=${pairNotice.kind === 'neutral' ? 'notice neutral' : 'notice'}
+              role="status"
+            >
+              <strong>${pairNotice.title}</strong>
+              ${pairNotice.restorable && invite && typeof ctrl.restorePair === 'function'
+                ? html`
+                    <div class="actions">
+                      <button
+                        type="button"
+                        class="btn small primary"
+                        disabled=${busy}
+                        onClick=${() => ctrl.restorePair()}
+                      >
+                        Restore pairing
+                      </button>
+                    </div>
+                  `
+                : pairNotice.retryable && invite
+                  ? html`
+                      <div class="actions">
+                        <button
+                          type="button"
+                          class="btn small primary"
+                          disabled=${busy}
+                          onClick=${() => ctrl.retryPair()}
+                        >
+                          Try again
+                        </button>
+                      </div>
+                    `
+                  : null}
+            </div>
+          `
+        : null}
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${error && pState.source === 'scan' && invite && !pairing
+        ? html`
+            <div class="actions">
+              <button
+                type="button"
+                class="btn primary full"
+                disabled=${busy}
+                onClick=${() => ctrl.retryPair()}
+              >
+                Try again
+              </button>
+            </div>
+          `
+        : null}
       ${canScan
         ? html`
             <div class="actions">
@@ -250,15 +367,23 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
           <span>Invite</span>
           <textarea
             value=${invite}
-            onInput=${(e) => setInvite(e.target.value)}
+            onInput=${(e) => ctrl.setInvite(e.target.value)}
             placeholder="Paste the invite line"
+            disabled=${busy}
             required
           ></textarea>
         </label>
         <div class="actions">
           <button type="submit" class=${canScan ? 'btn full' : 'btn primary full'} disabled=${busy}>
-            ${busy ? 'Pairing…' : 'Pair machine'}
+            ${pairing ? 'Pairing…' : 'Pair machine'}
           </button>
+          ${pairing
+            ? html`
+                <button type="button" class="btn" disabled=${cancelling} onClick=${cancelPairing}>
+                  ${cancelling ? 'Stopping…' : 'Cancel'}
+                </button>
+              `
+            : null}
         </div>
       </form>
     </div>
@@ -1141,10 +1266,12 @@ function IncomingDeviceSubpage({
   function askRemove() {
     onRequestConfirm({
       title: `Remove ${device.name}?`,
-      summary: device.local_only
-        ? `${device.name} is only paired with this machine and will lose access here right away.`
-        : `${device.name} will lose access to this machine right away.`,
-      confirmLabel: 'Remove access',
+      summary: device.unconfirmed
+        ? `${device.name} never finished pairing and will be removed from this machine right away.`
+        : device.local_only
+          ? `${device.name} is only paired with this machine and will lose access here right away.`
+          : `${device.name} will lose access to this machine right away.`,
+      confirmLabel: device.unconfirmed ? 'Remove' : 'Remove access',
       danger: true,
       async onConfirm() {
         setBusy(true);
@@ -1165,10 +1292,12 @@ function IncomingDeviceSubpage({
     });
   }
 
+  const statusNotice = device.status || (device.unconfirmed ? 'Pairing not finished' : null);
+
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
-      ${device.status ? html`<${Notice} title=${device.status} kind="warn" />` : null}
+      ${statusNotice ? html`<${Notice} title=${statusNotice} kind="warn" />` : null}
       <div class="list">
         <dl class=${technical ? 'kv' : 'kv plain'}>
           <dt>${technical ? 'name' : 'Device'}</dt>
@@ -1232,7 +1361,7 @@ function IncomingDeviceSubpage({
                 disabled=${busy}
                 onClick=${askRemove}
               >
-                Remove access
+                ${device.unconfirmed ? 'Remove' : 'Remove access'}
               </button>
             </div>
           `
@@ -1247,6 +1376,8 @@ function ConnectionsPage({
   capsStore = null,
   onRegisterRefresh = null,
   linkState,
+  pairingController = null,
+  pairingState = null,
   nodeInfo,
   tools,
   allowedSet,
@@ -1278,6 +1409,9 @@ function ConnectionsPage({
   const canListDevices =
     Boolean((tools || []).find((t) => t.name === 'device.list')) &&
     (!allowedSet || allowedSet.has('device.list'));
+  const canRemoveDevices =
+    Boolean((tools || []).find((t) => t.name === 'device.remove')) &&
+    (!allowedSet || allowedSet.has('device.remove'));
   const hasDeviceRoles = Boolean((tools || []).find((t) => t.name === 'device.roles'));
   const canReadPolicy =
     Boolean((tools || []).find((t) => t.name === 'config.read')) &&
@@ -1421,6 +1555,8 @@ function ConnectionsPage({
       <${PairMachineSubpage}
         link=${link}
         linkState=${linkState}
+        pairingController=${pairingController}
+        pairingState=${pairingState}
         onConnected=${onConnected}
       />
     `;
@@ -1507,23 +1643,43 @@ function ConnectionsPage({
   const hasMakeSection = link.kind === 'app' || canInvite || canFleetAdd;
   const incomingDevices = incoming?.devices || [];
 
+  function askRemoveIncoming(dev) {
+    onRequestConfirm({
+      title: `Remove ${dev.name}?`,
+      summary: dev.unconfirmed
+        ? `${dev.name} never finished pairing and will be removed from this machine right away.`
+        : dev.local_only
+          ? `${dev.name} is only paired with this machine and will lose access here right away.`
+          : `${dev.name} will lose access to this machine right away.`,
+      confirmLabel: dev.unconfirmed ? 'Remove' : 'Remove access',
+      danger: true,
+      async onConfirm() {
+        setBusy(true);
+        setError(null);
+        try {
+          const res = await link.call(
+            'device.remove',
+            buildDeviceRemoveArgs(dev),
+            { on: connectionsNode || undefined },
+          );
+          setNotice(formatDeviceRemovedNotice(dev, res) || null);
+          await loadIncoming();
+        } catch (err) {
+          setError(err);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
+  }
+
   function formatIncomingSubtitle(dev) {
-    const addedPart = dev.added ? `paired ${formatRelativeTime(dev.added)}` : '';
-    if (technical) {
-      const parts = [dev.principal || ''];
-      if (dev.role) parts.push(dev.role);
-      if (addedPart) parts.push(addedPart);
-      return parts.filter(Boolean).join(' · ');
-    }
-    const roleLabel =
-      (dev.role && roleDescriptions[dev.role]) ||
-      (dev.role === 'owner'
-        ? 'everything, including changing who may do what'
-        : dev.role
-          ? describeRolePlain(dev.role)
-          : '');
-    const accessPart = roleLabel ? capitalize(roleLabel) : 'Allowed in';
-    return [accessPart, addedPart].filter(Boolean).join(' · ');
+    return formatIncomingDeviceSubtitle(dev, {
+      roleDescriptions,
+      technical,
+      relativeTime: dev.added ? formatRelativeTime(dev.added) : '',
+      describeRole: describeRolePlain,
+    });
   }
 
   return html`
@@ -1751,26 +1907,41 @@ function ConnectionsPage({
             ${incomingDevices.length > 0
               ? html`
                   <div class="list">
-                    ${incomingDevices.map(
-                      (dev) => html`
-                        <a
-                          key=${dev.id || dev.name}
-                          class="row"
-                          href=${routeHref({
-                            section: 'settings',
-                            page: 'connections',
-                            sub: 'incoming',
-                            item: dev.id || dev.name,
-                          })}
-                        >
+                    ${incomingDevices.map((dev) => {
+                      const href = routeHref({
+                        section: 'settings',
+                        page: 'connections',
+                        sub: 'incoming',
+                        item: dev.id || dev.name,
+                      });
+                      if (dev.unconfirmed && canRemoveDevices) {
+                        return html`
+                          <div key=${dev.id || dev.name} class="row">
+                            <a class="body" href=${href}>
+                              <span class="title">${dev.name}</span>
+                              <span class="sub">${formatIncomingSubtitle(dev)}</span>
+                            </a>
+                            <button
+                              type="button"
+                              class="btn small danger"
+                              disabled=${busy}
+                              onClick=${() => askRemoveIncoming(dev)}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        `;
+                      }
+                      return html`
+                        <a key=${dev.id || dev.name} class="row" href=${href}>
                           <span class="body">
                             <span class="title">${dev.name}</span>
                             <span class="sub">${formatIncomingSubtitle(dev)}</span>
                           </span>
                           <span class="chev" aria-hidden="true">›</span>
                         </a>
-                      `,
-                    )}
+                      `;
+                    })}
                   </div>
                 `
               : html`<div class="empty">No other devices paired with ${connectionsNode || 'this machine'}.</div>`}
@@ -2148,6 +2319,8 @@ export function SettingsView({
   capsStore = null,
   onRegisterRefresh = null,
   linkState,
+  pairingController = null,
+  pairingState = null,
   nodeInfo,
   tools,
   allowedSet,
@@ -2299,6 +2472,8 @@ export function SettingsView({
           capsStore=${capsStore}
           onRegisterRefresh=${wide ? null : onRegisterRefresh}
           linkState=${linkState}
+          pairingController=${pairingController}
+          pairingState=${pairingState}
           nodeInfo=${nodeInfo}
           tools=${tools}
           allowedSet=${allowedSet}

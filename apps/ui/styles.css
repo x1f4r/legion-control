@@ -1060,6 +1060,12 @@ button.row:active {
   min-width: 0;
 }
 
+.row a.body {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+}
+
 .row .title {
   display: block;
   overflow: hidden;
