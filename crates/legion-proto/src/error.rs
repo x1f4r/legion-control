@@ -1,11 +1,12 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// What went wrong, from a set closed on purpose: an agent branches on it, so every door uses the
-/// same fourteen words and a new failure picks the nearest one rather than inventing another.
+/// same thirteen words and a new failure picks the nearest one rather than inventing another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -19,8 +20,6 @@ pub enum ErrorCode {
     Exists,
     /// The thing changed since the caller last looked, so the call would overwrite someone.
     Conflict,
-    /// The machine answered under a different node name than its fleet name.
-    NameMismatch,
     /// Policy does not let this principal do this.
     Denied,
     /// The machine the call is for cannot be reached.
@@ -41,13 +40,12 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every code, in the order the design lists them.
-    pub const ALL: [ErrorCode; 14] = [
+    pub const ALL: [ErrorCode; 13] = [
         ErrorCode::InvalidArgs,
         ErrorCode::UnknownTool,
         ErrorCode::NotFound,
         ErrorCode::Exists,
         ErrorCode::Conflict,
-        ErrorCode::NameMismatch,
         ErrorCode::Denied,
         ErrorCode::Unreachable,
         ErrorCode::Timeout,
@@ -66,7 +64,6 @@ impl ErrorCode {
             ErrorCode::NotFound => "not_found",
             ErrorCode::Exists => "exists",
             ErrorCode::Conflict => "conflict",
-            ErrorCode::NameMismatch => "name_mismatch",
             ErrorCode::Denied => "denied",
             ErrorCode::Unreachable => "unreachable",
             ErrorCode::Timeout => "timeout",
@@ -101,7 +98,10 @@ impl FromStr for ErrorCode {
 ///
 /// `message` says what happened in one sentence and `hint`, when there is something to do, says
 /// what. Both are written for someone who has never read the source.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialization is forward-tolerant: an unrecognized `code` string from a newer peer decodes as
+/// [`ErrorCode::Failed`] while preserving the original string under `details.unknown_code`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ErrorBody {
     /// The code an agent branches on.
     pub code: ErrorCode,
@@ -116,6 +116,58 @@ pub struct ErrorBody {
     /// Anything structured a caller may want to act on, such as the line a file failed to parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+}
+
+impl<'de> Deserialize<'de> for ErrorBody {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawErrorBody {
+            code: String,
+            message: String,
+            #[serde(default)]
+            hint: Option<String>,
+            #[serde(default)]
+            machine: Option<String>,
+            #[serde(default)]
+            details: Option<Value>,
+        }
+
+        let raw = RawErrorBody::deserialize(deserializer)?;
+        let (code, details) = match raw.code.parse::<ErrorCode>() {
+            Ok(known) => (known, raw.details),
+            Err(_) => {
+                if raw.code.is_empty() {
+                    return Err(de::Error::custom("error code cannot be empty"));
+                }
+                let merged = match raw.details {
+                    None => {
+                        let mut map = Map::new();
+                        map.insert("unknown_code".to_owned(), Value::String(raw.code));
+                        Value::Object(map)
+                    }
+                    Some(Value::Object(mut map)) => {
+                        map.entry("unknown_code".to_owned())
+                            .or_insert_with(|| Value::String(raw.code));
+                        Value::Object(map)
+                    }
+                    Some(other) => {
+                        let mut map = Map::new();
+                        map.insert("unknown_code".to_owned(), Value::String(raw.code));
+                        map.insert("original_details".to_owned(), other);
+                        Value::Object(map)
+                    }
+                };
+                (ErrorCode::Failed, Some(merged))
+            }
+        };
+        Ok(ErrorBody {
+            code,
+            message: raw.message,
+            hint: raw.hint,
+            machine: raw.machine,
+            details,
+        })
+    }
 }
 
 impl ErrorBody {

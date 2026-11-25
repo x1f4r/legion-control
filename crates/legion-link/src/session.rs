@@ -352,6 +352,7 @@ impl Session {
         let reader_handle = tokio::spawn(reader_loop(
             buf_reader,
             machine.to_owned(),
+            hello_result.version.clone(),
             Arc::clone(&stdin),
             Arc::clone(&pending),
             Arc::clone(&alive),
@@ -887,9 +888,17 @@ async fn read_hello_reply<R: AsyncBufRead + Unpin>(
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                if let Ok(response) = serde_json::from_slice::<Response>(&line)
-                    && response.id.as_ref() == Some(hello_id)
+                if let Ok(value) = serde_json::from_slice::<Value>(&line)
+                    && value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                    && value.get("method").is_none()
+                    && value
+                        .get("id")
+                        .and_then(|raw| serde_json::from_value::<Id>(raw.clone()).ok())
+                        .as_ref()
+                        == Some(hello_id)
                 {
+                    let response = serde_json::from_value::<Response>(value)
+                        .map_err(|e| HandshakeFailure::BadHelloResult(e.to_string()))?;
                     return match response.outcome {
                         Outcome::Result(value) => {
                             let hello: HelloResult = serde_json::from_value(value)
@@ -1047,6 +1056,7 @@ fn format_handshake_unreachable(
 async fn reader_loop<R: AsyncBufRead + Unpin>(
     mut reader: R,
     machine: String,
+    remote_version: String,
     stdin: Arc<tokio::sync::Mutex<Option<BoxWriter>>>,
     pending: Arc<Mutex<HashMap<Id, PendingCall>>>,
     alive: Arc<AtomicBool>,
@@ -1063,7 +1073,7 @@ async fn reader_loop<R: AsyncBufRead + Unpin>(
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                dispatch_incoming(&line, &machine, &pending);
+                dispatch_incoming(&line, &machine, &remote_version, &pending);
             }
             Err(err) => break Some(err),
         }
@@ -1120,7 +1130,12 @@ async fn reader_loop<R: AsyncBufRead + Unpin>(
     }
 }
 
-fn dispatch_incoming(line: &[u8], machine: &str, pending: &Arc<Mutex<HashMap<Id, PendingCall>>>) {
+fn dispatch_incoming(
+    line: &[u8],
+    machine: &str,
+    remote_version: &str,
+    pending: &Arc<Mutex<HashMap<Id, PendingCall>>>,
+) {
     let Ok(value) = serde_json::from_slice::<Value>(line) else {
         return;
     };
@@ -1149,32 +1164,62 @@ fn dispatch_incoming(line: &[u8], machine: &str, pending: &Arc<Mutex<HashMap<Id,
         return;
     }
 
-    // Response (has `id` and `result` or `error`).
-    if let Ok(response) = serde_json::from_value::<Response>(value)
-        && let Some(id) = response.id
-    {
-        let entry = {
-            let mut map = pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            map.remove(&id)
-        };
-        if let Some(entry) = entry {
-            let result = match response.outcome {
-                Outcome::Result(value) => Ok(value),
-                Outcome::Error(rpc_err) => {
-                    let mut body = rpc_err.data.unwrap_or_else(|| {
-                        ErrorBody::new(ErrorCode::Failed, rpc_err.message.clone())
-                    });
-                    if body.machine.is_none() {
-                        body = body.with_machine(machine);
-                    }
-                    Err(CallError::Remote(body))
+    // Response (has `id`): never silently drop a reply whose `id` we can match.
+    let Some(id) = value
+        .get("id")
+        .and_then(|raw| serde_json::from_value::<Id>(raw.clone()).ok())
+    else {
+        return;
+    };
+    let entry = {
+        let mut map = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.remove(&id)
+    };
+    let Some(entry) = entry else {
+        return;
+    };
+    let result = match serde_json::from_value::<Response>(value) {
+        Ok(response) => match response.outcome {
+            Outcome::Result(value) => Ok(value),
+            Outcome::Error(rpc_err) => {
+                let mut body = rpc_err
+                    .data
+                    .unwrap_or_else(|| ErrorBody::new(ErrorCode::Failed, rpc_err.message.clone()));
+                if body.machine.is_none() {
+                    body = body.with_machine(machine);
                 }
+                Err(CallError::Remote(body))
+            }
+        },
+        Err(decode_err) => {
+            let trimmed_ver = remote_version.trim();
+            let message = if trimmed_ver.is_empty() {
+                format!(
+                    "{machine} answered with a reply this version of legion does not understand ({decode_err})."
+                )
+            } else {
+                format!(
+                    "{machine} (legion {trimmed_ver}) answered with a reply this version of legion does not understand ({decode_err})."
+                )
             };
-            let _ = entry.reply.send(result);
+            let details = if trimmed_ver.is_empty() {
+                json!({"reason": "unrecognized_reply"})
+            } else {
+                json!({"reason": "unrecognized_reply", "remote_version": trimmed_ver})
+            };
+            Err(CallError::Remote(
+                ErrorBody::new(ErrorCode::Internal, message)
+                    .with_hint(
+                        "Update legion on whichever side is older so both understand the same replies.",
+                    )
+                    .with_machine(machine)
+                    .with_details(details),
+            ))
         }
-    }
+    };
+    let _ = entry.reply.send(result);
 }
 
 pub(crate) enum Line {
@@ -1237,6 +1282,7 @@ mod tests {
             serde_json::to_value(HelloResult {
                 node: node.to_owned(),
                 node_explicit: None,
+                node_id: None,
                 version: "0.1.0".to_owned(),
                 build: None,
                 protocol,
@@ -1857,6 +1903,177 @@ mod tests {
             .into_error();
         assert_eq!(err.machine.as_deref(), Some("c"));
         assert_eq!(*seen_relayed.lock().unwrap(), vec![Some("c".to_owned())]);
+
+        session.close().await;
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_error_code_and_malformed_reply_fail_promptly_without_hanging() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+
+        let server_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let first = lines.next_line().await.unwrap().unwrap();
+            assert!(first.contains("\"method\":\"hello\""));
+            let hello = Response::ok(
+                Some(Id::Number(1)),
+                serde_json::to_value(HelloResult {
+                    node: "tower".to_owned(),
+                    node_explicit: Some(true),
+                    node_id: None,
+                    version: "9.9.0".to_owned(),
+                    build: None,
+                    protocol: PROTOCOL,
+                    os: "linux".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    systems: Vec::new(),
+                    system: None,
+                    boot_id: None,
+                })
+                .unwrap(),
+            );
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&hello).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            // Call 1: reply carrying a future unknown ErrorCode string.
+            let call1: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let unknown_code_reply = json!({
+                "jsonrpc": "2.0",
+                "id": call1.id,
+                "error": {
+                    "code": TOOL_ERROR,
+                    "message": "Future error from a newer node.",
+                    "data": {
+                        "code": "future_fancy_code",
+                        "message": "Future error from a newer node.",
+                        "hint": "Upgrade client.",
+                        "details": {"extra": 42}
+                    }
+                }
+            });
+            server_w
+                .write_all(format!("{unknown_code_reply}\n").as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            // Call 2: malformed reply with matching `id` that cannot decode as Response.
+            let call2: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let malformed_reply = json!({
+                "jsonrpc": "2.0",
+                "id": call2.id,
+                "unexpected_outcome": "neither result nor error"
+            });
+            server_w
+                .write_all(format!("{malformed_reply}\n").as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            // Call 3: session stays healthy and answers a normal call afterwards.
+            let call3: Request =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let ok_reply = Response::ok(call3.id, json!({"ok": true}));
+            server_w
+                .write_all(format!("{}\n", serde_json::to_string(&ok_reply).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            server_w.flush().await.unwrap();
+
+            let _ = lines.next_line().await;
+        });
+
+        let session = Session::open_io(
+            client_r,
+            client_w,
+            "tower",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let err1 = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::discard(),
+            ),
+        )
+        .await
+        .expect("unknown error code must not hang")
+        .unwrap_err()
+        .into_error();
+        assert_eq!(err1.code, ErrorCode::Failed);
+        assert_eq!(err1.message, "Future error from a newer node.");
+        assert_eq!(
+            err1.details,
+            Some(json!({"extra": 42, "unknown_code": "future_fancy_code"}))
+        );
+        assert_eq!(err1.machine.as_deref(), Some("tower"));
+
+        let err2 = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::discard(),
+            ),
+        )
+        .await
+        .expect("malformed reply must not hang")
+        .unwrap_err()
+        .into_error();
+        assert_eq!(err2.code, ErrorCode::Internal);
+        assert!(
+            err2.message.contains("tower")
+                && err2.message.contains("9.9.0")
+                && err2.message.contains("does not understand"),
+            "unexpected message: {}",
+            err2.message
+        );
+        assert_eq!(err2.machine.as_deref(), Some("tower"));
+
+        let ok3 = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.call(
+                CallParams {
+                    tool: "meta.version".into(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 1,
+                },
+                CancellationToken::new(),
+                EventSink::discard(),
+            ),
+        )
+        .await
+        .expect("subsequent call must succeed")
+        .unwrap();
+        assert_eq!(ok3, json!({"ok": true}));
 
         session.close().await;
         server_task.await.unwrap();

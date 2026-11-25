@@ -184,7 +184,7 @@ pub fn status_for_error(code: ErrorCode) -> StatusCode {
         ErrorCode::InvalidArgs => StatusCode::BAD_REQUEST,
         ErrorCode::Denied => StatusCode::FORBIDDEN,
         ErrorCode::NotFound | ErrorCode::UnknownTool => StatusCode::NOT_FOUND,
-        ErrorCode::Exists | ErrorCode::Conflict | ErrorCode::NameMismatch => StatusCode::CONFLICT,
+        ErrorCode::Exists | ErrorCode::Conflict => StatusCode::CONFLICT,
         ErrorCode::Busy => StatusCode::LOCKED,
         ErrorCode::Unsupported => StatusCode::NOT_IMPLEMENTED,
         ErrorCode::Unreachable => StatusCode::BAD_GATEWAY,

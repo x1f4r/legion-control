@@ -2,16 +2,19 @@
 //! through.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use legion_os::lock::{FileLock, LockMode};
 pub use legion_proto::{CANCEL_GRACE, VERSION};
 use legion_proto::{ErrorBody, ErrorCode, HelloParams, HelloResult, PROTOCOL, ToolSpec};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{self, AuditLog, Entry, Outcome};
-use crate::config::{ConfigStore, NodeFile, NodeName};
+use crate::config::{ConfigStore, NodeFile, NodeName, write_atomically};
 use crate::ctx::{Ctx, Door, EventSink};
 use crate::paths::Paths;
 use crate::policy::Policy;
@@ -95,6 +98,7 @@ struct Inner {
     config: ConfigStore,
     audit: AuditLog,
     host_name: NodeName,
+    node_id: OnceLock<String>,
 }
 
 impl Node {
@@ -109,6 +113,7 @@ impl Node {
                 config: ConfigStore::new(paths.config_dir()),
                 audit: AuditLog::new(&paths),
                 host_name: NodeName::from_host(),
+                node_id: OnceLock::new(),
                 paths,
                 registry,
             }),
@@ -239,6 +244,7 @@ impl Node {
         Ok(HelloResult {
             node: self.name(),
             node_explicit,
+            node_id: self.node_id(),
             version: VERSION.to_owned(),
             build: BUILD.map(str::to_owned),
             protocol: PROTOCOL,
@@ -248,6 +254,18 @@ impl Node {
             system,
             boot_id: self.boot_id(),
         })
+    }
+
+    /// Persistent random identifier for this node's state directory (`<state_dir>/node-id`),
+    /// created race-safely on first use. Returns `None` if the state directory is not writable.
+    pub fn node_id(&self) -> Option<String> {
+        if let Some(id) = self.inner.node_id.get() {
+            return Some(id.clone());
+        }
+        let state_dir = self.inner.paths.state_dir();
+        let id = load_or_create_node_id(state_dir)?;
+        let _ = self.inner.node_id.set(id.clone());
+        Some(id)
     }
 
     /// An identifier of the machine's current boot, which changes on every restart; `None` when
@@ -459,6 +477,60 @@ fn cancelled(tool: &str) -> ErrorBody {
     )
 }
 
+/// Persistent node identifier stored in `<state_dir>/node-id` (32 lower-case hex characters).
+const NODE_ID_FILE: &str = "node-id";
+const NODE_ID_LOCK_FILE: &str = "node-id.lock";
+const NODE_ID_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn valid_node_id(text: &str) -> bool {
+    text.len() == 32
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn generate_node_id(state_dir: &std::path::Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"legion-node-id-v1:");
+    for salt in 0u64..4 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(salt);
+        hasher.update(&h.finish().to_le_bytes());
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    hasher.update(&nanos.to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(state_dir.as_os_str().as_encoded_bytes());
+    let hex = hasher.finalize().to_hex();
+    hex.as_str()[..32].to_owned()
+}
+
+fn load_or_create_node_id(state_dir: &std::path::Path) -> Option<String> {
+    let id_path = state_dir.join(NODE_ID_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&id_path) {
+        let trimmed = raw.trim();
+        if valid_node_id(trimmed) {
+            return Some(trimmed.to_owned());
+        }
+    }
+    std::fs::create_dir_all(state_dir).ok()?;
+    let lock_path = state_dir.join(NODE_ID_LOCK_FILE);
+    let _held =
+        FileLock::acquire_timeout(&lock_path, LockMode::Exclusive, NODE_ID_LOCK_TIMEOUT).ok()?;
+    if let Ok(raw) = std::fs::read_to_string(&id_path) {
+        let trimmed = raw.trim();
+        if valid_node_id(trimmed) {
+            return Some(trimmed.to_owned());
+        }
+    }
+    let generated = generate_node_id(state_dir);
+    let content = format!("{generated}\n");
+    write_atomically(&id_path, content.as_bytes()).ok()?;
+    Some(generated)
+}
+
 #[cfg(test)]
 mod tests {
     use legion_proto::HelloParams;
@@ -479,6 +551,12 @@ mod tests {
         let node = Node::new(Paths::under(dir.path()), Registry::new());
         let bare = node.hello(&hello_params()).unwrap();
         assert_eq!(bare.node_explicit, Some(false));
+        assert!(bare.node_id.as_deref().is_some_and(valid_node_id));
+        let second_node = Node::new(Paths::under(dir.path()), Registry::new());
+        assert_eq!(second_node.node_id(), bare.node_id);
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_node = Node::new(Paths::under(other_dir.path()), Registry::new());
+        assert_ne!(other_node.node_id(), bare.node_id);
         assert_eq!(bare.build.as_deref(), BUILD);
         assert_eq!(bare.system, None);
         assert!(bare.systems.is_empty());

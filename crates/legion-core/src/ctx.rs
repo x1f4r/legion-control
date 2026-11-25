@@ -94,6 +94,11 @@ impl Ctx {
         self.node.name_explicit()
     }
 
+    /// Persistent identifier for this node's state directory, or `None` if unavailable.
+    pub fn node_id(&self) -> Option<String> {
+        self.node.node_id()
+    }
+
     /// The operating system: `linux`, `macos` or `windows`.
     pub fn os(&self) -> &'static str {
         std::env::consts::OS

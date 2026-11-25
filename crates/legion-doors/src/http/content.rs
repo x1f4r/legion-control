@@ -935,7 +935,6 @@ fn sanitize_holder_error(err: &ErrorBody) -> ErrorBody {
         ErrorCode::Exists | ErrorCode::Conflict => {
             "The requested path is not a readable regular file."
         }
-        ErrorCode::NameMismatch => "The machine answered under a different node name.",
         ErrorCode::Unreachable => "The machine holding this file could not be reached.",
         ErrorCode::Timeout => "Reading this file timed out.",
         ErrorCode::Cancelled => "The file read was cancelled.",

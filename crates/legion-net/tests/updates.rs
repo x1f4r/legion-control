@@ -143,6 +143,7 @@ fn run_peer_helper(args: &[String]) -> ExitCode {
                             protocol: PROTOCOL,
                             node: node.name(),
                             node_explicit: node.name_explicit(),
+                            node_id: node.node_id(),
                             version: VERSION.to_owned(),
                             os: std::env::consts::OS.to_owned(),
                             arch: std::env::consts::ARCH.to_owned(),

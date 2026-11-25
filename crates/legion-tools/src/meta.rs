@@ -65,6 +65,12 @@ pub struct Version {
     /// (`Some(false)`), or unknown because `node.toml` failed to parse (`None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_explicit: Option<bool>,
+    /// Persistent identifier for this node's state directory, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Identifier of this machine's current boot, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
     /// The operating system.
     pub os: &'static str,
     /// The CPU architecture.
@@ -81,6 +87,8 @@ async fn version(ctx: &Ctx, _args: NoArgs) -> Result<Version, ToolError> {
         protocol: PROTOCOL,
         node: ctx.node_name().to_owned(),
         node_explicit: ctx.node_name_explicit(),
+        node_id: ctx.node_id(),
+        boot_id: ctx.boot_id(),
         os: ctx.os(),
         arch: ctx.arch(),
     })
