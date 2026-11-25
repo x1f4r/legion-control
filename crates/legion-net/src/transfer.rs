@@ -2769,7 +2769,6 @@ impl Conn {
             let (server_out, client_in) = tokio::io::duplex(CHUNK);
             let host = Host::new(ctx.paths().clone(), ctx.node_name());
             let principal = ctx.principal().to_owned();
-            let door = ctx.door();
             let device = ctx.device().map(str::to_owned);
             let pairing_id = ctx.pairing_id().map(str::to_owned);
             let input = SyncIoBridge::new(server_in);
@@ -2778,7 +2777,7 @@ impl Conn {
                 stream::serve_with_door(
                     &host,
                     Some(&principal),
-                    door,
+                    Door::Stream,
                     device.as_deref(),
                     pairing_id.as_deref(),
                     input,
