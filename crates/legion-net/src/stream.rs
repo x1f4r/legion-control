@@ -842,26 +842,42 @@ impl StreamAuthCheck {
         }
     }
 
-    fn verify(&self) -> io::Result<()> {
+    fn verify_once(&self) -> Result<(), ErrorBody> {
         let config = ConfigStore::new(self.paths.config_dir());
-        let res = (|| -> Result<(), ErrorBody> {
-            if let Some(ref pid) = self.pairing_id {
-                check_pairing_not_revoked(&config, pid)?;
+        if let Some(ref pid) = self.pairing_id {
+            check_pairing_not_revoked(&config, pid)?;
+        }
+        let policy = config.get::<Policy>()?;
+        let spec = ToolSpec {
+            name: self.tool.to_owned(),
+            description: String::new(),
+            effect: self.effect,
+            input_schema: json!({"type": "object"}),
+        };
+        let live_grant = policy.authorize(&self.principal, &spec, &self.paths)?;
+        let checked = live_grant.check_path(&self.path, self.access)?;
+        if let Some(kind) = self.create_kind {
+            live_grant.check_create(&checked, kind, true)?;
+        }
+        Ok(())
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        const RETRY_DELAY: Duration = Duration::from_millis(200);
+        const RETRIES: usize = 2;
+
+        let mut res = self.verify_once();
+        if res.is_err() {
+            // Confirm a negative read twice after a short pause so an in-place editor save or
+            // momentary unreadable file never cancels an active stream spuriously.
+            for _ in 0..RETRIES {
+                std::thread::sleep(RETRY_DELAY);
+                res = self.verify_once();
+                if res.is_ok() {
+                    break;
+                }
             }
-            let policy = config.get::<Policy>()?;
-            let spec = ToolSpec {
-                name: self.tool.to_owned(),
-                description: String::new(),
-                effect: self.effect,
-                input_schema: json!({"type": "object"}),
-            };
-            let live_grant = policy.authorize(&self.principal, &spec, &self.paths)?;
-            let checked = live_grant.check_path(&self.path, self.access)?;
-            if let Some(kind) = self.create_kind {
-                live_grant.check_create(&checked, kind, true)?;
-            }
-            Ok(())
-        })();
+        }
         if let Ok(mut last) = self.last_check.lock() {
             *last = Instant::now();
         }
@@ -4453,5 +4469,72 @@ mod tests {
                 "unpack sub/b.bin mismatch on seed {seed}"
             );
         }
+    }
+
+    #[test]
+    fn stream_auth_recheck_tolerates_transient_inplace_save_and_rejects_real_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let paths = legion_core::Paths::under(dir.path());
+        fs::create_dir_all(paths.config_dir()).unwrap();
+        let policy_path = paths.config_file("policy.toml");
+        let valid_policy = "default = \"mover\"\n[principals.mover]\nrole = \"m\"\n[roles.m]\nallow = [\"effect:read\", \"effect:write\"]\n";
+        fs::write(&policy_path, valid_policy).unwrap();
+
+        let host = Host::new(paths.clone(), "box".to_owned());
+        let config = ConfigStore::new(paths.config_dir());
+        let policy = config.get::<Policy>().unwrap();
+        let write_spec = ToolSpec {
+            name: "fs.write".to_owned(),
+            description: String::new(),
+            effect: Effect::Write,
+            input_schema: json!({"type": "object"}),
+        };
+        let grant = policy.authorize("mover", &write_spec, &paths).unwrap();
+        let target = home.join("file.bin");
+        let check = StreamAuthCheck::new(
+            &host,
+            &grant,
+            None,
+            "fs.write",
+            Effect::Write,
+            target,
+            Access::Write,
+            Some(CreateKind::File),
+        );
+
+        // 1. Transient half-written `policy.toml` restored after 150 ms must pass after retry.
+        fs::write(&policy_path, &valid_policy[..12]).unwrap();
+        let restore_path = policy_path.clone();
+        let restorer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            fs::write(&restore_path, valid_policy).unwrap();
+        });
+        assert!(
+            check.verify().is_ok(),
+            "transient in-place save must not trigger revocation"
+        );
+        restorer.join().unwrap();
+        assert!(!check.is_denied());
+
+        // 2. Genuinely broken `policy.toml` still denies within 2 seconds.
+        fs::write(&policy_path, "this is = [broken toml\n").unwrap();
+        let started = Instant::now();
+        assert!(check.verify().is_err());
+        assert!(check.is_denied());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = check.take_denied();
+
+        // 3. Genuine right narrowing (`effect:read` only) still denies within 2 seconds.
+        fs::write(
+            &policy_path,
+            valid_policy.replace("effect:write", "effect:read"),
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert!(check.verify().is_err());
+        assert!(check.is_denied());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

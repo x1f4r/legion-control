@@ -326,13 +326,15 @@ fn load_live_policy_and_devices(
     Some((policy, devices))
 }
 
-/// Checks live `policy.toml` and `devices.toml` for a running transfer job by id.
-///
-/// Used periodically by the detached transfer supervisor so direct edits to `policy.toml` or
-/// `devices.toml` revoke a running transfer promptly. Fails closed when the job record,
-/// `policy.toml`, or `devices.toml` cannot be read or parsed so a transfer whose authorisation
-/// cannot be established stops rather than continuing unchecked.
-pub fn is_transfer_job_authorized(paths: &Paths, id: &str) -> bool {
+/// Pause between consecutive confirmation reads before treating `policy.toml` or `devices.toml` as
+/// broken or as having revoked a running transfer's permissions.
+const AUTH_RECHECK_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Number of confirmation re-reads after an initial negative policy/devices check (so 3 consecutive
+/// negative reads over ~400 ms are required before cancelling an active transfer).
+const AUTH_RECHECK_RETRIES: usize = 2;
+
+fn is_transfer_job_authorized_once(paths: &Paths, id: &str) -> bool {
     let dir = job_dir(paths.state_dir(), id);
     let Ok(record) = read_job_record(&dir, id) else {
         return false;
@@ -341,6 +343,46 @@ pub fn is_transfer_job_authorized(paths: &Paths, id: &str) -> bool {
         return false;
     };
     transfer_record_still_authorized(paths, &policy, devices.as_ref(), &record)
+}
+
+/// Checks live `policy.toml` and `devices.toml` for a running transfer job by id.
+///
+/// Used periodically by the detached transfer supervisor so direct edits to `policy.toml` or
+/// `devices.toml` revoke a running transfer promptly. Before treating a file as broken or as
+/// having removed a right (which can happen transiently during an editor's in-place save), re-reads
+/// twice after [`AUTH_RECHECK_RETRY_DELAY`] and returns `false` only if every read agrees.
+pub fn is_transfer_job_authorized(paths: &Paths, id: &str) -> bool {
+    if is_transfer_job_authorized_once(paths, id) {
+        return true;
+    }
+    for _ in 0..AUTH_RECHECK_RETRIES {
+        std::thread::sleep(AUTH_RECHECK_RETRY_DELAY);
+        if is_transfer_job_authorized_once(paths, id) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Async counterpart to [`is_transfer_job_authorized`] for callers on a Tokio runtime so the
+/// confirmation pauses do not block worker threads.
+pub async fn is_transfer_job_authorized_async(paths: &Paths, id: &str) -> bool {
+    for attempt in 0..=AUTH_RECHECK_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(AUTH_RECHECK_RETRY_DELAY).await;
+        }
+        let paths_clone = paths.clone();
+        let id_owned = id.to_owned();
+        let ok = tokio::task::spawn_blocking(move || {
+            is_transfer_job_authorized_once(&paths_clone, &id_owned)
+        })
+        .await
+        .unwrap_or(false);
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cancels every active (`starting` or `running`) `kind: "transfer"` job belonging to the given
@@ -402,12 +444,22 @@ pub async fn cancel_revoked_transfer_jobs(
     principal_filter: Option<&str>,
     pairing_id_filter: Option<&str>,
 ) -> Vec<String> {
-    let paths_clone = paths.clone();
-    let Ok(live_auth) =
-        tokio::task::spawn_blocking(move || load_live_policy_and_devices(&paths_clone)).await
-    else {
-        return Vec::new();
-    };
+    let mut live_auth = None;
+    for attempt in 0..=AUTH_RECHECK_RETRIES {
+        if attempt > 0 {
+            tokio::time::sleep(AUTH_RECHECK_RETRY_DELAY).await;
+        }
+        let paths_clone = paths.clone();
+        let Ok(loaded) =
+            tokio::task::spawn_blocking(move || load_live_policy_and_devices(&paths_clone)).await
+        else {
+            return Vec::new();
+        };
+        if loaded.is_some() {
+            live_auth = loaded;
+            break;
+        }
+    }
     let state_dir = paths.state_dir().to_path_buf();
     let Ok((records, boot)) = blocking("job.cancel", move || {
         let records = load_all_records(&state_dir)?;

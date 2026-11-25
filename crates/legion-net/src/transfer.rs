@@ -955,10 +955,11 @@ async fn supervise_transfer(paths: Paths, id: &str) -> Result<(), String> {
                     break;
                 }
                 if ticks.is_multiple_of(5)
-                    && !transfer_job::is_transfer_job_authorized(
+                    && !transfer_job::is_transfer_job_authorized_async(
                         &paths_for_watcher,
                         &id_for_watcher,
                     )
+                    .await
                 {
                     revoked_flag.store(true, Ordering::Relaxed);
                     cancel_token.cancel();
