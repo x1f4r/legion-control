@@ -457,7 +457,11 @@ impl AndroidTransferPlatform {
                 && last_sent != Some((client_gen, seq))
             {
                 let fresh_connection = last_sent.map(|(g, _)| g) != Some(client_gen);
-                if fresh_connection && summary.active_count == 0 && summary.paused_count == 0 {
+                if fresh_connection
+                    && summary.active_count == 0
+                    && summary.paused_count == 0
+                    && summary.cancelling_count == 0
+                {
                     last_sent = Some((client_gen, seq));
                     continue;
                 }

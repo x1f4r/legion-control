@@ -14,6 +14,9 @@
 //     --key <private-key> [--public-key <public-key>] \
 //     --artifact <path[:program=...,os=...,arch=...,kind=...[,name=...]]> ...
 //   node scripts/make-update-set.mjs verify --dir <dir> --public-key <public-key>
+//   node scripts/make-update-set.mjs check-artifact \
+//     --file <path> --kind <binary|apk|deb|appimage|app-tar|nsis|app-bundle|ipa> \
+//     --sequence <SEQ> [--forbid-preview-key] [--build-log <path>]
 //
 // Default preview key locations (always outside the repository, mode 600 for private):
 //   private key: ~/.legion-control/preview-update.key
@@ -406,13 +409,17 @@ function sha256FileSync(filePath) {
   }
 }
 
-// ── Non-executing artifact sequence inspection ──────────────────────────────────────────────
+// ── Non-executing artifact sequence & preview-key inspection ────────────────────────────────
 
 const SEQUENCE_MARKER_PREFIX = Buffer.from('LEGION_UPDATE_SEQUENCE=', 'ascii');
+const PREVIEW_KEY_MARKER_PREFIX = Buffer.from('LEGION_UPDATE_PREVIEW_KEY=', 'ascii');
+const NSIS_MAGIC = Buffer.from([
+  0xef, 0xbe, 0xad, 0xde, 0x4e, 0x75, 0x6c, 0x6c, 0x73, 0x6f, 0x66, 0x74, 0x49, 0x6e, 0x73, 0x74,
+]); // 0xDEADBEEF (LE) + "NullsoftInst"
 
-/** Scan a buffer for all `LEGION_UPDATE_SEQUENCE=<digits>\0` markers and return found sequences. */
-function findSequenceMarkersInBuffer(buf) {
-  const found = new Set();
+/** Scan a buffer for EVERY `LEGION_UPDATE_SEQUENCE=<digits>\0` occurrence (preserving count). */
+export function findSequenceMarkersInBuffer(buf) {
+  const occurrences = [];
   let idx = 0;
   while (true) {
     const pos = buf.indexOf(SEQUENCE_MARKER_PREFIX, idx);
@@ -423,35 +430,138 @@ function findSequenceMarkersInBuffer(buf) {
       end += 1;
     }
     if (end > start && end < buf.length && buf[end] === 0) {
-      found.add(buf.subarray(start, end).toString('ascii'));
+      occurrences.push(buf.subarray(start, end).toString('ascii'));
     }
     idx = start;
   }
-  return [...found];
+  return occurrences;
 }
 
-/** Stream-scan a file for `LEGION_UPDATE_SEQUENCE=<digits>\0` markers using bounded memory. */
-function findSequenceMarkersInFile(filePath) {
+/** Scan a buffer for EVERY `LEGION_UPDATE_PREVIEW_KEY=<value>\0` occurrence. */
+export function findPreviewKeyMarkersInBuffer(buf) {
+  const occurrences = [];
+  let idx = 0;
+  while (true) {
+    const pos = buf.indexOf(PREVIEW_KEY_MARKER_PREFIX, idx);
+    if (pos === -1) break;
+    const start = pos + PREVIEW_KEY_MARKER_PREFIX.length;
+    let end = start;
+    while (
+      end < buf.length &&
+      end - start < 128 &&
+      buf[end] >= 0x21 &&
+      buf[end] <= 0x7e
+    ) {
+      end += 1;
+    }
+    if (end > start && end < buf.length && buf[end] === 0) {
+      occurrences.push(buf.subarray(start, end).toString('ascii'));
+    }
+    idx = start;
+  }
+  return occurrences;
+}
+
+/** Stream-scan a file for `LEGION_UPDATE_SEQUENCE` and `LEGION_UPDATE_PREVIEW_KEY` occurrences. */
+function scanFileMarkers(filePath) {
   const fd = fs.openSync(filePath, 'r');
-  const found = new Set();
+  const seqByOffset = new Map();
+  const previewByOffset = new Map();
   const chunkSize = 1024 * 1024;
-  const overlap = 64;
+  const overlap = 256;
   let tail = Buffer.alloc(0);
+  let fileOffset = 0;
   try {
     const buf = Buffer.allocUnsafe(chunkSize);
     while (true) {
       const n = fs.readSync(fd, buf, 0, chunkSize, null);
       if (n === 0) break;
+      const baseOff = fileOffset - tail.length;
       const windowBuf = tail.length > 0 ? Buffer.concat([tail, buf.subarray(0, n)]) : buf.subarray(0, n);
-      for (const seq of findSequenceMarkersInBuffer(windowBuf)) {
-        found.add(seq);
+
+      let idx = 0;
+      while (true) {
+        const pos = windowBuf.indexOf(SEQUENCE_MARKER_PREFIX, idx);
+        if (pos === -1) break;
+        const start = pos + SEQUENCE_MARKER_PREFIX.length;
+        let end = start;
+        while (end < windowBuf.length && windowBuf[end] >= 0x30 && windowBuf[end] <= 0x39 && end - start < 24) {
+          end += 1;
+        }
+        if (end > start && end < windowBuf.length && windowBuf[end] === 0) {
+          seqByOffset.set(baseOff + pos, windowBuf.subarray(start, end).toString('ascii'));
+        }
+        idx = start;
       }
+
+      idx = 0;
+      while (true) {
+        const pos = windowBuf.indexOf(PREVIEW_KEY_MARKER_PREFIX, idx);
+        if (pos === -1) break;
+        const start = pos + PREVIEW_KEY_MARKER_PREFIX.length;
+        let end = start;
+        while (
+          end < windowBuf.length &&
+          end - start < 128 &&
+          windowBuf[end] >= 0x21 &&
+          windowBuf[end] <= 0x7e
+        ) {
+          end += 1;
+        }
+        if (end > start && end < windowBuf.length && windowBuf[end] === 0) {
+          previewByOffset.set(baseOff + pos, windowBuf.subarray(start, end).toString('ascii'));
+        }
+        idx = start;
+      }
+
+      fileOffset += n;
       tail = Buffer.from(windowBuf.subarray(Math.max(0, windowBuf.length - overlap)));
     }
   } finally {
     fs.closeSync(fd);
   }
-  return [...found];
+  return {
+    seqMarkers: [...seqByOffset.values()],
+    previewMarkers: [...previewByOffset.values()],
+  };
+}
+
+function assertSequenceMarkersMatch(occurrences, expectedStr, context, { requireExactlyOne = false } = {}) {
+  if (!Array.isArray(occurrences) || occurrences.length === 0) {
+    throw new Error(
+      `${context} has no compiled LEGION_UPDATE_SEQUENCE marker. Build with LEGION_BUILD_SEQUENCE=${expectedStr}.`,
+    );
+  }
+  const unique = [...new Set(occurrences)];
+  if (unique.length > 1) {
+    throw new Error(
+      `${context} contains conflicting compiled LEGION_UPDATE_SEQUENCE markers (${unique.join(', ')}); every marker must equal ${expectedStr}.`,
+    );
+  }
+  if (unique[0] !== expectedStr) {
+    throw new Error(
+      `${context} has compiled LEGION_UPDATE_SEQUENCE=${unique[0]}, expected ${expectedStr}. Build with LEGION_BUILD_SEQUENCE=${expectedStr}.`,
+    );
+  }
+  if (requireExactlyOne && occurrences.length !== 1) {
+    throw new Error(
+      `${context} contains ${occurrences.length} LEGION_UPDATE_SEQUENCE markers, expected exactly 1.`,
+    );
+  }
+}
+
+function assertNoPreviewKeyInMarkers(previewMarkers, context) {
+  if (!Array.isArray(previewMarkers) || previewMarkers.length === 0) {
+    throw new Error(
+      `${context} is missing a compiled LEGION_UPDATE_PREVIEW_KEY marker; refusing unverified release artifact.`,
+    );
+  }
+  const bad = previewMarkers.filter((val) => val !== 'none');
+  if (bad.length > 0) {
+    throw new Error(
+      `${context} trusts a compiled-in preview update key (${[...new Set(bad)].join(', ')}); official release and CI artifacts must contain no preview key.`,
+    );
+  }
 }
 
 /** Scan a file for UTF-16LE `+seq<digits>` tokens (embedded by NSIS PE `VS_VERSION_INFO`). */
@@ -486,7 +596,7 @@ function findUtf16SeqMarkersInFile(filePath) {
           }
         }
         // Require non-digit UTF-16LE boundary (usually NUL 0x00 0x00) after the digits.
-        if (digits.length > 0 && end + 1 < windowBuf.length && (windowBuf[end] === 0 && windowBuf[end + 1] === 0)) {
+        if (digits.length > 0 && end + 1 < windowBuf.length && windowBuf[end] === 0 && windowBuf[end + 1] === 0) {
           found.add(digits);
         }
         idx = start;
@@ -499,8 +609,8 @@ function findUtf16SeqMarkersInFile(filePath) {
   return [...found];
 }
 
-/** Extract a single entry by exact path from a ZIP buffer (stored or deflate). */
-function readZipEntry(zipBuf, targetName) {
+/** List all entries in a ZIP buffer with a lazy reader for stored (0) or deflate (8) entries. */
+function listZipEntries(zipBuf) {
   // Locate End of Central Directory record (0x06054b50) within last 66 KiB.
   const searchStart = Math.max(0, zipBuf.length - 65557);
   let eocd = -1;
@@ -521,6 +631,7 @@ function readZipEntry(zipBuf, targetName) {
   const cdOffset = zipBuf.readUInt32LE(eocd + 16);
   let off = cdOffset;
   const cdEnd = cdOffset + cdSize;
+  const entries = [];
   for (let idx = 0; idx < entryCount && off + 46 <= cdEnd; idx += 1) {
     if (zipBuf.readUInt32LE(off) !== 0x02014b50) {
       throw new Error('Corrupt ZIP Central Directory header.');
@@ -533,20 +644,205 @@ function readZipEntry(zipBuf, targetName) {
     const localOff = zipBuf.readUInt32LE(off + 42);
     const name = zipBuf.subarray(off + 46, off + 46 + nameLen).toString('utf8');
     off += 46 + nameLen + extraLen + commentLen;
-    if (name !== targetName) continue;
+    entries.push({
+      name,
+      read() {
+        if (localOff + 30 > zipBuf.length || zipBuf.readUInt32LE(localOff) !== 0x04034b50) {
+          throw new Error(`Corrupt ZIP local header for ${name}.`);
+        }
+        const lNameLen = zipBuf.readUInt16LE(localOff + 26);
+        const lExtraLen = zipBuf.readUInt16LE(localOff + 28);
+        const dataStart = localOff + 30 + lNameLen + lExtraLen;
+        const raw = zipBuf.subarray(dataStart, dataStart + compSize);
+        if (method === 0) return raw;
+        if (method === 8) return zlib.inflateRawSync(raw);
+        throw new Error(`Unsupported ZIP compression method ${method} for ${name}.`);
+      },
+    });
+  }
+  return entries;
+}
 
-    if (localOff + 30 > zipBuf.length || zipBuf.readUInt32LE(localOff) !== 0x04034b50) {
-      throw new Error(`Corrupt ZIP local header for ${targetName}.`);
+function findSevenZipBinary() {
+  const candidates =
+    process.platform === 'win32'
+      ? ['7z', '7z.exe', 'C:\\Program Files\\7-Zip\\7z.exe', 'C:\\Program Files (x86)\\7-Zip\\7z.exe']
+      : ['7z', '7zz', '7za'];
+  for (const cand of candidates) {
+    try {
+      execFileSync(cand, ['i'], { stdio: 'ignore' });
+      return cand;
+    } catch {
+      // Try next candidate.
     }
-    const lNameLen = zipBuf.readUInt16LE(localOff + 26);
-    const lExtraLen = zipBuf.readUInt16LE(localOff + 28);
-    const dataStart = localOff + 30 + lNameLen + lExtraLen;
-    const raw = zipBuf.subarray(dataStart, dataStart + compSize);
-    if (method === 0) return raw;
-    if (method === 8) return zlib.inflateRawSync(raw);
-    throw new Error(`Unsupported ZIP compression method ${method} for ${targetName}.`);
   }
   return null;
+}
+
+function walkRegularFiles(rootDir, relPrefix = '', out = []) {
+  for (const dirent of fs.readdirSync(rootDir, { withFileTypes: true })) {
+    const rel = relPrefix ? `${relPrefix}/${dirent.name}` : dirent.name;
+    const full = path.join(rootDir, dirent.name);
+    if (dirent.isDirectory()) {
+      if (dirent.name === '$PLUGINSDIR') continue;
+      walkRegularFiles(full, rel, out);
+    } else if (dirent.isFile()) {
+      out.push({ rel, full });
+    }
+  }
+  return out;
+}
+
+/**
+ * Inspect the compiled payload inside an NSIS installer without executing it.
+ *
+ * Uses `7z` when installed (as on GitHub Actions runners) to extract the installer files cleanly,
+ * and falls back to parsing the NSIS FirstHeader (`0xDEADBEEF` + `"NullsoftInst"`) and
+ * decompressing uncompressed, zlib (solid or per-block), or LZMA1 datablocks directly.
+ */
+function inspectNsisCompiledPayload(filePath) {
+  const sevenZip = findSevenZipBinary();
+  if (sevenZip) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-nsis-inspect-'));
+    try {
+      execFileSync(sevenZip, ['x', '-y', '-bd', `-o${tmpDir}`, filePath], { stdio: 'pipe' });
+      const files = walkRegularFiles(tmpDir);
+      const exes = files.filter((f) => {
+        const lower = path.basename(f.rel).toLowerCase();
+        return lower.endsWith('.exe') && !lower.includes('uninst');
+      });
+      if (exes.length > 0) {
+        const mainExes = exes.filter((f) => {
+          const lower = path.basename(f.rel).toLowerCase();
+          return lower === 'legion-app.exe' || lower === 'legion.exe';
+        });
+        const topLevelExes = exes.filter((f) => !f.rel.includes('/'));
+        const required = mainExes.length > 0 ? mainExes : topLevelExes.length > 0 ? topLevelExes : exes;
+        const requiredSet = new Set(required.map((f) => f.rel));
+        const binReports = [];
+        for (const f of exes) {
+          const markers = scanFileMarkers(f.full);
+          if (requiredSet.has(f.rel) || markers.seqMarkers.length > 0 || markers.previewMarkers.length > 0) {
+            binReports.push({ name: f.rel, ...markers });
+          }
+        }
+        return binReports;
+      }
+    } catch {
+      // Fall through to the built-in NSIS FirstHeader parser if 7z rejects a synthetic archive.
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // Fallback: locate the NSIS FirstHeader (`flags[4] + 0xDEADBEEF + "NullsoftInst" + headerLen[4] + archiveLen[4]`)
+  // and decompress the payload datablocks directly without executing the installer.
+  const buf = fs.readFileSync(filePath);
+  const magicOff = buf.indexOf(NSIS_MAGIC);
+  if (magicOff === -1 || magicOff < 4 || magicOff + 24 > buf.length) {
+    return [];
+  }
+  const archiveLen = buf.readUInt32LE(magicOff + 20);
+  const payloadStart = magicOff + 24;
+  const payloadEnd = Math.min(buf.length, magicOff - 4 + archiveLen);
+  const stream = buf.subarray(payloadStart, payloadEnd > payloadStart ? payloadEnd : buf.length);
+
+  const collectFromBuffers = (buffers) => {
+    const seqMarkers = [];
+    const previewMarkers = [];
+    for (const b of buffers) {
+      seqMarkers.push(...findSequenceMarkersInBuffer(b));
+      previewMarkers.push(...findPreviewKeyMarkersInBuffer(b));
+    }
+    return seqMarkers.length > 0 || previewMarkers.length > 0
+      ? [{ name: 'nsis-payload', seqMarkers, previewMarkers }]
+      : [];
+  };
+
+  // 1. Try NSIS non-solid datablocks: `[u32 len_and_flag][block]...`
+  const blockBufs = [];
+  let pos = 0;
+  let validBlocks = 0;
+  while (pos + 4 <= stream.length) {
+    const rawLen = stream.readUInt32LE(pos);
+    const isCompressed = (rawLen & 0x80000000) !== 0;
+    const len = rawLen & 0x7fffffff;
+    pos += 4;
+    if (len === 0 || pos + len > stream.length) break;
+    const chunk = stream.subarray(pos, pos + len);
+    pos += len;
+    if (isCompressed) {
+      try {
+        blockBufs.push(zlib.inflateRawSync(chunk));
+        validBlocks += 1;
+      } catch {
+        break;
+      }
+    } else {
+      blockBufs.push(chunk);
+      validBlocks += 1;
+    }
+  }
+  if (validBlocks > 0) {
+    const found = collectFromBuffers(blockBufs);
+    if (found.length > 0) return found;
+  }
+
+  // 2. Try NSIS solid zlib stream.
+  try {
+    const inflated = zlib.inflateRawSync(stream, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+    const found = collectFromBuffers([inflated]);
+    if (found.length > 0) return found;
+  } catch {
+    // Not a solid zlib stream.
+  }
+
+  // 3. Try NSIS solid LZMA1 stream (optionally prefixed with 1-byte BCJ x86 filter flag 0x00/0x01)
+  //    using Python's stdlib `lzma` module.
+  for (const skipBcj of [0, 1]) {
+    if (stream.length <= skipBcj + 5) continue;
+    const lcLpPb = stream[skipBcj];
+    if (lcLpPb >= 225) continue;
+    const dictSize = stream.readUInt32LE(skipBcj + 1);
+    if (dictSize < 4096 || dictSize > 128 * 1024 * 1024) continue;
+    try {
+      const py = [
+        'import lzma, struct, sys',
+        'data = sys.stdin.buffer.read()',
+        'prop = data[0]',
+        'lc = prop % 9; r = prop // 9; lp = r % 5; pb = r // 5',
+        'ds = struct.unpack("<I", data[1:5])[0]',
+        'dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA1, "lc": lc, "lp": lp, "pb": pb, "dict_size": ds}])',
+        'out = bytearray()',
+        'mv = memoryview(data)[5:]',
+        'for i in range(0, len(mv), 65536):',
+        '    try:',
+        '        out.extend(dec.decompress(mv[i:i+65536]))',
+        '    except lzma.LZMAError:',
+        '        break',
+        '    if dec.eof: break',
+        'sys.stdout.buffer.write(out)',
+      ].join('\n');
+      const pyBins = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python'];
+      for (const pyBin of pyBins) {
+        try {
+          const inflated = execFileSync(pyBin, ['-c', py], {
+            input: stream.subarray(skipBcj),
+            maxBuffer: 256 * 1024 * 1024,
+          });
+          const found = collectFromBuffers([inflated]);
+          if (found.length > 0) return found;
+          break;
+        } catch {
+          // Try next python executable or next candidate offset.
+        }
+      }
+    } catch {
+      // Try next candidate offset.
+    }
+  }
+
+  return [];
 }
 
 /** Parse Android Binary XML (AXML) `AndroidManifest.xml` to extract `<manifest android:versionCode>`. */
@@ -729,10 +1025,10 @@ function decompressSquashfsBlock(compId, raw) {
 }
 
 /**
- * Minimal pure-Node SquashFS 4.0 reader for inspecting AppImage `.desktop` and `usr/bin/*`
- * files without executing the AppImage.
+ * Minimal pure-Node SquashFS 4.0 reader for inspecting AppImage `usr/bin/*` compiled binaries and
+ * `.desktop` metadata without executing the AppImage.
  */
-function inspectAppImageSquashfs(filePath, expectedSeqStr) {
+function inspectAppImageSquashfs(filePath) {
   const fd = fs.openSync(filePath, 'r');
   const fileSize = fs.fstatSync(fd).size;
   const readAt = (offset, length) => {
@@ -975,21 +1271,25 @@ function inspectAppImageSquashfs(filePath, expectedSeqStr) {
       return cur;
     };
 
-    const foundSequences = new Set();
-    // 1. Check compiled binary marker inside usr/bin/*
+    const binFiles = [];
+    // 1. Inspect compiled binaries inside usr/bin/*
     const usrBin = resolvePath(['usr', 'bin']);
     if (usrBin && usrBin.type === 'dir') {
       for (const item of listDir(usrBin)) {
         const node = readInode(item.inodeRef);
         if (node.type === 'file') {
           const bytes = readFileContent(node, 128 * 1024 * 1024);
-          for (const s of findSequenceMarkersInBuffer(bytes)) {
-            foundSequences.add(s);
-          }
+          binFiles.push({
+            name: `usr/bin/${item.name}`,
+            seqMarkers: findSequenceMarkersInBuffer(bytes),
+            previewMarkers: findPreviewKeyMarkersInBuffer(bytes),
+          });
         }
       }
     }
-    // 2. Also check X-AppImage-Version inside usr/share/applications/*.desktop or root *.desktop
+    // 2. Also collect X-AppImage-Version and Exec= inside usr/share/applications/*.desktop or root *.desktop
+    const desktopSequences = [];
+    const desktopExecs = [];
     const checkDesktopDir = (dirNode) => {
       if (!dirNode || dirNode.type !== 'dir') return;
       for (const item of listDir(dirNode)) {
@@ -998,58 +1298,148 @@ function inspectAppImageSquashfs(filePath, expectedSeqStr) {
         if (node.type === 'file' && node.fileSize <= 64 * 1024) {
           const text = readFileContent(node, 64 * 1024).toString('utf8');
           const m = /^X-AppImage-Version=.*\+(\d+)\s*$/m.exec(text);
-          if (m) foundSequences.add(m[1]);
+          if (m) desktopSequences.push(m[1]);
+          const em = /^Exec=\s*(?:"([^"]+)"|'([^']+)'|(\S+))/m.exec(text);
+          const rawExec = em ? em[1] || em[2] || em[3] : null;
+          if (rawExec) {
+            desktopExecs.push(path.posix.basename(rawExec));
+          }
         }
       }
     };
     checkDesktopDir(readInode(rootInodeRef));
     checkDesktopDir(resolvePath(['usr', 'share', 'applications']));
 
-    if (foundSequences.has(expectedSeqStr)) {
-      return { matched: true, found: [...foundSequences] };
-    }
-    return { matched: false, found: [...foundSequences] };
+    return { binFiles, desktopSequences, desktopExecs };
   } finally {
     fs.closeSync(fd);
   }
 }
 
 /**
- * Inspect an artifact file without executing it and verify that the build sequence embedded inside
- * the artifact matches `sequence`. Throws on mismatch or missing embedded sequence.
+ * Inspect an artifact file (or macOS `.app` bundle directory) without executing it and verify:
+ * 1. Packaging metadata agrees with `sequence`.
+ * 2. Every compiled binary inside the artifact contains `LEGION_UPDATE_SEQUENCE=<sequence>` and
+ *    every marker found agrees (never passing on packaging metadata alone, and refusing dual
+ *    conflicting markers).
+ * 3. When `requireExactlyOne` is true, each compiled binary contains literally 1 sequence marker.
+ * 4. When `forbidPreviewKey` is true, every compiled binary contains `LEGION_UPDATE_PREVIEW_KEY=none`
+ *    and zero preview key fingerprints, and optional `buildLogPath` contains no preview key warning.
  */
-export function verifyArtifactSequence(filePath, spec, sequence) {
+export function checkShippedArtifact({
+  filePath,
+  kind,
+  name = path.basename(filePath),
+  sequence,
+  requireExactlyOne = false,
+  forbidPreviewKey = false,
+  buildLogPath = null,
+}) {
   const expectedStr = String(sequence);
-  const label = `${spec.name} (${spec.kind})`;
+  const label = `${name} (${kind})`;
 
-  if (spec.kind === 'apk') {
+  if (forbidPreviewKey && buildLogPath) {
+    const logText = fs.readFileSync(buildLogPath, 'utf8');
+    if (/preview update key compiled in/i.test(logText)) {
+      throw new Error(
+        `${label}: build log ${buildLogPath} reports a compiled-in preview update key; refusing to ship.`,
+      );
+    }
+  }
+
+  const checkBinaryReport = (report) => {
+    const ctx = `${label} [${report.name}]`;
+    assertSequenceMarkersMatch(report.seqMarkers, expectedStr, ctx, { requireExactlyOne });
+    if (forbidPreviewKey) {
+      assertNoPreviewKeyInMarkers(report.previewMarkers, ctx);
+    }
+  };
+
+  if (kind === 'apk') {
     const zipBuf = fs.readFileSync(filePath);
-    const manifestAxml = readZipEntry(zipBuf, 'AndroidManifest.xml');
-    if (!manifestAxml) {
+    const entries = listZipEntries(zipBuf);
+    const manifestEntry = entries.find((e) => e.name === 'AndroidManifest.xml');
+    if (!manifestEntry) {
       throw new Error(`Artifact ${label} is missing AndroidManifest.xml.`);
     }
-    const actualCode = parseApkManifestVersionCode(manifestAxml);
+    const actualCode = parseApkManifestVersionCode(manifestEntry.read());
     const expectedCode = androidVersionCode(sequence);
     if (actualCode !== expectedCode) {
       throw new Error(
         `Artifact ${label} has Android versionCode ${actualCode}, expected ${expectedCode} for sequence ${sequence}.`,
       );
     }
-    return;
-  }
-
-  if (spec.kind === 'binary') {
-    const found = findSequenceMarkersInFile(filePath);
-    if (!found.includes(expectedStr)) {
-      const detail = found.length > 0 ? `found ${found.join(', ')}` : 'no LEGION_UPDATE_SEQUENCE marker found';
+    const nativeLibs = entries.filter((e) => /^lib\/[^/]+\/liblegion_app_lib\.so$/.test(e.name));
+    if (nativeLibs.length === 0) {
       throw new Error(
-        `Artifact ${label} does not match sequence ${sequence} (${detail}). Build with LEGION_BUILD_SEQUENCE=${sequence}.`,
+        `Artifact ${label} is missing compiled native library lib/*/liblegion_app_lib.so.`,
       );
+    }
+    for (const lib of nativeLibs) {
+      const soBuf = lib.read();
+      checkBinaryReport({
+        name: lib.name,
+        seqMarkers: findSequenceMarkersInBuffer(soBuf),
+        previewMarkers: findPreviewKeyMarkersInBuffer(soBuf),
+      });
     }
     return;
   }
 
-  if (spec.kind === 'deb') {
+  if (kind === 'ipa') {
+    const zipBuf = fs.readFileSync(filePath);
+    const entries = listZipEntries(zipBuf);
+    let plistExec = null;
+    for (const entry of entries) {
+      if (/^Payload\/[^/]+\.app\/Info\.plist$/.test(entry.name)) {
+        const text = entry.read().toString('utf8');
+        const em = /<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/.exec(text);
+        if (em) plistExec = em[1].trim();
+      }
+    }
+    const binaries = [];
+    for (const entry of entries) {
+      if (!/^Payload\/[^/]+\.app\/[^/]+$/.test(entry.name)) continue;
+      if (/\.(plist|png|car|nib|json|mobileprovision|txt|css|js|html)$/i.test(entry.name)) continue;
+      const data = entry.read();
+      if (data.length < 4) continue;
+      const magic = data.readUInt32BE(0);
+      const isMachO =
+        magic === 0xfeedface ||
+        magic === 0xcefaedfe ||
+        magic === 0xfeedfacf ||
+        magic === 0xcffaedfe ||
+        magic === 0xcafebabe ||
+        magic === 0xbebafeca;
+      if (!isMachO) continue;
+      binaries.push({
+        name: entry.name,
+        base: path.posix.basename(entry.name),
+        seqMarkers: findSequenceMarkersInBuffer(data),
+        previewMarkers: findPreviewKeyMarkersInBuffer(data),
+      });
+    }
+    if (binaries.length === 0) {
+      throw new Error(`Artifact ${label} contains no Mach-O executable under Payload/*.app/.`);
+    }
+    if (plistExec && !binaries.some((b) => b.base === plistExec)) {
+      throw new Error(
+        `Artifact ${label} is missing main executable Payload/*.app/${plistExec} declared in Info.plist.`,
+      );
+    }
+    for (const bin of binaries) {
+      checkBinaryReport(bin);
+    }
+    return;
+  }
+
+  if (kind === 'binary') {
+    const markers = scanFileMarkers(filePath);
+    checkBinaryReport({ name, ...markers });
+    return;
+  }
+
+  if (kind === 'deb') {
     const buf = fs.readFileSync(filePath);
     const members = parseArArchive(buf);
     const controlName = [...members.keys()].find((k) => k === 'control.tar' || k.startsWith('control.tar.'));
@@ -1058,65 +1448,105 @@ export function verifyArtifactSequence(filePath, spec, sequence) {
     }
     const controlTar = decompressTarPayload(controlName, members.get(controlName));
     let controlVersion = null;
+    let controlPackage = null;
     readTarEntries(controlTar, (entryName, data) => {
       const clean = entryName.replace(/^\.\//, '');
       if (clean === 'control') {
-        const m = /^Version:\s*(\S+)/m.exec(data.toString('utf8'));
+        const text = data.toString('utf8');
+        const m = /^Version:\s*(\S+)/m.exec(text);
         if (m) controlVersion = m[1];
+        const pm = /^Package:\s*(\S+)/m.exec(text);
+        if (pm) controlPackage = pm[1];
         return true;
       }
       return false;
     });
     if (controlVersion) {
       const seqMatch = /\+(\d+)(?:-[A-Za-z0-9.+~]+)?$/.exec(controlVersion);
-      if (seqMatch) {
-        if (seqMatch[1] !== expectedStr) {
-          throw new Error(
-            `Artifact ${label} declares Debian Version ${controlVersion} (sequence ${seqMatch[1]}), expected sequence ${sequence}.`,
-          );
-        }
-        return;
+      if (seqMatch && seqMatch[1] !== expectedStr) {
+        throw new Error(
+          `Artifact ${label} declares Debian Version ${controlVersion} (sequence ${seqMatch[1]}), expected sequence ${sequence}.`,
+        );
       }
     }
-    // Node .deb packages use Version: <semver>-1 without +<seq>; check the compiled binary marker
-    // inside data.tar.* instead.
     const dataName = [...members.keys()].find((k) => k === 'data.tar' || k.startsWith('data.tar.'));
-    if (dataName) {
-      const dataTar = decompressTarPayload(dataName, members.get(dataName));
-      const found = new Set();
-      readTarEntries(dataTar, (entryName, data) => {
-        const clean = entryName.replace(/^\.\//, '');
-        if (clean.startsWith('usr/bin/')) {
-          for (const seq of findSequenceMarkersInBuffer(data)) {
-            found.add(seq);
-          }
-        }
-        return false;
-      });
-      if (found.has(expectedStr)) {
-        return;
-      }
-      const detail = found.size > 0
-        ? `found binary sequence ${[...found].join(', ')}`
-        : `control Version is ${controlVersion || 'missing'} and no binary LEGION_UPDATE_SEQUENCE marker was found`;
-      throw new Error(`Artifact ${label} does not match sequence ${sequence} (${detail}).`);
+    if (!dataName) {
+      throw new Error(`Artifact ${label} is missing data.tar.* inside the .deb archive.`);
     }
-    throw new Error(
-      `Artifact ${label} does not carry sequence ${sequence} in Debian control Version (${controlVersion || 'missing'}).`,
+    const dataTar = decompressTarPayload(dataName, members.get(dataName));
+    const bins = [];
+    const desktopExecs = [];
+    readTarEntries(dataTar, (entryName, data) => {
+      const clean = entryName.replace(/^\.\//, '');
+      if (clean.startsWith('usr/bin/') && !clean.slice('usr/bin/'.length).includes('/') && data.length > 0) {
+        bins.push({
+          name: clean,
+          base: path.posix.basename(clean),
+          seqMarkers: findSequenceMarkersInBuffer(data),
+          previewMarkers: findPreviewKeyMarkersInBuffer(data),
+        });
+      } else if (clean.startsWith('usr/share/applications/') && clean.endsWith('.desktop') && data.length <= 64 * 1024) {
+        const em = /^Exec=\s*(?:"([^"]+)"|'([^']+)'|(\S+))/m.exec(data.toString('utf8'));
+        const rawExec = em ? em[1] || em[2] || em[3] : null;
+        if (rawExec) desktopExecs.push(path.posix.basename(rawExec));
+      }
+      return false;
+    });
+    if (bins.length === 0) {
+      throw new Error(
+        `Artifact ${label} has no executables under usr/bin/* inside data.tar.* (control Version is ${controlVersion || 'missing'}).`,
+      );
+    }
+    const requiredNames = new Set();
+    if (controlPackage && bins.some((b) => b.base === controlPackage)) {
+      requiredNames.add(controlPackage);
+    }
+    for (const execName of desktopExecs) {
+      if (bins.some((b) => b.base === execName)) {
+        requiredNames.add(execName);
+      }
+    }
+    for (const known of ['legion-app', 'legion']) {
+      if (bins.some((b) => b.base === known)) {
+        requiredNames.add(known);
+      }
+    }
+    if (requiredNames.size === 0) {
+      // No known main binary name matched: require EVERY executable in usr/bin/* to carry valid markers.
+      for (const bin of bins) {
+        requiredNames.add(bin.base);
+      }
+    }
+    const toCheck = bins.filter(
+      (b) => requiredNames.has(b.base) || b.seqMarkers.length > 0 || b.previewMarkers.length > 0,
     );
+    for (const bin of toCheck) {
+      checkBinaryReport(bin);
+    }
+    return;
   }
 
-  if (spec.kind === 'app-tar') {
+  if (kind === 'app-tar') {
     const raw = fs.readFileSync(filePath);
-    const tarBuf = decompressTarPayload(spec.name, raw);
+    const tarBuf = decompressTarPayload(name, raw);
     let plistVersion = null;
+    let plistExec = null;
+    const macosBins = [];
     readTarEntries(tarBuf, (entryName, data) => {
       const clean = entryName.replace(/^\.\//, '');
       if (/^[^/]+\.app\/Contents\/Info\.plist$/.test(clean)) {
         const text = data.toString('utf8');
-        const m = /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(text);
-        if (m) plistVersion = m[1].trim();
-        return true;
+        const vm = /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(text);
+        if (vm) plistVersion = vm[1].trim();
+        const em = /<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/.exec(text);
+        if (em) plistExec = em[1].trim();
+      } else if (/^[^/]+\.app\/Contents\/MacOS\/[^/]+$/.test(clean)) {
+        macosBins.push({
+          name: clean,
+          base: path.posix.basename(clean),
+          seqMarkers: findSequenceMarkersInBuffer(data),
+          previewMarkers: findPreviewKeyMarkersInBuffer(data),
+        });
       }
       return false;
     });
@@ -1125,47 +1555,198 @@ export function verifyArtifactSequence(filePath, spec, sequence) {
         `Artifact ${label} has Info.plist CFBundleVersion ${JSON.stringify(plistVersion)}, expected ${JSON.stringify(expectedStr)}.`,
       );
     }
+    if (!plistExec) {
+      throw new Error(`Artifact ${label} Info.plist is missing CFBundleExecutable.`);
+    }
+    const mainBins = macosBins.filter((b) => b.base === plistExec);
+    if (mainBins.length === 0) {
+      throw new Error(
+        `Artifact ${label} is missing main executable Contents/MacOS/${plistExec} declared in Info.plist.`,
+      );
+    }
+    const toCheck = macosBins.filter(
+      (b) => b.base === plistExec || b.seqMarkers.length > 0 || b.previewMarkers.length > 0,
+    );
+    for (const bin of toCheck) {
+      checkBinaryReport(bin);
+    }
     return;
   }
 
-  if (spec.kind === 'nsis') {
+  if (kind === 'app-bundle') {
+    const macosPlistPath = path.join(filePath, 'Contents', 'Info.plist');
+    const iosPlistPath = path.join(filePath, 'Info.plist');
+    if (fs.existsSync(macosPlistPath)) {
+      const plistText = fs.readFileSync(macosPlistPath, 'utf8');
+      const vm = /<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/.exec(plistText);
+      const plistVersion = vm ? vm[1].trim() : null;
+      if (plistVersion !== expectedStr) {
+        throw new Error(
+          `Artifact ${label} has Info.plist CFBundleVersion ${JSON.stringify(plistVersion)}, expected ${JSON.stringify(expectedStr)}.`,
+        );
+      }
+      const em = /<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/.exec(plistText);
+      const execName = em ? em[1].trim() : null;
+      if (!execName) {
+        throw new Error(`Artifact ${label} Contents/Info.plist is missing CFBundleExecutable.`);
+      }
+      const macosDir = path.join(filePath, 'Contents', 'MacOS');
+      if (!fs.existsSync(macosDir)) {
+        throw new Error(`Artifact ${label} is missing Contents/MacOS directory.`);
+      }
+      const mainBinPath = path.join(macosDir, execName);
+      if (!fs.existsSync(mainBinPath) || !fs.statSync(mainBinPath).isFile()) {
+        throw new Error(
+          `Artifact ${label} is missing main executable Contents/MacOS/${execName} declared in Info.plist.`,
+        );
+      }
+      checkBinaryReport({ name: `Contents/MacOS/${execName}`, ...scanFileMarkers(mainBinPath) });
+      for (const f of fs.readdirSync(macosDir)) {
+        if (f === execName) continue;
+        const p = path.join(macosDir, f);
+        if (!fs.statSync(p).isFile()) continue;
+        const markers = scanFileMarkers(p);
+        if (markers.seqMarkers.length > 0 || markers.previewMarkers.length > 0) {
+          checkBinaryReport({ name: `Contents/MacOS/${f}`, ...markers });
+        }
+      }
+      return;
+    }
+    if (fs.existsSync(iosPlistPath)) {
+      const iosPlistText = fs.readFileSync(iosPlistPath, 'utf8');
+      const em = /<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/.exec(iosPlistText);
+      const execName = em ? em[1].trim() : null;
+      // Flat iOS / iOS Simulator .app bundle: scan top-level Mach-O executable(s).
+      const binaries = [];
+      for (const dirent of fs.readdirSync(filePath, { withFileTypes: true })) {
+        if (!dirent.isFile()) continue;
+        if (/\.(plist|png|car|nib|json|mobileprovision|txt|css|js|html)$/i.test(dirent.name)) {
+          continue;
+        }
+        const full = path.join(filePath, dirent.name);
+        const fd = fs.openSync(full, 'r');
+        let magic = 0;
+        try {
+          const head = Buffer.allocUnsafe(4);
+          if (fs.readSync(fd, head, 0, 4, 0) === 4) {
+            magic = head.readUInt32BE(0);
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
+        const isMachO =
+          magic === 0xfeedface ||
+          magic === 0xcefaedfe ||
+          magic === 0xfeedfacf ||
+          magic === 0xcffaedfe ||
+          magic === 0xcafebabe ||
+          magic === 0xbebafeca;
+        if (!isMachO) continue;
+        const markers = scanFileMarkers(full);
+        binaries.push({ name: dirent.name, ...markers });
+      }
+      if (binaries.length === 0) {
+        throw new Error(`Artifact ${label} contains no Mach-O executable in flat .app bundle.`);
+      }
+      if (execName && !binaries.some((b) => b.name === execName)) {
+        throw new Error(
+          `Artifact ${label} is missing main executable ${execName} declared in Info.plist.`,
+        );
+      }
+      for (const bin of binaries) {
+        checkBinaryReport(bin);
+      }
+      return;
+    }
+    throw new Error(`Artifact ${label} is missing Contents/Info.plist (macOS) or Info.plist (iOS).`);
+  }
+
+  if (kind === 'nsis') {
     const utf16Found = findUtf16SeqMarkersInFile(filePath);
-    if (utf16Found.includes(expectedStr)) {
-      return;
+    if (utf16Found.length === 0) {
+      throw new Error(
+        `Artifact ${label} has no +seq<sequence> PE version string. Build with tauri-config --os windows --sequence ${sequence}.`,
+      );
     }
-    const asciiFound = findSequenceMarkersInFile(filePath);
-    if (asciiFound.includes(expectedStr)) {
-      return;
+    const uniqueUtf16 = [...new Set(utf16Found)];
+    if (uniqueUtf16.length > 1 || uniqueUtf16[0] !== expectedStr) {
+      throw new Error(
+        `Artifact ${label} PE version string (${uniqueUtf16.join(', ')}) does not match sequence ${sequence}.`,
+      );
     }
-    const allFound = [...new Set([...utf16Found, ...asciiFound])];
-    const detail = allFound.length > 0
-      ? `found ${allFound.join(', ')}`
-      : 'no +seq<sequence> PE version string or LEGION_UPDATE_SEQUENCE marker found';
-    throw new Error(
-      `Artifact ${label} does not match sequence ${sequence} (${detail}). Build with tauri-config --os windows --sequence ${sequence}.`,
+    const payloadBins = inspectNsisCompiledPayload(filePath);
+    if (payloadBins.length === 0) {
+      throw new Error(
+        `Artifact ${label} has no inspectable compiled LEGION_UPDATE_SEQUENCE marker inside its NSIS payload.`,
+      );
+    }
+    for (const bin of payloadBins) {
+      checkBinaryReport(bin);
+    }
+    return;
+  }
+
+  if (kind === 'appimage') {
+    const sq = inspectAppImageSquashfs(filePath);
+    if (!sq) {
+      throw new Error(`Artifact ${label} does not contain a valid SquashFS 4.0 image.`);
+    }
+    for (const deskSeq of sq.desktopSequences) {
+      if (deskSeq !== expectedStr) {
+        throw new Error(
+          `Artifact ${label} declares X-AppImage-Version sequence ${deskSeq}, expected ${sequence}.`,
+        );
+      }
+    }
+    if (sq.binFiles.length === 0) {
+      throw new Error(
+        `Artifact ${label} has no compiled LEGION_UPDATE_SEQUENCE marker in usr/bin/* inside SquashFS (desktop metadata alone is not accepted).`,
+      );
+    }
+    const requiredNames = new Set();
+    for (const execName of sq.desktopExecs || []) {
+      if (sq.binFiles.some((b) => path.posix.basename(b.name) === execName)) {
+        requiredNames.add(execName);
+      }
+    }
+    for (const known of ['legion-app', 'legion']) {
+      if (sq.binFiles.some((b) => path.posix.basename(b.name) === known)) {
+        requiredNames.add(known);
+      }
+    }
+    if (requiredNames.size === 0) {
+      for (const bin of sq.binFiles) {
+        requiredNames.add(path.posix.basename(bin.name));
+      }
+    }
+    const toCheck = sq.binFiles.filter(
+      (b) =>
+        requiredNames.has(path.posix.basename(b.name)) ||
+        b.seqMarkers.length > 0 ||
+        b.previewMarkers.length > 0,
     );
+    for (const bin of toCheck) {
+      checkBinaryReport(bin);
+    }
+    return;
   }
 
-  if (spec.kind === 'appimage') {
-    const sq = inspectAppImageSquashfs(filePath, expectedStr);
-    if (sq) {
-      if (sq.matched) return;
-      const detail = sq.found.length > 0
-        ? `found ${sq.found.join(', ')} inside SquashFS`
-        : 'no matching binary LEGION_UPDATE_SEQUENCE marker or X-AppImage-Version inside SquashFS';
-      throw new Error(`Artifact ${label} does not match sequence ${sequence} (${detail}).`);
-    }
-    const rawFound = findSequenceMarkersInFile(filePath);
-    if (rawFound.includes(expectedStr)) {
-      return;
-    }
-    const detail = rawFound.length > 0
-      ? `found ${rawFound.join(', ')}`
-      : 'no SquashFS image or LEGION_UPDATE_SEQUENCE marker found';
-    throw new Error(`Artifact ${label} does not match sequence ${sequence} (${detail}).`);
-  }
+  throw new Error(`Unsupported artifact kind ${kind} for sequence verification.`);
+}
 
-  throw new Error(`Unsupported artifact kind ${spec.kind} for sequence verification.`);
+/**
+ * Inspect an artifact file without executing it and verify that the build sequence embedded inside
+ * both its packaging metadata and its compiled binary matches `sequence`.
+ */
+export function verifyArtifactSequence(filePath, spec, sequence, { forbidPreviewKey = false } = {}) {
+  checkShippedArtifact({
+    filePath,
+    kind: spec.kind,
+    name: spec.name,
+    sequence,
+    requireExactlyOne: false,
+    forbidPreviewKey,
+  });
 }
 
 /** Assemble and sign a Legion update set directory. */
@@ -1225,8 +1806,10 @@ export function makeUpdateSet({
       throw new Error(`Artifact ${art.name} has invalid size ${st.size} bytes (must be 1..=${MAX_ARTIFACT_BYTES}).`);
     }
     // Verify that the artifact's embedded build sequence matches the update set's sequence
-    // without executing the artifact.
-    verifyArtifactSequence(art.srcPath, art, seqNum);
+    // without executing the artifact, and refuse preview-keyed builds on the stable channel.
+    verifyArtifactSequence(art.srcPath, art, seqNum, {
+      forbidPreviewKey: channel === 'stable',
+    });
     artifactSizes.set(art.name, st.size);
   }
 
@@ -1360,7 +1943,9 @@ export function verifyUpdateSet({ dir, publicKeyPath }) {
     if (!Number.isSafeInteger(art.size) || art.size <= 0 || art.size !== st.size) {
       throw new Error(`Size mismatch for ${art.name}: manifest declares ${art.size}, file is ${st.size} bytes.`);
     }
-    verifyArtifactSequence(filePath, art, manifest.sequence);
+    verifyArtifactSequence(filePath, art, manifest.sequence, {
+      forbidPreviewKey: manifest.channel === 'stable',
+    });
   }
 
   return { manifest, fingerprint: publicKeyFingerprint(publicKey), count: entries.size };
@@ -1375,6 +1960,7 @@ function usage() {
     '  node scripts/make-update-set.mjs tauri-config --os <linux|macos|windows> --version VER --sequence SEQ',
     '  node scripts/make-update-set.mjs create --out DIR --channel <preview|stable> --version VER --build REV [--sequence SEQ] [--notes TEXT | --notes-file PATH] --key KEY [--public-key PUB] --artifact SPEC [--artifact SPEC ...] [--force]',
     '  node scripts/make-update-set.mjs verify --dir DIR --public-key PUB',
+    '  node scripts/make-update-set.mjs check-artifact --file PATH --kind KIND --sequence SEQ [--forbid-preview-key] [--build-log PATH]',
   ].join('\n');
 }
 
@@ -1465,6 +2051,36 @@ function runCli(argv) {
     const res = verifyUpdateSet({ dir, publicKeyPath });
     console.log(
       `Verified ${res.manifest.channel} update set ${res.manifest.version} (sequence ${res.manifest.sequence}, ${res.count} files, signer ${res.fingerprint}).`,
+    );
+    return;
+  }
+  if (cmd === 'check-artifact') {
+    let filePath;
+    let kind;
+    let sequence;
+    let forbidPreviewKey = false;
+    let buildLogPath = null;
+    for (let i = 0; i < rest.length; i += 1) {
+      if (rest[i] === '--file') filePath = rest[++i];
+      else if (rest[i] === '--kind') kind = rest[++i];
+      else if (rest[i] === '--sequence') sequence = Number(rest[++i]);
+      else if (rest[i] === '--forbid-preview-key') forbidPreviewKey = true;
+      else if (rest[i] === '--build-log') buildLogPath = rest[++i];
+      else throw new Error(`Unknown option: ${rest[i]}`);
+    }
+    if (!filePath || !kind || !Number.isSafeInteger(sequence) || sequence <= 0) {
+      throw new Error('check-artifact requires --file, --kind, and a positive integer --sequence.');
+    }
+    checkShippedArtifact({
+      filePath,
+      kind,
+      sequence,
+      requireExactlyOne: true,
+      forbidPreviewKey,
+      buildLogPath,
+    });
+    console.log(
+      `Verified shipped artifact ${path.basename(filePath)} (${kind}): sequence ${sequence}${forbidPreviewKey ? ', no preview key' : ''}.`,
     );
     return;
   }
