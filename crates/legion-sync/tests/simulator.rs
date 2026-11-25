@@ -35,13 +35,13 @@ use legion_sync::path::{
 };
 use legion_sync::{
     BinEntry, ConflictChoice, DeletionBrakeConfig, DeletionBrakeDecision,
-    FORCED_ROTATION_COOLDOWN_SECS, FORCED_ROTATION_WEEK_WINDOW_SECS, FetchClock, FetchOptions,
-    FolderConfig, FolderMarker, FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry,
-    FsWalkResult, HeldBackRecord, INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher,
-    InboundDeletionBrakeDecision, IndexRecord, IndexStore, MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK,
-    MAX_VERSION_COUNTER, MemberId, MemberState, MemoryIndexStore, Peer, PeerAckView, PeerCursor,
-    PeerHandshake, PendingOp, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION,
-    ScanOptions, StoreBatch, SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector,
+    FORCED_ROTATION_COOLDOWN_SECS, FetchClock, FetchOptions, FolderConfig, FolderMarker,
+    FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry, FsWalkResult, HeldBackRecord,
+    INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher, InboundDeletionBrakeDecision, IndexRecord,
+    IndexStore, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_VERSION_COUNTER, MemberId, MemberState,
+    MemoryIndexStore, Peer, PeerAckView, PeerCursor, PeerHandshake, PeerRollbackClaimDecision,
+    PendingOp, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, ScanOptions,
+    StoreBatch, SyncEngine, SyncError, SyncFs, SyncWrite, VersionKey, VersionVector,
     is_internal_sync_path, validate_sync_path,
 };
 use legion_xfer::hash::hash_bytes;
@@ -5324,10 +5324,8 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
                 caller_pulled: None,
                 caller_acked: None,
                 caller_pull_matches: None,
-                caller_regressed: false,
                 caller_rejoining: false,
                 refused_from_caller: None,
-                caller_evidence_record: None,
             })
         }
         fn records_since(
@@ -5980,9 +5978,18 @@ fn run_backup_restore_more_changes_than_gap_seed(root_seed: u64, seed: u64, reco
     let b_inc_before = world.members[b].engine.meta().unwrap().incarnation;
 
     // 3 edits after backup, synced to everyone (small gap of 3).
+    // When `seed % 3 == 2`, ONLY `a` creates files so `b` loses only APPLIED records (its own
+    // `local_clock` never changed between backup and restore — `review5::b`).
+    let applied_only_lost = (seed % 3) == 2;
     world.global_secs += 60;
-    for i in 0..3 {
-        world.user_create_or_edit_file(b, &format!("f{i}.txt"), true);
+    if applied_only_lost {
+        for i in 0..3 {
+            world.user_create_or_edit_file(a, &format!("from_a_{i}.txt"), true);
+        }
+    } else {
+        for i in 0..3 {
+            world.user_create_or_edit_file(b, &format!("f{i}.txt"), true);
+        }
     }
     world.sync_connected_groups_to_quiescence();
 
@@ -6009,11 +6016,17 @@ fn run_backup_restore_more_changes_than_gap_seed(root_seed: u64, seed: u64, reco
     restored.set_deletion_brake(brake_disabled());
     world.members[b].engine = restored;
 
-    // Make MORE changes after restore than the gap (8 changes vs gap 3), testing both
-    // edit-first-then-new (m7) and new-first-then-edit (m6)!
+    // Make post-restore changes on B:
+    // - mode 0: MORE changes than gap, edit-first-then-new (m7)
+    // - mode 1: MORE changes than gap, new-first-then-edit (m6)
+    // - mode 2: applied-only-records-lost backup + 1 new file (review5::b: local_seq < a.pulled_seq)
     world.global_secs += 60;
     let mut must_survive = Vec::new();
-    if (seed & 1) == 0 {
+    if applied_only_lost {
+        let p = "after_restore_applied_only.txt".to_string();
+        world.user_create_or_edit_file(b, &p, true);
+        must_survive.push(world.members[b].engine.fs().live_file_hash(&p).unwrap());
+    } else if (seed & 1) == 0 {
         for i in 0..3 {
             world.user_create_or_edit_file(b, &format!("f{i}.txt"), true);
             must_survive.push(
@@ -6334,10 +6347,8 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
                 }),
                 caller_acked: None,
                 caller_pull_matches: Some(true),
-                caller_regressed: false,
                 caller_rejoining: false,
                 refused_from_caller: None,
-                caller_evidence_record: None,
             })
         }
         fn records_since(
@@ -6418,24 +6429,11 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
         conflict_dismissed: false,
     };
 
-    // A bare seq > local_seq claim with no checkable record evidence rotates nothing.
-    let p_no_ev = ForcedRotPeer {
-        claim_inc: inc0,
-        claim_seq: 999,
-        records: Vec::new(),
-    };
-    m0.pull_from_peer(&p_no_ev, Timestamp::new(t0.secs + 30, 0))
-        .unwrap();
-    assert_eq!(
-        m0.meta().unwrap().incarnation,
-        inc0,
-        "claim beyond local_seq without record evidence must not rotate"
-    );
-
-    // Checkable fingerprint contradiction at seq 1 (which m0 has) rotates once.
+    // A peer reporting received seq > local_seq triggers self-detected rollback rotation once,
+    // while still refusing escaping symlinks and > 2^62 counters.
     let p1 = ForcedRotPeer {
         claim_inc: inc0,
-        claim_seq: 1,
+        claim_seq: 999,
         records: vec![escaping_sym, huge_rec],
     };
     let r1 = m0
@@ -6444,13 +6442,13 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
     let inc1 = m0.meta().unwrap().incarnation;
     assert_ne!(
         inc1, inc0,
-        "first evidence-backed rollback claim rotates once"
+        "first rollback claim (seq > local_seq) rotates once"
     );
     assert_eq!(r1.held_back, 1, "escaping inbound symlink held back");
     assert_eq!(r1.invalid_skipped, 1, "> 2^62 counter refused");
     assert!(m0.fs().stat_live("in_escape").unwrap().is_none());
 
-    // Second forced rotation within 1 hour MUST be rate-limited!
+    // Second forced rotation within 1 day MUST be rate-limited!
     let p2 = ForcedRotPeer {
         claim_inc: inc1,
         claim_seq: 1,
@@ -7094,16 +7092,13 @@ fn run_index_loss_during_hold_seed(root_seed: u64, seed: u64, _record_trace: boo
     }
 }
 
-/// Scenario 20: A lying peer repeatedly claiming regressions is bounded to at most 1 rotation/day
-/// Scenario 21: Lying peer sending bare or forged rollback claims is bounded strictly per
-/// claimant (bare claim rotates nothing; forged evidence capped at 1/day and 3/week per peer with
-/// no global cap), surfaces a clear problem naming the peer, never cuts off honest syncing with
-/// other members, and clears the stale problem once the peer behaves (`r11`, `p7`).
+/// Scenario 20: Lying peer claiming false rollbacks is bounded strictly per claimant (at most
+/// 1/day and stops after 3 rotations until confirmed in status), surfaces a clear confirmation
+/// prompt naming the peer, never cuts off honest syncing with other members, and honours the
+/// user's confirmation choice (`KeepHonouring` or `IgnoreReports`) (`r11`, `p7`, `review5`).
 fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_trace: bool) {
     struct RegressionLiar<'a> {
         inner: SimPeer<'a>,
-        bare_lie: bool,
-        forge_evidence: bool,
     }
     impl Peer for RegressionLiar<'_> {
         fn member_id(&self) -> &str {
@@ -7111,16 +7106,11 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
         }
         fn handshake(&self, c: &legion_sync::HandshakeHello) -> legion_sync::Result<PeerHandshake> {
             let mut h = self.inner.handshake(c)?;
-            if self.bare_lie {
-                h.caller_regressed = true;
-            }
-            if self.forge_evidence {
-                h.caller_pulled = Some(PeerAckView {
-                    incarnation: c.incarnation,
-                    seq: c.snapshot_seq.max(1),
-                    fingerprint: Some(hash_bytes(b"forged-fp")),
-                });
-            }
+            h.caller_pulled = Some(PeerAckView {
+                incarnation: c.incarnation,
+                seq: c.snapshot_seq.saturating_add(1),
+                fingerprint: Some(hash_bytes(b"forged-fp")),
+            });
             Ok(h)
         }
         fn records_since(
@@ -7180,31 +7170,11 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
             .unwrap();
     }
 
-    // First verify a bare `caller_regressed = true` claim with NO evidence rotates nothing.
-    let inc_before_bare = pi.meta().unwrap().incarnation;
-    assert!(
-        pi.pull_from_peer(
-            &RegressionLiar {
-                inner: SimPeer::new(&nas, "pi", "nas", PeerFault::None),
-                bare_lie: true,
-                forge_evidence: false,
-            },
-            Timestamp::new(t0.secs + 10, 0),
-        )
-        .is_err(),
-        "seed={root_seed}: bare regression claim must be rejected"
-    );
-    assert_eq!(
-        pi.meta().unwrap().incarnation,
-        inc_before_bare,
-        "seed={root_seed}: bare regression claim rotated incarnation"
-    );
-
-    // Next test a peer forging checkable fingerprint evidence across 10 ticks spaced every 12h:
-    // capped at 1/day and MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK/week for nas!
-    let mut rotations = 0usize;
+    // Repeated false rollback claims across 10 ticks spaced every 12h: capped at 1/day and stops
+    // after MAX_FORCED_ROTATIONS_BEFORE_CONFIRM (3) rotations until confirmed!
+    let mut rotations = 0u32;
     let mut prev_inc = pi.meta().unwrap().incarnation;
-    let mut week_rot_times: Vec<i64> = Vec::new();
+    let mut rot_times: Vec<i64> = Vec::new();
     for step in 1..=10i64 {
         let now = Timestamp::new(
             t0.secs + step * (FORCED_ROTATION_COOLDOWN_SECS as i64 / 2),
@@ -7213,8 +7183,6 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
         let _ = pi.pull_from_peer(
             &RegressionLiar {
                 inner: SimPeer::new(&nas, "pi", "nas", PeerFault::None),
-                bare_lie: false,
-                forge_evidence: true,
             },
             now,
         );
@@ -7222,10 +7190,9 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
         if inc != prev_inc {
             rotations += 1;
             prev_inc = inc;
-            week_rot_times.push(now.secs);
-            if week_rot_times.len() >= 2 {
-                let gap = week_rot_times[week_rot_times.len() - 1]
-                    - week_rot_times[week_rot_times.len() - 2];
+            rot_times.push(now.secs);
+            if rot_times.len() >= 2 {
+                let gap = rot_times[rot_times.len() - 1] - rot_times[rot_times.len() - 2];
                 assert!(
                     gap >= FORCED_ROTATION_COOLDOWN_SECS as i64,
                     "seed={root_seed}: rotated twice inside 1 day (gap={gap})"
@@ -7257,31 +7224,63 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
         assert_eq!(tower.store().held_back_count().unwrap(), 0);
     }
 
-    assert!(
-        rotations <= MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK,
-        "seed={root_seed}: expected <= {MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK} rotations for nas inside 1 week, got {rotations}"
+    assert_eq!(
+        rotations, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM,
+        "seed={root_seed}: expected exactly {MAX_FORCED_ROTATIONS_BEFORE_CONFIRM} rotations before stop, got {rotations}"
+    );
+    let st = pi.status().unwrap();
+    assert_eq!(
+        st.pending_rollback_confirmations,
+        vec!["nas".to_string()],
+        "seed={root_seed}: pi must require confirmation for nas"
     );
     assert!(
         matches!(
-            pi.status().unwrap().state,
+            st.state,
             MemberState::Problem { ref problems, .. }
-                if problems.iter().any(|p| p.kind == ProblemKind::PeerRollbackRateLimited)
+                if problems.iter().any(|p| p.kind == ProblemKind::PeerRollbackRateLimited
+                    && p.sentence.contains("has reported three times"))
         ),
-        "seed={root_seed}: pi must report PeerRollbackRateLimited"
+        "seed={root_seed}: pi must report exact 3-rotation confirmation prompt"
     );
 
-    // Once nas stops lying and sends an honest handshake, the stale rate-limit problem clears.
-    let later = Timestamp::new(t0.secs + FORCED_ROTATION_WEEK_WINDOW_SECS as i64 + 100, 0);
-    pi.pull_from_peer(&SimPeer::new(&nas, "pi", "nas", PeerFault::None), later)
-        .unwrap();
+    // Confirming with either KeepHonouring or IgnoreReports clears the confirmation prompt.
+    let ignore = rng.chance(1, 2);
+    let decision = if ignore {
+        PeerRollbackClaimDecision::IgnoreReports
+    } else {
+        PeerRollbackClaimDecision::KeepHonouring
+    };
+    pi.confirm_peer_rollback_claims("nas", decision).unwrap();
     assert!(
-        !pi.store()
-            .list_problems()
+        pi.status()
             .unwrap()
-            .iter()
-            .any(|(_, p)| p.kind == ProblemKind::PeerRollbackRateLimited),
-        "seed={root_seed}: stale PeerRollbackRateLimited did not clear after honest handshake"
+            .pending_rollback_confirmations
+            .is_empty(),
+        "seed={root_seed}: pending confirmation must clear after confirm_peer_rollback_claims"
     );
+    let later = Timestamp::new(t0.secs + 20 * FORCED_ROTATION_COOLDOWN_SECS as i64, 0);
+    let inc_before = pi.meta().unwrap().incarnation;
+    pi.pull_from_peer(
+        &RegressionLiar {
+            inner: SimPeer::new(&nas, "pi", "nas", PeerFault::None),
+        },
+        later,
+    )
+    .unwrap();
+    if ignore {
+        assert_eq!(
+            pi.meta().unwrap().incarnation,
+            inc_before,
+            "seed={root_seed}: IgnoreReports must make future claims from nas change nothing"
+        );
+    } else {
+        assert_ne!(
+            pi.meta().unwrap().incarnation,
+            inc_before,
+            "seed={root_seed}: KeepHonouring must allow future claims from nas again"
+        );
+    }
 }
 
 /// Scenario 21: Randomized asymmetric membership views (`p2`, `p2b`, `p6`, `p6b`):

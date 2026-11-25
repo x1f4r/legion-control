@@ -32,14 +32,10 @@ pub const MAX_VERSION_COUNTER: u64 = 1u64 << 62;
 /// Minimum interval (in seconds) between peer-forced incarnation rotations per peer (1 day).
 pub const FORCED_ROTATION_COOLDOWN_SECS: u64 = 86_400;
 
-/// Rolling window (in seconds) over which peer-forced incarnation rotations from one peer are
-/// bounded (7 days).
-pub const FORCED_ROTATION_WEEK_WINDOW_SECS: u64 = 7 * 86_400;
-
-/// Maximum number of peer-forced incarnation rotations accepted from a single peer within
-/// [`FORCED_ROTATION_WEEK_WINDOW_SECS`] (strictly per claimant; one peer can never exhaust another
-/// peer's budget).
-pub const MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK: usize = 3;
+/// Maximum number of peer-forced incarnation rotations accepted from a single claimant before
+/// further claims from that peer change nothing until the person explicitly confirms in status
+/// (strictly per claimant; one peer can never exhaust another peer's budget).
+pub const MAX_FORCED_ROTATIONS_BEFORE_CONFIRM: u32 = 3;
 
 /// Default retention duration for files moved to `.legion-sync/bin` (30 days).
 pub const DEFAULT_BIN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -466,6 +462,33 @@ impl FolderConfig {
     }
 }
 
+/// Per-claimant state tracking incarnation rotations triggered by one peer's rollback reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRollbackClaimState {
+    /// Timestamp of the most recent rotation triggered by this peer (enforces at most 1/day).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rotation_at: Option<Timestamp>,
+    /// Number of rotations triggered by this peer since the last explicit human confirmation.
+    /// Once this reaches [`MAX_FORCED_ROTATIONS_BEFORE_CONFIRM`], further rollback claims from
+    /// this peer change nothing until the person confirms.
+    #[serde(default)]
+    pub rotations_since_confirm: u32,
+    /// `true` when the person chose to ignore future rollback reports from this peer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignored: bool,
+}
+
+/// A person's response after one peer triggers [`MAX_FORCED_ROTATIONS_BEFORE_CONFIRM`] rollback
+/// rotations on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRollbackClaimDecision {
+    /// Keep honouring rollback reports from this peer (resets its rotation count to 0).
+    KeepHonouring,
+    /// Ignore future rollback reports from this peer.
+    IgnoreReports,
+}
+
 /// Persistent folder-level metadata stored in the index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderMeta {
@@ -502,10 +525,11 @@ pub struct FolderMeta {
     /// Chained fingerprint at `local_seq` (commits to the full sequence history `1..=local_seq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
-    /// Per-claimant timestamps of peer-forced incarnation rotations within the last week
-    /// (enforcing at most once per day and three times per week per peer, with no global cap).
+    /// Per-claimant state for peer-triggered rollback rotations (at most once per day, stopping
+    /// after the third rotation until the person explicitly confirms whether to keep honouring or
+    /// ignore that peer's reports).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub forced_rotations_by_peer: BTreeMap<MemberId, Vec<Timestamp>>,
+    pub rollback_claims_by_peer: BTreeMap<MemberId, PeerRollbackClaimState>,
     /// Directories deleted remotely that were intentionally kept on disk only because they still
     /// hold ignored or held-back local files, persisted across tombstone GC and restarts so scans
     /// never revive them unless synced files are later added inside.
@@ -547,7 +571,7 @@ impl FolderMeta {
             pending_brake: None,
             join_mode: true,
             head_fingerprint: None,
-            forced_rotations_by_peer: BTreeMap::new(),
+            rollback_claims_by_peer: BTreeMap::new(),
             kept_deleted_dirs: BTreeSet::new(),
             needs_rescan: BTreeSet::new(),
             pending_deletions: BTreeMap::new(),
@@ -818,11 +842,6 @@ pub struct PeerHandshake {
     /// fingerprint history (`Some(false)` means the peer's index went back in time or diverged).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pull_matches: Option<bool>,
-    /// `true` when the caller claimed a pull/ack position for this peer's current incarnation that
-    /// is strictly behind what the caller previously directly acknowledged (meaning the caller
-    /// rolled back in time).
-    #[serde(default)]
-    pub caller_regressed: bool,
     /// `true` when the callee has `caller` in its `rejoining_peers` list (removed and re-added),
     /// so `caller_pulled == None` and `caller_acked == None` reflect the fresh re-add rather than
     /// a rollback.
@@ -831,11 +850,6 @@ pub struct PeerHandshake {
     /// Short summary of records the callee could not accept from the caller, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused_from_caller: Option<PeerRefusalSummary>,
-    /// Checkable record evidence supplied when the callee detects the caller may have rolled back:
-    /// a record from the callee's index naming the caller's current `(member, incarnation)` so the
-    /// caller can verify the claim locally before rotating.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caller_evidence_record: Option<IndexRecord>,
 }
 
 /// Monotonic elapsed-time clock for [`FetchOptions`] idle-timeout enforcement.
@@ -1795,6 +1809,10 @@ pub struct FolderStatus {
     /// Temporarily deferred items with their reasons and retry counts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred: Vec<DeferredItem>,
+    /// Peers that have triggered [`MAX_FORCED_ROTATIONS_BEFORE_CONFIRM`] rollback rotations and
+    /// are awaiting an explicit decision via [`crate::SyncEngine::confirm_peer_rollback_claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_rollback_confirmations: Vec<MemberId>,
 }
 
 /// Snapshot of what was expected on disk at the target path immediately before an apply began,

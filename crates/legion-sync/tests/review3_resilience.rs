@@ -1736,7 +1736,11 @@ impl Peer for LyingPeer<'_> {
     }
     fn handshake(&self, c: &HandshakeHello) -> legion_sync::Result<PeerHandshake> {
         let mut h = self.inner.handshake(c)?;
-        h.caller_regressed = true;
+        h.caller_pulled = Some(legion_sync::PeerAckView {
+            incarnation: c.incarnation,
+            seq: c.snapshot_seq.saturating_add(1),
+            fingerprint: Some(legion_xfer::hash::hash_bytes(b"liar-fp")),
+        });
         Ok(h)
     }
     fn records_since(
@@ -1789,10 +1793,12 @@ fn r11_liar_cuts_honest_member_off() {
             },
             ts(now),
         );
-        assert!(
-            r.is_err(),
-            "hour {h}: bare regression claim without evidence must be rejected"
-        );
+        if h >= 2 {
+            assert!(
+                r.is_err(),
+                "hour {h}: repeat rollback claim within 1 day must be rate-limited"
+            );
+        }
         let inc = pi.meta().unwrap().incarnation;
         if *incs.last().unwrap() != inc {
             incs.push(inc);
@@ -1812,17 +1818,17 @@ fn r11_liar_cuts_honest_member_off() {
     }
     assert_eq!(
         incs.len() - 1,
-        0,
-        "bare caller_regressed claim with no checkable evidence must rotate nothing"
+        1,
+        "hourly false rollback claim must rotate at most once per day"
     );
     let probs = pi.store().list_problems().unwrap();
     assert!(
         probs.iter().any(|(_, p)| {
             p.kind == ProblemKind::PeerRollbackRateLimited
                 && p.peer.as_deref() == Some("nas")
-                && p.sentence.contains("without valid evidence")
+                && p.sentence.contains("nas reported again within a day")
         }),
-        "expected PeerRollbackRateLimited problem naming nas without evidence, got {probs:?}"
+        "expected PeerRollbackRateLimited problem naming nas, got {probs:?}"
     );
 }
 
@@ -3357,10 +3363,8 @@ impl Peer for ManyOversizedPeer {
             caller_pulled: None,
             caller_acked: None,
             caller_pull_matches: None,
-            caller_regressed: false,
             caller_rejoining: false,
             refused_from_caller: None,
-            caller_evidence_record: None,
         })
     }
     fn records_since(

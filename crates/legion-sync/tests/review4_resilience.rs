@@ -712,38 +712,6 @@ fn p6b_same_with_a_deletion() {
     }
 }
 
-struct Liar<'a>(EnginePeer<'a, RealFs, RedbIndexStore>);
-impl legion_sync::Peer for Liar<'_> {
-    fn member_id(&self) -> &str {
-        self.0.member_id.as_str()
-    }
-    fn handshake(
-        &self,
-        c: &legion_sync::HandshakeHello,
-    ) -> legion_sync::Result<legion_sync::PeerHandshake> {
-        let mut h = self.0.handshake(c)?;
-        h.caller_regressed = true;
-        Ok(h)
-    }
-    fn records_since(
-        &self,
-        i: u64,
-        s: u64,
-        l: usize,
-        c: Option<&std::sync::atomic::AtomicBool>,
-    ) -> legion_sync::Result<legion_sync::RecordsPage> {
-        self.0.records_since(i, s, l, c)
-    }
-    fn fetch_file(
-        &self,
-        p: &str,
-        h: legion_xfer::Hash,
-        o: &legion_sync::FetchOptions,
-    ) -> legion_sync::Result<Box<dyn std::io::Read + Send>> {
-        self.0.fetch_file(p, h, o)
-    }
-}
-
 struct ForgedEvidenceLiar<'a>(EnginePeer<'a, RealFs, RedbIndexStore>);
 impl legion_sync::Peer for ForgedEvidenceLiar<'_> {
     fn member_id(&self) -> &str {
@@ -756,7 +724,7 @@ impl legion_sync::Peer for ForgedEvidenceLiar<'_> {
         let mut h = self.0.handshake(c)?;
         h.caller_pulled = Some(legion_sync::PeerAckView {
             incarnation: c.incarnation,
-            seq: c.snapshot_seq.max(1),
+            seq: c.snapshot_seq.saturating_add(1),
             fingerprint: Some(legion_xfer::hash::hash_bytes(b"forged-fp")),
         });
         Ok(h)
@@ -780,133 +748,120 @@ impl legion_sync::Peer for ForgedEvidenceLiar<'_> {
     }
 }
 
-/// 1) Bare `caller_regressed = true` claims from `nas` rotate nothing.
-/// 2) Even if `nas` forges checkable evidence on three consecutive days to exhaust `nas`'s own
-///    per-claimant budget, `pi`'s real backup restore on day 4 recovers immediately via `tower`
-///    (never blocked by `nas`), and both sides report honest backup-restore sentences (never
-///    blaming two machines sharing a name).
+/// Even if `nas` claims a rollback on three consecutive days to reach `nas`'s 3-rotation stop,
+/// a 4th claim from `nas` changes nothing until confirmed, `pi`'s real backup restore on day 4
+/// recovers immediately via `tower` (never blocked by `nas`), and both sides report honest
+/// backup-restore sentences (never blaming two machines sharing a name).
 #[test]
 fn p7_liar_spends_weekly_budget_then_real_restore() {
     const DAY: i64 = 86_400;
-    for forged in [false, true] {
-        let tmp = scratch();
-        let t = tmp.path();
-        let all = ["tower", "pi", "nas"];
-        fs::create_dir_all(t.join("tower")).unwrap();
-        for i in 0..5 {
-            fs::write(t.join(format!("tower/f{i}.txt")), format!("base {i}")).unwrap();
-        }
-        let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-        let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
-        let mut nas = open_real(&t.join("nas"), &t.join("nas.redb"), "nas", &all);
-        let base = 1_795_000_000i64;
-        tower.scan(ts(base)).unwrap();
-        sync_all(&mut [&mut tower, &mut pi, &mut nas], base + 1);
-
-        let inc_initial = pi.meta().unwrap().incarnation;
-        let mut liar_rotations = 0usize;
-        let mut prev_inc = inc_initial;
-        for d in 1..=3 {
-            let now = base + d * DAY + 10;
-            let r = if forged {
-                pi.pull_from_peer(&ForgedEvidenceLiar(EnginePeer::new(&nas, "pi")), ts(now))
-            } else {
-                pi.pull_from_peer(&Liar(EnginePeer::new(&nas, "pi")), ts(now))
-            };
-            if !forged {
-                assert!(r.is_err(), "bare claim without evidence must be rejected");
-            }
-            let cur_inc = pi.meta().unwrap().incarnation;
-            if cur_inc != prev_inc {
-                liar_rotations += 1;
-                prev_inc = cur_inc;
-            }
-            sync_all(&mut [&mut tower, &mut pi, &mut nas], now + 100);
-        }
-        if !forged {
-            assert_eq!(
-                liar_rotations, 0,
-                "bare caller_regressed claim must cause 0 rotations"
-            );
-        } else {
-            assert_eq!(
-                liar_rotations, 3,
-                "forged-evidence liar spends its own 3/week per-peer budget"
-            );
-            // A 4th forged lie from nas inside 7 days is now ignored & reported as faulty!
-            let r4 = pi.pull_from_peer(
-                &ForgedEvidenceLiar(EnginePeer::new(&nas, "pi")),
-                ts(base + 4 * DAY - 100),
-            );
-            assert!(r4.is_err(), "4th claim from nas must be rate-limited");
-            assert_eq!(pi.meta().unwrap().incarnation, prev_inc);
-        }
-
-        // Back up pi's index, make pi work, sync to tower & nas, then restore the backup.
-        drop(pi);
-        fs::copy(t.join("pi.redb"), t.join("pi.redb.bak")).unwrap();
-        let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
-        for i in 0..3 {
-            fs::write(t.join(format!("pi/new{i}.txt")), format!("pi work {i}")).unwrap();
-        }
-        pi.scan(ts(base + 3 * DAY + 500)).unwrap();
-        sync_all(&mut [&mut tower, &mut pi, &mut nas], base + 3 * DAY + 600);
-        assert!(t.join("tower/new0.txt").exists());
-        drop(pi);
-        fs::copy(t.join("pi.redb.bak"), t.join("pi.redb")).unwrap();
-        let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
-        fs::write(t.join("pi/after-restore.txt"), b"written after restore").unwrap();
-
-        // Day 4: first let tower pull from pi (healthy peer observing restored pi) -> must say
-        // backup restore, NEVER "Two different machines".
-        let day4 = base + 4 * DAY;
-        pi.scan(ts(day4)).unwrap();
-        let tower_first = pull(&mut tower, &pi, day4 + 1);
-        let tower_err =
-            tower_first.expect("tower must pause pulling from pre-rotation restored pi");
-        assert!(
-            tower_err.contains("restored from a backup")
-                && !tower_err.contains("Two different machines"),
-            "tower sentence must explain backup restore, not duplicate name: {tower_err}"
-        );
-
-        // Now pi pulls from tower -> recovers immediately on day 4 despite nas's spent budget!
-        assert!(
-            pull(&mut pi, &tower, day4 + 2).is_none(),
-            "forged={forged}: pi must recover immediately via tower on day 4"
-        );
-        assert!(
-            pull(&mut tower, &pi, day4 + 3).is_none(),
-            "forged={forged}: tower must pull from rejoined pi on day 4"
-        );
-        assert!(
-            t.join("tower/after-restore.txt").exists(),
-            "forged={forged}: after-restore.txt must reach tower on day 4"
-        );
-        assert_eq!(
-            fs::read(t.join("tower/after-restore.txt")).unwrap(),
-            b"written after restore"
-        );
-
-        // Verify the exact honest sentence on the restored machine (pi).
-        let pi_probs = pi.store().list_problems().unwrap();
-        assert!(
-            pi_probs.iter().any(|(_, p)| {
-                p.kind == ProblemKind::PeerForcedRotation
-                    && p.sentence
-                        == "This machine's copy of the folder is older than what tower has already received from it; it looks like it was restored from a backup. Legion is joining the folder again. Nothing is deleted."
-            }),
-            "expected exact backup-restore sentence on pi, got {pi_probs:?}"
-        );
-        // Tower's temporary waiting-for-rejoin problem cleared once pi rejoined!
-        let tower_probs = tower.store().list_problems().unwrap();
-        assert!(
-            !tower_probs
-                .iter()
-                .any(|(_, p)| p.kind == ProblemKind::DuplicateMemberId),
-            "tower's waiting problem should clear once pi rejoins, got {tower_probs:?}"
-        );
+    let tmp = scratch();
+    let t = tmp.path();
+    let all = ["tower", "pi", "nas"];
+    fs::create_dir_all(t.join("tower")).unwrap();
+    for i in 0..5 {
+        fs::write(t.join(format!("tower/f{i}.txt")), format!("base {i}")).unwrap();
     }
+    let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
+    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+    let mut nas = open_real(&t.join("nas"), &t.join("nas.redb"), "nas", &all);
+    let base = 1_795_000_000i64;
+    tower.scan(ts(base)).unwrap();
+    sync_all(&mut [&mut tower, &mut pi, &mut nas], base + 1);
+
+    let inc_initial = pi.meta().unwrap().incarnation;
+    let mut liar_rotations = 0usize;
+    let mut prev_inc = inc_initial;
+    for d in 1..=3 {
+        let now = base + d * DAY + 10;
+        pi.pull_from_peer(&ForgedEvidenceLiar(EnginePeer::new(&nas, "pi")), ts(now))
+            .unwrap();
+        let cur_inc = pi.meta().unwrap().incarnation;
+        if cur_inc != prev_inc {
+            liar_rotations += 1;
+            prev_inc = cur_inc;
+        }
+        sync_all(&mut [&mut tower, &mut pi, &mut nas], now + 100);
+    }
+    assert_eq!(
+        liar_rotations, 3,
+        "false rollback claims from nas must stop after 3 rotations"
+    );
+    // A 4th claim from nas is blocked until confirmed in status!
+    let r4 = pi.pull_from_peer(
+        &ForgedEvidenceLiar(EnginePeer::new(&nas, "pi")),
+        ts(base + 4 * DAY - 100),
+    );
+    assert!(r4.is_err(), "4th claim from nas must stop until confirmed");
+    assert_eq!(pi.meta().unwrap().incarnation, prev_inc);
+    assert_eq!(
+        pi.status().unwrap().pending_rollback_confirmations,
+        vec!["nas".to_string()]
+    );
+
+    // Back up pi's index, make pi work, sync to tower & nas, then restore the backup.
+    drop(pi);
+    fs::copy(t.join("pi.redb"), t.join("pi.redb.bak")).unwrap();
+    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+    for i in 0..3 {
+        fs::write(t.join(format!("pi/new{i}.txt")), format!("pi work {i}")).unwrap();
+    }
+    pi.scan(ts(base + 3 * DAY + 500)).unwrap();
+    sync_all(&mut [&mut tower, &mut pi, &mut nas], base + 3 * DAY + 600);
+    assert!(t.join("tower/new0.txt").exists());
+    drop(pi);
+    fs::copy(t.join("pi.redb.bak"), t.join("pi.redb")).unwrap();
+    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+    fs::write(t.join("pi/after-restore.txt"), b"written after restore").unwrap();
+
+    // Day 4: first let tower pull from pi (healthy peer observing restored pi) -> must say
+    // backup restore, NEVER "Two different machines".
+    let day4 = base + 4 * DAY;
+    pi.scan(ts(day4)).unwrap();
+    let tower_first = pull(&mut tower, &pi, day4 + 1);
+    let tower_err = tower_first.expect("tower must pause pulling from pre-rotation restored pi");
+    assert!(
+        tower_err.contains("restored from a backup")
+            && !tower_err.contains("Two different machines"),
+        "tower sentence must explain backup restore, not duplicate name: {tower_err}"
+    );
+
+    // Now pi pulls from tower -> recovers immediately on day 4 despite nas hitting its limit!
+    assert!(
+        pull(&mut pi, &tower, day4 + 2).is_none(),
+        "pi must recover immediately via tower on day 4"
+    );
+    assert!(
+        pull(&mut tower, &pi, day4 + 3).is_none(),
+        "tower must pull from rejoined pi on day 4"
+    );
+    assert!(
+        t.join("tower/after-restore.txt").exists(),
+        "after-restore.txt must reach tower on day 4"
+    );
+    assert_eq!(
+        fs::read(t.join("tower/after-restore.txt")).unwrap(),
+        b"written after restore"
+    );
+
+    // Verify the exact honest sentence on the restored machine (pi).
+    let pi_probs = pi.store().list_problems().unwrap();
+    assert!(
+        pi_probs.iter().any(|(_, p)| {
+            p.kind == ProblemKind::PeerForcedRotation
+                && p.sentence
+                    == "This machine's copy of the folder is older than what tower has already received from it; it looks like it was restored from a backup. Legion is joining the folder again. Nothing is deleted."
+        }),
+        "expected exact backup-restore sentence on pi, got {pi_probs:?}"
+    );
+    // Tower's temporary waiting-for-rejoin problem cleared once pi rejoined!
+    let tower_probs = tower.store().list_problems().unwrap();
+    assert!(
+        !tower_probs
+            .iter()
+            .any(|(_, p)| p.kind == ProblemKind::DuplicateMemberId),
+        "tower's waiting problem should clear once pi rejoins, got {tower_probs:?}"
+    );
 }
 
 fn st(e: &E) -> String {

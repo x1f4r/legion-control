@@ -12,8 +12,8 @@ use std::sync::atomic::AtomicBool;
 
 use legion_sync::{
     FORCED_ROTATION_COOLDOWN_SECS, FetchOptions, HandshakeHello, IndexRecord, IndexStore,
-    MAX_VERSION_COUNTER, MemberState, Peer, PeerAckView, PeerHandshake, ProblemKind, RecordsPage,
-    SYNC_PROTOCOL_VERSION, SyncError, VersionKey, VersionVector,
+    MAX_VERSION_COUNTER, MemberState, Peer, PeerAckView, PeerHandshake, PeerRollbackClaimDecision,
+    ProblemKind, RecordsPage, SYNC_PROTOCOL_VERSION, SyncError, VersionKey, VersionVector,
 };
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -45,10 +45,8 @@ impl Peer for LyingPeer {
             caller_pulled: self.caller_pulled,
             caller_acked: self.caller_acked,
             caller_pull_matches: Some(true),
-            caller_regressed: false,
             caller_rejoining: false,
             refused_from_caller: None,
-            caller_evidence_record: None,
         })
     }
 
@@ -226,7 +224,7 @@ fn forged_own_counter_and_huge_counter_are_refused_unacked_and_durable() {
 }
 
 #[test]
-fn peer_forced_rotation_requires_evidence_and_is_budgeted_per_claimant() {
+fn peer_forced_rotation_is_rate_limited_and_requires_confirmation_after_three() {
     let tmp = scratch();
     let t = tmp.path();
     let all = ["tower", "evil1", "honest"];
@@ -237,36 +235,15 @@ fn peer_forced_rotation_requires_evidence_and_is_budgeted_per_claimant() {
     tower.scan(ts(0)).unwrap();
     let inc1 = tower.meta().unwrap().incarnation;
 
-    // 1. A peer citing a sequence BEYOND tower's local_seq with NO record evidence rotates nothing.
-    let no_evidence = LyingPeer {
-        id: "evil1".into(),
-        incarnation: 10,
-        snapshot_seq: 0,
-        caller_pulled: Some(PeerAckView {
-            incarnation: inc1,
-            seq: 999,
-            fingerprint: Some(hash_bytes(b"fake-fp")),
-        }),
-        caller_acked: None,
-        pages: RefCell::new(Vec::new()),
-        payloads: BTreeMap::new(),
-    };
-    tower.pull_from_peer(&no_evidence, ts(50)).unwrap();
-    assert_eq!(
-        tower.meta().unwrap().incarnation,
-        inc1,
-        "claim citing seq beyond local_seq without record evidence must not rotate"
-    );
-
-    // 2. A peer presenting checkable evidence (mismatched fingerprint at seq=1 which tower HAS)
-    //    forces rotation once per day and reports the honest backup-restore sentence.
-    let liar_at_seq1 = |id: &str, peer_inc: u64, target_inc: u64, tag: &[u8]| LyingPeer {
+    // 1. A peer reporting a received seq > local_seq triggers self-detected rollback rotation once
+    //    and reports the honest backup-restore sentence.
+    let liar_ahead = |id: &str, peer_inc: u64, target_inc: u64, seq: u64, tag: &[u8]| LyingPeer {
         id: id.into(),
         incarnation: peer_inc,
         snapshot_seq: 0,
         caller_pulled: Some(PeerAckView {
             incarnation: target_inc,
-            seq: 1,
+            seq,
             fingerprint: Some(hash_bytes(tag)),
         }),
         caller_acked: None,
@@ -274,32 +251,29 @@ fn peer_forced_rotation_requires_evidence_and_is_budgeted_per_claimant() {
         payloads: BTreeMap::new(),
     };
     tower
-        .pull_from_peer(&liar_at_seq1("evil1", 10, inc1, b"fake-fp-1"), ts(100))
+        .pull_from_peer(&liar_ahead("evil1", 10, inc1, 999, b"fp-1"), ts(100))
         .unwrap();
     let inc2 = tower.meta().unwrap().incarnation;
     assert_ne!(
         inc2, inc1,
-        "first evidence-backed rollback claim should rotate incarnation"
+        "first rollback claim (peer seq > local_seq) should rotate incarnation"
     );
     match tower.status().unwrap().state {
         MemberState::Problem { problems, .. } => {
             assert!(
                 problems.iter().any(|p| {
                     p.kind == ProblemKind::PeerForcedRotation
-                        && p.sentence.contains("restored from a backup")
-                        && p.sentence.contains("Nothing is deleted.")
+                        && p.sentence
+                            == "This machine's copy of the folder is older than what evil1 has already received from it; it looks like it was restored from a backup. Legion is joining the folder again. Nothing is deleted."
                 }),
-                "forced rotation must be reported with backup-restore sentence, got {problems:?}"
+                "forced rotation must be reported with exact backup-restore sentence, got {problems:?}"
             );
         }
         other => panic!("expected PeerForcedRotation problem, got {other:?}"),
     }
 
-    // 3. Second claim 2 hours later (< 1 day) from evil1: refused and rate-limited (no rotation!).
-    let err = tower.pull_from_peer(
-        &liar_at_seq1("evil1", 10, inc2, b"fake-fp-2"),
-        ts(100 + 7200),
-    );
+    // 2. Second claim 2 hours later (< 1 day) from evil1: refused and rate-limited (no rotation!).
+    let err = tower.pull_from_peer(&liar_ahead("evil1", 10, inc2, 1, b"fp-2"), ts(100 + 7200));
     assert!(matches!(err, Err(SyncError::Conflict { .. })));
     assert_eq!(
         tower.meta().unwrap().incarnation,
@@ -313,8 +287,7 @@ fn peer_forced_rotation_requires_evidence_and_is_budgeted_per_claimant() {
                 .find(|p| p.kind == ProblemKind::PeerRollbackRateLimited)
                 .expect("rate-limited rotation attempt must be reported");
             assert!(
-                rl.sentence
-                    .contains("evil1 keeps reporting that this machine's history went back"),
+                rl.sentence.contains("evil1 reported again within a day"),
                 "unexpected rate-limit sentence: {}",
                 rl.sentence
             );
@@ -322,11 +295,11 @@ fn peer_forced_rotation_requires_evidence_and_is_budgeted_per_claimant() {
         other => panic!("expected PeerRollbackRateLimited problem, got {other:?}"),
     }
 
-    // 4. evil1 uses its remaining 2 per-peer weekly slots on days 2 and 3 (total 3 for evil1).
+    // 3. evil1 triggers its 2nd and 3rd rotations on days 2 and 3.
     let day = FORCED_ROTATION_COOLDOWN_SECS as i64;
     tower
         .pull_from_peer(
-            &liar_at_seq1("evil1", 10, inc2, b"fake-fp-d2"),
+            &liar_ahead("evil1", 10, inc2, 1, b"fp-d2"),
             ts(100 + day + 1),
         )
         .unwrap();
@@ -335,38 +308,94 @@ fn peer_forced_rotation_requires_evidence_and_is_budgeted_per_claimant() {
 
     tower
         .pull_from_peer(
-            &liar_at_seq1("evil1", 10, inc3, b"fake-fp-d3"),
+            &liar_ahead("evil1", 10, inc3, 1, b"fp-d3"),
             ts(100 + 2 * day + 2),
         )
         .unwrap();
     let inc4 = tower.meta().unwrap().incarnation;
     assert_ne!(inc4, inc3);
 
-    // 5. Fourth claim from evil1 inside 7 days is blocked by evil1's per-peer weekly budget!
+    // After the 3rd rotation, status surfaces the exact confirmation prompt and pending peer.
+    let st3 = tower.status().unwrap();
+    assert_eq!(
+        st3.pending_rollback_confirmations,
+        vec!["evil1".to_string()]
+    );
+    match st3.state {
+        MemberState::Problem { problems, .. } => {
+            assert!(
+                problems.iter().any(|p| {
+                    p.kind == ProblemKind::PeerRollbackRateLimited
+                        && p.sentence
+                            == "evil1 has reported three times that this machine's copy went back in time. If you restored this machine from a backup, that is expected. Otherwise evil1 may be faulty."
+                }),
+                "expected exact 3-rotation confirmation sentence, got {problems:?}"
+            );
+        }
+        other => panic!("expected PeerRollbackRateLimited confirmation problem, got {other:?}"),
+    }
+
+    // 4. Fourth claim from evil1 (even weeks later!) changes nothing until confirmed.
     assert!(matches!(
         tower.pull_from_peer(
-            &liar_at_seq1("evil1", 10, inc4, b"fake-fp-d4"),
-            ts(100 + 3 * day + 3)
+            &liar_ahead("evil1", 10, inc4, 1, b"fp-d30"),
+            ts(100 + 30 * day)
         ),
         Err(SyncError::Conflict { .. })
     ));
     assert_eq!(
         tower.meta().unwrap().incarnation,
         inc4,
-        "4th rotation from evil1 within 7 days must be refused"
+        "4th rotation from evil1 must remain blocked until user confirms"
     );
 
-    // 6. Budgets are strictly per claimant: honest peer can STILL recover immediately on day 4!
+    // 5. Limits are strictly per claimant: honest peer can STILL recover immediately!
     tower
         .pull_from_peer(
-            &liar_at_seq1("honest", 20, inc4, b"honest-fp-d4"),
-            ts(100 + 3 * day + 10),
+            &liar_ahead("honest", 20, inc4, 1, b"honest-fp"),
+            ts(100 + 30 * day + 10),
         )
         .unwrap();
+    let inc5 = tower.meta().unwrap().incarnation;
     assert_ne!(
+        inc5, inc4,
+        "evil1 hitting 3-rotation stop must never block honest peer recovery"
+    );
+
+    // 6. User chooses KeepHonouring -> resets counter and allows evil1 to trigger again next day.
+    tower
+        .confirm_peer_rollback_claims("evil1", PeerRollbackClaimDecision::KeepHonouring)
+        .unwrap();
+    assert!(
+        tower
+            .status()
+            .unwrap()
+            .pending_rollback_confirmations
+            .is_empty()
+    );
+    tower
+        .pull_from_peer(
+            &liar_ahead("evil1", 10, inc5, 999, b"fp-after-keep"),
+            ts(100 + 31 * day + 20),
+        )
+        .unwrap();
+    let inc6 = tower.meta().unwrap().incarnation;
+    assert_ne!(inc6, inc5, "KeepHonouring must allow evil1 claims again");
+
+    // 7. User chooses IgnoreReports -> further claims from evil1 change nothing (no rotation, no error).
+    tower
+        .confirm_peer_rollback_claims("evil1", PeerRollbackClaimDecision::IgnoreReports)
+        .unwrap();
+    tower
+        .pull_from_peer(
+            &liar_ahead("evil1", 10, inc6, 999, b"fp-ignored"),
+            ts(100 + 33 * day),
+        )
+        .unwrap();
+    assert_eq!(
         tower.meta().unwrap().incarnation,
-        inc4,
-        "evil1 exhausting its own budget must never block honest peer recovery"
+        inc6,
+        "IgnoreReports must make future rollback claims from evil1 change nothing"
     );
 }
 
