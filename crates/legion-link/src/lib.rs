@@ -126,6 +126,12 @@ pub const REASON_UNREACHABLE: &str = "unreachable";
 /// Structured `details.reason` when the remote side emits too much non-protocol output before
 /// answering `hello` (`code: "unreachable"`).
 pub const REASON_NON_PROTOCOL_OUTPUT: &str = "non_protocol_output";
+/// Structured `details.reason` when a relay node does not advertise `stream.relay` and needs an
+/// update before it can pass files along from another machine (`code: "unsupported"`).
+pub const REASON_RELAY_TOO_OLD: &str = "relay_too_old";
+/// Structured `details.reason` when neither this device nor its relay knows a machine by that name
+/// (`code: "not_found"`).
+pub const REASON_UNKNOWN_MACHINE: &str = "unknown_machine";
 /// Structured `details` boolean key set to `false` when a [`Link`] request provably never left
 /// this device (failure to open a session or [`CallError::NotWritten`]). Absent when bytes were
 /// already written to the wire or when an error came back from the node.
@@ -143,10 +149,77 @@ pub(crate) fn strip_remote_sent(mut err: legion_proto::ErrorBody) -> legion_prot
     err
 }
 
+/// Attaches `details.sent = false` to an error that provably failed before any request bytes left
+/// this device.
+pub(crate) fn mark_not_sent(mut err: legion_proto::ErrorBody) -> legion_proto::ErrorBody {
+    let mut details = err.details.take().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert(DETAIL_SENT.to_owned(), serde_json::Value::Bool(false));
+    } else {
+        details = serde_json::json!({
+            DETAIL_SENT: false,
+            "detail": details,
+        });
+    }
+    err.details = Some(details);
+    err
+}
+
+/// Preserves `err.machine` when the remote side already named which machine refused, falling back
+/// to `fallback` otherwise.
+pub(crate) fn ensure_error_machine(
+    err: legion_proto::ErrorBody,
+    fallback: &str,
+) -> legion_proto::ErrorBody {
+    if err.machine.is_some() {
+        err
+    } else {
+        err.with_machine(fallback)
+    }
+}
+
+/// Decodes a remote `{"error": ...}` stream frame into an [`legion_proto::ErrorBody`] using the
+/// same forward-tolerance rules as [`Session`]:
+///
+/// - Any valid error object — including one carrying an unrecognized non-empty `code` string from
+///   a newer peer — decodes via [`legion_proto::ErrorBody`]'s `Deserialize` impl (falling back to
+///   [`legion_proto::ErrorCode::Failed`] with the original string preserved in
+///   `details.unknown_code`).
+/// - If the `error` payload cannot be decoded as an [`legion_proto::ErrorBody`] at all (missing
+///   required fields, empty `code`, or wrong shape), returns [`legion_proto::ErrorCode::Internal`]
+///   with `details.reason = "unrecognized_reply"` and the same wording as `session.rs`.
+pub(crate) fn decode_remote_error(
+    error_val: &serde_json::Value,
+    fallback_machine: &str,
+) -> legion_proto::ErrorBody {
+    match serde_json::from_value::<legion_proto::ErrorBody>(error_val.clone()) {
+        Ok(body) => ensure_error_machine(strip_remote_sent(body), fallback_machine),
+        Err(decode_err) => {
+            let machine = error_val
+                .get("machine")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(fallback_machine);
+            legion_proto::ErrorBody::new(
+                legion_proto::ErrorCode::Internal,
+                format!(
+                    "{machine} answered with a reply this version of legion does not understand ({decode_err})."
+                ),
+            )
+            .with_hint(
+                "Update legion on whichever side is older so both understand the same replies.",
+            )
+            .with_machine(machine)
+            .with_details(serde_json::json!({ "reason": "unrecognized_reply" }))
+        }
+    }
+}
+
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 pub use content::{
-    ContentStream, ContentTime, DEFAULT_MAX_PARKED_STREAMS, RawStream, StreamOpenError,
-    StreamOpener,
+    CAP_STREAM_RELAY, ContentStream, ContentTime, DEFAULT_MAX_PARKED_STREAMS, RawStream,
+    StreamOpenError, StreamOpener,
 };
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
@@ -157,14 +230,14 @@ pub use invite::{
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    ConflictingIdentityReport, DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN, DEFAULT_IDLE_TIMEOUT,
-    DEFAULT_UNSYNCED_BACKOFF, DisagreementReport, LearnDisagreement, LearnReport, Link, LinkConfig,
-    LinkOptions, MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN,
-    MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS, MachineRouteStatus, NodeLink, NodeOrigin,
-    PendingIdentityChange, Route, RoutedValue, SessionOpener, parse_optional_target,
-    public_key_fingerprint,
+    ConflictingIdentityReport, ContentRoutePolicy, DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN,
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, DisagreementReport, LearnDisagreement,
+    LearnRejection, LearnReport, Link, LinkConfig, LinkOptions, MAX_CONFIGURED_NODES,
+    MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN, MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS,
+    MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
+    SessionOpener, parse_optional_target, public_key_fingerprint,
 };
-pub use put::{CAP_PUT_NO_REPLACE, PutRequest, PutResult, PutStream};
+pub use put::{CAP_IF_EXISTS, PutIfExists, PutRequest, PutResult, PutStream};
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
 };
@@ -176,3 +249,51 @@ pub use stderr::StderrTail;
 pub use legion_proto as proto;
 /// Cancellation token re-exported from `tokio-util`.
 pub use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use legion_proto::ErrorCode;
+    use serde_json::json;
+
+    #[test]
+    fn decode_remote_error_matches_session_for_unknown_code_and_malformed_frames() {
+        // 1. Unknown non-empty error code decodes via `ErrorBody` to `Failed` with
+        //    `details.unknown_code`, preserving existing details and stripping spoofed `sent`.
+        let unknown = decode_remote_error(
+            &json!({
+                "code": "future_fancy_code",
+                "message": "Future stream error from a newer node.",
+                "hint": "Upgrade client.",
+                "details": { "extra": 42, "sent": false }
+            }),
+            "tower",
+        );
+        assert_eq!(unknown.code, ErrorCode::Failed);
+        assert_eq!(unknown.message, "Future stream error from a newer node.");
+        assert_eq!(unknown.hint.as_deref(), Some("Upgrade client."));
+        assert_eq!(unknown.machine.as_deref(), Some("tower"));
+        assert_eq!(
+            unknown.details,
+            Some(json!({ "extra": 42, "unknown_code": "future_fancy_code" }))
+        );
+
+        // 2. Unparseable error shapes (empty code, missing message, non-object) fail with
+        //    `Internal` + `details.reason = "unrecognized_reply"`, matching `session.rs`.
+        for malformed in [
+            json!({ "code": "", "message": "empty code" }),
+            json!({ "code": "failed" }),
+            json!("unexpected string payload"),
+        ] {
+            let err = decode_remote_error(&malformed, "tower");
+            assert_eq!(err.code, ErrorCode::Internal, "for {malformed}: {err:?}");
+            assert_eq!(err.machine.as_deref(), Some("tower"));
+            assert!(
+                err.message.contains("tower") && err.message.contains("does not understand"),
+                "unexpected message for {malformed}: {}",
+                err.message
+            );
+            assert_eq!(err.details, Some(json!({ "reason": "unrecognized_reply" })));
+        }
+    }
+}

@@ -2839,7 +2839,10 @@ export function FilesView({
         })
         .catch((err) => {
           if (onToast && err?.code !== 'cancelled') {
-            onToast(plainErrorMessage(err, `Could not upload to ${machine}.`, { technical, deviceNoun }), { tone: 'error' });
+            onToast(
+              plainErrorMessage(err, `Could not upload to ${machine}.`, { technical, deviceNoun }),
+              { tone: 'error' },
+            );
           }
         });
     },

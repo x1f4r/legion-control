@@ -12,7 +12,7 @@
 //! loopback literal `127.0.0.1`, allowing WebView to stream and seek arbitrarily large media with
 //! flat memory while keeping cleartext blocked for every other host.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -42,13 +42,14 @@ use legion_content::{
     extract_file_name, handle_request,
 };
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
+use legion_link::{ContentRoutePolicy, Route};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{AppError, Backend, ErrorCode};
+use crate::backend::{AppError, Backend, ErrorCode, NodeRouteIdentity};
 
 /// Custom URI scheme name registered with Tauri on Android.
 pub const CUSTOM_SCHEME_NAME: &str = "legion-content";
@@ -346,12 +347,15 @@ impl Drop for LoopbackConnGuard {
 
 struct ActiveStreamGuard {
     active_streams: Arc<AtomicUsize>,
+    active_streams_notify: Arc<Notify>,
     activity: Arc<Mutex<ActivityState>>,
 }
 
 impl Drop for ActiveStreamGuard {
     fn drop(&mut self) {
-        self.active_streams.fetch_sub(1, Ordering::AcqRel);
+        if self.active_streams.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.active_streams_notify.notify_waiters();
+        }
         self.activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -359,8 +363,186 @@ impl Drop for ActiveStreamGuard {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FleetDirectBinding {
+    holder: String,
+    host_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TicketRouteBinding {
+    /// Minted over `Route::Direct`: served only directly through this holder and pinned host-key
+    /// identity. Never falls back to any relay.
+    Direct {
+        holder: String,
+        direct_identity: Option<NodeRouteIdentity>,
+        learned_host_keys: Option<Vec<String>>,
+    },
+    /// Minted over `Route::Relay { via }`: served only through that paired machine's identity, or
+    /// upgraded at most once to a direct entry learned from that same machine during the ticket's
+    /// fleet epoch, and after upgrade only through that direct entry's pinned identity.
+    Relayed {
+        relay_node: String,
+        relay_identity: NodeRouteIdentity,
+        upgraded_direct: Option<FleetDirectBinding>,
+    },
+}
+
+fn parse_fleet_holder(holder: &str) -> Option<u64> {
+    holder.strip_prefix("fleet:")?.parse::<u64>().ok()
+}
+
 struct LinkContentSource {
     backend: Arc<dyn Backend>,
+    tickets: Arc<TicketTable>,
+    ticket_cancels: Arc<Mutex<HashMap<[u8; 32], CancellationToken>>>,
+    route_bindings: Arc<Mutex<HashMap<[u8; 32], TicketRouteBinding>>>,
+}
+
+impl LinkContentSource {
+    fn authorize_target(
+        &self,
+        ticket: &Ticket,
+        target: &crate::backend::ContentTarget,
+    ) -> Result<(ContentRoutePolicy, Option<FleetDirectBinding>), OpenRangeError> {
+        if !self.backend.is_pairing_holder_live(&ticket.holder) {
+            return Err(OpenRangeError::TicketRevoked);
+        }
+
+        let binding = self
+            .route_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&ticket.key_hash)
+            .cloned();
+
+        let Some(binding) = binding else {
+            return if target.holder == ticket.holder {
+                Ok((ContentRoutePolicy::DirectOnly, None))
+            } else {
+                Err(OpenRangeError::TicketRevoked)
+            };
+        };
+
+        match binding {
+            TicketRouteBinding::Direct {
+                holder,
+                direct_identity,
+                learned_host_keys,
+            } => {
+                if target.holder != holder {
+                    return Err(OpenRangeError::TicketRevoked);
+                }
+                if let Some(expected_identity) = direct_identity
+                    && self.backend.node_route_identity(&ticket.machine).as_ref()
+                        != Some(&expected_identity)
+                {
+                    return Err(OpenRangeError::TicketRevoked);
+                }
+                if let Some(expected_keys) = learned_host_keys {
+                    let Some(identity) = target.learned_identity.as_ref() else {
+                        return Err(OpenRangeError::TicketRevoked);
+                    };
+                    if identity.host_keys != expected_keys {
+                        return Err(OpenRangeError::TicketRevoked);
+                    }
+                }
+                Ok((ContentRoutePolicy::DirectOnly, None))
+            }
+            TicketRouteBinding::Relayed {
+                relay_node,
+                relay_identity,
+                upgraded_direct,
+            } => {
+                let introducer_matches = |identity: &crate::backend::LearnedDirectIdentity| {
+                    identity.from_paired_introducer
+                        && relay_identity.is_paired
+                        && identity.learned_from.as_deref() == Some(relay_node.as_str())
+                        && identity.introducer_holder.as_deref()
+                            == Some(relay_identity.holder.as_str())
+                        && identity.introducer_host_keys == relay_identity.host_keys
+                };
+
+                if let Some(bound) = upgraded_direct {
+                    // Once upgraded to a learned direct entry, the ticket is permanently bound to
+                    // that exact holder, introducer, and pinned host-key identity; it never
+                    // falls back to a relay or another fleet.
+                    let Some(identity) = target.learned_identity.as_ref() else {
+                        return Err(OpenRangeError::TicketRevoked);
+                    };
+                    let epoch_ok = parse_fleet_holder(&ticket.holder)
+                        .is_none_or(|ep| identity.learned_fleet_epoch == ep);
+                    if target.holder == bound.holder
+                        && epoch_ok
+                        && introducer_matches(identity)
+                        && identity.host_keys == bound.host_keys
+                    {
+                        return Ok((ContentRoutePolicy::DirectOnly, None));
+                    }
+                    return Err(OpenRangeError::TicketRevoked);
+                }
+
+                // Still routed through the minting relay: verify the relay's own pairing identity
+                // is still live and unchanged before serving or upgrading.
+                if !self.backend.is_pairing_holder_live(&relay_identity.holder) {
+                    return Err(OpenRangeError::TicketRevoked);
+                }
+                let Some(current_relay) = self.backend.node_route_identity(&relay_node) else {
+                    return Err(OpenRangeError::TicketRevoked);
+                };
+                if current_relay != relay_identity {
+                    return Err(OpenRangeError::TicketRevoked);
+                }
+
+                if target.holder == ticket.holder {
+                    if parse_fleet_holder(&ticket.holder).is_some() {
+                        return Ok((ContentRoutePolicy::RelayOnly(relay_node), None));
+                    }
+                    // Machine already had a configured direct entry whose mint probe fell back to
+                    // `relay_node`. If that entry was learned from `relay_node`'s exact paired
+                    // identity, permit upgrading to it once reachable; otherwise stay pinned
+                    // strictly to `relay_node` so a fallback mint never crosses into another fleet.
+                    if let Some(identity) = target.learned_identity.as_ref()
+                        && introducer_matches(identity)
+                        && !identity.host_keys.is_empty()
+                    {
+                        return Ok((
+                            ContentRoutePolicy::DirectOrRelay(relay_node),
+                            Some(FleetDirectBinding {
+                                holder: target.holder.clone(),
+                                host_keys: identity.host_keys.clone(),
+                            }),
+                        ));
+                    }
+                    return Ok((ContentRoutePolicy::RelayOnly(relay_node), None));
+                }
+
+                // Move from `fleet:<epoch>` to a direct entry: allowed at most once, and ONLY to
+                // an entry learned from THAT SAME paired introducer identity during this ticket's
+                // fleet epoch. Never allows a second paired fleet's introducer or a fresh direct
+                // pairing under the same machine name.
+                let Some(ticket_fleet_epoch) = parse_fleet_holder(&ticket.holder) else {
+                    return Err(OpenRangeError::TicketRevoked);
+                };
+                let Some(identity) = target.learned_identity.as_ref() else {
+                    return Err(OpenRangeError::TicketRevoked);
+                };
+                if !introducer_matches(identity)
+                    || identity.learned_fleet_epoch != ticket_fleet_epoch
+                    || identity.host_keys.is_empty()
+                {
+                    return Err(OpenRangeError::TicketRevoked);
+                }
+                Ok((
+                    ContentRoutePolicy::DirectOrRelay(relay_node),
+                    Some(FleetDirectBinding {
+                        holder: target.holder.clone(),
+                        host_keys: identity.host_keys.clone(),
+                    }),
+                ))
+            }
+        }
+    }
 }
 
 impl ContentSource for LinkContentSource {
@@ -371,22 +553,63 @@ impl ContentSource for LinkContentSource {
         length: Option<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<OpenedRange, OpenRangeError>> + Send + 'a>> {
         Box::pin(async move {
-            if !self.backend.is_pairing_holder_live(&ticket.holder) {
-                return Err(OpenRangeError::TicketRevoked);
-            }
             let target = match self.backend.content_target(&ticket.machine) {
                 Ok(target) => target,
                 Err(_) => return Err(OpenRangeError::TicketRevoked),
             };
-            if target.holder != ticket.holder {
+            let (route_policy, pending_upgrade) = self.authorize_target(ticket, &target)?;
+
+            let stream_cancel = {
+                let mut map = self
+                    .ticket_cancels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                map.entry(ticket.key_hash).or_default().child_token()
+            };
+            if !self.tickets.is_live(&ticket.key_hash) {
+                if let Some(token) = self
+                    .ticket_cancels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&ticket.key_hash)
+                {
+                    token.cancel();
+                }
+                self.route_bindings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&ticket.key_hash);
                 return Err(OpenRangeError::TicketRevoked);
             }
 
             let stream = target
                 .link
-                .open_content(&target.link_node, &ticket.path, offset, length)
+                .open_content_with_policy(
+                    &target.link_node,
+                    &ticket.path,
+                    offset,
+                    length,
+                    route_policy,
+                    stream_cancel,
+                )
                 .await
                 .map_err(map_link_open_error)?;
+
+            if let Some(bound) = pending_upgrade
+                && stream.route() == &Route::Direct
+            {
+                let mut bindings = self
+                    .route_bindings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(TicketRouteBinding::Relayed {
+                    upgraded_direct, ..
+                }) = bindings.get_mut(&ticket.key_hash)
+                    && upgraded_direct.is_none()
+                {
+                    *upgraded_direct = Some(bound);
+                }
+            }
 
             Ok(OpenedRange {
                 size: stream.size(),
@@ -400,10 +623,11 @@ impl ContentSource for LinkContentSource {
     }
 
     fn check_live(&self, ticket: &Ticket) -> Result<(), OpenRangeError> {
-        if !self.backend.is_pairing_holder_live(&ticket.holder) {
-            return Err(OpenRangeError::TicketRevoked);
-        }
-        Ok(())
+        let target = match self.backend.content_target(&ticket.machine) {
+            Ok(target) => target,
+            Err(_) => return Err(OpenRangeError::TicketRevoked),
+        };
+        self.authorize_target(ticket, &target).map(|_| ())
     }
 }
 
@@ -454,9 +678,12 @@ pub struct AppContentServer {
     listener_lock: AsyncMutex<()>,
     listener: Mutex<Option<ListenerHandle>>,
     active_streams: Arc<AtomicUsize>,
+    active_streams_notify: Arc<Notify>,
     activity: Arc<Mutex<ActivityState>>,
     request_log: Mutex<VecDeque<ContentRequestLog>>,
     ticket_statuses: Mutex<VecDeque<TicketStatusEntry>>,
+    ticket_cancels: Arc<Mutex<HashMap<[u8; 32], CancellationToken>>>,
+    route_bindings: Arc<Mutex<HashMap<[u8; 32], TicketRouteBinding>>>,
 }
 
 impl AppContentServer {
@@ -507,8 +734,14 @@ impl AppContentServer {
         custom_scheme_max_full_bytes: u64,
         custom_scheme_total_memory_budget_bytes: usize,
     ) -> Self {
+        let tickets = Arc::new(TicketTable::with_config(ticket_config));
+        let ticket_cancels = Arc::new(Mutex::new(HashMap::new()));
+        let route_bindings = Arc::new(Mutex::new(HashMap::new()));
         let source = Arc::new(LinkContentSource {
             backend: Arc::clone(&backend),
+            tickets: Arc::clone(&tickets),
+            ticket_cancels: Arc::clone(&ticket_cancels),
+            route_bindings: Arc::clone(&route_bindings),
         });
         let conn_cap = max_loopback_connections.max(1);
         let budget_units = custom_scheme_total_memory_budget_bytes
@@ -517,7 +750,7 @@ impl AppContentServer {
         Self {
             backend,
             mode,
-            tickets: Arc::new(TicketTable::with_config(ticket_config)),
+            tickets,
             limiter: ContentLimiter::default(),
             source,
             allowed_origins,
@@ -533,11 +766,14 @@ impl AppContentServer {
             listener_lock: AsyncMutex::new(()),
             listener: Mutex::new(None),
             active_streams: Arc::new(AtomicUsize::new(0)),
+            active_streams_notify: Arc::new(Notify::new()),
             activity: Arc::new(Mutex::new(ActivityState {
                 last_activity: Instant::now(),
             })),
             request_log: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
             ticket_statuses: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
+            ticket_cancels,
+            route_bindings,
         }
     }
 
@@ -704,13 +940,39 @@ impl AppContentServer {
         let target = self.backend.content_target(machine_trimmed)?;
 
         // Probe zero bytes before minting so missing files, directories, denied paths, or offline
-        // machines return a structured AppError immediately.
+        // machines return a structured AppError immediately, and capture the exact route that
+        // answered so the minted ticket stays bound to that route/introducer.
         let probe = target
             .link
             .open_content(&target.link_node, path, 0, Some(0))
             .await
             .map_err(AppError::from)?;
+        let mint_route = probe.route().clone();
         drop(probe);
+
+        let binding = match mint_route {
+            Route::Direct => TicketRouteBinding::Direct {
+                holder: target.holder.clone(),
+                direct_identity: self.backend.node_route_identity(machine_trimmed),
+                learned_host_keys: target
+                    .learned_identity
+                    .as_ref()
+                    .map(|id| id.host_keys.clone()),
+            },
+            Route::Relay { via } => {
+                let Some(relay_identity) = self.backend.node_route_identity(&via) else {
+                    return Err(AppError::new(
+                        ErrorCode::Unreachable,
+                        format!("Can't reach {machine_trimmed} right now."),
+                    ));
+                };
+                TicketRouteBinding::Relayed {
+                    relay_node: via,
+                    relay_identity,
+                    upgraded_direct: None,
+                }
+            }
+        };
 
         let issued = self
             .tickets
@@ -721,6 +983,11 @@ impl AppContentServer {
                 path: path.to_owned(),
             })
             .map_err(AppError::from)?;
+        self.route_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(ticket_hash(&issued.id), binding);
+        self.prune_dead_ticket_cancels();
 
         self.touch_activity();
 
@@ -748,15 +1015,56 @@ impl AppContentServer {
         })
     }
 
-    /// Revokes the single content ticket identified by `raw_url` immediately (used when the viewer
-    /// closes, switches files, or tears down a media element). Returns `true` if a live ticket was
-    /// removed.
+    fn cancel_ticket_streams(&self, key_hash: &[u8; 32]) {
+        if let Some(token) = self
+            .ticket_cancels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key_hash)
+        {
+            token.cancel();
+        }
+        self.route_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key_hash);
+    }
+
+    fn prune_dead_ticket_cancels(&self) {
+        let dead: Vec<CancellationToken> = {
+            let mut map = self
+                .ticket_cancels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dead_keys: Vec<[u8; 32]> = map
+                .keys()
+                .copied()
+                .filter(|h| !self.tickets.contains_hash(h))
+                .collect();
+            dead_keys
+                .into_iter()
+                .filter_map(|h| map.remove(&h))
+                .collect()
+        };
+        for token in dead {
+            token.cancel();
+        }
+        self.route_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|h, _| self.tickets.contains_hash(h));
+    }
+
+    /// Revokes the single content ticket identified by `raw_url` immediately and cancels any
+    /// in-flight or active streams serving it (used when the viewer closes, switches files, or
+    /// tears down a media element). Returns `true` if a live ticket was removed.
     pub fn revoke_url(&self, raw_url: &str) -> bool {
         let Some(ticket_id) = extract_ticket_id_from_url(raw_url) else {
             return false;
         };
         let key_hash = ticket_hash(ticket_id);
         let removed = self.tickets.revoke(ticket_id);
+        self.cancel_ticket_streams(&key_hash);
         if removed {
             let mut statuses = self
                 .ticket_statuses
@@ -772,6 +1080,7 @@ impl AppContentServer {
         let _ = self
             .tickets
             .retain_holders(|holder| self.backend.is_pairing_holder_live(holder));
+        self.prune_dead_ticket_cancels();
     }
 
     /// Returns the number of content response streams currently being served.
@@ -779,9 +1088,43 @@ impl AppContentServer {
         self.active_streams.load(Ordering::Acquire)
     }
 
+    /// Waits up to `timeout` for every active content response stream to finish and release its
+    /// underlying direct or relayed [`legion_link::ContentStream`]. Returns `true` when zero
+    /// streams remain active.
+    pub async fn wait_for_active_streams_stopped(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.active_streams_notify.notified();
+            if self.active_streams.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return self.active_streams.load(Ordering::Acquire) == 0;
+            };
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.active_streams.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+
     /// Revokes every issued content ticket (used on store repair and app exit).
     pub fn revoke_all(&self) {
         let _ = self.tickets.retain_holders(|_| false);
+        let tokens: Vec<CancellationToken> = self
+            .ticket_cancels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, tok)| tok)
+            .collect();
+        for tok in tokens {
+            tok.cancel();
+        }
+        self.route_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// Revokes every ticket and immediately stops any active loopback listener.
@@ -1321,6 +1664,7 @@ impl AppContentServer {
         self.active_streams.fetch_add(1, Ordering::AcqRel);
         let active_guard = ActiveStreamGuard {
             active_streams: Arc::clone(&self.active_streams),
+            active_streams_notify: Arc::clone(&self.active_streams_notify),
             activity: Arc::clone(&self.activity),
         };
         let hooks = StreamHooks {
@@ -2371,6 +2715,7 @@ mod tests {
                 machine: "tower".to_owned(),
                 principal: "phone".to_owned(),
                 holder: self.holder.clone(),
+                learned_identity: None,
             })
         }
         fn is_pairing_holder_live(&self, holder: &str) -> bool {
@@ -3585,6 +3930,471 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relayed_picture_and_ranged_media_work_on_loopback_then_switch_to_direct() {
+        use std::sync::atomic::AtomicUsize;
+
+        let png_bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0, 1, 2, 3, 4,
+        ];
+        let media_bytes: Vec<u8> = (0..96 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let mut studio_files = HashMap::new();
+        studio_files.insert("/home/me/photo.png".to_owned(), png_bytes.clone());
+        studio_files.insert("/home/me/video.mp4".to_owned(), media_bytes.clone());
+        let studio_files = Arc::new(studio_files);
+
+        let relay_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let studio_key = legion_link::DeviceKey::from_seed([55u8; 32])
+            .public_key_line("studio")
+            .unwrap();
+        let tower_key = legion_link::DeviceKey::from_seed([56u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+
+        struct FleetRelayStreamOpener {
+            node: String,
+            files: Arc<HashMap<String, Vec<u8>>>,
+            relay_hits: Arc<AtomicUsize>,
+            direct_hits: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for FleetRelayStreamOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let node = self.node.clone();
+                let files = Arc::clone(&self.files);
+                let relay_hits = Arc::clone(&self.relay_hits);
+                let direct_hits = Arc::clone(&self.direct_hits);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if node == "tower" && req["op"] == json!("relay") {
+                            assert_eq!(req["on"], json!("studio"));
+                            relay_hits.fetch_add(1, Ordering::SeqCst);
+                            &req["request"]
+                        } else {
+                            assert_eq!(node, "studio");
+                            direct_hits.fetch_add(1, Ordering::SeqCst);
+                            &req
+                        };
+                        let path = inner["path"].as_str().unwrap_or("");
+                        let Some(payload) = files.get(path) else {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::NotFound, "not found")
+                                    .with_machine("studio")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            return;
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 99u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct RelayedContentBackend {
+            link: Link,
+            live: Arc<AtomicBool>,
+        }
+
+        impl Backend for RelayedContentBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                // Phone is paired ONLY with `tower`; `studio` routes via the link with fleet holder.
+                let cfg = self.link.config();
+                let (holder, learned_identity) = if let Some(entry) = cfg.node(machine) {
+                    let learned_identity = if entry.origin == legion_link::NodeOrigin::Learned {
+                        let paired_introducer = entry.learned_from.as_deref().and_then(|intro| {
+                            cfg.node(intro)
+                                .filter(|n| n.origin == legion_link::NodeOrigin::Paired)
+                                .cloned()
+                        });
+                        let from_paired_introducer = paired_introducer.is_some();
+                        let introducer_holder = paired_introducer
+                            .as_ref()
+                            .map(|intro| format!("pairing:{}:1", intro.node));
+                        let introducer_host_keys = paired_introducer
+                            .as_ref()
+                            .and_then(|intro| intro.target.as_ref())
+                            .map(|t| {
+                                let mut set = std::collections::BTreeSet::new();
+                                for line in &t.host_keys {
+                                    let mut parts = line.split_whitespace();
+                                    if let (Some(k), Some(d)) = (parts.next(), parts.next()) {
+                                        set.insert(format!("{k} {d}"));
+                                    }
+                                }
+                                set.into_iter().collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let learned_from = paired_introducer.map(|intro| intro.node);
+                        let host_keys = entry
+                            .target
+                            .as_ref()
+                            .map(|t| {
+                                let mut set = std::collections::BTreeSet::new();
+                                for line in &t.host_keys {
+                                    let mut parts = line.split_whitespace();
+                                    if let (Some(k), Some(d)) = (parts.next(), parts.next()) {
+                                        set.insert(format!("{k} {d}"));
+                                    }
+                                }
+                                set.into_iter().collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (!host_keys.is_empty()).then_some(crate::backend::LearnedDirectIdentity {
+                            learned_fleet_epoch: 1,
+                            from_paired_introducer,
+                            learned_from,
+                            introducer_holder,
+                            introducer_host_keys,
+                            host_keys,
+                        })
+                    } else {
+                        None
+                    };
+                    (format!("pairing:{machine}:1"), learned_identity)
+                } else {
+                    ("fleet:1".to_owned(), None)
+                };
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder,
+                    learned_identity,
+                })
+            }
+            fn is_pairing_holder_live(&self, _holder: &str) -> bool {
+                self.live.load(Ordering::SeqCst)
+            }
+            fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+                let cfg = self.link.config();
+                let entry = cfg.node(node)?;
+                let host_keys = entry
+                    .target
+                    .as_ref()
+                    .map(|t| {
+                        let mut set = std::collections::BTreeSet::new();
+                        for line in &t.host_keys {
+                            let mut parts = line.split_whitespace();
+                            if let (Some(k), Some(d)) = (parts.next(), parts.next()) {
+                                set.insert(format!("{k} {d}"));
+                            }
+                        }
+                        set.into_iter().collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Some(NodeRouteIdentity {
+                    node: entry.node.clone(),
+                    is_paired: entry.origin == legion_link::NodeOrigin::Paired,
+                    holder: format!("pairing:{}:1", entry.node),
+                    host_keys,
+                })
+            }
+        }
+
+        let session_opener: SessionOpener = {
+            let studio_files = Arc::clone(&studio_files);
+            let relay_hits = Arc::clone(&relay_hits);
+            let direct_hits = Arc::clone(&direct_hits);
+            let studio_key = studio_key.clone();
+            Arc::new(move |entry, _, cancel| {
+                let studio_files = Arc::clone(&studio_files);
+                let relay_hits = Arc::clone(&relay_hits);
+                let direct_hits = Arc::clone(&direct_hits);
+                let studio_key = studio_key.clone();
+                Box::pin(async move {
+                    let node_name = entry.node.clone();
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_for_rpc = node_name.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = if req.method == legion_link::proto::method::HELLO {
+                                ProtoResp::ok(
+                                    req.id,
+                                    serde_json::to_value(HelloResult {
+                                        node: node_for_rpc.clone(),
+                                        node_explicit: None,
+                                        node_id: None,
+                                        version: VERSION.to_owned(),
+                                        build: None,
+                                        protocol: PROTOCOL,
+                                        os: "linux".to_owned(),
+                                        arch: "x86_64".to_owned(),
+                                        systems: vec![],
+                                        system: None,
+                                        boot_id: None,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                ProtoResp::ok(
+                                    req.id,
+                                    json!({
+                                        "results": {
+                                            "studio": {
+                                                "ok": {
+                                                    "node": "studio",
+                                                    "hosts": ["studio.example.net"],
+                                                    "port": 22,
+                                                    "user": "me",
+                                                    "host_keys": [studio_key],
+                                                }
+                                            }
+                                        }
+                                    }),
+                                )
+                            };
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let stream_opener = Arc::new(FleetRelayStreamOpener {
+                        node: node_name.clone(),
+                        files: studio_files,
+                        relay_hits,
+                        direct_hits,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            })
+        };
+
+        let cfg = LinkConfig {
+            device_key: Some("dummy".to_owned()),
+            nodes: vec![NodeLink::ssh(
+                "tower",
+                SshTarget {
+                    hosts: vec!["tower.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![tower_key],
+                },
+                Some("device:pixel".to_owned()),
+            )],
+            ..LinkConfig::default()
+        };
+        let link = Link::with_opener(cfg, LinkOptions::default(), session_opener);
+        let live = Arc::new(AtomicBool::new(true));
+        let backend = Arc::new(RelayedContentBackend {
+            link: link.clone(),
+            live: Arc::clone(&live),
+        });
+
+        // 1) Universal loopback mount (desktop, iOS, and Android): picture GET + ranged media
+        // reads on `studio` via relay `tower`, with both desktop and Android origins allowed.
+        let lb = Arc::new(AppContentServer::with_config(
+            backend.clone(),
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec![
+                "tauri://localhost".to_owned(),
+                "http://tauri.localhost".to_owned(),
+            ],
+        ));
+        let pic = lb
+            .mint_url("studio", "/home/me/photo.png", false)
+            .await
+            .unwrap();
+        let lb_port = lb.loopback_port().unwrap();
+        let pic_path = pic
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
+            .unwrap();
+        let (status, head, body) = raw_http(
+            lb_port,
+            &format!(
+                "GET {pic_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{head}");
+        assert_eq!(body, png_bytes);
+
+        let vid = lb
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let vid_path = vid
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
+            .unwrap();
+        let (rstatus, rhead, rbody) = raw_http(
+            lb_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=4096-12287\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(rstatus, 206, "{rhead}");
+        assert_eq!(rbody, &media_bytes[4096..=12287]);
+
+        let (rstatus2, rhead2, rbody2) = raw_http(
+            lb_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=16384-32767\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(rstatus2, 206, "{rhead2}");
+        assert_eq!(rbody2, &media_bytes[16384..=32767]);
+        assert!(relay_hits.load(Ordering::SeqCst) >= 3);
+        assert_eq!(direct_hits.load(Ordering::SeqCst), 0);
+
+        // 2) Learn a direct route to `studio` -> subsequent reads on the active `fleet:` ticket
+        // switch seamlessly to direct without reminting!
+        let learned = link.learn().await.unwrap();
+        assert_eq!(learned.added, vec!["studio".to_owned()]);
+        let relay_before = relay_hits.load(Ordering::SeqCst);
+        let (dstatus, dhead, dbody) = raw_http(
+            lb_port,
+            &format!(
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=0-1023\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(dstatus, 206, "{dhead}");
+        assert_eq!(dbody, &media_bytes[0..=1023]);
+        assert_eq!(relay_hits.load(Ordering::SeqCst), relay_before);
+        assert!(direct_hits.load(Ordering::SeqCst) >= 1);
+
+        // 3) Unpairing revokes the holder -> relayed ticket is refused with 404 (TicketRevoked).
+        live.store(false, Ordering::SeqCst);
+        let (rev_status, rev_head, _) = raw_http(
+            lb_port,
+            &format!(
+                "GET {pic_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(rev_status, 404, "{rev_head}");
+
+        lb.shutdown();
+        link.close().await;
+    }
+
+    #[tokio::test]
     async fn evicted_parked_stream_aborts_loopback_cleanly_and_fresh_ticket_recovers() {
         // 2 GiB virtual pattern file: strictly larger than the RFC 7323 maximum TCP receive window
         // (~1 GiB) with zero RAM allocated, so paused streams always hit backpressure and park
@@ -4734,6 +5544,1924 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relayed_mid_stream_failure_sets_stream_failed_on_loopback() {
+        let flac_bytes: Vec<u8> = (0..(128 * 1024usize)).map(|i| (i % 251) as u8).collect();
+        let flac_bytes_arc = Arc::new(flac_bytes.clone());
+        let tower_key = legion_link::DeviceKey::from_seed([61u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+        let relay_hits = Arc::new(AtomicUsize::new(0));
+
+        struct TruncatingRelayOpener {
+            payload: Arc<Vec<u8>>,
+            relay_hits: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for TruncatingRelayOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                let relay_hits = Arc::clone(&self.relay_hits);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(req["op"], json!("relay"));
+                        assert_eq!(req["on"], json!("studio"));
+                        relay_hits.fetch_add(1, Ordering::SeqCst);
+                        let inner = &req["request"];
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 77u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        if len == 0 {
+                            let _ = server_out.shutdown().await;
+                            return;
+                        }
+                        // Deliver only the first 70 KiB (past ContentBody's 64 KiB first frame so
+                        // HTTP 206 headers flush) then drop the relayed stream mid-transfer so
+                        // loopback records `stream_failed: true`.
+                        let cut = len.min(70 * 1024);
+                        let _ = server_out.write_all(&payload[offset..offset + cut]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct RelayedOnlyBackend {
+            link: Link,
+        }
+
+        impl Backend for RelayedOnlyBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                    learned_identity: None,
+                })
+            }
+            fn is_pairing_holder_live(&self, _holder: &str) -> bool {
+                true
+            }
+            fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+                let entry = self.link.config().node(node).cloned()?;
+                Some(NodeRouteIdentity {
+                    node: entry.node,
+                    is_paired: entry.origin == legion_link::NodeOrigin::Paired,
+                    holder: format!("pairing:{node}:1"),
+                    host_keys: entry.target.map(|t| t.host_keys).unwrap_or_default(),
+                })
+            }
+        }
+
+        let session_opener: SessionOpener = {
+            let payload = Arc::clone(&flac_bytes_arc);
+            let relay_hits = Arc::clone(&relay_hits);
+            Arc::new(move |entry, _, cancel| {
+                let payload = Arc::clone(&payload);
+                let relay_hits = Arc::clone(&relay_hits);
+                Box::pin(async move {
+                    let node_name = entry.node.clone();
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_for_rpc = node_name.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_for_rpc.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let stream_opener = Arc::new(TruncatingRelayOpener {
+                        payload,
+                        relay_hits,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![tower_key],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            session_opener,
+        );
+        let backend: Arc<dyn Backend> = Arc::new(RelayedOnlyBackend { link: link.clone() });
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let minted = server
+            .mint_url("studio", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        let (status, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 206, "{head}");
+        assert!(body.len() < flac_bytes.len());
+        assert_eq!(relay_hits.load(Ordering::SeqCst), 2);
+
+        let st = server.content_status_for_url(&minted.url);
+        assert_eq!(st.request_count, 1);
+        assert_eq!(st.status, Some(206));
+        assert_eq!(st.content_type.as_deref(), Some("audio/flac"));
+        assert!(
+            st.stream_failed,
+            "mid-stream relayed failure must set stream_failed=true so the viewer shows the transport sentence"
+        );
+        assert!(st.ticket_live);
+
+        server.shutdown();
+        link.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn content_revoke_terminates_active_relayed_stream_on_relay_and_target() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Stdio};
+
+        fn find_tool(name: &str) -> Option<PathBuf> {
+            let path_var = std::env::var_os("PATH")?;
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+
+        fn find_sshd() -> Option<PathBuf> {
+            find_tool("sshd").or_else(|| {
+                ["/usr/sbin/sshd", "/sbin/sshd", "/usr/local/sbin/sshd"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|p| p.is_file())
+            })
+        }
+
+        fn find_legion_bin() -> Option<PathBuf> {
+            if let Some(explicit) = std::env::var_os("LEGION_BIN") {
+                let p = PathBuf::from(explicit);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let repo_root = manifest_dir.parent()?.parent()?.parent()?;
+            for profile in ["debug", "release"] {
+                let candidate = repo_root.join("target").join(profile).join("legion");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+
+        fn is_legion_pid_alive(pid: u32) -> bool {
+            let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+            if proc_dir.is_dir() {
+                let Ok(stat) = std::fs::read_to_string(proc_dir.join("stat")) else {
+                    return false;
+                };
+                // Process state is the first token after the final ')'. Ignore zombies/dead.
+                let state = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or("");
+                if matches!(state, "Z" | "X" | "x") {
+                    return false;
+                }
+                let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline")) else {
+                    return false;
+                };
+                return cmdline.windows(b"legion".len()).any(|w| w == b"legion");
+            }
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+
+        fn count_live_pids(dir: &Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .filter(|&pid| is_legion_pid_alive(pid))
+                .count()
+        }
+
+        let (Some(sshd_bin), Some(keygen_bin)) = (find_sshd(), find_tool("ssh-keygen")) else {
+            eprintln!("skipping 3-node content_revoke test: sshd/ssh-keygen unavailable");
+            return;
+        };
+        let Some(legion_bin) = find_legion_bin() else {
+            eprintln!(
+                "skipping 3-node content_revoke test: built target/debug/legion not found (build workspace first)"
+            );
+            return;
+        };
+        let user_out = Command::new("id")
+            .arg("-un")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(user_out.status.success());
+        let user = String::from_utf8(user_out.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        struct SshdGuard(Child);
+        impl Drop for SshdGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let _ = std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700));
+        let tower_home = root.path().join("tower-home");
+        let studio_home = root.path().join("studio-home");
+        let tower_legion = root.path().join("tower-legion");
+        let studio_legion = root.path().join("studio-legion");
+        let tower_pids = root.path().join("tower-pids");
+        let studio_pids = root.path().join("studio-pids");
+        let sshd_dir = root.path().join("sshd-tower");
+        let auth_keys = tower_home.join(".ssh/authorized_keys");
+
+        for d in [
+            tower_home.join(".ssh"),
+            studio_home.join("media"),
+            tower_legion.join("config"),
+            studio_legion.join("config"),
+            tower_pids.clone(),
+            studio_pids.clone(),
+            sshd_dir.clone(),
+        ] {
+            std::fs::create_dir_all(&d).unwrap();
+        }
+        for d in [&tower_home, &tower_home.join(".ssh"), &sshd_dir] {
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+        }
+
+        // Write a 32 MiB file on `studio` using a repeating 64 KiB pattern (no 32 MiB RAM copy;
+        // combined with the bounded 16 KiB client SO_RCVBUF and 128 KiB listener SO_SNDBUF, a
+        // paused client leaves the relayed stream actively open across all 3 nodes).
+        let file_size = 32 * 1024 * 1024usize;
+        let pattern_chunk: Vec<u8> = (0..(64 * 1024usize))
+            .map(|i| ((i * 19 + 7) % 251) as u8)
+            .collect();
+        let media_path = studio_home.join("media/concert.flac");
+        {
+            use std::io::Write as _;
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&media_path).unwrap());
+            let mut written = 0usize;
+            while written < file_size {
+                let take = (file_size - written).min(pattern_chunk.len());
+                out.write_all(&pattern_chunk[..take]).unwrap();
+                written += take;
+            }
+            out.flush().unwrap();
+        }
+
+        // Wrapper for `studio` (target): records PID of every `legion stream` process before exec.
+        let studio_wrapper = root.path().join("studio-exec.sh");
+        std::fs::write(
+            &studio_wrapper,
+            format!(
+                "#!/bin/sh\nexport LEGION_HOME='{}'\nexport HOME='{}'\nunset XDG_CONFIG_HOME XDG_STATE_HOME\nif [ \"$1\" = \"stream\" ]; then echo \"$$\" > '{}/stream.'\"$$\"; fi\nexec '{}' \"$@\"\n",
+                studio_legion.display(),
+                studio_home.display(),
+                studio_pids.display(),
+                legion_bin.display(),
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(&studio_wrapper, std::fs::Permissions::from_mode(0o700));
+
+        // Forced-command dispatch wrapper for `tower` (relay): records PID of `legion stream`.
+        let tower_dispatch = root.path().join("tower-dispatch.sh");
+        std::fs::write(
+            &tower_dispatch,
+            format!(
+                "#!/bin/sh\nexport LEGION_HOME='{}'\nexport HOME='{}'\nunset XDG_CONFIG_HOME XDG_STATE_HOME\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  *'legion stream'*)\n    echo \"$$\" > '{}/stream.'\"$$\"\n    exec '{}' stream\n    ;;\n  *'legion rpc'*)\n    exec '{}' rpc\n    ;;\n  *)\n    printf 'unexpected command: %s\\n' \"$SSH_ORIGINAL_COMMAND\" >&2\n    exit 2\n    ;;\nesac\n",
+                tower_legion.display(),
+                tower_home.display(),
+                tower_pids.display(),
+                legion_bin.display(),
+                legion_bin.display(),
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(&tower_dispatch, std::fs::Permissions::from_mode(0o700));
+
+        let toml_lit = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+        let policy = "default = \"owner\"\n\n[principals.phone]\nrole = \"owner\"\n";
+        std::fs::write(tower_legion.join("config/policy.toml"), policy).unwrap();
+        std::fs::write(studio_legion.join("config/policy.toml"), policy).unwrap();
+        std::fs::write(tower_legion.join("config/node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            studio_legion.join("config/node.toml"),
+            "name = \"studio\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tower_legion.join("config/fleet.toml"),
+            format!(
+                "[machines.tower]\nssh = \"127.0.0.1\"\n\n[machines.studio]\ncommand = [{}, \"rpc\"]\n",
+                toml_lit(&studio_wrapper),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            studio_legion.join("config/fleet.toml"),
+            "[machines.studio]\nssh = \"127.0.0.1\"\n",
+        )
+        .unwrap();
+
+        // Generate host key for `tower` sshd and a client device key for the app.
+        let host_key = sshd_dir.join("host_ed25519");
+        let host_key_pub = sshd_dir.join("host_ed25519.pub");
+        let kg = Command::new(&keygen_bin)
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "tower-host"])
+            .arg("-f")
+            .arg(&host_key)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(kg.status.success());
+        let _ = std::fs::set_permissions(&host_key, std::fs::Permissions::from_mode(0o600));
+        let host_key_line = std::fs::read_to_string(&host_key_pub)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        let device_key = legion_link::DeviceKey::from_seed([91u8; 32]);
+        let device_pub = device_key.public_key_line("phone").unwrap();
+        std::fs::write(
+            &auth_keys,
+            format!(
+                "command=\"{}\",restrict {device_pub}\n",
+                tower_dispatch.display()
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600));
+
+        let probe_sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sshd_port = probe_sock.local_addr().unwrap().port();
+        drop(probe_sock);
+
+        let supports_no_penalties = Command::new(&sshd_bin)
+            .args(["-T", "-f", "/dev/null", "-o", "PerSourcePenalties=no", "-h"])
+            .arg(&host_key)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let sshd_cfg = sshd_dir.join("sshd_config");
+        let sshd_log = sshd_dir.join("sshd.log");
+        let mut cfg_text = format!(
+            "ListenAddress 127.0.0.1\nPort {sshd_port}\nHostKey {}\nPidFile none\n\
+             AuthorizedKeysFile {}\nAllowUsers {user}\nStrictModes yes\n\
+             PubkeyAuthentication yes\nPasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\nChallengeResponseAuthentication no\n\
+             PermitRootLogin no\nUsePAM no\nAllowAgentForwarding no\n\
+             AllowTcpForwarding no\nX11Forwarding no\nPrintMotd no\n\
+             SetEnv HOME={}\n",
+            host_key.display(),
+            auth_keys.display(),
+            tower_home.display(),
+        );
+        if supports_no_penalties {
+            cfg_text.push_str("PerSourcePenalties no\n");
+        }
+        std::fs::write(&sshd_cfg, &cfg_text).unwrap();
+
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sshd_log)
+            .unwrap();
+        let mut sshd_child = Command::new(&sshd_bin)
+            .args(["-D", "-e", "-f"])
+            .arg(&sshd_cfg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < wait_deadline {
+            assert!(
+                sshd_child.try_wait().unwrap().is_none(),
+                "sshd exited early:\n{}",
+                std::fs::read_to_string(&sshd_log).unwrap_or_default()
+            );
+            if std::net::TcpStream::connect(("127.0.0.1", sshd_port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _sshd = SshdGuard(sshd_child);
+
+        // Device is paired ONLY with `tower`; `studio` is reached strictly through relay `tower`.
+        let link = Link::new(LinkConfig {
+            device_key: Some(device_key.to_openssh().unwrap()),
+            nodes: vec![NodeLink::ssh(
+                "tower",
+                SshTarget {
+                    hosts: vec!["127.0.0.1".to_owned()],
+                    port: sshd_port,
+                    user,
+                    host_keys: vec![host_key_line],
+                },
+                Some("phone".to_owned()),
+            )],
+            ..LinkConfig::default()
+        });
+
+        struct LiveRelayedBackend {
+            link: Link,
+        }
+        impl Backend for LiveRelayedBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "phone".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                    learned_identity: None,
+                })
+            }
+            fn is_pairing_holder_live(&self, _holder: &str) -> bool {
+                true
+            }
+            fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+                let entry = self.link.config().node(node).cloned()?;
+                Some(NodeRouteIdentity {
+                    node: entry.node,
+                    is_paired: entry.origin == legion_link::NodeOrigin::Paired,
+                    holder: format!("pairing:{node}:1"),
+                    host_keys: entry.target.map(|t| t.host_keys).unwrap_or_default(),
+                })
+            }
+        }
+
+        let server = Arc::new(AppContentServer::with_config(
+            Arc::new(LiveRelayedBackend { link: link.clone() }),
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let minted = server
+            .mint_url("studio", &media_path.to_string_lossy(), false)
+            .await
+            .unwrap();
+        let lb_port = server.loopback_port().unwrap();
+        let req_path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
+            .unwrap();
+
+        // Open a streaming GET with a bounded SO_RCVBUF and read headers + 64 KiB, then hold the
+        // TCP socket open so the relayed stream stays active across device, relay `tower`, and
+        // target `studio` regardless of platform TCP autotuning.
+        let mut sock = connect_bounded_client(lb_port).await;
+        sock.write_all(
+            format!(
+                "GET {req_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (status, head, mut received) = read_http_head_and_prefix(&mut sock, 64 * 1024).await;
+        assert_eq!(status, 200, "{head}");
+        for (idx, &byte) in received.iter().enumerate() {
+            assert_eq!(
+                byte,
+                pattern_chunk[idx % pattern_chunk.len()],
+                "mismatch at byte {idx}"
+            );
+        }
+
+        // Confirm all three nodes have the active relayed stream running before revoke.
+        assert_eq!(server.active_streams.load(Ordering::Acquire), 1);
+        assert!(
+            count_live_pids(&tower_pids) >= 1,
+            "expected live relay `legion stream` on tower"
+        );
+        assert!(
+            count_live_pids(&studio_pids) >= 1,
+            "expected live target `legion stream` on studio"
+        );
+
+        // Revoke the URL (as viewer close does) BEFORE closing the TCP socket: both relay and
+        // target `legion stream` processes must exit within bounded time.
+        let revoke_started = Instant::now();
+        assert!(server.revoke_url(&minted.url));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if count_live_pids(&tower_pids) == 0 && count_live_pids(&studio_pids) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            count_live_pids(&tower_pids),
+            0,
+            "relay `legion stream` on tower lingered past {:?} after content_revoke",
+            revoke_started.elapsed()
+        );
+        assert_eq!(
+            count_live_pids(&studio_pids),
+            0,
+            "target `legion stream` on studio lingered past {:?} after content_revoke",
+            revoke_started.elapsed()
+        );
+
+        // Draining the still-open loopback socket observes clean truncation before Content-Length
+        // and drops device active_streams to 0.
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let step = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+            assert!(
+                step.is_ok(),
+                "loopback stream did not abort after content_revoke"
+            );
+            match step.unwrap() {
+                Ok(0) | Err(_) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+            }
+        }
+        assert!(
+            received.len() < file_size,
+            "revoked relayed stream must abort strictly before full 32 MiB ({} vs {})",
+            received.len(),
+            file_size
+        );
+        drop(sock);
+
+        let dev_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < dev_deadline && server.active_streams.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            server.active_streams.load(Ordering::Acquire),
+            0,
+            "device active_streams did not drop to 0 after content_revoke"
+        );
+        assert_eq!(count_live_pids(&tower_pids), 0);
+        assert_eq!(count_live_pids(&studio_pids), 0);
+
+        server.shutdown();
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn fleet_ticket_binds_once_to_learned_identity_and_revokes_on_new_pairing_or_identity_change()
+     {
+        use crate::backend::LearnedDirectIdentity;
+
+        let media_bytes: Vec<u8> = (0..64 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let media_arc = Arc::new(media_bytes.clone());
+        let tower_key = legion_link::DeviceKey::from_seed([71u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+        let studio_key_a = legion_link::DeviceKey::from_seed([72u8; 32])
+            .public_key_line("studio")
+            .unwrap();
+        let studio_key_b = legion_link::DeviceKey::from_seed([73u8; 32])
+            .public_key_line("studio")
+            .unwrap();
+        let canonical = |k: &str| {
+            let mut parts = k.split_whitespace();
+            format!("{} {}", parts.next().unwrap(), parts.next().unwrap())
+        };
+        let key_a_canon = canonical(&studio_key_a);
+        let key_b_canon = canonical(&studio_key_b);
+
+        struct SimpleMediaOpener {
+            payload: Arc<Vec<u8>>,
+        }
+
+        impl StreamOpener for SimpleMediaOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if req["op"] == json!("relay") {
+                            &req["request"]
+                        } else {
+                            &req
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 77u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let opener: SessionOpener = {
+            let payload = Arc::clone(&media_arc);
+            Arc::new(move |entry, _, cancel| {
+                let payload = Arc::clone(&payload);
+                let node_name = entry.node.clone();
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(8 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+                    let node_for_rpc = node_name.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_for_rpc.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: Arc::new(SimpleMediaOpener { payload }),
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            })
+        };
+
+        let tower_key_canon = {
+            let mut parts = tower_key.split_whitespace();
+            format!("{} {}", parts.next().unwrap(), parts.next().unwrap())
+        };
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![tower_key.clone()],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        let attach_learned_studio = |link: &Link, host_key: &str| {
+            let mut learned = NodeLink::ssh(
+                "studio",
+                SshTarget {
+                    hosts: vec!["studio.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![host_key.to_owned()],
+                },
+                Some("device:pixel".to_owned()),
+            );
+            learned.origin = legion_link::NodeOrigin::Learned;
+            learned.learned_from = Some("tower".to_owned());
+            link.upsert_node(learned);
+        };
+
+        #[derive(Clone)]
+        struct MutableTargetState {
+            live_fleet_epoch: u64,
+            studio_holder: String,
+            studio_learned: Option<LearnedDirectIdentity>,
+            tower_key_canon: String,
+        }
+
+        struct MutableFleetBackend {
+            link: Link,
+            state: Arc<Mutex<MutableTargetState>>,
+        }
+
+        impl Backend for MutableFleetBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                let st = self.state.lock().unwrap().clone();
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder: st.studio_holder,
+                    learned_identity: st.studio_learned,
+                })
+            }
+            fn is_pairing_holder_live(&self, holder: &str) -> bool {
+                let st = self.state.lock().unwrap();
+                holder == "pairing:tower:1"
+                    || parse_fleet_holder(holder) == Some(st.live_fleet_epoch)
+            }
+            fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+                if node != "tower" {
+                    return None;
+                }
+                let st = self.state.lock().unwrap();
+                Some(NodeRouteIdentity {
+                    node: "tower".to_owned(),
+                    is_paired: true,
+                    holder: "pairing:tower:1".to_owned(),
+                    host_keys: vec![st.tower_key_canon.clone()],
+                })
+            }
+        }
+
+        let target_state = Arc::new(Mutex::new(MutableTargetState {
+            live_fleet_epoch: 1,
+            studio_holder: "fleet:1".to_owned(),
+            studio_learned: None,
+            tower_key_canon: tower_key_canon.clone(),
+        }));
+        let backend = Arc::new(MutableFleetBackend {
+            link: link.clone(),
+            state: Arc::clone(&target_state),
+        });
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let get_range = |port: u16, path: String, range: &'static str| async move {
+            raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://tauri.localhost\r\nRange: {range}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await
+        };
+
+        // 1) Fleet ticket upgrades once to a learned direct entry from a paired introducer during
+        //    the ticket's epoch, keeps working on that bound identity, and is revoked immediately
+        //    if the learned entry's pinned host keys later change (even if fleet epoch didn't bump).
+        let t1 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let p1 = t1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, body) = get_range(port, p1.clone(), "bytes=0-1023").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &media_bytes[0..=1023]);
+
+        // Learn `studio` with key A during epoch 1 -> first move succeeds and binds to key A.
+        attach_learned_studio(&link, &key_a_canon);
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:2".to_owned();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 1,
+                from_paired_introducer: true,
+                learned_from: Some("tower".to_owned()),
+                introducer_holder: Some("pairing:tower:1".to_owned()),
+                introducer_host_keys: vec![tower_key_canon.clone()],
+                host_keys: vec![key_a_canon.clone()],
+            });
+        }
+        let (st, head, body) = get_range(port, p1.clone(), "bytes=1024-2047").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &media_bytes[1024..=2047]);
+        // Subsequent range read with identical bound identity still succeeds.
+        let (st, head, _) = get_range(port, p1.clone(), "bytes=2048-3071").await;
+        assert_eq!(st, 206, "{head}");
+
+        // Now learned entry's identity changes to key B -> ticket MUST be refused with 404!
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 1,
+                from_paired_introducer: true,
+                learned_from: Some("tower".to_owned()),
+                introducer_holder: Some("pairing:tower:1".to_owned()),
+                introducer_host_keys: vec![tower_key_canon.clone()],
+                host_keys: vec![key_b_canon.clone()],
+            });
+        }
+        let (st, head, _) = get_range(port, p1.clone(), "bytes=3072-4095").await;
+        assert_eq!(
+            st, 404,
+            "ticket bound to key A must be refused when learned host keys change to key B: {head}"
+        );
+
+        // 2) Once moved to a direct entry, a fleet ticket cannot bounce back to `fleet:` or move
+        //    to a second direct entry.
+        link.remove_node("studio").await;
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "fleet:1".to_owned();
+            st.studio_learned = None;
+        }
+        let t2 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p2 = t2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        attach_learned_studio(&link, &key_a_canon);
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:3".to_owned();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 1,
+                from_paired_introducer: true,
+                learned_from: Some("tower".to_owned()),
+                introducer_holder: Some("pairing:tower:1".to_owned()),
+                introducer_host_keys: vec![tower_key_canon.clone()],
+                host_keys: vec![key_a_canon.clone()],
+            });
+        }
+        let (st, head, _) = get_range(port, p2.clone(), "bytes=0-511").await;
+        assert_eq!(st, 206, "{head}");
+        // Bouncing back to fleet or to a new pairing epoch holder ends the ticket.
+        link.remove_node("studio").await;
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "fleet:1".to_owned();
+            st.studio_learned = None;
+        }
+        let (st, head, _) = get_range(port, p2.clone(), "bytes=512-1023").await;
+        assert_eq!(
+            st, 404,
+            "already-upgraded fleet ticket must not fall back to fleet: {head}"
+        );
+
+        // 3) A new direct `pair()` under the same name `studio` ends the open `fleet:` ticket
+        //    (both because `learned_identity` is None for Paired entries AND because `pair()`
+        //    bumps `fleet_pairing_epoch`).
+        {
+            let mut st = target_state.lock().unwrap();
+            st.live_fleet_epoch = 2;
+            st.studio_holder = "fleet:2".to_owned();
+            st.studio_learned = None;
+        }
+        let t3 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p3 = t3
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, _) = get_range(port, p3.clone(), "bytes=0-511").await;
+        assert_eq!(st, 206, "{head}");
+        // Even if the fleet epoch hadn't bumped yet, a Paired entry (`learned_identity: None`)
+        // must refuse the fleet ticket.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:4".to_owned();
+            st.studio_learned = None;
+        }
+        let (st, head, _) = get_range(port, p3.clone(), "bytes=512-1023").await;
+        assert_eq!(
+            st, 404,
+            "fleet ticket must never move to a directly Paired entry: {head}"
+        );
+        // And bumping fleet epoch (as `LinkBackend::pair()` does) also ends it.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.live_fleet_epoch = 3;
+        }
+        let (st, head, _) = get_range(port, p3.clone(), "bytes=512-1023").await;
+        assert_eq!(
+            st, 404,
+            "bumping fleet epoch on pair must revoke ticket: {head}"
+        );
+
+        // 4) A learned entry from a non-paired introducer or from another fleet epoch is refused.
+        {
+            let mut st = target_state.lock().unwrap();
+            st.live_fleet_epoch = 4;
+            st.studio_holder = "fleet:4".to_owned();
+            st.studio_learned = None;
+        }
+        let t4 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p4 = t4
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_holder = "pairing:studio:5".to_owned();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 4,
+                from_paired_introducer: false,
+                learned_from: Some("tower".to_owned()),
+                introducer_holder: None,
+                introducer_host_keys: Vec::new(),
+                host_keys: vec![key_a_canon.clone()],
+            });
+        }
+        let (st, head, _) = get_range(port, p4.clone(), "bytes=0-511").await;
+        assert_eq!(
+            st, 404,
+            "fleet ticket must refuse learned entry from non-paired introducer: {head}"
+        );
+
+        {
+            let mut st = target_state.lock().unwrap();
+            st.studio_learned = Some(LearnedDirectIdentity {
+                learned_fleet_epoch: 3,
+                from_paired_introducer: true,
+                learned_from: Some("tower".to_owned()),
+                introducer_holder: Some("pairing:tower:1".to_owned()),
+                introducer_host_keys: vec![tower_key_canon],
+                host_keys: vec![key_a_canon],
+            });
+        }
+        let (st, head, _) = get_range(port, p4, "bytes=0-511").await;
+        assert_eq!(
+            st, 404,
+            "fleet ticket must refuse learned entry from another epoch: {head}"
+        );
+
+        server.shutdown();
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn two_fleet_relayed_ticket_never_serves_other_fleet_studio_and_allows_same_introducer_upgrade()
+     {
+        use legion_link::proto::{HelloResult, PROTOCOL, Response as ProtoResp, VERSION};
+        use legion_link::{
+            CAP_STREAM_RELAY, DeviceKey, Link, LinkConfig, LinkOptions, NodeLink, NodeOrigin,
+            RawStream, Session, SessionOpener, SshTarget, StreamOpenError, StreamOpener,
+            TransportHandle,
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        use crate::backend::LearnedDirectIdentity;
+
+        let fleet_a_bytes: Vec<u8> = (0..16_384usize)
+            .map(|i| b'A'.wrapping_add((i % 13) as u8))
+            .collect();
+        let fleet_b_bytes: Vec<u8> = (0..16_384usize)
+            .map(|i| b'a'.wrapping_add((i % 13) as u8))
+            .collect();
+
+        let tower_key_line = DeviceKey::from_seed([61u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+        let other_key_line = DeviceKey::from_seed([62u8; 32])
+            .public_key_line("other-hub")
+            .unwrap();
+        let studio_a_key_line = DeviceKey::from_seed([63u8; 32])
+            .public_key_line("studio-a")
+            .unwrap();
+        let studio_b_key_line = DeviceKey::from_seed([64u8; 32])
+            .public_key_line("studio-b")
+            .unwrap();
+
+        let canon = |line: &str| {
+            let mut parts = line.split_whitespace();
+            format!("{} {}", parts.next().unwrap(), parts.next().unwrap())
+        };
+        let tower_key_canon = canon(&tower_key_line);
+        let other_key_canon = canon(&other_key_line);
+        let studio_a_key_canon = canon(&studio_a_key_line);
+        let studio_b_key_canon = canon(&studio_b_key_line);
+
+        let tower_down = Arc::new(AtomicBool::new(false));
+        let studio_a_down = Arc::new(AtomicBool::new(false));
+        let other_hub_hits = Arc::new(AtomicUsize::new(0));
+        let studio_a_direct_hits = Arc::new(AtomicUsize::new(0));
+        let studio_b_direct_hits = Arc::new(AtomicUsize::new(0));
+
+        struct TaggedOpener {
+            payload: Vec<u8>,
+            file_id: u64,
+            hits: Option<Arc<AtomicUsize>>,
+        }
+
+        impl StreamOpener for TaggedOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = self.payload.clone();
+                let file_id = self.file_id;
+                let hits = self.hits.clone();
+                Box::pin(async move {
+                    if let Some(h) = hits {
+                        h.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    tokio::spawn(async move {
+                        let greeting = json!({
+                            "protocol": 1,
+                            "capabilities": [CAP_STREAM_RELAY],
+                        });
+                        let _ = server_out
+                            .write_all(format!("{greeting}\n").as_bytes())
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if req["op"] == "relay" {
+                            &req["request"]
+                        } else {
+                            &req
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let length = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(payload.len().saturating_sub(offset))
+                            .min(payload.len().saturating_sub(offset));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": length,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": file_id,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out
+                            .write_all(&payload[offset..offset + length])
+                            .await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: CancellationToken::new(),
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct TwoFleetTransport(Arc<dyn StreamOpener>);
+        impl TransportHandle for TwoFleetTransport {
+            fn collect_exit_info(
+                &mut self,
+                _: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                Box::pin(async { (Some(0), String::new()) })
+            }
+            fn close(self: Box<Self>, _: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+            fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        let opener: SessionOpener = {
+            let tower_down = Arc::clone(&tower_down);
+            let studio_a_down = Arc::clone(&studio_a_down);
+            let other_hub_hits = Arc::clone(&other_hub_hits);
+            let studio_a_direct_hits = Arc::clone(&studio_a_direct_hits);
+            let studio_b_direct_hits = Arc::clone(&studio_b_direct_hits);
+            let fleet_a_bytes = fleet_a_bytes.clone();
+            let fleet_b_bytes = fleet_b_bytes.clone();
+            let studio_a_key_canon = studio_a_key_canon.clone();
+            Arc::new(move |entry, _, cancel| {
+                let tower_down = Arc::clone(&tower_down);
+                let studio_a_down = Arc::clone(&studio_a_down);
+                let other_hub_hits = Arc::clone(&other_hub_hits);
+                let studio_a_direct_hits = Arc::clone(&studio_a_direct_hits);
+                let studio_b_direct_hits = Arc::clone(&studio_b_direct_hits);
+                let fleet_a_bytes = fleet_a_bytes.clone();
+                let fleet_b_bytes = fleet_b_bytes.clone();
+                let studio_a_key_canon = studio_a_key_canon.clone();
+                Box::pin(async move {
+                    if entry.node == "tower" && tower_down.load(Ordering::SeqCst) {
+                        return Err(ProtoErrorBody::new(
+                            ProtoErrorCode::Unreachable,
+                            "Can't reach tower right now.",
+                        )
+                        .with_machine("tower"));
+                    }
+                    let is_studio_a = entry.node == "studio"
+                        && entry.target.as_ref().is_some_and(|t| {
+                            t.host_keys
+                                .iter()
+                                .any(|k| k.starts_with(&studio_a_key_canon))
+                        });
+                    if is_studio_a && studio_a_down.load(Ordering::SeqCst) {
+                        return Err(ProtoErrorBody::new(
+                            ProtoErrorCode::Unreachable,
+                            "Can't reach studio right now.",
+                        )
+                        .with_machine("studio"));
+                    }
+
+                    let (payload, file_id, hits) = match entry.node.as_str() {
+                        "tower" => (fleet_a_bytes, 101u64, None),
+                        "other-hub" => (fleet_b_bytes, 202u64, Some(other_hub_hits)),
+                        "studio" if is_studio_a => {
+                            (fleet_a_bytes, 101u64, Some(studio_a_direct_hits))
+                        }
+                        "studio" => (fleet_b_bytes, 202u64, Some(studio_b_direct_hits)),
+                        _ => unreachable!(),
+                    };
+
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_name = entry.node.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(TwoFleetTransport(Arc::new(TaggedOpener {
+                            payload,
+                            file_id,
+                            hits,
+                        }))),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![
+                    NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["tower.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![tower_key_line.clone()],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                    NodeLink::ssh(
+                        "other-hub",
+                        SshTarget {
+                            hosts: vec!["other-hub.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![other_key_line.clone()],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                ],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        struct TwoFleetBackend {
+            link: Link,
+            tower_key_canon: String,
+            other_key_canon: String,
+        }
+
+        impl Backend for TwoFleetBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                let cfg = self.link.config();
+                if let Some(entry) = cfg.node(machine) {
+                    let learned_identity = if entry.origin == NodeOrigin::Learned {
+                        let intro = entry.learned_from.as_deref().and_then(|n| cfg.node(n));
+                        let intro_keys = intro
+                            .and_then(|n| match n.node.as_str() {
+                                "tower" => Some(vec![self.tower_key_canon.clone()]),
+                                "other-hub" => Some(vec![self.other_key_canon.clone()]),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        let host_keys = entry
+                            .target
+                            .as_ref()
+                            .map(|t| {
+                                t.host_keys
+                                    .iter()
+                                    .map(|l| {
+                                        let mut p = l.split_whitespace();
+                                        format!("{} {}", p.next().unwrap(), p.next().unwrap())
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        Some(LearnedDirectIdentity {
+                            learned_fleet_epoch: 1,
+                            from_paired_introducer: intro
+                                .is_some_and(|n| n.origin == NodeOrigin::Paired),
+                            learned_from: intro.map(|n| n.node.clone()),
+                            introducer_holder: intro.map(|n| format!("pairing:{}:1", n.node)),
+                            introducer_host_keys: intro_keys,
+                            host_keys,
+                        })
+                    } else {
+                        None
+                    };
+                    return Ok(ContentTarget {
+                        link: self.link.clone(),
+                        link_node: entry.node.clone(),
+                        machine: entry.node.clone(),
+                        principal: "device:pixel".to_owned(),
+                        holder: format!("pairing:{}:1", entry.node),
+                        learned_identity,
+                    });
+                }
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                    learned_identity: None,
+                })
+            }
+            fn is_pairing_holder_live(&self, holder: &str) -> bool {
+                matches!(
+                    holder,
+                    "fleet:1" | "pairing:tower:1" | "pairing:other-hub:1" | "pairing:studio:1"
+                )
+            }
+            fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+                match node {
+                    "tower" => Some(NodeRouteIdentity {
+                        node: "tower".to_owned(),
+                        is_paired: true,
+                        holder: "pairing:tower:1".to_owned(),
+                        host_keys: vec![self.tower_key_canon.clone()],
+                    }),
+                    "other-hub" => Some(NodeRouteIdentity {
+                        node: "other-hub".to_owned(),
+                        is_paired: true,
+                        holder: "pairing:other-hub:1".to_owned(),
+                        host_keys: vec![self.other_key_canon.clone()],
+                    }),
+                    _ => None,
+                }
+            }
+        }
+
+        let backend = Arc::new(TwoFleetBackend {
+            link: link.clone(),
+            tower_key_canon,
+            other_key_canon,
+        });
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let get_range = |port: u16, path: String, range: &'static str| async move {
+            raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://tauri.localhost\r\nRange: {range}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await
+        };
+
+        // Sequence 1: Ticket minted for `studio` through `tower`. Then `other-hub` introduces its
+        // own learned `studio` in the SAME fleet epoch -> ticket MUST NOT serve fleet B's `studio`.
+        let t_seq1 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let p_seq1 = t_seq1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, body) = get_range(port, p_seq1.clone(), "bytes=0-1023").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &fleet_a_bytes[0..=1023]);
+        assert_eq!(other_hub_hits.load(Ordering::SeqCst), 0);
+
+        // `other-hub` introduces learned `studio` (fleet B) in epoch 1.
+        {
+            let mut learned_b = NodeLink::ssh(
+                "studio",
+                SshTarget {
+                    hosts: vec!["studio-b.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![studio_b_key_line.clone()],
+                },
+                Some("device:pixel".to_owned()),
+            );
+            learned_b.origin = NodeOrigin::Learned;
+            learned_b.learned_from = Some("other-hub".to_owned());
+            link.upsert_node(learned_b);
+        }
+        let (st, head, body) = get_range(port, p_seq1, "bytes=1024-2047").await;
+        assert_eq!(
+            st, 404,
+            "ticket minted via tower must refuse learned studio introduced by other-hub: {head}"
+        );
+        assert_ne!(body, &fleet_b_bytes[1024..=2047]);
+        assert_eq!(studio_b_direct_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(other_hub_hits.load(Ordering::SeqCst), 0);
+
+        // Remove learned `studio-b` for Sequence 2.
+        link.remove_node("studio").await;
+
+        // Sequence 2: With NO learn/pair event, `tower` becomes unreachable during playback while
+        // `other-hub` is online and knows a `studio` -> ticket MUST fail with the transport error
+        // (502) and NEVER fall back to `other-hub`. Minting a fresh ticket then resolves afresh.
+        let t_seq2 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p_seq2 = t_seq2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, body) = get_range(port, p_seq2.clone(), "bytes=0-1023").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &fleet_a_bytes[0..=1023]);
+
+        tower_down.store(true, Ordering::SeqCst);
+        link.close().await;
+        let (st, head, _) = get_range(port, p_seq2, "bytes=1024-2047").await;
+        assert_eq!(
+            st, 502,
+            "ticket pinned to unreachable tower must fail with 502 transport error, never fall back to other-hub: {head}"
+        );
+        assert_eq!(
+            other_hub_hits.load(Ordering::SeqCst),
+            0,
+            "other-hub must never be contacted for a ticket minted via tower"
+        );
+        let status = server.content_status_for_url(&t_seq2.url);
+        assert_eq!(status.status, Some(502));
+        assert_eq!(status.error_code.as_deref(), Some("unreachable"));
+
+        // Viewer minting a NEW ticket resolves `studio` afresh (now via `other-hub`).
+        let t_fresh = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p_fresh = t_fresh
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, body) = get_range(port, p_fresh, "bytes=0-511").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &fleet_b_bytes[0..=511]);
+        assert!(other_hub_hits.load(Ordering::SeqCst) >= 1);
+
+        // Sequence 3: Route upgrade from the SAME introducer (`tower`) still works mid-playback,
+        // and after upgrade the ticket is served ONLY through that direct entry's pinned identity.
+        tower_down.store(false, Ordering::SeqCst);
+        other_hub_hits.store(0, Ordering::SeqCst);
+        studio_a_direct_hits.store(0, Ordering::SeqCst);
+        link.close().await;
+
+        let t_seq3 = server
+            .mint_url("studio", "/home/me/video.mp4", false)
+            .await
+            .unwrap();
+        let p_seq3 = t_seq3
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let (st, head, body) = get_range(port, p_seq3.clone(), "bytes=0-1023").await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &fleet_a_bytes[0..=1023]);
+        assert_eq!(studio_a_direct_hits.load(Ordering::SeqCst), 0);
+
+        // Same introducer `tower` introduces learned `studio` (key A) mid-playback.
+        {
+            let mut learned_a = NodeLink::ssh(
+                "studio",
+                SshTarget {
+                    hosts: vec!["studio-a.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![studio_a_key_line.clone()],
+                },
+                Some("device:pixel".to_owned()),
+            );
+            learned_a.origin = NodeOrigin::Learned;
+            learned_a.learned_from = Some("tower".to_owned());
+            link.upsert_node(learned_a);
+        }
+        let (st, head, body) = get_range(port, p_seq3.clone(), "bytes=1024-2047").await;
+        assert_eq!(st, 206, "upgrade from same introducer must work: {head}");
+        assert_eq!(body, &fleet_a_bytes[1024..=2047]);
+        assert!(
+            studio_a_direct_hits.load(Ordering::SeqCst) >= 1,
+            "range after same-introducer learn must use direct studio-A route"
+        );
+        assert_eq!(other_hub_hits.load(Ordering::SeqCst), 0);
+
+        // Once upgraded, if direct `studio-A` goes unreachable, ticket fails with 502 and NEVER
+        // falls back to `tower` or `other-hub`.
+        studio_a_down.store(true, Ordering::SeqCst);
+        link.close().await;
+        let (st, head, _) = get_range(port, p_seq3.clone(), "bytes=2048-3071").await;
+        assert_eq!(
+            st, 502,
+            "upgraded direct ticket must fail with 502 when direct studio is unreachable: {head}"
+        );
+        assert_eq!(other_hub_hits.load(Ordering::SeqCst), 0);
+
+        // And if `studio`'s pinned host key changes to key B, ticket is refused with 404.
+        studio_a_down.store(false, Ordering::SeqCst);
+        {
+            let mut updated = link
+                .config()
+                .node("studio")
+                .cloned()
+                .expect("learned studio entry present");
+            updated.target.as_mut().unwrap().host_keys = vec![studio_b_key_line];
+            link.upsert_node(updated);
+        }
+        let (st, head, _) = get_range(port, p_seq3, "bytes=2048-3071").await;
+        assert_eq!(
+            st, 404,
+            "upgraded direct ticket must refuse changed host key: {head}"
+        );
+        assert_eq!(studio_b_direct_hits.load(Ordering::SeqCst), 0);
+        let _ = studio_a_key_canon;
+        let _ = studio_b_key_canon;
+
+        server.shutdown();
+        link.close().await;
+    }
+
+    #[tokio::test]
     async fn loopback_recovers_when_socket_is_reclaimed_under_running_accept_task() {
         let payload = b"reclaimed-socket-recovery-payload".to_vec();
         let mut files = HashMap::new();
@@ -5228,5 +7956,391 @@ mod tests {
         drop(holders);
 
         server.shutdown();
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn local_desktop_pipe_content_ticket_binds_strictly_to_local_direct_route_and_never_relays()
+     {
+        use std::sync::atomic::AtomicUsize;
+
+        let local_bytes: Vec<u8> = (0..16_384usize)
+            .map(|i| ((i * 7 + 3) % 251) as u8)
+            .collect();
+        let tower_bytes: Vec<u8> = (0..16_384usize)
+            .map(|i| ((i * 17 + 11) % 251) as u8)
+            .collect();
+        let local_down = Arc::new(AtomicBool::new(false));
+        let local_hits = Arc::new(AtomicUsize::new(0));
+        let tower_relay_hits = Arc::new(AtomicUsize::new(0));
+        let tower_key = legion_link::DeviceKey::from_seed([73u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+
+        struct LocalOrRelayOpener {
+            is_local: bool,
+            payload: Arc<Vec<u8>>,
+            hits: Arc<AtomicUsize>,
+            down: Arc<AtomicBool>,
+        }
+
+        impl StreamOpener for LocalOrRelayOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let is_local = self.is_local;
+                let payload = Arc::clone(&self.payload);
+                let hits = Arc::clone(&self.hits);
+                let down = Arc::clone(&self.down);
+                Box::pin(async move {
+                    if is_local && down.load(Ordering::SeqCst) {
+                        return Err(StreamOpenError::Failed(
+                            ErrorBody::new(ProtoCode::Unreachable, "local legion pipe down")
+                                .with_details(json!({ "sent": false })),
+                        ));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let inner = if req["op"] == json!("relay") {
+                            &req["request"]
+                        } else {
+                            &req
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": if is_local { 101u64 } else { 202u64 },
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        if len > 0 {
+                            let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        }
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let session_opener: SessionOpener = {
+            let local_payload = Arc::new(local_bytes.clone());
+            let tower_payload = Arc::new(tower_bytes.clone());
+            let local_down = Arc::clone(&local_down);
+            let local_hits = Arc::clone(&local_hits);
+            let tower_relay_hits = Arc::clone(&tower_relay_hits);
+            Arc::new(move |entry, _, cancel| {
+                let is_local = entry.node == "local";
+                let payload = if is_local {
+                    Arc::clone(&local_payload)
+                } else {
+                    Arc::clone(&tower_payload)
+                };
+                let hits = if is_local {
+                    Arc::clone(&local_hits)
+                } else {
+                    Arc::clone(&tower_relay_hits)
+                };
+                let down = Arc::clone(&local_down);
+                Box::pin(async move {
+                    if is_local && down.load(Ordering::SeqCst) {
+                        return Err(ErrorBody::new(
+                            ProtoCode::Unreachable,
+                            "local legion binary unavailable",
+                        )
+                        .with_details(json!({ "sent": false })));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_name = entry.node.clone();
+                    let hello_name = if is_local {
+                        "workstation".to_owned()
+                    } else {
+                        node_name.clone()
+                    };
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: hello_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let opener = Arc::new(LocalOrRelayOpener {
+                        is_local,
+                        payload,
+                        hits,
+                        down,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport { opener }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![
+                    NodeLink::local("local", "/usr/bin/legion"),
+                    NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["tower.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![tower_key.clone()],
+                        },
+                        Some("device:desktop".to_owned()),
+                    ),
+                ],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            session_opener,
+        );
+
+        struct DesktopLocalPipeBackend {
+            link: Link,
+            tower_key: String,
+        }
+        impl Backend for DesktopLocalPipeBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                if machine == "local" || machine == "workstation" {
+                    return Ok(ContentTarget {
+                        link: self.link.clone(),
+                        link_node: "local".to_owned(),
+                        machine: machine.to_owned(),
+                        principal: "local".to_owned(),
+                        holder: "pairing:local:1".to_owned(),
+                        learned_identity: None,
+                    });
+                }
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:desktop".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                    learned_identity: None,
+                })
+            }
+            fn is_pairing_holder_live(&self, holder: &str) -> bool {
+                matches!(holder, "pairing:local:1" | "pairing:tower:1" | "fleet:1")
+            }
+            fn node_route_identity(&self, node: &str) -> Option<NodeRouteIdentity> {
+                match node {
+                    "local" | "workstation" => Some(NodeRouteIdentity {
+                        node: "local".to_owned(),
+                        is_paired: true,
+                        holder: "pairing:local:1".to_owned(),
+                        host_keys: Vec::new(),
+                    }),
+                    "tower" => Some(NodeRouteIdentity {
+                        node: "tower".to_owned(),
+                        is_paired: true,
+                        holder: "pairing:tower:1".to_owned(),
+                        host_keys: vec![self.tower_key.clone()],
+                    }),
+                    _ => None,
+                }
+            }
+        }
+
+        let server = Arc::new(AppContentServer::with_config(
+            Arc::new(DesktopLocalPipeBackend {
+                link: link.clone(),
+                tower_key,
+            }),
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+
+        // 1) Mint and read via `"local"` (the wire target `apps/ui/link/app.js` sends for this
+        // computer) and via `"workstation"` (the resolved local node name): both bind strictly to
+        // `Route::Direct` over the local pipe and never contact `tower`.
+        for machine in ["local", "workstation"] {
+            let minted = server
+                .mint_url(machine, "/home/me/photo.bin", false)
+                .await
+                .unwrap();
+            let port = server.loopback_port().unwrap();
+            let path = minted
+                .url
+                .strip_prefix(&format!("http://127.0.0.1:{port}"))
+                .unwrap();
+            let (st, head, body) = raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: tauri://localhost\r\nRange: bytes=0-1023\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(st, 206, "machine={machine}: {head}");
+            assert_eq!(body, &local_bytes[0..=1023]);
+            assert_eq!(
+                tower_relay_hits.load(Ordering::SeqCst),
+                0,
+                "local desktop content ticket must never relay through tower"
+            );
+
+            // 2) If the local pipe drops mid-playback, the ticket fails with 502 and NEVER falls
+            // back to relaying through `tower`.
+            local_down.store(true, Ordering::SeqCst);
+            link.close().await;
+            let (st_down, head_down, body_down) = raw_http(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: tauri://localhost\r\nRange: bytes=1024-2047\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(st_down, 502, "machine={machine}: {head_down}");
+            assert_ne!(body_down, &tower_bytes[1024..=2047]);
+            assert_eq!(
+                tower_relay_hits.load(Ordering::SeqCst),
+                0,
+                "failing local desktop ticket must never fall back to tower relay"
+            );
+
+            // 3) Even minting a brand-new ticket while the local pipe is unavailable fails
+            // directly without attempting to relay through `tower`.
+            let err = server
+                .mint_url(machine, "/home/me/photo.bin", false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Unreachable);
+            assert_eq!(tower_relay_hits.load(Ordering::SeqCst), 0);
+
+            local_down.store(false, Ordering::SeqCst);
+            link.close().await;
+        }
+        assert!(local_hits.load(Ordering::SeqCst) >= 4);
+
+        server.shutdown();
+        link.close().await;
     }
 }

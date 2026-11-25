@@ -191,16 +191,23 @@ about the removal; removal is complete only once every machine has received the 
 
 **The device learns every way in.** Each node can describe how a device reaches it (`device.endpoint`:
 names, port, account, ssh host keys). After pairing, and from then on in the background, the app
-asks for that from every machine through whichever node answers, and keeps it. It then talks to
-each machine directly where it can and through another node where it cannot, and shows which.
-A machine added to the fleet later appears in the app by itself once the fleet has synced.
+asks for that from every machine through whichever node answers, and keeps it. Both RPC calls and
+bulk file streams (previews, media playback, downloads, uploads, and opening files in other apps)
+use the same link routing: directly to the machine when the device has a direct route, and relayed
+through a paired node (using `legion stream` `op: "relay"`, advertised via `stream.relay`) when it
+does not, never silently retrying through another route once bytes have been sent. Settings shows
+whether each machine is reached directly or through another machine, and a machine added to the
+fleet later appears in the app by itself once the fleet has synced.
 
 Only directly paired machines may act as introducers; learned machines never introduce other
 machines. If two or more paired nodes report differing endpoints or host keys for a new machine, it
 is shown as a disagreement and not pinned; when another paired node cannot reach a new machine, that
 counts as an abstention rather than a disagreement, so a single reporting paired node pins a new
 machine on its own when no other paired node can see it, though it can never alter a paired
-machine's pins or silently replace an existing machine's keys or route.
+machine's pins or silently replace an existing machine's keys or route. If a reported endpoint is
+rejected during learning (name mismatch, malformed endpoint, shared host keys, or node cap), the
+machine remains usable through its paired relay and Settings → Connections shows the rejection
+reason under Technical details.
 
 ## The browser door
 

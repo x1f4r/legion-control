@@ -18,6 +18,7 @@ pub mod power;
 pub mod session;
 mod state;
 pub mod stream;
+mod stream_relay;
 pub mod sync;
 pub mod tools;
 pub mod transfer;

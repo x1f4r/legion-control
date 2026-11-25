@@ -18,6 +18,7 @@ import {
   formatDeviceRemovedNotice,
   formatDisagreementNotice,
   formatInvitedDeviceSyncNotice,
+  formatLearnRejectionTechnical,
   formatPairSyncNotice,
   isInviteOwnerStrength,
   isPairingId,
@@ -567,4 +568,136 @@ allow = ["effect:read", "effect:exec"]
   assert.match(plainNotice.detail, /Received by pi and tower/);
   assert.match(plainNotice.detail, /studio will get it at the next sync/);
   assert.ok(!plainNotice.detail.includes('fleet.sync'));
+});
+
+test('buildRelayedConnections attaches learn rejections and formats technical reason only', () => {
+  const linkState = {
+    nodes: [{ node: 'tower', via: 'ssh', origin: 'paired' }],
+    routes: {
+      tower: { kind: 'direct' },
+      studio: { kind: 'relay', via: 'tower' },
+    },
+    learn_rejections: [
+      {
+        machine: 'studio',
+        code: 'name_mismatch',
+        reason: 'studio calls itself someones-laptop.',
+        reported_by: 'tower',
+      },
+      {
+        machine: 'broken',
+        code: 'malformed_endpoint',
+        reason: 'Endpoint host list was empty.',
+        reported_by: 'tower',
+      },
+    ],
+  };
+  const snapshot = {
+    machines: [
+      { name: 'tower', status: 'up' },
+      { name: 'studio', status: 'up' },
+      { name: 'pi', status: 'up' },
+    ],
+  };
+  const relayed = buildRelayedConnections(linkState, snapshot);
+  const byName = new Map(relayed.map((r) => [r.node, r]));
+
+  assert.equal(byName.has('tower'), false);
+  assert.equal(byName.get('studio')?.route_via, 'tower');
+  assert.equal(byName.get('studio')?.learn_rejection?.code, 'name_mismatch');
+  assert.equal(byName.get('pi')?.route_via, 'tower');
+  assert.equal(byName.get('pi')?.learn_rejection, null);
+  assert.equal(byName.get('broken')?.route_via, 'tower');
+  assert.equal(byName.get('broken')?.learn_rejection?.code, 'malformed_endpoint');
+
+  // Plain route line for relayed machine is short ("through tower").
+  assert.equal(describeConnectionRoute(byName.get('studio'), false).label, 'through tower');
+
+  // Technical details formats the rejection code, reason, and reporter.
+  const tech = formatLearnRejectionTechnical(byName.get('studio').learn_rejection);
+  assert.equal(
+    tech,
+    'Direct route skipped (name_mismatch): studio calls itself someones-laptop. — reported by tower',
+  );
+  assert.equal(formatLearnRejectionTechnical(null), null);
+});
+
+test('describeConnectionRoute and buildRelayedConnections never show Through or learn rejections for desktop local computer', () => {
+  // Even if a local-pipe entry carries stale relay/identity fields, it always renders as This computer.
+  const localRoute = describeConnectionRoute(
+    {
+      node: 'studio',
+      via: 'local',
+      isLocalComputer: true,
+      route: 'relay',
+      route_via: 'tower',
+    },
+    false,
+  );
+  assert.equal(localRoute.kind, 'direct');
+  assert.equal(localRoute.label, 'This computer');
+  assert.equal(localRoute.isWarning, false);
+
+  // Pending local name ("This computer") + fleet snapshot containing `this_node: true` ("studio"):
+  // `studio` must never appear under relayed connections, and peer hops through `local` rewrite cleanly.
+  const pendingRelayed = buildRelayedConnections(
+    {
+      nodes: [
+        { node: 'This computer', via: 'local', isLocalComputer: true, nodeNamePending: true },
+        { node: 'tower', via: 'ssh', origin: 'paired' },
+      ],
+      routes: {
+        local: { kind: 'direct' },
+        studio: { kind: 'relay', via: 'tower' },
+        pi: { kind: 'relay', via: 'local' },
+      },
+      learn_rejections: [
+        { machine: 'studio', code: 'loopback_host', reason: 'Loopback.', reported_by: 'local' },
+        { machine: 'nas', code: 'name_mismatch', reason: 'Mismatch.', reported_by: 'local' },
+      ],
+    },
+    {
+      machines: [
+        { name: 'studio', this_node: true, status: 'up' },
+        { name: 'tower', this_node: false, status: 'up' },
+        { name: 'pi', this_node: false, status: 'up' },
+      ],
+    },
+  );
+  const pendingByName = new Map(pendingRelayed.map((r) => [r.node, r]));
+  assert.equal(pendingByName.has('studio'), false);
+  assert.equal(pendingByName.has('local'), false);
+  assert.equal(pendingByName.has('This computer'), false);
+  assert.equal(pendingByName.get('pi')?.route_via, 'This computer');
+  assert.equal(pendingByName.get('nas')?.route_via, 'This computer');
+  assert.equal(pendingByName.get('nas')?.learn_rejection?.reported_by, 'This computer');
+
+  // Resolved local name ("studio"): never lists `studio` as relayed, and peer hops show `studio`.
+  const resolvedRelayed = buildRelayedConnections(
+    {
+      nodes: [
+        { node: 'studio', via: 'local', isLocalComputer: true, nodeNamePending: false },
+        { node: 'tower', via: 'ssh', origin: 'paired' },
+      ],
+      routes: {
+        studio: { kind: 'direct' },
+        pi: { kind: 'relay', via: 'local' },
+      },
+      learn_rejections: [
+        { machine: 'studio', code: 'loopback_host', reason: 'Loopback.', reported_by: 'tower' },
+      ],
+    },
+    {
+      machines: [
+        { name: 'studio', this_node: true, status: 'up' },
+        { name: 'tower', this_node: false, status: 'up' },
+        { name: 'pi', this_node: false, status: 'up' },
+      ],
+    },
+  );
+  assert.deepEqual(
+    resolvedRelayed.map((r) => [r.node, r.route_via]),
+    [['pi', 'studio']],
+  );
+  assert.equal(describeConnectionRoute(resolvedRelayed[0], false).label, 'through studio');
 });

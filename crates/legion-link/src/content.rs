@@ -30,10 +30,13 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, R
 use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 
+use crate::link::Route;
 use crate::stderr::StderrTail;
 
 /// Stream protocol version spoken by `legion stream`.
 const STREAM_PROTOCOL: u32 = 1;
+/// Stream capability advertised in a node's opening greeting when it supports `op: "relay"`.
+pub const CAP_STREAM_RELAY: &str = "stream.relay";
 /// Maximum reply line length accepted during the `get` handshake.
 const MAX_REPLY_LINE: usize = 1024 * 1024;
 /// Maximum `{"done": true}` trailer line length on a `keep_open` frame.
@@ -328,6 +331,150 @@ pub trait StreamOpener: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>;
 }
 
+/// A raw `legion stream` channel whose opening `{"protocol": 1, "capabilities": [...]}` greeting
+/// line has already been read and validated before any request header was sent.
+pub(crate) struct GreetedStream {
+    pub reader: BufReader<BoxStreamRead>,
+    pub writer: BoxStreamWrite,
+    pub stderr: Option<Arc<StderrTail>>,
+    pub cancel: CancellationToken,
+    pub park: Option<CancellationToken>,
+    pub guard: Option<Box<dyn Send + Sync>>,
+    pub capabilities: Vec<String>,
+}
+
+/// Reads and validates a freshly opened `legion stream` channel's opening greeting line before any
+/// request bytes are sent. Any transport or timeout failure is marked `details.sent = false`.
+pub(crate) async fn greet_raw_stream(
+    stream: RawStream,
+    peer: &str,
+    buf_capacity: usize,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<GreetedStream, ErrorBody> {
+    let RawStream {
+        reader,
+        writer,
+        stderr,
+        cancel: channel_cancel,
+        park,
+        guard,
+    } = stream;
+    let mut buf_reader = BufReader::with_capacity(buf_capacity, reader);
+
+    let read_fut = async {
+        let mut noise_lines = 0usize;
+        let mut noise_bytes = 0usize;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = read_bounded_line(&mut buf_reader, &mut line, MAX_REPLY_LINE)
+                .await
+                .map_err(|err| {
+                    crate::mark_not_sent(stream_io_error(
+                        peer,
+                        "reading stream greeting",
+                        &err,
+                        &stderr,
+                    ))
+                })?;
+            if n == 0 {
+                let mut err = ErrorBody::new(
+                    ErrorCode::Unreachable,
+                    format!("The stream to {peer} closed before answering."),
+                )
+                .with_machine(peer);
+                if let Some(tail) = &stderr {
+                    let text = tail.text();
+                    if !text.is_empty() {
+                        err = err.with_hint(format!("Remote stderr: {text}"));
+                    }
+                }
+                return Err(crate::mark_not_sent(err));
+            }
+            if let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(&line)
+                && let Some(spoken) = fields.get("protocol")
+            {
+                if spoken.as_u64() != Some(u64::from(STREAM_PROTOCOL)) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Unsupported,
+                        format!(
+                            "{peer} speaks stream protocol {spoken}, and this client speaks stream protocol {STREAM_PROTOCOL}."
+                        ),
+                    )
+                    .with_hint("Update legion so both sides speak the same stream protocol.")
+                    .with_machine(peer));
+                }
+                return Ok(crate::put::parse_greeting_capabilities(&fields));
+            }
+            noise_lines += 1;
+            noise_bytes += line.len();
+            if noise_lines > MAX_NOISE_LINES || noise_bytes > MAX_NOISE_BYTES {
+                return Err(crate::mark_not_sent(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!(
+                            "{peer} sent too much non-protocol output before starting legion stream."
+                        ),
+                    )
+                    .with_hint("Check the remote account's shell profile or forced command.")
+                    .with_machine(peer)
+                    .with_details(json!({ "reason": crate::REASON_NON_PROTOCOL_OUTPUT })),
+                ));
+            }
+        }
+    };
+
+    let capabilities = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            channel_cancel.cancel();
+            return Err(ErrorBody::new(
+                ErrorCode::Cancelled,
+                format!("Opening stream to {peer} was cancelled."),
+            )
+            .with_machine(peer));
+        }
+        res = tokio::time::timeout(timeout, read_fut) => match res {
+            Ok(Ok(caps)) => caps,
+            Ok(Err(err)) => {
+                channel_cancel.cancel();
+                return Err(err);
+            }
+            Err(_) => {
+                channel_cancel.cancel();
+                let mut err = ErrorBody::new(
+                    ErrorCode::Timeout,
+                    format!(
+                        "Timed out waiting for {peer} to start legion stream after {}s.",
+                        timeout.as_secs_f64()
+                    ),
+                )
+                .with_machine(peer);
+                if let Some(tail) = &stderr {
+                    let text = tail.text();
+                    if !text.is_empty() {
+                        err = err.with_hint(format!("Remote stderr: {text}"));
+                    }
+                }
+                return Err(crate::mark_not_sent(err));
+            }
+        }
+    };
+
+    Ok(GreetedStream {
+        reader: buf_reader,
+        writer,
+        stderr,
+        cancel: channel_cancel,
+        park,
+        guard,
+        capabilities,
+    })
+}
+
+pub(crate) const CONTENT_STREAM_BUF_BYTES: usize = STREAM_BUF_BYTES;
+
 struct OpenedChannel {
     reader: BufReader<BoxStreamRead>,
     writer: BoxStreamWrite,
@@ -369,6 +516,7 @@ impl Drop for ActiveChunk {
 struct ChunkContinuation {
     opener: Arc<dyn StreamOpener>,
     machine: String,
+    relay_via: Option<String>,
     path: String,
     as_principal: Option<String>,
     timeout: Duration,
@@ -611,6 +759,7 @@ struct KeepOpenState {
     timeout: Duration,
     options: ContentStreamOptions,
     machine: String,
+    relay_via: Option<String>,
     path: String,
     as_principal: Option<String>,
     expected_size: u64,
@@ -727,6 +876,7 @@ impl KeepOpenState {
         let cursor_offset = self.logical_end.saturating_sub(total_remaining);
         let want = total_remaining.min(self.policy.initial_bytes);
         let machine = self.machine.clone();
+        let relay_via = self.relay_via.clone();
         let path = self.path.clone();
         let as_principal = self.as_principal.clone();
         let timeout = self.timeout;
@@ -740,6 +890,7 @@ impl KeepOpenState {
             reopen_keep_open_channel(
                 opener,
                 machine,
+                relay_via,
                 path,
                 cursor_offset,
                 want,
@@ -840,6 +991,7 @@ impl KeepOpenState {
             Some(want),
             self.as_principal.as_deref(),
             true,
+            self.relay_via.as_ref().map(|_| self.machine.as_str()),
         );
         self.pending_write.extend_from_slice(&header);
         self.need_flush = true;
@@ -877,6 +1029,7 @@ pub struct ContentStream {
     remaining: u64,
     mtime: ContentTime,
     file_id: Option<u64>,
+    route: Route,
     cancel: CancellationToken,
 }
 
@@ -909,6 +1062,11 @@ impl ContentStream {
     /// Platform file identity (derived from device and inode on Unix) when reported by the node.
     pub fn file_id(&self) -> Option<u64> {
         self.file_id
+    }
+
+    /// Route taken to reach the target machine (`Direct` or `Relay { via }`).
+    pub fn route(&self) -> &Route {
+        &self.route
     }
 
     /// Cancels this stream and closes its underlying SSH channel or child process immediately.
@@ -1507,9 +1665,8 @@ fn poll_keep_open(
                         }
                         state.busy_count = 0;
                         state.progress_deadline = None;
-                        if let Some(error_val) = fields.get("error")
-                            && let Ok(body) = serde_json::from_value::<ErrorBody>(error_val.clone())
-                        {
+                        if let Some(error_val) = fields.get("error") {
+                            let body = crate::decode_remote_error(error_val, &state.machine);
                             state.fail_stream(total_remaining);
                             let kind = match body.code {
                                 ErrorCode::Denied => io::ErrorKind::PermissionDenied,
@@ -1747,6 +1904,7 @@ fn poll_per_chunk(
             cont.next_offset = cont.next_offset.saturating_add(want);
             let opener = Arc::clone(&cont.opener);
             let machine = cont.machine.clone();
+            let relay_via = cont.relay_via.clone();
             let path = cont.path.clone();
             let as_principal = cont.as_principal.clone();
             let timeout = cont.timeout;
@@ -1759,6 +1917,7 @@ fn poll_per_chunk(
                 open_continuation_chunk(
                     opener,
                     machine,
+                    relay_via,
                     path,
                     next_offset,
                     want,
@@ -1783,6 +1942,15 @@ fn poll_per_chunk(
                 }
                 Poll::Ready(Ok(chunk)) => {
                     *next_chunk = None;
+                    let active_cancel = chunk.chunk_cancel.clone();
+                    let master = cancel.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            () = master.cancelled() => active_cancel.cancel(),
+                            () = active_cancel.cancelled() => {}
+                        }
+                    });
                     *active_slot = Some(chunk);
                 }
             }
@@ -1890,22 +2058,40 @@ fn build_get_header(
     length: Option<u64>,
     as_principal: Option<&str>,
     keep_open: bool,
+    relay_on: Option<&str>,
 ) -> Vec<u8> {
-    let mut header = json!({
+    let mut inner = json!({
         "protocol": STREAM_PROTOCOL,
         "op": "get",
         "path": path,
         "offset": offset,
     });
     if let Some(len) = length {
-        header["length"] = json!(len);
-    }
-    if let Some(principal) = as_principal {
-        header["as"] = json!(principal);
+        inner["length"] = json!(len);
     }
     if keep_open {
-        header["keep_open"] = json!(true);
+        inner["keep_open"] = json!(true);
     }
+    let header = match relay_on {
+        Some(target) => {
+            let mut envelope = json!({
+                "protocol": STREAM_PROTOCOL,
+                "op": "relay",
+                "on": target,
+                "request": inner,
+            });
+            if let Some(principal) = as_principal {
+                envelope["as"] = json!(principal);
+            }
+            envelope
+        }
+        None => {
+            if let Some(principal) = as_principal {
+                inner["as"] = json!(principal);
+            }
+            inner
+        }
+    };
     let mut bytes = header.to_string().into_bytes();
     bytes.push(b'\n');
     bytes
@@ -1984,11 +2170,81 @@ pub(crate) async fn handshake_get_with_options(
     .await
 }
 
+/// Runs the `legion stream` `get` handshake on an already-greeted relayed stream and returns a
+/// positioned [`ContentStream`] recording `Route::Relay { via }`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handshake_get_relayed(
+    stream: GreetedStream,
+    opener: Option<Arc<dyn StreamOpener>>,
+    machine: &str,
+    relay_via: &str,
+    path: &str,
+    offset: u64,
+    length: Option<u64>,
+    as_principal: Option<&str>,
+    timeout: Duration,
+    cancel: CancellationToken,
+    options: ContentStreamOptions,
+) -> Result<ContentStream, ErrorBody> {
+    handshake_get_from_source(
+        StreamStart::Greeted(stream),
+        opener,
+        machine,
+        Some(relay_via),
+        path,
+        offset,
+        length,
+        as_principal,
+        timeout,
+        cancel,
+        options,
+        None,
+    )
+    .await
+}
+
+enum StreamStart {
+    Raw(RawStream),
+    Greeted(GreetedStream),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handshake_get_inner(
     stream: RawStream,
     opener: Option<Arc<dyn StreamOpener>>,
     machine: &str,
+    path: &str,
+    offset: u64,
+    length: Option<u64>,
+    as_principal: Option<&str>,
+    timeout: Duration,
+    cancel: CancellationToken,
+    options: ContentStreamOptions,
+    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
+) -> Result<ContentStream, ErrorBody> {
+    handshake_get_from_source(
+        StreamStart::Raw(stream),
+        opener,
+        machine,
+        None,
+        path,
+        offset,
+        length,
+        as_principal,
+        timeout,
+        cancel,
+        options,
+        on_greeting_capabilities,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handshake_get_from_source(
+    stream: StreamStart,
+    opener: Option<Arc<dyn StreamOpener>>,
+    machine: &str,
+    relay_via: Option<&str>,
     path: &str,
     offset: u64,
     length: Option<u64>,
@@ -2011,6 +2267,7 @@ async fn handshake_get_inner(
     let (opened, validated) = open_one_chunk(
         stream,
         machine,
+        relay_via,
         path,
         offset,
         first_request_len,
@@ -2018,7 +2275,7 @@ async fn handshake_get_inner(
         request_keep_open,
         timeout,
         options.max_busy_lines,
-        cancel,
+        cancel.clone(),
         on_greeting_capabilities,
     )
     .await?;
@@ -2027,7 +2284,7 @@ async fn handshake_get_inner(
     let total_available = validated.size - validated.offset;
     let total_length = length.map_or(total_available, |n| n.min(total_available));
 
-    let stream_cancel = CancellationToken::new();
+    let stream_cancel = cancel.child_token();
     let active_cancel = opened.channel_cancel.clone();
     let master = stream_cancel.clone();
     tokio::spawn(async move {
@@ -2037,6 +2294,13 @@ async fn handshake_get_inner(
             () = active_cancel.cancelled() => {}
         }
     });
+
+    let route = match relay_via {
+        Some(via) => Route::Relay {
+            via: via.to_owned(),
+        },
+        None => Route::Direct,
+    };
 
     let mode = if let Some(policy) = policy
         && validated.keep_open
@@ -2073,6 +2337,7 @@ async fn handshake_get_inner(
             timeout,
             options,
             machine: machine.to_owned(),
+            relay_via: relay_via.map(str::to_owned),
             path: path.to_owned(),
             as_principal: as_principal.map(str::to_owned),
             expected_size: validated.size,
@@ -2091,6 +2356,7 @@ async fn handshake_get_inner(
             (Some(opener), Some(p)) if validated.length < total_length => Some(ChunkContinuation {
                 opener,
                 machine: machine.to_owned(),
+                relay_via: relay_via.map(str::to_owned),
                 path: path.to_owned(),
                 as_principal: as_principal.map(str::to_owned),
                 timeout,
@@ -2120,6 +2386,7 @@ async fn handshake_get_inner(
         remaining: total_length,
         mtime: validated.mtime,
         file_id: validated.file_id,
+        route,
         cancel: stream_cancel,
     })
 }
@@ -2128,6 +2395,7 @@ async fn handshake_get_inner(
 async fn reopen_keep_open_channel(
     opener: Arc<dyn StreamOpener>,
     machine: String,
+    relay_via: Option<String>,
     path: String,
     cursor_offset: u64,
     length: u64,
@@ -2175,9 +2443,25 @@ async fn reopen_keep_open_channel(
         }
     };
 
+    let start = if let Some(ref via) = relay_via {
+        let greeted = greet_raw_stream(raw, via, STREAM_BUF_BYTES, timeout, &cancel)
+            .await
+            .map_err(|err| io::Error::other(err.message))?;
+        if !greeted.capabilities.iter().any(|c| c == CAP_STREAM_RELAY) {
+            greeted.cancel.cancel();
+            return Err(io::Error::other(format!(
+                "{via} needs an update before it can pass files along from {machine}."
+            )));
+        }
+        StreamStart::Greeted(greeted)
+    } else {
+        StreamStart::Raw(raw)
+    };
+
     let (opened, validated) = open_one_chunk(
-        raw,
+        start,
         &machine,
+        relay_via.as_deref(),
         &path,
         cursor_offset,
         Some(length),
@@ -2222,6 +2506,7 @@ async fn reopen_keep_open_channel(
 async fn open_continuation_chunk(
     opener: Arc<dyn StreamOpener>,
     machine: String,
+    relay_via: Option<String>,
     path: String,
     offset: u64,
     length: u64,
@@ -2260,9 +2545,24 @@ async fn open_continuation_chunk(
             }
         }
     };
+    let start = if let Some(ref via) = relay_via {
+        let greeted = greet_raw_stream(raw, via, STREAM_BUF_BYTES, timeout, &cancel)
+            .await
+            .map_err(|err| io::Error::other(err.message))?;
+        if !greeted.capabilities.iter().any(|c| c == CAP_STREAM_RELAY) {
+            greeted.cancel.cancel();
+            return Err(io::Error::other(format!(
+                "{via} needs an update before it can pass files along from {machine}."
+            )));
+        }
+        StreamStart::Greeted(greeted)
+    } else {
+        StreamStart::Raw(raw)
+    };
     let (opened, validated) = open_one_chunk(
-        raw,
+        start,
         &machine,
+        relay_via.as_deref(),
         &path,
         offset,
         Some(length),
@@ -2290,8 +2590,9 @@ async fn open_continuation_chunk(
 
 #[allow(clippy::too_many_arguments)]
 async fn open_one_chunk(
-    stream: RawStream,
+    stream: StreamStart,
     machine: &str,
+    relay_via: Option<&str>,
     path: &str,
     offset: u64,
     length: Option<u64>,
@@ -2302,30 +2603,51 @@ async fn open_one_chunk(
     cancel: CancellationToken,
     on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<(OpenedChannel, ValidatedGet), ErrorBody> {
-    let RawStream {
-        reader,
-        mut writer,
-        stderr,
-        cancel: chunk_cancel,
-        park: park_cancel,
-        guard,
-    } = stream;
+    let (mut buf_reader, mut writer, stderr, chunk_cancel, park_cancel, guard, already_greeted) =
+        match stream {
+            StreamStart::Raw(raw) => (
+                BufReader::with_capacity(STREAM_BUF_BYTES, raw.reader),
+                raw.writer,
+                raw.stderr,
+                raw.cancel,
+                raw.park,
+                raw.guard,
+                false,
+            ),
+            StreamStart::Greeted(greeted) => (
+                greeted.reader,
+                greeted.writer,
+                greeted.stderr,
+                greeted.cancel,
+                greeted.park,
+                greeted.guard,
+                true,
+            ),
+        };
 
-    let header_bytes = build_get_header(path, offset, length, as_principal, keep_open);
+    let header_bytes = build_get_header(
+        path,
+        offset,
+        length,
+        as_principal,
+        keep_open,
+        relay_via.map(|_| machine),
+    );
+    let io_peer = relay_via.unwrap_or(machine);
 
-    let mut buf_reader = BufReader::with_capacity(STREAM_BUF_BYTES, reader);
     let handshake = async {
         writer
             .write_all(&header_bytes)
             .await
-            .map_err(|err| stream_io_error(machine, "writing stream header", &err, &stderr))?;
+            .map_err(|err| stream_io_error(io_peer, "writing stream header", &err, &stderr))?;
         writer
             .flush()
             .await
-            .map_err(|err| stream_io_error(machine, "flushing stream header", &err, &stderr))?;
+            .map_err(|err| stream_io_error(io_peer, "flushing stream header", &err, &stderr))?;
         read_get_ready(
             &mut buf_reader,
             machine,
+            already_greeted,
             &stderr,
             max_busy_lines,
             on_greeting_capabilities,
@@ -2393,11 +2715,12 @@ async fn open_one_chunk(
 async fn read_get_ready<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     machine: &str,
+    already_greeted: bool,
     stderr: &Option<Arc<StderrTail>>,
     max_busy_lines: usize,
     on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<GetReadyReply, ErrorBody> {
-    let mut greeted = false;
+    let mut greeted = already_greeted;
     let mut noise_lines = 0usize;
     let mut noise_bytes = 0usize;
     let mut busy_lines = 0usize;
@@ -2456,10 +2779,8 @@ async fn read_get_ready<R: AsyncRead + Unpin>(
                 }
                 continue;
             } else {
-                if let Some(error_val) = fields.get("error")
-                    && let Ok(body) = serde_json::from_value::<ErrorBody>(error_val.clone())
-                {
-                    return Err(crate::strip_remote_sent(body).with_machine(machine));
+                if let Some(error_val) = fields.get("error") {
+                    return Err(crate::decode_remote_error(error_val, machine));
                 }
                 if let Ok(ready) = serde_json::from_value::<GetReadyReply>(Value::Object(fields)) {
                     return Ok(ready);
@@ -2640,6 +2961,10 @@ mod tests {
                 let watch_cancel = stream_cancel.clone();
 
                 tokio::spawn(async move {
+                    if banner_noise {
+                        let _ = server_out.write_all(b"Welcome banner\n").await;
+                    }
+                    let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
                     let mut reader = BufReader::new(server_in);
                     let mut line = String::new();
                     if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
@@ -2651,10 +2976,6 @@ mod tests {
                         .get("length")
                         .and_then(Value::as_u64)
                         .map(|n| n as usize);
-                    if banner_noise {
-                        let _ = server_out.write_all(b"Welcome banner\n").await;
-                    }
-                    let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
                     let _ = server_out.write_all(b"{\"busy\":true}\n").await;
                     if offset > payload.len() {
                         let err = json!({
@@ -2827,13 +3148,32 @@ mod tests {
         });
         let link = make_mock_link("tower", "tower", opener, Arc::new(AtomicUsize::new(0)));
 
-        // Unknown machine is refused with NotFound and never falls back to tower.
+        // Machine with no direct entry tries tower as a relay, sees tower's greeting lacks
+        // `stream.relay`, and refuses with Unsupported before sending any request.
         let err = link
             .open_content("pi", "/etc/hosts", 0, None)
             .await
             .err()
             .unwrap();
-        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+        assert_eq!(
+            err.message,
+            "tower needs an update before it can pass files along from pi."
+        );
+        assert_eq!(
+            err.details.as_ref().and_then(|d| d.get("reason")),
+            Some(&json!(crate::REASON_RELAY_TOO_OLD))
+        );
+        // Cached `stream.relay` absence prevents opening another stream channel on retry.
+        let opens_after_probe = opened.load(Ordering::SeqCst);
+        let err2 = link
+            .open_content("pi", "/etc/hosts", 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err2.code, ErrorCode::Unsupported);
+        assert_eq!(opened.load(Ordering::SeqCst), opens_after_probe);
 
         // Two concurrent ranges open at once on the same session (s2 spans >1 chunk).
         let mut s1 = link
@@ -2863,8 +3203,8 @@ mod tests {
         r2.unwrap();
         assert_eq!(b1, &payload[1000..33_000]);
         assert_eq!(b2, &payload[50_000..120_000]);
-        // s1 used 1 chunk; s2 (70_000 bytes with 32 KiB chunks) used 3 chunks.
-        assert_eq!(opened.load(Ordering::SeqCst), 4);
+        // Initial relay capability probe on tower (1) + s1 (1 chunk) + s2 (3 chunks) = 5.
+        assert_eq!(opened.load(Ordering::SeqCst), 5);
 
         // Cancelling mid-stream stops reading and cancels the channel.
         let mut s3 = link

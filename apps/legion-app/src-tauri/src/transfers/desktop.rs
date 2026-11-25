@@ -316,6 +316,19 @@ impl TransferPlatform for DesktopTransferPlatform {
                     .await
                     .unwrap_or(false);
                     if spawned {
+                        if let (Some(transfers), Some(content), Some(backend)) = (
+                            app.try_state::<crate::transfers::SharedTransfers>(),
+                            app.try_state::<crate::content::SharedContentServer>(),
+                            app.try_state::<crate::commands::SharedBackend>(),
+                        ) {
+                            crate::commands::quiesce_for_update_exit(
+                                &transfers.0,
+                                &content.0,
+                                &backend.0,
+                                crate::UPDATE_EXIT_QUIESCE_TIMEOUT,
+                            )
+                            .await;
+                        }
                         tauri_plugin_single_instance::destroy(&app);
                     }
                 }
