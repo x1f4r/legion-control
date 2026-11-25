@@ -83,9 +83,11 @@ impl ProgressLine {
 
 /// A progress event as a person reads it: `42% 1.2 MiB of 2.9 MiB, 3 of 10 files`.
 fn describe(data: &Value) -> String {
-    let field = |name: &str| data.get(name).and_then(Value::as_u64).unwrap_or(0);
-    let (bytes, total) = (field("bytes"), field("bytes_total"));
-    let (files, files_total) = (field("files"), field("files_total"));
+    let field = |name: &str| data.get(name).and_then(Value::as_u64);
+    let bytes = field("bytes_done").or_else(|| field("bytes")).unwrap_or(0);
+    let total = field("bytes_total").unwrap_or(0);
+    let files = field("files_done").or_else(|| field("files")).unwrap_or(0);
+    let files_total = field("files_total").unwrap_or(0);
     let mut text = String::new();
     if total > 0 {
         let percent = (u128::from(bytes) * 100 / u128::from(total)).min(100);
