@@ -30,8 +30,6 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use legion_core::media::{Category, classify_path};
 use legion_core::proto::{ErrorBody, ErrorCode};
 use serde::{Deserialize, Serialize};
@@ -41,6 +39,11 @@ use serde_json::json;
 pub(crate) const MAX_AUDIO_TAG_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of Unicode scalar values kept in any text tag field.
 pub(crate) const MAX_TAG_FIELD_CHARS: usize = 512;
+/// Maximum raw input bytes decoded for any single text tag field before cleaning (8 KiB: 4x the
+/// worst-case 512x4-byte UTF-8 or UTF-16 astral sequence with generous headroom for leading
+/// stripped characters and multi-value separators, so a 16 MiB invalid-byte value can never
+/// expand into tens of MiB before truncation).
+const MAX_TEXT_DECODE_BYTES: usize = 8 * 1024;
 
 const MAX_CONTAINER_CHUNKS: usize = 4096;
 const MAX_ID3_FRAMES: usize = 4096;
@@ -294,11 +297,16 @@ fn read_mp4_box_header_raw<R: Read + Seek>(
 /// Cleans a tag text value per the player contract: removes all control characters, trims
 /// surrounding whitespace, caps at [`MAX_TAG_FIELD_CHARS`] (512) Unicode characters, re-trims, and
 /// returns `None` when empty.
+#[cfg(test)]
 pub(crate) fn clean_tag_text(raw: &str) -> Option<String> {
-    let mut out = String::with_capacity(raw.len().min(MAX_TAG_FIELD_CHARS));
+    clean_tag_chars(raw.chars())
+}
+
+fn clean_tag_chars(chars: impl Iterator<Item = char>) -> Option<String> {
+    let mut out = String::with_capacity(MAX_TAG_FIELD_CHARS.min(64));
     let mut count = 0usize;
     let mut started = false;
-    for ch in raw.chars() {
+    for ch in chars {
         if ch.is_control() {
             continue;
         }
@@ -319,17 +327,131 @@ pub(crate) fn clean_tag_text(raw: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Returns a prefix of `data` bounded to `max_bytes`, stepping back at most 3 bytes if `max_bytes`
+/// falls in the middle of a UTF-8 continuation sequence so valid multi-byte characters at the cut
+/// boundary are not turned into `U+FFFD`.
+fn bounded_utf8_prefix(data: &[u8], max_bytes: usize) -> &[u8] {
+    if data.len() <= max_bytes {
+        return data;
+    }
+    let mut end = max_bytes;
+    let floor = max_bytes.saturating_sub(3);
+    while end > floor && (data[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    &data[..end]
+}
+
+/// Zero-allocation lossy UTF-8 character iterator over a byte slice.
+struct LossyUtf8Chars<'a> {
+    rest: &'a [u8],
+    valid: std::str::Chars<'a>,
+    pending_replacement: bool,
+}
+
+impl<'a> LossyUtf8Chars<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            rest: bytes,
+            valid: "".chars(),
+            pending_replacement: false,
+        }
+    }
+}
+
+impl Iterator for LossyUtf8Chars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        loop {
+            if let Some(ch) = self.valid.next() {
+                return Some(ch);
+            }
+            if self.pending_replacement {
+                self.pending_replacement = false;
+                return Some('\u{FFFD}');
+            }
+            if self.rest.is_empty() {
+                return None;
+            }
+            match std::str::from_utf8(self.rest) {
+                Ok(s) => {
+                    self.valid = s.chars();
+                    self.rest = &[];
+                }
+                Err(err) => {
+                    let valid_len = err.valid_up_to();
+                    if valid_len > 0
+                        && let Ok(prefix) = std::str::from_utf8(&self.rest[..valid_len])
+                    {
+                        self.valid = prefix.chars();
+                    }
+                    let bad_len = err
+                        .error_len()
+                        .unwrap_or(self.rest.len() - valid_len)
+                        .max(1);
+                    self.rest = &self.rest[(valid_len + bad_len).min(self.rest.len())..];
+                    self.pending_replacement = true;
+                }
+            }
+        }
+    }
+}
+
+fn clean_utf8_bytes(data: &[u8]) -> Option<String> {
+    let prefix = bounded_utf8_prefix(data, MAX_TEXT_DECODE_BYTES);
+    clean_tag_chars(LossyUtf8Chars::new(prefix))
+}
+
+fn clean_latin1_bytes(data: &[u8]) -> Option<String> {
+    let prefix = &data[..data.len().min(MAX_TEXT_DECODE_BYTES)];
+    clean_tag_chars(prefix.iter().map(|&b| char::from(b)))
+}
+
+fn clean_utf16_bytes(data: &[u8], little_endian: bool) -> Option<String> {
+    let mut len = data.len().min(MAX_TEXT_DECODE_BYTES) & !1;
+    // Avoid splitting a UTF-16 surrogate pair when truncating at `MAX_TEXT_DECODE_BYTES`.
+    if data.len() > len && len >= 2 {
+        let last = if little_endian {
+            u16::from_le_bytes([data[len - 2], data[len - 1]])
+        } else {
+            u16::from_be_bytes([data[len - 2], data[len - 1]])
+        };
+        if (0xD800..=0xDBFF).contains(&last) {
+            len -= 2;
+        }
+    }
+    let units = data[..len].as_chunks::<2>().0.iter().map(|pair| {
+        if little_endian {
+            u16::from_le_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_be_bytes([pair[0], pair[1]])
+        }
+    });
+    clean_tag_chars(char::decode_utf16(units).map(|res| res.unwrap_or('\u{FFFD}')))
+}
+
 /// Parses a positive track or disc number from tag text such as `"3"`, `"03"`, or `"3/12"`.
+#[cfg(test)]
 pub(crate) fn parse_track_or_disc(raw: &str) -> Option<u32> {
     let cleaned = clean_tag_text(raw)?;
+    parse_track_or_disc_cleaned(&cleaned)
+}
+
+fn parse_track_or_disc_cleaned(cleaned: &str) -> Option<u32> {
     let head = cleaned.split('/').next()?.trim();
     let n = head.parse::<u32>().ok()?;
     (n > 0).then_some(n)
 }
 
 /// Parses a 4-digit year from tag text such as `"2024"`, `"2024-05-12"`, or `"2024-05-12T10:00Z"`.
+#[cfg(test)]
 pub(crate) fn parse_year(raw: &str) -> Option<u32> {
     let cleaned = clean_tag_text(raw)?;
+    parse_year_cleaned(&cleaned)
+}
+
+fn parse_year_cleaned(cleaned: &str) -> Option<u32> {
     let bytes = cleaned.as_bytes();
     if bytes.len() >= 4 && bytes[..4].iter().all(u8::is_ascii_digit) {
         let y = cleaned.get(..4)?.parse::<u32>().ok()?;
@@ -638,8 +760,7 @@ fn parse_generic_audio<R: Read + Seek>(
 fn parse_id3v1_into(v1: &[u8; 128], tags: &mut ParsedAudioTags) {
     let latin1 = |slice: &[u8]| -> Option<String> {
         let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-        let text: String = slice[..end].iter().map(|&b| char::from(b)).collect();
-        clean_tag_text(&text)
+        clean_latin1_bytes(&slice[..end])
     };
     if tags.title.is_none() {
         tags.title = latin1(&v1[3..33]);
@@ -653,7 +774,7 @@ fn parse_id3v1_into(v1: &[u8; 128], tags: &mut ParsedAudioTags) {
     if tags.year.is_none()
         && let Some(yr) = latin1(&v1[93..97])
     {
-        tags.year = parse_year(&yr);
+        tags.year = parse_year_cleaned(&yr);
     }
     // ID3v1.1: comment byte 28 == 0 and byte 29 == non-zero track number.
     if tags.track.is_none() && v1[125] == 0 && v1[126] != 0 {
@@ -842,10 +963,27 @@ fn decode_synchsafe(b: [u8; 4]) -> Option<u32> {
     )
 }
 
-fn deunsync(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
+fn deunsync_in_place(data: &mut Vec<u8>) {
+    let mut read = 0usize;
+    let mut write = 0usize;
+    let len = data.len();
+    while read < len {
+        let b = data[read];
+        data[write] = b;
+        write += 1;
+        if b == 0xFF && read + 1 < len && data[read + 1] == 0x00 {
+            read += 2;
+        } else {
+            read += 1;
+        }
+    }
+    data.truncate(write);
+}
+
+fn deunsync_prefix(data: &[u8], max_out: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len().min(max_out));
     let mut i = 0usize;
-    while i < data.len() {
+    while i < data.len() && out.len() < max_out {
         let b = data[i];
         out.push(b);
         if b == 0xFF && data.get(i + 1) == Some(&0x00) {
@@ -855,6 +993,50 @@ fn deunsync(data: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Zero-allocation streaming reader over an unsynchronised ID3v2.4 frame payload.
+struct DeunsyncReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DeunsyncReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let &b = self.data.get(self.pos)?;
+        if b == 0xFF && self.data.get(self.pos + 1) == Some(&0x00) {
+            self.pos += 2;
+        } else {
+            self.pos += 1;
+        }
+        Some(b)
+    }
+
+    fn skip_terminated_text(&mut self, encoding: u8) -> bool {
+        match encoding {
+            0 | 3 => {
+                while let Some(b) = self.next_byte() {
+                    if b == 0 {
+                        return true;
+                    }
+                }
+                false
+            }
+            1 | 2 => loop {
+                let (Some(b0), Some(b1)) = (self.next_byte(), self.next_byte()) else {
+                    return false;
+                };
+                if b0 == 0 && b1 == 0 {
+                    return true;
+                }
+            },
+            _ => false,
+        }
+    }
 }
 
 fn parse_id3v2_from_stream<R: Read + Seek>(
@@ -931,7 +1113,7 @@ fn parse_id3v2_slice(
 fn parse_id3v2_body(
     major: u8,
     header_flags: u8,
-    raw_body: Vec<u8>,
+    mut body: Vec<u8>,
     tags: &mut ParsedAudioTags,
     cover: &mut CoverSlot,
     display_path: &Path,
@@ -950,13 +1132,11 @@ fn parse_id3v2_body(
     let has_ext_header = (header_flags & 0x40) != 0;
 
     // ID3v2.2 and ID3v2.3 apply global unsynchronisation to the entire tag body after the header.
-    // Drop `raw_body` right after deunsyncing so peak heap does not hold both copies during frame
-    // parsing and cover extraction.
-    let body: Vec<u8> = if global_unsync && major < 4 {
-        deunsync(&raw_body)
-    } else {
-        raw_body
-    };
+    // Deunsync in place because removing `0x00` after `0xFF` only shrinks the buffer, avoiding any
+    // duplicate multi-megabyte allocation.
+    if global_unsync && major < 4 {
+        deunsync_in_place(&mut body);
+    }
 
     let mut pos = 0usize;
     if has_ext_header && major >= 3 {
@@ -1062,63 +1242,65 @@ fn parse_id3v2_body(
             };
             payload = rest;
         }
-        let owned_frame;
-        if frame_unsync {
-            owned_frame = deunsync(payload);
-            payload = &owned_frame;
-        }
+
+        let decode_text = |payload: &[u8]| -> Option<String> {
+            if frame_unsync {
+                let prefix = deunsync_prefix(payload, MAX_TEXT_DECODE_BYTES + 1);
+                clean_id3_text_frame(&prefix)
+            } else {
+                clean_id3_text_frame(payload)
+            }
+        };
 
         match id_bytes {
             b"TIT2" | b"TT2" => {
-                if tags.title.is_none()
-                    && let Some(text) = decode_id3_text_frame(payload)
-                {
-                    tags.title = clean_tag_text(&text);
+                if tags.title.is_none() {
+                    tags.title = decode_text(payload);
                 }
             }
             b"TPE1" | b"TP1" => {
-                if tags.artist.is_none()
-                    && let Some(text) = decode_id3_text_frame(payload)
-                {
-                    tags.artist = clean_tag_text(&text);
+                if tags.artist.is_none() {
+                    tags.artist = decode_text(payload);
                 }
             }
             b"TALB" | b"TAL" => {
-                if tags.album.is_none()
-                    && let Some(text) = decode_id3_text_frame(payload)
-                {
-                    tags.album = clean_tag_text(&text);
+                if tags.album.is_none() {
+                    tags.album = decode_text(payload);
                 }
             }
             b"TPE2" | b"TP2" => {
-                if tags.album_artist.is_none()
-                    && let Some(text) = decode_id3_text_frame(payload)
-                {
-                    tags.album_artist = clean_tag_text(&text);
+                if tags.album_artist.is_none() {
+                    tags.album_artist = decode_text(payload);
                 }
             }
             b"TRCK" | b"TRK" => {
                 if tags.track.is_none()
-                    && let Some(text) = decode_id3_text_frame(payload)
+                    && let Some(text) = decode_text(payload)
                 {
-                    tags.track = parse_track_or_disc(&text);
+                    tags.track = parse_track_or_disc_cleaned(&text);
                 }
             }
             b"TPOS" | b"TPA" => {
                 if tags.disc.is_none()
-                    && let Some(text) = decode_id3_text_frame(payload)
+                    && let Some(text) = decode_text(payload)
                 {
-                    tags.disc = parse_track_or_disc(&text);
+                    tags.disc = parse_track_or_disc_cleaned(&text);
                 }
             }
             b"TDRC" | b"TYER" | b"TYE" => {
                 if tags.year.is_none()
-                    && let Some(text) = decode_id3_text_frame(payload)
+                    && let Some(text) = decode_text(payload)
                 {
-                    tags.year = parse_year(&text);
+                    tags.year = parse_year_cleaned(&text);
                 }
             }
-            b"APIC" => parse_id3_apic(payload, cover),
+            b"APIC" => {
+                if frame_unsync {
+                    parse_id3_apic_unsynced(payload, cover);
+                } else {
+                    parse_id3_apic(payload, cover);
+                }
+            }
             b"PIC" => parse_id3_pic(payload, cover),
             _ => {}
         }
@@ -1127,15 +1309,15 @@ fn parse_id3v2_body(
     Ok(())
 }
 
-fn decode_id3_text_frame(payload: &[u8]) -> Option<String> {
+fn clean_id3_text_frame(payload: &[u8]) -> Option<String> {
     let (&enc, data) = payload.split_first()?;
-    decode_id3_string(enc, data)
+    clean_id3_string(enc, data)
 }
 
-fn decode_id3_string(encoding: u8, data: &[u8]) -> Option<String> {
+fn clean_id3_string(encoding: u8, data: &[u8]) -> Option<String> {
     match encoding {
         // ISO-8859-1 (Latin-1)
-        0 => Some(data.iter().map(|&b| char::from(b)).collect()),
+        0 => clean_latin1_bytes(data),
         // UTF-16 with BOM
         1 => {
             let (le, body) = if data.starts_with(&[0xFF, 0xFE]) {
@@ -1145,27 +1327,76 @@ fn decode_id3_string(encoding: u8, data: &[u8]) -> Option<String> {
             } else {
                 (true, data)
             };
-            Some(decode_utf16_bytes(body, le))
+            clean_utf16_bytes(body, le)
         }
         // UTF-16BE without BOM
-        2 => Some(decode_utf16_bytes(data, false)),
+        2 => clean_utf16_bytes(data, false),
         // UTF-8
-        3 => Some(String::from_utf8_lossy(data).into_owned()),
+        3 => clean_utf8_bytes(data),
         _ => None,
     }
 }
 
-fn decode_utf16_bytes(data: &[u8], little_endian: bool) -> String {
-    let units = data.as_chunks::<2>().0.iter().map(|pair| {
-        if little_endian {
-            u16::from_le_bytes([pair[0], pair[1]])
-        } else {
-            u16::from_be_bytes([pair[0], pair[1]])
+fn parse_id3_apic_unsynced(payload: &[u8], cover: &mut CoverSlot) {
+    if (cover.mode == CoverExtractMode::CheckOnly && cover.has_any) || cover.has_front {
+        return;
+    }
+    let mut r = DeunsyncReader::new(payload);
+    let Some(enc) = r.next_byte() else {
+        return;
+    };
+    if enc > 3 {
+        return;
+    }
+    // Read MIME up to NUL, checking for external URL link (`-->`).
+    let mut mime_len = 0usize;
+    let mut mime_head = [0u8; 3];
+    loop {
+        let Some(b) = r.next_byte() else {
+            return;
+        };
+        if b == 0 {
+            break;
         }
-    });
-    char::decode_utf16(units)
-        .map(|res| res.unwrap_or('\u{FFFD}'))
-        .collect()
+        if mime_len < 3 {
+            mime_head[mime_len] = b;
+        }
+        mime_len += 1;
+    }
+    if mime_len == 3 && &mime_head == b"-->" {
+        return;
+    }
+    let Some(pic_type) = r.next_byte() else {
+        return;
+    };
+    if !cover.wants_picture(pic_type) {
+        return;
+    }
+    if !r.skip_terminated_text(enc) {
+        return;
+    }
+    match cover.mode {
+        CoverExtractMode::CheckOnly => {
+            let mut peek = [0u8; COVER_MAGIC_PEEK_BYTES];
+            let mut n = 0usize;
+            while n < COVER_MAGIC_PEEK_BYTES {
+                let Some(b) = r.next_byte() else {
+                    break;
+                };
+                peek[n] = b;
+                n += 1;
+            }
+            cover.record_checked_cover(pic_type, &peek[..n]);
+        }
+        CoverExtractMode::ExtractBytes => {
+            let remaining_upper = payload.len().saturating_sub(r.pos);
+            let mut img = Vec::with_capacity(remaining_upper);
+            while let Some(b) = r.next_byte() {
+                img.push(b);
+            }
+            cover.consider_owned(pic_type, img);
+        }
+    }
 }
 
 fn skip_id3_terminated_text(encoding: u8, data: &[u8]) -> Option<&[u8]> {
@@ -1330,13 +1561,17 @@ fn parse_riff_info(raw: &[u8], out: &mut ParsedAudioTags) {
             break;
         }
         let val_slice = &raw[start..end];
-        let text = String::from_utf8_lossy(val_slice);
         match id {
-            b"INAM" if out.title.is_none() => out.title = clean_tag_text(&text),
-            b"IART" if out.artist.is_none() => out.artist = clean_tag_text(&text),
-            b"IPRD" if out.album.is_none() => out.album = clean_tag_text(&text),
-            b"ICRD" if out.year.is_none() => out.year = parse_year(&text),
-            b"ITRK" if out.track.is_none() => out.track = parse_track_or_disc(&text),
+            b"INAM" if out.title.is_none() => out.title = clean_utf8_bytes(val_slice),
+            b"IART" if out.artist.is_none() => out.artist = clean_utf8_bytes(val_slice),
+            b"IPRD" if out.album.is_none() => out.album = clean_utf8_bytes(val_slice),
+            b"ICRD" if out.year.is_none() => {
+                out.year = clean_utf8_bytes(val_slice).and_then(|s| parse_year_cleaned(&s));
+            }
+            b"ITRK" if out.track.is_none() => {
+                out.track =
+                    clean_utf8_bytes(val_slice).and_then(|s| parse_track_or_disc_cleaned(&s));
+            }
             _ => {}
         }
         let padded = len.saturating_add(len & 1);
@@ -1622,67 +1857,216 @@ fn parse_flac_picture_from_stream<R: Read + Seek>(
     Ok(())
 }
 
-fn parse_flac_picture_owned(mut raw: Vec<u8>, cover: &mut CoverSlot) -> Result<(), &'static str> {
-    if raw.len() < 32 {
-        return Err("truncated METADATA_BLOCK_PICTURE");
+/// Zero-copy streaming RFC 4648 base64 decoder that skips ASCII whitespace in-place so line-wrapped
+/// `METADATA_BLOCK_PICTURE` comments neither copy into a compacted buffer nor decode the full image
+/// when only checking cover presence.
+struct Base64StreamReader<'a> {
+    input: &'a [u8],
+    pos: usize,
+    buf: [u8; 3],
+    buf_pos: usize,
+    buf_len: usize,
+    finished: bool,
+}
+
+impl<'a> Base64StreamReader<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            pos: 0,
+            buf: [0; 3],
+            buf_pos: 0,
+            buf_len: 0,
+            finished: false,
+        }
     }
-    let pic_type_u32 = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+
+    fn decode_sym(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    fn next_non_ws(&mut self) -> Option<u8> {
+        while let Some(&b) = self.input.get(self.pos) {
+            self.pos += 1;
+            if !b.is_ascii_whitespace() {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    fn fill_buf(&mut self) -> Result<bool, ()> {
+        if self.finished {
+            return Ok(false);
+        }
+        let Some(c0) = self.next_non_ws() else {
+            self.finished = true;
+            return Ok(false);
+        };
+        let (Some(c1), Some(c2), Some(c3)) =
+            (self.next_non_ws(), self.next_non_ws(), self.next_non_ws())
+        else {
+            return Err(());
+        };
+        let v0 = Self::decode_sym(c0).ok_or(())?;
+        let v1 = Self::decode_sym(c1).ok_or(())?;
+        self.buf_pos = 0;
+        if c2 == b'=' {
+            if c3 != b'=' || (v1 & 0x0F) != 0 {
+                return Err(());
+            }
+            self.buf[0] = (v0 << 2) | (v1 >> 4);
+            self.buf_len = 1;
+            self.finished = true;
+            if self.next_non_ws().is_some() {
+                return Err(());
+            }
+        } else if c3 == b'=' {
+            let v2 = Self::decode_sym(c2).ok_or(())?;
+            if (v2 & 0x03) != 0 {
+                return Err(());
+            }
+            self.buf[0] = (v0 << 2) | (v1 >> 4);
+            self.buf[1] = (v1 << 4) | (v2 >> 2);
+            self.buf_len = 2;
+            self.finished = true;
+            if self.next_non_ws().is_some() {
+                return Err(());
+            }
+        } else {
+            let v2 = Self::decode_sym(c2).ok_or(())?;
+            let v3 = Self::decode_sym(c3).ok_or(())?;
+            self.buf[0] = (v0 << 2) | (v1 >> 4);
+            self.buf[1] = (v1 << 4) | (v2 >> 2);
+            self.buf[2] = (v2 << 6) | v3;
+            self.buf_len = 3;
+        }
+        Ok(true)
+    }
+
+    fn read_exact(&mut self, mut dst: &mut [u8]) -> Result<(), ()> {
+        while !dst.is_empty() {
+            if self.buf_pos >= self.buf_len && !self.fill_buf()? {
+                return Err(());
+            }
+            let avail = self.buf_len - self.buf_pos;
+            let take = avail.min(dst.len());
+            dst[..take].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + take]);
+            self.buf_pos += take;
+            dst = &mut dst[take..];
+        }
+        Ok(())
+    }
+
+    fn read_u32_be(&mut self) -> Result<u32, ()> {
+        let mut b = [0u8; 4];
+        self.read_exact(&mut b)?;
+        Ok(u32::from_be_bytes(b))
+    }
+
+    fn skip_bytes(&mut self, mut n: usize) -> Result<(), ()> {
+        while n > 0 {
+            if self.buf_pos >= self.buf_len && !self.fill_buf()? {
+                return Err(());
+            }
+            let avail = self.buf_len - self.buf_pos;
+            let take = avail.min(n);
+            self.buf_pos += take;
+            n -= take;
+        }
+        Ok(())
+    }
+
+    /// Computes the exact number of decoded bytes still available (without allocating) by counting
+    /// non-whitespace base64 symbols in the unread tail.
+    fn remaining_decoded_len(&self) -> Result<usize, ()> {
+        let buffered = self.buf_len - self.buf_pos;
+        if self.finished {
+            return Ok(buffered);
+        }
+        let mut non_ws = 0usize;
+        let mut pad = 0usize;
+        for &b in &self.input[self.pos..] {
+            if b.is_ascii_whitespace() {
+                continue;
+            }
+            non_ws += 1;
+            if b == b'=' {
+                pad += 1;
+                if pad > 2 {
+                    return Err(());
+                }
+            } else if pad > 0 {
+                return Err(());
+            }
+        }
+        if !non_ws.is_multiple_of(4) {
+            return Err(());
+        }
+        let tail_bytes = (non_ws / 4)
+            .checked_mul(3)
+            .and_then(|v| v.checked_sub(pad))
+            .ok_or(())?;
+        buffered.checked_add(tail_bytes).ok_or(())
+    }
+}
+
+fn parse_vorbis_metadata_block_picture(val_bytes: &[u8], cover: &mut CoverSlot) -> Result<(), ()> {
+    if (cover.mode == CoverExtractMode::CheckOnly && cover.has_any) || cover.has_front {
+        return Ok(());
+    }
+    let mut b64 = Base64StreamReader::new(val_bytes);
+    let pic_type_u32 = b64.read_u32_be()?;
     let pic_type = u8::try_from(pic_type_u32).unwrap_or(0);
     if !cover.wants_picture(pic_type) {
         return Ok(());
     }
-    let mime_len = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
-    let mime_end = 8usize
-        .checked_add(mime_len)
-        .ok_or("METADATA_BLOCK_PICTURE MIME overflow")?;
-    if mime_end > raw.len() {
-        return Err("METADATA_BLOCK_PICTURE MIME exceeds block");
+    let mime_len = b64.read_u32_be()? as usize;
+    if mime_len > val_bytes.len() {
+        return Err(());
     }
-    if &raw[8..mime_end] == b"-->" {
-        return Ok(());
-    }
-    let desc_len_end = mime_end
-        .checked_add(4)
-        .ok_or("METADATA_BLOCK_PICTURE offset overflow")?;
-    if desc_len_end > raw.len() {
-        return Err("truncated METADATA_BLOCK_PICTURE description length");
-    }
-    let desc_len = u32::from_be_bytes([
-        raw[mime_end],
-        raw[mime_end + 1],
-        raw[mime_end + 2],
-        raw[mime_end + 3],
-    ]) as usize;
-    let desc_end = desc_len_end
-        .checked_add(desc_len)
-        .ok_or("METADATA_BLOCK_PICTURE description overflow")?;
-    let data_len_off = desc_end
-        .checked_add(16)
-        .ok_or("METADATA_BLOCK_PICTURE header overflow")?;
-    let data_start = data_len_off
-        .checked_add(4)
-        .ok_or("METADATA_BLOCK_PICTURE data length overflow")?;
-    if data_start > raw.len() {
-        return Err("truncated METADATA_BLOCK_PICTURE header");
-    }
-    let data_len = u32::from_be_bytes([
-        raw[data_len_off],
-        raw[data_len_off + 1],
-        raw[data_len_off + 2],
-        raw[data_len_off + 3],
-    ]) as usize;
-    let data_end = data_start
-        .checked_add(data_len)
-        .ok_or("METADATA_BLOCK_PICTURE data overflow")?;
-    if data_end > raw.len() {
-        return Err("METADATA_BLOCK_PICTURE image data truncated");
-    }
-    if cover.mode == CoverExtractMode::CheckOnly {
-        cover.consider_slice(pic_type, &raw[data_start..data_end]);
+    if mime_len == 3 {
+        let mut mime = [0u8; 3];
+        b64.read_exact(&mut mime)?;
+        if &mime == b"-->" {
+            return Ok(());
+        }
     } else {
-        raw.truncate(data_end);
-        raw.drain(..data_start);
-        cover.consider_owned(pic_type, raw);
+        b64.skip_bytes(mime_len)?;
+    }
+    let desc_len = b64.read_u32_be()? as usize;
+    if desc_len > val_bytes.len() {
+        return Err(());
+    }
+    b64.skip_bytes(desc_len)?;
+    // width(4) + height(4) + depth(4) + colors(4) = 16 bytes.
+    b64.skip_bytes(16)?;
+    let data_len = b64.read_u32_be()? as usize;
+    if data_len == 0 || data_len > MAX_AUDIO_TAG_BYTES {
+        return Err(());
+    }
+    if b64.remaining_decoded_len()? < data_len {
+        return Err(());
+    }
+    match cover.mode {
+        CoverExtractMode::CheckOnly => {
+            let peek_len = data_len.min(COVER_MAGIC_PEEK_BYTES);
+            let mut peek = [0u8; COVER_MAGIC_PEEK_BYTES];
+            b64.read_exact(&mut peek[..peek_len])?;
+            cover.record_checked_cover(pic_type, &peek[..peek_len]);
+        }
+        CoverExtractMode::ExtractBytes => {
+            let mut img = vec![0u8; data_len];
+            b64.read_exact(&mut img)?;
+            cover.consider_owned(pic_type, img);
+        }
     }
     Ok(())
 }
@@ -1755,60 +2139,43 @@ fn parse_vorbis_comments(
         let val_bytes = &entry[eq + 1..];
 
         if key_bytes.eq_ignore_ascii_case(b"METADATA_BLOCK_PICTURE") {
-            if cover.mode == CoverExtractMode::CheckOnly && cover.has_any {
-                continue;
-            }
-            if cover.has_front {
-                continue;
-            }
-            let decoded = if val_bytes.iter().any(u8::is_ascii_whitespace) {
-                let compact: Vec<u8> = val_bytes
-                    .iter()
-                    .copied()
-                    .filter(|b| !b.is_ascii_whitespace())
-                    .collect();
-                BASE64.decode(&compact).ok()
-            } else {
-                BASE64.decode(val_bytes).ok()
-            };
-            if let Some(decoded) = decoded {
-                let _ = parse_flac_picture_owned(decoded, cover);
-            }
+            let _ = parse_vorbis_metadata_block_picture(val_bytes, cover);
             continue;
         }
 
-        let value = String::from_utf8_lossy(val_bytes);
         if key_bytes.eq_ignore_ascii_case(b"TITLE") {
             if tags.title.is_none() {
-                tags.title = clean_tag_text(&value);
+                tags.title = clean_utf8_bytes(val_bytes);
             }
         } else if key_bytes.eq_ignore_ascii_case(b"ARTIST") {
             if tags.artist.is_none() {
-                tags.artist = clean_tag_text(&value);
+                tags.artist = clean_utf8_bytes(val_bytes);
             }
         } else if key_bytes.eq_ignore_ascii_case(b"ALBUM") {
             if tags.album.is_none() {
-                tags.album = clean_tag_text(&value);
+                tags.album = clean_utf8_bytes(val_bytes);
             }
         } else if key_bytes.eq_ignore_ascii_case(b"ALBUMARTIST")
             || key_bytes.eq_ignore_ascii_case(b"ALBUM ARTIST")
         {
             if tags.album_artist.is_none() {
-                tags.album_artist = clean_tag_text(&value);
+                tags.album_artist = clean_utf8_bytes(val_bytes);
             }
         } else if key_bytes.eq_ignore_ascii_case(b"TRACKNUMBER") {
             if tags.track.is_none() {
-                tags.track = parse_track_or_disc(&value);
+                tags.track =
+                    clean_utf8_bytes(val_bytes).and_then(|s| parse_track_or_disc_cleaned(&s));
             }
         } else if key_bytes.eq_ignore_ascii_case(b"DISCNUMBER") {
             if tags.disc.is_none() {
-                tags.disc = parse_track_or_disc(&value);
+                tags.disc =
+                    clean_utf8_bytes(val_bytes).and_then(|s| parse_track_or_disc_cleaned(&s));
             }
         } else if (key_bytes.eq_ignore_ascii_case(b"DATE")
             || key_bytes.eq_ignore_ascii_case(b"YEAR"))
             && tags.year.is_none()
         {
-            tags.year = parse_year(&value);
+            tags.year = clean_utf8_bytes(val_bytes).and_then(|s| parse_year_cleaned(&s));
         }
     }
 
@@ -1950,8 +2317,10 @@ fn parse_ogg<R: Read + Seek>(
     };
 
     // 2. Reassemble packet 1 (comment header) across pages for `serial`, bounded by the 16 MiB tag
-    //    budget.
+    //    budget. Cap `comment_packet` capacity growth at `MAX_AUDIO_TAG_BYTES` so a 15.9 MiB
+    //    comment packet never triggers a 32 MiB Vec doubling spike.
     let mut pages_read = 0usize;
+    let mut page_buf = Vec::new();
     while !comment_done && stream.remaining_file() >= 27 && pages_read < MAX_OGG_COMMENT_PAGES {
         pages_read += 1;
         let page = read_ogg_page_header(stream)?;
@@ -1973,10 +2342,31 @@ fn parse_ogg<R: Read + Seek>(
             }
         }
 
-        let chunk = stream.read_tag_bytes(want_bytes as u64)?;
-        comment_packet.extend_from_slice(&chunk);
+        let len = stream.charge_tag_budget(want_bytes as u64)?;
+        if (len as u64) > stream.remaining_file() {
+            return Err(stream.malformed("declared tag length exceeds remaining file size"));
+        }
+        page_buf.resize(len, 0);
+        stream
+            .inner
+            .read_exact(&mut page_buf)
+            .map_err(|err| stream.malformed(&format!("read failed: {err}")))?;
+        stream.pos = stream.pos.saturating_add(len as u64);
+
+        let needed = comment_packet.len().saturating_add(len);
+        if needed > comment_packet.capacity() {
+            let grown = comment_packet
+                .capacity()
+                .max(64 * 1024)
+                .saturating_mul(2)
+                .min(MAX_AUDIO_TAG_BYTES)
+                .max(needed);
+            comment_packet.reserve_exact(grown - comment_packet.len());
+        }
+        comment_packet.extend_from_slice(&page_buf);
         stream.seek_to(page_end)?;
     }
+    drop(page_buf);
 
     if !comment_done {
         return Err(stream.malformed("truncated Ogg comment header packet"));
@@ -2323,7 +2713,22 @@ fn parse_mp4_item_data_boxes<R: Read + Seek>(
                     }
                 }
             } else {
-                let payload = stream.read_tag_bytes(value_len)?;
+                // Charge the full declared item value against the 16 MiB cumulative tag budget,
+                // verify it fits within the file, then read ONLY the bounded text prefix so a
+                // multi-megabyte MP4 text item is never materialized in memory.
+                let _ = stream.charge_tag_budget(value_len)?;
+                if value_len > stream.remaining_file() {
+                    return Err(stream.malformed("MP4 item length exceeds remaining file size"));
+                }
+                let to_read = usize::try_from(value_len)
+                    .unwrap_or(MAX_TEXT_DECODE_BYTES)
+                    .min(MAX_TEXT_DECODE_BYTES);
+                let mut payload = vec![0u8; to_read];
+                stream
+                    .inner
+                    .read_exact(&mut payload)
+                    .map_err(|err| stream.malformed(&format!("read failed: {err}")))?;
+                stream.pos = stream.pos.saturating_add(to_read as u64);
                 apply_mp4_item(item_type, type_indicator, &payload, tags);
             }
         }
@@ -2335,10 +2740,10 @@ fn parse_mp4_item_data_boxes<R: Read + Seek>(
     Ok(())
 }
 
-fn decode_mp4_text(type_indicator: u32, payload: &[u8]) -> Option<String> {
+fn clean_mp4_text(type_indicator: u32, payload: &[u8]) -> Option<String> {
     match type_indicator {
-        1 => Some(String::from_utf8_lossy(payload).into_owned()),
-        2 => Some(decode_utf16_bytes(payload, false)),
+        1 => clean_utf8_bytes(payload),
+        2 => clean_utf16_bytes(payload, false),
         _ => None,
     }
 }
@@ -2351,38 +2756,30 @@ fn apply_mp4_item(
 ) {
     match &item_type {
         b"\xa9nam" => {
-            if tags.title.is_none()
-                && let Some(text) = decode_mp4_text(type_indicator, payload)
-            {
-                tags.title = clean_tag_text(&text);
+            if tags.title.is_none() {
+                tags.title = clean_mp4_text(type_indicator, payload);
             }
         }
         b"\xa9ART" => {
-            if tags.artist.is_none()
-                && let Some(text) = decode_mp4_text(type_indicator, payload)
-            {
-                tags.artist = clean_tag_text(&text);
+            if tags.artist.is_none() {
+                tags.artist = clean_mp4_text(type_indicator, payload);
             }
         }
         b"\xa9alb" => {
-            if tags.album.is_none()
-                && let Some(text) = decode_mp4_text(type_indicator, payload)
-            {
-                tags.album = clean_tag_text(&text);
+            if tags.album.is_none() {
+                tags.album = clean_mp4_text(type_indicator, payload);
             }
         }
         b"aART" => {
-            if tags.album_artist.is_none()
-                && let Some(text) = decode_mp4_text(type_indicator, payload)
-            {
-                tags.album_artist = clean_tag_text(&text);
+            if tags.album_artist.is_none() {
+                tags.album_artist = clean_mp4_text(type_indicator, payload);
             }
         }
         b"\xa9day" => {
             if tags.year.is_none()
-                && let Some(text) = decode_mp4_text(type_indicator, payload)
+                && let Some(text) = clean_mp4_text(type_indicator, payload)
             {
-                tags.year = parse_year(&text);
+                tags.year = parse_year_cleaned(&text);
             }
         }
         b"trkn" => {
@@ -2453,10 +2850,36 @@ mod tests {
 
     #[test]
     fn deunsync_handles_ff_00_sequences() {
-        assert_eq!(
-            deunsync(&[0xFF, 0x00, 0xD8, 0xFF, 0x00, 0x00, 0x01, 0xFF]),
-            vec![0xFF, 0xD8, 0xFF, 0x00, 0x01, 0xFF]
-        );
+        let mut buf = vec![0xFF, 0x00, 0xD8, 0xFF, 0x00, 0x00, 0x01, 0xFF];
+        deunsync_in_place(&mut buf);
+        assert_eq!(buf, vec![0xFF, 0xD8, 0xFF, 0x00, 0x01, 0xFF]);
+    }
+
+    #[test]
+    fn streaming_base64_reader_skips_whitespace_and_validates_padding() {
+        // "Hello, world!" -> "SGVsbG8sIHdvcmxkIQ==" wrapped with CRLF and spaces
+        let wrapped = b"  SGVs\r\nbG8s \nIHdv\tcmxkIQ==  \n";
+        let mut r = Base64StreamReader::new(wrapped);
+        assert_eq!(r.remaining_decoded_len(), Ok(13));
+        let mut out = [0u8; 13];
+        r.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"Hello, world!");
+        assert_eq!(r.remaining_decoded_len(), Ok(0));
+        assert!(r.read_exact(&mut [0u8; 1]).is_err());
+
+        // Single padding `=` ("Hello" -> "SGVsbG8=")
+        let mut r1 = Base64StreamReader::new(b"SGVs\nbG8=");
+        assert_eq!(r1.remaining_decoded_len(), Ok(5));
+        let mut out1 = [0u8; 5];
+        r1.read_exact(&mut out1).unwrap();
+        assert_eq!(&out1, b"Hello");
+
+        // Rejects invalid base64 character and non-canonical non-zero pad bits.
+        let mut bad = Base64StreamReader::new(b"SGVs!G8=");
+        let mut tmp = [0u8; 5];
+        assert!(bad.read_exact(&mut tmp).is_err());
+        let mut bad_pad = Base64StreamReader::new(b"SGVsbG9=");
+        assert!(bad_pad.read_exact(&mut tmp).is_err());
     }
 
     #[test]

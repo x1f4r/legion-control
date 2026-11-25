@@ -73,6 +73,7 @@ fn main() -> ExitCode {
         test_worker_cli_rejects_absurd_args_without_allocating().await;
         test_audio_tags_and_covers_through_real_worker_and_benchmarks().await;
         test_reply_budget_real_worker_node_memory_and_completion().await;
+        test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mib_cap().await;
     });
 
     ExitCode::SUCCESS
@@ -2485,4 +2486,188 @@ async fn test_reply_budget_real_worker_node_memory_and_completion() {
         .await;
         assert!(png1024_calls >= 16);
     }
+}
+
+async fn test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mib_cap() {
+    use audio_fixtures as af;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+
+    // 1. Line-wrapped base64 `METADATA_BLOCK_PICTURE` of ~15.9 MiB inside Ogg Opus (strictly
+    //    within the 16 MiB cumulative tag budget). Previously copying into a whitespace-free
+    //    buffer + decoding the entire image in CheckOnly mode tripped the 48 MiB worker cap.
+    let small_png = af::encode_solid_png(128, 128, [30, 170, 80]);
+    let mut padded_png = small_png;
+    // Pad trailing bytes after PNG IEND so the FLAC picture payload is ~11.6 MiB -> ~15.47 MiB
+    // raw base64 -> ~15.88 MiB with CRLF every 76 chars (strictly under 16 MiB tag cap!).
+    padded_png.resize(11_600_000, 0x00);
+    let flac_pic = af::build_flac_picture_payload(3, "image/png", "cover", &padded_png);
+    let raw_b64 = BASE64.encode(&flac_pic);
+    let mut wrapped_b64 = Vec::with_capacity(raw_b64.len() + raw_b64.len() / 76 * 2 + 4);
+    for chunk in raw_b64.as_bytes().chunks(76) {
+        wrapped_b64.extend_from_slice(chunk);
+        wrapped_b64.extend_from_slice(b"\r\n");
+    }
+    assert!(
+        wrapped_b64.len() > 15_800_000 && wrapped_b64.len() < 16 * 1024 * 1024 - 1024,
+        "expected ~15.9 MiB line-wrapped base64, got {} bytes",
+        wrapped_b64.len()
+    );
+    let opus_wrapped_pic = home.join("wrapped_15_9mib_pic.opus");
+    fs::write(
+        &opus_wrapped_pic,
+        af::build_ogg_opus_raw_comments(
+            &[
+                (b"TITLE", b"Wrapped cover song"),
+                (b"ARTIST", b"Someone"),
+                (b"METADATA_BLOCK_PICTURE", &wrapped_b64),
+            ],
+            5,
+        ),
+    )
+    .unwrap();
+    drop(wrapped_b64);
+    drop(raw_b64);
+    drop(flac_pic);
+    drop(padded_png);
+
+    // 2. ~15.9 MiB invalid UTF-8 byte sequence (`0xFF`) in Ogg Opus TITLE and MP3 ID3v2.4 TIT2
+    //    (plus a ~15.9 MiB invalid UTF-8 M4A `©nam`): previously `String::from_utf8_lossy` grew
+    //    15.9 MiB of 0xFF into ~47.7 MiB of U+FFFD before the 512-char cut, tripping the 48 MiB
+    //    worker cap.
+    let invalid_utf8 = vec![0xFFu8; 15_900_000];
+    let opus_invalid_utf8 = home.join("invalid_utf8_15_9mib.opus");
+    fs::write(
+        &opus_invalid_utf8,
+        af::build_ogg_opus_raw_comments(&[(b"TITLE", &invalid_utf8), (b"ARTIST", b"Someone")], 6),
+    )
+    .unwrap();
+
+    let mp3_invalid_utf8 = home.join("invalid_utf8_15_9mib.mp3");
+    {
+        let mut frames = Vec::with_capacity(invalid_utf8.len() + 64);
+        frames.extend_from_slice(b"TIT2");
+        frames.extend_from_slice(&af::encode_syncsafe((1 + invalid_utf8.len()) as u32));
+        frames.extend_from_slice(&[0x00, 0x00, 0x03]); // UTF-8
+        frames.extend_from_slice(&invalid_utf8);
+        frames.extend_from_slice(b"TPE1");
+        frames.extend_from_slice(&af::encode_syncsafe(8));
+        frames.extend_from_slice(&[0x00, 0x00, 0x03]);
+        frames.extend_from_slice(b"Someone");
+
+        let mut mp3 = Vec::with_capacity(10 + frames.len() + 417);
+        mp3.extend_from_slice(b"ID3");
+        mp3.extend_from_slice(&[4, 0, 0]);
+        mp3.extend_from_slice(&af::encode_syncsafe(frames.len() as u32));
+        mp3.extend_from_slice(&frames);
+        mp3.extend_from_slice(&af::silent_mp3_xing_frame(191));
+        fs::write(&mp3_invalid_utf8, &mp3).unwrap();
+    }
+
+    let m4a_invalid_utf8 = home.join("invalid_utf8_15_9mib.m4a");
+    {
+        let box_bytes = |tag: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+            let len = (8 + payload.len()) as u32;
+            let mut out = Vec::with_capacity(len as usize);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(tag);
+            out.extend_from_slice(payload);
+            out
+        };
+        let ftyp = box_bytes(b"ftyp", b"M4A \x00\x00\x00\x00M4A isom");
+        let mut nam_data = Vec::with_capacity(8 + invalid_utf8.len());
+        nam_data.extend_from_slice(&1u32.to_be_bytes()); // UTF-8
+        nam_data.extend_from_slice(&0u32.to_be_bytes());
+        nam_data.extend_from_slice(&invalid_utf8);
+        let nam = box_bytes(b"\xA9nam", &box_bytes(b"data", &nam_data));
+        let mut art_data = Vec::new();
+        art_data.extend_from_slice(&1u32.to_be_bytes());
+        art_data.extend_from_slice(&0u32.to_be_bytes());
+        art_data.extend_from_slice(b"Someone");
+        let art = box_bytes(b"\xA9ART", &box_bytes(b"data", &art_data));
+        let mut ilst_body = Vec::with_capacity(nam.len() + art.len());
+        ilst_body.extend_from_slice(&nam);
+        ilst_body.extend_from_slice(&art);
+        let ilst = box_bytes(b"ilst", &ilst_body);
+        let mut meta_body = vec![0u8; 4];
+        meta_body.extend_from_slice(&ilst);
+        let moov = box_bytes(
+            b"moov",
+            &box_bytes(b"udta", &box_bytes(b"meta", &meta_body)),
+        );
+        let mut out = Vec::with_capacity(ftyp.len() + moov.len());
+        out.extend_from_slice(&ftyp);
+        out.extend_from_slice(&moov);
+        fs::write(&m4a_invalid_utf8, &out).unwrap();
+    }
+    drop(invalid_utf8);
+
+    // Run ALL four ~15.9 MiB in-budget hostile files through the real `--audio-tags` worker under
+    // its 48 MiB CappedAlloc limit: every single one must succeed cleanly!
+    let res = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.tags",
+            json!({
+                "paths": [
+                    opus_wrapped_pic.to_string_lossy(),
+                    opus_invalid_utf8.to_string_lossy(),
+                    mp3_invalid_utf8.to_string_lossy(),
+                    m4a_invalid_utf8.to_string_lossy(),
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    let arr = res["results"].as_array().unwrap();
+    assert_eq!(arr.len(), 4);
+
+    assert_eq!(
+        arr[0]["ok"]["title"],
+        json!("Wrapped cover song"),
+        "15.9 MiB wrapped base64 picture failed: {}",
+        arr[0]
+    );
+    assert_eq!(arr[0]["ok"]["cover"], json!(true), "{}", arr[0]);
+
+    for (idx, label) in [
+        (1, "15.9 MiB invalid UTF-8 Opus"),
+        (2, "15.9 MiB invalid UTF-8 MP3"),
+        (3, "15.9 MiB invalid UTF-8 M4A"),
+    ] {
+        let ok = arr[idx]
+            .get("ok")
+            .unwrap_or_else(|| panic!("{label} killed worker or failed: {}", arr[idx]));
+        let title = ok["title"].as_str().unwrap();
+        assert_eq!(title.chars().count(), 512, "{label}: {ok}");
+        assert!(
+            title.chars().all(|c| c == '\u{FFFD}'),
+            "{label} should contain 512 U+FFFD chars"
+        );
+        assert_eq!(ok["artist"], json!("Someone"), "{label}: {ok}");
+    }
+
+    // Also verify `fs.thumb` extracts the 15.9 MiB line-wrapped base64 picture cleanly via the
+    // real `--audio-cover` worker without hitting its memory cap!
+    let th = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({"paths": [opus_wrapped_pic.to_string_lossy()], "size": 128}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        th["results"][0].get("ok").is_some(),
+        "fs.thumb on 15.9 MiB wrapped base64 picture failed: {}",
+        th["results"][0]
+    );
 }

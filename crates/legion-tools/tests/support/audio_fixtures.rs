@@ -569,9 +569,10 @@ fn push_ogg_packet_pages(
     granule: u64,
     packet: &[u8],
 ) {
-    // Split large packets across multiple Ogg pages (<= 60 KiB per page) to exercise multi-page
-    // packet reassembly for METADATA_BLOCK_PICTURE.
-    let max_page_payload = 60 * 1024usize;
+    // Split large packets across multiple Ogg pages (255 * 255 = 65,025 bytes, an exact multiple of
+    // 255 so non-final pages contain only 255-byte lacing segments and never prematurely terminate
+    // the multi-page packet).
+    let max_page_payload = 255 * 255usize;
     let mut offset = 0usize;
     let mut first_page = true;
     loop {
@@ -687,6 +688,49 @@ pub fn build_ogg_opus(
         .collect();
     let mut tags_pkt = b"OpusTags".to_vec();
     tags_pkt.extend_from_slice(&build_vorbis_comment_payload(comments, &extra));
+    push_ogg_packet_pages(&mut out, serial, &mut seq, 0x00, 0, &tags_pkt);
+
+    let granule = u64::from(duration_secs) * 48_000 + u64::from(pre_skip);
+    push_ogg_packet_pages(&mut out, serial, &mut seq, 0x04, granule, &[0u8; 32]);
+    out
+}
+
+/// Builds an Ogg Opus file from raw byte `(key, value)` Vorbis comments so tests can embed
+/// arbitrarily large line-wrapped base64 pictures or raw invalid UTF-8 bytes.
+pub fn build_ogg_opus_raw_comments(entries: &[(&[u8], &[u8])], duration_secs: u32) -> Vec<u8> {
+    let serial = 0x5566_7799u32;
+    let pre_skip = 312u16;
+    let mut seq = 0u32;
+    let mut out = Vec::new();
+
+    let mut head = b"OpusHead".to_vec();
+    head.push(1);
+    head.push(2);
+    head.extend_from_slice(&pre_skip.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&0u16.to_le_bytes());
+    head.push(0);
+    push_ogg_packet_pages(&mut out, serial, &mut seq, 0x02, 0, &head);
+
+    let vendor = b"legion-test";
+    let total_cap: usize = 16
+        + vendor.len()
+        + entries
+            .iter()
+            .map(|(k, v)| 4 + k.len() + 1 + v.len())
+            .sum::<usize>();
+    let mut tags_pkt = Vec::with_capacity(total_cap);
+    tags_pkt.extend_from_slice(b"OpusTags");
+    tags_pkt.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    tags_pkt.extend_from_slice(vendor);
+    tags_pkt.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for &(k, v) in entries {
+        let len = (k.len() + 1 + v.len()) as u32;
+        tags_pkt.extend_from_slice(&len.to_le_bytes());
+        tags_pkt.extend_from_slice(k);
+        tags_pkt.push(b'=');
+        tags_pkt.extend_from_slice(v);
+    }
     push_ogg_packet_pages(&mut out, serial, &mut seq, 0x00, 0, &tags_pkt);
 
     let granule = u64::from(duration_secs) * 48_000 + u64::from(pre_skip);

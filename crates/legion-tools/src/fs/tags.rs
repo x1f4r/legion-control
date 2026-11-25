@@ -48,9 +48,10 @@ use super::{
     path_to_string,
 };
 
-/// Live-heap cap for `--audio-tags` on audio files larger than 4 MiB (covers worst-case 16 MiB
-/// unsynchronised ID3v2 or base64 `METADATA_BLOCK_PICTURE` decoding cleanly while remaining well
-/// inside the shared in-flight pool).
+/// Live-heap cap for `--audio-tags` on audio files larger than 4 MiB (covers the up-to-16 MiB
+/// cumulative tag buffer, bounded Ogg packet reassembly growth, and worker runtime overhead; text
+/// values decode only a bounded prefix and base64 `METADATA_BLOCK_PICTURE` values are sniffed in a
+/// streaming pass without copying or decoding the full picture).
 const AUDIO_TAGS_LARGE_HEAP_CAP_BYTES: u64 = 48 * 1024 * 1024;
 const SMALL_AUDIO_FILE_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
 
