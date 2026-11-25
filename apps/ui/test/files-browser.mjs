@@ -345,6 +345,12 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     // Send to sheet is still open; laptop transitions to selectable radio button once awake!
     await sendSheet.locator('button[role="radio"]', { hasText: 'laptop' }).waitFor({ timeout: 5000 });
 
+    // Send to sheet offers only Copy when sending to another machine (no Move button).
+    assert.equal(
+      await sendSheet.getByRole('button', { name: 'Move', exact: true }).count(),
+      0,
+      'Cross-machine Send to must offer only Copy when move capability is absent',
+    );
     await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
     await sendSheet.waitFor({ state: 'hidden' });
     // Non-blocking toast confirms transfer started while user remains free to browse (no em-dash).

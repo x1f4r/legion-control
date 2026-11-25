@@ -216,17 +216,15 @@ planned `entries` (`path`, `kind`, `size`, `hash`, `target`) and refuses anythin
 stream. Every operation is checked against the target machine's `policy.toml` (`fs.read`,
 `fs.write`, or `fs.remove`) and written to its audit log with door `stream`.
 
-### Collisions (`if_exists`), moves, and background transfers
+### Collisions (`if_exists`) and background transfers
 
 - **`if_exists`** controls what happens when a destination file already exists: `replace`
   (default), `fail` (refuse with `exists` before overwriting), `skip` (keep the existing file), or
   `rename` (write `name (2).ext`, counting up atomically at the destination even when two transfers
   race for the same name). Works for both single files and directory trees.
-- **`move=true`** verifies every destination file by BLAKE3 hash before removing its source, and is
-  refused up front unless the caller is allowed `fs.remove` on the source (and refused if moving
-  onto itself or into its own subtree). Directory trees are verified and cleaned up batch by batch;
-  an interrupted move leaves every file in at least one place and can be re-run safely. With
-  `dry_run=true`, `would_remove` lists the source paths that would be removed.
+- **`move=true`** is not available yet in default builds (refused with `unsupported` before copying
+  anything while moving between places is reworked around OS file-handle locks). Copy the file or
+  folder first, check the copy, and then remove the original.
 - **`background=true`** starts the transfer as a detached job on the node running `fs.transfer` and
   returns `{job: {id, machine}}` immediately. The job runs strictly under the caller's own
   principal and grant, survives the caller disconnecting, appears in `job.list` with

@@ -190,6 +190,23 @@ test('detectFileCapabilities cleanly degrades against old nodes and limited role
   assert.equal(fullCaps.hasUpload, true);
   assert.equal(fullCaps.hasDeviceTransfers, true);
 
+  // Node with background & if_exists on fs.transfer, but without cross-machine move advertised.
+  const copyOnlyTools = newTools.map((t) =>
+    t.name === 'fs.transfer'
+      ? { ...t, input_schema: { properties: { from: {}, to: {}, background: {}, if_exists: {} } } }
+      : t,
+  );
+  const copyOnlyCaps = detectFileCapabilities({
+    tools: copyOnlyTools,
+    allowedSet: new Set(copyOnlyTools.map((t) => t.name)),
+    link: { kind: 'http', contentUrl: async () => ({ url: '' }) },
+  });
+  assert.equal(copyOnlyCaps.hasTransfer, true);
+  assert.equal(copyOnlyCaps.hasTransferBg, true);
+  assert.equal(copyOnlyCaps.hasTransferIfExists, true);
+  assert.equal(copyOnlyCaps.hasTransferMove, false);
+  assert.equal(copyOnlyCaps.hasMove, true);
+
   // Observer role has read tools only: write/destroy/move capabilities are off.
   const obsCaps = detectFileCapabilities({
     tools: newTools,

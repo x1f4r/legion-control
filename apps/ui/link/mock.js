@@ -608,7 +608,6 @@ export function createMockLink(mode = '') {
           properties: {
             ...t.input_schema.properties,
             if_exists: { type: 'string', enum: ['fail', 'skip', 'replace', 'rename'] },
-            move: { type: 'boolean', default: false },
             background: { type: 'boolean', default: false },
           },
         },

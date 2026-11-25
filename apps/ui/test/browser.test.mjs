@@ -347,6 +347,28 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await maybeShot(page, 'real-phone-dark-machine-files');
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // Real node omits move capability on fs.transfer: Send to another machine offers only Copy.
+    await page.locator('.list a.row', { hasText: 'hello.txt' }).click();
+    await page.locator('.viewer').waitFor();
+    await page.locator('.viewer-bar button', { hasText: 'Send to' }).click();
+    const realSendSheet = page.locator('.sheet');
+    await realSendSheet.waitFor();
+    await page.waitForFunction(
+      () => document.activeElement?.classList?.contains('sheet'),
+      null,
+      { timeout: 3000 },
+    );
+    await realSendSheet.getByRole('button', { name: 'Copy to pi' }).waitFor();
+    assert.equal(
+      await realSendSheet.getByRole('button', { name: 'Move', exact: true }).count(),
+      0,
+      'Real node without move capability must offer only Copy when sending to another machine',
+    );
+    await page.keyboard.press('Escape');
+    await realSendSheet.waitFor({ state: 'hidden' });
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
     await page.goto(`${server.url}/#/machines/tower/power`, { waitUntil: 'domcontentloaded' });
     await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
     await page.getByRole('button', { name: 'Sleep', exact: true }).waitFor();

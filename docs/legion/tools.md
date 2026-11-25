@@ -442,7 +442,7 @@ Compare, push, or pull shared configuration documents (devices.toml, favorites.t
 | `fs.remove` | `destroy` | Remove a file, symbolic link or directory (with optional recursive and dry_run modes), refusing roots, the home directory and Legion's own directories. |
 | `fs.stat` | `read` | Return metadata for a path (kind, size, modification time, Unix mode, readonly flag, symbolic link target, and file category and MIME type) without following a symbolic link. |
 | `fs.thumb` | `read` | Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, out-of-process memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory. |
-| `fs.transfer` | `write` | Copy or move a file or a directory tree between machines, or within one. |
+| `fs.transfer` | `write` | Copy a file or a directory tree between machines, or within one. |
 | `fs.write` | `write` | Write UTF-8 text or base64 bytes to a file atomically, supporting overwrite, create-only and append modes, optional expect_hash conflict checks, parent creation and Unix mode. |
 
 ### `fs.copy`
@@ -629,7 +629,7 @@ Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source
 
 Effect: `write`
 
-Copy or move a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); move removes each source file only after its destination copy is verified by hash (refused up front unless the caller may fs.remove the source); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent, deleted and removed without changing anything.
+Copy a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent and deleted without changing anything.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -640,7 +640,6 @@ Copy or move a file or a directory tree between machines, or within one. Each of
 | `exclude` | `array of string` | no | `[]` | Globs of paths to leave out at both ends, relative to the tree; a trailing `/` matches directories only. What is left out at the destination is never deleted. |
 | `dry_run` | `boolean` | no | `false` | List and plan, and report what would be sent, deleted and removed, without changing anything. |
 | `if_exists` | `string` | no | `"replace"` | What to do when a destination entry already exists: `replace` (default), `fail`, `skip`, or `rename` (`name (2).ext`, decided atomically at the destination). `replace`: Overwrite the destination entry atomically (default). `fail`: Refuse with `exists` before overwriting anything. `skip`: Keep the existing destination entry untouched and skip sending. `rename`: Write beside the existing entry as `name (2).ext`, counting up atomically at the destination. Allowed values: `replace`, `fail`, `skip`, `rename`. |
-| `move` | `boolean` | no | `false` | Remove each source file after its destination copy is verified by BLAKE3 hash (requires `fs.remove` permission on the source; refused up front otherwise). |
 | `background` | `boolean` | no | `false` | Run the transfer as a detached job on this node and return `{job: {id, machine}}` at once. The job runs under the caller's principal and grant, survives the caller disconnecting, and finishes with the same result object a foreground transfer returns. |
 
 ### `fs.write`
