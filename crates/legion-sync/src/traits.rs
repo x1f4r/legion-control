@@ -4,7 +4,7 @@
 //! real disks (`RealFs` + `RedbIndexStore`), network peers (supplied by upper crates), and the
 //! deterministic fault-injecting simulator.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
 
@@ -94,6 +94,10 @@ pub struct FsMeta {
     /// `ChangeTime` + `FileId` on Windows) so same-size, same-mtime overwrites and renames are
     /// detected without re-hashing unchanged files.
     pub change_id: Option<u64>,
+    /// Stable filesystem object identity `(dev, ino)` on platforms where atomic rename/exchange
+    /// preserves it across placement (Unix); `None` when the platform may not preserve identity
+    /// across replacement so post-placement verification re-hashes instead.
+    pub file_identity: Option<(u64, u64)>,
 }
 
 /// One live entry discovered during a [`SyncFs::walk`] or [`SyncFs::walk_subtree`].
@@ -213,6 +217,10 @@ pub trait SyncFs {
 
     /// Inspects a staged file inside `.legion-sync/tmp/<tmp_name>`.
     fn stat_tmp(&self, tmp_name: &str) -> Result<Option<FsMeta>>;
+
+    /// Applies modification time and (on Unix) permission bits to a staged file inside
+    /// `.legion-sync/tmp/<tmp_name>` *before* it is placed into the live tree.
+    fn set_tmp_metadata(&self, tmp_name: &str, mtime: Timestamp, mode: Option<u32>) -> Result<()>;
 
     /// Computes the BLAKE3 digest and byte length of `.legion-sync/tmp/<tmp_name>`.
     fn hash_tmp(&self, tmp_name: &str) -> Result<(Hash, u64)>;
@@ -357,6 +365,12 @@ pub struct StoreBatch {
     /// Update to the write-ahead crash journal (`Some(Some(op))` sets it; `Some(None)` clears it;
     /// `None` leaves it unchanged).
     pub set_pending_op: Option<Option<PendingOp>>,
+    /// Staged download tmp filenames written by the engine itself to register before creation so
+    /// recovery knows which `.legion-sync/tmp/` entries are disposable engine downloads.
+    pub add_staged_tmps: Vec<String>,
+    /// Staged download tmp filenames to unregister (once placed, exchanged with a live user file,
+    /// or cleaned up).
+    pub remove_staged_tmps: Vec<String>,
 }
 
 impl StoreBatch {
@@ -374,6 +388,8 @@ impl StoreBatch {
             && self.upsert_deleted_history.is_empty()
             && self.remove_deleted_history.is_empty()
             && self.set_pending_op.is_none()
+            && self.add_staged_tmps.is_empty()
+            && self.remove_staged_tmps.is_empty()
     }
 }
 
@@ -446,6 +462,9 @@ pub trait IndexStore {
 
     /// Loads the active write-ahead [`PendingOp`], if any.
     fn load_pending_op(&self) -> Result<Option<PendingOp>>;
+
+    /// Lists tmp filenames currently proven to be engine-written staged downloads.
+    fn list_staged_tmps(&self) -> Result<BTreeSet<String>>;
 
     /// Returns the total number of records (live + tombstones) in the index.
     fn record_count(&self) -> Result<u64>;

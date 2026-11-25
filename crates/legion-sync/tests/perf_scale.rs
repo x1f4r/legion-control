@@ -41,6 +41,7 @@ impl SyntheticFs {
                     mode: Some(0o644),
                     link_target: None,
                     change_id: Some(i as u64 + 1),
+                    file_identity: Some((1, i as u64 + 1)),
                 },
             });
         }
@@ -155,6 +156,15 @@ impl SyncFs for SyntheticFs {
 
     fn stat_tmp(&self, _tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
         Ok(None)
+    }
+
+    fn set_tmp_metadata(
+        &self,
+        _tmp_name: &str,
+        _mtime: Timestamp,
+        _mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        Ok(())
     }
 
     fn hash_tmp(&self, _tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {

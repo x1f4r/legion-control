@@ -14,7 +14,7 @@
 //! - **Licence & maintenance**: dual-licensed `MIT OR Apache-2.0` (compatible with this
 //!   repository's MIT licence), actively maintained (`redb` 5.0, Rust edition 2024).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::path::Path;
 
@@ -42,6 +42,7 @@ const PEER_CURSORS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("p
 const BIN_ENTRIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("bin_entries");
 const HELD_BACK_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("held_back");
 const DELETED_HISTORY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("deleted_history");
+const STAGED_TMPS_TABLE: TableDefinition<&str, ()> = TableDefinition::new("staged_tmps");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 const META_KEY_SCHEMA: &str = "schema_version";
@@ -86,6 +87,7 @@ impl RedbIndexStore {
             let _ = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
             let _ = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
             let _ = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
+            let _ = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
             let mut meta_table = txn.open_table(META_TABLE).map_err(table_err)?;
 
             let existing = meta_table
@@ -633,6 +635,23 @@ impl IndexStore for RedbIndexStore {
         Ok(Some(decode_json("pending_op", guard.value())?))
     }
 
+    fn list_staged_tmps(&self) -> Result<BTreeSet<String>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| storage_err("begin read", e))?;
+        let table = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
+        let iter = table
+            .iter()
+            .map_err(|e| storage_err("iterate staged_tmps", e))?;
+        let mut out = BTreeSet::new();
+        for item in iter {
+            let (k, _) = item.map_err(|e| storage_err("step staged_tmps", e))?;
+            out.insert(k.value().to_string());
+        }
+        Ok(out)
+    }
+
     fn record_count(&self) -> Result<u64> {
         let txn = self
             .db
@@ -676,6 +695,7 @@ impl IndexStore for RedbIndexStore {
             let mut bin_entries = txn.open_table(BIN_ENTRIES_TABLE).map_err(table_err)?;
             let mut held_back = txn.open_table(HELD_BACK_TABLE).map_err(table_err)?;
             let mut deleted_history = txn.open_table(DELETED_HISTORY_TABLE).map_err(table_err)?;
+            let mut staged_tmps = txn.open_table(STAGED_TMPS_TABLE).map_err(table_err)?;
 
             let mut live_files = match meta_table
                 .get(META_KEY_LIVE_FILES)
@@ -838,6 +858,17 @@ impl IndexStore for RedbIndexStore {
                             .map_err(|e| storage_err("clear pending_op", e))?;
                     }
                 }
+            }
+
+            for tmp in &batch.remove_staged_tmps {
+                staged_tmps
+                    .remove(tmp.as_str())
+                    .map_err(|e| storage_err("remove staged_tmp", e))?;
+            }
+            for tmp in &batch.add_staged_tmps {
+                staged_tmps
+                    .insert(tmp.as_str(), ())
+                    .map_err(|e| storage_err("add staged_tmp", e))?;
             }
         }
         txn.commit()

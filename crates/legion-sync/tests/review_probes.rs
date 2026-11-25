@@ -1591,6 +1591,14 @@ fn item_g_mid_apply_non_crash_error_recovers_immediately() {
         fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<legion_sync::FsMeta>> {
             self.inner.stat_tmp(tmp_name)
         }
+        fn set_tmp_metadata(
+            &self,
+            tmp_name: &str,
+            mtime: Timestamp,
+            mode: Option<u32>,
+        ) -> legion_sync::Result<()> {
+            self.inner.set_tmp_metadata(tmp_name, mtime, mode)
+        }
         fn hash_tmp(&self, tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
             self.inner.hash_tmp(tmp_name)
         }

@@ -52,6 +52,7 @@ impl Node {
                 mode: *mode,
                 link_target: None,
                 change_id: Some(*gen_id),
+                file_identity: None,
             },
             Node::Dir { mtime } => FsMeta {
                 kind: EntryKind::Dir,
@@ -60,6 +61,7 @@ impl Node {
                 mode: None,
                 link_target: None,
                 change_id: None,
+                file_identity: None,
             },
             Node::Symlink { target, mtime } => FsMeta {
                 kind: EntryKind::Symlink,
@@ -68,6 +70,7 @@ impl Node {
                 mode: None,
                 link_target: Some(target.clone()),
                 change_id: None,
+                file_identity: None,
             },
         }
     }
@@ -78,6 +81,7 @@ struct StrictPlatformFs {
     marker: Mutex<Option<FolderMarker>>,
     live: Mutex<BTreeMap<String, Node>>,
     tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    tmp_meta: Mutex<BTreeMap<String, (Timestamp, Option<u32>)>>,
     bin: Mutex<BTreeMap<String, Vec<u8>>>,
     next_gen: Mutex<u64>,
 }
@@ -89,6 +93,7 @@ impl StrictPlatformFs {
             marker: Mutex::new(None),
             live: Mutex::new(BTreeMap::new()),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
+            tmp_meta: Mutex::new(BTreeMap::new()),
             bin: Mutex::new(BTreeMap::new()),
             next_gen: Mutex::new(1),
         }
@@ -570,14 +575,35 @@ impl SyncFs for StrictPlatformFs {
 
     fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
         validate_flat_internal_name(tmp_name)?;
+        let tm = self.tmp_meta.lock().unwrap().get(tmp_name).copied();
         Ok(self.tmp.lock().unwrap().get(tmp_name).map(|b| FsMeta {
             kind: EntryKind::File,
             size: b.len() as u64,
-            mtime: Timestamp::new(0, 0),
-            mode: None,
+            mtime: tm.map_or(Timestamp::new(0, 0), |(mt, _)| mt),
+            mode: tm.and_then(|(_, md)| md),
             link_target: None,
             change_id: None,
+            file_identity: None,
         }))
+    }
+
+    fn set_tmp_metadata(
+        &self,
+        tmp_name: &str,
+        mtime: Timestamp,
+        mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        validate_flat_internal_name(tmp_name)?;
+        let effective_mode = if self.caps.windows_naming {
+            None
+        } else {
+            Some(mode.unwrap_or(0o644) & 0o777)
+        };
+        self.tmp_meta
+            .lock()
+            .unwrap()
+            .insert(tmp_name.to_string(), (mtime, effective_mode));
+        Ok(())
     }
 
     fn hash_tmp(&self, tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
@@ -628,7 +654,21 @@ impl SyncFs for StrictPlatformFs {
                 detail: "tmp not found".to_string(),
                 kind: FsErrorKind::NotFound,
             })?;
-        let mtime = Timestamp::new(0, 0);
+        let (mtime, mode) = self
+            .tmp_meta
+            .lock()
+            .unwrap()
+            .remove(tmp_name)
+            .unwrap_or_else(|| {
+                (
+                    Timestamp::new(0, 0),
+                    if self.caps.windows_naming {
+                        None
+                    } else {
+                        Some(0o644)
+                    },
+                )
+            });
         for anc in ancestors(&clean) {
             live.entry(anc.to_string()).or_insert(Node::Dir { mtime });
         }
@@ -637,11 +677,7 @@ impl SyncFs for StrictPlatformFs {
             Node::File {
                 bytes,
                 mtime,
-                mode: if self.caps.windows_naming {
-                    None
-                } else {
-                    Some(0o644)
-                },
+                mode,
                 gen_id: self.alloc_gen(),
             },
         );
@@ -662,7 +698,10 @@ impl SyncFs for StrictPlatformFs {
             });
         };
         let Some(Node::File {
-            bytes: old_bytes, ..
+            bytes: old_bytes,
+            mtime: old_mtime,
+            mode: old_mode,
+            ..
         }) = live.remove(&clean)
         else {
             tmp.insert(tmp_name.to_string(), new_bytes);
@@ -672,17 +711,25 @@ impl SyncFs for StrictPlatformFs {
                 kind: FsErrorKind::NotFound,
             });
         };
+        let mut tm = self.tmp_meta.lock().unwrap();
+        let (new_mtime, new_mode) = tm.remove(tmp_name).unwrap_or_else(|| {
+            (
+                Timestamp::new(0, 0),
+                if self.caps.windows_naming {
+                    None
+                } else {
+                    Some(0o644)
+                },
+            )
+        });
+        tm.insert(tmp_name.to_string(), (old_mtime, old_mode));
         tmp.insert(tmp_name.to_string(), old_bytes);
         live.insert(
             clean,
             Node::File {
                 bytes: new_bytes,
-                mtime: Timestamp::new(0, 0),
-                mode: if self.caps.windows_naming {
-                    None
-                } else {
-                    Some(0o644)
-                },
+                mtime: new_mtime,
+                mode: new_mode,
                 gen_id: self.alloc_gen(),
             },
         );
@@ -805,6 +852,7 @@ impl SyncFs for StrictPlatformFs {
             mode: None,
             link_target: None,
             change_id: None,
+            file_identity: None,
         }))
     }
 

@@ -20,7 +20,7 @@ pub type MemberId = String;
 
 /// Current durable index schema version. Opening an index with a higher version is refused
 /// cleanly with [`SyncError::SchemaTooNew`].
-pub const INDEX_SCHEMA_VERSION: u32 = 2;
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
 
 /// Sync wire/trait protocol version advertised in [`PeerHandshake`].
 pub const SYNC_PROTOCOL_VERSION: u32 = 2;
@@ -396,6 +396,10 @@ pub struct FolderMeta {
     /// never revive them unless synced files are later added inside.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub kept_deleted_dirs: BTreeSet<String>,
+    /// Live paths that raced with a person's save or move during placement or crash recovery and
+    /// must be hashed on the next scan regardless of cached stat metadata.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub needs_rescan: BTreeSet<String>,
 }
 
 impl FolderMeta {
@@ -420,6 +424,7 @@ impl FolderMeta {
             head_fingerprint: None,
             recent_seq_fingerprints: BTreeMap::new(),
             kept_deleted_dirs: BTreeSet::new(),
+            needs_rescan: BTreeSet::new(),
         }
     }
 

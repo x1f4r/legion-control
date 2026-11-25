@@ -269,6 +269,15 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
         self.inner.stat_tmp(tmp_name)
     }
 
+    fn set_tmp_metadata(
+        &self,
+        tmp_name: &str,
+        mtime: Timestamp,
+        mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        self.inner.set_tmp_metadata(tmp_name, mtime, mode)
+    }
+
     fn hash_tmp(&self, tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
         self.inner.hash_tmp(tmp_name)
     }
@@ -1408,6 +1417,14 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
         }
         fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
             self.inner.stat_tmp(tmp_name)
+        }
+        fn set_tmp_metadata(
+            &self,
+            tmp_name: &str,
+            mtime: Timestamp,
+            mode: Option<u32>,
+        ) -> legion_sync::Result<()> {
+            self.inner.set_tmp_metadata(tmp_name, mtime, mode)
         }
         fn hash_tmp(&self, tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
             self.inner.hash_tmp(tmp_name)

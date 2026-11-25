@@ -217,6 +217,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
     let mut still_tracking: BTreeSet<String> = BTreeSet::new();
     let mut kept_dirs_seen: BTreeSet<String> = BTreeSet::new();
     let mut kept_dirs_revived: BTreeSet<String> = BTreeSet::new();
+    let mut cleared_rescan_paths: BTreeSet<String> = BTreeSet::new();
     let mut disk_idx = 0usize;
 
     let mut visit_record = |rec: IndexRecord| -> Result<bool> {
@@ -232,7 +233,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                 }
                 kept_dirs_revived.insert(entry.path.clone());
             }
-            handle_new_disk_entry(
+            if handle_new_disk_entry(
                 fs,
                 entry,
                 tracker,
@@ -241,7 +242,10 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                 options,
                 &mut changes,
                 &mut report,
-            )?;
+            )? && meta.needs_rescan.contains(&entry.path)
+            {
+                cleared_rescan_paths.insert(entry.path.clone());
+            }
             disk_idx += 1;
         }
 
@@ -258,25 +262,35 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                     kept_dirs_revived.insert(entry.path.clone());
                 }
             }
-            handle_existing_disk_entry(
+            let force_hash = meta.needs_rescan.contains(&entry.path);
+            if handle_existing_disk_entry(
                 fs,
                 entry,
                 rec,
                 ignore,
                 &held_back_paths,
+                force_hash,
                 tracker,
                 &mut still_tracking,
                 now,
                 options,
                 &mut changes,
                 &mut report,
-            )?;
+            )? && force_hash
+            {
+                cleared_rescan_paths.insert(entry.path.clone());
+            }
             disk_idx += 1;
         } else if !rec.deleted
             && !ignore.is_path_or_ancestor_ignored(&rec.path, rec.kind == EntryKind::Dir)
             && !is_under_skipped(&rec.path, &walk_skipped)
         {
+            if meta.needs_rescan.contains(&rec.path) {
+                cleared_rescan_paths.insert(rec.path.clone());
+            }
             changes.push(PendingChange::Delete { old: rec });
+        } else if rec.deleted && meta.needs_rescan.contains(&rec.path) {
+            cleared_rescan_paths.insert(rec.path.clone());
         }
 
         Ok(true)
@@ -298,7 +312,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             }
             kept_dirs_revived.insert(entry.path.clone());
         }
-        handle_new_disk_entry(
+        if handle_new_disk_entry(
             fs,
             entry,
             tracker,
@@ -307,7 +321,10 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             options,
             &mut changes,
             &mut report,
-        )?;
+        )? && meta.needs_rescan.contains(&entry.path)
+        {
+            cleared_rescan_paths.insert(entry.path.clone());
+        }
         disk_idx += 1;
     }
 
@@ -322,6 +339,26 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         meta.kept_deleted_dirs
             .retain(|p| kept_dirs_seen.contains(p) || is_under_skipped(p, &walk_skipped));
         if meta.kept_deleted_dirs.len() != before {
+            kept_dirs_changed = true;
+        }
+    }
+    for p in cleared_rescan_paths {
+        if meta.needs_rescan.remove(&p) {
+            kept_dirs_changed = true;
+        }
+    }
+    if subtree_root.is_none() && !meta.needs_rescan.is_empty() {
+        let before = meta.needs_rescan.len();
+        // Clear any needs_rescan paths that are neither on disk nor unstable/skipped (e.g.
+        // disappeared before they were ever indexed).
+        let unstable_set: BTreeSet<&str> = report
+            .held_back_unstable
+            .iter()
+            .map(String::as_str)
+            .collect();
+        meta.needs_rescan
+            .retain(|p| unstable_set.contains(p.as_str()) || is_under_skipped(p, &report.skipped_errors));
+        if meta.needs_rescan.len() != before {
             kept_dirs_changed = true;
         }
     }
@@ -564,9 +601,26 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
     let disk_opt = fs.stat_live(&clean)?;
 
     match (prev, disk_opt) {
-        (None, None) => Ok(SingleRescanOutcome::Unchanged),
-        (Some(ref rec), None) if rec.deleted => Ok(SingleRescanOutcome::Unchanged),
+        (None, None) => {
+            if meta.needs_rescan.remove(&clean) {
+                store.apply_batch(StoreBatch {
+                    folder_meta: Some(meta),
+                    ..StoreBatch::default()
+                })?;
+            }
+            Ok(SingleRescanOutcome::Unchanged)
+        }
+        (Some(ref rec), None) if rec.deleted => {
+            if meta.needs_rescan.remove(&clean) {
+                store.apply_batch(StoreBatch {
+                    folder_meta: Some(meta),
+                    ..StoreBatch::default()
+                })?;
+            }
+            Ok(SingleRescanOutcome::Unchanged)
+        }
         (Some(old), None) => {
+            meta.needs_rescan.remove(&clean);
             // If an indexed directory disappeared from disk, any live indexed descendants under
             // it have necessarily vanished too; tombstone them deepest-first in the same batch so
             // stale ghost subdirectories are never served before the next full scan.
@@ -650,6 +704,8 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                     m.kind == EntryKind::File
                         && m.size == disk_meta.size
                         && m.mtime == disk_meta.mtime
+                        && m.change_id == disk_meta.change_id
+                        && m.file_identity == disk_meta.file_identity
                         && bytes_read == disk_meta.size
                 });
                 if !stable {
@@ -667,18 +723,26 @@ pub fn rescan_single_path<F: SyncFs, S: IndexStore>(
                 && existing.link_target == disk_meta.link_target
                 && !mode_changed(existing.mode, disk_meta.mode)
             {
-                if existing.disk_mtime != Some(disk_meta.mtime)
-                    || existing.disk_change_id != disk_meta.change_id
-                {
-                    let mut refreshed = existing.clone();
-                    refreshed.disk_mtime = Some(disk_meta.mtime);
-                    refreshed.disk_change_id = disk_meta.change_id;
+                let cleared = meta.needs_rescan.remove(&clean);
+                let stat_diff = existing.disk_mtime != Some(disk_meta.mtime)
+                    || existing.disk_change_id != disk_meta.change_id;
+                if stat_diff || cleared {
                     let mut batch = StoreBatch::default();
-                    batch.upsert_records.push(refreshed);
+                    if stat_diff {
+                        let mut refreshed = existing.clone();
+                        refreshed.disk_mtime = Some(disk_meta.mtime);
+                        refreshed.disk_change_id = disk_meta.change_id;
+                        batch.upsert_records.push(refreshed);
+                    }
+                    if cleared {
+                        batch.folder_meta = Some(meta);
+                    }
                     store.apply_batch(batch)?;
                 }
                 return Ok(SingleRescanOutcome::Unchanged);
             }
+
+            meta.needs_rescan.remove(&clean);
 
             let is_kind_change = prev_opt
                 .as_ref()
@@ -758,7 +822,7 @@ fn handle_new_disk_entry<F: SyncFs>(
     options: ScanOptions,
     changes: &mut Vec<PendingChange>,
     report: &mut ScanReport,
-) -> Result<()> {
+) -> Result<bool> {
     let hash = match entry.meta.kind {
         EntryKind::File => {
             match check_and_hash_file(
@@ -772,7 +836,7 @@ fn handle_new_disk_entry<F: SyncFs>(
                 report,
             )? {
                 Some(h) => Some(h),
-                None => return Ok(()),
+                None => return Ok(false),
             }
         }
         EntryKind::Dir | EntryKind::Symlink => None,
@@ -785,7 +849,7 @@ fn handle_new_disk_entry<F: SyncFs>(
         prev: None,
         is_kind_change: false,
     }));
-    Ok(())
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,13 +859,14 @@ fn handle_existing_disk_entry<F: SyncFs>(
     rec: IndexRecord,
     ignore: &IgnoreMatcher,
     held_back_paths: &BTreeSet<String>,
+    force_hash: bool,
     tracker: &mut PendingStabilityTracker,
     still_tracking: &mut BTreeSet<String>,
     now: Timestamp,
     options: ScanOptions,
     changes: &mut Vec<PendingChange>,
     report: &mut ScanReport,
-) -> Result<()> {
+) -> Result<bool> {
     // Item H: a directory that was deleted elsewhere and intentionally kept on disk only because
     // it still contains ignored or held-back files must NOT be revived as a new directory on scan.
     if rec.deleted
@@ -809,15 +874,16 @@ fn handle_existing_disk_entry<F: SyncFs>(
         && dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, held_back_paths)?
     {
         report.unchanged += 1;
-        return Ok(());
+        return Ok(true);
     }
 
     if !rec.deleted
+        && !force_hash
         && !(options.verify_checksums && entry.meta.kind == EntryKind::File)
         && is_stat_unchanged(&rec, &entry.meta)
     {
         report.unchanged += 1;
-        return Ok(());
+        return Ok(true);
     }
 
     let is_kind_change = !rec.deleted && rec.kind != entry.meta.kind;
@@ -834,7 +900,7 @@ fn handle_existing_disk_entry<F: SyncFs>(
                 report,
             )? {
                 Some(h) => Some(h),
-                None => return Ok(()),
+                None => return Ok(false),
             }
         }
         EntryKind::Dir | EntryKind::Symlink => None,
@@ -856,7 +922,7 @@ fn handle_existing_disk_entry<F: SyncFs>(
             changes.push(PendingChange::RefreshDiskStatOnly { record: refreshed });
         }
         report.unchanged += 1;
-        return Ok(());
+        return Ok(true);
     }
 
     changes.push(PendingChange::Upsert(PendingUpsert {
@@ -866,7 +932,7 @@ fn handle_existing_disk_entry<F: SyncFs>(
         prev: Some(rec),
         is_kind_change,
     }));
-    Ok(())
+    Ok(true)
 }
 
 /// Returns `true` when `dir_path` is non-empty on disk AND every entry inside it is excluded from
@@ -962,6 +1028,8 @@ fn check_and_hash_file<F: SyncFs>(
         m.kind == EntryKind::File
             && m.size == meta1.size
             && m.mtime == meta1.mtime
+            && m.change_id == meta1.change_id
+            && m.file_identity == meta1.file_identity
             && bytes_read == meta1.size
     });
     if !stable {

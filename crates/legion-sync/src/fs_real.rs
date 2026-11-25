@@ -379,6 +379,7 @@ impl SyncFs for RealFs {
                     mode: entry_mode(&meta),
                     link_target: None,
                     change_id: file_change_id(&full, &meta),
+                    file_identity: file_identity(&meta),
                 },
             });
             walk_dir(&full, &clean, ignore, &mut entries, &mut skipped)?;
@@ -602,6 +603,27 @@ impl SyncFs for RealFs {
         stat_path(&full, &format!("{SYNC_TMP_DIR}/{tmp_name}"))
     }
 
+    fn set_tmp_metadata(&self, tmp_name: &str, mtime: Timestamp, mode: Option<u32>) -> Result<()> {
+        let label = format!("{SYNC_TMP_DIR}/{tmp_name}");
+        let full = self.resolve_tmp(tmp_name)?;
+        let meta =
+            fs::symlink_metadata(&full).map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
+        if meta.file_type().is_file() {
+            let effective_mode = mode.unwrap_or(0o644) & 0o777;
+            set_unix_mode(&full, effective_mode, &label)?;
+            if let Some(st) = timestamp_to_system_time(mtime) {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(&full)
+                    .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
+                let times = FileTimes::new().set_modified(st);
+                file.set_times(times)
+                    .map_err(|e| SyncError::from_io(Some(label), e))?;
+            }
+        }
+        Ok(())
+    }
+
     fn hash_tmp(&self, tmp_name: &str) -> Result<(Hash, u64)> {
         let full = self.resolve_tmp(tmp_name)?;
         let mut file = File::open(&full)
@@ -631,7 +653,6 @@ impl SyncFs for RealFs {
         let parent = self.ensure_parent_dirs(&clean)?;
         let src = self.resolve_tmp(tmp_name)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
-        set_unix_mode(&src, 0o644, &clean)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
         sync_dir(&parent);
         sync_dir(&self.tmp_dir());
@@ -648,7 +669,6 @@ impl SyncFs for RealFs {
         let _parent = self.ensure_parent_dirs(&clean)?;
         let src = self.resolve_tmp(tmp_name)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
-        set_unix_mode(&src, 0o644, &clean)?;
         rename_no_replace(&src, &dst).map_err(|err| SyncError::from_os(Some(clean), err))?;
         Ok(())
     }
@@ -659,7 +679,6 @@ impl SyncFs for RealFs {
         self.ensure_no_symlink_ancestors(&clean)?;
         let src = self.resolve_tmp(tmp_name)?;
         let dst = self.resolve_live(&clean, EntryKind::File)?;
-        set_unix_mode(&src, 0o644, &clean)?;
         match exchange_files(&src, &dst) {
             Ok(()) => {
                 if let Some(parent) = dst.parent() {
@@ -890,6 +909,7 @@ fn walk_dir(
                     mode: entry_mode(&meta),
                     link_target: None,
                     change_id: file_change_id(&full_path, &meta),
+                    file_identity: file_identity(&meta),
                 },
             });
             walk_dir(&full_path, &rel, ignore, entries, skipped)?;
@@ -905,6 +925,7 @@ fn walk_dir(
                             mode: entry_mode(&meta),
                             link_target: Some(t.to_string()),
                             change_id: file_change_id(&full_path, &meta),
+                            file_identity: file_identity(&meta),
                         },
                     }),
                     None => skipped.push((rel, "non-UTF-8 symbolic link target".to_string())),
@@ -921,6 +942,7 @@ fn walk_dir(
                     mode: entry_mode(&meta),
                     link_target: None,
                     change_id: file_change_id(&full_path, &meta),
+                    file_identity: file_identity(&meta),
                 },
             });
         } else {
@@ -946,6 +968,7 @@ fn stat_path(full: &Path, label: &str) -> Result<Option<FsMeta>> {
             mode: entry_mode(&meta),
             link_target: None,
             change_id: file_change_id(full, &meta),
+            file_identity: file_identity(&meta),
         }))
     } else if ft.is_symlink() {
         let target = fs::read_link(full).map_err(|e| SyncError::from_io(Some(label.into()), e))?;
@@ -962,6 +985,7 @@ fn stat_path(full: &Path, label: &str) -> Result<Option<FsMeta>> {
             mode: entry_mode(&meta),
             link_target: Some(target_str.to_string()),
             change_id: file_change_id(full, &meta),
+            file_identity: file_identity(&meta),
         }))
     } else if ft.is_file() {
         Ok(Some(FsMeta {
@@ -971,6 +995,7 @@ fn stat_path(full: &Path, label: &str) -> Result<Option<FsMeta>> {
             mode: entry_mode(&meta),
             link_target: None,
             change_id: file_change_id(full, &meta),
+            file_identity: file_identity(&meta),
         }))
     } else {
         Err(SyncError::Unsupported {
@@ -1086,6 +1111,17 @@ fn probe_case_insensitive(dir: &Path) -> bool {
     let insensitive = fs::symlink_metadata(&lower).is_ok();
     let _ = fs::remove_file(&upper);
     insensitive
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(unix)]

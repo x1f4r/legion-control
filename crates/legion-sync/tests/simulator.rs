@@ -110,7 +110,7 @@ impl SimNode {
         }
     }
 
-    fn meta(&self) -> FsMeta {
+    fn meta(&self, windows_naming: bool) -> FsMeta {
         match self {
             SimNode::File {
                 bytes,
@@ -125,6 +125,11 @@ impl SimNode {
                 mode: *mode,
                 link_target: None,
                 change_id: Some(*gen_id),
+                file_identity: if windows_naming {
+                    None
+                } else {
+                    Some((1, *gen_id))
+                },
             },
             SimNode::Dir { mtime } => FsMeta {
                 kind: EntryKind::Dir,
@@ -133,6 +138,7 @@ impl SimNode {
                 mode: Some(0o755),
                 link_target: None,
                 change_id: None,
+                file_identity: None,
             },
             SimNode::Symlink { target, mtime } => FsMeta {
                 kind: EntryKind::Symlink,
@@ -141,6 +147,7 @@ impl SimNode {
                 mode: Some(0o777),
                 link_target: Some(target.clone()),
                 change_id: None,
+                file_identity: None,
             },
         }
     }
@@ -246,6 +253,7 @@ struct HonestSimFs {
     marker: RefCell<Option<FolderMarker>>,
     live: RefCell<BTreeMap<String, SimNode>>,
     tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    tmp_meta: RefCell<BTreeMap<String, (Timestamp, Option<u32>, u64)>>,
     bin: RefCell<BTreeMap<String, SimBinData>>,
     unreadable: RefCell<BTreeSet<String>>,
     any_unreadable: Cell<bool>,
@@ -269,6 +277,7 @@ impl HonestSimFs {
             marker: RefCell::new(None),
             live: RefCell::new(BTreeMap::new()),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
+            tmp_meta: RefCell::new(BTreeMap::new()),
             bin: RefCell::new(BTreeMap::new()),
             unreadable: RefCell::new(BTreeSet::new()),
             any_unreadable: Cell::new(false),
@@ -303,6 +312,7 @@ impl HonestSimFs {
             marker: RefCell::new(snap.marker),
             live: RefCell::new(snap.live),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
+            tmp_meta: RefCell::new(BTreeMap::new()),
             bin: RefCell::new(snap.bin),
             unreadable: RefCell::new(BTreeSet::new()),
             any_unreadable: Cell::new(false),
@@ -868,7 +878,7 @@ impl SyncFs for HonestSimFs {
                 }
                 continue;
             }
-            let meta = node.meta();
+            let meta = node.meta(self.caps.windows_naming);
             if ignore.is_path_or_ancestor_ignored(path, meta.kind == EntryKind::Dir) {
                 continue;
             }
@@ -931,7 +941,7 @@ impl SyncFs for HonestSimFs {
         Ok(self
             .resolve_existing_key(&live, &clean)
             .and_then(|k| live.get(&k))
-            .map(SimNode::meta))
+            .map(|n| n.meta(self.caps.windows_naming)))
     }
 
     fn hash_live(&self, rel_path: &str) -> legion_sync::Result<(Hash, u64)> {
@@ -1291,14 +1301,48 @@ impl SyncFs for HonestSimFs {
     fn stat_tmp(&self, tmp_name: &str) -> legion_sync::Result<Option<FsMeta>> {
         validate_flat_internal_name(tmp_name)?;
         let tmp = self.tmp.lock().unwrap();
-        Ok(tmp.get(tmp_name).map(|b| FsMeta {
-            kind: EntryKind::File,
-            size: b.len() as u64,
-            mtime: Timestamp::new(0, 0),
-            mode: Some(0o600),
-            link_target: None,
-            change_id: None,
+        let tm = self.tmp_meta.borrow().get(tmp_name).copied();
+        Ok(tmp.get(tmp_name).map(|b| {
+            let (mtime, mode, gen_id) = tm.unwrap_or((Timestamp::new(0, 0), Some(0o600), 0));
+            FsMeta {
+                kind: EntryKind::File,
+                size: b.len() as u64,
+                mtime,
+                mode,
+                link_target: None,
+                change_id: (gen_id != 0).then_some(gen_id),
+                file_identity: if self.caps.windows_naming || gen_id == 0 {
+                    None
+                } else {
+                    Some((1, gen_id))
+                },
+            }
         }))
+    }
+
+    fn set_tmp_metadata(
+        &self,
+        tmp_name: &str,
+        mtime: Timestamp,
+        mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        validate_flat_internal_name(tmp_name)?;
+        let effective_mode = if self.caps.windows_naming {
+            None
+        } else {
+            Some(mode.unwrap_or(0o644) & 0o777)
+        };
+        let gen_id = self
+            .tmp_meta
+            .borrow()
+            .get(tmp_name)
+            .map(|(_, _, g)| *g)
+            .filter(|&g| g != 0)
+            .unwrap_or_else(|| self.alloc_gen());
+        self.tmp_meta
+            .borrow_mut()
+            .insert(tmp_name.to_string(), (mtime, effective_mode, gen_id));
+        Ok(())
     }
 
     fn hash_tmp(&self, tmp_name: &str) -> legion_sync::Result<(Hash, u64)> {
@@ -1360,6 +1404,21 @@ impl SyncFs for HonestSimFs {
                     detail: "tmp not found".to_string(),
                     kind: FsErrorKind::NotFound,
                 })?;
+            let (mtime, mode, gen_id) = self
+                .tmp_meta
+                .borrow_mut()
+                .remove(tmp_name)
+                .unwrap_or_else(|| {
+                    (
+                        Timestamp::new(0, 0),
+                        if self.caps.windows_naming {
+                            None
+                        } else {
+                            Some(0o644)
+                        },
+                        self.alloc_gen(),
+                    )
+                });
             let hash = hash_bytes(&bytes);
             for anc in legion_sync::path::ancestors(&clean) {
                 if self.resolve_existing_key(&live, anc).is_none() {
@@ -1376,13 +1435,9 @@ impl SyncFs for HonestSimFs {
                 SimNode::File {
                     bytes,
                     hash,
-                    mtime: Timestamp::new(0, 0),
-                    mode: if self.caps.windows_naming {
-                        None
-                    } else {
-                        Some(0o644)
-                    },
-                    gen_id: self.alloc_gen(),
+                    mtime,
+                    mode,
+                    gen_id,
                 },
             );
             Ok(())
@@ -1417,23 +1472,44 @@ impl SyncFs for HonestSimFs {
                 detail: "tmp not found".to_string(),
                 kind: FsErrorKind::NotFound,
             })?;
+            let (new_mtime, new_mode, new_gen) = self
+                .tmp_meta
+                .borrow_mut()
+                .remove(tmp_name)
+                .unwrap_or_else(|| {
+                    (
+                        Timestamp::new(0, 0),
+                        if self.caps.windows_naming {
+                            None
+                        } else {
+                            Some(0o644)
+                        },
+                        self.alloc_gen(),
+                    )
+                });
             let staged_hash = hash_bytes(&staged_bytes);
             let old_node = live.insert(
                 actual,
                 SimNode::File {
                     bytes: staged_bytes,
                     hash: staged_hash,
-                    mtime: Timestamp::new(0, 0),
-                    mode: if self.caps.windows_naming {
-                        None
-                    } else {
-                        Some(0o644)
-                    },
-                    gen_id: self.alloc_gen(),
+                    mtime: new_mtime,
+                    mode: new_mode,
+                    gen_id: new_gen,
                 },
             );
-            if let Some(SimNode::File { bytes: old_b, .. }) = old_node {
+            if let Some(SimNode::File {
+                bytes: old_b,
+                mtime: old_mt,
+                mode: old_md,
+                gen_id: old_g,
+                ..
+            }) = old_node
+            {
                 tmp.insert(tmp_name.to_string(), old_b);
+                self.tmp_meta
+                    .borrow_mut()
+                    .insert(tmp_name.to_string(), (old_mt, old_md, old_g));
             }
             Ok(true)
         })
@@ -1464,8 +1540,17 @@ impl SyncFs for HonestSimFs {
                 });
             };
             match live.remove(&actual) {
-                Some(SimNode::File { bytes, .. }) => {
+                Some(SimNode::File {
+                    bytes,
+                    mtime,
+                    mode,
+                    gen_id,
+                    ..
+                }) => {
                     tmp.insert(tmp_name.to_string(), bytes);
+                    self.tmp_meta
+                        .borrow_mut()
+                        .insert(tmp_name.to_string(), (mtime, mode, gen_id));
                     Ok(())
                 }
                 Some(other) => {
@@ -1591,6 +1676,7 @@ impl SyncFs for HonestSimFs {
             mode: Some(0o600),
             link_target: None,
             change_id: None,
+            file_identity: None,
         }))
     }
 

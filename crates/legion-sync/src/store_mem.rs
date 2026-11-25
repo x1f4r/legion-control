@@ -31,6 +31,7 @@ pub struct MemoryIndexStore {
     held_back: BTreeMap<String, HeldBackRecord>,
     deleted_history: BTreeMap<String, Vec<Hash>>,
     pending_op: Option<PendingOp>,
+    staged_tmps: BTreeSet<String>,
 }
 
 impl Default for MemoryIndexStore {
@@ -56,6 +57,7 @@ impl MemoryIndexStore {
             held_back: BTreeMap::new(),
             deleted_history: BTreeMap::new(),
             pending_op: None,
+            staged_tmps: BTreeSet::new(),
         }
     }
 
@@ -298,6 +300,10 @@ impl IndexStore for MemoryIndexStore {
         Ok(self.pending_op.clone())
     }
 
+    fn list_staged_tmps(&self) -> Result<BTreeSet<String>> {
+        Ok(self.staged_tmps.clone())
+    }
+
     fn record_count(&self) -> Result<u64> {
         Ok(self.records.len() as u64)
     }
@@ -361,6 +367,12 @@ impl IndexStore for MemoryIndexStore {
         }
         if let Some(op_update) = batch.set_pending_op {
             self.pending_op = op_update;
+        }
+        for tmp in batch.remove_staged_tmps {
+            self.staged_tmps.remove(&tmp);
+        }
+        for tmp in batch.add_staged_tmps {
+            self.staged_tmps.insert(tmp);
         }
         Ok(())
     }
