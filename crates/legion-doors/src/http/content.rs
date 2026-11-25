@@ -499,7 +499,7 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         );
     };
 
-    let open_slot: Arc<Mutex<Option<(Ticket, Arc<AtomicU64>)>>> = Arc::new(Mutex::new(None));
+    let open_slot: OpenAuditSlot = Arc::new(Mutex::new(None));
     let source = Arc::new(DoorContentSource {
         shared: Arc::clone(&shared),
         open_slot: Arc::clone(&open_slot),
@@ -619,9 +619,11 @@ impl http_body::Body for AuditCountingBody {
     }
 }
 
+type OpenAuditSlot = Arc<Mutex<Option<(Ticket, Arc<AtomicU64>)>>>;
+
 struct DoorContentSource {
     shared: Arc<Shared>,
-    open_slot: Arc<Mutex<Option<(Ticket, Arc<AtomicU64>)>>>,
+    open_slot: OpenAuditSlot,
 }
 
 impl ContentSource for DoorContentSource {
