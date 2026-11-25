@@ -285,8 +285,18 @@ where
 {
     let guard = slot.try_acquire()?;
     let (tx, rx) = tokio::sync::oneshot::channel();
+    // Keep the thread name within Linux's 15-byte `TASK_COMM_LEN - 1` limit so
+    // `pthread_setname_np` sets `/proc/self/task/<tid>/comm` reliably.
+    let mut thread_name = format!("probe-{name}");
+    if thread_name.len() > 15 {
+        let mut end = 15;
+        while !thread_name.is_char_boundary(end) {
+            end -= 1;
+        }
+        thread_name.truncate(end);
+    }
     let spawned = std::thread::Builder::new()
-        .name(format!("legion-probe-{name}"))
+        .name(thread_name)
         .spawn(move || {
             let _guard = guard;
             let value = work();
@@ -1574,18 +1584,23 @@ mod tests {
             assert_eq!(rc, 0, "mkfifo failed for {}", path.display());
         }
 
-        fn process_thread_count() -> usize {
-            let status = fs::read_to_string("/proc/self/status").unwrap();
-            for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("Threads:") {
-                    return rest.trim().parse().unwrap();
+        fn count_threads_named(names: &[&str]) -> usize {
+            let Ok(entries) = fs::read_dir("/proc/self/task") else {
+                return 0;
+            };
+            let mut count = 0;
+            for entry in entries.flatten() {
+                if let Ok(comm) = fs::read_to_string(entry.path().join("comm"))
+                    && names.contains(&comm.trim_end_matches('\n'))
+                {
+                    count += 1;
                 }
             }
-            panic!("Threads: not found in /proc/self/status");
+            count
         }
 
         // 1. FIFOs placed where sysfs regular files belong are rejected by symlink_metadata
-        // without ever opening or blocking; 200 calls leave thread count flat.
+        // without ever opening or blocking; 200 calls leave no sysfs probe threads behind.
         let dir = tempfile::tempdir().unwrap();
         mkfifo_at(&dir.path().join("class/hwmon/hwmon0/name"));
         write(dir.path(), "class/power_supply/BAT0/type", "Battery\n");
@@ -1594,7 +1609,7 @@ mod tests {
 
         let missing_cmd =
             CommandSpec::argv("legion-nonexistent-nvidia-smi-probe", Vec::<&str>::new());
-        let before_sysfs = process_thread_count();
+        let sysfs_thread_names = ["probe-cpu-temp", "probe-drm-gpus", "probe-battery"];
         for _ in 0..200 {
             let snap = probe_all(ProbeConfig {
                 sys_root: dir.path().to_path_buf(),
@@ -1607,12 +1622,16 @@ mod tests {
             assert!(snap.gpus.is_empty());
             assert_eq!(snap.battery, None);
         }
-        // Let detached probe threads finish exiting.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let after_sysfs = process_thread_count();
-        assert!(
-            after_sysfs <= before_sysfs + 4,
-            "FIFO sysfs fixture leaked threads: before={before_sysfs}, after={after_sysfs}"
+        // Let detached probe threads finish exiting, then check only sysfs probe threads so
+        // unrelated parallel tests in this process cannot cause false failures.
+        let drain_deadline = Instant::now() + Duration::from_millis(500);
+        while count_threads_named(&sysfs_thread_names) > 0 && Instant::now() < drain_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let after_sysfs = count_threads_named(&sysfs_thread_names);
+        assert_eq!(
+            after_sysfs, 0,
+            "FIFO sysfs fixture left {after_sysfs} probe thread(s) alive"
         );
 
         // 2. Even when a driver read genuinely blocks inside a probe slot (simulated by opening
@@ -1622,7 +1641,6 @@ mod tests {
         mkfifo_at(&stuck_fifo);
         let slot = ProbeSlot::new();
         let spawned = Arc::new(AtomicUsize::new(0));
-        let before_stuck = process_thread_count();
 
         let started = Instant::now();
         for _ in 0..200 {
@@ -1649,19 +1667,26 @@ mod tests {
             "subsequent calls while stuck must return immediately, took {:?}",
             started.elapsed()
         );
-        let during_stuck = process_thread_count();
-        assert!(
-            during_stuck <= before_stuck + 2,
-            "stuck slot leaked threads: before={before_stuck}, during={during_stuck}"
+        let during_stuck = count_threads_named(&["probe-fifo-test"]);
+        assert_eq!(
+            during_stuck, 1,
+            "stuck slot must hold exactly one probe-fifo-test thread, saw {during_stuck}"
         );
 
         // Unblock the FIFO by writing to it; the stuck mark must clear and the next call succeeds.
         fs::write(&stuck_fifo, "unblocked").unwrap();
         let unblock_deadline = Instant::now() + Duration::from_secs(2);
-        while slot.is_busy() && Instant::now() < unblock_deadline {
+        while (slot.is_busy() || count_threads_named(&["probe-fifo-test"]) > 0)
+            && Instant::now() < unblock_deadline
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!slot.is_busy(), "stuck mark must clear after read returns");
+        assert_eq!(
+            count_threads_named(&["probe-fifo-test"]),
+            0,
+            "probe-fifo-test thread should exit after FIFO unblocks"
+        );
         let ok = run_guarded_probe(&slot, "fifo-test", Duration::from_millis(200), || {
             Some(99u32)
         })
