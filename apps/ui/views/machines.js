@@ -86,6 +86,9 @@ export function MachinesView({
   error,
   pairNotice,
   onDismissPairNotice,
+  updateState,
+  onOpenWhatIsNew,
+  onDismissUpdateNotice,
   loading,
   wide,
   route,
@@ -107,6 +110,8 @@ export function MachinesView({
   const showMetrics = settings?.showMetrics !== false;
   const showOffline = settings?.showOffline !== false;
   const syncBanner = formatPairSyncNotice(pairNotice, Boolean(settings?.technical));
+  const justUpdated = updateState?.just_updated || null;
+  const rolledBack = updateState?.rolled_back || null;
 
   const onlineMachines = machines.filter((m) => m.reachable);
   const askingMachines = machines.filter((m) => !m.reachable && (m.status === 'asking' || m.asking));
@@ -120,6 +125,41 @@ export function MachinesView({
   const listColumn = html`
     <section>
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${rolledBack
+        ? html`
+            <${Notice}
+              title=${`Kept version ${updateState?.current?.version || ''}`.trim()}
+              hint=${rolledBack.reason ||
+                `Version ${rolledBack.version} did not start cleanly, so Legion kept the previous copy.`}
+              kind="warn"
+              onDismiss=${onDismissUpdateNotice}
+            />
+          `
+        : null}
+      ${justUpdated
+        ? html`
+            <div class="list spaced" role="status">
+              <div class="row">
+                <span class="body">
+                  <span class="title">
+                    Updated to ${justUpdated.version}
+                    ${justUpdated.notes
+                      ? html` · <button type="button" class="btn small" onClick=${onOpenWhatIsNew}>What is new</button>`
+                      : null}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  class="btn small"
+                  aria-label="Dismiss update notice"
+                  onClick=${onDismissUpdateNotice}
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          `
+        : null}
       ${syncBanner
         ? html`
             <${Notice}

@@ -33,6 +33,11 @@ import {
   summarizeInvitedDeviceFleet,
 } from '../lib/settings.js';
 
+import {
+  describeUpdateSummary,
+  formatUpdateTechnicalRows,
+} from '../lib/updates.js';
+
 export const UI_VERSION = '0.1.0';
 
 function capitalize(word) {
@@ -1895,20 +1900,189 @@ function RefreshingPage({ settings, onUpdateSettings }) {
 
 // ── About page ───────────────────────────────────────────────────────────────────────────────
 
-function AboutPage({ nodeInfo }) {
+function AboutPage({
+  link,
+  nodeInfo,
+  technical,
+  updateState,
+  onCheckUpdates,
+  onInstallUpdate,
+  onSetAutoUpdate,
+  onDismissUpdateNotice,
+}) {
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState(null);
+  const hasAppUpdater = Boolean(
+    updateState || (link?.kind === 'app' && typeof link?.checkUpdates === 'function'),
+  );
+  const summary = describeUpdateSummary(hasAppUpdater ? updateState : null, {
+    doorKind: hasAppUpdater ? 'app' : link?.kind || 'http',
+    nodeName: nodeInfo?.node || '',
+  });
+  const techRows = technical && hasAppUpdater ? formatUpdateTechnicalRows(updateState) : [];
+  const appVersion = updateState?.current?.version || UI_VERSION;
+
+  async function runCheck() {
+    if (!onCheckUpdates || busy) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await onCheckUpdates();
+    } catch (err) {
+      setActionError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runInstall() {
+    if (!onInstallUpdate || busy) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await onInstallUpdate();
+    } catch (err) {
+      setActionError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleAuto(checked) {
+    if (!onSetAutoUpdate) return;
+    setActionError(null);
+    try {
+      await onSetAutoUpdate(checked);
+    } catch (err) {
+      setActionError(err);
+    }
+  }
+
   return html`
     <div>
+      <p class="label">Updates</p>
+      ${actionError ? html`<${Notice} error=${actionError} />` : null}
+      ${updateState?.rolled_back
+        ? html`
+            <${Notice}
+              title=${`Kept version ${appVersion}`}
+              hint=${updateState.rolled_back.reason ||
+                `Version ${updateState.rolled_back.version} did not start cleanly, so Legion went back to the previous copy.`}
+              kind="warn"
+              onDismiss=${onDismissUpdateNotice}
+            />
+          `
+        : null}
+
       <div class="list">
-        <dl class="kv">
-          <dt>interface</dt>
-          <dd>${UI_VERSION}</dd>
-          <dt>node</dt>
+        <div class="row">
+          <span class="body">
+            <span class="title">${summary.line}</span>
+            ${summary.detail ? html`<span class="sub wrap">${summary.detail}</span>` : null}
+          </span>
+        </div>
+
+        ${summary.manualCommand
+          ? html`
+              <div class="row">
+                <span class="body">
+                  <span class="title mono">${summary.manualCommand}</span>
+                </span>
+                <${CopyButton} text=${summary.manualCommand} />
+              </div>
+            `
+          : null}
+
+        ${summary.showAutoSwitch && hasAppUpdater
+          ? html`
+              <label class="row switch row-switch">
+                <span class="body">
+                  <span class="title">Update automatically</span>
+                  <span class="sub wrap">
+                    Download when a newer version is seen and install on next start or when idle
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked=${Boolean(updateState?.auto_update)}
+                  onChange=${(e) => toggleAuto(e.target.checked)}
+                />
+              </label>
+            `
+          : null}
+      </div>
+
+      ${hasAppUpdater && (summary.canAction || summary.showCheck)
+        ? html`
+            <div class="actions">
+              ${summary.canAction && summary.actionLabel
+                ? html`
+                    <button
+                      type="button"
+                      class="btn primary"
+                      disabled=${busy}
+                      onClick=${runInstall}
+                    >
+                      ${busy ? 'Working…' : summary.actionLabel}
+                    </button>
+                  `
+                : null}
+              ${summary.showCheck
+                ? html`
+                    <button type="button" class="btn" disabled=${busy} onClick=${runCheck}>
+                      ${busy ? 'Checking…' : 'Check now'}
+                    </button>
+                  `
+                : null}
+            </div>
+          `
+        : null}
+
+      ${summary.notes
+        ? html`
+            <p class="label">What is new</p>
+            <div class="list">
+              <div class="row">
+                <span class="body">
+                  <span class="sub wrap">${summary.notes}</span>
+                </span>
+              </div>
+            </div>
+          `
+        : null}
+
+      ${technical && techRows.length > 0
+        ? html`
+            <p class="label">Update details</p>
+            <div class="list">
+              <dl class="kv">
+                ${techRows.map(
+                  (r) => html`
+                    <dt key=${`dt-${r.key}`}>${r.key}</dt>
+                    <dd key=${`dd-${r.key}`}>${r.value}</dd>
+                  `,
+                )}
+              </dl>
+            </div>
+          `
+        : null}
+
+      <p class="label">Version</p>
+      <div class="list">
+        <dl class=${technical ? 'kv' : 'kv plain'}>
+          <dt>${hasAppUpdater ? (technical ? 'app' : 'App') : technical ? 'interface' : 'Interface'}</dt>
+          <dd>${appVersion}</dd>
+          <dt>${technical ? 'node' : 'Connected machine'}</dt>
           <dd>
             ${nodeInfo?.version || 'unknown'}
-            ${nodeInfo?.build ? ` (${nodeInfo.build})` : ''}
+            ${technical && nodeInfo?.build ? ` (${nodeInfo.build})` : ''}
           </dd>
-          <dt>protocol</dt>
-          <dd>${nodeInfo?.protocol ?? 1}</dd>
+          ${technical
+            ? html`
+                <dt>protocol</dt>
+                <dd>${nodeInfo?.protocol ?? 1}</dd>
+              `
+            : null}
         </dl>
       </div>
     </div>
@@ -1930,6 +2104,11 @@ export function SettingsView({
   settings,
   pairNotice,
   onDismissPairNotice,
+  updateState,
+  onCheckUpdates,
+  onInstallUpdate,
+  onSetAutoUpdate,
+  onDismissUpdateNotice,
   onUpdateSettings,
   onRequestConfirm,
   onSelectNode,
@@ -2032,7 +2211,13 @@ export function SettingsView({
         >
           <span class="body">
             <span class="title">About</span>
-            <span class="sub">Legion ${UI_VERSION}</span>
+            <span class="sub">
+              ${`Legion ${updateState?.current?.version || UI_VERSION}${
+                updateState?.phase === 'ready' || updateState?.phase === 'available' || updateState?.phase === 'manual'
+                  ? ' · Update available'
+                  : ''
+              }`}
+            </span>
           </span>
           <span class="chev" aria-hidden="true">›</span>
         </a>
@@ -2091,7 +2276,18 @@ export function SettingsView({
       `;
     }
     if (page === 'about') {
-      return html`<${AboutPage} nodeInfo=${nodeInfo} />`;
+      return html`
+        <${AboutPage}
+          link=${link}
+          nodeInfo=${nodeInfo}
+          technical=${technical}
+          updateState=${updateState}
+          onCheckUpdates=${onCheckUpdates}
+          onInstallUpdate=${onInstallUpdate}
+          onSetAutoUpdate=${onSetAutoUpdate}
+          onDismissUpdateNotice=${onDismissUpdateNotice}
+        />
+      `;
     }
     return null;
   }

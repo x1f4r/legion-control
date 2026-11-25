@@ -477,6 +477,47 @@ const MOCK_TOOLS = [
       },
     },
   },
+  {
+    name: 'update.list',
+    effect: 'read',
+    description: 'List the signed update sets stored on this node (newest first).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        channel: { type: 'string', enum: ['stable', 'preview'], description: 'Filter by channel.' },
+      },
+    },
+  },
+  {
+    name: 'update.publish',
+    effect: 'admin',
+    description: 'Verify a signed update set, store it, and notify reachable fleet machines.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Local directory holding the signed update set.' },
+        from_peer: { type: 'string', description: 'Peer machine to pull a set from.' },
+        channel: { type: 'string', enum: ['stable', 'preview'], description: 'Channel when using from_peer.' },
+        sequence: { type: 'integer', minimum: 1, description: 'Sequence when using from_peer.' },
+      },
+    },
+  },
+  {
+    name: 'update.read',
+    effect: 'read',
+    description: 'Read up to 1 MiB of one listed file from a stored update set as base64.',
+    input_schema: {
+      type: 'object',
+      required: ['channel', 'sequence', 'name'],
+      properties: {
+        channel: { type: 'string', enum: ['stable', 'preview'] },
+        sequence: { type: 'integer', minimum: 1 },
+        name: { type: 'string' },
+        offset: { type: 'integer', minimum: 0 },
+        length: { type: 'integer', minimum: 0, maximum: 1048576 },
+      },
+    },
+  },
 ];
 
 export function createMockLink(mode = '') {
@@ -503,10 +544,16 @@ export function createMockLink(mode = '') {
   const isRepair = flags.has('repair');
   const isPair = flags.has('pair');
   const isToken = flags.has('token');
+  const isUpdate = flags.has('update');
+  const isUpdated = flags.has('updated');
+  const isUpdateDeb = flags.has('update-deb');
 
   let authed = !isToken && !isPair && !isRepair;
   let repaired = false;
-  const kind = isPair || isMulti || isRepair || isFleet ? 'app' : 'mock';
+  const kind =
+    isPair || isMulti || isRepair || isFleet || isUpdate || isUpdated || isUpdateDeb
+      ? 'app'
+      : 'mock';
   let jobCounter = 10;
   let inviteCounter = 1;
   let activeNode = 'tower';
@@ -1689,7 +1736,153 @@ export function createMockLink(mode = '') {
     return 'legion-invite-1.mock.scanned';
   }
 
-  return {
+  const updateWatchers = new Set();
+  let mockUpdateState =
+    kind === 'app'
+      ? {
+          phase: isUpdateDeb ? 'manual' : isUpdate ? 'ready' : 'up_to_date',
+          current: {
+            version: isUpdated ? '0.2.0' : '0.1.0',
+            build: isUpdated ? 'feedface1234' : 'abc123456789',
+            sequence: isUpdated ? 202611250205 : 202611250200,
+            os: isUpdateDeb ? 'linux' : 'android',
+            arch: isUpdateDeb ? 'x86_64' : 'aarch64',
+            install_kind: isUpdateDeb ? 'deb' : 'apk',
+            preview_enabled: true,
+            release_key_fingerprint: 'SHA256:MockReleaseKey11111111111111111111111111111',
+            preview_key_fingerprint: 'SHA256:MockPreviewKey22222222222222222222222222222',
+          },
+          sequence_floor: isUpdated ? 202611250205 : 202611250200,
+          auto_update: true,
+          can_self_install: !isUpdateDeb,
+          unsupported_reason: null,
+          manual_command: isUpdateDeb
+            ? 'sudo apt-get install /home/me/.local/share/com.x1f4r.legion/updates/downloads/preview-202611250205/legion-app_0.2.0_amd64.deb'
+            : null,
+          available:
+            isUpdate || isUpdateDeb
+              ? {
+                  channel: 'preview',
+                  version: '0.2.0',
+                  build: 'feedface1234',
+                  sequence: 202611250205,
+                  published_at: isoAgo(180),
+                  notes: 'Automatic fleet updates and faster status refresh.',
+                  signer: 'preview',
+                  key_fingerprint: 'SHA256:MockPreviewKey22222222222222222222222222222',
+                  source_node: 'tower',
+                  artifact_name: isUpdateDeb ? 'legion-app_0.2.0_amd64.deb' : 'Legion-0.2.0.apk',
+                  artifact_sha256: '0'.repeat(64),
+                  artifact_size: 18_000_000,
+                  downloaded: true,
+                }
+              : null,
+          progress: null,
+          last_checked_at: isoAgo(30),
+          checked_nodes: ['tower'],
+          just_updated: isUpdated
+            ? {
+                channel: 'preview',
+                version: '0.2.0',
+                build: 'feedface1234',
+                sequence: 202611250205,
+                notes: 'Automatic fleet updates and faster status refresh.',
+                updated_at: isoAgo(60),
+              }
+            : null,
+          rolled_back: null,
+          android: isUpdateDeb
+            ? null
+            : {
+                canRequestPackageInstalls: true,
+                isSelfInstaller: true,
+                installerPackage: 'com.x1f4r.legion',
+                apiLevel: 35,
+                supportsSilentSelfUpdate: true,
+              },
+          last_error: null,
+        }
+      : null;
+
+  function emitMockUpdateState() {
+    if (!mockUpdateState) return;
+    const copy = structuredClone(mockUpdateState);
+    for (const fn of updateWatchers) {
+      try {
+        fn(copy);
+      } catch {
+        // Ignore callback failure.
+      }
+    }
+  }
+
+  async function updateState() {
+    return mockUpdateState ? structuredClone(mockUpdateState) : null;
+  }
+
+  function watchUpdates(onState) {
+    if (!mockUpdateState || typeof onState !== 'function') return () => {};
+    updateWatchers.add(onState);
+    onState(structuredClone(mockUpdateState));
+    return () => updateWatchers.delete(onState);
+  }
+
+  async function checkUpdates() {
+    if (!mockUpdateState) return null;
+    mockUpdateState.last_checked_at = new Date().toISOString();
+    emitMockUpdateState();
+    return structuredClone(mockUpdateState);
+  }
+
+  async function installUpdate() {
+    if (!mockUpdateState) return null;
+    if (mockUpdateState.available && mockUpdateState.can_self_install) {
+      const next = mockUpdateState.available;
+      mockUpdateState = {
+        ...mockUpdateState,
+        phase: 'up_to_date',
+        current: {
+          ...mockUpdateState.current,
+          version: next.version,
+          build: next.build,
+          sequence: next.sequence,
+        },
+        sequence_floor: next.sequence,
+        available: null,
+        just_updated: {
+          channel: next.channel,
+          version: next.version,
+          build: next.build,
+          sequence: next.sequence,
+          notes: next.notes,
+          updated_at: new Date().toISOString(),
+        },
+      };
+      emitMockUpdateState();
+    }
+    return structuredClone(mockUpdateState);
+  }
+
+  async function setAutoUpdate(enabled) {
+    if (!mockUpdateState) return null;
+    mockUpdateState.auto_update = Boolean(enabled);
+    emitMockUpdateState();
+    return structuredClone(mockUpdateState);
+  }
+
+  async function dismissUpdateNotice() {
+    if (!mockUpdateState) return null;
+    mockUpdateState.just_updated = null;
+    mockUpdateState.rolled_back = null;
+    emitMockUpdateState();
+    return structuredClone(mockUpdateState);
+  }
+
+  async function maybeAutoInstall() {
+    return updateState();
+  }
+
+  const baseApi = {
     kind,
     mockFlags: flags,
     state,
@@ -1708,4 +1901,18 @@ export function createMockLink(mode = '') {
     scanInvite,
     initialFleetCache,
   };
+
+  if (kind === 'app') {
+    return {
+      ...baseApi,
+      updateState,
+      watchUpdates,
+      checkUpdates,
+      installUpdate,
+      setAutoUpdate,
+      dismissUpdateNotice,
+      maybeAutoInstall,
+    };
+  }
+  return baseApi;
 }
