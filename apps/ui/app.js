@@ -241,7 +241,7 @@ function App() {
   const [route, setRoute] = useState(() => parseRoute(window.location.hash));
   const [booting, setBooting] = useState(true);
   const [linkState, setLinkState] = useState(null);
-  const [tools, setTools] = useState(() => sessionCache.get('tools')?.value || []);
+  const [tools, setTools] = useState([]);
   const [snapshot, setSnapshot] = useState(null);
   const [fleetError, setFleetError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -366,6 +366,10 @@ function App() {
           build: n.build ?? old.build,
           protocol: n.protocol ?? old.protocol,
           whoami: n.whoami || old.whoami,
+          reachable: n.reachable !== undefined ? n.reachable : old.reachable,
+          whoamiStale: n.whoamiStale !== undefined ? n.whoamiStale : old.whoamiStale,
+          roleCheckedAt: n.roleCheckedAt || n.role_checked_at || old.roleCheckedAt || old.role_checked_at || null,
+          unreachableError: n.unreachableError !== undefined ? n.unreachableError : old.unreachableError,
         };
       });
       return {
@@ -389,20 +393,6 @@ function App() {
         learnInFlightRef.current = false;
       });
   }, [link, mergeBackendState]);
-
-  const handleActiveNodeChanged = useCallback(
-    (nextNode) => {
-      if (!nextNode) return;
-      setLinkState((prev) => {
-        if (!prev || !Array.isArray(prev.nodes)) return prev;
-        const idx = prev.nodes.findIndex((n) => n.node === nextNode);
-        if (idx <= 0) return prev;
-        const reordered = [prev.nodes[idx], ...prev.nodes.slice(0, idx), ...prev.nodes.slice(idx + 1)];
-        return { ...prev, nodes: reordered };
-      });
-    },
-    [],
-  );
 
   const refreshFleet = useCallback(
     async (activeNodeInfo, options = {}) => {
@@ -430,7 +420,6 @@ function App() {
           forceOffline: Boolean(options.forceOffline),
           checkOffline: settingsRef.current.checkOffline !== false,
           signal: ctrl.signal,
-          onActiveNodeChanged: handleActiveNodeChanged,
           onUpdate(next) {
             if (ctrl.signal.aborted) return;
             setSnapshot(next);
@@ -454,7 +443,7 @@ function App() {
         }
       }
     },
-    [link, persistentCache, handleActiveNodeChanged],
+    [link, persistentCache],
   );
 
   const handleAcceptIdentityChange = useCallback(
@@ -500,15 +489,20 @@ function App() {
       }
       setBooting(false);
 
-      link
-        .tools({})
-        .then((toolList) => {
-          if (Array.isArray(toolList)) {
-            setTools(toolList);
-            sessionCache.set('tools', toolList);
-          }
-        })
-        .catch(() => {});
+      const toolsCacheKey = `tools:${primary.node}`;
+      const cachedNodeTools = sessionCache.get(toolsCacheKey)?.value;
+      setTools(Array.isArray(cachedNodeTools) ? cachedNodeTools : []);
+      if (primary.reachable !== false) {
+        link
+          .tools({ on: primary.node })
+          .then((toolList) => {
+            if (Array.isArray(toolList) && nodeInfoRef.current?.node === primary.node) {
+              setTools(toolList);
+              sessionCache.set(toolsCacheKey, toolList);
+            }
+          })
+          .catch(() => {});
+      }
 
       refreshFleet(primary, { initialSnapshot: cachedSnap });
       triggerLearnInBackground();

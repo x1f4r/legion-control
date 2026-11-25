@@ -604,6 +604,43 @@ export function formatPairSyncNotice(lastPaired, technical = false) {
 }
 
 /**
+ * Formats a multi-introducer disagreement for Settings -> Connections.
+ * Plain mode gives one calm sentence naming the introducers and target machine; technical mode
+ * includes each introducer's reported address, port, user, and host-key fingerprints.
+ */
+export function formatDisagreementNotice(disagreement, technical = false) {
+  if (!disagreement || typeof disagreement !== 'object' || !disagreement.machine) return null;
+  const reports = Array.isArray(disagreement.reports) ? disagreement.reports : [];
+  const reporters = reports.map((r) => String(r?.reported_by || '').trim()).filter(Boolean);
+  const who =
+    reporters.length === 0
+      ? 'Paired machines'
+      : reporters.length === 1
+        ? reporters[0]
+        : reporters.length === 2
+          ? `${reporters[0]} and ${reporters[1]}`
+          : `${reporters.slice(0, -1).join(', ')} and ${reporters[reporters.length - 1]}`;
+  const title = `${who} describe ${disagreement.machine} differently; not connecting to it directly`;
+  const details = technical
+    ? reports.map((r) => {
+        const hosts = Array.isArray(r?.hosts) && r.hosts.length > 0 ? r.hosts.join(', ') : 'unknown';
+        const port = r?.port ? `:${r.port}` : '';
+        const user = r?.user ? `${r.user}@` : '';
+        const fps =
+          Array.isArray(r?.fingerprints) && r.fingerprints.length > 0
+            ? r.fingerprints.join(', ')
+            : 'no fingerprint';
+        return `${r.reported_by}: ${user}${hosts}${port} (${fps})`;
+      })
+    : [];
+  return {
+    machine: disagreement.machine,
+    title,
+    details,
+  };
+}
+
+/**
  * Describes how this device reaches a machine for Settings -> Connections.
  * Never exposes tool names when `technical` is false.
  */

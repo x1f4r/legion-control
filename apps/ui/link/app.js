@@ -50,6 +50,38 @@ function randomCallPrefix() {
   return Math.random().toString(16).slice(2, 10) + Date.now().toString(16);
 }
 
+function isPairingError(err) {
+  const reason = err?.details?.reason;
+  return (
+    err?.code === 'denied' &&
+    (reason === 'device_removed_or_unknown' ||
+      reason === 'auth_failed' ||
+      reason === 'host_key_mismatch')
+  );
+}
+
+function readCachedNodeIdentity(nodeName) {
+  if (!nodeName || typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage?.getItem(`legion.nodeIdentity.${nodeName}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedNodeIdentity(nodeName, entry) {
+  if (!nodeName || typeof window === 'undefined') return;
+  try {
+    window.localStorage?.setItem(`legion.nodeIdentity.${nodeName}`, JSON.stringify(entry));
+  } catch {
+    // Ignore storage quota or private-mode failures.
+  }
+}
+
 export function createAppLink() {
   const callPrefix = randomCallPrefix();
   let nextCallId = 1;
@@ -162,20 +194,45 @@ export function createAppLink() {
 
       await ensureLocalNetworkPermission();
 
+      const primary = base.nodes[0];
+      const targetNode = primary.node;
+
       try {
         const [whoami, version] = await Promise.all([
-          call('meta.whoami', {}),
-          call('meta.version', {}).catch(() => null),
+          call('meta.whoami', {}, { on: targetNode }),
+          call('meta.version', {}, { on: targetNode }).catch(() => null),
         ]);
-        // Re-read backend state in case failover switched the active node during the probe.
+        if (whoami?.node && whoami.node !== targetNode) {
+          throw {
+            code: 'denied',
+            message: `Expected identity from ${targetNode}, but ${whoami.node} answered.`,
+            hint: 'Check the connection settings for this machine.',
+            machine: targetNode,
+            details: { reason: 'node_mismatch', expected: targetNode, actual: whoami.node },
+          };
+        }
+        const checkedAt = new Date().toISOString();
         const latest = await rawState().catch(() => base);
-        const nodes = Array.isArray(latest?.nodes) && latest.nodes.length > 0 ? latest.nodes : base.nodes;
-        const primary = nodes[0];
+        const nodes =
+          Array.isArray(latest?.nodes) && latest.nodes.length > 0 ? latest.nodes : base.nodes;
+        const currentPrimary = nodes[0]?.node === targetNode ? nodes[0] : primary;
+        const resolvedPrincipal = whoami.principal || currentPrimary.principal;
+        const resolvedRole = whoami.role || currentPrimary.role;
+        writeCachedNodeIdentity(targetNode, {
+          principal: resolvedPrincipal,
+          role: resolvedRole,
+          tools: Array.isArray(whoami.tools) ? whoami.tools : null,
+          checkedAt,
+        });
         const enriched = {
-          ...primary,
-          node: whoami.node || primary.node,
-          principal: whoami.principal || primary.principal,
-          role: whoami.role || primary.role,
+          ...currentPrimary,
+          node: targetNode,
+          principal: resolvedPrincipal,
+          role: resolvedRole,
+          reachable: true,
+          whoamiStale: false,
+          roleCheckedAt: checkedAt,
+          unreachableError: null,
           version: version?.version || '',
           build: version?.build || null,
           protocol: version?.protocol ?? 1,
@@ -183,12 +240,44 @@ export function createAppLink() {
         };
         return {
           ...latest,
-          nodes: [enriched, ...nodes.slice(1)],
+          nodes: [enriched, ...nodes.filter((n) => n.node !== targetNode)],
         };
       } catch (err) {
+        const normalized = normalizeError(err);
+        if (isPairingError(normalized)) {
+          return {
+            ...base,
+            error: normalized,
+          };
+        }
+        // Selected machine did not answer: keep it selected and mark it unreachable with its
+        // last known role ("as of <when>"), never substituting another node's identity.
+        const cached = readCachedNodeIdentity(targetNode);
+        const lastRole = cached?.role || (primary.role && primary.role !== 'unknown' ? primary.role : null);
+        const lastPrincipal = cached?.principal || primary.principal || '';
+        const checkedAt = cached?.checkedAt || primary.role_checked_at || null;
+        const offlinePrimary = {
+          ...primary,
+          node: targetNode,
+          principal: lastPrincipal,
+          role: lastRole || primary.role || 'unknown',
+          reachable: false,
+          whoamiStale: true,
+          roleCheckedAt: checkedAt,
+          unreachableError: normalized,
+          whoami: lastRole
+            ? {
+                node: targetNode,
+                principal: lastPrincipal,
+                role: lastRole,
+                tools: Array.isArray(cached?.tools) ? cached.tools : null,
+                stale: true,
+              }
+            : null,
+        };
         return {
           ...base,
-          error: normalizeError(err),
+          nodes: [offlinePrimary, ...base.nodes.slice(1)],
         };
       }
     } finally {

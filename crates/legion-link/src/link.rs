@@ -148,8 +148,10 @@ impl LinkConfig {
     }
 
     /// Forgets `node`, records it in [`LinkConfig::forgotten_nodes`] so `learn` will not re-add it
-    /// automatically, and drops any learned entries whose `learned_from` was `node` (without
-    /// marking those dependents forgotten so another paired introducer may re-learn them).
+    /// automatically, drops any learned entries whose `learned_from` was `node` (without marking
+    /// those dependents forgotten so another paired introducer may re-learn them), and strips any
+    /// pending identity changes or conflicts that `node` reported on remaining paired or learned
+    /// entries (promoting a remaining conflict from another introducer or clearing the change).
     ///
     /// Returns every node name removed from [`LinkConfig::nodes`] (`node` first when present, then
     /// any dropped learned dependents).
@@ -169,6 +171,24 @@ impl LinkConfig {
                 !(n.origin == NodeOrigin::Learned && n.learned_from.as_deref() == Some(node))
             });
             removed.extend(dependents);
+        }
+        for entry in &mut self.nodes {
+            let Some(mut pending) = entry.identity_changed.take() else {
+                continue;
+            };
+            pending.conflicts.retain(|c| c.reported_by != node);
+            if pending.reported_by == node {
+                if !pending.conflicts.is_empty() {
+                    let promoted = pending.conflicts.remove(0);
+                    entry.identity_changed = Some(PendingIdentityChange {
+                        target: promoted.target,
+                        reported_by: promoted.reported_by,
+                        conflicts: pending.conflicts,
+                    });
+                }
+            } else {
+                entry.identity_changed = Some(pending);
+            }
         }
         if !node.is_empty() && !self.forgotten_nodes.iter().any(|n| n == node) {
             self.forgotten_nodes.push(node.to_owned());
@@ -352,6 +372,24 @@ pub struct PendingIdentityChange {
     pub conflicts: Vec<ConflictingIdentityReport>,
 }
 
+/// One paired introducer's description of a machine involved in a [`LearnDisagreement`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisagreementReport {
+    /// Directly paired node that reported this endpoint.
+    pub reported_by: String,
+    /// Endpoint target reported by `reported_by`.
+    pub target: SshTarget,
+}
+
+/// Two or more directly paired introducers returned differing endpoint descriptions for `machine`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnDisagreement {
+    /// Machine name that was not pinned because paired introducers disagreed.
+    pub machine: String,
+    /// Conflicting endpoint reports, sorted by `reported_by`.
+    pub reports: Vec<DisagreementReport>,
+}
+
 /// Summary returned by [`Link::learn`] and [`Link::learn_from`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearnReport {
@@ -368,10 +406,13 @@ pub struct LearnReport {
     /// route changed via a different introducer); old pins were kept and the entries were marked
     /// with [`NodeLink::identity_changed`].
     pub identity_changed: Vec<String>,
-    /// New machines that were not pinned because reachable paired introducers disagreed on their
-    /// host keys (or did not all report them).
+    /// New machines that were not pinned because two or more paired introducers reported
+    /// differing endpoints or host keys for them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disagreements: Vec<String>,
+    /// Detailed per-introducer reports for each machine listed in [`LearnReport::disagreements`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disagreement_details: Vec<LearnDisagreement>,
     /// Machines that returned an error during `device.endpoint` fan-out.
     pub unreachable: Vec<String>,
     /// Machines whose `device.endpoint` reply failed validation (for example mismatched node name,
@@ -800,6 +841,16 @@ impl Link {
             self.clear_route_state(node);
             self.evict(node).await;
         }
+        self.inner
+            .routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, status| {
+                !matches!(
+                    status,
+                    MachineRouteStatus::IdentityChanged { reported_by } if reported_by == node
+                )
+            });
         removed_self
     }
 
@@ -1238,15 +1289,28 @@ impl Link {
                     rejected_set.insert(machine);
                     continue;
                 }
-                // When two or more paired introducers are reachable, pin a brand-new machine ONLY
-                // when all reachable paired introducers report it and agree on its host keys.
-                if total_introducers >= 2 {
-                    let first_keys = canonical_host_keys(&reports[0].1.host_keys);
-                    let all_agree = reports.len() == total_introducers
-                        && reports
-                            .iter()
-                            .all(|(_, t)| canonical_host_keys(&t.host_keys) == first_keys);
+                // When two or more paired introducers report this brand-new machine, pin it only
+                // if all reports agree. An error/unreachable reply from another paired node is an
+                // abstention, not a disagreement, so a single reporting paired node pins on its
+                // own when no other paired node can see the machine.
+                if reports.len() >= 2 {
+                    let first_target = reports[0].1;
+                    let all_agree = reports
+                        .iter()
+                        .all(|(_, t)| same_endpoint_target(first_target, t));
                     if !all_agree {
+                        let mut detail_reports: Vec<DisagreementReport> = reports
+                            .iter()
+                            .map(|(intro, target)| DisagreementReport {
+                                reported_by: (*intro).to_owned(),
+                                target: (*target).clone(),
+                            })
+                            .collect();
+                        detail_reports.sort_by(|a, b| a.reported_by.cmp(&b.reported_by));
+                        report.disagreement_details.push(LearnDisagreement {
+                            machine: machine.clone(),
+                            reports: detail_reports,
+                        });
                         report.disagreements.push(machine);
                         continue;
                     }
@@ -1277,6 +1341,9 @@ impl Link {
         report.updated.sort();
         report.identity_changed.sort();
         report.disagreements.sort();
+        report
+            .disagreement_details
+            .sort_by(|a, b| a.machine.cmp(&b.machine));
         report.unreachable = unreachable_set.into_iter().collect();
         report.rejected = rejected_set.into_iter().collect();
         report
@@ -2559,12 +2626,17 @@ async fn default_open_session(
                 .with_machine(&entry.node)
             })?;
             let key = crate::key::DeviceKey::from_openssh(key_text)?;
-            return crate::ssh::open(
+            let policy = crate::ssh::ConnectPolicy {
+                restrict_resolved_addrs: entry.origin == NodeOrigin::Learned,
+                allow_loopback: options.allow_loopback_endpoints,
+            };
+            return crate::ssh::open_with_policy(
                 &entry.node,
                 _target,
                 &key,
                 crate::command::Subcommand::Rpc,
                 options.ssh_timeouts,
+                policy,
                 cancel,
             )
             .await;
@@ -2737,38 +2809,75 @@ fn is_allowed_ipv4(ip: std::net::Ipv4Addr, allow_loopback: bool) -> bool {
     true
 }
 
+pub(crate) fn is_allowed_ip(ip: std::net::IpAddr, allow_loopback: bool) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_allowed_ipv4(v4, allow_loopback),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            if v6.is_loopback() {
+                return allow_loopback;
+            }
+            let segs = v6.segments();
+            if (segs[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_allowed_ipv4(v4, allow_loopback);
+            }
+            // IPv4-compatible IPv6 (`::a.b.c.d`, deprecated in RFC 4291 but still parsed by
+            // resolvers): treat as its embedded IPv4 address.
+            if segs[0..6] == [0, 0, 0, 0, 0, 0] {
+                let [a, b] = segs[6].to_be_bytes();
+                let [c, d] = segs[7].to_be_bytes();
+                return is_allowed_ipv4(std::net::Ipv4Addr::new(a, b, c, d), allow_loopback);
+            }
+            true
+        }
+    }
+}
+
+/// Returns `true` when `label` (already lowercased) would be parsed as an integer by the
+/// POSIX/BSD `inet_aton` IPv4 parser family (decimal, octal with leading `0`, or `0x` hex).
+fn is_numeric_ipv4_label(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    if label.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    if let Some(hex) = label.strip_prefix("0x") {
+        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    false
+}
+
 fn is_allowed_endpoint_host(raw: &str, allow_loopback: bool) -> bool {
     let stripped = raw
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(raw);
     // Scoped IPv6 literals (e.g. `fe80::1%eth0`) are link-local and rejected.
-    if let Some((addr_part, _zone)) = stripped.split_once('%') {
-        if addr_part.parse::<std::net::Ipv6Addr>().is_ok() {
-            return false;
-        }
+    if stripped.contains('%') {
         return false;
     }
     if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_allowed_ipv4(v4, allow_loopback),
-            std::net::IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    return is_allowed_ipv4(v4, allow_loopback);
-                }
-                let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-                if v6.is_unspecified() || is_link_local || v6.is_multicast() {
-                    return false;
-                }
-                if v6.is_loopback() && !allow_loopback {
-                    return false;
-                }
-                true
-            }
-        };
+        return is_allowed_ip(ip, allow_loopback);
     }
     let lowered = stripped.trim_end_matches('.').to_ascii_lowercase();
     if lowered.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = lowered.split('.').collect();
+    if labels.iter().any(|l| l.is_empty()) {
+        return false;
+    }
+    // Reject any non-canonical numeric IPv4 form (`2130706433`, `0x7f.1`, `0x7f000001`, `127.1`,
+    // `0177.0.0.1`, `0`, or any host ending in a numeric/hex label).
+    if labels.iter().all(|l| is_numeric_ipv4_label(l))
+        || labels.last().is_some_and(|l| is_numeric_ipv4_label(l))
+    {
         return false;
     }
     if !allow_loopback && (lowered == "localhost" || lowered.ends_with(".localhost")) {
@@ -5921,5 +6030,393 @@ mod tests {
         let key = crate::key::DeviceKey::from_seed([77u8; 32]);
         let line = key.public_key_line("host").unwrap();
         assert_eq!(public_key_fingerprint(&line), Some(key.fingerprint()));
+    }
+
+    #[test]
+    fn endpoint_host_filter_rejects_numeric_and_ipv4_compatible_bypasses() {
+        // Every non-canonical numeric/hex/octal/short IPv4 form and disallowed IPv6 form MUST be
+        // rejected when allow_loopback is false.
+        let rejected_default = [
+            "2130706433",
+            "0x7f.1",
+            "0x7f000001",
+            "0X7F000001",
+            "127.1",
+            "127.0.1",
+            "0177.0.0.1",
+            "0177.1",
+            "0x7f.0.0.1",
+            "0",
+            "0.0",
+            "0x0",
+            "00",
+            "foo.1",
+            "bar.0x1",
+            "::127.0.0.1",
+            "[::127.0.0.1]",
+            "::0:7f00:1",
+            "::ffff:127.0.0.1",
+            "[::ffff:127.0.0.1]",
+            "::0.0.0.0",
+            "::169.254.169.254",
+            "::224.0.0.1",
+            "::255.255.255.255",
+            "::ffff:169.254.1.1",
+            "::ffff:0.0.0.0",
+            "::ffff:224.0.0.1",
+            "::ffff:255.255.255.255",
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "sub.localhost",
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "fe80::1",
+            "fe80::1%eth0",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ];
+        for host in rejected_default {
+            assert!(
+                !is_allowed_endpoint_host(host, false),
+                "expected host {host:?} to be rejected with allow_loopback=false"
+            );
+        }
+
+        // Non-canonical numeric forms are also rejected even when allow_loopback=true.
+        for host in [
+            "2130706433",
+            "0x7f.1",
+            "0x7f000001",
+            "127.1",
+            "0177.0.0.1",
+            "0",
+        ] {
+            assert!(
+                !is_allowed_endpoint_host(host, true),
+                "expected non-canonical numeric host {host:?} to be rejected even with allow_loopback=true"
+            );
+        }
+
+        // Legitimate canonical loopback works ONLY when allow_loopback=true.
+        for host in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "::127.0.0.1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                is_allowed_endpoint_host(host, true),
+                "expected loopback host {host:?} to be allowed with allow_loopback=true"
+            );
+        }
+
+        // Legitimate hosts and addresses are allowed.
+        for host in [
+            "10.0.2.2",
+            "100.64.0.1",
+            "192.0.2.10",
+            "2001:db8::1",
+            "[2001:db8::1]",
+            "tower",
+            "pi",
+            "node-1",
+            "tower.example.net",
+            "node1.example.net.",
+        ] {
+            assert!(
+                is_allowed_endpoint_host(host, false),
+                "expected legitimate host {host:?} to be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forget_clears_or_promotes_pending_identity_changes_and_conflicts_reported_by_node() {
+        let key_a = test_host_key(101);
+        let key_b = test_host_key(102);
+        let key_c = test_host_key(103);
+        let key_c_new = test_host_key(104);
+        let key_d = test_host_key(105);
+        let key_d_b = test_host_key(106);
+        let key_d_e = test_host_key(107);
+        let key_e = test_host_key(108);
+        let key_f = test_host_key(109);
+        let key_f_e = test_host_key(110);
+        let key_f_b = test_host_key(111);
+
+        let target_for = |host: &str, key: &str| SshTarget {
+            hosts: vec![host.to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![key.to_owned()],
+        };
+
+        let mut node_a = NodeLink::ssh("a", target_for("a.example.net", &key_a), None);
+        node_a.identity_changed = Some(PendingIdentityChange {
+            target: target_for("a-evil.example.net", &key_c_new),
+            reported_by: "b".to_owned(),
+            conflicts: Vec::new(),
+        });
+
+        let node_b = NodeLink::ssh("b", target_for("b.example.net", &key_b), None);
+        let node_e = NodeLink::ssh("e", target_for("e.example.net", &key_e), None);
+
+        let mut node_c = NodeLink::learned("c", target_for("c.example.net", &key_c), None, "a");
+        node_c.identity_changed = Some(PendingIdentityChange {
+            target: target_for("c-new.example.net", &key_c_new),
+            reported_by: "b".to_owned(),
+            conflicts: Vec::new(),
+        });
+
+        let mut node_d = NodeLink::learned("d", target_for("d.example.net", &key_d), None, "a");
+        node_d.identity_changed = Some(PendingIdentityChange {
+            target: target_for("d-from-b.example.net", &key_d_b),
+            reported_by: "b".to_owned(),
+            conflicts: vec![ConflictingIdentityReport {
+                target: target_for("d-from-e.example.net", &key_d_e),
+                reported_by: "e".to_owned(),
+            }],
+        });
+
+        let mut node_f = NodeLink::learned("f", target_for("f.example.net", &key_f), None, "a");
+        node_f.identity_changed = Some(PendingIdentityChange {
+            target: target_for("f-from-e.example.net", &key_f_e),
+            reported_by: "e".to_owned(),
+            conflicts: vec![ConflictingIdentityReport {
+                target: target_for("f-from-b.example.net", &key_f_b),
+                reported_by: "b".to_owned(),
+            }],
+        });
+
+        let link = Link::new(LinkConfig {
+            device_key: None,
+            nodes: vec![node_a, node_b, node_e, node_c, node_d, node_f],
+            forgotten_nodes: Vec::new(),
+        });
+
+        link.forget("b").await;
+        let cfg = link.config();
+
+        // 1. Single-reporter pending changes on both paired (`a`) and learned (`c`) are cleared.
+        assert!(
+            cfg.node("a").unwrap().identity_changed.is_none(),
+            "forgetting b must clear informational warning b reported on paired node a"
+        );
+        assert!(
+            cfg.node("c").unwrap().identity_changed.is_none(),
+            "forgetting b must clear pending identity change b reported on learned node c"
+        );
+        let fp_c_new = public_key_fingerprint(&key_c_new).unwrap();
+        let err = link
+            .accept_identity_change("c", std::slice::from_ref(&fp_c_new))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs);
+
+        // 2. When b was primary reporter on `d` and `e` was a conflict, `e` is promoted cleanly.
+        let d_pending = cfg
+            .node("d")
+            .unwrap()
+            .identity_changed
+            .as_ref()
+            .expect("e's remaining report on d should be promoted");
+        assert_eq!(d_pending.reported_by, "e");
+        assert_eq!(d_pending.target.hosts, vec!["d-from-e.example.net"]);
+        assert!(d_pending.conflicts.is_empty());
+
+        // 3. When b was in `conflicts` on `f`, b's conflict is removed leaving `e` clean.
+        let f_pending = cfg
+            .node("f")
+            .unwrap()
+            .identity_changed
+            .as_ref()
+            .expect("e's primary report on f should stay");
+        assert_eq!(f_pending.reported_by, "e");
+        assert!(f_pending.conflicts.is_empty());
+
+        // 4. Route status for `c` no longer reports IdentityChanged from `b`.
+        let routes = link.route_status();
+        assert_eq!(routes.get("c"), Some(&MachineRouteStatus::Direct));
+        assert_eq!(
+            routes.get("d"),
+            Some(&MachineRouteStatus::IdentityChanged {
+                reported_by: "e".to_owned()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_reachability_abstention_learns_while_differing_reports_disagree() {
+        let key_tower = test_host_key(120);
+        let key_pi = test_host_key(121);
+        let key_edge = test_host_key(122);
+        let key_studio_a = test_host_key(123);
+        let key_studio_b = test_host_key(124);
+
+        let answers: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+        let answers_c = Arc::clone(&answers);
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let answers_c = Arc::clone(&answers_c);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        let resp = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            )
+                        } else {
+                            let body = answers_c
+                                .lock()
+                                .unwrap()
+                                .get(&node_name)
+                                .cloned()
+                                .unwrap_or_else(|| json!({ "results": {} }));
+                            Response::ok(req.id, body)
+                        };
+                        let _ = server_w
+                            .write_all(
+                                format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes(),
+                            )
+                            .await;
+                        let _ = server_w.flush().await;
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        {
+            let mut map = answers.lock().unwrap();
+            map.insert(
+                "tower".to_owned(),
+                json!({
+                    "results": {
+                        "edge": {
+                            "ok": {
+                                "node": "edge",
+                                "hosts": ["edge.example.net"],
+                                "port": 22,
+                                "user": "me",
+                                "host_keys": [key_edge],
+                            }
+                        },
+                        "studio": {
+                            "ok": {
+                                "node": "studio",
+                                "hosts": ["studio.example.net"],
+                                "port": 22,
+                                "user": "me",
+                                "host_keys": [key_studio_a],
+                            }
+                        }
+                    }
+                }),
+            );
+            map.insert(
+                "pi".to_owned(),
+                json!({
+                    "results": {
+                        // pi cannot reach edge: honest abstention (error), NOT a disagreement!
+                        "edge": {
+                            "error": {
+                                "code": "unreachable",
+                                "message": "edge did not answer."
+                            }
+                        },
+                        // pi returns a differing report for studio: REAL disagreement!
+                        "studio": {
+                            "ok": {
+                                "node": "studio",
+                                "hosts": ["studio-other.example.net"],
+                                "port": 2222,
+                                "user": "me",
+                                "host_keys": [key_studio_b],
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![
+                    NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["tower.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![key_tower],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                    NodeLink::ssh(
+                        "pi",
+                        SshTarget {
+                            hosts: vec!["pi.example.net".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![key_pi],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                ],
+                forgotten_nodes: Vec::new(),
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        let report = link.learn().await.unwrap();
+        // edge was reported by tower and abstained on by pi -> learned cleanly!
+        assert_eq!(report.added, vec!["edge".to_owned()]);
+        assert!(link.config().node("edge").is_some());
+        assert_eq!(
+            link.config().node("edge").unwrap().learned_from.as_deref(),
+            Some("tower")
+        );
+        // studio had two differing reports -> NOT pinned, recorded as disagreement with details!
+        assert_eq!(report.disagreements, vec!["studio".to_owned()]);
+        assert_eq!(report.disagreement_details.len(), 1);
+        assert_eq!(report.disagreement_details[0].machine, "studio");
+        assert_eq!(report.disagreement_details[0].reports.len(), 2);
+        assert_eq!(report.disagreement_details[0].reports[0].reported_by, "pi");
+        assert_eq!(
+            report.disagreement_details[0].reports[1].reported_by,
+            "tower"
+        );
+        assert!(link.config().node("studio").is_none());
+        link.close().await;
     }
 }

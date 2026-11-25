@@ -16,6 +16,7 @@ import {
   extractInviteRoles,
   findIncomingDevice,
   formatDeviceRemovedNotice,
+  formatDisagreementNotice,
   formatInvitedDeviceSyncNotice,
   formatPairSyncNotice,
   isInviteOwnerStrength,
@@ -465,6 +466,22 @@ test('describeConnectionRoute and buildRelayedConnections render direct, relay, 
       ['nas', 'relay', 'tower'],
     ],
   );
+
+  const disagree = {
+    machine: 'studio',
+    reports: [
+      { reported_by: 'tower', hosts: ['studio.example.net'], port: 22, user: 'me', fingerprints: ['SHA256:aaa'] },
+      { reported_by: 'pi', hosts: ['studio-alt.example.net'], port: 2222, user: 'me', fingerprints: ['SHA256:bbb'] },
+    ],
+  };
+  const plainDis = formatDisagreementNotice(disagree, false);
+  assert.equal(plainDis.title, 'tower and pi describe studio differently; not connecting to it directly');
+  assert.deepEqual(plainDis.details, []);
+  const techDis = formatDisagreementNotice(disagree, true);
+  assert.equal(techDis.title, plainDis.title);
+  assert.equal(techDis.details.length, 2);
+  assert.match(techDis.details[0], /tower: me@studio\.example\.net:22 \(SHA256:aaa\)/);
+  assert.match(techDis.details[1], /pi: me@studio-alt\.example\.net:2222 \(SHA256:bbb\)/);
 });
 
 test('extractInviteRoles, normalizeNodeRoles, and live policy analysis never hardcode descriptions by role name', () => {

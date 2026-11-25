@@ -1037,6 +1037,58 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText('This device may not see the roles on tower; ask the owner.').waitFor();
     await assertNoToolNames(p, 'fleet invite policy refused plain');
 
+    // 6b. Switching to a target whose tool catalogue cannot be read (`mini`) says so instead of
+    //     falling back to another machine's catalogue.
+    const machineSelect = p.locator('label.field:has-text("Machine") select');
+    await machineSelect.selectOption('mini');
+    await p.getByText('Could not read what mini supports right now.').waitFor();
+    assert.equal(
+      await p.getByRole('button', { name: 'Make invite' }).count(),
+      0,
+      'Invite form must not fall back to another machine catalogue when target catalogue fails',
+    );
+    await assertNoToolNames(p, 'fleet invite target catalogue error plain');
+
+    // 7. Unreachable selected node (`aoff`): keeps selected node (`tower`) shown as unreachable
+    //    with its last known role marked "as of <when>", never adopting answering peer (`pi`).
+    await p.goto(`${server.url}/?mock=fleet,aoff#/settings/device`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('tower is unreachable right now.').waitFor();
+    await p.getByText(/as of /i).first().waitFor();
+    await p.getByText('tower (unreachable)').waitFor();
+    await assertNoToolNames(p, 'offline selected node device page plain');
+
+    // 8. Real introducer disagreement (`disagree`): plain wording in Connections, with per-reporter
+    //    host/port/fingerprint detail in technical mode.
+    await p.goto(`${server.url}/?mock=fleet,disagree#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('tower and pi describe studio differently; not connecting to it directly').waitFor();
+    await assertNoToolNames(p, 'fleet connections disagreement plain');
+    await p.goto(`${server.url}/?mock=fleet,disagree,tech#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText('tower and pi describe studio differently; not connecting to it directly').waitFor();
+    await p.getByText(/SHA256:studioTowerKey1111/).waitFor();
+    await p.getByText(/SHA256:studioPiKey2222/).waitFor();
+
+    // 9. Effectful tool run from Tools with target "all" expands to the explicit list of machine
+    //    names shown in the confirmation sheet and sends that exact array (never literal "all").
+    await p.goto(`${server.url}/?mock=fleet,tech#/actions/all/power.restart`, {
+      waitUntil: 'domcontentloaded',
+    });
+    const onSelect = p.locator('#tool-target-on');
+    await onSelect.waitFor();
+    await onSelect.selectOption('all');
+    await p.getByRole('button', { name: 'Restart tower, pi, studio' }).click();
+    await p.locator('.sheet').getByText('Restart tower, pi, studio now?').waitFor();
+    await p.locator('.sheet .btn.danger').click();
+    await p.locator('.sheet').waitFor({ state: 'hidden' });
+    const lastCall = await p.evaluate(() => window.__LEGION_MOCK_LAST_CALL__);
+    assert.equal(lastCall.tool, 'power.restart');
+    assert.deepEqual(lastCall.on, ['tower', 'pi', 'studio']);
+
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);

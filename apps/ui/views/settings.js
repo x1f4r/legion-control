@@ -24,6 +24,7 @@ import {
   extractInviteRoles,
   findIncomingDevice,
   formatDeviceRemovedNotice,
+  formatDisagreementNotice,
   formatInvitedDeviceSyncNotice,
   formatPairSyncNotice,
   isInviteOwnerStrength,
@@ -53,6 +54,14 @@ function ThisDevicePage({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const whoami = nodeInfo?.whoami;
+  const unreachable = nodeInfo?.reachable === false;
+  const checkedAt = nodeInfo?.roleCheckedAt || nodeInfo?.role_checked_at || null;
+  const asOfSuffix =
+    unreachable || whoami?.stale
+      ? checkedAt
+        ? ` (as of ${formatRelativeTime(checkedAt)})`
+        : ' (last known)'
+      : '';
   const plainPerms = describePlainPermissions(whoami, tools);
   const roleLines = describeRoleAccess(whoami, tools);
 
@@ -80,6 +89,17 @@ function ThisDevicePage({
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${unreachable
+        ? html`
+            <${Notice}
+              title=${`${nodeInfo?.node || 'This machine'} is unreachable right now.`}
+              hint=${checkedAt
+                ? `Showing the last known role on ${nodeInfo?.node || 'this machine'} as of ${formatRelativeTime(checkedAt)}.`
+                : `Showing the last known role on ${nodeInfo?.node || 'this machine'}.`}
+              kind="warn"
+            />
+          `
+        : null}
 
       <p class="label">Identity</p>
       <div class="list">
@@ -87,13 +107,13 @@ function ThisDevicePage({
           <dt>${technical ? 'principal' : 'Name'}</dt>
           <dd>${whoami?.principal || nodeInfo?.principal || 'Unknown'}</dd>
           <dt>${technical ? 'node' : 'Connected to'}</dt>
-          <dd>${whoami?.node || nodeInfo?.node || 'Unknown'}</dd>
+          <dd>${nodeInfo?.node || whoami?.node || 'Unknown'}${unreachable ? ' (unreachable)' : ''}</dd>
           <dt>${technical ? 'access' : 'What it can do'}</dt>
-          <dd>${plainPerms}</dd>
+          <dd>${plainPerms}${asOfSuffix}</dd>
           ${technical
             ? html`
                 <dt>role</dt>
-                <dd>${whoami?.role || nodeInfo?.role || 'unknown'}</dd>
+                <dd>${whoami?.role || nodeInfo?.role || 'unknown'}${asOfSuffix}</dd>
                 <dt>door</dt>
                 <dd>${whoami?.door || link.kind}</dd>
                 <dt>allows</dt>
@@ -239,10 +259,7 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
 function InviteDeviceSubpage({
   link,
   linkState,
-  tools,
-  allowedSet,
   nodeInfo,
-  incomingDevices,
   technical,
   onDevicePaired,
 }) {
@@ -261,40 +278,97 @@ function InviteDeviceSubpage({
     }
   }, [targetNode, initialTarget, availableNodes]);
 
-  const [targetTools, setTargetTools] = useState(tools || []);
+  // Load tool catalogue, caller identity, and existing devices strictly from `targetNode`.
+  // Never fall back to another machine's tool catalogue, permissions, or device list.
+  const [catalog, setCatalog] = useState({
+    status: 'loading',
+    node: '',
+    tools: [],
+    error: null,
+  });
+  const [targetWhoami, setTargetWhoami] = useState(null);
+  const [targetDevices, setTargetDevices] = useState([]);
+
   useEffect(() => {
     if (!targetNode || typeof link.tools !== 'function') {
-      setTargetTools(tools || []);
+      setCatalog({ status: 'error', node: targetNode, tools: [], error: null });
+      setTargetWhoami(null);
+      setTargetDevices([]);
       return;
     }
     let alive = true;
-    link
-      .tools({ on: targetNode })
-      .then((list) => {
-        if (alive && Array.isArray(list) && list.length > 0) setTargetTools(list);
-      })
-      .catch(() => {
-        if (alive && targetNode === nodeInfo?.node) setTargetTools(tools || []);
-      });
+    setCatalog({ status: 'loading', node: targetNode, tools: [], error: null });
+    setTargetWhoami(null);
+    setTargetDevices([]);
+
+    Promise.all([
+      link.tools({ on: targetNode }).then(
+        (list) => ({ ok: true, list: Array.isArray(list) ? list : [] }),
+        (err) => ({ ok: false, error: err }),
+      ),
+      link
+        .call('meta.whoami', {}, { on: targetNode })
+        .catch(() => null),
+    ]).then(([toolsRes, whoamiRes]) => {
+      if (!alive) return;
+      if (whoamiRes && (!whoamiRes.node || whoamiRes.node === targetNode)) {
+        setTargetWhoami(whoamiRes);
+      }
+      if (toolsRes.ok && toolsRes.list.length > 0) {
+        setCatalog({ status: 'ready', node: targetNode, tools: toolsRes.list, error: null });
+      } else {
+        setCatalog({
+          status: 'error',
+          node: targetNode,
+          tools: [],
+          error: toolsRes.ok ? null : toolsRes.error,
+        });
+      }
+    });
+
     return () => {
       alive = false;
     };
-  }, [link, targetNode, nodeInfo?.node, tools]);
+  }, [link, targetNode]);
 
-  const activeTools = targetTools?.length > 0 ? targetTools : tools || [];
+  const targetToolsReady = catalog.status === 'ready' && catalog.node === targetNode;
+  const activeTools = targetToolsReady ? catalog.tools : [];
+  const targetAllowedSet = useMemo(
+    () => (Array.isArray(targetWhoami?.tools) ? new Set(targetWhoami.tools) : null),
+    [targetWhoami],
+  );
   const inviteSpec = useMemo(() => activeTools.find((t) => t.name === 'device.invite'), [activeTools]);
   const inviteProps = inviteSpec?.input_schema?.properties || {};
   const roleProp = inviteProps.role || null;
   const hasNameProp = Boolean(inviteProps.name);
   const hasAllowOwner = Boolean(inviteProps.allow_owner);
-  const defaultIdentity = nodeInfo?.whoami?.principal || 'phone';
+  const defaultIdentity = targetWhoami?.principal || 'phone';
   const hasDeviceRolesTool = Boolean(activeTools.find((t) => t.name === 'device.roles'));
   const canReadPolicy =
     Boolean(activeTools.find((t) => t.name === 'config.read')) &&
-    (!allowedSet || targetNode !== nodeInfo?.node || allowedSet.has('config.read'));
+    (!targetAllowedSet || targetAllowedSet.has('config.read'));
   const canListDevices =
     Boolean(activeTools.find((t) => t.name === 'device.list')) &&
-    (!allowedSet || targetNode !== nodeInfo?.node || allowedSet.has('device.list'));
+    (!targetAllowedSet || targetAllowedSet.has('device.list'));
+
+  useEffect(() => {
+    if (!targetToolsReady || !canListDevices || !targetNode) {
+      setTargetDevices([]);
+      return;
+    }
+    let alive = true;
+    link
+      .call('device.list', {}, { on: targetNode })
+      .then((res) => {
+        if (alive) setTargetDevices(Array.isArray(res?.devices) ? res.devices : []);
+      })
+      .catch(() => {
+        if (alive) setTargetDevices([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [link, targetNode, targetToolsReady, canListDevices]);
 
   const [principal, setPrincipal] = useState(defaultIdentity);
   const [deviceLabel, setDeviceLabel] = useState('');
@@ -314,7 +388,7 @@ function InviteDeviceSubpage({
   // Load roles from `device.roles` on the target machine when offered; otherwise fall back to
   // reading `policy.toml` on that same named machine. Never guess if both are refused/unavailable.
   useEffect(() => {
-    if (!targetNode || (!hasAllowOwner && !roleProp)) {
+    if (!targetToolsReady || !targetNode || (!hasAllowOwner && !roleProp)) {
       setNodeRoles(null);
       setPolicy(null);
       setRolesStatus('idle');
@@ -372,7 +446,7 @@ function InviteDeviceSubpage({
     return () => {
       alive = false;
     };
-  }, [link, targetNode, hasAllowOwner, roleProp, hasDeviceRolesTool, canReadPolicy]);
+  }, [link, targetNode, targetToolsReady, hasAllowOwner, roleProp, hasDeviceRolesTool, canReadPolicy]);
 
   const roleOptions = useMemo(() => {
     if (Array.isArray(nodeRoles)) return nodeRoles;
@@ -406,8 +480,8 @@ function InviteDeviceSubpage({
             role,
             usesRoleName,
             policy,
-            whoami: targetNode === nodeInfo?.node ? nodeInfo?.whoami : null,
-            incomingDevices,
+            whoami: targetWhoami,
+            incomingDevices: targetDevices,
           })),
   );
 
@@ -479,21 +553,22 @@ function InviteDeviceSubpage({
   async function onCreate(e) {
     e.preventDefault();
     const who = activeLabel.trim();
-    if (!who || !targetNode) return;
+    if (!who || !targetNode || !targetToolsReady || !inviteSpec) return;
     setBusy(true);
     setError(null);
     setPairedDelivery(null);
     try {
       const deviceKey = (d) => d?.id || d?.fingerprint || `${d?.name || ''}:${d?.principal || ''}`;
-      beforeDeviceKeysRef.current = new Set((incomingDevices || []).map(deviceKey));
+      beforeDeviceKeysRef.current = new Set((targetDevices || []).map(deviceKey));
       if (canListDevices) {
         try {
           const cur = await link.call('device.list', {}, { on: targetNode });
           if (Array.isArray(cur?.devices)) {
+            setTargetDevices(cur.devices);
             beforeDeviceKeysRef.current = new Set(cur.devices.map(deviceKey));
           }
         } catch {
-          // Keep snapshot from props.
+          // Keep target-scoped device snapshot.
         }
       }
 
@@ -543,6 +618,7 @@ function InviteDeviceSubpage({
                     setRole('');
                     setRoleTouched(false);
                     setAllowOwner(false);
+                    setError(null);
                     setInviteRes(null);
                     setPairedDelivery(null);
                   }}
@@ -555,7 +631,25 @@ function InviteDeviceSubpage({
             `
           : null}
 
-        <label class="field">
+        ${catalog.status === 'loading'
+          ? html`<p class="lede">Checking ${targetNode || 'this machine'}…</p>`
+          : catalog.status === 'error'
+            ? html`
+                <${Notice}
+                  kind="bad"
+                  title=${`Could not read what ${targetNode || 'this machine'} supports right now.`}
+                  hint=${technical && catalog.error?.message ? catalog.error.message : null}
+                />
+              `
+            : !inviteSpec
+              ? html`
+                  <${Notice}
+                    kind="warn"
+                    title=${`${targetNode || 'This machine'} does not offer device invites for this account.`}
+                  />
+                `
+              : html`
+                  <label class="field">
           <span>
             ${usesRoleName
               ? technical
@@ -706,6 +800,7 @@ function InviteDeviceSubpage({
             ${busy ? 'Making invite…' : inviteRes ? 'Make a new invite' : 'Make invite'}
           </button>
         </div>
+              `}
       </form>
 
       ${deliveryNotice
@@ -1303,10 +1398,7 @@ function ConnectionsPage({
       <${InviteDeviceSubpage}
         link=${link}
         linkState=${linkState}
-        tools=${tools}
-        allowedSet=${allowedSet}
         nodeInfo=${nodeInfo}
-        incomingDevices=${incoming?.devices || []}
         technical=${technical}
         onDevicePaired=${loadIncoming}
       />
@@ -1375,6 +1467,7 @@ function ConnectionsPage({
   const nodes = linkState?.nodes || [];
   const relayed = link.kind === 'app' ? buildRelayedConnections(linkState, snapshot) : [];
   const identityChangedNodes = nodes.filter((n) => Boolean(n.identity_changed));
+  const disagreements = Array.isArray(linkState?.disagreements) ? linkState.disagreements : [];
   const syncBanner = formatPairSyncNotice(pairNotice, technical);
   const hasMakeSection = link.kind === 'app' || canInvite || canFleetAdd;
   const incomingDevices = incoming?.devices || [];
@@ -1432,6 +1525,21 @@ function ConnectionsPage({
                 Review
               </a>
             </div>
+          </div>
+        `;
+      })}
+
+      ${disagreements.map((d) => {
+        const formatted = formatDisagreementNotice(d, technical);
+        if (!formatted) return null;
+        return html`
+          <div class="notice" key=${`disagree:${formatted.machine}`} role="status">
+            <strong>${formatted.title}</strong>
+            ${technical && formatted.details.length > 0
+              ? formatted.details.map(
+                  (line, i) => html`<span class="mono" key=${i}>${line}</span>`,
+                )
+              : html`<span>Pair with ${formatted.machine} directly to connect to it without relying on another machine.</span>`}
           </div>
         `;
       })}
@@ -1832,7 +1940,12 @@ export function SettingsView({
 }) {
   const technical = Boolean(settings?.technical);
   const whoami = nodeInfo?.whoami;
+  const unreachable = nodeInfo?.reachable === false;
+  const checkedAt = nodeInfo?.roleCheckedAt || nodeInfo?.role_checked_at || null;
   const plainPerms = describePlainPermissions(whoami, tools);
+  const deviceSub = unreachable
+    ? `${nodeInfo?.node || 'Machine'} unreachable · ${plainPerms}${checkedAt ? ` (as of ${formatRelativeTime(checkedAt)})` : ' (last known)'}`
+    : `${whoami?.principal || nodeInfo?.principal || capitalize(deviceNoun)} · ${plainPerms}`;
   const nodeCount = (linkState?.nodes || []).length;
   const selectedPage = wide ? route.page || 'device' : route.page || null;
 
@@ -1848,9 +1961,7 @@ export function SettingsView({
         >
           <span class="body">
             <span class="title">This ${deviceNoun}</span>
-            <span class="sub">
-              ${whoami?.principal || nodeInfo?.principal || capitalize(deviceNoun)} · ${plainPerms}
-            </span>
+            <span class="sub">${deviceSub}</span>
           </span>
           <span class="chev" aria-hidden="true">›</span>
         </a>

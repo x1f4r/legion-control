@@ -380,12 +380,8 @@ export async function refreshFleetProgressive({
   if (signal?.aborted) return null;
   if (fatalError) throw fatalError;
 
-  const prevHere = here;
-  here = fleetList?.node || here;
-  const switchedActive = Boolean(here && prevHere && here !== prevHere);
-  if (switchedActive && typeof onActiveNodeChanged === 'function') {
-    onActiveNodeChanged(here);
-  }
+  const answeringNode = fleetList?.answered_by || fleetList?.node || here;
+  const answeredByPeer = Boolean(answeringNode && here && answeringNode !== here);
   const listedMap = new Map();
   for (const m of fleetList?.machines || []) {
     if (m && m.name) listedMap.set(m.name, m);
@@ -393,37 +389,51 @@ export async function refreshFleetProgressive({
   if (here && !listedMap.has(here)) {
     listedMap.set(here, { name: here, this_node: true, systems: [], wake_via: [] });
   }
+  if (answeringNode && !listedMap.has(answeringNode)) {
+    listedMap.set(answeringNode, { name: answeringNode, this_node: false, systems: [], wake_via: [] });
+  }
 
   // Reconcile the machine map with fleet.toml; never-seen remotes show as `asking`, while machines
-  // known to be off stay calmly `offline`.
+  // known to be off stay calmly `offline`. Keep the selected node (`here`) fixed — another node
+  // answering `fleet.list` never switches the selected node.
   for (const existing of Array.from(map.keys())) {
     if (!listedMap.has(existing)) map.delete(existing);
   }
   const remoteNames = [];
   for (const [name, listed] of listedMap.entries()) {
-    const isLocal = name === here || Boolean(listed.this_node);
+    const isSelected = name === here;
+    const isAnsweringPeer = answeredByPeer && name === answeringNode;
     const prev = map.get(name);
-    if (isLocal) {
+    if (isSelected) {
       map.set(name, {
         ...(prev || makeEntry(name, true, listed, null)),
         thisNode: true,
         canWake: Boolean(listed.mac || (listed.wake_via && listed.wake_via.length > 0)),
       });
+      if (answeredByPeer) {
+        // Selected node did not answer `fleet.list`; probe it like any peer so if it is off it
+        // settles cleanly into `offline` rather than staying `asking`.
+        remoteNames.push(name);
+      }
+    } else if (isAnsweringPeer) {
+      map.set(name, {
+        ...makeEntry(name, false, listed, prev),
+        thisNode: false,
+        canWake: Boolean(listed.mac || (listed.wake_via && listed.wake_via.length > 0)),
+      });
     } else {
       const nextEntry = makeEntry(name, false, listed, prev);
-      if (switchedActive && name === initialLocalNode) {
-        nextEntry.thisNode = false;
-      }
+      nextEntry.thisNode = false;
       map.set(name, nextEntry);
       remoteNames.push(name);
     }
   }
   emit(false);
 
-  // If failover switched the answering node (e.g. originally paired node A is off and B answered),
-  // fetch live details for the new answering node too.
-  const failoverLocalPromise =
-    switchedActive && here ? fetchMachineDetails(here, true) : Promise.resolve();
+  // When a peer answered `fleet.list`, fetch live details for that answering peer directly too.
+  const answeringPeerPromise = answeredByPeer
+    ? fetchMachineDetails(answeringNode, false)
+    : Promise.resolve();
 
   // Probe each remote machine once; machines known to be off are checked quietly at most every
   // `offlineRecheckMs` (or when `forceOffline` is set) without flipping back to `asking`.
@@ -502,7 +512,7 @@ export async function refreshFleetProgressive({
     await fetchMachineDetails(name, false);
   });
 
-  await Promise.all([localPromise, failoverLocalPromise, remotesPromise]);
+  await Promise.all([localPromise, answeringPeerPromise, remotesPromise]);
   if (signal?.aborted) return null;
   if (fatalError) throw fatalError;
 

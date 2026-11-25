@@ -196,9 +196,11 @@ each machine directly where it can and through another node where it cannot, and
 A machine added to the fleet later appears in the app by itself once the fleet has synced.
 
 Only directly paired machines may act as introducers; learned machines never introduce other
-machines. When only one paired node is reachable, you trust it to supply the host keys pinned for
-brand-new machines it reports, though it can never alter a paired machine's pins or silently replace
-an existing machine's keys or route.
+machines. If two or more paired nodes report differing endpoints or host keys for a new machine, it
+is shown as a disagreement and not pinned; when another paired node cannot reach a new machine, that
+counts as an abstention rather than a disagreement, so a single reporting paired node pins a new
+machine on its own when no other paired node can see it, though it can never alter a paired
+machine's pins or silently replace an existing machine's keys or route.
 
 ## The browser door
 
