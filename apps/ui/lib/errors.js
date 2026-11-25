@@ -1,6 +1,7 @@
 // Centralized plain-language error formatting and technical-details gating.
-// Plain mode shows calm, accurate sentences without raw codes, reasons, backticks,
-// config paths, or CLI hints; Technical details mode shows the full diagnostic context.
+// Every UI surface that renders errors routes through this module so raw codes, reasons,
+// CLI commands, backticks, config file paths, and dotted tool names only appear when
+// Technical details is on.
 
 const TOOL_NAME_RE =
   /\b(?:agent|audit|config|device|env|exec|ext|fav|fleet|fs|job|meta|net|power|proj|svc|sync|sys|token|update)\.[a-z_]+\b/;
@@ -49,7 +50,8 @@ export function containsTechnicalText(text) {
 }
 
 /**
- * Plain-language sentence for an error's stable `code`, used when Technical details is off.
+ * Plain-language sentence for an error's stable `code`, used whenever Technical details is off
+ * and the raw message would expose technical details (or for codes that always need plain wording).
  */
 export function plainMessageForCode(code, { machine = null, deviceNoun = 'device' } = {}) {
   const target = machine || 'This machine';
@@ -111,10 +113,10 @@ export function formatErrorForDisplay({
   if (technical) {
     const techParts = [];
     if (rawDetail) techParts.push(rawDetail);
-    const metaParts = [];
-    if (code) metaParts.push(`code: ${code}`);
-    if (reason) metaParts.push(`reason: ${reason}`);
-    if (metaParts.length > 0 && error && !title) {
+    if (reason && error && !title) {
+      const metaParts = [];
+      if (code) metaParts.push(`code: ${code}`);
+      metaParts.push(`reason: ${reason}`);
       techParts.push(`(${metaParts.join(', ')})`);
     }
     return {
@@ -125,7 +127,8 @@ export function formatErrorForDisplay({
     };
   }
 
-  // Plain mode: calm sentences without codes, reasons, backticks, or CLI hints.
+  // Plain mode: calm sentences without codes, reasons, raw tool names, backticks,
+  // config file paths, or CLI hints.
   if (!title && error) {
     if (code === 'denied' && reason === 'device_removed_or_unknown') {
       return {
@@ -208,7 +211,7 @@ export function formatErrorForDisplay({
 }
 
 /**
- * Returns a single sentence for toast banners and inline error slots.
+ * Returns a single plain-language sentence for toast banners and inline error slots.
  */
 export function plainErrorMessage(
   error,

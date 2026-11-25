@@ -264,6 +264,7 @@ function PairMachineSubpage({ link, linkState, onConnected }) {
 
 function InviteDeviceSubpage({
   link,
+  capsStore = null,
   linkState,
   nodeInfo,
   technical,
@@ -296,7 +297,7 @@ function InviteDeviceSubpage({
   const [targetDevices, setTargetDevices] = useState([]);
 
   useEffect(() => {
-    if (!targetNode || typeof link.tools !== 'function') {
+    if (!targetNode || (!capsStore && typeof link.tools !== 'function')) {
       setCatalog({ status: 'error', node: targetNode, tools: [], error: null });
       setTargetWhoami(null);
       setTargetDevices([]);
@@ -307,11 +308,18 @@ function InviteDeviceSubpage({
     setTargetWhoami(null);
     setTargetDevices([]);
 
+    const toolsPromise = capsStore
+      ? capsStore.ensure(targetNode).then(
+          (entry) => ({ ok: true, list: Array.isArray(entry?.tools) ? entry.tools : [] }),
+          (err) => ({ ok: false, error: err }),
+        )
+      : link.tools({ on: targetNode }).then(
+          (list) => ({ ok: true, list: Array.isArray(list) ? list : [] }),
+          (err) => ({ ok: false, error: err }),
+        );
+
     Promise.all([
-      link.tools({ on: targetNode }).then(
-        (list) => ({ ok: true, list: Array.isArray(list) ? list : [] }),
-        (err) => ({ ok: false, error: err }),
-      ),
+      toolsPromise,
       link
         .call('meta.whoami', {}, { on: targetNode })
         .catch(() => null),
@@ -335,7 +343,7 @@ function InviteDeviceSubpage({
     return () => {
       alive = false;
     };
-  }, [link, targetNode]);
+  }, [link, capsStore, targetNode]);
 
   const targetToolsReady = catalog.status === 'ready' && catalog.node === targetNode;
   const activeTools = targetToolsReady ? catalog.tools : [];
@@ -855,6 +863,7 @@ function PairedNodeSubpage({
   node,
   isActive,
   link,
+  capsStore = null,
   tools,
   technical,
   busy,
@@ -877,7 +886,14 @@ function PairedNodeSubpage({
         if (alive && res) setLiveWhoami(res);
       })
       .catch(() => {});
-    if (typeof link.tools === 'function') {
+    if (capsStore) {
+      capsStore
+        .ensure(node.node)
+        .then((entry) => {
+          if (alive && Array.isArray(entry?.tools)) setLiveTools(entry.tools);
+        })
+        .catch(() => {});
+    } else if (typeof link.tools === 'function') {
       link
         .tools({ on: node.node })
         .then((list) => {
@@ -888,7 +904,7 @@ function PairedNodeSubpage({
     return () => {
       alive = false;
     };
-  }, [link, node?.node, node?.whoami?.node]);
+  }, [link, capsStore, node?.node, node?.whoami?.node]);
 
   if (!node) return html`<div class="empty">Connection not found.</div>`;
 
@@ -1225,6 +1241,7 @@ function IncomingDeviceSubpage({
 function ConnectionsPage({
   route,
   link,
+  capsStore = null,
   linkState,
   nodeInfo,
   tools,
@@ -1403,6 +1420,7 @@ function ConnectionsPage({
     return html`
       <${InviteDeviceSubpage}
         link=${link}
+        capsStore=${capsStore}
         linkState=${linkState}
         nodeInfo=${nodeInfo}
         technical=${technical}
@@ -1437,6 +1455,7 @@ function ConnectionsPage({
         node=${idx >= 0 ? nodes[idx] : null}
         isActive=${idx === 0}
         link=${link}
+        capsStore=${capsStore}
         tools=${tools}
         technical=${technical}
         busy=${busy}
@@ -2106,6 +2125,7 @@ export function SettingsView({
   wide,
   deviceNoun,
   link,
+  capsStore = null,
   linkState,
   nodeInfo,
   tools,
@@ -2254,6 +2274,7 @@ export function SettingsView({
         <${ConnectionsPage}
           route=${route}
           link=${link}
+          capsStore=${capsStore}
           linkState=${linkState}
           nodeInfo=${nodeInfo}
           tools=${tools}

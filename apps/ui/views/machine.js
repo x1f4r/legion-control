@@ -1,7 +1,7 @@
 // One machine screen: Overview, Files, Power, More, Command, Services, Projects, and Activity.
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
-import { Meter, Notice, Sheet } from './common.js';
+import { Meter, Notice, OlderMachineNote, Sheet } from './common.js';
 import { ActivityDetail, ActivityGroups, ActivityRow } from './activity.js';
 import { MachineFilesBrowser } from './files.js';
 import { plainDenyReason } from '../lib/actions.js';
@@ -43,7 +43,7 @@ function targetFor(machineName, nodeName) {
 
 // ── Program detail and Stop / Force stop sheet ───────────────────────────────────────────────
 
-function ProgramSheet({ program, machine, on, link, canKill, technical, onStopped, onClose }) {
+function ProgramSheet({ program, machine, on, link, capsStore = null, canKill, technical, onStopped, onClose }) {
   const [step, setStep] = useState('detail'); // 'detail' | 'confirm' | 'stopping' | 'still_running' | 'refused'
   const [stillTargets, setStillTargets] = useState([]);
   const [refusals, setRefusals] = useState([]);
@@ -68,7 +68,9 @@ function ProgramSheet({ program, machine, on, link, canKill, technical, onStoppe
         targets.length > 0
           ? { targets, force }
           : { pid: pidList[0], force };
-      const res = await link.call('sys.kill', args, { on });
+      const res = capsStore
+        ? (await capsStore.call('sys.kill', args, { on })).value
+        : await link.call('sys.kill', args, { on });
       const items = Array.isArray(res?.results) ? res.results : [];
       if (items.length === 0) {
         if (res?.stopped === false) {
@@ -269,6 +271,7 @@ function OverviewTab({
   machine,
   nodeInfo,
   link,
+  capsStore = null,
   allowedSet,
   technical,
   wide,
@@ -277,12 +280,20 @@ function OverviewTab({
   onStopJob,
   onUpdateMachineSys,
 }) {
+  const [, setCapsRev] = useState(0);
   const [liveSys, setLiveSys] = useState(() => machine.sys || null);
   const [liveProcs, setLiveProcs] = useState(null);
   const [stale, setStale] = useState(false);
   const [selectedProgram, setSelectedProgram] = useState(null);
   const pollerRef = useRef(null);
   const on = targetFor(machine.name, nodeInfo?.node);
+
+  useEffect(() => {
+    if (!capsStore || !machine?.reachable || !machine?.name) return undefined;
+    const unsub = capsStore.subscribe(() => setCapsRev((n) => n + 1));
+    capsStore.ensure(machine.name).catch(() => {});
+    return unsub;
+  }, [capsStore, machine?.name, machine?.reachable]);
 
   useEffect(() => {
     setLiveSys(machine.sys || null);
@@ -300,10 +311,24 @@ function OverviewTab({
         if (mounted) setStale(nextStale);
       },
       async fetchTick() {
-        const [sysRes, procsRes] = await Promise.allSettled([
-          link.call('sys.info', {}, { on }),
-          link.call('sys.procs', { group: true, limit: 12 }, { on }),
-        ]);
+        if (capsStore && !capsStore.isKnown(machine.name)) {
+          await capsStore.ensure(machine.name).catch(() => null);
+          if (!mounted) return false;
+        }
+        const supportsGroupProcs = capsStore
+          ? capsStore.acceptsArg(machine.name, 'sys.procs', 'group')
+          : true;
+
+        const infoCall = capsStore
+          ? capsStore.call('sys.info', {}, { on }).then((r) => r.value)
+          : link.call('sys.info', {}, { on });
+        const procsCall = supportsGroupProcs
+          ? capsStore
+            ? capsStore.call('sys.procs', { group: true, limit: 12 }, { on }).then((r) => r.value)
+            : link.call('sys.procs', { group: true, limit: 12 }, { on })
+          : Promise.resolve(null);
+
+        const [sysRes, procsRes] = await Promise.allSettled([infoCall, procsCall]);
         if (!mounted) return false;
         let gotAny = false;
         if (sysRes.status === 'fulfilled' && sysRes.value) {
@@ -313,7 +338,7 @@ function OverviewTab({
             onUpdateMachineSys(machine.name, sysRes.value);
           }
         }
-        if (procsRes.status === 'fulfilled' && Array.isArray(procsRes.value?.procs)) {
+        if (supportsGroupProcs && procsRes.status === 'fulfilled' && Array.isArray(procsRes.value?.procs)) {
           gotAny = true;
           setLiveProcs(procsRes.value.procs);
         }
@@ -335,7 +360,7 @@ function OverviewTab({
         document.removeEventListener('visibilitychange', onVis);
       }
     };
-  }, [machine.name, machine.reachable, link, on]);
+  }, [machine.name, machine.reachable, link, capsStore, on]);
 
   if (machine.status === 'asking' || machine.asking) {
     return html`<div class="empty">Checking ${machine.name}…</div>`;
@@ -410,6 +435,12 @@ function OverviewTab({
     .join(' ')
     .replace(' ·', ' ·');
 
+  const capsEntry = capsStore && machine?.name ? capsStore.get(machine.name) : null;
+  const missingFeatures = capsStore && machine?.name ? capsStore.missingFeatures(machine.name) : [];
+  const capsKnown = capsStore ? capsStore.isKnown(machine.name) : true;
+  const canGroupProcs = capsStore ? capsKnown && capsStore.acceptsArg(machine.name, 'sys.procs', 'group') : true;
+  const canKillTargets = capsStore ? capsKnown && capsStore.acceptsArg(machine.name, 'sys.kill', 'targets') : true;
+
   const hasAboutRows =
     Boolean(systemLine) ||
     busyReasonLines.length > 0 ||
@@ -423,6 +454,18 @@ function OverviewTab({
               <span class=${activeBusy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
               <span>${stateLine}</span>
             </div>
+          `
+        : null}
+
+      ${missingFeatures.length > 0
+        ? html`
+            <${OlderMachineNote}
+              machine=${machine.name}
+              version=${capsEntry?.version || machine.version || null}
+              build=${capsEntry?.build || machine.build || null}
+              missing=${missingFeatures}
+              technical=${technical}
+            />
           `
         : null}
 
@@ -448,41 +491,44 @@ function OverviewTab({
           `
         : null}
 
-      <p class="label">Using it now</p>
-      <div class=${stale ? 'list stale-values' : 'list'}>
-        ${liveProcs === null
-          ? html`
-              <div class="row off">
-                <span class="body"><span class="sub">Checking…</span></span>
-              </div>
-            `
-          : busyPrograms.length === 0
-            ? html`
-                <div class="row off">
-                  <span class="body"><span class="sub">Nothing much is running.</span></span>
-                </div>
-              `
-            : busyPrograms.map(
-                (prog) => html`
-                  <button
-                    type="button"
-                    class="row"
-                    key=${`${prog.name}:${prog.user || ''}`}
-                    onClick=${() => setSelectedProgram(prog)}
-                  >
-                    <span class="body">
-                      <span class="title">
-                        ${prog.name}
-                        ${prog.count > 1 ? html`<span class="proc-count">× ${prog.count}</span>` : null}
-                      </span>
-                      <span class="sub">${prog.primaryText}</span>
-                    </span>
-                    <span class="chev" aria-hidden="true">›</span>
-                  </button>
-                `,
-              )}
-      </div>
-
+      ${canGroupProcs
+        ? html`
+            <p class="label">Using it now</p>
+            <div class=${stale ? 'list stale-values' : 'list'}>
+              ${liveProcs === null
+                ? html`
+                    <div class="row off">
+                      <span class="body"><span class="sub">Checking…</span></span>
+                    </div>
+                  `
+                : busyPrograms.length === 0
+                  ? html`
+                      <div class="row off">
+                        <span class="body"><span class="sub">Nothing much is running.</span></span>
+                      </div>
+                    `
+                  : busyPrograms.map(
+                      (prog) => html`
+                        <button
+                          type="button"
+                          class="row"
+                          key=${`${prog.name}:${prog.user || ''}`}
+                          onClick=${() => setSelectedProgram(prog)}
+                        >
+                          <span class="body">
+                            <span class="title">
+                              ${prog.name}
+                              ${prog.count > 1 ? html`<span class="proc-count">× ${prog.count}</span>` : null}
+                            </span>
+                            <span class="sub">${prog.primaryText}</span>
+                          </span>
+                          <span class="chev" aria-hidden="true">›</span>
+                        </button>
+                      `,
+                    )}
+            </div>
+          `
+        : null}
       ${runningJobs.length > 0
         ? html`
             <p class="label">Running now</p>
@@ -557,7 +603,8 @@ function OverviewTab({
               machine=${machine}
               on=${on}
               link=${link}
-              canKill=${canKill}
+              capsStore=${capsStore}
+              canKill=${canKill && canKillTargets}
               technical=${technical}
               onStopped=${() => pollerRef.current?.refreshNow()}
               onClose=${() => setSelectedProgram(null)}
@@ -1635,12 +1682,15 @@ export function MachineDetail({
   jobId,
   wide,
   link,
+  capsStore = null,
   nodeInfo,
   tools,
   allowedSet,
   settings,
   deviceNoun,
   thumbCache,
+  filesState = null,
+  filesActions = null,
   wakePending,
   onEnsureAwake,
   onWakeSent,
@@ -1733,6 +1783,7 @@ export function MachineDetail({
               technical=${technical}
               wide=${wide}
               wakePending=${wakePending}
+              capsStore=${capsStore}
               onEnsureAwake=${onEnsureAwake}
               onStopJob=${handleStopJob}
               onUpdateMachineSys=${onUpdateMachineSys}
@@ -1781,9 +1832,13 @@ export function MachineDetail({
                     tools=${tools}
                     allowedSet=${allowedSet}
                     link=${link}
+                    capsStore=${capsStore}
                     settings=${settings}
                     deviceNoun=${deviceNoun}
                     thumbCache=${thumbCache}
+                    wide=${wide}
+                    filesState=${filesState}
+                    filesActions=${filesActions}
                     onEnsureAwake=${onEnsureAwake}
                   />
                 `

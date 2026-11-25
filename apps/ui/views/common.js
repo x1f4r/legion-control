@@ -112,6 +112,28 @@ export function Notice({
   `;
 }
 
+// Quiet one-line note shown once on an older machine's screen and at the top of its Files.
+export function OlderMachineNote({ machine, version = null, build = null, missing = [], technical = false }) {
+  if (!machine || !Array.isArray(missing) || missing.length === 0) return null;
+  const verParts = [
+    version ? String(version) : null,
+    build ? `(${String(build).slice(0, 12)})` : null,
+  ].filter(Boolean);
+  const verLabel = verParts.join(' ');
+  return html`
+    <div class="older-note" role="status">
+      <p>${machine} runs an older Legion, so some things are simpler here.</p>
+      ${technical
+        ? html`
+            <p class="older-note-tech mono">
+              ${verLabel ? `${verLabel} · ` : ''}Missing: ${missing.join(', ')}
+            </p>
+          `
+        : null}
+    </div>
+  `;
+}
+
 export function CopyButton({ text, label = 'Copy', iconOnly = false }) {
   const [copied, setCopied] = useState(false);
 
