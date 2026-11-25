@@ -380,7 +380,6 @@ async fn procs(_ctx: &Ctx, args: ProcsArgs) -> Result<Procs, ToolError> {
         .with_hint("Narrow the list with `filter` instead of asking for more."));
     }
     let gpu_mem_task = tokio::spawn(hardware::probe_gpu_process_memory(
-        hardware::default_nvidia_compute_procs_command(),
         hardware::default_nvidia_pmon_procs_command(),
         hardware::DEFAULT_PROBE_TIMEOUT,
     ));
@@ -744,7 +743,9 @@ async fn kill_single(
         let lookup = identify(pid)?;
         let probe = match lookup {
             Lookup::Missing => probe::probe(pid),
-            Lookup::Found(..) | Lookup::NotPermitted => probe::Probe::Unknown,
+            Lookup::Found(..) | Lookup::Gone | Lookup::NotPermitted | Lookup::NotAProcess(_) => {
+                probe::Probe::Unknown
+            }
         };
         let outcome = decide(pid, std::process::id(), std::env::consts::OS, lookup, probe);
         // The rules that need the identity: the processes legion runs under, and those the system
@@ -761,6 +762,14 @@ async fn kill_single(
     let (identity, started) = match outcome {
         Outcome::Found(identity, started) => (identity, started),
         Outcome::Protected(reason) => return Err(protected(pid, Some(reason))),
+        Outcome::NotAProcess(detail) => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                format!("Id {pid} is not a process ({detail}), so nothing was stopped."),
+            )
+            .with_hint("Pass a process id from sys.procs, not a thread id.")
+            .with_details(json!({"pid": pid})));
+        }
         Outcome::NotPermitted => {
             return Err(ErrorBody::new(
                 ErrorCode::Denied,
@@ -862,6 +871,7 @@ async fn kill_targets(
         };
         parsed.push((target.pid, ts));
     }
+    let parsed = dedup_targets(parsed);
 
     let own = std::process::id();
     let inspected: Vec<TargetPlan> = blocking(move || {
@@ -884,7 +894,9 @@ async fn kill_targets(
             };
             let probe = match lookup {
                 Lookup::Missing => probe::probe(pid),
-                Lookup::Found(..) | Lookup::NotPermitted => probe::Probe::Unknown,
+                Lookup::Found(..) | Lookup::Gone | Lookup::NotPermitted | Lookup::NotAProcess(_) => {
+                    probe::Probe::Unknown
+                }
             };
             let outcome = decide(pid, own, std::env::consts::OS, lookup, probe);
             match outcome {
@@ -893,6 +905,13 @@ async fn kill_targets(
                         pid,
                         ErrorCode::Denied,
                         plain_protected_sentence(reason),
+                    )));
+                }
+                Outcome::NotAProcess(detail) => {
+                    plans.push(TargetPlan::Ready(refused_target(
+                        pid,
+                        ErrorCode::InvalidArgs,
+                        format!("Id {pid} is not a process ({detail}), so nothing was stopped."),
                     )));
                 }
                 Outcome::NotPermitted => {
@@ -974,6 +993,27 @@ async fn kill_targets(
                         code: None,
                         message: None,
                     }));
+                }
+                Ok(SignalOutcome::CannotAskGracefully) => {
+                    results.push(Some(TargetOutcome {
+                        pid: identity.pid,
+                        status: TargetStatus::StillRunning,
+                        code: None,
+                        message: Some(
+                            "This program has no window or console to ask to close; force stop it instead."
+                                .to_owned(),
+                        ),
+                    }));
+                }
+                Err(OsError::InvalidArgument { detail }) => {
+                    results.push(Some(refused_target(
+                        identity.pid,
+                        ErrorCode::InvalidArgs,
+                        format!(
+                            "Id {} is not a process ({detail}), so nothing was stopped.",
+                            identity.pid
+                        ),
+                    )));
                 }
                 Err(OsError::PermissionDenied { .. }) => {
                     results.push(Some(refused_target(
@@ -1099,24 +1139,39 @@ fn protected(pid: u32, reason: Option<&str>) -> ErrorBody {
     .with_details(json!({"pid": pid, "reason": reason}))
 }
 
+/// Merge repeated `(pid, start_time)` entries while preserving first-seen order.
+fn dedup_targets(targets: Vec<(u32, u64)>) -> Vec<(u32, u64)> {
+    let mut seen = std::collections::HashSet::with_capacity(targets.len());
+    targets
+        .into_iter()
+        .filter(|pair| seen.insert(*pair))
+        .collect()
+}
+
 /// What reading a process's identity found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Lookup {
     /// The process, and when it started in seconds since the epoch where the system says.
     Found(ProcessId, Option<u64>),
+    /// The process has already exited (e.g. an unreaped zombie) and must be treated as gone.
+    Gone,
     /// Nothing could be read, which is either no process or one that hides itself.
     Missing,
+    /// The id is not a process (for example, a Linux non-main thread id).
+    NotAProcess(String),
     /// The system refused to say anything about it.
     NotPermitted,
 }
 
 /// What sys.kill does about a pid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Outcome {
     /// Stops this process, once the rules that need its identity have passed.
     Found(ProcessId, Option<u64>),
     /// Refuses: the process is protected, for this reason.
     Protected(&'static str),
+    /// Refuses: the id is not a process (for example, a thread id).
+    NotAProcess(String),
     /// Refuses: the process exists but belongs to another user or the system.
     NotPermitted,
     /// There is no such process.
@@ -1144,6 +1199,8 @@ fn decide(pid: u32, own: u32, os: &str, lookup: Lookup, probe: probe::Probe) -> 
     }
     match (lookup, probe) {
         (Lookup::Found(identity, started), _) => Outcome::Found(identity, started),
+        (Lookup::NotAProcess(detail), _) => Outcome::NotAProcess(detail),
+        (Lookup::Gone, _) => Outcome::NotFound,
         (Lookup::NotPermitted, _)
         | (Lookup::Missing, probe::Probe::Exists | probe::Probe::NotPermitted) => {
             Outcome::NotPermitted
@@ -1160,8 +1217,18 @@ fn decide(pid: u32, own: u32, os: &str, lookup: Lookup, probe: probe::Probe) -> 
 fn identify(pid: u32) -> Result<Lookup, ErrorBody> {
     let read = || match procid::of_pid(pid) {
         Err(OsError::PermissionDenied { .. }) => Ok(Err(Lookup::NotPermitted)),
+        Err(OsError::InvalidArgument { detail }) => Ok(Err(Lookup::NotAProcess(detail))),
         Err(error) => Err(os_error(pid, &format!("read process {pid}"), error)),
-        Ok(None) => Ok(Err(Lookup::Missing)),
+        Ok(None) => {
+            // Distinguish an unreaped zombie (already exited -> Gone) from an absent or hidden
+            // process so `kill(pid, 0)` succeeding on a zombie never misreports it as belonging
+            // to another user.
+            if matches!(procid::of_pid_including_zombie(pid), Ok(Some(_))) {
+                Ok(Err(Lookup::Gone))
+            } else {
+                Ok(Err(Lookup::Missing))
+            }
+        }
         Ok(Some(identity)) => Ok(Ok(identity)),
     };
     let identity = match read()? {
@@ -1181,6 +1248,8 @@ fn identify(pid: u32) -> Result<Lookup, ErrorBody> {
         .filter(|&seconds| seconds > 0);
     match read()? {
         Ok(again) if again.matches(&identity) => Ok(Lookup::Found(identity, started)),
+        Err(Lookup::Gone) => Ok(Lookup::Gone),
+        Err(Lookup::NotAProcess(detail)) => Ok(Lookup::NotAProcess(detail)),
         _ => Ok(Lookup::Missing),
     }
 }
@@ -1189,6 +1258,11 @@ fn identify(pid: u32) -> Result<Lookup, ErrorBody> {
 /// of permission is `denied`, whichever way the process was being stopped, and names the process.
 fn os_error(pid: u32, what: &str, error: OsError) -> ErrorBody {
     match error {
+        OsError::InvalidArgument { detail } => ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Cannot {what}: {detail}."),
+        )
+        .with_details(json!({"pid": pid})),
         OsError::PermissionDenied { .. } => ErrorBody::new(
             ErrorCode::Denied,
             format!("The system does not let legion {what}: it belongs to another account, or the system protects it."),
@@ -1397,7 +1471,7 @@ mod tests {
             Outcome::Protected(_)
         ));
         assert!(matches!(
-            decide(own, own, "macos", found, Probe::Exists),
+            decide(own, own, "macos", found.clone(), Probe::Exists),
             Outcome::Protected(_)
         ));
         // Another user's process whose identity cannot be read is theirs, never missing.
@@ -1430,6 +1504,22 @@ mod tests {
             decide(4, own, "linux", Lookup::Missing, Probe::Missing),
             Outcome::NotFound
         );
+        // Unreaped zombie counts as gone even if a raw probe would see its process-table slot.
+        assert_eq!(
+            decide(501, own, "linux", Lookup::Gone, Probe::Exists),
+            Outcome::NotFound
+        );
+        // Non-process thread id is refused, never reported missing.
+        assert_eq!(
+            decide(
+                502,
+                own,
+                "linux",
+                Lookup::NotAProcess("thread".into()),
+                Probe::Exists
+            ),
+            Outcome::NotAProcess("thread".into())
+        );
         // Targets mode refuses pid 0 and 1 on every OS.
         assert!(protected_target_pid(0, own, "windows").is_some());
         assert!(protected_target_pid(1, own, "windows").is_some());
@@ -1437,11 +1527,58 @@ mod tests {
     }
 
     #[test]
-    fn times_round_trip_through_rfc3339_and_zero_is_absent() {
+    fn repeated_targets_with_same_pid_and_start_time_merge_once() {
+        let merged = dedup_targets(vec![
+            (10, 1_700_000_000),
+            (20, 1_700_000_005),
+            (10, 1_700_000_000),
+            (10, 1_700_000_099),
+            (20, 1_700_000_005),
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                (10, 1_700_000_000),
+                (20, 1_700_000_005),
+                (10, 1_700_000_099),
+            ]
+        );
+    }
+
+    #[test]
+    fn refusals_by_the_system_are_denied_and_missing_abilities_unsupported() {
+        let denied = os_error(
+            42,
+            "stop process 42",
+            OsError::PermissionDenied {
+                detail: "kill".into(),
+                source: None,
+            },
+        );
+        assert_eq!(denied.code, ErrorCode::Denied);
+        assert_eq!(denied.details, Some(json!({"pid": 42})));
+        let unsupported = os_error(
+            42,
+            "stop process 42",
+            OsError::Unsupported {
+                detail: "no signals".into(),
+            },
+        );
+        assert_eq!(unsupported.code, ErrorCode::Unsupported);
+    }
+
+    #[test]
+    fn start_times_round_trip_through_rfc_3339() {
+        assert_eq!(
+            rfc3339(1_700_000_000).as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
         assert_eq!(rfc3339(0), None);
-        let text = rfc3339(1_700_000_000).unwrap_or_default();
-        assert_eq!(text, "2023-11-14T22:13:20Z");
-        assert_eq!(parse_rfc3339(&text), Some(1_700_000_000));
-        assert_eq!(parse_rfc3339("not a time"), None);
+        assert_eq!(parse_rfc3339("2023-11-14T22:13:20Z"), Some(1_700_000_000));
+        assert_eq!(
+            parse_rfc3339("2023-11-14T23:13:20+01:00"),
+            Some(1_700_000_000)
+        );
+        assert_eq!(parse_rfc3339("yesterday"), None);
     }
 }

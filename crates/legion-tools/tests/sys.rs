@@ -43,6 +43,15 @@ fn main() -> ExitCode {
         ("kill_targets_reports_per_target_outcomes", || {
             Box::pin(kill_targets_reports_per_target_outcomes())
         }),
+        ("kill_refuses_thread_ids_of_self_and_child", || {
+            Box::pin(kill_refuses_thread_ids_of_self_and_child())
+        }),
+        ("kill_reports_unreaped_zombie_child_as_gone", || {
+            Box::pin(kill_reports_unreaped_zombie_child_as_gone())
+        }),
+        ("kill_targets_merges_repeated_entries", || {
+            Box::pin(kill_targets_merges_repeated_entries())
+        }),
     ];
     support::main(tests)
 }
@@ -515,7 +524,34 @@ async fn kill_targets_reports_per_target_outcomes() {
     assert_no_nulls(&res);
     let results = res["results"].as_array().unwrap();
     assert_eq!(results.len(), targets.len(), "{res:#}");
+    #[cfg(unix)]
     assert_eq!(results[0]["status"], json!("stopped"), "{res:#}");
+    #[cfg(windows)]
+    {
+        // Windowless helper outside its own console group cannot be asked gracefully on Windows:
+        // reports `still_running` immediately with a sentence saying it must be forced.
+        assert_eq!(results[0]["status"], json!("still_running"), "{res:#}");
+        assert!(results[0]["message"].is_string(), "{res:#}");
+        assert!(
+            alive(normal.id()),
+            "normal child must not be terminated without force"
+        );
+        let forced_normal = fixture
+            .call(
+                "sys.kill",
+                json!({
+                    "targets": [{"pid": normal.id(), "start_time": normal_start}],
+                    "force": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            forced_normal["results"][0]["status"],
+            json!("stopped"),
+            "{forced_normal:#}"
+        );
+    }
     assert_eq!(results[1]["status"], json!("gone"), "{res:#}");
     assert_eq!(results[2]["status"], json!("reused"), "{res:#}");
     assert!(alive(reused_child.id()), "reused pid must not be stopped");
@@ -577,4 +613,209 @@ async fn kill_targets_reports_per_target_outcomes() {
     let _ = normal.wait();
     let _ = reused_child.kill();
     let _ = reused_child.wait();
+}
+
+async fn kill_refuses_thread_ids_of_self_and_child() {
+    #[cfg(target_os = "linux")]
+    {
+        let fixture = Fixture::new();
+        let own = std::process::id();
+        let self_start = start_time_of(&fixture, own).await;
+
+        // 1. Spawn a thread in the current process and verify both `pid` and `targets` refuse its
+        // TID without killing the test process.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let _ = stop_rx.recv();
+        });
+        ready_rx.recv().unwrap();
+        let self_tid = support::find_other_linux_tid(own).unwrap();
+        assert_ne!(self_tid, own);
+
+        let err_single = fixture
+            .call("sys.kill", json!({"pid": self_tid, "force": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err_single.code,
+            ErrorCode::InvalidArgs,
+            "single-pid form must refuse self TID: {}",
+            err_single.message
+        );
+        assert!(
+            err_single.message.to_lowercase().contains("not a process"),
+            "{}",
+            err_single.message
+        );
+
+        let res_targets = fixture
+            .call(
+                "sys.kill",
+                json!({
+                    "targets": [{"pid": self_tid, "start_time": self_start}],
+                    "force": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_targets["results"][0]["status"],
+            json!("refused"),
+            "{res_targets:#}"
+        );
+        assert_eq!(
+            res_targets["results"][0]["code"],
+            json!("invalid_args"),
+            "{res_targets:#}"
+        );
+        assert!(
+            res_targets["results"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("not a process"),
+            "{res_targets:#}"
+        );
+
+        let _ = stop_tx.send(());
+        worker.join().unwrap();
+
+        // 2. Spawn a multi-threaded child process and verify both `pid` and `targets` refuse its
+        // worker TID while the child survives.
+        let pid_file = fixture.dir.path().join("threaded.pids");
+        let mut child = spawn_helper("threaded", &[pid_file.to_str().unwrap()]);
+        let ids = read_pids(&pid_file).await;
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        let child_pid = ids[0];
+        let child_tid = ids[1];
+        assert_eq!(child_pid, child.id());
+        assert_ne!(
+            child_tid, child_pid,
+            "child worker TID must differ from child PID"
+        );
+        let child_start = start_time_of(&fixture, child_pid).await;
+
+        let err_child_single = fixture
+            .call("sys.kill", json!({"pid": child_tid, "force": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err_child_single.code,
+            ErrorCode::InvalidArgs,
+            "{}",
+            err_child_single.message
+        );
+        assert!(
+            alive(child_pid),
+            "child process must survive refusal of its worker TID"
+        );
+
+        let res_child_targets = fixture
+            .call(
+                "sys.kill",
+                json!({
+                    "targets": [{"pid": child_tid, "start_time": child_start}],
+                    "force": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_child_targets["results"][0]["status"],
+            json!("refused"),
+            "{res_child_targets:#}"
+        );
+        assert_eq!(
+            res_child_targets["results"][0]["code"],
+            json!("invalid_args"),
+            "{res_child_targets:#}"
+        );
+        assert!(
+            alive(child_pid),
+            "child process must survive targets refusal of its worker TID"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+async fn kill_reports_unreaped_zombie_child_as_gone() {
+    #[cfg(unix)]
+    {
+        let fixture = Fixture::new();
+        // Start a child that exits immediately and deliberately do NOT wait() on it yet so it
+        // remains an unreaped zombie in the kernel process table.
+        let mut child = spawn_helper("args", &["done"]);
+        let pid = child.id();
+
+        wait_for(Duration::from_secs(10), || (!alive(pid)).then_some(()))
+            .await
+            .unwrap();
+
+        let err_single = fixture
+            .call("sys.kill", json!({"pid": pid}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err_single.code,
+            ErrorCode::NotFound,
+            "unreaped zombie must be NotFound, not Denied: {}",
+            err_single.message
+        );
+
+        let res_targets = fixture
+            .call(
+                "sys.kill",
+                json!({
+                    "targets": [{"pid": pid, "start_time": "2020-01-01T00:00:00Z"}],
+                    "force": false
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_targets["results"][0]["status"],
+            json!("gone"),
+            "unreaped zombie must be gone, not refused: {res_targets:#}"
+        );
+
+        let _ = child.wait();
+    }
+}
+
+async fn kill_targets_merges_repeated_entries() {
+    let fixture = Fixture::new();
+    let mut child = spawn_helper("sleep", &["60"]);
+    wait_for(Duration::from_secs(30), || alive(child.id()).then_some(()))
+        .await
+        .unwrap();
+    let start_z = start_time_of(&fixture, child.id()).await;
+    let start_offset = start_z.replace('Z', "+00:00");
+
+    let res = fixture
+        .call(
+            "sys.kill",
+            json!({
+                "targets": [
+                    {"pid": child.id(), "start_time": start_z},
+                    {"pid": child.id(), "start_time": start_z},
+                    {"pid": child.id(), "start_time": start_offset},
+                ],
+                "force": true
+            }),
+        )
+        .await
+        .unwrap();
+    let results = res["results"].as_array().unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "repeated (pid, start_time) entries must merge into one outcome: {res:#}"
+    );
+    assert_eq!(results[0]["status"], json!("stopped"), "{res:#}");
+
+    let _ = child.wait();
 }
