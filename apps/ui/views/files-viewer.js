@@ -8,6 +8,7 @@ import {
   baseFileName,
   entryCategory,
   entryIconName,
+  extractThumbMap,
   mimeFromName,
   plainCategoryLabel,
 } from '../lib/files.js';
@@ -216,7 +217,7 @@ export function FilesViewer({
         runCall('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { signal: ctrl.signal })
           .then((res) => {
             if (ctrl.signal.aborted) return;
-            const t = res?.thumbnails?.[path];
+            const t = extractThumbMap(res)[path];
             if (t?.content && t?.mime) {
               setMediaUrl(`data:${t.mime};base64,${t.content}`);
             } else {
