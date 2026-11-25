@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Build the Arch source or -bin package from the local checkout using makepkg.
+# Build the Arch node (source or -bin) or desktop app package from the local checkout using makepkg.
 #
 # Usage:
 #   packaging/arch/build-local.sh source <out dir>
 #   packaging/arch/build-local.sh bin <path to static legion binary> <out dir>
+#   packaging/arch/build-local.sh app <out dir>
 #
 # Pre-populates the source archive or files that the PKGBUILD expects so makepkg runs
 # offline against the current working tree without needing a published GitHub release tag.
@@ -19,6 +20,7 @@ usage() {
 Usage:
   packaging/arch/build-local.sh source <out dir>
   packaging/arch/build-local.sh bin <static legion binary> <out dir>
+  packaging/arch/build-local.sh app <out dir>
 EOF
   exit 2
 }
@@ -45,6 +47,11 @@ case "$MODE" in
     [[ -f "$STATIC_BIN" && -s "$STATIC_BIN" ]] || die "Binary does not exist or is empty: $STATIC_BIN"
     PKGBUILD_SRC="${SCRIPT_DIR}/legion-bin/PKGBUILD"
     ;;
+  app)
+    [[ "$#" -eq 1 ]] || usage
+    OUT_DIR="$1"
+    PKGBUILD_SRC="${SCRIPT_DIR}/legion-app/PKGBUILD"
+    ;;
   *)
     usage
     ;;
@@ -63,11 +70,11 @@ trap cleanup EXIT
 
 cp "$PKGBUILD_SRC" "${WORK}/PKGBUILD"
 
-if [[ "$MODE" == "source" ]]; then
-  # Every path that `cargo build --release -p legion-cli` and `package()` read from the repo root:
-  # `apps/ui` is embedded at compile time by `crates/legion-doors/build.rs`, and `contract` holds
-  # the compiled-in release public key. Verify all required paths before archiving so a missing
-  # directory or renamed asset fails immediately with a clear error.
+if [[ "$MODE" == "source" || "$MODE" == "app" ]]; then
+  # Every path that `cargo build` and `package()` read from the repo root:
+  # `apps/ui` is embedded at compile time, and `contract` holds the compiled-in release public key.
+  # Verify all required paths before archiving so a missing directory or renamed asset fails
+  # immediately with a clear error.
   REQUIRED_PATHS=(
     Cargo.toml
     Cargo.lock
@@ -82,6 +89,23 @@ if [[ "$MODE" == "source" ]]; then
     apps/ui/index.html
     contract/release-public-key.pem
   )
+  TAR_EXCLUDES=()
+  ARCHIVE_PREFIX="legion"
+  if [[ "$MODE" == "app" ]]; then
+    REQUIRED_PATHS+=(apps/legion-app)
+    REQUIRED_FILES+=(
+      apps/legion-app/src-tauri/Cargo.toml
+      apps/legion-app/src-tauri/Cargo.lock
+      apps/legion-app/src-tauri/icons/32x32.png
+      apps/legion-app/src-tauri/icons/128x128.png
+      apps/legion-app/src-tauri/icons/128x128@2x.png
+    )
+    TAR_EXCLUDES+=(
+      --exclude=apps/legion-app/src-tauri/target
+      --exclude=apps/legion-app/src-tauri/gen
+    )
+    ARCHIVE_PREFIX="legion-app"
+  fi
   for rel in "${REQUIRED_PATHS[@]}"; do
     [[ -e "${REPO_ROOT}/${rel}" ]] || die "Required source path is missing from checkout: ${rel}"
   done
@@ -102,13 +126,13 @@ if [[ "$MODE" == "source" ]]; then
     fi
   fi
 
-  ARCHIVE="${WORK}/legion-${PKGVER}.tar.gz"
+  ARCHIVE="${WORK}/${ARCHIVE_PREFIX}-${PKGVER}.tar.gz"
   PREFIX="legion-control-legion-v${PKGVER}/"
   # Archive the workspace files needed to build and package legion, including uncommitted edits,
   # while skipping target/ and other build artifacts. When building from a clean commit SHA, write
   # the same PAX `comment=<sha>` header that GitHub's tag archives carry so PKGBUILD extracts it
   # identically to a published release tag.
-  TAR_ARGS=(-C "$REPO_ROOT" --transform "s,^,${PREFIX},")
+  TAR_ARGS=(-C "$REPO_ROOT" "${TAR_EXCLUDES[@]}" --transform "s,^,${PREFIX},")
   if [[ "$BUILD_REV" =~ ^[0-9a-fA-F]{40}$ ]]; then
     TAR_ARGS+=(--format=posix --pax-option="comment=${BUILD_REV,,}")
     MAKEPKG_ENV=(-u LEGION_BUILD_REV PKGDEST="$OUT_DIR_ABS")
