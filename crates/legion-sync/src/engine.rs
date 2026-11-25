@@ -23,11 +23,11 @@ use crate::model::{
     FetchOptions, FolderConfig, FolderDeletionLogEntry, FolderDeletionRecord, FolderMarker,
     FolderMeta, FolderStatus, HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION,
     InboundDeletionBrake, InboundDeletionBrakeDecision, IndexRecord, MAX_DEFERRAL_ATTEMPTS,
-    MAX_FORCED_ROTATIONS_PER_WEEK, MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS,
-    MemberId, MemberState, MemberStatus, PeerAckView, PeerCursor, PeerHandshake,
-    PeerRefusalSummary, ProblemKind, RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION,
-    SyncProblem, SyncProgress, encode_deletion_log_entries, parse_deletion_log,
-    random_incarnation_id, validate_member_id,
+    MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK, MAX_HELD_BACK_ENTRIES, MAX_PAGE_RECORDS,
+    MAX_PEER_PROBLEMS, MAX_VERSION_COUNTER, MemberId, MemberState, MemberStatus, PeerAckView,
+    PeerCursor, PeerHandshake, PeerRefusalSummary, ProblemKind, RecordsPage, RestoreStrategy,
+    SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, encode_deletion_log_entries,
+    parse_deletion_log, random_incarnation_id, validate_member_id,
 };
 use crate::path::{
     IgnoreMatcher, is_descendant_of, is_internal_sync_path, path_depth, validate_sync_path,
@@ -891,8 +891,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             }
             meta.former_members.insert(member.to_string());
             meta.rejoining_peers.remove(member);
-            meta.last_forced_rotation_by_peer.remove(member);
-            meta.forced_rotation_history.retain(|(p, _)| p != member);
+            meta.forced_rotations_by_peer.remove(member);
             e.unreachable_peers.remove(member);
             e.active_progress.remove(member);
             e.last_pull_errors.remove(member);
@@ -1313,30 +1312,58 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     })
             });
 
-        // Item 5: check the peer's statement about US before any page moves!
-        let mut own_rolled_back = hs.caller_regressed;
-        if !own_rolled_back
-            && !peer_regressed_below_ack
-            && let Some(view) = hs.caller_pulled
-            && !view_matches_local(&self.store, &meta, &view)?
-        {
-            own_rolled_back = true;
+        // Check checkable evidence about OUR OWN history before any page moves!
+        // A claim MUST carry evidence we can verify locally:
+        // 1. A valid record naming our current `(local_member, incarnation)` at a counter beyond
+        //    our own `local_clock` (or contradicting our stored record at that path), OR
+        // 2. Our own fingerprint for a sequence we have (`1..=meta.local_seq`) that differs from
+        //    what we stored.
+        // A bare `caller_regressed = true` claim with no checkable evidence rotates NOTHING.
+        let mut has_rollback_evidence = false;
+        if !peer_regressed_below_ack {
+            if let Some(ref ev) = hs.caller_evidence_record
+                && evidence_record_proves_rollback(&self.store, &meta, ev)?
+            {
+                has_rollback_evidence = true;
+            }
+            if !has_rollback_evidence
+                && let Some(view) = hs.caller_pulled
+                && view_contradicts_stored_fingerprint(&self.store, &meta, &view)?
+            {
+                has_rollback_evidence = true;
+            }
+            if !has_rollback_evidence
+                && let Some(view) = hs.caller_acked
+                && view_contradicts_stored_fingerprint(&self.store, &meta, &view)?
+            {
+                has_rollback_evidence = true;
+            }
         }
-        if !own_rolled_back
-            && !peer_regressed_below_ack
-            && let Some(view) = hs.caller_acked
-            && !view_matches_local(&self.store, &meta, &view)?
-        {
-            own_rolled_back = true;
-        }
-        if own_rolled_back {
+        if has_rollback_evidence {
             self.recover_own_rollback(&peer_id, &meta, now)?;
             meta = self.meta()?;
             initial_cursors = self.store.load_peer_cursors()?;
             hs = self.do_handshake(peer, &peer_id, &meta, &initial_cursors)?;
+        } else if hs.caller_regressed && !peer_regressed_below_ack {
+            let sentence = format!(
+                "{peer_id} reported that this machine's history went back without valid evidence; ignoring the claim."
+            );
+            self.record_peer_problem(
+                &peer_id,
+                SyncProblem {
+                    path: String::new(),
+                    kind: ProblemKind::PeerRollbackRateLimited,
+                    peer: Some(peer_id.clone()),
+                    sentence: sentence.clone(),
+                },
+            )?;
+            return Err(SyncError::Conflict {
+                path: peer_id,
+                reason: sentence,
+            });
         }
 
-        // Item 5: check if the PEER went back in time BEFORE any page moves!
+        // Check if the PEER went back in time BEFORE any page moves!
         if let Some(existing_cursor) = initial_cursors.get(&peer_id)
             && existing_cursor.incarnation == hs.incarnation
             && (existing_cursor.seq > 0 || peer_regressed_below_ack)
@@ -1353,7 +1380,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 self.flag_duplicate_member(&peer_id, existing_cursor.clone(), false)?;
                 return Err(SyncError::Conflict {
                     path: peer_id.clone(),
-                    reason: duplicate_member_sentence(&peer_id),
+                    reason: peer_rollback_sentence(&peer_id),
                 });
             }
         }
@@ -1460,7 +1487,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             if cursor.duplicate_detected {
                 return Err(SyncError::Conflict {
                     path: peer_id.clone(),
-                    reason: duplicate_member_sentence(&peer_id),
+                    reason: peer_identity_problem_sentence(&peer_id, cursor.alternation_detected),
                 });
             }
             let cursor_before_page = cursor.clone();
@@ -1525,7 +1552,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     self.flag_duplicate_member(&peer_id, cursor, false)?;
                     return Err(SyncError::Conflict {
                         path: peer_id.clone(),
-                        reason: duplicate_member_sentence(&peer_id),
+                        reason: peer_rollback_sentence(&peer_id),
                     });
                 }
                 let page_view = PeerAckView {
@@ -1533,7 +1560,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     seq: acked_seq,
                     fingerprint: page.caller_acked_fingerprint,
                 };
-                if !view_matches_local(&self.store, &local_meta, &page_view)? {
+                if view_contradicts_stored_fingerprint(&self.store, &local_meta, &page_view)? {
                     self.recover_own_rollback(&peer_id, &local_meta, now)?;
                     continue;
                 }
@@ -1550,7 +1577,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     self.flag_duplicate_member(&peer_id, cursor, false)?;
                     return Err(SyncError::Conflict {
                         path: peer_id.clone(),
-                        reason: duplicate_member_sentence(&peer_id),
+                        reason: peer_rollback_sentence(&peer_id),
                     });
                 }
                 if page.snapshot_seq == cursor.seq
@@ -1562,7 +1589,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     self.flag_duplicate_member(&peer_id, cursor, false)?;
                     return Err(SyncError::Conflict {
                         path: peer_id.clone(),
-                        reason: duplicate_member_sentence(&peer_id),
+                        reason: peer_rollback_sentence(&peer_id),
                     });
                 }
             }
@@ -3281,7 +3308,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             if new_inc == cursor.incarnation {
                 return Err(SyncError::Conflict {
                     path: peer_id.to_string(),
-                    reason: duplicate_member_sentence(peer_id),
+                    reason: peer_rollback_sentence(peer_id),
                 });
             }
             if cursor.prior_incarnations.contains(&new_inc) {
@@ -3402,6 +3429,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         if permanent_alternation {
             cursor.alternation_detected = true;
         }
+        let is_alternation = cursor.alternation_detected;
         let mut batch = StoreBatch::default();
         batch.set_peer_cursors.insert(peer_id.to_string(), cursor);
         self.store.apply_batch(batch)?;
@@ -3411,45 +3439,44 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                 path: String::new(),
                 kind: ProblemKind::DuplicateMemberId,
                 peer: Some(peer_id.to_string()),
-                sentence: duplicate_member_sentence(peer_id),
+                sentence: peer_identity_problem_sentence(peer_id, is_alternation),
             },
         )?;
         Ok(())
     }
 
-    /// Recovers when a peer's handshake or page shows our own index went back in time (backup
-    /// restore or clone): rate-limited to at most once per day per peer and three times per week
-    /// in total, rotates to a fresh incarnation, carries every pending tombstone + held deletion +
-    /// `.legion-sync/deletions.log`, runs a join scan over disk so post-restore changes meet peers
-    /// as two versions rather than silently replacing them, and reports the forced rotation.
+    /// Recovers when a peer's handshake or page presents checkable evidence that our own index
+    /// went back in time (backup restore): rate-limited strictly per claimant (at most once per
+    /// day and three times per week for that peer, with no global cap), rotates to a fresh
+    /// incarnation, carries every pending tombstone + held deletion + `.legion-sync/deletions.log`,
+    /// runs a join scan over disk so post-restore changes meet peers as two versions rather than
+    /// silently replacing them, and reports the recovery honestly.
     fn recover_own_rollback(
         &mut self,
         peer_id: &str,
         meta: &FolderMeta,
         now: Timestamp,
     ) -> Result<()> {
-        let recent_history: Vec<(MemberId, Timestamp)> = meta
-            .forced_rotation_history
-            .iter()
-            .filter(|(_, ts)| {
+        let peer_recent: Vec<Timestamp> = meta
+            .forced_rotations_by_peer
+            .get(peer_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|ts| {
                 now.secs >= ts.secs
                     && (now.secs - ts.secs) < FORCED_ROTATION_WEEK_WINDOW_SECS as i64
             })
-            .cloned()
             .collect();
-        let peer_within_day = recent_history.iter().any(|(p, ts)| {
-            p == peer_id && (now.secs - ts.secs) < FORCED_ROTATION_COOLDOWN_SECS as i64
-        }) || meta.last_forced_rotation_by_peer.get(peer_id).is_some_and(
-            |&prev_ts| {
-                now.secs >= prev_ts.secs
-                    && (now.secs - prev_ts.secs) < FORCED_ROTATION_COOLDOWN_SECS as i64
-            },
-        );
-        let week_limit_reached = recent_history.len() >= MAX_FORCED_ROTATIONS_PER_WEEK;
+        let peer_within_day = peer_recent
+            .iter()
+            .any(|ts| (now.secs - ts.secs) < FORCED_ROTATION_COOLDOWN_SECS as i64);
+        let peer_week_limit_reached = peer_recent.len() >= MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK;
 
-        if peer_within_day || week_limit_reached {
-            let sentence =
-                format!("{peer_id} keeps reporting that this machine's history went back.");
+        if peer_within_day || peer_week_limit_reached {
+            let sentence = format!(
+                "{peer_id} keeps reporting that this machine's history went back; its rollback claims are being ignored."
+            );
             self.record_peer_problem(
                 peer_id,
                 SyncProblem {
@@ -3487,13 +3514,11 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         new_meta.join_mode = true;
         new_meta.head_fingerprint = None;
         new_meta.pending_deletions.clear();
+        let mut updated_peer_history = peer_recent;
+        updated_peer_history.push(now);
         new_meta
-            .last_forced_rotation_by_peer
-            .insert(peer_id.to_string(), now);
-        new_meta.forced_rotation_history = recent_history;
-        new_meta
-            .forced_rotation_history
-            .push((peer_id.to_string(), now));
+            .forced_rotations_by_peer
+            .insert(peer_id.to_string(), updated_peer_history);
 
         let reset_batch = StoreBatch {
             folder_meta: Some(new_meta),
@@ -3524,16 +3549,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
 
         reissue_carried_deletions(&self.fs, &mut self.store, carried_deletions)?;
 
-        // Report the forced rotation durably (Item 9).
+        // Report the recovery honestly (clear backup-restore sentence).
         self.record_peer_problem(
             peer_id,
             SyncProblem {
                 path: String::new(),
                 kind: ProblemKind::PeerForcedRotation,
                 peer: Some(peer_id.to_string()),
-                sentence: format!(
-                    "Started a fresh sync history after '{peer_id}' reported a newer or divergent index for this folder."
-                ),
+                sentence: own_rollback_sentence(peer_id),
             },
         )?;
         Ok(())
@@ -3820,6 +3843,31 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         };
         let caller_rejoining = meta.rejoining_peers.contains(caller_member);
         let refused_from_caller = self.refusal_summary_for_peer(caller_member)?;
+        let caller_may_have_regressed = caller_regressed
+            || caller_cursor.is_some_and(|c| {
+                c.incarnation == caller.incarnation
+                    && (caller.snapshot_seq < c.seq
+                        || (caller.snapshot_seq == c.seq
+                            && c.seq > 0
+                            && caller.head_fingerprint.is_some()
+                            && c.head_fingerprint.is_some()
+                            && caller.head_fingerprint != c.head_fingerprint))
+            });
+        let caller_evidence_record = if caller_may_have_regressed && caller.incarnation != 0 {
+            let caller_key =
+                crate::version::VersionKey::new(caller_member.to_string(), caller.incarnation);
+            let mut best: Option<(u64, IndexRecord)> = None;
+            self.store.scan_records_in_order(&mut |rec| {
+                let c = rec.version.get(&caller_key);
+                if c > 0 && best.as_ref().is_none_or(|(bc, _)| c > *bc) {
+                    best = Some((c, rec.for_wire()));
+                }
+                Ok(true)
+            })?;
+            best.map(|(_, rec)| rec)
+        } else {
+            None
+        };
         Ok(PeerHandshake {
             folder_id: meta.folder_id,
             member_id: meta.local_member,
@@ -3833,6 +3881,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             caller_regressed,
             caller_rejoining,
             refused_from_caller,
+            caller_evidence_record,
         })
     }
 
@@ -4241,7 +4290,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     path: String::new(),
                     kind: ProblemKind::DuplicateMemberId,
                     peer: Some(member.clone()),
-                    sentence: duplicate_member_sentence(member),
+                    sentence: peer_identity_problem_sentence(member, c.alternation_detected),
                 });
             }
             if let Some(ref ib) = c.inbound_brake {
@@ -4342,7 +4391,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
             {
                 peer_problems.push(peer_refused_problem(member, summary));
             }
-            if cursors.get(member).is_some_and(|c| c.duplicate_detected)
+            if let Some(c) = cursors.get(member)
+                && c.duplicate_detected
                 && !peer_problems
                     .iter()
                     .any(|p| p.kind == ProblemKind::DuplicateMemberId)
@@ -4351,7 +4401,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     path: String::new(),
                     kind: ProblemKind::DuplicateMemberId,
                     peer: Some(member.clone()),
-                    sentence: duplicate_member_sentence(member),
+                    sentence: peer_identity_problem_sentence(member, c.alternation_detected),
                 });
             }
             if peer_problems.is_empty()
@@ -4528,6 +4578,80 @@ fn view_matches_local<S: IndexStore>(
         Some(fp) => Ok(fp == expected_fp),
         None => Ok(false),
     }
+}
+
+/// Returns `true` when `view` names our current incarnation at a sequence we have
+/// (`1 <= view.seq <= meta.local_seq`) and carries a fingerprint that contradicts what we stored.
+fn view_contradicts_stored_fingerprint<S: IndexStore>(
+    store: &S,
+    meta: &FolderMeta,
+    view: &PeerAckView,
+) -> Result<bool> {
+    if view.incarnation != meta.incarnation || view.seq == 0 || view.seq > meta.local_seq {
+        return Ok(false);
+    }
+    let Some(claimed_fp) = view.fingerprint else {
+        return Ok(false);
+    };
+    let Some(expected_fp) = store.get_seq_fingerprint(view.seq)? else {
+        return Ok(false);
+    };
+    Ok(claimed_fp != expected_fp)
+}
+
+/// Returns `true` when `ev` is a structurally valid record naming our current
+/// `(local_member, incarnation)` at a counter beyond our own `local_clock`, or contradicting our
+/// stored record at that path (lower counter or identical version with divergent state).
+fn evidence_record_proves_rollback<S: IndexStore>(
+    store: &S,
+    meta: &FolderMeta,
+    ev: &IndexRecord,
+) -> Result<bool> {
+    let Ok(clean_path) = validate_sync_path(&ev.path) else {
+        return Ok(false);
+    };
+    if ev.deleted {
+        if ev.size != 0 || ev.hash.is_some() || ev.link_target.is_some() {
+            return Ok(false);
+        }
+    } else {
+        match ev.kind {
+            EntryKind::File => {
+                if ev.hash.is_none() || ev.link_target.is_some() {
+                    return Ok(false);
+                }
+            }
+            EntryKind::Dir => {
+                if ev.size != 0 || ev.hash.is_some() || ev.link_target.is_some() {
+                    return Ok(false);
+                }
+            }
+            EntryKind::Symlink => {
+                if ev.size != 0 || ev.hash.is_some() || ev.link_target.is_none() {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    let own_key = meta.version_key();
+    let ev_counter = ev.version.get(&own_key);
+    if ev_counter == 0 || ev_counter > MAX_VERSION_COUNTER {
+        return Ok(false);
+    }
+    if ev_counter > meta.local_clock {
+        return Ok(true);
+    }
+    if let Some(local) = store.get_record(&clean_path)? {
+        if local.version.get(&own_key) < ev_counter {
+            return Ok(true);
+        }
+        if local.version == ev.version
+            && (local.deleted != ev.deleted || (!local.deleted && !local.content_equal(ev)))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Minimal [`Peer`] stub used by [`SyncEngine::retry_held_back_local`] for local-only decisions
@@ -4814,6 +4938,26 @@ fn duplicate_member_sentence(peer_id: &str) -> String {
     format!(
         "Two different machines appear to be using the same member name '{peer_id}'. Rename or remove one before syncing with it again."
     )
+}
+
+fn peer_rollback_sentence(peer_id: &str) -> String {
+    format!(
+        "{peer_id}'s copy of the folder is older than what this machine has already received from it; it looks like it was restored from a backup. Waiting for {peer_id} to rejoin the folder. Nothing is deleted."
+    )
+}
+
+fn own_rollback_sentence(peer_id: &str) -> String {
+    format!(
+        "This machine's copy of the folder is older than what {peer_id} has already received from it; it looks like it was restored from a backup. Legion is joining the folder again. Nothing is deleted."
+    )
+}
+
+fn peer_identity_problem_sentence(peer_id: &str, alternation_detected: bool) -> String {
+    if alternation_detected {
+        duplicate_member_sentence(peer_id)
+    } else {
+        peer_rollback_sentence(peer_id)
+    }
 }
 
 fn summarize_problems(problems: &[SyncProblem]) -> String {

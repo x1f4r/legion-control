@@ -398,6 +398,7 @@ impl Peer for BenchPeer {
             caller_regressed: false,
             caller_rejoining: false,
             refused_from_caller: None,
+            caller_evidence_record: None,
         })
     }
 

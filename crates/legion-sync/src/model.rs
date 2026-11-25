@@ -32,13 +32,14 @@ pub const MAX_VERSION_COUNTER: u64 = 1u64 << 62;
 /// Minimum interval (in seconds) between peer-forced incarnation rotations per peer (1 day).
 pub const FORCED_ROTATION_COOLDOWN_SECS: u64 = 86_400;
 
-/// Rolling window (in seconds) over which total peer-forced incarnation rotations across all peers
-/// are bounded (7 days).
+/// Rolling window (in seconds) over which peer-forced incarnation rotations from one peer are
+/// bounded (7 days).
 pub const FORCED_ROTATION_WEEK_WINDOW_SECS: u64 = 7 * 86_400;
 
-/// Maximum number of peer-forced incarnation rotations accepted in total across all peers within
-/// [`FORCED_ROTATION_WEEK_WINDOW_SECS`].
-pub const MAX_FORCED_ROTATIONS_PER_WEEK: usize = 3;
+/// Maximum number of peer-forced incarnation rotations accepted from a single peer within
+/// [`FORCED_ROTATION_WEEK_WINDOW_SECS`] (strictly per claimant; one peer can never exhaust another
+/// peer's budget).
+pub const MAX_FORCED_ROTATIONS_PER_PEER_PER_WEEK: usize = 3;
 
 /// Default retention duration for files moved to `.legion-sync/bin` (30 days).
 pub const DEFAULT_BIN_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -504,14 +505,10 @@ pub struct FolderMeta {
     /// Chained fingerprint at `local_seq` (commits to the full sequence history `1..=local_seq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
-    /// Last timestamp at which each peer forced an incarnation rotation (rate-limited to at most
-    /// once per day per peer).
+    /// Per-claimant timestamps of peer-forced incarnation rotations within the last week
+    /// (enforcing at most once per day and three times per week per peer, with no global cap).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub last_forced_rotation_by_peer: BTreeMap<MemberId, Timestamp>,
-    /// Bounded history of `(peer, timestamp)` peer-forced incarnation rotations within the last
-    /// week (enforcing at most once per day per peer and three times per week in total).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forced_rotation_history: Vec<(MemberId, Timestamp)>,
+    pub forced_rotations_by_peer: BTreeMap<MemberId, Vec<Timestamp>>,
     /// Directories deleted remotely that were intentionally kept on disk only because they still
     /// hold ignored or held-back local files, persisted across tombstone GC and restarts so scans
     /// never revive them unless synced files are later added inside.
@@ -549,8 +546,7 @@ impl FolderMeta {
             pending_brake: None,
             join_mode: true,
             head_fingerprint: None,
-            last_forced_rotation_by_peer: BTreeMap::new(),
-            forced_rotation_history: Vec::new(),
+            forced_rotations_by_peer: BTreeMap::new(),
             kept_deleted_dirs: BTreeSet::new(),
             needs_rescan: BTreeSet::new(),
             pending_deletions: BTreeMap::new(),
@@ -783,6 +779,11 @@ pub struct PeerHandshake {
     /// Short summary of records the callee could not accept from the caller, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused_from_caller: Option<PeerRefusalSummary>,
+    /// Checkable record evidence supplied when the callee detects the caller may have rolled back:
+    /// a record from the callee's index naming the caller's current `(member, incarnation)` so the
+    /// caller can verify the claim locally before rotating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_evidence_record: Option<IndexRecord>,
 }
 
 /// Monotonic elapsed-time clock for [`FetchOptions`] idle-timeout enforcement.

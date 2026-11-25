@@ -539,6 +539,7 @@ impl Peer for FakePeer {
             caller_regressed: false,
             caller_rejoining: false,
             refused_from_caller: None,
+            caller_evidence_record: None,
         })
     }
 
@@ -1825,6 +1826,7 @@ fn item_k_ranged_resumable_fetch_and_cancellation() {
                 caller_regressed: false,
                 caller_rejoining: false,
                 refused_from_caller: None,
+                caller_evidence_record: None,
             })
         }
 

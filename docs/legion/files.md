@@ -551,9 +551,12 @@ always-on machine) simply makes that happen sooner for everyone.
   explicit rejoin signal in the handshake so healthy members do not rotate. If a member detects
   that it rolled back or reinstalled, it starts a fresh incarnation (carrying existing tombstones,
   held deletions, and `.legion-sync/deletions.log` forward) rather than reusing counters and
-  reconciles its disk by the join rule above; peer-forced rotations are rate-limited to at most
-  once per day per peer and three times per week in total, after which further claims are ignored
-  and reported as a problem naming the peer. Version vectors are always compared whole and never
+  reconciles its disk by the join rule above. Peer-initiated rollback claims require checkable
+  evidence (a record naming this member's current incarnation past its own counter, or a
+  diverging fingerprint at a sequence this member has) — a bare claim rotates nothing — and
+  budgets are strictly per claimant (at most once per day and three times per week per peer, with
+  no global cap), so one faulty peer can never block another peer's legitimate recovery or a local
+  marker-mismatch recovery. Version vectors are always compared whole and never
   drop a key from a record or a remembered deletion; a safety cap of 64 incarnations per member in
   one record bounds growth, and if reached that member's new records are refused with a durable
   problem on both sides without affecting unrelated files or losing data. Two live machines using

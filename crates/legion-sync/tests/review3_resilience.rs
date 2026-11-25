@@ -435,8 +435,7 @@ fn r2_restore_matrix() {
     }
     for (issue, where_) in &summary {
         let allowed_transient = issue.starts_with("first-meeting error ")
-            && issue
-                .contains("Two different machines appear to be using the same member name 'pi'");
+            && issue.contains("pi's copy of the folder is older than what this machine has already received from it; it looks like it was restored from a backup");
         assert!(
             allowed_transient,
             "unexpected restore-matrix issue ({}x, e.g. {}): {issue}",
@@ -1772,9 +1771,10 @@ fn r11_liar_cuts_honest_member_off() {
             },
             ts(now),
         );
-        if h >= 2 {
-            assert!(r.is_err(), "hour {h}: liar should be rate-limited");
-        }
+        assert!(
+            r.is_err(),
+            "hour {h}: bare regression claim without evidence must be rejected"
+        );
         let inc = pi.meta().unwrap().incarnation;
         if *incs.last().unwrap() != inc {
             incs.push(inc);
@@ -1794,16 +1794,17 @@ fn r11_liar_cuts_honest_member_off() {
     }
     assert_eq!(
         incs.len() - 1,
-        1,
-        "pi should rotate at most once per day for nas"
+        0,
+        "bare caller_regressed claim with no checkable evidence must rotate nothing"
     );
     let probs = pi.store().list_problems().unwrap();
     assert!(
         probs.iter().any(|(_, p)| {
             p.kind == ProblemKind::PeerRollbackRateLimited
-                && p.sentence == "nas keeps reporting that this machine's history went back."
+                && p.peer.as_deref() == Some("nas")
+                && p.sentence.contains("without valid evidence")
         }),
-        "expected PeerRollbackRateLimited problem naming nas, got {probs:?}"
+        "expected PeerRollbackRateLimited problem naming nas without evidence, got {probs:?}"
     );
 }
 
@@ -3341,6 +3342,7 @@ impl Peer for ManyOversizedPeer {
             caller_regressed: false,
             caller_rejoining: false,
             refused_from_caller: None,
+            caller_evidence_record: None,
         })
     }
     fn records_since(
