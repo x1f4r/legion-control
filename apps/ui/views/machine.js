@@ -1,26 +1,29 @@
 // One machine screen: Overview, Files, Power, More, Command, Services, Projects, and Activity.
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
-import { Meter, Notice } from './common.js';
+import { Meter, Notice, Sheet } from './common.js';
 import { ActivityDetail, ActivityGroups, ActivityRow } from './activity.js';
 import { MachineFilesBrowser } from './files.js';
 import { plainDenyReason } from '../lib/actions.js';
 import {
   formatCommandMeta,
+  formatFriendlyRelativeTime,
   formatFriendlyUptime,
   formatMachineDetailSubtitle,
   friendlyJobName,
 } from '../lib/activity.js';
 import {
-  diskUsagePct,
   formatBusyReasonLines,
-  formatBytePair,
   formatBytes,
-  formatRelativeTime,
-  machineMetrics,
   osLabel,
-  realDisks,
 } from '../lib/format.js';
+import {
+  buildOverviewMeters,
+  createOverviewPoller,
+  formatOverviewStateLine,
+  isOverviewBusy,
+  selectBusyPrograms,
+} from '../lib/machine-monitor.js';
 import { routeHref, WIDE_MACHINE_TABS } from '../lib/route.js';
 import { describePowerConfirm, unavailableReason } from '../lib/schema.js';
 
@@ -38,9 +41,301 @@ function targetFor(machineName, nodeName) {
   return machineName || nodeName || undefined;
 }
 
+// ── Program detail and Stop / Force stop sheet ───────────────────────────────────────────────
+
+function ProgramSheet({ program, machine, on, link, canKill, technical, onStopped, onClose }) {
+  const [step, setStep] = useState('detail'); // 'detail' | 'confirm' | 'stopping' | 'still_running' | 'refused'
+  const [stillTargets, setStillTargets] = useState([]);
+  const [refusals, setRefusals] = useState([]);
+  const [error, setError] = useState(null);
+
+  if (!program) return null;
+
+  const isSelf = Boolean(program.self);
+  const title = program.count > 1 ? `${program.name} × ${program.count}` : program.name;
+  const members = Array.isArray(program.members) ? program.members : [];
+  const pidList = members.map((m) => m.pid).filter((p) => Number.isFinite(p));
+  const verifiedTargets = members
+    .filter((m) => Number.isFinite(m.pid) && typeof m.start_time === 'string' && m.start_time)
+    .map((m) => ({ pid: m.pid, start_time: m.start_time }));
+
+  async function sendStop(targets, force) {
+    setStep('stopping');
+    setError(null);
+    setRefusals([]);
+    try {
+      const args =
+        targets.length > 0
+          ? { targets, force }
+          : { pid: pidList[0], force };
+      const res = await link.call('sys.kill', args, { on });
+      const items = Array.isArray(res?.results) ? res.results : [];
+      if (items.length === 0) {
+        if (res?.stopped === false) {
+          setStillTargets(targets);
+          setStep('still_running');
+        } else {
+          if (onStopped) onStopped();
+          onClose();
+        }
+        return;
+      }
+
+      const targetByPid = new Map(targets.map((t) => [t.pid, t]));
+      const remaining = [];
+      const refusedMsgs = [];
+      const seenMsg = new Set();
+      for (const item of items) {
+        if (item.status === 'still_running') {
+          const matched = targetByPid.get(item.pid);
+          if (matched) remaining.push(matched);
+        } else if (item.status === 'refused') {
+          const msg = item.message || 'This program could not be stopped.';
+          if (!seenMsg.has(msg)) {
+            seenMsg.add(msg);
+            refusedMsgs.push(msg);
+          }
+        }
+      }
+
+      if (remaining.length > 0) {
+        setStillTargets(remaining);
+        setRefusals(refusedMsgs);
+        setStep('still_running');
+      } else if (refusedMsgs.length > 0) {
+        setRefusals(refusedMsgs);
+        setStep('refused');
+      } else {
+        if (onStopped) onStopped();
+        onClose();
+      }
+    } catch (err) {
+      setError(err);
+      setStep(force ? 'still_running' : 'detail');
+    }
+  }
+
+  return html`
+    <${Sheet} title=${title} onClose=${onClose}>
+      ${step === 'confirm'
+        ? html`
+            <p>Stop ${program.name} on ${machine.name}? Anything unsaved in it is lost.</p>
+            <div class="actions">
+              <button type="button" class="btn" onClick=${() => setStep('detail')}>Cancel</button>
+              <button
+                type="button"
+                class="btn danger full"
+                onClick=${() => sendStop(verifiedTargets, false)}
+              >
+                Stop ${program.name}
+              </button>
+            </div>
+          `
+        : html`
+            <div class="list">
+              <dl class=${technical ? 'kv' : 'kv plain'}>
+                <dt>${technical ? 'cpu' : 'Processor'}</dt>
+                <dd>
+                  ${technical
+                    ? `${Math.round(program.wholeCpuPct)}% (${program.cpu_pct}% across cores)`
+                    : `${Math.round(program.wholeCpuPct)}%`}
+                </dd>
+                <dt>${technical ? 'memory' : 'Memory'}</dt>
+                <dd>
+                  ${formatBytes(program.memory)}
+                  ${program.memPct >= 1 ? ` (${Math.round(program.memPct)}%)` : ''}
+                </dd>
+                ${program.gpuMemBytes > 0
+                  ? html`
+                      <dt>${technical ? 'gpu_memory' : 'Graphics memory'}</dt>
+                      <dd>${formatBytes(program.gpuMemBytes)}</dd>
+                    `
+                  : null}
+                ${program.earliestStartTime
+                  ? html`
+                      <dt>${technical ? 'started' : 'Running since'}</dt>
+                      <dd>${formatFriendlyRelativeTime(program.earliestStartTime)}</dd>
+                    `
+                  : null}
+                ${program.user
+                  ? html`
+                      <dt>${technical ? 'user' : 'Running as'}</dt>
+                      <dd>${program.user}</dd>
+                    `
+                  : null}
+                ${technical && program.cmd
+                  ? html`
+                      <dt>command</dt>
+                      <dd>${program.cmd}</dd>
+                    `
+                  : null}
+                ${technical && pidList.length > 0
+                  ? html`
+                      <dt>pids</dt>
+                      <dd>
+                        ${pidList.join(', ')}
+                        ${program.more > 0 ? ` (+${program.more} more)` : ''}
+                      </dd>
+                    `
+                  : null}
+              </dl>
+            </div>
+
+            ${error ? html`<${Notice} error=${error} />` : null}
+
+            ${refusals.map(
+              (msg, idx) => html`
+                <div class="notice bad" key=${idx} role="status">
+                  <strong>${msg}</strong>
+                </div>
+              `,
+            )}
+
+            ${step === 'still_running'
+              ? html`
+                  <div class="notice" role="status">
+                    <strong>${program.name} is still running.</strong>
+                    <span>It did not stop on its own. You can force it to stop now.</span>
+                  </div>
+                `
+              : null}
+
+            ${isSelf
+              ? html`
+                  <div class="notice neutral" role="status">
+                    <strong>Legion cannot stop this program.</strong>
+                    <span>Legion is running inside it.</span>
+                  </div>
+                  <div class="actions">
+                    <button type="button" class="btn full" onClick=${onClose}>Close</button>
+                  </div>
+                `
+              : !canKill
+                ? html`
+                    <div class="notice neutral" role="status">
+                      <strong>Stopping programs is not allowed on this device.</strong>
+                    </div>
+                    <div class="actions">
+                      <button type="button" class="btn full" onClick=${onClose}>Close</button>
+                    </div>
+                  `
+                : step === 'still_running'
+                  ? html`
+                      <div class="actions">
+                        <button type="button" class="btn" onClick=${onClose}>Close</button>
+                        <button
+                          type="button"
+                          class="btn danger full"
+                          onClick=${() => sendStop(stillTargets, true)}
+                        >
+                          Force stop
+                        </button>
+                      </div>
+                    `
+                  : step === 'refused'
+                    ? html`
+                        <div class="actions">
+                          <button type="button" class="btn full" onClick=${onClose}>Close</button>
+                        </div>
+                      `
+                    : html`
+                        <div class="actions">
+                          <button
+                            type="button"
+                            class="btn"
+                            disabled=${step === 'stopping'}
+                            onClick=${onClose}
+                          >
+                            Close
+                          </button>
+                          <button
+                            type="button"
+                            class="btn danger full"
+                            disabled=${step === 'stopping' || (verifiedTargets.length === 0 && pidList.length === 0)}
+                            onClick=${() => setStep('confirm')}
+                          >
+                            ${step === 'stopping' ? 'Stopping…' : 'Stop'}
+                          </button>
+                        </div>
+                      `}
+          `}
+    <//>
+  `;
+}
+
 // ── Overview tab ─────────────────────────────────────────────────────────────────────────────
 
-function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onStopJob }) {
+function OverviewTab({
+  machine,
+  nodeInfo,
+  link,
+  allowedSet,
+  technical,
+  wakePending,
+  onWake,
+  onStopJob,
+  onUpdateMachineSys,
+}) {
+  const [liveSys, setLiveSys] = useState(() => machine.sys || null);
+  const [liveProcs, setLiveProcs] = useState(null);
+  const [stale, setStale] = useState(false);
+  const [selectedProgram, setSelectedProgram] = useState(null);
+  const pollerRef = useRef(null);
+  const on = targetFor(machine.name, nodeInfo?.node);
+
+  useEffect(() => {
+    setLiveSys(machine.sys || null);
+  }, [machine.name, machine.sys]);
+
+  useEffect(() => {
+    setLiveProcs(null);
+    setSelectedProgram(null);
+    setStale(false);
+    if (!machine.reachable || !link) return undefined;
+
+    let mounted = true;
+    const poller = createOverviewPoller({
+      onStaleChange(nextStale) {
+        if (mounted) setStale(nextStale);
+      },
+      async fetchTick() {
+        const [sysRes, procsRes] = await Promise.allSettled([
+          link.call('sys.info', {}, { on }),
+          link.call('sys.procs', { group: true, limit: 12 }, { on }),
+        ]);
+        if (!mounted) return false;
+        let gotAny = false;
+        if (sysRes.status === 'fulfilled' && sysRes.value) {
+          gotAny = true;
+          setLiveSys(sysRes.value);
+          if (typeof onUpdateMachineSys === 'function') {
+            onUpdateMachineSys(machine.name, sysRes.value);
+          }
+        }
+        if (procsRes.status === 'fulfilled' && Array.isArray(procsRes.value?.procs)) {
+          gotAny = true;
+          setLiveProcs(procsRes.value.procs);
+        }
+        return gotAny;
+      },
+    });
+    pollerRef.current = poller;
+    poller.start({ immediate: true });
+
+    const onVis = () => poller.onVisibilityChange();
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVis);
+    }
+    return () => {
+      mounted = false;
+      poller.stop();
+      pollerRef.current = null;
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVis);
+      }
+    };
+  }, [machine.name, machine.reachable, link, on]);
+
   if (machine.status === 'asking' || machine.asking) {
     return html`<div class="empty">Checking ${machine.name}…</div>`;
   }
@@ -77,23 +372,14 @@ function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onSt
     `;
   }
 
-  const sys = machine.sys;
-  const metrics = machineMetrics(sys);
-  const disks = realDisks(sys?.disks);
+  const sys = liveSys || machine.sys;
+  const meters = buildOverviewMeters(sys, { technical });
+  const busyPrograms = selectBusyPrograms(liveProcs || [], sys);
   const runningJobs = Array.isArray(machine.jobs) ? machine.jobs : [];
   const canCancel = allowedSet ? allowedSet.has('job.cancel') : true;
-
-  const loadText =
-    technical && Array.isArray(sys?.cpu?.load) && sys.cpu.load.length > 0
-      ? `load ${sys.cpu.load[0].toFixed(1)}`
-      : null;
-  const cpuDetail = [
-    metrics ? `${metrics.cpuPct}%` : null,
-    loadText,
-    technical && sys?.cpu?.cores ? `${sys.cpu.cores} cores` : null,
-  ]
-    .filter(Boolean)
-    .join(' · ');
+  const canKill = allowedSet ? allowedSet.has('sys.kill') : true;
+  const activeBusy = isOverviewBusy(sys);
+  const stateLine = formatOverviewStateLine(sys);
 
   const busyReasonLines = formatBusyReasonLines(machine.busyReasons);
   const busySummary = machine.busy
@@ -117,6 +403,68 @@ function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onSt
 
   return html`
     <div>
+      <div class=${stale ? 'machine-state stale-values' : 'machine-state'}>
+        <span class=${activeBusy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
+        <span>${stateLine}</span>
+      </div>
+
+      ${meters.length > 0
+        ? html`
+            <p class="label">Health</p>
+            <div class=${stale ? 'list stale-values' : 'list'}>
+              ${meters.map(
+                (m) => html`
+                  <div class=${m.amber ? 'gauge warn' : 'gauge'} key=${m.id}>
+                    <header>
+                      <span>
+                        ${m.label}
+                        ${m.subLabel ? html` <span class="mono dim">${m.subLabel}</span>` : null}
+                      </span>
+                      <span>${m.detail}</span>
+                    </header>
+                    <${Meter} value=${m.pct} level=${m.amber ? 'warn' : ''} />
+                  </div>
+                `,
+              )}
+            </div>
+          `
+        : null}
+
+      <p class="label">Using it now</p>
+      <div class=${stale ? 'list stale-values' : 'list'}>
+        ${liveProcs === null
+          ? html`
+              <div class="row off">
+                <span class="body"><span class="sub">Checking…</span></span>
+              </div>
+            `
+          : busyPrograms.length === 0
+            ? html`
+                <div class="row off">
+                  <span class="body"><span class="sub">Nothing much is running.</span></span>
+                </div>
+              `
+            : busyPrograms.map(
+                (prog) => html`
+                  <button
+                    type="button"
+                    class="row"
+                    key=${`${prog.name}:${prog.user || ''}`}
+                    onClick=${() => setSelectedProgram(prog)}
+                  >
+                    <span class="body">
+                      <span class="title">
+                        ${prog.name}
+                        ${prog.count > 1 ? html`<span class="proc-count">× ${prog.count}</span>` : null}
+                      </span>
+                      <span class="sub">${prog.primaryText}</span>
+                    </span>
+                    <span class="chev" aria-hidden="true">›</span>
+                  </button>
+                `,
+              )}
+      </div>
+
       ${runningJobs.length > 0
         ? html`
             <p class="label">Running now</p>
@@ -142,55 +490,6 @@ function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onSt
             </div>
           `
         : null}
-
-      <p class="label">Health</p>
-      ${metrics
-        ? html`
-            <div class="list">
-              <div class="gauge">
-                <header>
-                  <span>Processor</span>
-                  <span>${cpuDetail}</span>
-                </header>
-                <${Meter} value=${metrics.cpuPct} />
-              </div>
-              <div class="gauge">
-                <header>
-                  <span>Memory</span>
-                  <span>${formatBytePair(metrics.memUsed, metrics.memTotal)}</span>
-                </header>
-                <${Meter} value=${metrics.memPct} />
-              </div>
-              ${disks.map((disk) => {
-                const used = Math.max(0, disk.total - (disk.available ?? 0));
-                const pct = diskUsagePct(disk);
-                const showMount = technical || disks.length > 1;
-                return html`
-                  <div class="gauge" key=${disk.mount}>
-                    <header>
-                      <span>
-                        Disk${showMount ? html` <span class="mono dim">${disk.mount}</span>` : null}
-                      </span>
-                      <span>${formatBytePair(used, disk.total)}</span>
-                    </header>
-                    <${Meter} value=${pct} />
-                  </div>
-                `;
-              })}
-              ${metrics.gpus.map(
-                (gpu, idx) => html`
-                  <div class="gauge" key=${`${gpu.name}-${idx}`}>
-                    <header>
-                      <span>Graphics memory</span>
-                      <span>${formatBytePair(gpu.used, gpu.total)}</span>
-                    </header>
-                    <${Meter} value=${gpu.pct} />
-                  </div>
-                `,
-              )}
-            </div>
-          `
-        : html`<div class="empty">Loading health…</div>`}
 
       <p class="label">About</p>
       <div class="list">
@@ -219,6 +518,21 @@ function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onSt
             : html`<dd>${busySummary}</dd>`}
         </dl>
       </div>
+
+      ${selectedProgram
+        ? html`
+            <${ProgramSheet}
+              program=${selectedProgram}
+              machine=${machine}
+              on=${on}
+              link=${link}
+              canKill=${canKill}
+              technical=${technical}
+              onStopped=${() => pollerRef.current?.refreshNow()}
+              onClose=${() => setSelectedProgram(null)}
+            />
+          `
+        : null}
     </div>
   `;
 }
@@ -235,6 +549,7 @@ export function CommandComposer({
   onAppendRun,
   onUpdateRun,
   onOpenJob,
+  onEnsureAwake,
 }) {
   const abortRef = useRef(null);
   const canExec = allowedSet ? allowedSet.has('exec.run') : true;
@@ -254,28 +569,20 @@ export function CommandComposer({
   const jobName = state.jobName || '';
   const running = Boolean(state.running);
 
-  async function submit(e) {
-    e.preventDefault();
-    if (running && abortRef.current) {
-      abortRef.current.abort();
-      return;
-    }
-    const trimmed = cmd.trim();
-    if (!trimmed) return;
-
+  async function executeSubmitted(trimmed, runAsJob, nameForJob) {
     const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
-    if (asJob && canJob) {
+    if (runAsJob && canJob) {
       onStateChange({ running: true, error: null });
       try {
         const args = { cmd: trimmed };
-        if (jobName.trim()) args.name = jobName.trim();
+        if (nameForJob.trim()) args.name = nameForJob.trim();
         const res = await link.call('job.start', args, { on });
         onAppendRun(machine.name, {
           id: runId,
           cmd: trimmed,
           jobId: res.id,
-          jobName: res.name || jobName.trim() || '',
+          jobName: res.name || nameForJob.trim() || '',
           status: 'started',
           at: Date.now(),
         });
@@ -346,6 +653,39 @@ export function CommandComposer({
       abortRef.current = null;
       onStateChange({ running: false });
     }
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    if (running && abortRef.current) {
+      abortRef.current.abort();
+      return;
+    }
+    const trimmed = cmd.trim();
+    if (!trimmed) return;
+
+    if (!machine.reachable && onEnsureAwake) {
+      const res = await onEnsureAwake(machine, {
+        kind: 'command',
+        label: trimmed,
+        onContinue: ({ inBackground }) =>
+          executeSubmitted(trimmed, inBackground && canJob ? true : asJob, jobName),
+      });
+      if (!res?.awake && res?.canWake === false) {
+        onStateChange({
+          error: {
+            code: 'unreachable',
+            message: `${machine.name} is off.`,
+            hint: machine.canWake
+              ? 'This device is not allowed to wake machines.'
+              : 'Wake-on-LAN is not set up for this machine.',
+          },
+        });
+      }
+      return;
+    }
+
+    await executeSubmitted(trimmed, asJob, jobName);
   }
 
   return html`
@@ -1265,9 +1605,11 @@ export function MachineDetail({
   thumbCache,
   wakePending,
   onWakeMachine,
+  onEnsureAwake,
   onWakeSent,
   onRequestConfirm,
   onRefreshFleet,
+  onUpdateMachineSys,
   commandRuns,
   onCommandRunsChange,
 }) {
@@ -1348,11 +1690,14 @@ export function MachineDetail({
         ? html`
             <${OverviewTab}
               machine=${machine}
+              nodeInfo=${nodeInfo}
+              link=${link}
               allowedSet=${allowedSet}
               technical=${technical}
               wakePending=${wakePending}
               onWake=${onWakeMachine || (() => selectTab('power'))}
               onStopJob=${handleStopJob}
+              onUpdateMachineSys=${onUpdateMachineSys}
             />
           `
         : effectiveTab === 'more'
@@ -1370,7 +1715,7 @@ export function MachineDetail({
                       onOpenJob=${openJob}
                     />
                   </div>
-                  ${machine.reachable && commandRuns
+                  ${(machine.reachable || (machine.canWake && allowedSet?.has('power.wake'))) && commandRuns
                     ? html`
                         <div class="spaced">
                           <${CommandComposer}
@@ -1383,6 +1728,7 @@ export function MachineDetail({
                             onAppendRun=${onCommandRunsChange.appendRun}
                             onUpdateRun=${onCommandRunsChange.updateRun}
                             onOpenJob=${openJob}
+                            onEnsureAwake=${onEnsureAwake}
                           />
                         </div>
                       `
