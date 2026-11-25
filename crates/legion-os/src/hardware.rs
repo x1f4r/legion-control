@@ -1,0 +1,1341 @@
+//! Optional hardware probes: processor temperature, graphics cards, battery, and per-process
+//! graphics memory.
+//!
+//! Every source is probed independently with a one-second limit and run side by side with the
+//! others: a missing, malformed, or slow source leaves its fields out and never fails or delays
+//! the caller.
+//!
+//! All probes accept their sysfs root directory or command as parameters so tests exercise every
+//! parser and timeout rule against fixture trees and recorded output rather than the host machine.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Serialize;
+
+use crate::run::{RunOptions, run};
+use crate::shell::CommandSpec;
+
+/// Default time limit for each independent hardware probe.
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+const MIB: u64 = 1024 * 1024;
+const PROBE_CAPTURE_LIMIT: usize = 64 * 1024;
+const PROBE_KILL_GRACE: Duration = Duration::from_millis(150);
+
+/// Battery state reported by the operating system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BatteryState {
+    /// Connected to power and gaining charge.
+    Charging,
+    /// Running on battery power.
+    Discharging,
+    /// Fully charged.
+    Full,
+    /// Present, but the system does not report a more specific state.
+    Unknown,
+}
+
+/// System battery readings, absent on machines without a battery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Battery {
+    /// Charge percentage, 0 to 100.
+    pub percent: u8,
+    /// Current battery state.
+    pub state: BatteryState,
+    /// Whether external AC power is connected, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_ac: Option<bool>,
+    /// Estimated seconds remaining (to empty while discharging, or to full while charging).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_left_s: Option<u64>,
+}
+
+/// One graphics card reported by `nvidia-smi` or Linux `/sys/class/drm`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Gpu {
+    /// Model or display name.
+    pub name: String,
+    /// Vendor identifier such as `nvidia`, `amd`, or `intel`, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// Total graphics memory, in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_total: Option<u64>,
+    /// Graphics memory currently in use, in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used: Option<u64>,
+    /// Current GPU busy percentage, 0 to 100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization_pct: Option<f64>,
+    /// GPU temperature, in degrees Celsius.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<f64>,
+    /// Current GPU power draw, in watts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_w: Option<f64>,
+}
+
+/// Combined result of probing processor temperature, graphics cards, and battery side by side.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HardwareSnapshot {
+    /// Processor package temperature in degrees Celsius, when reported.
+    pub cpu_temperature_c: Option<f64>,
+    /// Graphics cards reported by the system or driver.
+    pub gpus: Vec<Gpu>,
+    /// System battery information, when a battery is present.
+    pub battery: Option<Battery>,
+}
+
+/// Parameters controlling where each hardware probe reads from and how long it may take.
+#[derive(Clone, Debug)]
+pub struct ProbeConfig {
+    /// Root of the Linux sysfs tree (normally `/sys`).
+    pub sys_root: PathBuf,
+    /// Command used to query NVIDIA GPUs.
+    pub nvidia_gpu_cmd: CommandSpec,
+    /// Command used on macOS to query battery state.
+    pub macos_battery_cmd: CommandSpec,
+    /// Per-probe wall-clock timeout.
+    pub timeout: Duration,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            sys_root: PathBuf::from("/sys"),
+            nvidia_gpu_cmd: default_nvidia_gpu_command(),
+            macos_battery_cmd: default_macos_battery_command(),
+            timeout: DEFAULT_PROBE_TIMEOUT,
+        }
+    }
+}
+
+/// Default `nvidia-smi` invocation for GPU summary readings.
+pub fn default_nvidia_gpu_command() -> CommandSpec {
+    CommandSpec::argv(
+        "nvidia-smi",
+        [
+            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+}
+
+/// Default `nvidia-smi` invocation for compute process GPU memory.
+pub fn default_nvidia_compute_procs_command() -> CommandSpec {
+    CommandSpec::argv(
+        "nvidia-smi",
+        [
+            "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+}
+
+/// Default `nvidia-smi` invocation for combined compute and graphics process GPU memory.
+pub fn default_nvidia_pmon_procs_command() -> CommandSpec {
+    CommandSpec::argv("nvidia-smi", ["pmon", "-c", "1", "-s", "m"])
+}
+
+/// Default macOS battery query command.
+pub fn default_macos_battery_command() -> CommandSpec {
+    CommandSpec::argv("/usr/bin/pmset", ["-g", "batt"])
+}
+
+/// Run every hardware probe concurrently, each bounded by `config.timeout`.
+pub async fn probe_all(config: ProbeConfig) -> HardwareSnapshot {
+    let timeout = config.timeout;
+    let sys_for_cpu = config.sys_root.clone();
+    let sys_for_batt = config.sys_root.clone();
+    let sys_for_drm = config.sys_root;
+    let nvidia_cmd = config.nvidia_gpu_cmd;
+    let macos_batt_cmd = config.macos_battery_cmd;
+
+    let (cpu_temperature_c, nvidia_gpus, drm_gpus, battery) = tokio::join!(
+        probe_cpu_temperature(sys_for_cpu, timeout),
+        probe_nvidia_gpus(nvidia_cmd, timeout),
+        probe_drm_gpus(sys_for_drm, timeout),
+        probe_battery(sys_for_batt, macos_batt_cmd, timeout),
+    );
+
+    HardwareSnapshot {
+        cpu_temperature_c,
+        gpus: merge_gpus(nvidia_gpus, drm_gpus),
+        battery,
+    }
+}
+
+/// Probe per-process graphics memory (in bytes) via `nvidia-smi` compute and pmon queries run
+/// side by side, each bounded by `timeout`.
+pub async fn probe_gpu_process_memory(
+    compute_cmd: CommandSpec,
+    pmon_cmd: CommandSpec,
+    timeout: Duration,
+) -> HashMap<u32, u64> {
+    let (compute, pmon) = tokio::join!(
+        run_probe_command(compute_cmd, timeout),
+        run_probe_command(pmon_cmd, timeout),
+    );
+    let compute_map = compute
+        .as_deref()
+        .map(parse_nvidia_compute_procs)
+        .unwrap_or_default();
+    let pmon_map = pmon
+        .as_deref()
+        .map(parse_nvidia_pmon_procs)
+        .unwrap_or_default();
+    merge_gpu_process_memory(compute_map, pmon_map)
+}
+
+/// Merge GPU lists from `nvidia-smi` and `/sys/class/drm`, avoiding duplicate NVIDIA cards when
+/// `nvidia-smi` already reported them.
+pub fn merge_gpus(nvidia: Vec<Gpu>, drm: Vec<Gpu>) -> Vec<Gpu> {
+    let has_nvidia = !nvidia.is_empty();
+    let mut out = nvidia;
+    for gpu in drm {
+        if has_nvidia && gpu.vendor.as_deref() == Some("nvidia") {
+            continue;
+        }
+        out.push(gpu);
+    }
+    out
+}
+
+/// Merge per-process GPU memory maps from compute-apps and pmon, keeping the larger reported
+/// figure per PID so a process listed in both is never double-counted.
+pub fn merge_gpu_process_memory(
+    mut compute: HashMap<u32, u64>,
+    pmon: HashMap<u32, u64>,
+) -> HashMap<u32, u64> {
+    for (pid, bytes) in pmon {
+        compute
+            .entry(pid)
+            .and_modify(|existing| {
+                if bytes > *existing {
+                    *existing = bytes;
+                }
+            })
+            .or_insert(bytes);
+    }
+    compute
+}
+
+/// Run a blocking probe function with a wall-clock timeout, returning `None` if it panics or
+/// exceeds `timeout`.
+pub async fn run_blocking_probe<T, F>(timeout: Duration, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(work);
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(value)) => value,
+        _ => None,
+    }
+}
+
+/// Probe CPU package temperature from `sys_root` on Linux; absent on macOS and Windows.
+pub async fn probe_cpu_temperature(sys_root: PathBuf, timeout: Duration) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        run_blocking_probe(timeout, move || read_linux_cpu_temperature(&sys_root)).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (sys_root, timeout);
+        None
+    }
+}
+
+/// Probe NVIDIA GPUs by running `cmd` with a bounded timeout.
+pub async fn probe_nvidia_gpus(cmd: CommandSpec, timeout: Duration) -> Vec<Gpu> {
+    run_probe_command(cmd, timeout)
+        .await
+        .map(|text| parse_nvidia_gpus(&text))
+        .unwrap_or_default()
+}
+
+/// Probe graphics cards exposed under Linux `<sys_root>/class/drm`; empty on macOS and Windows.
+pub async fn probe_drm_gpus(sys_root: PathBuf, timeout: Duration) -> Vec<Gpu> {
+    #[cfg(target_os = "linux")]
+    {
+        run_blocking_probe(timeout, move || Some(read_linux_drm_gpus(&sys_root)))
+            .await
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (sys_root, timeout);
+        Vec::new()
+    }
+}
+
+/// Probe the system battery using the platform's own interface, bounded by `timeout`.
+pub async fn probe_battery(
+    sys_root: PathBuf,
+    macos_cmd: CommandSpec,
+    timeout: Duration,
+) -> Option<Battery> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = macos_cmd;
+        run_blocking_probe(timeout, move || read_linux_battery(&sys_root)).await
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = sys_root;
+        let text = run_probe_command(macos_cmd, timeout).await?;
+        parse_macos_pmset_batt(&text)
+    }
+    #[cfg(windows)]
+    {
+        let _ = (sys_root, macos_cmd);
+        run_blocking_probe(timeout, || {
+            let raw = crate::win_proc::query_system_power_status()?;
+            parse_windows_power_status(
+                raw.ac_line_status,
+                raw.battery_flag,
+                raw.battery_life_percent,
+                raw.battery_life_time,
+            )
+        })
+        .await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = (sys_root, macos_cmd, timeout);
+        None
+    }
+}
+
+async fn run_probe_command(command: CommandSpec, timeout: Duration) -> Option<String> {
+    let options = RunOptions::new(command)
+        .c_locale()
+        .timeout(timeout)
+        .kill_grace(PROBE_KILL_GRACE)
+        .capture_limit(PROBE_CAPTURE_LIMIT);
+    match run(options).await {
+        Ok(output) if output.success() => Some(output.stdout.text),
+        _ => None,
+    }
+}
+
+// ── Linux sysfs: hwmon (CPU temperature) ─────────────────────────────────────────────────────
+
+/// Read the processor package temperature from a Linux sysfs root (`<sys_root>/class/hwmon` with
+/// fallback to `<sys_root>/class/thermal`).
+pub fn read_linux_cpu_temperature(sys_root: &Path) -> Option<f64> {
+    if let Some(temp) = read_hwmon_cpu_temperature(&sys_root.join("class/hwmon")) {
+        return Some(temp);
+    }
+    read_thermal_zone_cpu_temperature(&sys_root.join("class/thermal"))
+}
+
+fn read_hwmon_cpu_temperature(hwmon_dir: &Path) -> Option<f64> {
+    let mut entries = sorted_dir_entries(hwmon_dir)?;
+    let mut best: Option<(u8, f64)> = None;
+
+    for path in entries.drain(..) {
+        let Some(driver) = read_trimmed(&path.join("name")) else {
+            continue;
+        };
+        let driver_lower = driver.to_ascii_lowercase();
+        let Some(priority) = cpu_hwmon_priority(&driver_lower) else {
+            continue;
+        };
+
+        let readings = read_hwmon_temps(&path);
+        let Some(temp) = select_cpu_hwmon_temp(&driver_lower, &readings) else {
+            continue;
+        };
+
+        let replace = match best {
+            None => true,
+            Some((best_prio, best_temp)) => {
+                priority < best_prio || (priority == best_prio && temp > best_temp)
+            }
+        };
+        if replace {
+            best = Some((priority, temp));
+        }
+    }
+
+    best.map(|(_, temp)| round1(temp))
+}
+
+/// Lower number = stronger match for a CPU package sensor.
+fn cpu_hwmon_priority(driver: &str) -> Option<u8> {
+    match driver {
+        "coretemp" | "k10temp" | "zenpower" | "fam15h_power" => Some(0),
+        "cpu_thermal" | "soc_thermal" | "bcm2835_thermal" | "scpi_sensors" => Some(1),
+        "x86_pkg_temp" => Some(2),
+        "acpitz" => Some(3),
+        _ => None,
+    }
+}
+
+fn select_cpu_hwmon_temp(driver: &str, readings: &[(Option<String>, f64)]) -> Option<f64> {
+    if readings.is_empty() {
+        return None;
+    }
+    // Prefer an explicit package/die label when present.
+    let preferred_labels: &[&str] = match driver {
+        "coretemp" => &["package id", "package"],
+        "k10temp" | "zenpower" => &["tctl", "tdie", "tccd1"],
+        _ => &["package", "cpu", "tctl", "tdie"],
+    };
+    for needle in preferred_labels {
+        let mut matched: Option<f64> = None;
+        for (label, temp) in readings {
+            if let Some(lbl) = label
+                && lbl.to_ascii_lowercase().contains(needle)
+            {
+                matched = Some(matched.map_or(*temp, |prev| prev.max(*temp)));
+            }
+        }
+        if matched.is_some() {
+            return matched;
+        }
+    }
+    // Fall back to the highest valid reading on that CPU hwmon device.
+    readings.iter().map(|(_, t)| *t).reduce(f64::max)
+}
+
+fn read_hwmon_temps(dir: &Path) -> Vec<(Option<String>, f64)> {
+    let Some(entries) = sorted_dir_entries(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix("temp") else {
+            continue;
+        };
+        let Some(index) = rest.strip_suffix("_input") else {
+            continue;
+        };
+        if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Some(raw) = read_trimmed(&entry) else {
+            continue;
+        };
+        let Some(temp_c) = parse_millidegrees(&raw) else {
+            continue;
+        };
+        let label = read_trimmed(&dir.join(format!("temp{index}_label")));
+        out.push((label, temp_c));
+    }
+    out
+}
+
+fn read_thermal_zone_cpu_temperature(thermal_dir: &Path) -> Option<f64> {
+    let entries = sorted_dir_entries(thermal_dir)?;
+    let mut best: Option<(u8, f64)> = None;
+    for path in entries {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("thermal_zone") {
+            continue;
+        }
+        let Some(kind) = read_trimmed(&path.join("type")) else {
+            continue;
+        };
+        let lower = kind.to_ascii_lowercase();
+        let priority = match lower.as_str() {
+            "x86_pkg_temp" | "cpu-thermal" | "cpu_thermal" | "soc-thermal" | "soc_thermal" => 0,
+            "acpitz" => 1,
+            _ => continue,
+        };
+        let Some(raw) = read_trimmed(&path.join("temp")) else {
+            continue;
+        };
+        let Some(temp_c) = parse_millidegrees(&raw) else {
+            continue;
+        };
+        let replace = match best {
+            None => true,
+            Some((best_prio, best_temp)) => {
+                priority < best_prio || (priority == best_prio && temp_c > best_temp)
+            }
+        };
+        if replace {
+            best = Some((priority, temp_c));
+        }
+    }
+    best.map(|(_, t)| round1(t))
+}
+
+fn parse_millidegrees(raw: &str) -> Option<f64> {
+    let milli = raw.trim().parse::<i64>().ok()?;
+    let celsius = (milli as f64) / 1000.0;
+    if celsius.is_finite() && (-40.0..150.0).contains(&celsius) {
+        Some(celsius)
+    } else {
+        None
+    }
+}
+
+// ── Linux sysfs: power_supply (battery) ──────────────────────────────────────────────────────
+
+/// Read system battery information from a Linux sysfs root (`<sys_root>/class/power_supply`).
+///
+/// Device batteries (`scope = Device`, such as a wireless mouse or keyboard) are ignored.
+pub fn read_linux_battery(sys_root: &Path) -> Option<Battery> {
+    let ps_dir = sys_root.join("class/power_supply");
+    let entries = sorted_dir_entries(&ps_dir)?;
+
+    let mut mains_online: Option<bool> = None;
+    let mut batteries: Vec<LinuxBatterySample> = Vec::new();
+
+    for path in entries {
+        let Some(kind) = read_trimmed(&path.join("type")) else {
+            continue;
+        };
+        if kind.eq_ignore_ascii_case("Mains") {
+            if let Some(online) = read_trimmed(&path.join("online")) {
+                if online == "1" {
+                    mains_online = Some(true);
+                } else if online == "0" && mains_online != Some(true) {
+                    mains_online = Some(false);
+                }
+            }
+            continue;
+        }
+        if !kind.eq_ignore_ascii_case("Battery") {
+            continue;
+        }
+        // Ignore peripheral batteries (mouse, keyboard, headphones).
+        if let Some(scope) = read_trimmed(&path.join("scope"))
+            && scope.eq_ignore_ascii_case("Device")
+        {
+            continue;
+        }
+        if let Some(present) = read_trimmed(&path.join("present"))
+            && present == "0"
+        {
+            continue;
+        }
+        if let Some(sample) = read_single_linux_battery(&path) {
+            batteries.push(sample);
+        }
+    }
+
+    if batteries.is_empty() {
+        return None;
+    }
+
+    // Combine multiple system batteries weighted by full energy when available, else average.
+    let total_weight: u64 = batteries.iter().filter_map(|b| b.weight).sum();
+    let percent = if total_weight > 0 && batteries.iter().all(|b| b.weight.is_some()) {
+        let weighted: u128 = batteries
+            .iter()
+            .map(|b| u128::from(b.percent) * u128::from(b.weight.unwrap_or(0)))
+            .sum();
+        let pct = (weighted + u128::from(total_weight) / 2) / u128::from(total_weight);
+        u8::try_from(pct.min(100)).unwrap_or(100)
+    } else {
+        let sum: u64 = batteries.iter().map(|b| u64::from(b.percent)).sum();
+        let count = batteries.len() as u64;
+        u8::try_from(((sum + count / 2) / count).min(100)).unwrap_or(100)
+    };
+
+    let state = if batteries.iter().any(|b| b.state == BatteryState::Charging) {
+        BatteryState::Charging
+    } else if batteries
+        .iter()
+        .any(|b| b.state == BatteryState::Discharging)
+    {
+        BatteryState::Discharging
+    } else if batteries.iter().all(|b| b.state == BatteryState::Full) {
+        BatteryState::Full
+    } else {
+        BatteryState::Unknown
+    };
+
+    let on_ac = mains_online.or(match state {
+        BatteryState::Charging | BatteryState::Full => Some(true),
+        BatteryState::Discharging => Some(false),
+        BatteryState::Unknown => None,
+    });
+
+    let time_left_s = combine_battery_time_left(&batteries, state);
+
+    Some(Battery {
+        percent,
+        state,
+        on_ac,
+        time_left_s,
+    })
+}
+
+struct LinuxBatterySample {
+    percent: u8,
+    state: BatteryState,
+    weight: Option<u64>,
+    time_left_s: Option<u64>,
+}
+
+fn read_single_linux_battery(dir: &Path) -> Option<LinuxBatterySample> {
+    let energy_now = read_u64(&dir.join("energy_now"));
+    let energy_full = read_u64(&dir.join("energy_full")).filter(|&v| v > 0);
+    let charge_now = read_u64(&dir.join("charge_now"));
+    let charge_full = read_u64(&dir.join("charge_full")).filter(|&v| v > 0);
+
+    let percent = if let Some(cap) = read_u64(&dir.join("capacity")) {
+        u8::try_from(cap.min(100)).ok()?
+    } else if let (Some(now), Some(full)) = (energy_now, energy_full) {
+        let pct = (u128::from(now) * 100 + u128::from(full) / 2) / u128::from(full);
+        u8::try_from(pct.min(100)).ok()?
+    } else if let (Some(now), Some(full)) = (charge_now, charge_full) {
+        let pct = (u128::from(now) * 100 + u128::from(full) / 2) / u128::from(full);
+        u8::try_from(pct.min(100)).ok()?
+    } else {
+        return None;
+    };
+
+    let status_raw = read_trimmed(&dir.join("status")).unwrap_or_default();
+    let state = match status_raw.to_ascii_lowercase().as_str() {
+        "charging" => BatteryState::Charging,
+        "discharging" => BatteryState::Discharging,
+        "full" => BatteryState::Full,
+        _ => BatteryState::Unknown,
+    };
+
+    let time_left_s = match state {
+        BatteryState::Discharging => read_u64(&dir.join("time_to_empty_now"))
+            .filter(|&v| v > 0)
+            .or_else(|| {
+                let power = read_u64(&dir.join("power_now")).filter(|&v| v > 0)?;
+                let now = energy_now?;
+                let secs = (u128::from(now) * 3600) / u128::from(power);
+                u64::try_from(secs).ok().filter(|&v| v > 0)
+            })
+            .or_else(|| {
+                let current = read_u64(&dir.join("current_now")).filter(|&v| v > 0)?;
+                let now = charge_now?;
+                let secs = (u128::from(now) * 3600) / u128::from(current);
+                u64::try_from(secs).ok().filter(|&v| v > 0)
+            }),
+        BatteryState::Charging => read_u64(&dir.join("time_to_full_now"))
+            .filter(|&v| v > 0)
+            .or_else(|| {
+                let power = read_u64(&dir.join("power_now")).filter(|&v| v > 0)?;
+                let (now, full) = (energy_now?, energy_full?);
+                let remaining = full.saturating_sub(now);
+                let secs = (u128::from(remaining) * 3600) / u128::from(power);
+                u64::try_from(secs).ok().filter(|&v| v > 0)
+            })
+            .or_else(|| {
+                let current = read_u64(&dir.join("current_now")).filter(|&v| v > 0)?;
+                let (now, full) = (charge_now?, charge_full?);
+                let remaining = full.saturating_sub(now);
+                let secs = (u128::from(remaining) * 3600) / u128::from(current);
+                u64::try_from(secs).ok().filter(|&v| v > 0)
+            }),
+        BatteryState::Full | BatteryState::Unknown => None,
+    };
+
+    Some(LinuxBatterySample {
+        percent,
+        state,
+        weight: energy_full.or(charge_full),
+        time_left_s,
+    })
+}
+
+fn combine_battery_time_left(batteries: &[LinuxBatterySample], state: BatteryState) -> Option<u64> {
+    if !matches!(state, BatteryState::Charging | BatteryState::Discharging) {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut any = false;
+    for batt in batteries {
+        if let Some(secs) = batt.time_left_s {
+            total = total.saturating_add(secs);
+            any = true;
+        }
+    }
+    any.then_some(total).filter(|&v| v > 0)
+}
+
+// ── Linux sysfs: drm (non-NVIDIA GPUs) ───────────────────────────────────────────────────────
+
+/// Read graphics cards from a Linux sysfs root (`<sys_root>/class/drm`).
+pub fn read_linux_drm_gpus(sys_root: &Path) -> Vec<Gpu> {
+    let drm_dir = sys_root.join("class/drm");
+    let Some(entries) = sorted_dir_entries(&drm_dir) else {
+        return Vec::new();
+    };
+
+    let mut gpus = Vec::new();
+    for card_path in entries {
+        let Some(name) = card_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(num) = name.strip_prefix("card") else {
+            continue;
+        };
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+
+        let device_dir = card_path.join("device");
+        let Some(vendor_raw) = read_trimmed(&device_dir.join("vendor")) else {
+            continue;
+        };
+        let vendor = pci_vendor_name(&vendor_raw);
+        let gpu_name = read_drm_gpu_name(&device_dir, vendor.as_deref());
+
+        let utilization_pct = read_u64(&device_dir.join("gpu_busy_percent"))
+            .filter(|&v| v <= 100)
+            .map(|v| round1(v as f64));
+        let memory_total = read_u64(&device_dir.join("mem_info_vram_total")).filter(|&v| v > 0);
+        let memory_used =
+            memory_total.and_then(|_| read_u64(&device_dir.join("mem_info_vram_used")));
+
+        let (temperature_c, power_w) = read_drm_hwmon(&device_dir.join("hwmon"));
+
+        gpus.push(Gpu {
+            name: gpu_name,
+            vendor,
+            memory_total,
+            memory_used,
+            utilization_pct,
+            temperature_c,
+            power_w,
+        });
+    }
+    gpus
+}
+
+fn pci_vendor_name(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let known = match lower.as_str() {
+        "0x10de" => "nvidia",
+        "0x1002" => "amd",
+        "0x8086" => "intel",
+        "0x106b" => "apple",
+        "0x1414" => "microsoft",
+        "0x1af4" => "virtio",
+        "0x15ad" => "vmware",
+        "" => return None,
+        other => return Some(other.to_owned()),
+    };
+    Some(known.to_owned())
+}
+
+fn read_drm_gpu_name(device_dir: &Path, vendor: Option<&str>) -> String {
+    if let Some(product) = read_trimmed(&device_dir.join("product_name"))
+        && !product.is_empty()
+    {
+        return product;
+    }
+    match vendor {
+        Some("amd") => "AMD GPU".to_owned(),
+        Some("intel") => "Intel GPU".to_owned(),
+        Some("nvidia") => "NVIDIA GPU".to_owned(),
+        Some("apple") => "Apple GPU".to_owned(),
+        Some(other) => format!("{other} GPU"),
+        None => "GPU".to_owned(),
+    }
+}
+
+fn read_drm_hwmon(hwmon_dir: &Path) -> (Option<f64>, Option<f64>) {
+    let Some(entries) = sorted_dir_entries(hwmon_dir) else {
+        return (None, None);
+    };
+    let mut max_temp: Option<f64> = None;
+    let mut power_w: Option<f64> = None;
+
+    for dir in entries {
+        for (_, temp) in read_hwmon_temps(&dir) {
+            max_temp = Some(max_temp.map_or(temp, |prev| prev.max(temp)));
+        }
+        if power_w.is_none() {
+            let microwatts = read_u64(&dir.join("power1_average"))
+                .or_else(|| read_u64(&dir.join("power1_input")));
+            if let Some(uw) = microwatts {
+                let watts = (uw as f64) / 1_000_000.0;
+                if watts.is_finite() && (0.0..2000.0).contains(&watts) {
+                    power_w = Some(round1(watts));
+                }
+            }
+        }
+    }
+
+    (max_temp.map(round1), power_w)
+}
+
+// ── nvidia-smi parsers ───────────────────────────────────────────────────────────────────────
+
+/// Parse `nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits`.
+///
+/// Also accepts the 4-column format without temperature/power so older output stays valid.
+pub fn parse_nvidia_gpus(text: &str) -> Vec<Gpu> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+            if fields.len() < 4 {
+                return None;
+            }
+            let name = fields[0];
+            if name.is_empty() {
+                return None;
+            }
+            let memory_total = parse_nvidia_u64(fields[1]).map(|mib| mib.saturating_mul(MIB));
+            let memory_used = parse_nvidia_u64(fields[2]).map(|mib| mib.saturating_mul(MIB));
+            let utilization_pct = parse_nvidia_f64(fields[3]).map(round1);
+            let temperature_c = fields
+                .get(4)
+                .and_then(|v| parse_nvidia_f64(v))
+                .filter(|t| (-40.0..150.0).contains(t))
+                .map(round1);
+            let power_w = fields
+                .get(5)
+                .and_then(|v| parse_nvidia_f64(v))
+                .filter(|w| (0.0..2000.0).contains(w))
+                .map(round1);
+
+            Some(Gpu {
+                name: name.to_owned(),
+                vendor: Some("nvidia".to_owned()),
+                memory_total,
+                memory_used,
+                utilization_pct,
+                temperature_c,
+                power_w,
+            })
+        })
+        .collect()
+}
+
+/// Parse `nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits`,
+/// summing bytes per PID across GPUs.
+pub fn parse_nvidia_compute_procs(text: &str) -> HashMap<u32, u64> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        let Ok(pid) = fields[0].parse::<u32>() else {
+            continue;
+        };
+        let Some(mib) = parse_nvidia_u64(fields[1]).filter(|&v| v > 0) else {
+            continue;
+        };
+        let bytes = mib.saturating_mul(MIB);
+        out.entry(pid)
+            .and_modify(|sum: &mut u64| *sum = sum.saturating_add(bytes))
+            .or_insert(bytes);
+    }
+    out
+}
+
+/// Parse `nvidia-smi pmon -c 1 -s m`, summing framebuffer memory (in bytes) per PID across GPUs.
+pub fn parse_nvidia_pmon_procs(text: &str) -> HashMap<u32, u64> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        // Columns: gpu, pid, type, fb (MB), [ccpm (MB)], command
+        if cols.len() < 5 {
+            continue;
+        }
+        let Ok(pid) = cols[1].parse::<u32>() else {
+            continue;
+        };
+        let Some(mib) = parse_nvidia_u64(cols[3]).filter(|&v| v > 0) else {
+            continue;
+        };
+        let bytes = mib.saturating_mul(MIB);
+        out.entry(pid)
+            .and_modify(|sum: &mut u64| *sum = sum.saturating_add(bytes))
+            .or_insert(bytes);
+    }
+    out
+}
+
+fn parse_nvidia_u64(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('[') || trimmed == "-" {
+        return None;
+    }
+    trimmed.parse::<u64>().ok().or_else(|| {
+        trimmed
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v.round() as u64)
+    })
+}
+
+fn parse_nvidia_f64(raw: &str) -> Option<f64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('[') || trimmed == "-" {
+        return None;
+    }
+    trimmed.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+// ── macOS & Windows battery parsers ──────────────────────────────────────────────────────────
+
+/// Parse macOS `pmset -g batt` output.
+///
+/// Desktop Macs without an internal battery print only the power source header line and return
+/// `None`.
+pub fn parse_macos_pmset_batt(text: &str) -> Option<Battery> {
+    let mut on_ac: Option<bool> = None;
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("'ac power'") {
+            on_ac = Some(true);
+        } else if lower.contains("'battery power'") {
+            on_ac = Some(false);
+        }
+        if !line.contains("InternalBattery") {
+            continue;
+        }
+        // Example: `-InternalBattery-0 (id=1234567)	84%; charging; 0:42 remaining present: true`
+        let after_tab = line.split_once('\t').map_or(line, |(_, rhs)| rhs);
+        let parts: Vec<&str> = after_tab.split(';').map(str::trim).collect();
+        let percent_part = parts.first()?;
+        let percent_str = percent_part.strip_suffix('%')?.trim();
+        let percent = percent_str.parse::<u8>().ok()?.min(100);
+
+        let state_raw = parts.get(1).copied().unwrap_or("").to_ascii_lowercase();
+        let state = if state_raw.contains("discharging") {
+            BatteryState::Discharging
+        } else if state_raw.contains("charging") && !state_raw.contains("not charging") {
+            BatteryState::Charging
+        } else if state_raw.contains("charged") {
+            BatteryState::Full
+        } else if state_raw.contains("finishing charge") {
+            BatteryState::Charging
+        } else {
+            BatteryState::Unknown
+        };
+
+        let time_left_s = parts
+            .iter()
+            .skip(2)
+            .find_map(|segment| parse_pmset_remaining(segment));
+
+        return Some(Battery {
+            percent,
+            state,
+            on_ac,
+            time_left_s,
+        });
+    }
+    None
+}
+
+fn parse_pmset_remaining(segment: &str) -> Option<u64> {
+    // Format: "4:15 remaining present: true" or "(no estimate)"
+    let token = segment.split_whitespace().next()?;
+    let (h, m) = token.split_once(':')?;
+    let hours = h.parse::<u64>().ok()?;
+    let mins = m.parse::<u64>().ok()?;
+    if mins >= 60 {
+        return None;
+    }
+    let secs = hours.saturating_mul(3600).saturating_add(mins * 60);
+    (secs > 0).then_some(secs)
+}
+
+/// Parse Win32 `SYSTEM_POWER_STATUS` fields into [`Battery`].
+///
+/// Returns `None` when Windows reports no system battery (`BatteryFlag & 128 != 0`), unknown
+/// battery flag (`255`), or unknown charge percentage (`255`).
+pub fn parse_windows_power_status(
+    ac_line_status: u8,
+    battery_flag: u8,
+    battery_life_percent: u8,
+    battery_life_time: u32,
+) -> Option<Battery> {
+    if battery_flag == 255 || (battery_flag & 128) != 0 || battery_life_percent > 100 {
+        return None;
+    }
+    let on_ac = match ac_line_status {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    };
+    let state = if (battery_flag & 8) != 0 {
+        BatteryState::Charging
+    } else if on_ac == Some(false) {
+        BatteryState::Discharging
+    } else if on_ac == Some(true) && battery_life_percent >= 99 {
+        BatteryState::Full
+    } else {
+        BatteryState::Unknown
+    };
+    let time_left_s = if state == BatteryState::Discharging
+        && battery_life_time != u32::MAX
+        && battery_life_time > 0
+    {
+        Some(u64::from(battery_life_time))
+    } else {
+        None
+    };
+    Some(Battery {
+        percent: battery_life_percent,
+        state,
+        on_ac,
+        time_left_s,
+    })
+}
+
+// ── Small filesystem and math helpers ────────────────────────────────────────────────────────
+
+fn sorted_dir_entries(dir: &Path) -> Option<Vec<PathBuf>> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    Some(paths)
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn read_u64(path: &Path) -> Option<u64> {
+    read_trimmed(path)?.parse::<u64>().ok()
+}
+
+fn round1(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    fn write(root: &Path, rel: &str, content: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn hwmon_fixture_prefers_cpu_package_and_ignores_malformed_values() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unrelated sensor (nvme) with higher temp must be ignored.
+        write(dir.path(), "class/hwmon/hwmon0/name", "nvme\n");
+        write(dir.path(), "class/hwmon/hwmon0/temp1_input", "78000\n");
+        // Intel coretemp with Package id 0 and individual cores.
+        write(dir.path(), "class/hwmon/hwmon1/name", "coretemp\n");
+        write(
+            dir.path(),
+            "class/hwmon/hwmon1/temp1_label",
+            "Package id 0\n",
+        );
+        write(dir.path(), "class/hwmon/hwmon1/temp1_input", "64500\n");
+        write(dir.path(), "class/hwmon/hwmon1/temp2_label", "Core 0\n");
+        write(dir.path(), "class/hwmon/hwmon1/temp2_input", "61000\n");
+        write(dir.path(), "class/hwmon/hwmon1/temp3_input", "not-a-num\n");
+
+        assert_eq!(read_linux_cpu_temperature(dir.path()), Some(64.5));
+    }
+
+    #[test]
+    fn hwmon_fixture_reads_amd_k10temp_and_thermal_zone_fallback() {
+        let amd = tempfile::tempdir().unwrap();
+        write(amd.path(), "class/hwmon/hwmon0/name", "acpitz\n");
+        write(amd.path(), "class/hwmon/hwmon0/temp1_input", "40000\n");
+        write(amd.path(), "class/hwmon/hwmon1/name", "k10temp\n");
+        write(amd.path(), "class/hwmon/hwmon1/temp1_label", "Tctl\n");
+        write(amd.path(), "class/hwmon/hwmon1/temp1_input", "72375\n");
+        write(amd.path(), "class/hwmon/hwmon1/temp2_label", "Tccd1\n");
+        write(amd.path(), "class/hwmon/hwmon1/temp2_input", "69000\n");
+        assert_eq!(read_linux_cpu_temperature(amd.path()), Some(72.4));
+
+        let tz = tempfile::tempdir().unwrap();
+        write(
+            tz.path(),
+            "class/thermal/thermal_zone0/type",
+            "cpu-thermal\n",
+        );
+        write(tz.path(), "class/thermal/thermal_zone0/temp", "51200\n");
+        assert_eq!(read_linux_cpu_temperature(tz.path()), Some(51.2));
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(read_linux_cpu_temperature(empty.path()), None);
+    }
+
+    #[test]
+    fn power_supply_fixture_reads_battery_and_ignores_peripheral_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        // Wireless mouse battery must be ignored.
+        write(dir.path(), "class/power_supply/hid-mouse/type", "Battery\n");
+        write(dir.path(), "class/power_supply/hid-mouse/scope", "Device\n");
+        write(dir.path(), "class/power_supply/hid-mouse/capacity", "12\n");
+        write(
+            dir.path(),
+            "class/power_supply/hid-mouse/status",
+            "Discharging\n",
+        );
+
+        // AC adapter offline + system battery discharging with energy/power readings.
+        write(dir.path(), "class/power_supply/AC/type", "Mains\n");
+        write(dir.path(), "class/power_supply/AC/online", "0\n");
+        write(dir.path(), "class/power_supply/BAT0/type", "Battery\n");
+        write(dir.path(), "class/power_supply/BAT0/present", "1\n");
+        write(dir.path(), "class/power_supply/BAT0/capacity", "62\n");
+        write(
+            dir.path(),
+            "class/power_supply/BAT0/status",
+            "Discharging\n",
+        );
+        // 40 Wh remaining at 10 W draw -> 4 hours = 14400 s.
+        write(
+            dir.path(),
+            "class/power_supply/BAT0/energy_now",
+            "40000000\n",
+        );
+        write(
+            dir.path(),
+            "class/power_supply/BAT0/energy_full",
+            "64000000\n",
+        );
+        write(
+            dir.path(),
+            "class/power_supply/BAT0/power_now",
+            "10000000\n",
+        );
+
+        assert_eq!(
+            read_linux_battery(dir.path()),
+            Some(Battery {
+                percent: 62,
+                state: BatteryState::Discharging,
+                on_ac: Some(false),
+                time_left_s: Some(14400),
+            })
+        );
+    }
+
+    #[test]
+    fn power_supply_fixture_absent_or_malformed_returns_none() {
+        let desktop = tempfile::tempdir().unwrap();
+        write(desktop.path(), "class/power_supply/AC/type", "Mains\n");
+        write(desktop.path(), "class/power_supply/AC/online", "1\n");
+        assert_eq!(read_linux_battery(desktop.path()), None);
+
+        let bad = tempfile::tempdir().unwrap();
+        write(bad.path(), "class/power_supply/BAT0/type", "Battery\n");
+        write(bad.path(), "class/power_supply/BAT0/capacity", "oops\n");
+        assert_eq!(read_linux_battery(bad.path()), None);
+    }
+
+    #[test]
+    fn drm_fixture_reads_amd_and_intel_cards_with_partial_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        // Connector directory must be skipped.
+        write(dir.path(), "class/drm/card0-DP-1/status", "connected\n");
+        // AMD discrete GPU with full metrics.
+        write(dir.path(), "class/drm/card0/device/vendor", "0x1002\n");
+        write(
+            dir.path(),
+            "class/drm/card0/device/product_name",
+            "Radeon RX 7900 XTX\n",
+        );
+        write(
+            dir.path(),
+            "class/drm/card0/device/gpu_busy_percent",
+            "42\n",
+        );
+        write(
+            dir.path(),
+            "class/drm/card0/device/mem_info_vram_total",
+            "25769803776\n",
+        );
+        write(
+            dir.path(),
+            "class/drm/card0/device/mem_info_vram_used",
+            "4294967296\n",
+        );
+        write(
+            dir.path(),
+            "class/drm/card0/device/hwmon/hwmon3/temp1_input",
+            "58000\n",
+        );
+        write(
+            dir.path(),
+            "class/drm/card0/device/hwmon/hwmon3/power1_average",
+            "115400000\n",
+        );
+        // Intel iGPU with no VRAM or busy percent exposed.
+        write(dir.path(), "class/drm/card1/device/vendor", "0x8086\n");
+        // NVIDIA card in DRM (deduplicated when nvidia-smi also reports).
+        write(dir.path(), "class/drm/card2/device/vendor", "0x10de\n");
+
+        let drm = read_linux_drm_gpus(dir.path());
+        assert_eq!(drm.len(), 3);
+        assert_eq!(
+            drm[0],
+            Gpu {
+                name: "Radeon RX 7900 XTX".to_owned(),
+                vendor: Some("amd".to_owned()),
+                memory_total: Some(25_769_803_776),
+                memory_used: Some(4_294_967_296),
+                utilization_pct: Some(42.0),
+                temperature_c: Some(58.0),
+                power_w: Some(115.4),
+            }
+        );
+        assert_eq!(
+            drm[1],
+            Gpu {
+                name: "Intel GPU".to_owned(),
+                vendor: Some("intel".to_owned()),
+                memory_total: None,
+                memory_used: None,
+                utilization_pct: None,
+                temperature_c: None,
+                power_w: None,
+            }
+        );
+
+        let nvidia = parse_nvidia_gpus("NVIDIA GeForce RTX 5080, 16303, 9120, 69, 68, 245.50\n");
+        let merged = merge_gpus(nvidia, drm);
+        // NVIDIA card from DRM was deduplicated, keeping nvidia-smi + AMD + Intel.
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].vendor.as_deref(), Some("nvidia"));
+        assert_eq!(merged[0].temperature_c, Some(68.0));
+        assert_eq!(merged[0].power_w, Some(245.5));
+        assert_eq!(merged[1].vendor.as_deref(), Some("amd"));
+        assert_eq!(merged[2].vendor.as_deref(), Some("intel"));
+    }
+
+    #[test]
+    fn nvidia_parsers_handle_na_garbage_and_multi_gpu_process_memory() {
+        let gpus = parse_nvidia_gpus(
+            "NVIDIA GeForce RTX 5080, 16303, 1024, 7, 42, 31.25\n\
+             NVIDIA A2, [N/A], 0, [N/A], [Not Supported], [N/A]\n\
+             garbage\n",
+        );
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].temperature_c, Some(42.0));
+        assert_eq!(gpus[0].power_w, Some(31.3));
+        assert_eq!(gpus[1].memory_total, None);
+        assert_eq!(gpus[1].temperature_c, None);
+        assert_eq!(gpus[1].power_w, None);
+
+        let compute = parse_nvidia_compute_procs("100, 4096\n100, 1024\n200, [N/A]\nbad\n");
+        let pmon = parse_nvidia_pmon_procs(
+            "# gpu         pid   type     fb   ccpm    command\n\
+             # Idx           #    C/G     MB     MB    name\n\
+                 0         100    C+G   4000      -    python3\n\
+                 0         300      G    512      -    firefox\n\
+                 0           -      -      -      -    -\n",
+        );
+        let merged = merge_gpu_process_memory(compute, pmon);
+        // PID 100 sums 4096 + 1024 MiB from compute (> 4000 MiB from pmon).
+        assert_eq!(merged.get(&100), Some(&(5120 * MIB)));
+        assert_eq!(merged.get(&200), None);
+        // PID 300 is graphics-only, picked up from pmon.
+        assert_eq!(merged.get(&300), Some(&(512 * MIB)));
+    }
+
+    #[test]
+    fn macos_and_windows_battery_parsers_handle_all_states() {
+        let charging = "Now drawing from 'AC Power'\n \
+             -InternalBattery-0 (id=1234567)\t84%; charging; 0:42 remaining present: true\n";
+        assert_eq!(
+            parse_macos_pmset_batt(charging),
+            Some(Battery {
+                percent: 84,
+                state: BatteryState::Charging,
+                on_ac: Some(true),
+                time_left_s: Some(42 * 60),
+            })
+        );
+
+        let desktop = "Now drawing from 'AC Power'\n";
+        assert_eq!(parse_macos_pmset_batt(desktop), None);
+
+        assert_eq!(
+            parse_windows_power_status(0, 1, 15, 3600),
+            Some(Battery {
+                percent: 15,
+                state: BatteryState::Discharging,
+                on_ac: Some(false),
+                time_left_s: Some(3600),
+            })
+        );
+        assert_eq!(
+            parse_windows_power_status(1, 8, 80, u32::MAX),
+            Some(Battery {
+                percent: 80,
+                state: BatteryState::Charging,
+                on_ac: Some(true),
+                time_left_s: None,
+            })
+        );
+        // No system battery flag (128).
+        assert_eq!(parse_windows_power_status(1, 128, 255, u32::MAX), None);
+    }
+
+    #[tokio::test]
+    async fn slow_or_missing_probes_never_fail_or_delay_past_limit() {
+        let missing = probe_nvidia_gpus(
+            CommandSpec::argv("legion-nonexistent-nvidia-smi-probe", Vec::<&str>::new()),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(missing.is_empty());
+
+        let started = Instant::now();
+        let slow = run_blocking_probe(Duration::from_millis(80), || {
+            std::thread::sleep(Duration::from_millis(600));
+            Some(42u32)
+        })
+        .await;
+        assert_eq!(slow, None);
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "slow probe delayed caller for {:?}",
+            started.elapsed()
+        );
+
+        #[cfg(unix)]
+        {
+            let cmd_started = Instant::now();
+            let slow_cmd = probe_nvidia_gpus(
+                CommandSpec::argv("sh", ["-c", "sleep 5"]),
+                Duration::from_millis(120),
+            )
+            .await;
+            assert!(slow_cmd.is_empty());
+            assert!(
+                cmd_started.elapsed() < Duration::from_secs(1),
+                "slow command probe delayed caller for {:?}",
+                cmd_started.elapsed()
+            );
+        }
+    }
+}

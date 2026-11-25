@@ -297,6 +297,42 @@ pub fn is_protected(identity: &ProcessId) -> Option<&'static str> {
     is_protected_impl(identity)
 }
 
+/// Return the PIDs of the current process and all of its live ancestors (stopping before PID 0/1
+/// on Unix and PID 0/4 on Windows).
+pub fn self_and_ancestors() -> std::collections::HashSet<u32> {
+    let mut set = self_and_ancestors_impl();
+    set.insert(std::process::id());
+    set
+}
+
+/// Outcome of delivering a single verified signal to one process without waiting or escalating.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalOutcome {
+    /// The signal was delivered to the exact verified process.
+    Signaled,
+    /// The process had already exited before the signal could be delivered.
+    AlreadyGone,
+    /// A different process now holds the PID (start time did not match); nothing was signaled.
+    IdentityMismatch,
+}
+
+/// Deliver one signal (`SIGTERM` when `!force`, `SIGKILL` when `force` on Unix; `TerminateProcess`
+/// through a creation-time-verified handle on Windows) to a single process without waiting for it
+/// to exit or escalating.
+pub async fn signal_process(identity: &ProcessId, force: bool) -> Result<SignalOutcome> {
+    if identity.pid == 0 {
+        return Err(OsError::InvalidArgument {
+            detail: "cannot signal pid 0".into(),
+        });
+    }
+    if identity.pid == std::process::id() {
+        return Err(OsError::InvalidArgument {
+            detail: "refusing to signal the current process".into(),
+        });
+    }
+    signal_process_impl(identity, force).await
+}
+
 /// Find the closest ancestor of the current process (walking through at most a few shell wrappers)
 /// that is a live, per-connection `sshd` / `sshd-session` process running under the same OS account
 /// as the current process.
@@ -552,6 +588,28 @@ fn is_protected_impl(identity: &ProcessId) -> Option<&'static str> {
 #[cfg(not(any(unix, windows)))]
 fn is_protected_impl(_identity: &ProcessId) -> Option<&'static str> {
     None
+}
+
+#[cfg(any(unix, windows))]
+fn self_and_ancestors_impl() -> std::collections::HashSet<u32> {
+    platform::self_and_ancestors()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn self_and_ancestors_impl() -> std::collections::HashSet<u32> {
+    std::collections::HashSet::new()
+}
+
+#[cfg(any(unix, windows))]
+async fn signal_process_impl(identity: &ProcessId, force: bool) -> Result<SignalOutcome> {
+    platform::signal_process(identity, force).await
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn signal_process_impl(_identity: &ProcessId, _force: bool) -> Result<SignalOutcome> {
+    Err(OsError::Unsupported {
+        detail: "single-process signaling is not supported on this platform".into(),
+    })
 }
 
 #[cfg(any(unix, windows))]

@@ -9,6 +9,7 @@
 pub mod atomic;
 pub mod detach;
 mod error;
+pub mod hardware;
 pub mod lock;
 pub mod procid;
 pub mod run;

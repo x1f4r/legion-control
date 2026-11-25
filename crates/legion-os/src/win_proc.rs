@@ -49,6 +49,7 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
 };
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, RPC_S_SERVER_UNAVAILABLE};
 use windows::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows::Win32::System::Threading::{
@@ -116,6 +117,29 @@ pub(crate) enum TerminateOutcome {
     IdentityMismatch,
     /// Access was denied when opening or terminating the process.
     AccessDenied,
+}
+
+/// Raw fields returned by Win32 `GetSystemPowerStatus`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RawWindowsPowerStatus {
+    pub(crate) ac_line_status: u8,
+    pub(crate) battery_flag: u8,
+    pub(crate) battery_life_percent: u8,
+    pub(crate) battery_life_time: u32,
+}
+
+/// Query Windows AC / battery status through `GetSystemPowerStatus`.
+pub(crate) fn query_system_power_status() -> Option<RawWindowsPowerStatus> {
+    let mut status = SYSTEM_POWER_STATUS::default();
+    // SAFETY: `status` is a plain Win32 output struct owned on the stack; `GetSystemPowerStatus`
+    // writes into it and returns `Ok(())` on success.
+    unsafe { GetSystemPowerStatus(&mut status) }.ok()?;
+    Some(RawWindowsPowerStatus {
+        ac_line_status: status.ACLineStatus,
+        battery_flag: status.BatteryFlag,
+        battery_life_percent: status.BatteryLifePercent,
+        battery_life_time: status.BatteryLifeTime,
+    })
 }
 
 /// An open Win32 process handle paired with its verified identity and parent PID read directly

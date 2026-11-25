@@ -13,7 +13,9 @@ use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::{OsError, Result};
 
-use super::{EnvMarkerCheck, KillTreeReport, ProcessId, child_not_older_than_parent, is_alive};
+use super::{
+    EnvMarkerCheck, KillTreeReport, ProcessId, SignalOutcome, child_not_older_than_parent, is_alive,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -44,6 +46,87 @@ pub(super) fn is_protected(identity: &ProcessId) -> Option<&'static str> {
         return Some("ancestor of current process");
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn self_and_ancestors() -> HashSet<u32> {
+    let mut seen = HashSet::new();
+    let own = std::process::id();
+    seen.insert(own);
+    let Some((mut parent_pid, mut child_start)) = linux_parent_and_start(own) else {
+        return seen;
+    };
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match linux_parent_and_start(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                if parent_start > child_start {
+                    seen.remove(&parent_pid);
+                    break;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => break,
+        }
+    }
+    seen
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn self_and_ancestors() -> HashSet<u32> {
+    let mut seen = HashSet::new();
+    let own = std::process::id();
+    seen.insert(own);
+    let Some((mut parent_pid, mut child_start)) = macos_proc::parent_and_start(own) else {
+        return seen;
+    };
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        match macos_proc::parent_and_start(parent_pid) {
+            Some((next_ppid, parent_start)) => {
+                if !child_not_older_than_parent(
+                    child_start,
+                    parent_start,
+                    EXACT_START_BACKWARD_TOLERANCE,
+                ) {
+                    seen.remove(&parent_pid);
+                    break;
+                }
+                child_start = parent_start;
+                parent_pid = next_ppid;
+            }
+            None => break,
+        }
+    }
+    seen
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn self_and_ancestors() -> HashSet<u32> {
+    let mut seen = HashSet::new();
+    let own = std::process::id();
+    seen.insert(own);
+    let Ok(mut system) = System::new() else {
+        return seen;
+    };
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let mut cur = sysinfo::Pid::from_u32(own);
+    for _ in 0..MAX_ANCESTOR_HOPS {
+        let Some(parent) = system.process(cur).and_then(|p| p.parent()) else {
+            break;
+        };
+        let parent_pid = parent.as_u32();
+        if parent_pid <= 1 || !seen.insert(parent_pid) {
+            break;
+        }
+        cur = parent;
+    }
+    seen
 }
 
 #[cfg(target_os = "linux")]
@@ -999,6 +1082,68 @@ fn signal_verified_once(identity: &ProcessId, sig: Signal) -> std::result::Resul
         Err(Errno::ESRCH) => Ok(true),
         Err(err) => Err(err),
     }
+}
+
+pub(super) async fn signal_process(identity: &ProcessId, force: bool) -> Result<SignalOutcome> {
+    let raw_pid = i32::try_from(identity.pid).map_err(|_| OsError::InvalidArgument {
+        detail: format!("pid {} exceeds Unix pid_t range", identity.pid),
+    })?;
+    let nix_pid = Pid::from_raw(raw_pid);
+    let identity = *identity;
+    let sig = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+
+    tokio::task::spawn_blocking(move || -> Result<SignalOutcome> {
+        #[cfg(target_os = "linux")]
+        match linux_pidfd::open_verified(&identity) {
+            linux_pidfd::VerifiedOpen::Pinned(pidfd) => {
+                return match pidfd.send_signal(sig) {
+                    Ok(()) => Ok(SignalOutcome::Signaled),
+                    Err(Errno::ESRCH) => Ok(SignalOutcome::AlreadyGone),
+                    Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                        detail: format!("permission denied signaling process {}", identity.pid),
+                        source: None,
+                    }),
+                    Err(err) => Err(OsError::Platform {
+                        detail: format!("failed signaling process {}: {err}", identity.pid),
+                    }),
+                };
+            }
+            linux_pidfd::VerifiedOpen::GoneOrMismatch => {
+                return match super::of_pid(identity.pid) {
+                    Ok(Some(_)) => Ok(SignalOutcome::IdentityMismatch),
+                    Ok(None) | Err(_) => Ok(SignalOutcome::AlreadyGone),
+                };
+            }
+            linux_pidfd::VerifiedOpen::FallbackToPid => {}
+        }
+
+        match super::of_pid(identity.pid)? {
+            None => return Ok(SignalOutcome::AlreadyGone),
+            Some(observed) if !identity.matches(&observed) => {
+                return Ok(SignalOutcome::IdentityMismatch);
+            }
+            Some(_) => {}
+        }
+        match kill(nix_pid, sig) {
+            Ok(()) => Ok(SignalOutcome::Signaled),
+            Err(Errno::ESRCH) => Ok(SignalOutcome::AlreadyGone),
+            Err(Errno::EPERM) => Err(OsError::PermissionDenied {
+                detail: format!("permission denied signaling process {}", identity.pid),
+                source: None,
+            }),
+            Err(err) => Err(OsError::Platform {
+                detail: format!("failed signaling process {}: {err}", identity.pid),
+            }),
+        }
+    })
+    .await
+    .map_err(|err| OsError::Platform {
+        detail: format!("signal_process worker task failed: {err}"),
+    })?
 }
 
 pub(super) async fn kill_process(
