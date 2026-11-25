@@ -344,6 +344,72 @@ fn helper(args: &[String]) -> ExitCode {
             });
             exit_of(child.wait().unwrap())
         }
+        // Simulates a case-folding filesystem where `stat` cannot tell case-sensitivity read-only
+        // (omits `case_insensitive` and `parent_case_insensitive`) and both `EmptyDir` and
+        // `emptydir` share the same `(file_id, parent_id)`. Proves `fs.transfer --move` asks
+        // `probe_write` (`action = "behavior"`) and renames cleanly instead of assuming sensitive.
+        "unknown-casefold-peer" if subcommand == "stream" => {
+            let mut input = BufReader::new(std::io::stdin());
+            let mut header = Vec::new();
+            input.read_until(b'\n', &mut header).unwrap();
+            let header_val: Value = serde_json::from_slice(&header).unwrap_or(Value::Null);
+            let op = header_val["op"].as_str().unwrap_or("");
+            let mut stdout = std::io::stdout().lock();
+            let hello = json!({"protocol": 1, "capabilities": ["if_exists", "lock", "move", "probe", "rename"]});
+            match op {
+                "stat" => {
+                    writeln!(stdout, "{hello}").unwrap();
+                    writeln!(
+                        stdout,
+                        "{}",
+                        json!({
+                            "kind": "dir",
+                            "resolved_path": header_val["path"],
+                            "file_id": {"dev": 77, "ino": 5001, "nlink": 2},
+                            "parent_id": {"dev": 77, "ino": 5000, "nlink": 3},
+                        })
+                    )
+                    .unwrap();
+                    stdout.flush().unwrap();
+                    return ExitCode::SUCCESS;
+                }
+                "probe_write" if header_val["action"].as_str() == Some("behavior") => {
+                    writeln!(stdout, "{hello}").unwrap();
+                    writeln!(
+                        stdout,
+                        "{}",
+                        json!({
+                            "dir": header_val["dir"],
+                            "case_insensitive": true,
+                            "unicode_normalizing": false,
+                        })
+                    )
+                    .unwrap();
+                    stdout.flush().unwrap();
+                    return ExitCode::SUCCESS;
+                }
+                "rename" => {
+                    writeln!(stdout, "{hello}").unwrap();
+                    writeln!(stdout, "{}", json!({"ok": true})).unwrap();
+                    stdout.flush().unwrap();
+                    return ExitCode::SUCCESS;
+                }
+                "delete" if header_val["dry_run"].as_bool() == Some(true) => {
+                    writeln!(stdout, "{hello}").unwrap();
+                    writeln!(stdout, "{}", json!({"removed": 0})).unwrap();
+                    stdout.flush().unwrap();
+                    return ExitCode::SUCCESS;
+                }
+                _ => {}
+            }
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            let mut child_in = child.stdin.take().unwrap();
+            child_in.write_all(&header).unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut child_in);
+            });
+            exit_of(child.wait().unwrap())
+        }
         // Makes `probe_write` return `{dir: null, marker: null, exists: false}` so directory
         // distinctness cannot be proven (proving move fails safe and keeps both copies).
         "inconclusive-probe" if subcommand == "stream" => {
@@ -3529,6 +3595,101 @@ fn move_same_file_aliases_symlinks_hardlinks_and_case_normalization_rename() {
     assert_eq!(
         fs::read(laptop.home().join(lower_umlaut)).unwrap(),
         b"umlaut-contents"
+    );
+
+    // 4d2. Case-only renames of an empty folder, a folder holding only subfolders, a folder with
+    // files, and a single file inside clean parent directories with no sibling regular files.
+    let dir_cases = laptop.home().join("case_dir_tests");
+    fs::create_dir_all(dir_cases.join("p1/EmptyDir")).unwrap();
+    fs::create_dir_all(dir_cases.join("p2/FolderOfFolders/SubA/SubB")).unwrap();
+    fs::create_dir_all(dir_cases.join("p3/FolderWithFiles")).unwrap();
+    fs::write(dir_cases.join("p3/FolderWithFiles/doc.txt"), b"inside").unwrap();
+    fs::create_dir_all(dir_cases.join("p4")).unwrap();
+    fs::write(dir_cases.join("p4/SoloFile.txt"), b"solo").unwrap();
+
+    for (rel_from, rel_to, expected_kind, parent_rel, expected_name) in [
+        (
+            "~/case_dir_tests/p1/EmptyDir",
+            "~/case_dir_tests/p1/emptydir",
+            "tree",
+            "case_dir_tests/p1",
+            "emptydir",
+        ),
+        (
+            "~/case_dir_tests/p2/FolderOfFolders",
+            "~/case_dir_tests/p2/folderoffolders",
+            "tree",
+            "case_dir_tests/p2",
+            "folderoffolders",
+        ),
+        (
+            "~/case_dir_tests/p3/FolderWithFiles",
+            "~/case_dir_tests/p3/folderwithfiles",
+            "tree",
+            "case_dir_tests/p3",
+            "folderwithfiles",
+        ),
+        (
+            "~/case_dir_tests/p4/SoloFile.txt",
+            "~/case_dir_tests/p4/solofile.txt",
+            "file",
+            "case_dir_tests/p4",
+            "solofile.txt",
+        ),
+    ] {
+        let moved = ok(&transfer(
+            &laptop,
+            json!({"from": rel_from, "to": rel_to, "move": true}),
+            &[],
+        ));
+        assert_eq!(moved["moved"], true, "{rel_from} -> {rel_to}: {moved}");
+        assert_eq!(moved["kind"], expected_kind, "{moved}");
+        if host_case_insensitive {
+            assert_eq!(
+                moved["renamed"],
+                json!([{"from": rel_from, "to": rel_to}]),
+                "case-insensitive host must use folding rename for {rel_from}: {moved}"
+            );
+        }
+        let entries = dir_entry_names(laptop.home().join(parent_rel));
+        assert!(
+            entries.iter().any(|n| n == expected_name.as_bytes()),
+            "expected {expected_name} in {parent_rel}: {entries:?}"
+        );
+    }
+    assert!(dir_cases.join("p2/folderoffolders/SubA/SubB").is_dir());
+    assert_eq!(
+        fs::read(dir_cases.join("p3/folderwithfiles/doc.txt")).unwrap(),
+        b"inside"
+    );
+    assert_eq!(
+        fs::read(dir_cases.join("p4/solofile.txt")).unwrap(),
+        b"solo"
+    );
+
+    // 4d3. Even when `stat` leaves `case_insensitive` and `parent_case_insensitive` unknown
+    // (`None`) on a remote peer, `fs.transfer --move` asks `probe_write action="behavior"` rather
+    // than assuming case-sensitivity, so renaming an empty folder on a case-folding volume works.
+    let vfat_peer = node("vfatbox");
+    fleet(
+        &laptop,
+        &[("vfatbox", &vfat_peer, "unknown-casefold-peer", vec![])],
+    );
+    let remote_renamed = ok(&transfer(
+        &laptop,
+        json!({
+            "from": "vfatbox:~/EmptyDir",
+            "to": "vfatbox:~/emptydir",
+            "move": true,
+        }),
+        &[],
+    ));
+    assert_eq!(remote_renamed["moved"], true, "{remote_renamed}");
+    assert_eq!(remote_renamed["kind"], "tree", "{remote_renamed}");
+    assert_eq!(
+        remote_renamed["renamed"],
+        json!([{"from": "~/EmptyDir", "to": "~/emptydir"}]),
+        "{remote_renamed}"
     );
 
     // 4e. Unicode normalization rename (NFD `cafe\u{0301}.txt` -> NFC `caf\u{00e9}.txt`) via

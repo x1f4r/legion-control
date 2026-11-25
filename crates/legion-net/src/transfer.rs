@@ -1275,6 +1275,118 @@ impl Transfer<'_> {
         Ok(())
     }
 
+    /// Resolves the case-sensitivity and Unicode-normalization behavior of the parent directory
+    /// holding `from` and `to` (never inspecting inside a directory being renamed). When read-only
+    /// `stat` left either property unknown and `same_file` holds on one parent, asks the node to
+    /// run `probe_dir_name_behavior` via `probe_write` (`action = "behavior"`) instead of assuming
+    /// case-sensitivity.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_parent_fs_behavior(
+        &self,
+        from: &End,
+        source_stat: &StatReply,
+        to_path: &str,
+        there_stat: &StatReply,
+        same_file: bool,
+        dry_run: bool,
+    ) -> FsNameBehavior {
+        // Prefer the parent-directory fields from `stat`, falling back to the legacy fields only
+        // for non-directories (where `stat` already inspected the parent) or older peers.
+        let mut ci = there_stat
+            .parent_case_insensitive
+            .or(source_stat.parent_case_insensitive);
+        let mut norm = there_stat
+            .parent_unicode_normalizing
+            .or(source_stat.parent_unicode_normalizing);
+        if source_stat.kind != "dir" {
+            ci = ci
+                .or(there_stat.case_insensitive)
+                .or(source_stat.case_insensitive);
+            norm = norm
+                .or(there_stat.unicode_normalizing)
+                .or(source_stat.unicode_normalizing);
+        }
+
+        let same_parent = source_stat
+            .parent_id
+            .zip(there_stat.parent_id)
+            .is_some_and(|(a, b)| a.same_file(&b));
+        let either_symlink = source_stat.is_symlink || there_stat.is_symlink;
+        let from_name = OsStr::new(file_name(&from.path));
+        let to_name = OsStr::new(file_name(to_path));
+        let needs_probe = (ci.is_none() || norm.is_none())
+            && same_file
+            && same_parent
+            && !either_symlink
+            && from_name.as_encoded_bytes() != to_name.as_encoded_bytes();
+
+        if needs_probe {
+            if !dry_run {
+                let parent = parent_dir_of(&from.path);
+                if let Ok(reply) = self
+                    .request_required::<ProbeReply>(
+                        from,
+                        json!({
+                            "op": "probe_write",
+                            "action": "behavior",
+                            "dir": parent,
+                        }),
+                        &[CAP_PROBE],
+                    )
+                    .await
+                {
+                    if let Some(probed_ci) = reply.case_insensitive {
+                        ci = Some(probed_ci);
+                    }
+                    if let Some(probed_norm) = reply.unicode_normalizing {
+                        norm = Some(probed_norm);
+                    }
+                }
+            } else if source_stat.kind == "dir"
+                || source_stat.file_id.is_some_and(|id| id.nlink == 1)
+            {
+                // Dry-run must not write probe files. Directories cannot be hardlinked and
+                // `nlink == 1` files have no hardlink aliases, so a same-file same-parent entry
+                // with a differing name can only be a folding alias.
+                let fold_ci = stream::names_fold_equivalent(
+                    from_name,
+                    to_name,
+                    FsNameBehavior {
+                        case_insensitive: true,
+                        unicode_normalizing: false,
+                    },
+                );
+                let fold_norm = stream::names_fold_equivalent(
+                    from_name,
+                    to_name,
+                    FsNameBehavior {
+                        case_insensitive: false,
+                        unicode_normalizing: true,
+                    },
+                );
+                let fold_both = stream::names_fold_equivalent(
+                    from_name,
+                    to_name,
+                    FsNameBehavior {
+                        case_insensitive: true,
+                        unicode_normalizing: true,
+                    },
+                );
+                if ci.is_none() && (fold_ci || (fold_both && !fold_norm)) {
+                    ci = Some(true);
+                }
+                if norm.is_none() && (fold_norm || (fold_both && !fold_ci)) {
+                    norm = Some(true);
+                }
+            }
+        }
+
+        FsNameBehavior {
+            case_insensitive: ci.unwrap_or(false),
+            unicode_normalizing: norm.unwrap_or(false),
+        }
+    }
+
     /// Always probes `(from_dir, to_dir)` by creating a unique marker in `to_dir` and checking
     /// whether it appears in `from_dir`, caching conclusive results for the transfer.
     ///
@@ -1811,16 +1923,16 @@ impl Transfer<'_> {
                     .file_id
                     .zip(there.file_id)
                     .is_some_and(|(a, b)| a.same_file(&b));
-                let fs_behavior = FsNameBehavior {
-                    case_insensitive: there
-                        .case_insensitive
-                        .or(source.case_insensitive)
-                        .unwrap_or(false),
-                    unicode_normalizing: there
-                        .unicode_normalizing
-                        .or(source.unicode_normalizing)
-                        .unwrap_or(false),
-                };
+                let fs_behavior = self
+                    .resolve_parent_fs_behavior(
+                        from,
+                        source,
+                        &target.path,
+                        &there,
+                        same_file,
+                        args.dry_run,
+                    )
+                    .await;
                 match classify_same_entry(
                     source.parent_id,
                     there.parent_id,
@@ -2222,16 +2334,16 @@ impl Transfer<'_> {
                     .file_id
                     .zip(there.file_id)
                     .is_some_and(|(a, b)| a.same_file(&b));
-                let fs_behavior = FsNameBehavior {
-                    case_insensitive: there
-                        .case_insensitive
-                        .or(source_stat.case_insensitive)
-                        .unwrap_or(false),
-                    unicode_normalizing: there
-                        .unicode_normalizing
-                        .or(source_stat.unicode_normalizing)
-                        .unwrap_or(false),
-                };
+                let fs_behavior = self
+                    .resolve_parent_fs_behavior(
+                        from,
+                        source_stat,
+                        &to.path,
+                        &there,
+                        same_file,
+                        args.dry_run,
+                    )
+                    .await;
                 match classify_same_entry(
                     source_stat.parent_id,
                     there.parent_id,

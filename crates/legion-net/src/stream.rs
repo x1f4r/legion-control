@@ -284,6 +284,9 @@ pub(crate) enum Op {
 pub(crate) enum ProbeWriteAction {
     Create,
     Remove,
+    /// Probe the directory's exact case-sensitivity and Unicode-normalization behavior (falling
+    /// back to an ephemeral unique probe file when read-only inspection is inconclusive).
+    Behavior,
 }
 
 impl Op {
@@ -361,6 +364,14 @@ pub(crate) struct StatReply {
     /// entry. Absent when that cannot be told without writing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unicode_normalizing: Option<bool>,
+    /// Case-folding behavior of `path`'s parent directory (where `path`'s own entry name lives),
+    /// never inspecting inside `path` itself. Absent when inconclusive without writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_case_insensitive: Option<bool>,
+    /// Unicode-normalization behavior of `path`'s parent directory (where `path`'s own entry name
+    /// lives), never inspecting inside `path` itself. Absent when inconclusive without writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_unicode_normalizing: Option<bool>,
     /// The resolved filesystem path on this node (with `~` and symlinks resolved on existing
     /// ancestors), used to detect moving a file onto itself or a tree into its own subtree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,6 +495,12 @@ pub(crate) struct ProbeReply {
     pub marker: Option<String>,
     #[serde(default)]
     pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_insensitive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unicode_normalizing: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_fs: Option<String>,
 }
 
 /// The line that answers a same-node `rename`.
@@ -1282,10 +1299,10 @@ fn stat<W: Write>(
     };
     let path = resolve_root(grant, path, Access::Read)?;
     let resolved_path = Some(path.to_string_lossy().into_owned());
-    let parent_id = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .and_then(|p| file_identity(p).ok());
+    let parent_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_id = parent_dir.and_then(|p| file_identity(p).ok());
+    let parent_case_insensitive = parent_dir.and_then(case_insensitive_in_dir);
+    let parent_unicode_normalizing = parent_dir.and_then(unicode_normalizing_in_dir);
     let ancestor_ids = || {
         let mut ids = Vec::new();
         for anc in path.ancestors().skip(1) {
@@ -1308,6 +1325,8 @@ fn stat<W: Write>(
                     partial: partial(),
                     case_insensitive: case_insensitive(&path),
                     unicode_normalizing: unicode_normalizing(&path),
+                    parent_case_insensitive,
+                    parent_unicode_normalizing,
                     resolved_path,
                     file_id: None,
                     parent_id,
@@ -1325,6 +1344,8 @@ fn stat<W: Write>(
             kind: "dir".to_owned(),
             case_insensitive: case_insensitive(&path),
             unicode_normalizing: unicode_normalizing(&path),
+            parent_case_insensitive,
+            parent_unicode_normalizing,
             resolved_path,
             file_id: fid,
             parent_id,
@@ -1350,6 +1371,8 @@ fn stat<W: Write>(
             partial: partial(),
             case_insensitive: case_insensitive(&path),
             unicode_normalizing: unicode_normalizing(&path),
+            parent_case_insensitive,
+            parent_unicode_normalizing,
             resolved_path,
             file_id: fid,
             parent_id,
@@ -1364,6 +1387,8 @@ fn stat<W: Write>(
                 "other"
             }
             .to_owned(),
+            parent_case_insensitive,
+            parent_unicode_normalizing,
             resolved_path,
             file_id: fid,
             parent_id,
@@ -1467,6 +1492,13 @@ fn case_insensitive(path: &Path) -> Option<bool> {
     let dir = path
         .ancestors()
         .find(|dir| fs::metadata(dir).is_ok_and(|meta| meta.is_dir()))?;
+    case_insensitive_in_dir(dir)
+}
+
+fn case_insensitive_in_dir(dir: &Path) -> Option<bool> {
+    if !fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return None;
+    }
     let inside = fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -1475,7 +1507,10 @@ fn case_insensitive(path: &Path) -> Option<bool> {
         .map(|entry| entry.path());
     for candidate in inside {
         // A link and what it leads to are the same file whatever their names.
-        if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        let Ok(meta) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
             continue;
         }
         let (Some(parent), Some(name)) = (
@@ -1503,9 +1538,10 @@ fn case_insensitive(path: &Path) -> Option<bool> {
         if fs::symlink_metadata(&twin).is_err() {
             return Some(false);
         }
-        // Only trust a positive match on a non-hardlinked entry so two hardlinks with flipped
-        // casing on a case-sensitive filesystem cannot spoof case-insensitivity.
-        if file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
+        // Directories cannot be hardlinked on POSIX, and regular files with `nlink == 1` have no
+        // hardlink aliases, so a same-file hit on either proves case-insensitivity without risking
+        // hardlink spoofing.
+        if meta.is_dir() || file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
             return Some(same_file::is_same_file(&candidate, &twin).unwrap_or(false));
         }
     }
@@ -1518,6 +1554,13 @@ fn unicode_normalizing(path: &Path) -> Option<bool> {
     let dir = path
         .ancestors()
         .find(|dir| fs::metadata(dir).is_ok_and(|meta| meta.is_dir()))?;
+    unicode_normalizing_in_dir(dir)
+}
+
+fn unicode_normalizing_in_dir(dir: &Path) -> Option<bool> {
+    if !fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return None;
+    }
     let inside = fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -1525,7 +1568,10 @@ fn unicode_normalizing(path: &Path) -> Option<bool> {
         .filter_map(Result::ok)
         .map(|entry| entry.path());
     for candidate in inside {
-        if fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        let Ok(meta) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
             continue;
         }
         let (Some(parent), Some(name)) = (
@@ -1544,7 +1590,7 @@ fn unicode_normalizing(path: &Path) -> Option<bool> {
         if fs::symlink_metadata(&twin).is_err() {
             return Some(false);
         }
-        if file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
+        if meta.is_dir() || file_identity(&candidate).is_ok_and(|id| id.nlink == 1) {
             return Some(same_file::is_same_file(&candidate, &twin).unwrap_or(false));
         }
     }
@@ -1553,9 +1599,9 @@ fn unicode_normalizing(path: &Path) -> Option<bool> {
 
 /// Probes `dir`'s exact case-sensitivity and Unicode-normalization behavior, using read-only
 /// inspection first and falling back to an ephemeral unique probe file when `dir` has no suitable
-/// `nlink == 1` entry.
+/// entry.
 fn probe_dir_name_behavior(dir: &Path) -> FsNameBehavior {
-    let ci = case_insensitive(dir).unwrap_or_else(|| {
+    let ci = case_insensitive_in_dir(dir).unwrap_or_else(|| {
         probe_dir_pair(
             dir,
             |pid, seq| format!(".legion-CaseProbe-{pid}-{seq}.tmp"),
@@ -1563,7 +1609,7 @@ fn probe_dir_name_behavior(dir: &Path) -> FsNameBehavior {
         )
         .unwrap_or(cfg!(any(windows, target_os = "macos")))
     });
-    let norm = unicode_normalizing(dir).unwrap_or_else(|| {
+    let norm = unicode_normalizing_in_dir(dir).unwrap_or_else(|| {
         probe_dir_pair(
             dir,
             |pid, seq| format!(".legion-NormProbe-e\u{0301}-{pid}-{seq}.tmp"),
@@ -2338,25 +2384,11 @@ fn probe_write<W: Write>(
                 match found {
                     Some(d) => d,
                     None => {
-                        return reply(
-                            output,
-                            &ProbeReply {
-                                dir: None,
-                                marker: None,
-                                exists: false,
-                            },
-                        );
+                        return reply(output, &ProbeReply::default());
                     }
                 }
             } else {
-                return reply(
-                    output,
-                    &ProbeReply {
-                        dir: None,
-                        marker: None,
-                        exists: false,
-                    },
-                );
+                return reply(output, &ProbeReply::default());
             };
 
             let pid = std::process::id();
@@ -2379,6 +2411,7 @@ fn probe_write<W: Write>(
                                 dir: Some(probe_dir.to_string_lossy().into_owned()),
                                 marker: Some(name),
                                 exists: true,
+                                ..ProbeReply::default()
                             },
                         );
                     }
@@ -2419,6 +2452,23 @@ fn probe_write<W: Write>(
                     dir: None,
                     marker: None,
                     exists: false,
+                    ..ProbeReply::default()
+                },
+            )
+        }
+        ProbeWriteAction::Behavior => {
+            let checked_dir = grant.check_path(dir, Access::Write)?;
+            if !fs::metadata(&checked_dir).is_ok_and(|m| m.is_dir()) {
+                return reply(output, &ProbeReply::default());
+            }
+            let behavior = probe_dir_name_behavior(&checked_dir);
+            reply(
+                output,
+                &ProbeReply {
+                    dir: Some(checked_dir.to_string_lossy().into_owned()),
+                    case_insensitive: Some(behavior.case_insensitive),
+                    unicode_normalizing: Some(behavior.unicode_normalizing),
+                    ..ProbeReply::default()
                 },
             )
         }
@@ -2450,9 +2500,8 @@ fn probe_read<W: Write>(
     reply(
         output,
         &ProbeReply {
-            dir: None,
-            marker: None,
             exists,
+            ..ProbeReply::default()
         },
     )
 }
